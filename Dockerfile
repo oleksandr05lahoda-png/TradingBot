@@ -1,4 +1,5 @@
-FROM openjdk:17-jdk
+FROM eclipse-temurin:17-jdk
+
 
 # Рабочая директория в контейнере
 WORKDIR /app
