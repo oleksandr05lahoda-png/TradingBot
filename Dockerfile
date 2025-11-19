@@ -6,17 +6,13 @@
 FROM eclipse-temurin:17-jdk
 WORKDIR /app
 
-# Копируем Gradle и скрипты
 COPY gradlew ./gradlew
 COPY gradle/ ./gradle
 COPY build.gradle ./build.gradle
 COPY settings.gradle ./settings.gradle
 
-# Копируем Java-код и ресурсы (относительно Dockerfile)
 COPY src/main/java/ ./java-bot
 COPY src/main/resources/ ./resources
-
-# Копируем Python-код
 COPY src/main/python-core/ ./python-core
 
 # Сборка Java-бота через Gradle
