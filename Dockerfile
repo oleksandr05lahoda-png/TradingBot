@@ -20,4 +20,3 @@ RUN pip3 install --no-cache-dir -r python-core/requirements.txt
 
 # Запуск бота
 CMD ["java", "-cp", "java-bot/build/classes/java/main", "com.bot.BotMain"]
-git add .
