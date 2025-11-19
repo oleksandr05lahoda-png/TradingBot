@@ -27,7 +27,9 @@ public class SignalSender {
 
     public void start() {
         try {
-            ProcessBuilder pb = new ProcessBuilder("python3", "python-core/analysis.py");
+            ProcessBuilder pb = new ProcessBuilder("python", "src/python-core/analysis.py");
+            pb.redirectErrorStream(true);
+            System.out.println("Запускаем Python-анализатор...");
             Process process = pb.start();
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
