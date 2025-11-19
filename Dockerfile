@@ -1,23 +1,28 @@
+# Используем стабильный JDK 17 образ
 FROM eclipse-temurin:17-jdk
 
-
-# Рабочая директория в контейнере
+# Рабочая директория
 WORKDIR /app
 
-# Копируем Gradle скрипты и wrapper
-COPY gradlew ./gradlew
+# Копируем Gradle wrapper и скрипты
+COPY gradlew .
 COPY gradle/ ./gradle
-COPY build.gradle ./build.gradle
-COPY settings.gradle ./settings.gradle
 
-# Копируем Java код и ресурсы
-COPY src/main/java ./java-bot
-COPY src/main/resources ./resources
+# Делаем gradlew исполняемым
+RUN chmod +x gradlew
 
-# Копируем Python код
-COPY src/python-core ./python-core
+# Копируем build.gradle и settings
+COPY build.gradle .
+COPY settings.gradle .
 
-# Делаем сборку Java бота через Gradle
+# Копируем Java-код
+COPY src/main/java/ ./java-bot
+COPY src/main/resources/ ./resources
+
+# Копируем Python-код
+COPY src/python-core/ ./python-core
+
+# Сборка Java бота
 RUN ./gradlew build --no-daemon
 
 # Запуск бота
