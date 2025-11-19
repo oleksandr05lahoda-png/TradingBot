@@ -1,26 +1,24 @@
-# -------------------------------
-# Dockerfile для TradingTelegramBot
-# -------------------------------
+# Используем официальный JDK образ
+FROM openjdk:17-jdk-slim
 
-# Базовый образ JDK 17
-FROM eclipse-temurin:17-jdk
+# Рабочая директория в контейнере
 WORKDIR /app
 
+# Копируем Gradle скрипты и wrapper
 COPY gradlew ./gradlew
 COPY gradle/ ./gradle
 COPY build.gradle ./build.gradle
 COPY settings.gradle ./settings.gradle
 
-COPY src/main/java/ ./java-bot
-COPY src/main/resources/ ./resources
-COPY src/main/python-core/ ./python-core
+# Копируем Java код и ресурсы
+COPY src/main/java ./java-bot
+COPY src/main/resources ./resources
 
-# Сборка Java-бота через Gradle
-RUN ./gradlew build
+# Копируем Python код
+COPY src/python-core ./python-core
 
-# Установка Python и pip
-RUN apt-get update && apt-get install -y python3 python3-pip
-RUN pip3 install --no-cache-dir -r python-core/requirements.txt
+# Делаем сборку Java бота через Gradle
+RUN ./gradlew build --no-daemon
 
 # Запуск бота
-CMD ["java", "-cp", "java-bot/com/bot", "BotMain"]
+CMD ["java", "-cp", "java-bot/build/classes/java/main", "com.bot.BotMain"]
