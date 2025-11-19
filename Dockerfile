@@ -19,7 +19,6 @@ COPY java-bot/ ./java-bot
 
 # Копируем Python-часть и shared конфиги
 COPY python-core/ ./python-core
-COPY shared/ ./shared
 
 # Делаем Gradle сборку Java бота
 RUN ./gradlew build
