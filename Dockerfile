@@ -1,15 +1,18 @@
-# Используем готовый образ с JDK 17
+# Используем образ с Python и OpenJDK 17
 FROM eclipse-temurin:17-jdk
+
+# Устанавливаем Python
+RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/apt/lists/*
 
 # Рабочая директория
 WORKDIR /app
 
-# Копируем Gradle wrapper и скрипты
+# Копируем Gradle wrapper
 COPY gradlew .
 COPY gradle/ ./gradle
 RUN chmod +x gradlew
 
-# Копируем build.gradle и settings.gradle
+# Копируем файлы сборки Gradle
 COPY build.gradle .
 COPY settings.gradle .
 
@@ -19,10 +22,13 @@ COPY src/main/resources/ ./resources
 
 # Копируем Python-код
 COPY src/python-core/ ./python-core
+COPY src/python-core/requirements.txt ./python-core/
 
-# Сборка Java бота
+# Устанавливаем Python-зависимости
+RUN pip3 install --no-cache-dir -r python-core/requirements.txt
+
+# Собираем Java-бота
 RUN ./gradlew build --no-daemon
-RUN apt-get update && apt-get install -y python3 python3-pip
 
 # Запуск бота
 CMD ["java", "-cp", "java-bot/build/classes/java/main", "com.bot.BotMain"]
