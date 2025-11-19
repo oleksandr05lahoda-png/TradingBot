@@ -22,6 +22,7 @@ COPY src/python-core/ ./python-core
 
 # Сборка Java бота
 RUN ./gradlew build --no-daemon
+RUN apt-get update && apt-get install -y python3 python3-pip
 
 # Запуск бота
 CMD ["java", "-cp", "java-bot/build/classes/java/main", "com.bot.BotMain"]
