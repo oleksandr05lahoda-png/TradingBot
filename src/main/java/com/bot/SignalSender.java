@@ -1,9 +1,6 @@
 package com.bot;
 
 import java.io.*;
-import java.util.Properties;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 
 public class SignalSender {
 
@@ -11,7 +8,6 @@ public class SignalSender {
     private String chatId;
 
     public SignalSender() {
-        // Загружаем конфиг
         try (InputStream input = getClass().getClassLoader().getResourceAsStream("config.json")) {
             if (input == null) {
                 System.out.println("Конфиг не найден!");
@@ -27,7 +23,8 @@ public class SignalSender {
 
     public void start() {
         try {
-            ProcessBuilder pb = new ProcessBuilder("python", "src/python-core/analysis.py");
+            // Запускаем Python через виртуальное окружение
+            ProcessBuilder pb = new ProcessBuilder("./venv/bin/python", "python-core/analysis.py");
             pb.redirectErrorStream(true);
             System.out.println("Запускаем Python-анализатор...");
             Process process = pb.start();
@@ -35,9 +32,8 @@ public class SignalSender {
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
             String line;
             while ((line = reader.readLine()) != null) {
-                // Пример: BTCUSDT,LONG,0.85
                 System.out.println("Сигнал: " + line);
-                // TODO: здесь подключить отправку в Telegram через Bot API
+                // TODO: подключить Telegram API для отправки
             }
 
             process.waitFor();
