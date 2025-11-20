@@ -13,8 +13,8 @@ public class SignalSender {
 
     public SignalSender() {
         // Читаем переменные окружения
-        telegramToken = System.getenv("8395445212:AAF7X7oFBx72HgKGoRTcFpdFbuHcZOPfTig");
-        chatId = System.getenv("953233853");
+        telegramToken = System.getenv("TELEGRAM_TOKEN");
+        chatId = System.getenv("CHAT_ID");
         String coinsEnv = System.getenv("COINS"); // Например "BTCUSDT,ETHUSDT,BNBUSDT"
         coins = coinsEnv != null ? Arrays.asList(coinsEnv.split(",")) : List.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
         timeframe = System.getenv().getOrDefault("TIMEFRAME", "1m");
