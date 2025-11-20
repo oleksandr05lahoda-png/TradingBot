@@ -1,7 +1,0 @@
-{
-  "telegram_token": "8395445212:AAF7X7oFBx72HgKGoRTcFpdFbuHcZOPfTig",
-  "chat_id": "953233853",
-  "coins": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
-  "timeframe": "1m",
-  "signal_threshold": 0.7
-}
