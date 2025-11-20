@@ -1,6 +1,9 @@
 package com.bot;
 
-import java.io.*;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.io.IOException;
+import org.json.JSONObject;
 
 public class SignalSender {
 
@@ -10,35 +13,26 @@ public class SignalSender {
     public SignalSender() {
         try (InputStream input = getClass().getClassLoader().getResourceAsStream("config.json")) {
             if (input == null) {
-                System.out.println("Конфиг не найден!");
+                System.out.println("Конфиг не найден в resources!");
                 return;
             }
-            String json = new String(input.readAllBytes());
-            telegramToken = json.split("\"telegram_token\":")[1].split("\"")[1];
-            chatId = json.split("\"chat_id\":")[1].split("\"")[1];
+
+            // Читаем весь файл в строку
+            String jsonText = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+
+            // Создаем JSON объект
+            JSONObject json = new JSONObject(jsonText);
+
+            telegramToken = json.getString("telegram_token");
+            chatId = json.getString("chat_id");
+
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
 
     public void start() {
-        try {
-            // Запускаем Python через виртуальное окружение
-            ProcessBuilder pb = new ProcessBuilder("./venv/bin/python", "python-core/analysis.py");
-            pb.redirectErrorStream(true);
-            System.out.println("Запускаем Python-анализатор...");
-            Process process = pb.start();
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                System.out.println("Сигнал: " + line);
-                // TODO: подключить Telegram API для отправки
-            }
-
-            process.waitFor();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        System.out.println("SignalSender запущен. Token: " + telegramToken + ", ChatID: " + chatId);
+        // Здесь позже будет логика запуска Python анализа и отправки сигналов
     }
 }

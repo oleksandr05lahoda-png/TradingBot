@@ -10,6 +10,9 @@ sourceCompatibility = '17'
 repositories {
     mavenCentral()
 }
+dependencies {
+    implementation 'org.json:json:20230227'
+}
 
 dependencies {
     implementation 'org.telegram:telegrambots:6.7.0'
