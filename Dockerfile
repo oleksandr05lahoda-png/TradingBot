@@ -1,4 +1,4 @@
-FROM openjdk:17-slim
+FROM openjdk:17-jdk
 
 RUN apt-get update && \
     apt-get install -y python3 python3-venv python3-pip && \
