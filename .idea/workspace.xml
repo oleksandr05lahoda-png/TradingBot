@@ -5,7 +5,12 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Dockerfile" beforeDir="false" afterPath="$PROJECT_DIR$/Dockerfile" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/build.gradle" beforeDir="false" afterPath="$PROJECT_DIR$/build.gradle" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/python-core/analysis.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/python-core/analysis.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/python-core/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/src/python-core/requirements.txt" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -51,6 +56,7 @@
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
+    "Gradle.Build TradingTelegramBot.executor": "Run",
     "ModuleVcsDetector.initialDetectionPerformed": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
@@ -85,7 +91,7 @@
       <option name="presentableId" value="Default" />
       <updated>1763588490502</updated>
       <workItem from="1763588491582" duration="635000" />
-      <workItem from="1763589143347" duration="6949000" />
+      <workItem from="1763589143347" duration="8738000" />
     </task>
     <servers />
   </component>
