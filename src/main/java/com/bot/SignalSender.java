@@ -6,8 +6,10 @@ import java.net.http.*;
 import java.util.*;
 import org.json.*;
 
+import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.bots.DefaultAbsSender;
 import org.telegram.telegrambots.bots.DefaultBotOptions;
+import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
@@ -75,8 +77,30 @@ public class SignalSender {
         return String.format("%s: %s, confidence: %.2f%%", coin, signal, confidence * 100);
     }
 
-    // Отправка в Telegram
-    public void sendToTelegram(String messageText) {
+    // Генерация графика через Python
+    public void generateChart(String coin) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "python3",
+                    "src/python-core/analysis.py",
+                    coin
+            );
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+            process.waitFor();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Отправка текста и картинки в Telegram
+    public void sendToTelegram(String messageText, String chartFile) {
         try {
             DefaultAbsSender bot = new DefaultAbsSender(new DefaultBotOptions()) {
                 @Override
@@ -84,16 +108,26 @@ public class SignalSender {
                     return telegramToken;
                 }
             };
-            SendMessage message = new SendMessage();
-            message.setChatId(chatId);
-            message.setText(messageText);
-            bot.execute(message);
+
+            // Отправляем картинку
+            if(chartFile != null) {
+                SendPhoto photo = new SendPhoto();
+                photo.setChatId(chatId);
+                photo.setPhoto(new InputFile(new File(chartFile))); // <-- вот исправлено
+                photo.setCaption(messageText);
+                bot.execute(photo);
+            } else {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId);
+                message.setText(messageText);
+                bot.execute(message);
+            }
         } catch (TelegramApiException e) {
             e.printStackTrace();
         }
     }
 
-    // Основной метод запуска анализа с фильтром порога
+    // Основной метод запуска анализа с фильтром порога и паузой
     public void start() {
         try {
             List<String> coins = getAllUSDTCoins();
@@ -107,11 +141,17 @@ public class SignalSender {
                 double last = prices.get(prices.size() - 1);
                 double confidence = Math.abs(last - first) / first;
 
-                if (confidence >= threshold) { // фильтруем только сильные сигналы
+                if (confidence >= threshold) {
                     String signal = analyzeCoin(coin, prices);
                     System.out.println(signal);
-                    sendToTelegram(signal);
+
+                    // Генерация графика через Python
+                    generateChart(coin);
+                    sendToTelegram(signal, coin + "_chart.png");
                 }
+
+                // Пауза между монетами (например 30 секунд)
+                Thread.sleep(30_000);
             }
         } catch (Exception e) {
             e.printStackTrace();
