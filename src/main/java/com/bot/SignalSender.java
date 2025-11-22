@@ -1,20 +1,23 @@
 package com.bot;
 
-import java.io.*;
+import java.io.File;
 import java.net.URI;
 import java.net.http.*;
 import java.util.*;
 import org.json.*;
 import org.telegram.telegrambots.bots.DefaultAbsSender;
 import org.telegram.telegrambots.bots.DefaultBotOptions;
-import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import org.knowm.xchart.*;
+import org.knowm.xchart.BitmapEncoder.BitmapFormat;
 
 public class SignalSender {
 
     private final String telegramToken;
     private final String chatId;
-    private final int topNCoins = 100; // анализируем только топ-100 по объему
+    private final int topNCoins = 100; // топ-N монет для анализа
 
     public SignalSender() {
         telegramToken = System.getenv("TELEGRAM_TOKEN");
@@ -42,7 +45,6 @@ public class SignalSender {
             }
         }
 
-        // Сортируем по объему (volume)
         usdtCoins.sort((a, b) -> Double.compare(b.getDouble("quoteVolume"), a.getDouble("quoteVolume")));
 
         List<String> topCoins = new ArrayList<>();
@@ -52,16 +54,14 @@ public class SignalSender {
         return topCoins;
     }
 
-    // Получаем последние закрытые цены
+    // Получаем цены закрытия
     public List<Double> getPrices(String coin, String interval, int limit) throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         String url = String.format(
                 "https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%d",
                 coin, interval, limit
         );
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .build();
+        HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).build();
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
         JSONArray klines = new JSONArray(response.body());
@@ -73,18 +73,33 @@ public class SignalSender {
         return prices;
     }
 
-    // Анализируем сигнал для монеты
-    public String analyzeCoin(String coin, List<Double> prices) {
-        double first = prices.get(0);
-        double last = prices.get(prices.size() - 1);
-        String signal = last > first ? "LONG" : "SHORT";
-        double confidence = Math.abs(last - first) / first;
+    // Генерация графика через XChart
+    public String generateChart(String coin, List<Double> prices) {
+        try {
+            XYChart chart = new XYChartBuilder()
+                    .width(600)
+                    .height(400)
+                    .title(coin.replace("USDT", ""))
+                    .xAxisTitle("Minutes")
+                    .yAxisTitle("Price")
+                    .build();
 
-        return String.format("%s: %s, confidence: %.2f%%", coin, signal, confidence * 100);
+            List<Integer> xData = new ArrayList<>();
+            for (int i = 0; i < prices.size(); i++) xData.add(i);
+
+            chart.addSeries(coin.replace("USDT", ""), xData, prices);
+
+            String fileName = coin + "_chart.png";
+            BitmapEncoder.saveBitmap(chart, fileName, BitmapFormat.PNG);
+            return fileName;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
     }
 
-    // Отправка текста в Telegram
-    public void sendToTelegram(String messageText) {
+    // Отправка графика и текста в Telegram
+    public void sendToTelegram(String messageText, String chartFile) {
         if (telegramToken == null || chatId == null) {
             System.out.println("[LOG] " + messageText);
             return;
@@ -98,22 +113,31 @@ public class SignalSender {
                 }
             };
 
-            SendMessage message = new SendMessage();
-            message.setChatId(chatId);
-            message.setText(messageText);
-            bot.execute(message);
+            SendPhoto photo = new SendPhoto();
+            photo.setChatId(chatId);
+            photo.setPhoto(new org.telegram.telegrambots.meta.api.objects.InputFile(new File(chartFile)));
+            photo.setCaption(messageText);
+            bot.execute(photo);
 
         } catch (TelegramApiException e) {
             e.printStackTrace();
         }
     }
 
-    // Основной метод запуска анализа с фильтром порога и небольшой паузой
+    // Анализ монеты и генерация сигнала
+    public String analyzeCoin(String coin, List<Double> prices) {
+        double first = prices.get(0);
+        double last = prices.get(prices.size() - 1);
+        String signal = last > first ? "LONG" : "SHORT";
+        double confidence = Math.abs(last - first) / first;
+        return String.format("%s: %s, confidence: %.2f%%", coin.replace("USDT", ""), signal, confidence * 100);
+    }
+
     public void start() {
         try {
             double threshold = Double.parseDouble(
                     System.getenv().getOrDefault("SIGNAL_THRESHOLD", "0.05")
-            ); // порог уверенности 5% по умолчанию
+            );
 
             List<String> coins = getTopUSDTCoins(topNCoins);
 
@@ -125,12 +149,12 @@ public class SignalSender {
 
                 if (confidence >= threshold) {
                     String signal = analyzeCoin(coin, prices);
+                    String chartFile = generateChart(coin, prices);
                     System.out.println(signal);
-                    sendToTelegram(signal);
+                    sendToTelegram(signal, chartFile);
                 }
 
-                // Пауза между проверкой монет (например 5 секунд)
-                Thread.sleep(5000);
+                Thread.sleep(5000); // пауза между проверкой монет
             }
         } catch (Exception e) {
             e.printStackTrace();
