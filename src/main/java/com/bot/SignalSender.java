@@ -1,48 +1,90 @@
 package com.bot;
 
 import java.io.*;
-import java.util.*;
+import java.time.Instant;
+import java.time.Duration;
+import java.util.Timer;
+import java.util.TimerTask;
 
 public class SignalSender {
 
-    private String telegramToken;
-    private String chatId;
-    private List<String> coins;
-    private String timeframe;
-    private double signalThreshold;
+    private final TelegramBotSender telegram;
+    private Instant lastSent = Instant.EPOCH;
 
     public SignalSender() {
-        // Читаем переменные окружения
-        telegramToken = System.getenv("TELEGRAM_TOKEN");
-        chatId = System.getenv("CHAT_ID");
-        String coinsEnv = System.getenv("COINS"); // Например "BTCUSDT,ETHUSDT,BNBUSDT"
-        coins = coinsEnv != null ? Arrays.asList(coinsEnv.split(",")) : List.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
-        timeframe = System.getenv().getOrDefault("TIMEFRAME", "1m");
-        signalThreshold = Double.parseDouble(System.getenv().getOrDefault("SIGNAL_THRESHOLD", "0.7"));
+        telegram = new TelegramBotSender();
+    }
 
-        if (telegramToken == null || chatId == null) {
-            System.out.println("Переменные TELEGRAM_TOKEN и CHAT_ID не заданы!");
+    public void runScheduler() {
+        // Запускаем task каждые 5 минут (настраивается ENV INTERVAL_SECONDS, но здесь дефолт 300)
+        long intervalSec = Long.parseLong(System.getenv().getOrDefault("INTERVAL_SECONDS", "300"));
+        Timer timer = new Timer(true);
+        timer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                runOnce();
+            }
+        }, 0, intervalSec * 1000);
+        // держим JVM живой
+        try {
+            Thread.sleep(Long.MAX_VALUE);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
         }
     }
 
-    public void start() {
+    private void runOnce() {
         try {
-            // Запускаем Python-анализатор
+            System.out.println("Запуск Python анализа...");
+            // В Railway и локально укажи путь к файлу analysis.py как в проекте
             ProcessBuilder pb = new ProcessBuilder("python3", "src/python-core/analysis.py");
             pb.redirectErrorStream(true);
-            System.out.println("Запускаем Python-анализатор...");
             Process process = pb.start();
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
             String line;
+            boolean anySent = false;
             while ((line = reader.readLine()) != null) {
-                System.out.println("Сигнал: " + line);
-                // TODO: подключить Telegram API для отправки сигналов
+                System.out.println("Python: " + line);
+                // формат ожидаемый: COIN|SIGNAL|CONFIDENCE|CHART_PATH
+                try {
+                    String[] parts = line.split("\\|");
+                    if (parts.length >= 4) {
+                        String coin = parts[0].trim();
+                        String signal = parts[1].trim();
+                        double conf = Double.parseDouble(parts[2].trim());
+                        String chart = parts[3].trim();
+                        String text = String.format("%s — %s (conf=%.2f)\nChart: %s", coin, signal, conf, chart);
+                        telegram.sendSignal(text);
+                        anySent = true;
+                        lastSent = Instant.now();
+                    } else {
+                        // если вывод другой — просто отправим как лог (опционально)
+                        System.out.println("Непарсируемая строка от Python: " + line);
+                    }
+                } catch (Exception e) {
+                    System.out.println("Ошибка парсинга строки: " + line);
+                    e.printStackTrace();
+                }
             }
 
             process.waitFor();
+
+            // если сигналы не отправлялись долго — отправляем уведомление о простое
+            int silenceHours = Integer.parseInt(System.getenv().getOrDefault("SILENCE_HOURS", "6"));
+            if (!anySent) {
+                Duration silence = Duration.between(lastSent, Instant.now());
+                if (silence.toHours() >= silenceHours) {
+                    String msg = String.format("Внимание: бота не было сигналов %d часов. Продолжаю мониторинг.", silence.toHours());
+                    telegram.sendSignal(msg);
+                    lastSent = Instant.now();
+                }
+            }
+
         } catch (Exception e) {
             e.printStackTrace();
+            // отправим ошибку в Telegram если настроен
+            telegram.sendSignal("SignalSender exception: " + e.getMessage());
         }
     }
 }

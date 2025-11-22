@@ -1,2 +1,5 @@
-matplotlib
 requests
+numpy
+pandas
+matplotlib
+scikit-learn

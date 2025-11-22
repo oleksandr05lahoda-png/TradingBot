@@ -1,19 +1,36 @@
 plugins {
     id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
 }
 
-group 'com.bot'
-version '1.0'
+group = 'com.bot'
+version = '1.0'
 
 sourceCompatibility = '17'
 
 repositories {
     mavenCentral()
 }
-dependencies {
-    implementation 'org.json:json:20230227'
-}
 
 dependencies {
+    implementation 'org.json:json:20230227'
     implementation 'org.telegram:telegrambots:6.7.0'
+    implementation 'org.telegram:telegrambotsextensions:6.7.0'
+}
+
+application {
+    mainClass = 'com.bot.BotMain'
+}
+
+shadowJar {
+    archiveFileName = 'bot.jar'
+}
+
+jar {
+    manifest {
+        attributes(
+                'Main-Class': 'com.bot.BotMain'
+        )
+    }
 }
