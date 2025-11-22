@@ -93,15 +93,25 @@ public class SignalSender {
         }
     }
 
-    // Основной метод запуска анализа
+    // Основной метод запуска анализа с фильтром порога
     public void start() {
         try {
             List<String> coins = getAllUSDTCoins();
+            double threshold = Double.parseDouble(
+                    System.getenv().getOrDefault("SIGNAL_THRESHOLD", "0.05")
+            ); // порог уверенности 5% по умолчанию
+
             for (String coin : coins) {
                 List<Double> prices = getPrices(coin, "1m", 20);
-                String signal = analyzeCoin(coin, prices);
-                System.out.println(signal);
-                sendToTelegram(signal);
+                double first = prices.get(0);
+                double last = prices.get(prices.size() - 1);
+                double confidence = Math.abs(last - first) / first;
+
+                if (confidence >= threshold) { // фильтруем только сильные сигналы
+                    String signal = analyzeCoin(coin, prices);
+                    System.out.println(signal);
+                    sendToTelegram(signal);
+                }
             }
         } catch (Exception e) {
             e.printStackTrace();

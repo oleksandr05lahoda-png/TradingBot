@@ -14,7 +14,9 @@ repositories {
 }
 
 dependencies {
+    // Библиотека для работы с JSON
     implementation 'org.json:json:20230227'
+    // Библиотеки для Telegram API
     implementation 'org.telegram:telegrambots:6.7.0'
     implementation 'org.telegram:telegrambotsextensions:6.7.0'
 }
@@ -23,6 +25,7 @@ application {
     mainClass = 'com.bot.BotMain'
 }
 
+// Настройка ShadowJar — соберёт все зависимости в один JAR
 shadowJar {
     archiveFileName = 'bot.jar'
 }
