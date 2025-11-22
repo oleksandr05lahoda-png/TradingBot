@@ -11,23 +11,20 @@ sourceCompatibility = '17'
 
 repositories {
     mavenCentral()
+    maven { url 'https://oss.sonatype.org/content/repositories/releases' } // для xchart
 }
 
 dependencies {
-    // Работа с JSON
     implementation 'org.json:json:20230227'
-    // Telegram API
     implementation 'org.telegram:telegrambots:6.7.0'
     implementation 'org.telegram:telegrambotsextensions:6.7.0'
-    // XChart для построения графиков
-    implementation 'org.knowm.xchart:xchart:3.9.3'
+    implementation 'org.knowm.xchart:xchart:3.8.1'
 }
 
 application {
     mainClass = 'com.bot.BotMain'
 }
 
-// ShadowJar — чтобы собрать все зависимости в один JAR
 shadowJar {
     archiveFileName = 'bot.jar'
 }
