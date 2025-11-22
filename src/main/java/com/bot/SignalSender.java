@@ -4,18 +4,11 @@ import java.io.*;
 import java.net.URI;
 import java.net.http.*;
 import java.util.*;
-
-
 import org.json.*;
 import org.telegram.telegrambots.bots.DefaultAbsSender;
 import org.telegram.telegrambots.bots.DefaultBotOptions;
-import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
-
-import org.knowm.xchart.*;
-import org.knowm.xchart.BitmapEncoder.BitmapFormat;
 
 public class SignalSender {
 
@@ -81,29 +74,13 @@ public class SignalSender {
         return String.format("%s: %s, confidence: %.2f%%", coin, signal, confidence * 100);
     }
 
-    // Генерация графика через Java (XChart)
-    public void generateChartJava(String coin, List<Double> prices) {
-        try {
-            XYChart chart = new XYChartBuilder()
-                    .width(600)
-                    .height(400)
-                    .title(coin)
-                    .xAxisTitle("Minutes")
-                    .yAxisTitle("Price")
-                    .build();
-
-            List<Integer> xData = new ArrayList<>();
-            for (int i = 0; i < prices.size(); i++) xData.add(i);
-
-            chart.addSeries(coin, xData, prices);
-            BitmapEncoder.saveBitmap(chart, coin + "_chart.png", BitmapFormat.PNG);
-        } catch (Exception e) {
-            e.printStackTrace();
+    // Отправка текста в Telegram
+    public void sendToTelegram(String messageText) {
+        if (telegramToken == null || chatId == null) {
+            System.out.println("[LOG] " + messageText);
+            return;
         }
-    }
 
-    // Отправка текста и картинки в Telegram
-    public void sendToTelegram(String messageText, String chartFile) {
         try {
             DefaultAbsSender bot = new DefaultAbsSender(new DefaultBotOptions()) {
                 @Override
@@ -112,24 +89,17 @@ public class SignalSender {
                 }
             };
 
-            if(chartFile != null) {
-                SendPhoto photo = new SendPhoto();
-                photo.setChatId(chatId);
-                photo.setPhoto(new InputFile(new File(chartFile)));
-                photo.setCaption(messageText);
-                bot.execute(photo);
-            } else {
-                SendMessage message = new SendMessage();
-                message.setChatId(chatId);
-                message.setText(messageText);
-                bot.execute(message);
-            }
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId);
+            message.setText(messageText);
+            bot.execute(message);
+
         } catch (TelegramApiException e) {
             e.printStackTrace();
         }
     }
 
-    // Основной метод запуска анализа с фильтром порога и паузой
+    // Основной метод запуска анализа с фильтром порога и небольшой паузой
     public void start() {
         try {
             List<String> coins = getAllUSDTCoins();
@@ -143,16 +113,14 @@ public class SignalSender {
                 double last = prices.get(prices.size() - 1);
                 double confidence = Math.abs(last - first) / first;
 
-                if (confidence >= threshold) { // фильтруем только сильные сигналы
+                if (confidence >= threshold) {
                     String signal = analyzeCoin(coin, prices);
                     System.out.println(signal);
-
-                    generateChartJava(coin, prices);
-                    sendToTelegram(signal, coin + "_chart.png");
+                    sendToTelegram(signal);
                 }
 
-                // Пауза между монетами (например 30 секунд)
-                Thread.sleep(30_000);
+                // Небольшая пауза между проверкой монет (например 5 секунд)
+                Thread.sleep(5000);
             }
         } catch (Exception e) {
             e.printStackTrace();
