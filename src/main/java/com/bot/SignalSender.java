@@ -4,14 +4,17 @@ import java.io.*;
 import java.net.URI;
 import java.net.http.*;
 import java.util.*;
-import org.json.*;
 
-import org.telegram.telegrambots.meta.api.objects.InputFile;
+import org.json.*;
 import org.telegram.telegrambots.bots.DefaultAbsSender;
 import org.telegram.telegrambots.bots.DefaultBotOptions;
 import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import org.knowm.xchart.*;
+import org.knowm.xchart.BitmapEncoder.BitmapFormat;
 
 public class SignalSender {
 
@@ -77,23 +80,22 @@ public class SignalSender {
         return String.format("%s: %s, confidence: %.2f%%", coin, signal, confidence * 100);
     }
 
-    // Генерация графика через Python
-    public void generateChart(String coin) {
+    // Генерация графика через Java (XChart)
+    public void generateChartJava(String coin, List<Double> prices) {
         try {
-            ProcessBuilder pb = new ProcessBuilder(
-                    "python3",
-                    "src/python-core/analysis.py",
-                    coin
-            );
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
+            XYChart chart = new XYChartBuilder()
+                    .width(600)
+                    .height(400)
+                    .title(coin)
+                    .xAxisTitle("Minutes")
+                    .yAxisTitle("Price")
+                    .build();
 
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                System.out.println(line);
-            }
-            process.waitFor();
+            List<Integer> xData = new ArrayList<>();
+            for (int i = 0; i < prices.size(); i++) xData.add(i);
+
+            chart.addSeries(coin, xData, prices);
+            BitmapEncoder.saveBitmap(chart, coin + "_chart.png", BitmapFormat.PNG);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -109,11 +111,10 @@ public class SignalSender {
                 }
             };
 
-            // Отправляем картинку
             if(chartFile != null) {
                 SendPhoto photo = new SendPhoto();
                 photo.setChatId(chatId);
-                photo.setPhoto(new InputFile(new File(chartFile))); // <-- вот исправлено
+                photo.setPhoto(new InputFile(new File(chartFile)));
                 photo.setCaption(messageText);
                 bot.execute(photo);
             } else {
@@ -141,12 +142,11 @@ public class SignalSender {
                 double last = prices.get(prices.size() - 1);
                 double confidence = Math.abs(last - first) / first;
 
-                if (confidence >= threshold) {
+                if (confidence >= threshold) { // фильтруем только сильные сигналы
                     String signal = analyzeCoin(coin, prices);
                     System.out.println(signal);
 
-                    // Генерация графика через Python
-                    generateChart(coin);
+                    generateChartJava(coin, prices);
                     sendToTelegram(signal, coin + "_chart.png");
                 }
 
