@@ -1,90 +1,110 @@
 package com.bot;
 
 import java.io.*;
-import java.time.Instant;
-import java.time.Duration;
-import java.util.Timer;
-import java.util.TimerTask;
+import java.net.URI;
+import java.net.http.*;
+import java.util.*;
+import org.json.*;
+
+import org.telegram.telegrambots.bots.DefaultAbsSender;
+import org.telegram.telegrambots.bots.DefaultBotOptions;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 public class SignalSender {
 
-    private final TelegramBotSender telegram;
-    private Instant lastSent = Instant.EPOCH;
+    private String telegramToken;
+    private String chatId;
 
     public SignalSender() {
-        telegram = new TelegramBotSender();
+        telegramToken = System.getenv("TELEGRAM_TOKEN");
+        chatId = System.getenv("CHAT_ID");
+
+        if (telegramToken == null || chatId == null) {
+            System.out.println("Переменные TELEGRAM_TOKEN и CHAT_ID не заданы!");
+        }
     }
 
-    public void runScheduler() {
-        // Запускаем task каждые 5 минут (настраивается ENV INTERVAL_SECONDS, но здесь дефолт 300)
-        long intervalSec = Long.parseLong(System.getenv().getOrDefault("INTERVAL_SECONDS", "300"));
-        Timer timer = new Timer(true);
-        timer.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
-                runOnce();
+    // Получаем список всех монет с USDT
+    public List<String> getAllUSDTCoins() throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.binance.com/api/v3/ticker/price"))
+                .build();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        JSONArray jsonArray = new JSONArray(response.body());
+        List<String> coins = new ArrayList<>();
+        for (int i = 0; i < jsonArray.length(); i++) {
+            String symbol = jsonArray.getJSONObject(i).getString("symbol");
+            if (symbol.endsWith("USDT")) {
+                coins.add(symbol);
             }
-        }, 0, intervalSec * 1000);
-        // держим JVM живой
+        }
+        return coins;
+    }
+
+    // Получаем последние закрытые цены
+    public List<Double> getPrices(String coin, String interval, int limit) throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+        String url = String.format(
+                "https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%d",
+                coin, interval, limit
+        );
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .build();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        JSONArray klines = new JSONArray(response.body());
+        List<Double> prices = new ArrayList<>();
+        for (int i = 0; i < klines.length(); i++) {
+            JSONArray candle = klines.getJSONArray(i);
+            prices.add(candle.getDouble(4)); // close price
+        }
+        return prices;
+    }
+
+    // Анализируем сигнал для монеты
+    public String analyzeCoin(String coin, List<Double> prices) {
+        double first = prices.get(0);
+        double last = prices.get(prices.size() - 1);
+        String signal = last > first ? "LONG" : "SHORT";
+        double confidence = Math.abs(last - first) / first;
+
+        return String.format("%s: %s, confidence: %.2f%%", coin, signal, confidence * 100);
+    }
+
+    // Отправка в Telegram
+    public void sendToTelegram(String messageText) {
         try {
-            Thread.sleep(Long.MAX_VALUE);
-        } catch (InterruptedException e) {
+            DefaultAbsSender bot = new DefaultAbsSender(new DefaultBotOptions()) {
+                @Override
+                public String getBotToken() {
+                    return telegramToken;
+                }
+            };
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId);
+            message.setText(messageText);
+            bot.execute(message);
+        } catch (TelegramApiException e) {
             e.printStackTrace();
         }
     }
 
-    private void runOnce() {
+    // Основной метод запуска анализа
+    public void start() {
         try {
-            System.out.println("Запуск Python анализа...");
-            // В Railway и локально укажи путь к файлу analysis.py как в проекте
-            ProcessBuilder pb = new ProcessBuilder("python3", "src/python-core/analysis.py");
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            String line;
-            boolean anySent = false;
-            while ((line = reader.readLine()) != null) {
-                System.out.println("Python: " + line);
-                // формат ожидаемый: COIN|SIGNAL|CONFIDENCE|CHART_PATH
-                try {
-                    String[] parts = line.split("\\|");
-                    if (parts.length >= 4) {
-                        String coin = parts[0].trim();
-                        String signal = parts[1].trim();
-                        double conf = Double.parseDouble(parts[2].trim());
-                        String chart = parts[3].trim();
-                        String text = String.format("%s — %s (conf=%.2f)\nChart: %s", coin, signal, conf, chart);
-                        telegram.sendSignal(text);
-                        anySent = true;
-                        lastSent = Instant.now();
-                    } else {
-                        // если вывод другой — просто отправим как лог (опционально)
-                        System.out.println("Непарсируемая строка от Python: " + line);
-                    }
-                } catch (Exception e) {
-                    System.out.println("Ошибка парсинга строки: " + line);
-                    e.printStackTrace();
-                }
+            List<String> coins = getAllUSDTCoins();
+            for (String coin : coins) {
+                List<Double> prices = getPrices(coin, "1m", 20);
+                String signal = analyzeCoin(coin, prices);
+                System.out.println(signal);
+                sendToTelegram(signal);
             }
-
-            process.waitFor();
-
-            // если сигналы не отправлялись долго — отправляем уведомление о простое
-            int silenceHours = Integer.parseInt(System.getenv().getOrDefault("SILENCE_HOURS", "6"));
-            if (!anySent) {
-                Duration silence = Duration.between(lastSent, Instant.now());
-                if (silence.toHours() >= silenceHours) {
-                    String msg = String.format("Внимание: бота не было сигналов %d часов. Продолжаю мониторинг.", silence.toHours());
-                    telegram.sendSignal(msg);
-                    lastSent = Instant.now();
-                }
-            }
-
         } catch (Exception e) {
             e.printStackTrace();
-            // отправим ошибку в Telegram если настроен
-            telegram.sendSignal("SignalSender exception: " + e.getMessage());
         }
     }
 }
