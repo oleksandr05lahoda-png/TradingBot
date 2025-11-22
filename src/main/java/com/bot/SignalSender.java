@@ -134,6 +134,7 @@ public class SignalSender {
     }
 
     public void start() {
+        System.setProperty("java.awt.headless", "true");
         try {
             double threshold = Double.parseDouble(
                     System.getenv().getOrDefault("SIGNAL_THRESHOLD", "0.05")
