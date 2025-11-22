@@ -12,8 +12,9 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 public class SignalSender {
 
-    private String telegramToken;
-    private String chatId;
+    private final String telegramToken;
+    private final String chatId;
+    private final int topNCoins = 100; // анализируем только топ-100 по объему
 
     public SignalSender() {
         telegramToken = System.getenv("TELEGRAM_TOKEN");
@@ -24,23 +25,31 @@ public class SignalSender {
         }
     }
 
-    // Получаем список всех монет с USDT
-    public List<String> getAllUSDTCoins() throws Exception {
+    // Получаем топ-N монет по объему
+    public List<String> getTopUSDTCoins(int limit) throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("https://api.binance.com/api/v3/ticker/price"))
+                .uri(URI.create("https://api.binance.com/api/v3/ticker/24hr"))
                 .build();
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
         JSONArray jsonArray = new JSONArray(response.body());
-        List<String> coins = new ArrayList<>();
+        List<JSONObject> usdtCoins = new ArrayList<>();
         for (int i = 0; i < jsonArray.length(); i++) {
-            String symbol = jsonArray.getJSONObject(i).getString("symbol");
-            if (symbol.endsWith("USDT")) {
-                coins.add(symbol);
+            JSONObject obj = jsonArray.getJSONObject(i);
+            if (obj.getString("symbol").endsWith("USDT")) {
+                usdtCoins.add(obj);
             }
         }
-        return coins;
+
+        // Сортируем по объему (volume)
+        usdtCoins.sort((a, b) -> Double.compare(b.getDouble("quoteVolume"), a.getDouble("quoteVolume")));
+
+        List<String> topCoins = new ArrayList<>();
+        for (int i = 0; i < Math.min(limit, usdtCoins.size()); i++) {
+            topCoins.add(usdtCoins.get(i).getString("symbol"));
+        }
+        return topCoins;
     }
 
     // Получаем последние закрытые цены
@@ -102,10 +111,11 @@ public class SignalSender {
     // Основной метод запуска анализа с фильтром порога и небольшой паузой
     public void start() {
         try {
-            List<String> coins = getAllUSDTCoins();
             double threshold = Double.parseDouble(
                     System.getenv().getOrDefault("SIGNAL_THRESHOLD", "0.05")
             ); // порог уверенности 5% по умолчанию
+
+            List<String> coins = getTopUSDTCoins(topNCoins);
 
             for (String coin : coins) {
                 List<Double> prices = getPrices(coin, "1m", 20);
@@ -119,7 +129,7 @@ public class SignalSender {
                     sendToTelegram(signal);
                 }
 
-                // Небольшая пауза между проверкой монет (например 5 секунд)
+                // Пауза между проверкой монет (например 5 секунд)
                 Thread.sleep(5000);
             }
         } catch (Exception e) {

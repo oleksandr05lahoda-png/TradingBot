@@ -11,14 +11,22 @@ sourceCompatibility = '17'
 
 repositories {
     mavenCentral()
-    maven { url 'https://oss.sonatype.org/content/repositories/releases' } // для xchart
+    maven { url 'https://oss.sonatype.org/content/repositories/releases' } // для XChart
 }
 
 dependencies {
+    // Работа с JSON
     implementation 'org.json:json:20230227'
+
+    // Telegram API
     implementation 'org.telegram:telegrambots:6.7.0'
     implementation 'org.telegram:telegrambotsextensions:6.7.0'
-    implementation 'ch.qos.logback:logback-classic:1.4.11' // добавили логирование
+
+    // Логирование (чтобы SLF4J не ругался)
+    implementation 'ch.qos.logback:logback-classic:1.4.11'
+
+    // XChart для графиков
+    implementation 'org.knowm.xchart:xchart:3.8.1'
 }
 
 application {
