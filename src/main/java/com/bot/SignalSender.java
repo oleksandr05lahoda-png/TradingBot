@@ -80,7 +80,7 @@ public class SignalSender {
                     .width(600)
                     .height(400)
                     .title(coin.replace("USDT", ""))
-                    .xAxisTitle("Minutes")
+                    .xAxisTitle("Candles")
                     .yAxisTitle("Price")
                     .build();
 
@@ -142,7 +142,7 @@ public class SignalSender {
             List<String> coins = getTopUSDTCoins(topNCoins);
 
             for (String coin : coins) {
-                List<Double> prices = getPrices(coin, "1m", 20);
+                List<Double> prices = getPrices(coin, "5m", 20); // 5 минутный таймфрейм
                 double first = prices.get(0);
                 double last = prices.get(prices.size() - 1);
                 double confidence = Math.abs(last - first) / first;

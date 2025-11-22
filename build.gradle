@@ -15,17 +15,10 @@ repositories {
 }
 
 dependencies {
-    // Работа с JSON
     implementation 'org.json:json:20230227'
-
-    // Telegram API
     implementation 'org.telegram:telegrambots:6.7.0'
     implementation 'org.telegram:telegrambotsextensions:6.7.0'
-
-    // Логирование (чтобы SLF4J не ругался)
     implementation 'ch.qos.logback:logback-classic:1.4.11'
-
-    // XChart для графиков
     implementation 'org.knowm.xchart:xchart:3.8.1'
 }
 
@@ -39,8 +32,6 @@ shadowJar {
 
 jar {
     manifest {
-        attributes(
-                'Main-Class': 'com.bot.BotMain'
-        )
+        attributes('Main-Class': 'com.bot.BotMain')
     }
 }
