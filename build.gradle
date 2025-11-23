@@ -7,15 +7,22 @@ plugins {
 group = 'com.bot'
 version = '1.0'
 sourceCompatibility = '17'
+targetCompatibility = '17'
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
+    // JSON обработка
     implementation 'org.json:json:20230227'
+
+    // Telegram API
     implementation 'org.telegram:telegrambots:6.8.0'
     implementation 'org.telegram:telegrambots-meta:6.8.0'
+
+    // Логирование (SLF4J, чтобы убрать NOP предупреждения)
+    implementation 'org.slf4j:slf4j-simple:2.0.9'
 }
 
 application {
@@ -24,10 +31,13 @@ application {
 
 shadowJar {
     archiveFileName = 'bot.jar'
+    mergeServiceFiles()
 }
 
 jar {
     manifest {
-        attributes('Main-Class': 'com.bot.BotMain')
+        attributes(
+                'Main-Class': 'com.bot.BotMain'
+        )
     }
 }
