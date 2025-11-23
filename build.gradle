@@ -1,12 +1,11 @@
 plugins {
     id 'java'
     id 'application'
-    id 'com.github.johnrengelman.shadow' version '7.1.2'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
 }
 
 group = 'com.bot'
 version = '1.0'
-
 sourceCompatibility = '17'
 
 repositories {
@@ -15,6 +14,10 @@ repositories {
 
 dependencies {
     implementation 'org.json:json:20230227'
+
+    // Telegram Bots
+    implementation 'org.telegram:telegrambots:6.8.0'
+    implementation 'org.telegram:telegrambots-meta:6.8.0'
 }
 
 application {
