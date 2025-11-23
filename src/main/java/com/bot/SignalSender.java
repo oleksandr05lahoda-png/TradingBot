@@ -142,7 +142,7 @@ public class SignalSender {
         if (rsi < 30 || (emaShort > emaLong && macd > signal)) direction = "LONG";
         else if (rsi > 70 || (emaShort < emaLong && macd < signal)) direction = "SHORT";
 
-        if (direction != null && confidence >= 0.7) {
+        if (direction != null && confidence >= 0.5) {
             return Optional.of(String.format("%s|%s|confidence=%.2f|RSI=%.1f|EMAshort=%.2f|EMAlong=%.2f|MACD=%.4f",
                     coin, direction, confidence, rsi, emaShort, emaLong, macd));
         }
