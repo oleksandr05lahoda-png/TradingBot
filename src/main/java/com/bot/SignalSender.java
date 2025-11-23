@@ -12,13 +12,16 @@ public class SignalSender {
     private final TelegramBotSender bot;
     private final int topNCoins = 100;
     private final int windowCandles = 200;
-    private final double SIGNAL_THRESHOLD = 0.8;
     private final int REQUEST_DELAY_MS = 350;
     private final HttpClient client;
 
     private final Set<String> STABLECOIN_KEYWORDS = new HashSet<>(Arrays.asList(
             "USDT","USDC","BUSD","TUSD","DAI","USDP","FRAX","UST","GUSD","USDD","FDUSD","USDE"
     ));
+
+    // новые фильтры для сильных сигналов
+    private final double MIN_PERCENT_CHANGE = 0.05;      // минимум 5% движения
+    private final double MIN_NORMALIZED_MOMENTUM = 5.0;  // только уверенные сигналы
 
     public SignalSender(TelegramBotSender bot) {
         this.bot = bot;
@@ -41,9 +44,8 @@ public class SignalSender {
             JSONObject obj = jsonArray.getJSONObject(i);
             String symbol = obj.getString("symbol");
 
-            if (!symbol.endsWith("USDT")) continue; // оставляем только USDT-пары
+            if (!symbol.endsWith("USDT")) continue;
 
-            // фильтр стейблкоинов по началу символа
             boolean isStable = STABLECOIN_KEYWORDS.stream().anyMatch(k -> symbol.startsWith(k));
             if (isStable) continue;
 
@@ -69,7 +71,7 @@ public class SignalSender {
         List<Double> prices = new ArrayList<>();
         for (int i = 0; i < klines.length(); i++) {
             JSONArray candle = klines.getJSONArray(i);
-            prices.add(candle.getDouble(4)); // close price
+            prices.add(candle.getDouble(4));
         }
         return prices;
     }
@@ -98,6 +100,7 @@ public class SignalSender {
         for (int i = 1; i < prices.size(); i++) {
             returns.add((prices.get(i) / prices.get(i - 1)) - 1.0);
         }
+
         double mu = mean(returns);
         double sigma = std(returns, mu);
         if (sigma == 0) sigma = 1e-9;
@@ -105,7 +108,8 @@ public class SignalSender {
         double normalizedMomentum = percentChange / sigma;
         String direction = percentChange > 0 ? "LONG" : "SHORT";
 
-        if (Math.abs(normalizedMomentum) < SIGNAL_THRESHOLD) {
+        // фильтр сильных сигналов
+        if (Math.abs(percentChange) < MIN_PERCENT_CHANGE || Math.abs(normalizedMomentum) < MIN_NORMALIZED_MOMENTUM) {
             System.out.printf("[SKIP] %s %s change=%.4f norm=%.3f vol=%.6f%n", coin, direction, percentChange, normalizedMomentum, sigma);
             return null;
         }
