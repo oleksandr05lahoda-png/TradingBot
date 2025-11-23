@@ -192,6 +192,13 @@ public class SignalSender {
     public void start(){
         System.out.println("[SignalSender] Starting TOP_N="+TOP_N+" MIN_CONF="+MIN_CONF+" INTERVAL_MIN="+INTERVAL_MIN);
 
+        // <<< ВСТАВЬ СЮДА >>>
+        try {
+            bot.sendSignal("✅ SignalSender запущен и работает!");
+        } catch (Exception e) {
+            System.out.println("[Telegram Test Message Error] " + e.getMessage());
+        }
+
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         Runnable job = () -> {
             try {
