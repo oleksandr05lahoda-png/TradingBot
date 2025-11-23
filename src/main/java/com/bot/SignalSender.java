@@ -11,7 +11,7 @@ public class SignalSender {
 
     private final TelegramBotSender bot;
     private final int topNCoins = 100;
-    private final int windowCandles = 200;
+    private final int windowCandles = 20; // последние 20 свечей
     private final int REQUEST_DELAY_MS = 350;
     private final HttpClient client;
 
@@ -19,15 +19,12 @@ public class SignalSender {
             "USDT","USDC","BUSD","TUSD","DAI","USDP","FRAX","UST","GUSD","USDD","FDUSD","USDE"
     ));
 
-    // новые фильтры для сильных сигналов
-    private final double MIN_PERCENT_CHANGE = 0.05;      // минимум 5% движения
-    private final double MIN_NORMALIZED_MOMENTUM = 5.0;  // только уверенные сигналы
-
     public SignalSender(TelegramBotSender bot) {
         this.bot = bot;
         client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     }
 
+    // Получаем топ-N монет по объему, без стейблкоинов
     public List<String> getTopUSDTCoins() {
         try {
             HttpRequest request = HttpRequest.newBuilder()
@@ -39,7 +36,6 @@ public class SignalSender {
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
             String body = response.body().trim();
 
-            // Проверяем, что ответ начинается с '[' → JSON-массив
             if (!body.startsWith("[")) {
                 System.out.println("Unexpected response from Binance API: " + body);
                 return Collections.emptyList();
@@ -52,10 +48,8 @@ public class SignalSender {
                 JSONObject obj = jsonArray.getJSONObject(i);
                 String symbol = obj.getString("symbol");
                 if (!symbol.endsWith("USDT")) continue;
-
                 boolean isStable = STABLECOIN_KEYWORDS.stream().anyMatch(symbol::startsWith);
                 if (isStable) continue;
-
                 usdtCoins.add(obj);
             }
 
@@ -66,7 +60,6 @@ public class SignalSender {
                 topCoins.add(usdtCoins.get(i).getString("symbol"));
             }
 
-            System.out.println("After filtering: " + topCoins.size() + " coins");
             return topCoins;
 
         } catch (Exception e) {
@@ -75,7 +68,7 @@ public class SignalSender {
         }
     }
 
-
+    // Получаем цены закрытия
     public List<Double> getPrices(String coin, String interval, int limit) throws Exception {
         String url = String.format("https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%d", coin, interval, limit);
         HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(20)).GET().build();
@@ -84,52 +77,72 @@ public class SignalSender {
         List<Double> prices = new ArrayList<>();
         for (int i = 0; i < klines.length(); i++) {
             JSONArray candle = klines.getJSONArray(i);
-            prices.add(candle.getDouble(4));
+            prices.add(candle.getDouble(4)); // close price
         }
         return prices;
     }
 
-    private static double mean(List<Double> arr) {
-        return arr.stream().mapToDouble(d -> d).average().orElse(0.0);
-    }
-
-    private static double std(List<Double> arr, double mean) {
-        double sum = 0;
-        for (double v : arr) {
-            double d = v - mean;
-            sum += d * d;
-        }
-        return Math.sqrt(sum / arr.size());
-    }
-
-    public String analyzeCoinAndGetSignal(String coin, List<Double> prices) {
-        if (prices == null || prices.size() < 10) return null;
-
-        double first = prices.get(0);
-        double last = prices.get(prices.size() - 1);
-        double percentChange = (last - first) / first;
-
-        List<Double> returns = new ArrayList<>();
+    // RSI
+    private double calculateRSI(List<Double> prices) {
+        double gain = 0, loss = 0;
         for (int i = 1; i < prices.size(); i++) {
-            returns.add((prices.get(i) / prices.get(i - 1)) - 1.0);
+            double diff = prices.get(i) - prices.get(i - 1);
+            if (diff > 0) gain += diff;
+            else loss -= diff;
         }
-
-        double mu = mean(returns);
-        double sigma = std(returns, mu);
-        if (sigma == 0) sigma = 1e-9;
-
-        double normalizedMomentum = percentChange / sigma;
-        String direction = percentChange > 0 ? "LONG" : "SHORT";
-
-        // фильтр сильных сигналов
-        if (Math.abs(percentChange) < MIN_PERCENT_CHANGE || Math.abs(normalizedMomentum) < MIN_NORMALIZED_MOMENTUM) {
-            System.out.printf("[SKIP] %s %s change=%.4f norm=%.3f vol=%.6f%n", coin, direction, percentChange, normalizedMomentum, sigma);
-            return null;
-        }
-
-        return String.format("%s|%s|change=%.4f|norm=%.3f|vol=%.6f", coin, direction, percentChange, normalizedMomentum, sigma);
+        if (gain + loss == 0) return 50;
+        return 100 * gain / (gain + loss);
     }
 
+    // EMA
+    private double calculateEMA(List<Double> prices, int period) {
+        double k = 2.0 / (period + 1);
+        double ema = prices.get(0);
+        for (int i = 1; i < prices.size(); i++) {
+            ema = prices.get(i) * k + ema * (1 - k);
+        }
+        return ema;
+    }
+
+    // MACD (fast=12, slow=26, signal=9)
+    private double[] calculateMACD(List<Double> prices) {
+        double ema12 = calculateEMA(prices.subList(prices.size()-12, prices.size()), 12);
+        double ema26 = calculateEMA(prices.subList(prices.size()-26, prices.size()), 26);
+        double macd = ema12 - ema26;
+        double signal = macd; // упрощённо, можно сделать EMA9
+        return new double[]{macd, signal};
+    }
+
+    // Генерация сигнала на основе индикаторов
+    private Optional<String> generateSignal(String coin, List<Double> prices) {
+        double rsi = calculateRSI(prices);
+        double emaShort = calculateEMA(prices.subList(prices.size()-10, prices.size()), 10);
+        double emaLong = calculateEMA(prices.subList(prices.size()-20, prices.size()), 20);
+        double[] macdArr = calculateMACD(prices);
+        double macd = macdArr[0], signal = macdArr[1];
+
+        double confidence = 0;
+
+        // Простейшая логика
+        if (rsi < 30) confidence += 0.3;
+        if (rsi > 70) confidence += 0.3;
+        if (emaShort > emaLong) confidence += 0.2;
+        if (emaShort < emaLong) confidence += 0.2;
+        if (macd > signal) confidence += 0.2;
+        if (macd < signal) confidence += 0.2;
+
+        String direction = null;
+        if (rsi < 30 || (emaShort > emaLong && macd > signal)) direction = "LONG";
+        else if (rsi > 70 || (emaShort < emaLong && macd < signal)) direction = "SHORT";
+
+        if (direction != null && confidence >= 0.7) {
+            return Optional.of(String.format("%s|%s|confidence=%.2f|RSI=%.1f|EMAshort=%.2f|EMAlong=%.2f|MACD=%.4f",
+                    coin, direction, confidence, rsi, emaShort, emaLong, macd));
+        }
+        return Optional.empty();
+    }
+
+    // Запуск анализа всех монет
     public void start() {
         try {
             List<String> coins = getTopUSDTCoins();
@@ -143,11 +156,9 @@ public class SignalSender {
                     try {
                         Thread.sleep(REQUEST_DELAY_MS);
                         List<Double> prices = getPrices(coin, "5m", windowCandles);
-                        String signal = analyzeCoinAndGetSignal(coin, prices);
-                        if (signal != null) {
-                            bot.sendSignal(signal);
-                            System.out.println("[SEND] " + signal);
-                        }
+                        Optional<String> signal = generateSignal(coin, prices);
+                        signal.ifPresent(bot::sendSignal);
+                        signal.ifPresent(s -> System.out.println("[SEND] " + s));
                     } catch (Exception e) {
                         System.out.println("Error analyzing " + coin + ": " + e.getMessage());
                     }
