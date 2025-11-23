@@ -84,6 +84,7 @@ public class SignalSender {
 
     // RSI
     private double calculateRSI(List<Double> prices) {
+        if (prices.size() < 2) return 50;
         double gain = 0, loss = 0;
         for (int i = 1; i < prices.size(); i++) {
             double diff = prices.get(i) - prices.get(i - 1);
@@ -96,6 +97,7 @@ public class SignalSender {
 
     // EMA
     private double calculateEMA(List<Double> prices, int period) {
+        if (prices.isEmpty()) return 0;
         double k = 2.0 / (period + 1);
         double ema = prices.get(0);
         for (int i = 1; i < prices.size(); i++) {
@@ -104,26 +106,31 @@ public class SignalSender {
         return ema;
     }
 
-    // MACD (fast=12, slow=26, signal=9)
+    // MACD (fast=12, slow=26)
     private double[] calculateMACD(List<Double> prices) {
-        double ema12 = calculateEMA(prices.subList(prices.size()-12, prices.size()), 12);
-        double ema26 = calculateEMA(prices.subList(prices.size()-26, prices.size()), 26);
+        int size = prices.size();
+        List<Double> last12 = prices.subList(Math.max(0, size - 12), size);
+        List<Double> last26 = prices.subList(Math.max(0, size - 26), size);
+        double ema12 = calculateEMA(last12, 12);
+        double ema26 = calculateEMA(last26, 26);
         double macd = ema12 - ema26;
-        double signal = macd; // упрощённо, можно сделать EMA9
+        double signal = macd; // упрощённо
         return new double[]{macd, signal};
     }
 
-    // Генерация сигнала на основе индикаторов
+    // Генерация сигнала
     private Optional<String> generateSignal(String coin, List<Double> prices) {
+        if (prices.size() < 2) return Optional.empty();
+
         double rsi = calculateRSI(prices);
-        double emaShort = calculateEMA(prices.subList(prices.size()-10, prices.size()), 10);
-        double emaLong = calculateEMA(prices.subList(prices.size()-20, prices.size()), 20);
+        int size = prices.size();
+        double emaShort = calculateEMA(prices.subList(Math.max(0, size - 10), size), 10);
+        double emaLong = calculateEMA(prices.subList(Math.max(0, size - 20), size), 20);
         double[] macdArr = calculateMACD(prices);
         double macd = macdArr[0], signal = macdArr[1];
 
         double confidence = 0;
 
-        // Простейшая логика
         if (rsi < 30) confidence += 0.3;
         if (rsi > 70) confidence += 0.3;
         if (emaShort > emaLong) confidence += 0.2;
@@ -139,10 +146,11 @@ public class SignalSender {
             return Optional.of(String.format("%s|%s|confidence=%.2f|RSI=%.1f|EMAshort=%.2f|EMAlong=%.2f|MACD=%.4f",
                     coin, direction, confidence, rsi, emaShort, emaLong, macd));
         }
+
         return Optional.empty();
     }
 
-    // Запуск анализа всех монет
+    // Запуск анализа
     public void start() {
         try {
             List<String> coins = getTopUSDTCoins();
