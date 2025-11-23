@@ -34,14 +34,19 @@ public class SignalSender {
 
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
         JSONArray jsonArray = new JSONArray(response.body());
+        System.out.println("Всего монет из Binance: " + jsonArray.length());
 
         List<JSONObject> usdtCoins = new ArrayList<>();
         for (int i = 0; i < jsonArray.length(); i++) {
             JSONObject obj = jsonArray.getJSONObject(i);
             String symbol = obj.getString("symbol");
-            if (!symbol.endsWith("USDT")) continue;
-            boolean isStable = STABLECOIN_KEYWORDS.stream().anyMatch(symbol::contains);
+
+            if (!symbol.endsWith("USDT")) continue; // оставляем только USDT-пары
+
+            // фильтр стейблкоинов по началу символа
+            boolean isStable = STABLECOIN_KEYWORDS.stream().anyMatch(k -> symbol.startsWith(k));
             if (isStable) continue;
+
             usdtCoins.add(obj);
         }
 
@@ -51,6 +56,8 @@ public class SignalSender {
         for (int i = 0; i < Math.min(topNCoins, usdtCoins.size()); i++) {
             topCoins.add(usdtCoins.get(i).getString("symbol"));
         }
+
+        System.out.println("После фильтра: " + topCoins.size() + " монет");
         return topCoins;
     }
 
@@ -62,7 +69,7 @@ public class SignalSender {
         List<Double> prices = new ArrayList<>();
         for (int i = 0; i < klines.length(); i++) {
             JSONArray candle = klines.getJSONArray(i);
-            prices.add(candle.getDouble(4));
+            prices.add(candle.getDouble(4)); // close price
         }
         return prices;
     }
@@ -131,7 +138,6 @@ public class SignalSender {
                 futures.add(future);
             }
 
-            // дождаться завершения всех задач
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
             executor.shutdown();
         } catch (Exception e) {
