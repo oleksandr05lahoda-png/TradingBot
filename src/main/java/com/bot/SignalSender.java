@@ -28,40 +28,53 @@ public class SignalSender {
         client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     }
 
-    public List<String> getTopUSDTCoins() throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("https://api.binance.com/api/v3/ticker/24hr"))
-                .timeout(Duration.ofSeconds(20))
-                .GET()
-                .build();
+    public List<String> getTopUSDTCoins() {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.binance.com/api/v3/ticker/24hr"))
+                    .timeout(Duration.ofSeconds(20))
+                    .GET()
+                    .build();
 
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-        JSONArray jsonArray = new JSONArray(response.body());
-        System.out.println("Всего монет из Binance: " + jsonArray.length());
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            String body = response.body().trim();
 
-        List<JSONObject> usdtCoins = new ArrayList<>();
-        for (int i = 0; i < jsonArray.length(); i++) {
-            JSONObject obj = jsonArray.getJSONObject(i);
-            String symbol = obj.getString("symbol");
+            // Проверяем, что ответ начинается с '[' → JSON-массив
+            if (!body.startsWith("[")) {
+                System.out.println("Unexpected response from Binance API: " + body);
+                return Collections.emptyList();
+            }
 
-            if (!symbol.endsWith("USDT")) continue;
+            JSONArray jsonArray = new JSONArray(body);
+            List<JSONObject> usdtCoins = new ArrayList<>();
 
-            boolean isStable = STABLECOIN_KEYWORDS.stream().anyMatch(k -> symbol.startsWith(k));
-            if (isStable) continue;
+            for (int i = 0; i < jsonArray.length(); i++) {
+                JSONObject obj = jsonArray.getJSONObject(i);
+                String symbol = obj.getString("symbol");
+                if (!symbol.endsWith("USDT")) continue;
 
-            usdtCoins.add(obj);
+                boolean isStable = STABLECOIN_KEYWORDS.stream().anyMatch(symbol::startsWith);
+                if (isStable) continue;
+
+                usdtCoins.add(obj);
+            }
+
+            usdtCoins.sort((a, b) -> Double.compare(b.optDouble("quoteVolume", 0.0), a.optDouble("quoteVolume", 0.0)));
+
+            List<String> topCoins = new ArrayList<>();
+            for (int i = 0; i < Math.min(topNCoins, usdtCoins.size()); i++) {
+                topCoins.add(usdtCoins.get(i).getString("symbol"));
+            }
+
+            System.out.println("After filtering: " + topCoins.size() + " coins");
+            return topCoins;
+
+        } catch (Exception e) {
+            System.out.println("Error fetching top coins: " + e.getMessage());
+            return Collections.emptyList();
         }
-
-        usdtCoins.sort((a, b) -> Double.compare(b.optDouble("quoteVolume", 0.0), a.optDouble("quoteVolume", 0.0)));
-
-        List<String> topCoins = new ArrayList<>();
-        for (int i = 0; i < Math.min(topNCoins, usdtCoins.size()); i++) {
-            topCoins.add(usdtCoins.get(i).getString("symbol"));
-        }
-
-        System.out.println("После фильтра: " + topCoins.size() + " монет");
-        return topCoins;
     }
+
 
     public List<Double> getPrices(String coin, String interval, int limit) throws Exception {
         String url = String.format("https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%d", coin, interval, limit);
