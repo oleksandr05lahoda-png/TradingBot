@@ -6,8 +6,13 @@ plugins {
 
 group = 'com.bot'
 version = '1.0'
-sourceCompatibility = '21'
-targetCompatibility = '21'
+
+// Используем toolchain для гарантированного Java 21 на любых средах
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
 
 repositories {
     mavenCentral()

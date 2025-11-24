@@ -23,6 +23,11 @@ public class SignalSender {
     private final long REQUEST_DELAY_MS;
 
     private Set<String> BINANCE_PAIRS = new HashSet<>();
+    private long lastBinancePairsRefresh = 0L; // millis
+    private final long BINANCE_REFRESH_INTERVAL_MS = 60 * 60 * 1000L; // 60 min
+
+    // track last sent signal to avoid duplicates: symbol -> key(direction|price|rsi)
+    private final Map<String, String> lastSentSignal = new ConcurrentHashMap<>();
 
     public SignalSender(TelegramBotSender bot) {
         this.bot = bot;
@@ -54,16 +59,30 @@ public class SignalSender {
             Set<String> result = new HashSet<>();
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject s = arr.getJSONObject(i);
+                // only include TRADING/spot symbols (optionally you can filter by status)
                 String symbol = s.getString("symbol");
-                result.add(symbol);
+                String status = s.optString("status", "TRADING");
+                String quoteAsset = s.optString("quoteAsset", "");
+                if ("TRADING".equalsIgnoreCase(status) && symbol.endsWith("USDT")) {
+                    result.add(symbol);
+                }
             }
 
-            System.out.println("[Binance] Loaded " + result.size() + " spot pairs");
+            System.out.println("[Binance] Loaded " + result.size() + " spot USDT pairs");
             return result;
 
         } catch (Exception e) {
             System.out.println("[Binance] Could NOT load pairs: " + e.getMessage());
             return Set.of("BTCUSDT","ETHUSDT","BNBUSDT");
+        }
+    }
+
+    // helper to refresh BINANCE_PAIRS periodically
+    private void ensureBinancePairsFresh() {
+        long now = System.currentTimeMillis();
+        if (BINANCE_PAIRS.isEmpty() || (now - lastBinancePairsRefresh) > BINANCE_REFRESH_INTERVAL_MS) {
+            BINANCE_PAIRS = getBinanceSymbols();
+            lastBinancePairsRefresh = now;
         }
     }
 
@@ -85,7 +104,7 @@ public class SignalSender {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject c = arr.getJSONObject(i);
                 String sym = c.getString("symbol").toUpperCase();
-                if (STABLE.contains(sym)) continue;
+                if (STABLE.contains(sym)) continue; // skip direct stable symbols like USDT
                 list.add(sym + "USDT");
             }
             return list;
@@ -99,7 +118,18 @@ public class SignalSender {
 
     /* ------------------------------ fetch KLINES ----------------------------- */
 
-    public List<Double> fetchCloses(String symbol) {
+    // wrapper to return closes + last open time (ms)
+    public static class KlinesResult {
+        public final List<Double> closes;
+        public final long lastOpenTime; // ms since epoch
+
+        public KlinesResult(List<Double> closes, long lastOpenTime) {
+            this.closes = closes;
+            this.lastOpenTime = lastOpenTime;
+        }
+    }
+
+    public KlinesResult fetchClosesWithMeta(String symbol) {
         try {
             Thread.sleep(REQUEST_DELAY_MS);
             String url = String.format(
@@ -113,21 +143,30 @@ public class SignalSender {
             String body = resp.body();
 
             // NEW: защита от ошибок Binance API
-            if (!body.startsWith("[")) {
+            if (body == null || body.isEmpty() || !body.startsWith("[")) {
                 System.out.println("[Binance] Invalid response for " + symbol + ": " + body);
-                return Collections.emptyList();
+                return new KlinesResult(Collections.emptyList(), 0L);
             }
 
             JSONArray arr = new JSONArray(body);
             List<Double> closes = new ArrayList<>();
+            long lastOpen = 0L;
             for (int i = 0; i < arr.length(); i++) {
-                closes.add(arr.getJSONArray(i).getDouble(4));
+                JSONArray k = arr.getJSONArray(i);
+                long openTime = k.getLong(0);
+                double close = k.getDouble(4);
+                closes.add(close);
+                lastOpen = openTime;
             }
-            return closes;
+
+            System.out.println(String.format("[Binance] %s: fetched %d candles, lastOpen=%s",
+                    symbol, closes.size(), Instant.ofEpochMilli(lastOpen).toString()));
+
+            return new KlinesResult(closes, lastOpen);
 
         } catch (Exception e) {
             System.out.println("[Binance] Error for " + symbol + ": " + e.getMessage());
-            return Collections.emptyList();
+            return new KlinesResult(Collections.emptyList(), 0L);
         }
     }
 
@@ -192,7 +231,7 @@ public class SignalSender {
     /* -------------------------------- evaluate -------------------------------- */
 
     public Optional<Signal> evaluate(String pair, List<Double> closes) {
-        if (closes.size()<20) return Optional.empty();
+        if (closes == null || closes.size() < 20) return Optional.empty();
         List<Double> last = closes.subList(Math.max(0,closes.size()-20), closes.size());
         double s1 = strategyEMACrossover(last);
         double s2 = strategyRSIMeanReversion(last);
@@ -238,8 +277,8 @@ public class SignalSender {
 
         System.out.println("[SignalSender] Starting TOP_N="+TOP_N+" MIN_CONF="+MIN_CONF+" INTERVAL_MIN="+INTERVAL_MIN);
 
-        // Load Binance pairs
-        BINANCE_PAIRS = getBinanceSymbols();
+        // Load Binance pairs (initial)
+        ensureBinancePairsFresh();
 
         // test telegram
         try { bot.sendSignal("✅ SignalSender запущен и работает!"); }
@@ -253,10 +292,23 @@ public class SignalSender {
                 .toList();
 
         for(String pair : coins){
-            List<Double> closes = fetchCloses(pair);
-            evaluate(pair,closes).ifPresent(s -> {
-                System.out.println("[Debug] First: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
-                bot.sendSignal(s.toTelegramMessage());
+            // fetch closes + meta
+            KlinesResult kr = fetchClosesWithMeta(pair);
+            if (kr.closes.isEmpty()) {
+                System.out.println("[SKIP] No candles for " + pair);
+                continue;
+            }
+            evaluate(pair,kr.closes).ifPresent(s -> {
+                String key = signalKey(s);
+                // duplicate suppression
+                String prev = lastSentSignal.get(s.symbol);
+                if (key.equals(prev)) {
+                    System.out.println("[SKIP] Duplicate first signal for " + s.symbol + " -> " + key);
+                } else {
+                    lastSentSignal.put(s.symbol, key);
+                    System.out.println("[Debug] First: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
+                    bot.sendSignal(s.toTelegramMessage());
+                }
             });
         }
 
@@ -265,16 +317,32 @@ public class SignalSender {
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> {
             try {
+                // refresh pairs if needed
+                ensureBinancePairsFresh();
+
                 List<String> filtered = getTopSymbols(TOP_N)
                         .stream()
                         .filter(BINANCE_PAIRS::contains)
                         .toList();
 
                 for(String pair : filtered){
-                    List<Double> closes = fetchCloses(pair);
-                    evaluate(pair,closes).ifPresent(s -> {
-                        System.out.println("[Debug] Scheduled: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
-                        bot.sendSignal(s.toTelegramMessage());
+                    KlinesResult kr = fetchClosesWithMeta(pair);
+                    if (kr.closes.isEmpty()) {
+                        System.out.println("[SKIP] No candles for " + pair);
+                        continue;
+                    }
+                    // optionally: check that lastOpenTime is new compared to previous run - we don't store per-symbol lastOpen here,
+                    // duplicate suppression by key(direction|price|rsi) is used instead.
+                    evaluate(pair,kr.closes).ifPresent(s -> {
+                        String key = signalKey(s);
+                        String prev = lastSentSignal.get(s.symbol);
+                        if (key.equals(prev)) {
+                            System.out.println("[SKIP] Duplicate scheduled signal for " + s.symbol + " -> " + key);
+                        } else {
+                            lastSentSignal.put(s.symbol, key);
+                            System.out.println("[Debug] Scheduled: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
+                            bot.sendSignal(s.toTelegramMessage());
+                        }
                     });
                 }
 
@@ -282,5 +350,12 @@ public class SignalSender {
                 System.out.println("[Job error] " + e.getMessage());
             }
         }, INTERVAL_MIN, INTERVAL_MIN, TimeUnit.MINUTES);
+    }
+
+    private static String signalKey(Signal s) {
+        // key: direction|price_rounded|rsi_rounded - reduces tiny float diffs
+        String priceFmt = String.format(Locale.ROOT,"%.5f", s.price); // 5 decimals enough for duplicate detection
+        String rsiFmt = String.format(Locale.ROOT,"%.2f", s.rsi);
+        return s.direction + "|" + priceFmt + "|" + rsiFmt;
     }
 }
