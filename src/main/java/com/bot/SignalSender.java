@@ -14,13 +14,15 @@ public class SignalSender {
 
     private final TelegramBotSender bot;
     private final HttpClient http;
-    private final Set<String> STABLE = Set.of("USDT","USDC","BUSD","DAI","FDUSD","TUSD","USDP","FRAX","USDD");
+    private final Set<String> STABLE = Set.of("USDT");
 
     private final int TOP_N;
     private final double MIN_CONF;
     private final int INTERVAL_MIN;
     private final int KLINES_LIMIT;
     private final long REQUEST_DELAY_MS;
+
+    private Set<String> BINANCE_PAIRS = new HashSet<>();
 
     public SignalSender(TelegramBotSender bot) {
         this.bot = bot;
@@ -33,7 +35,40 @@ public class SignalSender {
         this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "200"));
     }
 
-    // --- API запросы ---
+
+    /* ----------------------  NEW: fetch Binance symbols ---------------------- */
+
+    public Set<String> getBinanceSymbols() {
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.binance.com/api/v3/exchangeInfo"))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+
+            JSONObject json = new JSONObject(resp.body());
+            JSONArray arr = json.getJSONArray("symbols");
+
+            Set<String> result = new HashSet<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject s = arr.getJSONObject(i);
+                String symbol = s.getString("symbol");
+                result.add(symbol);
+            }
+
+            System.out.println("[Binance] Loaded " + result.size() + " spot pairs");
+            return result;
+
+        } catch (Exception e) {
+            System.out.println("[Binance] Could NOT load pairs: " + e.getMessage());
+            return Set.of("BTCUSDT","ETHUSDT","BNBUSDT");
+        }
+    }
+
+
+    /* ----------------------- Top CoinGecko symbols --------------------------- */
 
     public List<String> getTopSymbols(int limit) {
         try {
@@ -41,6 +76,7 @@ public class SignalSender {
                     "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=%d&page=1",
                     limit
             );
+
             HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             JSONArray arr = new JSONArray(resp.body());
@@ -53,32 +89,50 @@ public class SignalSender {
                 list.add(sym + "USDT");
             }
             return list;
+
         } catch (Exception e) {
-            System.out.println("[CoinGecko] error: " + e.getMessage());
+            System.out.println("[CoinGecko] Error: " + e.getMessage());
             return List.of("BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","ADAUSDT");
         }
     }
 
+
+    /* ------------------------------ fetch KLINES ----------------------------- */
+
     public List<Double> fetchCloses(String symbol) {
         try {
             Thread.sleep(REQUEST_DELAY_MS);
-            String url = String.format("https://api.binance.com/api/v3/klines?symbol=%s&interval=5m&limit=%d",
-                    symbol, KLINES_LIMIT);
+            String url = String.format(
+                    "https://api.binance.com/api/v3/klines?symbol=%s&interval=5m&limit=%d",
+                    symbol, KLINES_LIMIT
+            );
+
             HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            JSONArray arr = new JSONArray(resp.body());
+
+            String body = resp.body();
+
+            // NEW: защита от ошибок Binance API
+            if (!body.startsWith("[")) {
+                System.out.println("[Binance] Invalid response for " + symbol + ": " + body);
+                return Collections.emptyList();
+            }
+
+            JSONArray arr = new JSONArray(body);
             List<Double> closes = new ArrayList<>();
             for (int i = 0; i < arr.length(); i++) {
                 closes.add(arr.getJSONArray(i).getDouble(4));
             }
             return closes;
+
         } catch (Exception e) {
             System.out.println("[Binance] Error for " + symbol + ": " + e.getMessage());
             return Collections.emptyList();
         }
     }
 
-    // --- Индикаторы (EMA, RSI, MACD, Momentum) ---
+
+    /* -------------------- Indicators & strategies (unchanged) -------------------- */
     public static double ema(List<Double> prices, int period) {
         double k = 2.0 / (period + 1);
         double ema = prices.get(0);
@@ -107,7 +161,6 @@ public class SignalSender {
                 (prices.get(prices.size()-1-n) + 1e-12);
     }
 
-    // --- Стратегии ---
     public double strategyEMACrossover(List<Double> closes) {
         int look = Math.min(closes.size(), 30);
         List<Double> slice = closes.subList(closes.size()-look, closes.size());
@@ -135,7 +188,9 @@ public class SignalSender {
         return 0.0;
     }
 
-    // --- Оценка сигнала ---
+
+    /* -------------------------------- evaluate -------------------------------- */
+
     public Optional<Signal> evaluate(String pair, List<Double> closes) {
         if (closes.size()<20) return Optional.empty();
         List<Double> last = closes.subList(Math.max(0,closes.size()-20), closes.size());
@@ -156,6 +211,7 @@ public class SignalSender {
         return Optional.of(new Signal(symbolOnly,direction,conf,lastPrice,rsiVal,score));
     }
 
+
     public static class Signal {
         public final String symbol;
         public final String direction;
@@ -175,42 +231,56 @@ public class SignalSender {
         }
     }
 
-    // --- Запуск ---
-    public void start(){
+
+    /* ---------------------------------- START ---------------------------------- */
+
+    public void start() {
+
         System.out.println("[SignalSender] Starting TOP_N="+TOP_N+" MIN_CONF="+MIN_CONF+" INTERVAL_MIN="+INTERVAL_MIN);
 
-        // Тестовое сообщение
+        // Load Binance pairs
+        BINANCE_PAIRS = getBinanceSymbols();
+
+        // test telegram
         try { bot.sendSignal("✅ SignalSender запущен и работает!"); }
         catch (Exception e){ System.out.println("[Telegram Test Message Error] " + e.getMessage()); }
 
-        // --- Отправка первого прогноза сразу ---
-        List<String> pairs = getTopSymbols(TOP_N);
-        for(String pair : pairs){
-            try{
-                List<Double> closes = fetchCloses(pair);
-                evaluate(pair,closes).ifPresent(s -> {
-                    System.out.println("[Debug] First signal: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
-                    bot.sendSignal(s.toTelegramMessage());
-                });
-            }catch(Exception e){ System.out.println("[Error] "+pair+" "+e.getMessage()); }
+
+        /* First run immediately */
+        List<String> coins = getTopSymbols(TOP_N)
+                .stream()
+                .filter(BINANCE_PAIRS::contains)
+                .toList();
+
+        for(String pair : coins){
+            List<Double> closes = fetchCloses(pair);
+            evaluate(pair,closes).ifPresent(s -> {
+                System.out.println("[Debug] First: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
+                bot.sendSignal(s.toTelegramMessage());
+            });
         }
 
-        // --- Планировщик на INTERVAL_MIN ---
+
+        /* Scheduled every INTERVAL_MIN */
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-        Runnable job = () -> {
+        scheduler.scheduleAtFixedRate(() -> {
             try {
-                List<String> pairs2 = getTopSymbols(TOP_N);
-                for(String pair : pairs2){
-                    try{
-                        List<Double> closes = fetchCloses(pair);
-                        evaluate(pair,closes).ifPresent(s -> {
-                            System.out.println("[Debug] Scheduled signal: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
-                            bot.sendSignal(s.toTelegramMessage());
-                        });
-                    }catch(Exception e){ System.out.println("[Error] "+pair+" "+e.getMessage()); }
+                List<String> filtered = getTopSymbols(TOP_N)
+                        .stream()
+                        .filter(BINANCE_PAIRS::contains)
+                        .toList();
+
+                for(String pair : filtered){
+                    List<Double> closes = fetchCloses(pair);
+                    evaluate(pair,closes).ifPresent(s -> {
+                        System.out.println("[Debug] Scheduled: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
+                        bot.sendSignal(s.toTelegramMessage());
+                    });
                 }
-            }catch(Exception e){ System.out.println("[Job error] "+e.getMessage()); }
-        };
-        scheduler.scheduleAtFixedRate(job, INTERVAL_MIN, INTERVAL_MIN, TimeUnit.MINUTES);
+
+            } catch(Exception e){
+                System.out.println("[Job error] " + e.getMessage());
+            }
+        }, INTERVAL_MIN, INTERVAL_MIN, TimeUnit.MINUTES);
     }
 }
