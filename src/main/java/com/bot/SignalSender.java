@@ -35,7 +35,7 @@ public class SignalSender {
 
         this.TOP_N = Integer.parseInt(System.getenv().getOrDefault("TOP_N", "50"));
         // временно для теста ставим 0, чтобы сигналы точно шли
-        this.MIN_CONF = 0.0; Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.5"));
+        this.MIN_CONF = 0.5; Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.5"));
         this.INTERVAL_MIN = Integer.parseInt(System.getenv().getOrDefault("INTERVAL_MINUTES", "15"));
         this.KLINES_LIMIT = Integer.parseInt(System.getenv().getOrDefault("KLINES", "40"));
         this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "200"));
