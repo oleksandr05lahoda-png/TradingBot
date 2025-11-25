@@ -54,6 +54,14 @@ def MACD(series, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+def ATR(df, n=14):
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(n).mean()
+    return atr.fillna(0)
+
 def add_features(df):
     s = df['close']
     df_feat = pd.DataFrame(index=df.index)
