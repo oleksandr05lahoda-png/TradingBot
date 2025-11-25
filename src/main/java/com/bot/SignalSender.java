@@ -33,7 +33,7 @@ public class SignalSender {
         this.bot = bot;
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
-        this.TOP_N = Integer.parseInt(System.getenv().getOrDefault("TOP_N", "50"));
+        this.TOP_N = Integer.parseInt(System.getenv().getOrDefault("TOP_N", "100"));
         this.MIN_CONF = 0.5; Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.5"));
         this.INTERVAL_MIN = Integer.parseInt(System.getenv().getOrDefault("INTERVAL_MINUTES", "15"));
         this.KLINES_LIMIT = Integer.parseInt(System.getenv().getOrDefault("KLINES", "40"));
