@@ -246,39 +246,46 @@ public class SignalSender {
 
     // --- NEW evaluate: combines normalized scores with weights that sum to 1.0 ---
     public Optional<Signal> evaluate(String pair, List<Double> closes) {
-        if (closes == null || closes.size() < 22) return Optional.empty(); // need enough data
+        if (closes == null || closes.size() < 22) return Optional.empty(); // нужно больше данных
 
-        // compute normalized indicator scores in [-1, 1]
+        // --- получаем сигналы индикаторов ---
         double emaScore = strategyEMACrossoverNorm(closes);   // -1..1
         double rsiScore = strategyRSINorm(closes);            // -1..1
         double macdScore = strategyMACDNorm(closes);          // -1..1
         double momScore = strategyMomentumNorm(closes);       // -1..1
 
-        // Weights: sum to 1.0 (adjustable)
+        // --- веса индикаторов ---
         double wEma = 0.25, wRsi = 0.25, wMacd = 0.25, wMom = 0.25;
 
-        // raw combined score in [-1, 1]
+        // --- итоговый rawScore в диапазоне [-1,1] ---
         double rawScore = emaScore * wEma + rsiScore * wRsi + macdScore * wMacd + momScore * wMom;
 
-        // Confidence: absolute strength 0..1
-        double confidence = Math.max(0.0, Math.min(1.0, Math.abs(rawScore)));
+        // --- сила сигнала (0..1) ---
+        double confidence = Math.min(1.0, Math.abs(rawScore));
 
-        // Direction
-        String direction = rawScore > 0 ? "LONG" : rawScore < 0 ? "SHORT" : "NEUTRAL";
+        // --- направление (ЗДЕСЬ ДОБАВЛЕН ШОРТ) ---
+        String direction;
+        if (rawScore >= MIN_CONF) {
+            direction = "LONG";
+        } else if (rawScore <= -MIN_CONF) {
+            direction = "SHORT";
+        } else {
+            return Optional.empty(); // слишком слабый сигнал
+        }
 
-        // Logging: show contributions (useful for debugging)
-        System.out.println(String.format("[Eval] %s -> EMA=%.2f RSI=%.2f MACD=%.2f MOM=%.2f raw=%.3f conf=%.2f",
-                pair, emaScore, rsiScore, macdScore, momScore, rawScore, confidence));
+        // логирование
+        System.out.println(String.format(
+                "[Eval] %s -> raw=%.3f conf=%.2f DIR=%s (EMA=%.2f RSI=%.2f MACD=%.2f MOM=%.2f)",
+                pair, rawScore, confidence, direction, emaScore, rsiScore, macdScore, momScore
+        ));
 
-        // Filter by min confidence
-        if (confidence < MIN_CONF) return Optional.empty();
-
-        String symbolOnly = pair.replace("USDT","");
+        String symbolOnly = pair.replace("USDT", "");
         double lastPrice = closes.get(closes.size()-1);
-        double rsiVal = rsi(closes,14);
+        double rsiVal = rsi(closes, 14);
 
         return Optional.of(new Signal(symbolOnly, direction, confidence, lastPrice, rsiVal, rawScore));
     }
+
 
     public static class Signal {
         public final String symbol;
