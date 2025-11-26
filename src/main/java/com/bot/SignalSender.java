@@ -40,6 +40,7 @@ public class SignalSender {
         this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "200"));
     }
 
+    // --- helper network methods unchanged (getBinanceSymbols, getTopSymbols, fetchClosesWithMeta) ---
     public Set<String> getBinanceSymbols() {
         try {
             HttpRequest req = HttpRequest.newBuilder()
@@ -151,6 +152,7 @@ public class SignalSender {
         }
     }
 
+    // --- indicators (unchanged logic, but we'll normalize their outputs) ---
     public static double ema(List<Double> prices, int period) {
         double k = 2.0 / (period + 1);
         double ema = prices.get(0);
@@ -175,58 +177,107 @@ public class SignalSender {
     }
 
     public static double momentum(List<Double> prices, int n) {
+        if (prices.size() <= n) return 0.0;
         return (prices.get(prices.size()-1) - prices.get(prices.size()-1-n)) /
                 (prices.get(prices.size()-1-n) + 1e-12);
     }
 
-    public double strategyEMACrossover(List<Double> closes) {
+    // --- NEW: normalize helpers ---
+    // map EMA crossover output (+0.6/-0.6) -> [-1, +1]
+    private double normalizeEmaScore(double rawEma) {
+        // rawEma expected ±0.6 from old function; divide by 0.6
+        return Math.max(-1.0, Math.min(1.0, rawEma / 0.6));
+    }
+
+    // map RSI mean reversion (+0.7 / -0.7) -> [-1, +1] using distance from neutral (50)
+    private double normalizeRsiScore(double rsiVal) {
+        // rsiVal in [0,100]. We treat extremes as strong signals:
+        // if rsi <= 10 -> +1 (oversold), if rsi >= 90 -> -1 (overbought)
+        double oversold = Math.max(0, 50 - rsiVal);  // positive when rsi < 50
+        double overbought = Math.max(0, rsiVal - 50); // positive when rsi > 50
+        // normalize to [-1,1] with a sensible scale (50 points -> 1.0)
+        double score = 0.0;
+        if (rsiVal < 50) score = Math.min(1.0, oversold / 40.0);   // 40 -> ~1.0 sensitivity
+        else score = -Math.min(1.0, overbought / 40.0);
+        return score;
+    }
+
+    // map MACD histogram to [-1,1] by dividing by recent price scale
+    private double normalizeMacdScore(double rawMacd, List<Double> closes) {
+        // rawMacd is difference of EMAs; normalize by recent price (close)
+        double last = closes.get(closes.size()-1);
+        if (last <= 0) return 0.0;
+        double rel = rawMacd / last; // relative MACD
+        // choose a sensible scaling: rel of 0.01 -> fairly strong (1%)
+        return Math.max(-1.0, Math.min(1.0, rel / 0.01));
+    }
+
+    // normalize momentum (raw small) to [-1,1]
+    private double normalizeMomentumScore(double rawMomentum) {
+        // rawMomentum roughly (p_now - p_n)/p_n
+        // take 1% movement as strong (0.01 -> 1.0)
+        return Math.max(-1.0, Math.min(1.0, rawMomentum / 0.01));
+    }
+
+    // --- strategy building blocks updated to return normalized scores in [-1,1] ---
+    public double strategyEMACrossoverNorm(List<Double> closes) {
         int look = Math.min(closes.size(), 30);
         List<Double> slice = closes.subList(closes.size()-look, closes.size());
         double e9 = ema(slice,9);
         double e21 = ema(slice,21);
-        return e9>e21?+0.6:-0.6;
+        double raw = e9 > e21 ? +0.6 : -0.6; // same as before
+        return normalizeEmaScore(raw);
     }
 
-    public double strategyRSIMeanReversion(List<Double> closes) {
+    public double strategyRSINorm(List<Double> closes) {
         double r = rsi(closes,14);
-        if (r < 30) return +0.7;
-        if (r > 70) return -0.7;
-        return 0.0;
+        return normalizeRsiScore(r);
     }
 
-    public double strategyMACDMomentum(List<Double> closes) {
-        double h = macdHist(closes);
-        return h>0?+0.4:-0.4;
+    public double strategyMACDNorm(List<Double> closes) {
+        double raw = macdHist(closes);
+        return normalizeMacdScore(raw, closes);
     }
 
-    public double strategyVolMomentum(List<Double> closes) {
-        double m = momentum(closes,3);
-        if(m>0.003) return +0.2;
-        if(m<-0.003) return -0.2;
-        return 0.0;
+    public double strategyMomentumNorm(List<Double> closes) {
+        double raw = momentum(closes,3);
+        return normalizeMomentumScore(raw);
     }
 
+    // --- NEW evaluate: combines normalized scores with weights that sum to 1.0 ---
     public Optional<Signal> evaluate(String pair, List<Double> closes) {
-        if (closes == null || closes.size() < 20) return Optional.empty();
-        List<Double> last = closes.subList(Math.max(0,closes.size()-20), closes.size());
-        double s1 = strategyEMACrossover(last);
-        double s2 = strategyRSIMeanReversion(last);
-        double s3 = strategyMACDMomentum(last);
-        double s4 = strategyVolMomentum(last);
+        if (closes == null || closes.size() < 22) return Optional.empty(); // need enough data
 
-        double score = s1*0.3 + s2*0.35 + s3*0.25 + s4*0.1;
-        double conf = Math.min(1.0, Math.abs(score));
-        if(conf < MIN_CONF) return Optional.empty();
+        // compute normalized indicator scores in [-1, 1]
+        double emaScore = strategyEMACrossoverNorm(closes);   // -1..1
+        double rsiScore = strategyRSINorm(closes);            // -1..1
+        double macdScore = strategyMACDNorm(closes);          // -1..1
+        double momScore = strategyMomentumNorm(closes);       // -1..1
 
-        String direction = score>0?"LONG":"SHORT";
+        // Weights: sum to 1.0 (adjustable)
+        double wEma = 0.25, wRsi = 0.25, wMacd = 0.25, wMom = 0.25;
+
+        // raw combined score in [-1, 1]
+        double rawScore = emaScore * wEma + rsiScore * wRsi + macdScore * wMacd + momScore * wMom;
+
+        // Confidence: absolute strength 0..1
+        double confidence = Math.max(0.0, Math.min(1.0, Math.abs(rawScore)));
+
+        // Direction
+        String direction = rawScore > 0 ? "LONG" : rawScore < 0 ? "SHORT" : "NEUTRAL";
+
+        // Logging: show contributions (useful for debugging)
+        System.out.println(String.format("[Eval] %s -> EMA=%.2f RSI=%.2f MACD=%.2f MOM=%.2f raw=%.3f conf=%.2f",
+                pair, emaScore, rsiScore, macdScore, momScore, rawScore, confidence));
+
+        // Filter by min confidence
+        if (confidence < MIN_CONF) return Optional.empty();
+
         String symbolOnly = pair.replace("USDT","");
-        double lastPrice = last.get(last.size()-1);
-        double rsiVal = rsi(last,14);
+        double lastPrice = closes.get(closes.size()-1);
+        double rsiVal = rsi(closes,14);
 
-        System.out.println(String.format("[Eval] %s EMA=%.2f RSI=%.2f MACD=%.2f MOM=%.2f score=%.2f conf=%.2f",
-                pair,s1,s2,s3,s4,score,conf));
-
-        return Optional.of(new Signal(symbolOnly,direction,conf,lastPrice,rsiVal,score));
+        return Optional.of(new Signal(symbolOnly, direction, confidence, lastPrice, rsiVal, rawScore));
     }
 
     public static class Signal {
