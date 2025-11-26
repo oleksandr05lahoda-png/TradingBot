@@ -26,7 +26,6 @@ public class SignalSender {
     private long lastBinancePairsRefresh = 0L; // millis
     private final long BINANCE_REFRESH_INTERVAL_MS = 60 * 60 * 1000L; // 60 min
 
-    // track last candle time per symbol
     private final Map<String, Long> lastOpenTimeMap = new ConcurrentHashMap<>();
 
     public SignalSender(TelegramBotSender bot) {
@@ -40,17 +39,13 @@ public class SignalSender {
         this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "200"));
     }
 
-    // --- helper network methods unchanged (getBinanceSymbols, getTopSymbols, fetchClosesWithMeta) ---
     public Set<String> getBinanceSymbols() {
         try {
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create("https://api.binance.com/api/v3/exchangeInfo"))
                     .timeout(Duration.ofSeconds(10))
-                    .GET()
-                    .build();
-
+                    .GET().build();
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-
             JSONObject json = new JSONObject(resp.body());
             JSONArray arr = json.getJSONArray("symbols");
 
@@ -65,10 +60,9 @@ public class SignalSender {
             }
             System.out.println("[Binance] Loaded " + result.size() + " spot USDT pairs");
             return result;
-
         } catch (Exception e) {
             System.out.println("[Binance] Could NOT load pairs: " + e.getMessage());
-            return Set.of("BTCUSDT","ETHUSDT","BNBUSDT");
+            return Set.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
         }
     }
 
@@ -86,8 +80,8 @@ public class SignalSender {
                     "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=%d&page=1",
                     limit
             );
-
-            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
+            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(10)).GET().build();
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             JSONArray arr = new JSONArray(resp.body());
 
@@ -99,10 +93,9 @@ public class SignalSender {
                 list.add(sym + "USDT");
             }
             return list;
-
         } catch (Exception e) {
             System.out.println("[CoinGecko] Error: " + e.getMessage());
-            return List.of("BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","ADAUSDT");
+            return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT");
         }
     }
 
@@ -123,11 +116,10 @@ public class SignalSender {
                     "https://api.binance.com/api/v3/klines?symbol=%s&interval=5m&limit=%d",
                     symbol, KLINES_LIMIT
             );
-
-            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
+            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(10)).GET().build();
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             String body = resp.body();
-
             if (body == null || body.isEmpty() || !body.startsWith("[")) {
                 System.out.println("[Binance] Invalid response for " + symbol + ": " + body);
                 return new KlinesResult(Collections.emptyList(), 0L);
@@ -143,20 +135,18 @@ public class SignalSender {
                 closes.add(close);
                 lastOpen = openTime;
             }
-
             return new KlinesResult(closes, lastOpen);
-
         } catch (Exception e) {
             System.out.println("[Binance] Error for " + symbol + ": " + e.getMessage());
             return new KlinesResult(Collections.emptyList(), 0L);
         }
     }
 
-    // --- indicators (unchanged logic, but we'll normalize their outputs) ---
+    // --- Indicators ---
     public static double ema(List<Double> prices, int period) {
         double k = 2.0 / (period + 1);
         double ema = prices.get(0);
-        for (double p : prices) ema = p*k + ema*(1-k);
+        for (double p : prices) ema = p * k + ema * (1 - k);
         return ema;
     }
 
@@ -164,7 +154,7 @@ public class SignalSender {
         if (prices.size() <= period) return 50.0;
         double gain = 0, loss = 0;
         for (int i = prices.size() - period; i < prices.size(); i++) {
-            double diff = prices.get(i) - prices.get(i-1);
+            double diff = prices.get(i) - prices.get(i - 1);
             if (diff > 0) gain += diff; else loss -= diff;
         }
         if (gain + loss == 0) return 50.0;
@@ -178,114 +168,64 @@ public class SignalSender {
 
     public static double momentum(List<Double> prices, int n) {
         if (prices.size() <= n) return 0.0;
-        return (prices.get(prices.size()-1) - prices.get(prices.size()-1-n)) /
-                (prices.get(prices.size()-1-n) + 1e-12);
+        return (prices.get(prices.size() - 1) - prices.get(prices.size() - 1 - n)) /
+                (prices.get(prices.size() - 1 - n) + 1e-12);
     }
 
-    // --- NEW: normalize helpers ---
-    // map EMA crossover output (+0.6/-0.6) -> [-1, +1]
-    private double normalizeEmaScore(double rawEma) {
-        // rawEma expected ±0.6 from old function; divide by 0.6
-        return Math.max(-1.0, Math.min(1.0, rawEma / 0.6));
-    }
-
-    // map RSI mean reversion (+0.7 / -0.7) -> [-1, +1] using distance from neutral (50)
-    private double normalizeRsiScore(double rsiVal) {
-        // rsiVal in [0,100]. We treat extremes as strong signals:
-        // if rsi <= 10 -> +1 (oversold), if rsi >= 90 -> -1 (overbought)
-        double oversold = Math.max(0, 50 - rsiVal);  // positive when rsi < 50
-        double overbought = Math.max(0, rsiVal - 50); // positive when rsi > 50
-        // normalize to [-1,1] with a sensible scale (50 points -> 1.0)
-        double score = 0.0;
-        if (rsiVal < 50) score = Math.min(1.0, oversold / 40.0);   // 40 -> ~1.0 sensitivity
-        else score = -Math.min(1.0, overbought / 40.0);
-        return score;
-    }
-
-    // map MACD histogram to [-1,1] by dividing by recent price scale
-    private double normalizeMacdScore(double rawMacd, List<Double> closes) {
-        // rawMacd is difference of EMAs; normalize by recent price (close)
-        double last = closes.get(closes.size()-1);
-        if (last <= 0) return 0.0;
-        double rel = rawMacd / last; // relative MACD
-        // choose a sensible scaling: rel of 0.01 -> fairly strong (1%)
-        return Math.max(-1.0, Math.min(1.0, rel / 0.01));
-    }
-
-    // normalize momentum (raw small) to [-1,1]
-    private double normalizeMomentumScore(double rawMomentum) {
-        // rawMomentum roughly (p_now - p_n)/p_n
-        // take 1% movement as strong (0.01 -> 1.0)
-        return Math.max(-1.0, Math.min(1.0, rawMomentum / 0.01));
-    }
-
-    // --- strategy building blocks updated to return normalized scores in [-1,1] ---
-    public double strategyEMACrossoverNorm(List<Double> closes) {
-        int look = Math.min(closes.size(), 30);
-        List<Double> slice = closes.subList(closes.size()-look, closes.size());
-        double e9 = ema(slice,9);
-        double e21 = ema(slice,21);
-        double raw = e9 > e21 ? +0.6 : -0.6; // same as before
-        return normalizeEmaScore(raw);
+    // --- Strategy Signals ---
+    public double strategyEMANorm(List<Double> closes) {
+        int look = closes.size();
+        double e50 = ema(closes, 50);
+        double e200 = ema(closes, 200);
+        return e50 > e200 ? 1.0 : -1.0;
     }
 
     public double strategyRSINorm(List<Double> closes) {
-        double r = rsi(closes,14);
-        return normalizeRsiScore(r);
+        double r = rsi(closes, 14);
+        if (r < 30) return 1.0;      // oversold → LONG
+        else if (r > 70) return -1.0; // overbought → SHORT
+        else return 0.0;
     }
 
     public double strategyMACDNorm(List<Double> closes) {
         double raw = macdHist(closes);
-        return normalizeMacdScore(raw, closes);
+        double last = closes.get(closes.size() - 1);
+        double rel = raw / last;
+        return Math.max(-1.0, Math.min(1.0, rel / 0.01));
     }
 
     public double strategyMomentumNorm(List<Double> closes) {
-        double raw = momentum(closes,3);
-        return normalizeMomentumScore(raw);
+        double raw = momentum(closes, 3);
+        return Math.max(-1.0, Math.min(1.0, raw / 0.01));
     }
 
-    // --- NEW evaluate: combines normalized scores with weights that sum to 1.0 ---
     public Optional<Signal> evaluate(String pair, List<Double> closes) {
-        if (closes == null || closes.size() < 22) return Optional.empty(); // нужно больше данных
+        if (closes == null || closes.size() < 22) return Optional.empty();
 
-        // --- получаем сигналы индикаторов ---
-        double emaScore = strategyEMACrossoverNorm(closes);   // -1..1
-        double rsiScore = strategyRSINorm(closes);            // -1..1
-        double macdScore = strategyMACDNorm(closes);          // -1..1
-        double momScore = strategyMomentumNorm(closes);       // -1..1
+        double emaScore = strategyEMANorm(closes);
+        double rsiScore = strategyRSINorm(closes);
+        double macdScore = strategyMACDNorm(closes);
+        double momScore = strategyMomentumNorm(closes);
 
-        // --- веса индикаторов ---
-        double wEma = 0.25, wRsi = 0.25, wMacd = 0.25, wMom = 0.25;
-
-        // --- итоговый rawScore в диапазоне [-1,1] ---
+        // --- Weights ---
+        double wEma = 0.4, wRsi = 0.35, wMacd = 0.2, wMom = 0.05;
         double rawScore = emaScore * wEma + rsiScore * wRsi + macdScore * wMacd + momScore * wMom;
-
-        // --- сила сигнала (0..1) ---
         double confidence = Math.min(1.0, Math.abs(rawScore));
 
-        // --- направление (ЗДЕСЬ ДОБАВЛЕН ШОРТ) ---
         String direction;
-        if (rawScore >= MIN_CONF) {
-            direction = "LONG";
-        } else if (rawScore <= -MIN_CONF) {
-            direction = "SHORT";
-        } else {
-            return Optional.empty(); // слишком слабый сигнал
-        }
+        if (rawScore >= MIN_CONF) direction = "LONG";
+        else if (rawScore <= -MIN_CONF) direction = "SHORT";
+        else return Optional.empty();
 
-        // логирование
-        System.out.println(String.format(
-                "[Eval] %s -> raw=%.3f conf=%.2f DIR=%s (EMA=%.2f RSI=%.2f MACD=%.2f MOM=%.2f)",
-                pair, rawScore, confidence, direction, emaScore, rsiScore, macdScore, momScore
-        ));
+        System.out.println(String.format("[Eval] %s -> raw=%.3f conf=%.2f DIR=%s (EMA=%.2f RSI=%.2f MACD=%.2f MOM=%.2f)",
+                pair, rawScore, confidence, direction, emaScore, rsiScore, macdScore, momScore));
 
         String symbolOnly = pair.replace("USDT", "");
-        double lastPrice = closes.get(closes.size()-1);
+        double lastPrice = closes.get(closes.size() - 1);
         double rsiVal = rsi(closes, 14);
 
         return Optional.of(new Signal(symbolOnly, direction, confidence, lastPrice, rsiVal, rawScore));
     }
-
 
     public static class Signal {
         public final String symbol;
@@ -295,78 +235,40 @@ public class SignalSender {
         public final double rsi;
         public final double rawScore;
 
-        public Signal(String symbol, String direction, double confidence, double price, double rsi, double rawScore){
-            this.symbol=symbol; this.direction=direction; this.confidence=confidence;
-            this.price=price; this.rsi=rsi; this.rawScore=rawScore;
+        public Signal(String symbol, String direction, double confidence, double price, double rsi, double rawScore) {
+            this.symbol = symbol; this.direction = direction; this.confidence = confidence;
+            this.price = price; this.rsi = rsi; this.rawScore = rawScore;
         }
 
-        public String toTelegramMessage(){
+        public String toTelegramMessage() {
             return String.format("*%s* → *%s*\nConfidence: *%.2f*\nPrice: %.8f\nRSI(14): %.2f\n_time: %s_",
-                    symbol,direction,confidence,price,rsi,Instant.now().toString());
+                    symbol, direction, confidence, price, rsi, Instant.now().toString());
         }
     }
 
+    // --- Start Scheduler ---
     public void start() {
-
         System.out.println("[SignalSender] Starting TOP_N="+TOP_N+" MIN_CONF="+MIN_CONF+" INTERVAL_MIN="+INTERVAL_MIN);
-
         ensureBinancePairsFresh();
-
         try { bot.sendSignal("✅ SignalSender запущен и работает!"); }
         catch (Exception e){ System.out.println("[Telegram Test Message Error] " + e.getMessage()); }
-
-        List<String> coins = getTopSymbols(TOP_N)
-                .stream()
-                .filter(BINANCE_PAIRS::contains)
-                .toList();
-
-        for(String pair : coins){
-            KlinesResult kr = fetchClosesWithMeta(pair);
-            if (kr.closes.isEmpty()) continue;
-
-            Long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
-            if (kr.lastOpenTime <= lastOpen) {
-                System.out.println("[SKIP] No new candle for " + pair);
-                continue;
-            }
-            lastOpenTimeMap.put(pair, kr.lastOpenTime);
-
-            evaluate(pair,kr.closes).ifPresent(s -> {
-                System.out.println("[Debug] First: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
-                bot.sendSignal(s.toTelegramMessage());
-            });
-        }
 
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 ensureBinancePairsFresh();
-
-                List<String> filtered = getTopSymbols(TOP_N)
-                        .stream()
-                        .filter(BINANCE_PAIRS::contains)
-                        .toList();
-
+                List<String> filtered = getTopSymbols(TOP_N).stream().filter(BINANCE_PAIRS::contains).toList();
                 for(String pair : filtered){
                     KlinesResult kr = fetchClosesWithMeta(pair);
                     if (kr.closes.isEmpty()) continue;
 
                     Long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
-                    if (kr.lastOpenTime <= lastOpen) {
-                        System.out.println("[SKIP] No new candle for " + pair);
-                        continue;
-                    }
+                    if (kr.lastOpenTime <= lastOpen) continue;
                     lastOpenTimeMap.put(pair, kr.lastOpenTime);
 
-                    evaluate(pair,kr.closes).ifPresent(s -> {
-                        System.out.println("[Debug] Scheduled: " + s.symbol + " score=" + s.rawScore + " conf=" + s.confidence);
-                        bot.sendSignal(s.toTelegramMessage());
-                    });
+                    evaluate(pair,kr.closes).ifPresent(s -> bot.sendSignal(s.toTelegramMessage()));
                 }
-
-            } catch(Exception e){
-                System.out.println("[Job error] " + e.getMessage());
-            }
-        }, INTERVAL_MIN, INTERVAL_MIN, TimeUnit.MINUTES);
+            } catch(Exception e){ System.out.println("[Job error] " + e.getMessage()); }
+        }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
 }

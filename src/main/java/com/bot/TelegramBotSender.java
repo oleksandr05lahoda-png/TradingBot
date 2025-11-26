@@ -14,7 +14,6 @@ public class TelegramBotSender {
 
     public void sendSignal(String msg) {
         try {
-            // Полное URL-кодирование текста
             String encodedMsg = URLEncoder.encode(msg, "UTF-8");
             String url = String.format(
                     "https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s&parse_mode=Markdown",
@@ -27,7 +26,7 @@ public class TelegramBotSender {
                     .build();
             http.send(req, HttpResponse.BodyHandlers.ofString());
         } catch (Exception e) {
-            System.out.println("[Telegram] Error: " + e.getMessage());
+            System.out.println("[Telegram] Error sending message: " + e.getMessage());
         }
     }
 }
