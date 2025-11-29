@@ -3,7 +3,10 @@ package com.bot;
 public class BotMain {
     public static void main(String[] args) {
         System.out.println("Starting Trading Bot...");
+
         TelegramBotSender tele = new TelegramBotSender();
+        tele.testMessage(); // проверка, что Telegram работает
+
         SignalSender sender = new SignalSender(tele);
 
         // Запуск scheduler
