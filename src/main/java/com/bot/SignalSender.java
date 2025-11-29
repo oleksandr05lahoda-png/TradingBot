@@ -10,22 +10,6 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 
-/**
- * SignalSender (upgraded for futures / MTF analysis)
- *
- * Replaces previous SignalSender with:
- * - multi-timeframe fetching (1m,5m,15m,1h)
- * - EMA trend filter (1h)
- * - ATR volatility filter
- * - volume filter
- * - impulse (huge candle) filter
- * - cooldown per symbol
- * - adaptive confidence combining indicators + confirmations
- *
- * Notes:
- * - No external libs required except org.json
- * - Tunable via ENV variables
- */
 public class SignalSender {
 
     private final TelegramBotSender bot;
@@ -63,7 +47,7 @@ public class SignalSender {
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
         this.TOP_N = Integer.parseInt(System.getenv().getOrDefault("TOP_N", "100"));
-        this.MIN_CONF = Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.5"));
+        this.MIN_CONF = Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.7"));
         this.INTERVAL_MIN = Integer.parseInt(System.getenv().getOrDefault("INTERVAL_MINUTES", "15"));
         this.KLINES_LIMIT = Integer.parseInt(System.getenv().getOrDefault("KLINES", "80"));
         this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "150"));
