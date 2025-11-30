@@ -10,7 +10,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
-
 public class SignalSender {
 
     private final TelegramBotSender bot;
@@ -19,7 +18,7 @@ public class SignalSender {
 
     // CONFIG (from ENV or defaults)
     private final int TOP_N;
-    private final double MIN_CONF;            // base threshold (0..1)
+    private final double MIN_CONF;            // base threshold (0..1) - default updated to 0.50
     private final int INTERVAL_MIN;           // scheduler interval minutes
     private final int KLINES_LIMIT;           // number of candles fetched for each TF
     private final long REQUEST_DELAY_MS;      // delay between HTTP calls to avoid rate limits
@@ -31,7 +30,7 @@ public class SignalSender {
     private final String TF_LONG = "1h";
 
     // thresholds (env)
-    private final double IMPULSE_PCT;      // if one-minute candle body > this -> impulse (skip)
+    private final double IMPULSE_PCT;      // if one-minute candle body > this -> impulse (treat as strong move)
     private final double VOL_MULTIPLIER;   // volume multiplier vs avg to consider vol OK
     private final double ATR_MIN_PCT;      // min ATR relative to price
     private final long COOLDOWN_MS;        // cooldown per symbol
@@ -55,12 +54,13 @@ public class SignalSender {
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
         this.TOP_N = Integer.parseInt(System.getenv().getOrDefault("TOP_N", "100"));
-        this.MIN_CONF = Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.4")); // PRO default
+        // default MIN_CONF set to 0.50 as requested (user chose custom threshold option)
+        this.MIN_CONF = Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.50"));
         this.INTERVAL_MIN = Integer.parseInt(System.getenv().getOrDefault("INTERVAL_MINUTES", "10"));
         this.KLINES_LIMIT = Integer.parseInt(System.getenv().getOrDefault("KLINES", "120"));
         this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "150"));
 
-        this.IMPULSE_PCT = Double.parseDouble(System.getenv().getOrDefault("IMPULSE_PCT", "0.02")); // 2%  (more strict)
+        this.IMPULSE_PCT = Double.parseDouble(System.getenv().getOrDefault("IMPULSE_PCT", "0.02")); // 2%
         this.VOL_MULTIPLIER = Double.parseDouble(System.getenv().getOrDefault("VOL_MULT", "0.9"));
         this.ATR_MIN_PCT = Double.parseDouble(System.getenv().getOrDefault("ATR_MIN_PCT", "0.0007")); // 0.07%
         this.COOLDOWN_MS = Long.parseLong(System.getenv().getOrDefault("COOLDOWN_MS", String.valueOf(60 * 1000))); // default 60s cooldown per pair
@@ -413,13 +413,14 @@ public class SignalSender {
         if (atrOk) boost += 0.03;
         if (vwapAligned) boost += 0.04;
         if (bos) boost += 0.03;
+        // for futures: treat impulse as *possible* positive sign (less penalize)
         if (!notImpulse) {
-            // if impulse present, *penalize* confidence
-            boost -= 0.08;
+            // small penalize but not full rejection; main logic will allow impulse as trigger
+            boost -= 0.02;
         }
         if (liquiditySweep) {
             // liquidity sweeps decrease reliability unless structure and mtf both confirm
-            if (!structureAligned || mtfConfirm == 0) boost -= 0.12;
+            if (!structureAligned || mtfConfirm == 0) boost -= 0.10;
             else boost -= 0.03;
         }
         double conf = Math.min(1.0, Math.max(0.0, base + boost));
@@ -479,39 +480,66 @@ public class SignalSender {
         boolean structureAligned = (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure15m)) ||
                 (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure5m));
 
-        // VWAP alignment: compute vwap on 1h-ish candles? We'll use 15m VWAP window (or full session if available)
+        // VWAP alignment: compute VWAP on 15m
         double vwap15 = vwap(c15m);
         double lastPrice = c1m.get(c1m.size() - 1).close;
         boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) || (rawScore < 0 && lastPrice < vwap15);
 
         boolean bos = detectBOS(c5m); // treat BOS on 5m as important
 
+        // ATR breakout: check against last swing on 5m
+        double atrVal = atr(c5m, 14);
+        List<Integer> highs = detectSwingHighs(c5m, 3);
+        List<Integer> lows = detectSwingLows(c5m, 3);
+        double lastSwingHigh = highs.isEmpty() ? Double.NaN : c5m.get(highs.get(highs.size() - 1)).high;
+        double lastSwingLow = lows.isEmpty() ? Double.NaN : c5m.get(lows.get(lows.size() - 1)).low;
+        boolean atrBreakLong = !Double.isNaN(lastSwingHigh) && lastPrice > lastSwingHigh + atrVal;
+        boolean atrBreakShort = !Double.isNaN(lastSwingLow) && lastPrice < lastSwingLow - atrVal;
+
         // compose confidence
         double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
 
-        // decide direction and strict checks
-        String direction;
-        if (rawScore > 0 && confidence >= MIN_CONF && mtfConfirm >= 0 && structureAligned && vwapAligned) direction = "LONG";
-        else if (rawScore < 0 && confidence >= MIN_CONF && mtfConfirm <= 0 && structureAligned && vwapAligned) direction = "SHORT";
-        else return Optional.empty();
+        // If there's a strong impulse or ATR-break, boost confidence and relax strict MTF requirement
+        boolean strongTrigger = false;
+        if ((impulse && volOk) || atrBreakLong || atrBreakShort) {
+            strongTrigger = true;
+            confidence = Math.min(1.0, confidence + 0.15); // boost for strong move
+            // relax MTF requirement: keep mtfConfirm as-is for scoring, but allow pass-through
+        }
 
-        // extra safety: if impulse present or liquidity sweep and confidence not extremely high -> skip
-        if (impulse && confidence < 0.95) {
-            System.out.println(String.format("[Filter] %s rejected due to impulse (bodyPct=%.4f) conf=%.2f", pair,
-                    c1m.get(c1m.size()-1).bodyPct(), confidence));
+        // Decide direction: require either rawScore direction OR ATR-break/impulse direction
+        String direction = null;
+        double prevClose = c1m.get(c1m.size() - 2).close;
+        boolean priceUp = lastPrice > prevClose;
+        boolean priceDown = lastPrice < prevClose;
+
+        // Primary criteria: rawScore direction + confidence + confirmations OR strongTrigger can override some checks
+        if ((rawScore > 0 || atrBreakLong || (impulse && priceUp)) &&
+                confidence >= MIN_CONF &&
+                ( (mtfConfirm >= 0 && structureAligned && vwapAligned) || strongTrigger )) {
+            direction = "LONG";
+        } else if ((rawScore < 0 || atrBreakShort || (impulse && priceDown)) &&
+                confidence >= MIN_CONF &&
+                ( (mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger )) {
+            direction = "SHORT";
+        } else {
             return Optional.empty();
         }
+
+        // Extra safety: if liquidity sweep present and confidence not very high -> skip
         if (liquSweep && confidence < 0.92) {
             System.out.println(String.format("[Filter] %s rejected due liquidity sweep conf=%.2f", pair, confidence));
             return Optional.empty();
         }
 
-        // ensure trend alignment with 1h: skip counter-trend
-        if (direction.equals("LONG") && dir1h < 0) return Optional.empty();
-        if (direction.equals("SHORT") && dir1h > 0) return Optional.empty();
+        // ensure trend alignment with 1h if not a strongTrigger: skip counter-trend unless strong
+        if (!strongTrigger) {
+            if (direction.equals("LONG") && dir1h < 0) return Optional.empty();
+            if (direction.equals("SHORT") && dir1h > 0) return Optional.empty();
+        }
 
         double rsiVal = rsi(closes1m, 14);
-        Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal, rawScore, mtfConfirm, volOk, atrOk);
+        Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal, rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong, atrBreakShort, impulse);
         markSignalSent(pair);
         return Optional.of(s);
     }
@@ -619,10 +647,14 @@ public class SignalSender {
         public final int mtfConfirm;
         public final boolean volOk;
         public final boolean atrOk;
+        public final boolean strongTrigger;
+        public final boolean atrBreakLong;
+        public final boolean atrBreakShort;
+        public final boolean impulse;
         public final Instant created = Instant.now();
 
         public Signal(String symbol, String direction, double confidence, double price, double rsi, double rawScore,
-                      int mtfConfirm, boolean volOk, boolean atrOk) {
+                      int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger, boolean atrBreakLong, boolean atrBreakShort, boolean impulse) {
             this.symbol = symbol;
             this.direction = direction;
             this.confidence = confidence;
@@ -632,20 +664,26 @@ public class SignalSender {
             this.mtfConfirm = mtfConfirm;
             this.volOk = volOk;
             this.atrOk = atrOk;
+            this.strongTrigger = strongTrigger;
+            this.atrBreakLong = atrBreakLong;
+            this.atrBreakShort = atrBreakShort;
+            this.impulse = impulse;
         }
 
         public String toTelegramMessage() {
-            return String.format("*%s* → *%s*\nConfidence: *%.2f*\nPrice: %.8f\nRSI(14): %.2f\n_raw: %.3f mtf:%d vol:%b atr:%b_\n_time: %s_",
-                    symbol, direction, confidence, price, rsi, rawScore, mtfConfirm, volOk, atrOk, created.toString());
+            String flags = (strongTrigger ? "⚡strong " : "") +
+                    (atrBreakLong ? "ATR↑ " : "") + (atrBreakShort ? "ATR↓ " : "") + (impulse ? "IMPULSE " : "");
+            return String.format("*%s* → *%s*\nConfidence: *%.2f*\nPrice: %.8f\nRSI(14): %.2f\n_flags_: %s\n_raw: %.3f mtf:%d vol:%b atr:%b_\n_time: %s_",
+                    symbol, direction, confidence, price, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk, created.toString());
         }
     }
 
     // -------------------- Start Scheduler (main loop) --------------------
     public void start() {
-        System.out.println("[SignalSender] Starting PRO mode TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
+        System.out.println("[SignalSender] Starting (Futures-style signals) TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
         ensureBinancePairsFresh();
         try {
-            bot.sendSignal("✅ SignalSender (PRO mode) запущен и работает! MIN_CONF=" + MIN_CONF);
+            bot.sendSignal("✅ SignalSender (Futures-style) запущен и работает! MIN_CONF=" + MIN_CONF);
         } catch (Exception e) {
             System.out.println("[Telegram Test Message Error] " + e.getMessage());
         }
@@ -654,8 +692,12 @@ public class SignalSender {
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 ensureBinancePairsFresh();
-                List<String> filtered = getTopSymbols(TOP_N).stream().filter(BINANCE_PAIRS::contains).toList();
-                // iterate
+                List<String> topList = getTopSymbols(TOP_N);
+                List<String> filtered = topList.stream().filter(BINANCE_PAIRS::contains).collect(Collectors.toList());
+
+                // we'll collect all candidate signals first; if none active -> skip sending (market quiet)
+                List<Signal> candidates = new ArrayList<>();
+
                 for (String pair : filtered) {
                     // fetch MTF klines
                     List<Candle> c1m = fetchKlines(pair, TF_ENTRY, Math.max(KLINES_LIMIT, 120));
@@ -671,22 +713,36 @@ public class SignalSender {
                     if (c1h.isEmpty()) continue;
 
                     Optional<Signal> opt = evaluate(pair, c1m, c5m, c15m, c1h);
-                    opt.ifPresent(s -> {
-                        try {
-                            // avoid spamming same symbol with slightly different confidence too often
-                            double prevConf = lastSentConfidence.getOrDefault(pair, 0.0);
-                            if (Math.abs(prevConf - s.confidence) < 0.02 && (System.currentTimeMillis() - lastSignalTime.getOrDefault(pair, 0L)) < 3 * 60 * 1000) {
-                                // skip too-similar small updates within 3 minutes
-                                System.out.println("[Debounce] skipping similar signal for " + pair + " conf=" + s.confidence);
-                                return;
-                            }
-                            bot.sendSignal(s.toTelegramMessage());
-                            lastSentConfidence.put(pair, s.confidence);
-                        } catch (Exception e) {
-                            System.out.println("[Telegram] send error: " + e.getMessage());
-                        }
-                    });
+                    opt.ifPresent(candidates::add);
                 }
+
+                // MarketQuiet logic: if no candidates, skip cycle (stay silent)
+                if (candidates.isEmpty()) {
+                    System.out.println("[MarketQuiet] No active movers this cycle - skipping sends.");
+                    return;
+                }
+
+                // Otherwise send each candidate, with per-pair debounce
+                for (Signal s : candidates) {
+                    String pairKey = s.symbol + "USDT";
+                    try {
+                        double prevConf = lastSentConfidence.getOrDefault(pairKey, 0.0);
+                        long lastSent = lastSignalTime.getOrDefault(pairKey, 0L);
+                        // Debounce: skip too-similar small updates within 3 minutes
+                        if (Math.abs(prevConf - s.confidence) < 0.02 && (System.currentTimeMillis() - lastSent) < 3 * 60 * 1000) {
+                            System.out.println("[Debounce] skipping similar signal for " + pairKey + " conf=" + s.confidence);
+                            continue;
+                        }
+                        // Send message
+                        bot.sendSignal(s.toTelegramMessage());
+                        lastSentConfidence.put(pairKey, s.confidence);
+                        // markSignalSent already called in evaluate(), but update again just in case
+                        lastSignalTime.put(pairKey, System.currentTimeMillis());
+                    } catch (Exception e) {
+                        System.out.println("[Telegram] send error: " + e.getMessage());
+                    }
+                }
+
             } catch (Exception e) {
                 System.out.println("[Job error] " + e.getMessage());
             }
