@@ -435,6 +435,20 @@ public class SignalSender {
 
         // cooldown
         if (isCooldown(pair)) return Optional.empty();
+        // 1. Сначала считаем направления на разных таймфреймах
+        int dir1h = emaDirection(c1h, 20, 50, 0.002); // trend on 1h
+        int dir15m = emaDirection(c15m, 9, 21, 0.002);
+        int dir5m = emaDirection(c5m, 9, 21, 0.002);
+        int dir1m = emaDirection(c1m, 9, 21, 0.001);
+
+// 2. Потом вычисляем mtfConfirm
+        int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
+
+// 3. Потом проверяем ранний тренд
+        boolean earlyTrigger = earlyTrendTrigger(c1m);
+        if (earlyTrigger) {
+            mtfConfirm = 0; // при раннем тренде игнорируем MTF подтверждение
+        }
 
         // avoid duplicate processing for same candle
         long newOpen = c1m.get(c1m.size() - 1).openTime;
@@ -462,16 +476,16 @@ public class SignalSender {
         boolean volOk = isVolumeOk(c1m);                    // on entry TF
         boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);
         boolean impulse = isImpulseCandle(c1m.get(c1m.size() - 1));
+        // Adaptive impulse based on last 20 candles
+        double avgBody = c1m.stream()
+                .skip(Math.max(0, c1m.size() - 20))
+                .mapToDouble(c -> Math.abs(c.close - c.open))
+                .average()
+                .orElse(IMPULSE_PCT);
+        double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
+        impulse = Math.abs(c1m.get(c1m.size() - 1).close - c1m.get(c1m.size() - 1).open) / (c1m.get(c1m.size() - 1).open + 1e-12) >= adaptiveImpulse;
+
         boolean liquSweep = detectLiquiditySweep(c1m);
-
-        // multi-TF
-        int dir1h = emaDirection(c1h, 20, 50, 0.002); // trend on 1h
-        int dir15m = emaDirection(c15m, 9, 21, 0.002);
-        int dir5m = emaDirection(c5m, 9, 21, 0.002);
-        int dir1m = emaDirection(c1m, 9, 21, 0.001);
-
-        int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
-
         // price action
         int structure1h = marketStructure(c1h);
         int structure15m = marketStructure(c15m);
@@ -539,7 +553,7 @@ public class SignalSender {
         }
 
         double rsiVal = rsi(closes1m, 14);
-        Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal, rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong, atrBreakShort, impulse);
+        Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal, rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong, atrBreakShort, impulse, earlyTrigger);
         markSignalSent(pair);
         return Optional.of(s);
     }
@@ -615,8 +629,25 @@ public class SignalSender {
 
     public boolean isImpulseCandle(Candle c) {
         if (c == null) return false;
+        // Adaptive impulse based on last 20 candles average body
+        int lookback = 20;
+        double avgBody = 0.0;
+        if (c != null && c.openTime > 0) { // dummy check
+            avgBody = c.body(); // default to current if no list available
+        }
+        double adaptiveImpulse = avgBody * 1.5;
         double change = Math.abs(c.close - c.open) / (c.open + 1e-12);
-        return change >= IMPULSE_PCT;
+        return change >= Math.min(IMPULSE_PCT, adaptiveImpulse);
+    }
+    private boolean earlyTrendTrigger(List<Candle> candles) {
+        if (candles == null || candles.size() < 3) return false;
+        int bullCount = 0;
+        int bearCount = 0;
+        for (int i = candles.size() - 3; i < candles.size(); i++) {
+            if (candles.get(i).isBull()) bullCount++;
+            if (candles.get(i).isBear()) bearCount++;
+        }
+        return bullCount >= 2 || bearCount >= 2;
     }
 
     // multiTF confirm: simple voting with bias to higher TF (1h>15m>5m>1m)
@@ -651,10 +682,11 @@ public class SignalSender {
         public final boolean atrBreakLong;
         public final boolean atrBreakShort;
         public final boolean impulse;
+        public final boolean earlyTrigger;
         public final Instant created = Instant.now();
 
         public Signal(String symbol, String direction, double confidence, double price, double rsi, double rawScore,
-                      int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger, boolean atrBreakLong, boolean atrBreakShort, boolean impulse) {
+                      int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger, boolean atrBreakLong, boolean atrBreakShort, boolean impulse, boolean earlyTrigger) {
             this.symbol = symbol;
             this.direction = direction;
             this.confidence = confidence;
@@ -668,11 +700,16 @@ public class SignalSender {
             this.atrBreakLong = atrBreakLong;
             this.atrBreakShort = atrBreakShort;
             this.impulse = impulse;
+            this.earlyTrigger = earlyTrigger;
         }
 
         public String toTelegramMessage() {
             String flags = (strongTrigger ? "⚡strong " : "") +
-                    (atrBreakLong ? "ATR↑ " : "") + (atrBreakShort ? "ATR↓ " : "") + (impulse ? "IMPULSE " : "");
+                    (earlyTrigger ? "⚡early " : "") +
+                    (earlyTrigger ? "⚡early " : "") +
+                    (atrBreakLong ? "ATR↑ " : "") +
+                    (atrBreakShort ? "ATR↓ " : "") +
+                    (impulse ? "IMPULSE " : "");
             return String.format("*%s* → *%s*\nConfidence: *%.2f*\nPrice: %.8f\nRSI(14): %.2f\n_flags_: %s\n_raw: %.3f mtf:%d vol:%b atr:%b_\n_time: %s_",
                     symbol, direction, confidence, price, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk, created.toString());
         }
