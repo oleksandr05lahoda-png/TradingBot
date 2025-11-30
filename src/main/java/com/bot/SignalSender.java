@@ -55,7 +55,7 @@ public class SignalSender {
 
         this.TOP_N = Integer.parseInt(System.getenv().getOrDefault("TOP_N", "100"));
         // default MIN_CONF set to 0.50 as requested (user chose custom threshold option)
-        this.MIN_CONF = Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.50"));
+        this.MIN_CONF = Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.3"));
         this.INTERVAL_MIN = Integer.parseInt(System.getenv().getOrDefault("INTERVAL_MINUTES", "10"));
         this.KLINES_LIMIT = Integer.parseInt(System.getenv().getOrDefault("KLINES", "120"));
         this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "150"));
