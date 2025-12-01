@@ -18,6 +18,11 @@ public class TelegramBotSender {
         this.chatId = chatId;
         this.client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2).build();
     }
+    public void sendSignal(String message) {
+        // Подставим дефолтные значения для остальных параметров
+        sendSignal("", "", 0.0, 0.0, 0, message);
+    }
+
     public void sendSignal(String symbol, String direction, double confidence, double price, int rsi, String flags) {
         String message = symbol + " → " + direction + "\n" +
                 "Confidence: " + String.format("%.2f", confidence) + "\n" +

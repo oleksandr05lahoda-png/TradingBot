@@ -12,21 +12,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
-/**
- * SignalSender — полная версия для фьючерсов.
- *
- * Особенности:
- * - Берёт klines с Binance Futures (fapi) для 1m/5m/15m/1h
- * - Микро-тик (aggTrade) + partial depth для OBI
- * - 10 индикаторов: EMA(20/50/100), RSI(14), MACD(12/26), Momentum(3), ATR(14), VWAP(15m), OBV, SMA, EMA-based norms
- * - Price Action: swing highs/lows, BOS, liquidity sweep
- * - Compose confidence, multiTF confirm, strong triggers, debounce/cooldown, per-pair state
- * - Отправка в Telegram через TelegramBotSender (класс должен предоставлять sendSignal(String))
- *
- * Утилиты: настраивается через ENV:
- * - TOP_N, MIN_CONFIDENCE, INTERVAL_MINUTES, KLINES, REQUEST_DELAY_MS, IMPULSE_PCT, VOL_MULT, ATR_MIN_PCT, COOLDOWN_MS,
- * - TICK_HISTORY, OBI_THRESHOLD, VOL_SPIKE_MULT, BINANCE_REFRESH_MINUTES, SESSION_START
- */
 public class SignalSender {
 
     private final TelegramBotSender bot;
@@ -86,8 +71,8 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
-        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.50); // user earlier wanted >=0.5 default
-        this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 1); // quick cycles for futures (1 min)
+        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.7); // user earlier wanted >=0.5 default
+        this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5); // quick cycles for futures (1 min)
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
 
@@ -831,66 +816,7 @@ public class SignalSender {
         orderbookMap.put(pair, new OrderbookSnapshot(bidVol, askVol, System.currentTimeMillis()));
     }
 
-    // ========================= Start (main loop) =========================
-    public void start() {
-        System.out.println("[SignalSender] Starting (Futures-ready) ...");
-        ensureBinancePairsFresh();
-        try {
-            bot.sendSignal("✅ SignalSender (Futures) started. MIN_CONF=" + MIN_CONF);
-        } catch (Exception e) { System.out.println("[Telegram test send error] " + e.getMessage()); }
 
-        scheduler = Executors.newScheduledThreadPool(2);
-        // main scanning job
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                ensureBinancePairsFresh();
-                List<String> topList = getTopSymbols(TOP_N);
-                List<String> filtered = topList.stream().filter(BINANCE_PAIRS::contains).collect(Collectors.toList());
-
-                List<Signal> candidates = new ArrayList<>();
-
-                for (String pair : filtered) {
-                    // get MTF klines
-                    List<Candle> c1m = fetchKlines(pair, "1m", Math.max(KLINES_LIMIT, 120));
-                    if (c1m.isEmpty()) continue;
-                    List<Candle> c5m = fetchKlines(pair, "5m", Math.max(80, KLINES_LIMIT / 3));
-                    if (c5m.isEmpty()) continue;
-                    List<Candle> c15m = fetchKlines(pair, "15m", Math.max(80, KLINES_LIMIT / 6));
-                    if (c15m.isEmpty()) continue;
-                    List<Candle> c1h = fetchKlines(pair, "1h", Math.max(80, KLINES_LIMIT / 12));
-                    if (c1h.isEmpty()) continue;
-
-                    Optional<Signal> opt = evaluate(pair, c1m, c5m, c15m, c1h);
-                    opt.ifPresent(candidates::add);
-                }
-
-                if (candidates.isEmpty()) {
-                    System.out.println("[MarketQuiet] No active movers this cycle.");
-                }
-
-                for (Signal s : candidates) {
-                    String pairKey = s.symbol + "USDT";
-                    try {
-                        double prevConf = lastSentConfidence.getOrDefault(pairKey, 0.0);
-                        long lastSent = lastSignalTime.getOrDefault(pairKey, 0L);
-                        if (Math.abs(prevConf - s.confidence) < 0.02 && (System.currentTimeMillis() - lastSent) < 3 * 60 * 1000) {
-                            System.out.println("[Debounce] skipping similar signal for " + pairKey + " conf=" + s.confidence);
-                            continue;
-                        }
-                        bot.sendSignal(s.toTelegramMessage());
-                        lastSentConfidence.put(pairKey, s.confidence);
-                        lastSignalTime.put(pairKey, System.currentTimeMillis());
-                    } catch (Exception e) {
-                        System.out.println("[Telegram] send error: " + e.getMessage());
-                    }
-                }
-
-            } catch (Exception e) {
-                System.out.println("[Job error] " + e.getMessage());
-                e.printStackTrace();
-            }
-        }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
-    }
 
     // stop
     public void stop() {
