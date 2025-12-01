@@ -860,6 +860,29 @@ public class SignalSender {
     private void sendRaw(String msg) {
         try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
     }
+    public void start() {
+        System.out.println("[SignalSender] Scheduler started");
 
-    // ========================= END of class =========================
+        scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                ensureBinancePairsFresh(); // обновляем список пар
+                for (String pair : BINANCE_PAIRS) {
+                    try {
+                        List<Candle> c1m = fetchKlines(pair, "1m", 50);
+                        List<Candle> c5m = fetchKlines(pair, "5m", 50);
+                        List<Candle> c15m = fetchKlines(pair, "15m", 50);
+                        List<Candle> c1h = fetchKlines(pair, "1h", 50);
+
+                        Optional<Signal> sigOpt = evaluate(pair, c1m, c5m, c15m, c1h);
+                        sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
+                    } catch (Exception ex) {
+                        System.out.println("[start] Error evaluating " + pair + ": " + ex.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("[start] Scheduler error: " + e.getMessage());
+            }
+        }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
+    }
 }
