@@ -7,7 +7,7 @@ public class BotMain {
 
     public static void main(String[] args) {
         String tgToken = "TELEGRAM_TOKEN";
-        String chatId = "TELEGRAM_CHAT_ID\n";
+        String chatId = "TELEGRAM_CHAT_ID";
 
         TelegramBotSender telegram = new TelegramBotSender(tgToken, chatId);
         SignalSender signalSender = new SignalSender(telegram);
