@@ -141,10 +141,18 @@ public class SignalSender {
     private void ensureBinancePairsFresh() {
         long now = System.currentTimeMillis();
         if (BINANCE_PAIRS.isEmpty() || (now - lastBinancePairsRefresh) > BINANCE_REFRESH_INTERVAL_MS) {
-            BINANCE_PAIRS = getBinanceSymbolsFutures();
+            // Получаем топ 100 монет CoinGecko
+            List<String> topSymbols = getTopSymbols(TOP_N); // TOP_N = 100
+            // Оставляем только те, которые есть на Binance USDT фьючерсах
+            Set<String> allBinance = getBinanceSymbolsFutures();
+            BINANCE_PAIRS = topSymbols.stream()
+                    .filter(allBinance::contains)
+                    .collect(Collectors.toSet());
             lastBinancePairsRefresh = now;
+            System.out.println("[BinanceFutures] Using TOP " + BINANCE_PAIRS.size() + " pairs");
         }
     }
+
 
     // ========================= Fetch Klines (Futures) =========================
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
