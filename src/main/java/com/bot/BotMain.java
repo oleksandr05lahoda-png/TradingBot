@@ -6,8 +6,8 @@ import java.time.format.DateTimeFormatter;
 public class BotMain {
 
     public static void main(String[] args) {
-        String tgToken = "TELEGRAM_TOKEN";  // вставь свой токен
-        String chatId = "TELEGRAM_CHAT_ID"; // вставь свой chat_id
+        String tgToken = "8395445212:AAF7X7oFBx72HgKGoRTcFpdFbuHcZOPfTig";  // вставь свой токен
+        String chatId = "953233853"; // вставь свой chat_id
 
         TelegramBotSender telegram = new TelegramBotSender(tgToken, chatId);
         SignalSender signalSender = new SignalSender(telegram);
