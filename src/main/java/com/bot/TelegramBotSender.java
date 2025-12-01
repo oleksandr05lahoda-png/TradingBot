@@ -1,12 +1,13 @@
 package com.bot;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.concurrent.CompletableFuture;
 
 public class TelegramBotSender {
     private final String token;
@@ -18,8 +19,8 @@ public class TelegramBotSender {
         this.chatId = chatId;
         this.client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2).build();
     }
+
     public void sendSignal(String message) {
-        // Подставим дефолтные значения для остальных параметров
         sendSignal("", "", 0.0, 0.0, 0, message);
     }
 
@@ -33,10 +34,10 @@ public class TelegramBotSender {
         sendMessage(message);
     }
 
-
     public void sendMessage(String message) {
         try {
-            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" + chatId + "&text=" + message;
+            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" + chatId + "&text="
+                    + URLEncoder.encode(message, StandardCharsets.UTF_8);
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .GET()
