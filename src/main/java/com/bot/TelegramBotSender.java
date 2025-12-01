@@ -20,24 +20,11 @@ public class TelegramBotSender {
         this.client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2).build();
     }
 
-    public void sendSignal(String message) {
-        sendSignal("", "", 0.0, 0.0, 0, message);
-    }
-
-    public void sendSignal(String symbol, String direction, double confidence, double price, int rsi, String flags) {
-        String message = symbol + " → " + direction + "\n" +
-                "Confidence: " + String.format("%.2f", confidence) + "\n" +
-                "Price: " + String.format("%.2f", price) + "\n" +
-                "RSI: " + rsi + "\n" +
-                "Flags: " + flags + "\n" +
-                "Time: " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        sendMessage(message);
-    }
-
+    // Асинхронная отправка
     public void sendMessage(String message) {
         try {
-            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" + chatId + "&text="
-                    + URLEncoder.encode(message, StandardCharsets.UTF_8);
+            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" + chatId + "&text=" +
+                    URLEncoder.encode(message, StandardCharsets.UTF_8);
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .GET()
@@ -52,5 +39,39 @@ public class TelegramBotSender {
         } catch (Exception e) {
             System.out.println("[TG] Ошибка создания запроса: " + e.getMessage());
         }
+    }
+
+    // Синхронная отправка
+    public boolean sendMessageSync(String message) {
+        try {
+            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" + chatId + "&text=" +
+                    URLEncoder.encode(message, StandardCharsets.UTF_8);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            System.out.println("[TG " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "] Ответ: " + response.body());
+            return true;
+        } catch (Exception e) {
+            System.out.println("[TG] Ошибка отправки: " + e.getMessage());
+            return false;
+        }
+    }
+
+    // Удобный метод для сигналов
+    public void sendSignal(String message) {
+        sendSignal("", "", 0.0, 0.0, 0, message);
+    }
+
+    public void sendSignal(String symbol, String direction, double confidence, double price, int rsi, String flags) {
+        String message = symbol + " → " + direction + "\n" +
+                "Confidence: " + String.format("%.2f", confidence) + "\n" +
+                "Price: " + String.format("%.2f", price) + "\n" +
+                "RSI: " + rsi + "\n" +
+                "Flags: " + flags + "\n" +
+                "Time: " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        sendMessage(message);
     }
 }
