@@ -797,18 +797,23 @@ public class SignalSender {
     }
 
     private void evaluateTick(String pair, double price, double qty, long ts, MicroTrendResult tr, OrderbookSnapshot obs) {
-        // quick tick-level rules: orderbook imbalance + microtrend strong
         double obi = obs.obi();
-        if (Math.abs(obi) > OBI_THRESHOLD && Math.abs(tr.speed) > 0) {
-            double conf = Math.min(1.0, Math.abs(tr.speed) * 0.5 + Math.abs(obi) * 0.3);
-            String type = (obi > 0 ? "TICK_LONG_OBI" : "TICK_SHORT_OBI");
-            if (conf > MIN_CONF) {
-                if (!isCooldown(pair)) {
-                    bot.sendSignal(String.format("%s %s conf=%.2f price=%.8f", pair, type, conf, price));
-                    lastSentConfidence.put(pair, conf);
-                    lastSignalTime.put(pair, System.currentTimeMillis());
-                }
-            }
+        double microSpeed = tr.speed;
+        double microAccel = tr.accel;
+        double conf = Math.min(1.0, Math.abs(microSpeed) * 0.4 + Math.abs(obi) * 0.35 + Math.abs(microAccel) * 0.15);
+
+        boolean strongTickTrigger = Math.abs(obi) > OBI_THRESHOLD && Math.abs(microSpeed) > IMPULSE_PCT;
+
+        if (strongTickTrigger && conf > MIN_CONF && !isCooldown(pair)) {
+            String type = (obi > 0) ? "TICK_LONG_OBI" : "TICK_SHORT_OBI";
+            lastSentConfidence.put(pair, conf);
+            lastSignalTime.put(pair, System.currentTimeMillis());
+
+            // Улучшенные фьючерсные сигналы: включаем microtrend ускорение
+            String msg = String.format("%s %s conf=%.2f price=%.8f microSpeed=%.5f microAccel=%.5f obi=%.5f",
+                    pair, type, conf, price, microSpeed, microAccel, obi);
+            bot.sendSignal(msg);
+            System.out.println("[TickSignal] " + msg);
         }
     }
 
