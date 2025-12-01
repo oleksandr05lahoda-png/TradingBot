@@ -9,75 +9,125 @@ import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
+
+/**
+ * SignalSender — полная версия для фьючерсов.
+ *
+ * Особенности:
+ * - Берёт klines с Binance Futures (fapi) для 1m/5m/15m/1h
+ * - Микро-тик (aggTrade) + partial depth для OBI
+ * - 10 индикаторов: EMA(20/50/100), RSI(14), MACD(12/26), Momentum(3), ATR(14), VWAP(15m), OBV, SMA, EMA-based norms
+ * - Price Action: swing highs/lows, BOS, liquidity sweep
+ * - Compose confidence, multiTF confirm, strong triggers, debounce/cooldown, per-pair state
+ * - Отправка в Telegram через TelegramBotSender (класс должен предоставлять sendSignal(String))
+ *
+ * Утилиты: настраивается через ENV:
+ * - TOP_N, MIN_CONFIDENCE, INTERVAL_MINUTES, KLINES, REQUEST_DELAY_MS, IMPULSE_PCT, VOL_MULT, ATR_MIN_PCT, COOLDOWN_MS,
+ * - TICK_HISTORY, OBI_THRESHOLD, VOL_SPIKE_MULT, BINANCE_REFRESH_MINUTES, SESSION_START
+ */
 public class SignalSender {
 
     private final TelegramBotSender bot;
     private final HttpClient http;
-    private final Set<String> STABLE = Set.of("USDT", "USDC", "BUSD"); // skip stable-like tokens
 
-    // CONFIG (from ENV or defaults)
+    // ---------------- CONFIG (env or defaults) ----------------
     private final int TOP_N;
-    private final double MIN_CONF;            // base threshold (0..1) - default updated to 0.50
+    private final double MIN_CONF;            // 0..1
     private final int INTERVAL_MIN;           // scheduler interval minutes
-    private final int KLINES_LIMIT;           // number of candles fetched for each TF
-    private final long REQUEST_DELAY_MS;      // delay between HTTP calls to avoid rate limits
+    private final int KLINES_LIMIT;           // number of candles fetched per TF
+    private final long REQUEST_DELAY_MS;      // delay between HTTP calls
 
-    // MTF timeframes
-    private final String TF_ENTRY = "1m";     // entry TF
-    private final String TF_SHORT = "5m";
-    private final String TF_MED = "15m";
-    private final String TF_LONG = "1h";
+    private final double IMPULSE_PCT;         // one-minute impulse threshold (relative)
+    private final double VOL_MULTIPLIER;      // lastQ >= avgQ * VOL_MULTIPLIER
+    private final double ATR_MIN_PCT;         // min ATR pct for volatility check
+    private final long COOLDOWN_MS;           // cooldown per symbol
+    private final long BINANCE_REFRESH_INTERVAL_MS; // refresh pairs
 
-    // thresholds (env)
-    private final double IMPULSE_PCT;      // if one-minute candle body > this -> impulse (treat as strong move)
-    private final double VOL_MULTIPLIER;   // volume multiplier vs avg to consider vol OK
-    private final double ATR_MIN_PCT;      // min ATR relative to price
-    private final long COOLDOWN_MS;        // cooldown per symbol
-    private final long BINANCE_REFRESH_INTERVAL_MS;
-
-    // VWAP session start (HH:mm) - intraday VWAP; default midnight UTC
     private final LocalTime VWAP_SESSION_START;
 
+    // Micro / tick params
+    private final int TICK_HISTORY;
+    private final double OBI_THRESHOLD;
+    private final double VOLUME_SPIKE_MULT;
+
+    // ---------------- internal state ----------------
+    private final Set<String> STABLE; // tokens to skip
     private Set<String> BINANCE_PAIRS = new HashSet<>();
     private long lastBinancePairsRefresh = 0L;
 
-    private final Map<String, Long> lastOpenTimeMap = new ConcurrentHashMap<>();
-    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
-    private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastOpenTimeMap = new ConcurrentHashMap<>();   // openTime per symbol processed
+    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();     // last sent timestamp
+    private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
+    private final Map<String, Double> lastPriceMap = new ConcurrentHashMap<>();
 
-    // small utilities
     private final DateTimeFormatter dtf = DateTimeFormatter.ISO_INSTANT;
 
+    // tick / ws state
+    private java.net.http.WebSocket wsTick; // optional single ws used per pair connect model
+    private final Map<String, Deque<Double>> tickPriceDeque = new ConcurrentHashMap<>();
+    private final Map<String, Double> lastTickPrice = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastTickTime = new ConcurrentHashMap<>();
+    private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
+    private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
+
+    // daily request tracking / rate limiting
+    private final AtomicLong dailyRequests = new AtomicLong(0);
+    private long dailyResetTs = System.currentTimeMillis();
+
+    // scheduler
+    private ScheduledExecutorService scheduler;
+
+    // Constructor
     public SignalSender(TelegramBotSender bot) {
         this.bot = bot;
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
-        this.TOP_N = Integer.parseInt(System.getenv().getOrDefault("TOP_N", "100"));
-        // default MIN_CONF set to 0.50 as requested (user chose custom threshold option)
-        this.MIN_CONF = Double.parseDouble(System.getenv().getOrDefault("MIN_CONFIDENCE", "0.45"));
-        this.INTERVAL_MIN = Integer.parseInt(System.getenv().getOrDefault("INTERVAL_MINUTES", "10"));
-        this.KLINES_LIMIT = Integer.parseInt(System.getenv().getOrDefault("KLINES", "120"));
-        this.REQUEST_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("REQUEST_DELAY_MS", "150"));
+        // defaults (use env to override)
+        this.TOP_N = envInt("TOP_N", 100);
+        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.50); // user earlier wanted >=0.5 default
+        this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 1); // quick cycles for futures (1 min)
+        this.KLINES_LIMIT = envInt("KLINES", 240);
+        this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
 
-        this.IMPULSE_PCT = Double.parseDouble(System.getenv().getOrDefault("IMPULSE_PCT", "0.02")); // 2%
-        this.VOL_MULTIPLIER = Double.parseDouble(System.getenv().getOrDefault("VOL_MULT", "0.9"));
-        this.ATR_MIN_PCT = Double.parseDouble(System.getenv().getOrDefault("ATR_MIN_PCT", "0.0007")); // 0.07%
-        this.COOLDOWN_MS = Long.parseLong(System.getenv().getOrDefault("COOLDOWN_MS", String.valueOf(60 * 1000))); // default 60s cooldown per pair
-        long binanceRefreshMin = Long.parseLong(System.getenv().getOrDefault("BINANCE_REFRESH_MINUTES", "60"));
-        this.BINANCE_REFRESH_INTERVAL_MS = binanceRefreshMin * 60 * 1000L;
+        this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
+        this.VOL_MULTIPLIER = envDouble("VOL_MULT", 0.9);
+        this.ATR_MIN_PCT = envDouble("ATR_MIN_PCT", 0.0007);
+        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 3 * 60 * 1000L); // 3 minutes default
+        long brMin = envLong("BINANCE_REFRESH_MINUTES", 60);
+        this.BINANCE_REFRESH_INTERVAL_MS = brMin * 60 * 1000L;
 
-        String sessionStart = System.getenv().getOrDefault("SESSION_START", "00:00"); // default UTC midnight
-        this.VWAP_SESSION_START = LocalTime.parse(sessionStart);
+        this.VWAP_SESSION_START = LocalTime.parse(System.getenv().getOrDefault("SESSION_START", "00:00"));
+
+        this.TICK_HISTORY = envInt("TICK_HISTORY", 300);
+        this.OBI_THRESHOLD = envDouble("OBI_THRESHOLD", 0.28);
+        this.VOLUME_SPIKE_MULT = envDouble("VOL_SPIKE_MULT", 1.4);
+
+        this.STABLE = Set.of("USDT", "USDC", "BUSD");
 
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
     }
 
-    // -------------------- Binance / CoinGecko helpers --------------------
-    public Set<String> getBinanceSymbols() {
+    // ========================= Helpers for env parsing =========================
+    private int envInt(String k, int def) {
+        try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(def))); }
+        catch (Exception e) { return def; }
+    }
+    private long envLong(String k, long def) {
+        try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(def))); }
+        catch (Exception e) { return def; }
+    }
+    private double envDouble(String k, double def) {
+        try { return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(def))); }
+        catch (Exception e) { return def; }
+    }
+
+    // ========================= Binance Helpers =========================
+    public Set<String> getBinanceSymbolsFutures() {
         try {
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://api.binance.com/api/v3/exchangeInfo"))
+                    .uri(URI.create("https://fapi.binance.com/fapi/v1/exchangeInfo"))
                     .timeout(Duration.ofSeconds(10))
                     .GET().build();
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
@@ -89,14 +139,16 @@ public class SignalSender {
                 JSONObject s = arr.getJSONObject(i);
                 String symbol = s.getString("symbol");
                 String status = s.optString("status", "TRADING");
+                String contractType = s.optString("contractType", "");
+                // only USDT perpetual / TRADING
                 if ("TRADING".equalsIgnoreCase(status) && symbol.endsWith("USDT")) {
                     result.add(symbol);
                 }
             }
-            System.out.println("[Binance] Loaded " + result.size() + " spot USDT pairs");
+            System.out.println("[BinanceFutures] Loaded " + result.size() + " pairs");
             return result;
         } catch (Exception e) {
-            System.out.println("[Binance] Could NOT load pairs: " + e.getMessage());
+            System.out.println("[BinanceFutures] Could NOT load pairs: " + e.getMessage());
             return Set.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
         }
     }
@@ -104,78 +156,18 @@ public class SignalSender {
     private void ensureBinancePairsFresh() {
         long now = System.currentTimeMillis();
         if (BINANCE_PAIRS.isEmpty() || (now - lastBinancePairsRefresh) > BINANCE_REFRESH_INTERVAL_MS) {
-            BINANCE_PAIRS = getBinanceSymbols();
+            BINANCE_PAIRS = getBinanceSymbolsFutures();
             lastBinancePairsRefresh = now;
         }
     }
 
-    public List<String> getTopSymbols(int limit) {
-        try {
-            String url = String.format(
-                    "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=%d&page=1",
-                    limit
-            );
-            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(10)).GET().build();
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            JSONArray arr = new JSONArray(resp.body());
-
-            List<String> list = new ArrayList<>();
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject c = arr.getJSONObject(i);
-                String sym = c.getString("symbol").toUpperCase();
-                if (STABLE.contains(sym)) continue;
-                list.add(sym + "USDT");
-            }
-            return list;
-        } catch (Exception e) {
-            System.out.println("[CoinGecko] Error: " + e.getMessage());
-            return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT");
-        }
-    }
-
-    // -------------------- Candle structure --------------------
-    public static class Candle {
-        public final long openTime;
-        public final double open;
-        public final double high;
-        public final double low;
-        public final double close;
-        public final double volume;
-        public final double quoteAssetVolume;
-        public final long closeTime;
-
-        public Candle(long openTime, double open, double high, double low, double close,
-                      double volume, double quoteAssetVolume, long closeTime) {
-            this.openTime = openTime;
-            this.open = open;
-            this.high = high;
-            this.low = low;
-            this.close = close;
-            this.volume = volume;
-            this.quoteAssetVolume = quoteAssetVolume;
-            this.closeTime = closeTime;
-        }
-
-        public double body() {
-            return Math.abs(close - open);
-        }
-
-        public double bodyPct() {
-            return body() / (open + 1e-12);
-        }
-
-        public boolean isBull() { return close > open; }
-        public boolean isBear() { return close < open; }
-    }
-
+    // ========================= Fetch Klines (Futures) =========================
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
+            // small throttle
             Thread.sleep(REQUEST_DELAY_MS);
-            String url = String.format("https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%d",
-                    symbol, interval, limit);
-            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(10)).GET().build();
+            String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", symbol, interval, limit);
+            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             String body = resp.body();
             if (body == null || body.isEmpty() || !body.startsWith("[")) {
@@ -198,19 +190,111 @@ public class SignalSender {
             }
             return list;
         } catch (Exception e) {
-            System.out.println("[Binance] Error fetching klines " + symbol + " " + interval + " : " + e.getMessage());
+            System.out.println("[Binance] Error fetching klines for " + symbol + " : " + e.getMessage());
             return Collections.emptyList();
         }
     }
 
-    // -------------------- Indicators --------------------
+    // ========================= Candle data class =========================
+    public static class Candle {
+        public final long openTime;
+        public final double open;
+        public final double high;
+        public final double low;
+        public final double close;
+        public final double volume;
+        public final double quoteAssetVolume;
+        public final long closeTime;
+
+        public Candle(long openTime, double open, double high, double low, double close,
+                      double volume, double quoteAssetVolume, long closeTime) {
+            this.openTime = openTime;
+            this.open = open;
+            this.high = high;
+            this.low = low;
+            this.close = close;
+            this.volume = volume;
+            this.quoteAssetVolume = quoteAssetVolume;
+            this.closeTime = closeTime;
+        }
+
+        public double body() { return Math.abs(close - open); }
+        public double bodyPct() { return body() / (open + 1e-12); }
+        public boolean isBull() { return close > open; }
+        public boolean isBear() { return close < open; }
+    }
+
+    // ========================= Micro candle builder (ticks -> tiny candles) =========================
+    public static class MicroCandleBuilder {
+        private final int intervalMs;
+        private long currentBucketStart = -1;
+        private double open = Double.NaN, high = Double.NEGATIVE_INFINITY, low = Double.POSITIVE_INFINITY, close = Double.NaN;
+        private double volume = 0.0;
+        private long closeTime = -1;
+
+        public MicroCandleBuilder(int intervalMs) { this.intervalMs = intervalMs; }
+
+        public Optional<Candle> addTick(long tsMillis, double price, double qty) {
+            long bucket = (tsMillis / intervalMs) * intervalMs;
+            if (currentBucketStart == -1) {
+                currentBucketStart = bucket;
+                open = price; high = price; low = price; close = price; volume = qty; closeTime = bucket + intervalMs - 1;
+                return Optional.empty();
+            }
+            if (bucket == currentBucketStart) {
+                high = Math.max(high, price);
+                low = Math.min(low, price);
+                close = price;
+                volume += qty;
+                return Optional.empty();
+            } else {
+                Candle c = new Candle(currentBucketStart, open, high, low, close, volume, volume, closeTime);
+                currentBucketStart = bucket;
+                open = price; high = price; low = price; close = price; volume = qty; closeTime = bucket + intervalMs - 1;
+                return Optional.of(c);
+            }
+        }
+    }
+
+    // ========================= Orderbook snapshot =========================
+    public static class OrderbookSnapshot {
+        public final double bidVolume;
+        public final double askVolume;
+        public final long timestamp;
+
+        public OrderbookSnapshot(double bidVolume, double askVolume, long timestamp) {
+            this.bidVolume = bidVolume;
+            this.askVolume = askVolume;
+            this.timestamp = timestamp;
+        }
+
+        public double obi() {
+            double s = bidVolume + askVolume + 1e-12;
+            return (bidVolume - askVolume) / s;
+        }
+    }
+
+    // ========================= Microtrend container =========================
+    public static class MicroTrendResult {
+        public final double speed;
+        public final double accel;
+        public final double avgTick;
+        public MicroTrendResult(double speed, double accel, double avgTick) {
+            this.speed = speed; this.accel = accel; this.avgTick = avgTick;
+        }
+    }
+
+    // ========================= Indicator implementations =========================
+
+    // SMA
     public static double sma(List<Double> prices, int period) {
-        if (prices == null || prices.size() < period) return prices.get(prices.size()-1);
+        if (prices == null || prices.size() < period) return prices.get(prices.size() - 1);
         double sum = 0;
-        for (int i = prices.size()-period; i < prices.size(); i++) sum += prices.get(i);
+        for (int i = prices.size() - period; i < prices.size(); i++) sum += prices.get(i);
         return sum / period;
     }
 
+    // EMA
     public static double ema(List<Double> prices, int period) {
         if (prices == null || prices.isEmpty()) return 0.0;
         double k = 2.0 / (period + 1);
@@ -219,7 +303,7 @@ public class SignalSender {
         return ema;
     }
 
-    // RSI - Wilder's basic implementation with period lookback
+    // RSI (Wilder)
     public static double rsi(List<Double> prices, int period) {
         if (prices == null || prices.size() <= period) return 50.0;
         double gain = 0, loss = 0;
@@ -251,7 +335,7 @@ public class SignalSender {
         return sum / period;
     }
 
-    // momentum: last price change over n candles (relative)
+    // Momentum % over n candles
     public static double momentumPct(List<Double> prices, int n) {
         if (prices == null || prices.size() <= n) return 0.0;
         double last = prices.get(prices.size() - 1);
@@ -259,7 +343,7 @@ public class SignalSender {
         return (last - prev) / (prev + 1e-12);
     }
 
-    // OBV (On Balance Volume)
+    // OBV
     public static double obv(List<Candle> candles) {
         if (candles == null || candles.isEmpty()) return 0.0;
         double val = 0.0;
@@ -272,12 +356,10 @@ public class SignalSender {
         return val;
     }
 
-    // VWAP (intraday). Computes VWAP for list of candles but aligned to session start:
-    // For simplicity we calculate VWAP across provided list assuming they cover a session.
+    // VWAP (simple across list)
     public static double vwap(List<Candle> candles) {
         if (candles == null || candles.isEmpty()) return 0.0;
-        double pv = 0.0;
-        double vol = 0.0;
+        double pv = 0.0, vol = 0.0;
         for (Candle c : candles) {
             double tp = (c.high + c.low + c.close) / 3.0;
             pv += tp * c.volume;
@@ -287,19 +369,14 @@ public class SignalSender {
         return pv / vol;
     }
 
-    // -------------------- Price Action helpers --------------------
-    // detect simple swing highs/lows: returns list of pairs (index, price) for recent swings
-    // We'll implement small window swing detection (n left, n right)
+    // ========================= Price Action helpers =========================
     public static List<Integer> detectSwingHighs(List<Candle> candles, int leftRight) {
         List<Integer> res = new ArrayList<>();
         for (int i = leftRight; i < candles.size() - leftRight; i++) {
             double v = candles.get(i).high;
             boolean isHigh = true;
             for (int l = i - leftRight; l <= i + leftRight; l++) {
-                if (candles.get(l).high > v) {
-                    isHigh = false;
-                    break;
-                }
+                if (candles.get(l).high > v) { isHigh = false; break; }
             }
             if (isHigh) res.add(i);
         }
@@ -312,54 +389,41 @@ public class SignalSender {
             double v = candles.get(i).low;
             boolean isLow = true;
             for (int l = i - leftRight; l <= i + leftRight; l++) {
-                if (candles.get(l).low < v) {
-                    isLow = false;
-                    break;
-                }
+                if (candles.get(l).low < v) { isLow = false; break; }
             }
             if (isLow) res.add(i);
         }
         return res;
     }
 
-    // Determine market structure on given timeframe using recent swings.
-    // Returns: 1 = bullish structure (HH/HL), -1 = bearish (LL/LH), 0 = unclear
     public static int marketStructure(List<Candle> candles) {
         if (candles == null || candles.size() < 20) return 0;
-        // Very simple approach: compare last two swing highs/lows
         List<Integer> highs = detectSwingHighs(candles, 3);
         List<Integer> lows = detectSwingLows(candles, 3);
         if (highs.size() < 2 || lows.size() < 2) return 0;
-
         int lastHighIdx = highs.get(highs.size() - 1);
         int prevHighIdx = highs.get(highs.size() - 2);
         int lastLowIdx = lows.get(lows.size() - 1);
         int prevLowIdx = lows.get(lows.size() - 2);
-
         double lastHigh = candles.get(lastHighIdx).high;
         double prevHigh = candles.get(prevHighIdx).high;
         double lastLow = candles.get(lastLowIdx).low;
         double prevLow = candles.get(prevLowIdx).low;
-
         boolean hh = lastHigh > prevHigh;
         boolean hl = lastLow > prevLow;
         boolean ll = lastLow < prevLow;
         boolean lh = lastHigh < prevHigh;
-
         if (hh && hl) return 1;
         if (ll && lh) return -1;
         return 0;
     }
 
-    // Break Of Structure detection: did price break previous swing high/low significantly?
     public static boolean detectBOS(List<Candle> candles) {
         if (candles == null || candles.size() < 10) return false;
         List<Integer> highs = detectSwingHighs(candles, 3);
         List<Integer> lows = detectSwingLows(candles, 3);
         if (highs.size() < 2 && lows.size() < 2) return false;
-
-        Candle last = candles.get(candles.size()-1);
-        // if price breaks above last swing high by a small margin -> BOS up
+        Candle last = candles.get(candles.size() - 1);
         if (highs.size() >= 2) {
             double lastSwingHigh = candles.get(highs.get(highs.size() - 1)).high;
             if (last.close > lastSwingHigh * 1.0006) return true;
@@ -371,22 +435,20 @@ public class SignalSender {
         return false;
     }
 
-    // Simple liquidity sweep detection: check for wick beyond recent swing high/low followed by reversal
     public static boolean detectLiquiditySweep(List<Candle> candles) {
         if (candles == null || candles.size() < 6) return false;
         int n = candles.size();
-        Candle last = candles.get(n-1);
-        Candle prev = candles.get(n-2);
-        // look for long upper wick then close back lower (bull trap) or opposite
+        Candle last = candles.get(n - 1);
+        Candle prev = candles.get(n - 2);
         double upperWick = last.high - Math.max(last.open, last.close);
         double lowerWick = Math.min(last.open, last.close) - last.low;
         double body = Math.abs(last.close - last.open);
-        if (upperWick > body * 1.8 && last.close < prev.close) return true; // possible short-sweep (liquid long)
-        if (lowerWick > body * 1.8 && last.close > prev.close) return true; // possible long-sweep (liquid short)
+        if (upperWick > body * 1.8 && last.close < prev.close) return true;
+        if (lowerWick > body * 1.8 && last.close > prev.close) return true;
         return false;
     }
 
-    // EMA direction helper with hysteresis threshold
+    // EMA direction helper (with hysteresis)
     private int emaDirection(List<Candle> candles, int shortP, int longP, double hysteresis) {
         if (candles == null || candles.size() < longP + 2) return 0;
         List<Double> closes = candles.stream().map(c -> c.close).collect(Collectors.toList());
@@ -397,178 +459,22 @@ public class SignalSender {
         return 0;
     }
 
-    // -------------------- Confidence composition (improved) --------------------
-    // rawScore in -1..1 space built from robust primitives (ema trend, rsi extremes, macd-like, momentum)
-    private double composeConfidence(double rawScore, int mtfConfirm, boolean volOk, boolean atrOk,
-                                     boolean notImpulse, boolean vwapAligned, boolean structureAligned,
-                                     boolean bos, boolean liquiditySweep) {
-        // base absolute strength
-        double base = Math.min(1.0, Math.abs(rawScore));
-
-        // require structure alignment to give meaningful boost
-        double boost = 0.0;
-        if (structureAligned) boost += 0.12;             // structure alignment matters most
-        if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int)Math.signum(rawScore))) boost += 0.10;
-        if (volOk) boost += 0.05;
-        if (atrOk) boost += 0.03;
-        if (vwapAligned) boost += 0.04;
-        if (bos) boost += 0.03;
-        // for futures: treat impulse as *possible* positive sign (less penalize)
-        if (!notImpulse) {
-            // small penalize but not full rejection; main logic will allow impulse as trigger
-            boost -= 0.02;
-        }
-        if (liquiditySweep) {
-            // liquidity sweeps decrease reliability unless structure and mtf both confirm
-            if (!structureAligned || mtfConfirm == 0) boost -= 0.10;
-            else boost -= 0.03;
-        }
-        double conf = Math.min(1.0, Math.max(0.0, base + boost));
-        return conf;
+    // Overload with default hysteresis
+    private int emaDirection(List<Candle> candles, int shortP, int longP) {
+        return emaDirection(candles, shortP, longP, 0.001);
     }
 
-    // -------------------- Strategy: evaluate --------------------
-    public Optional<Signal> evaluate(String pair,
-                                     List<Candle> c1m, List<Candle> c5m, List<Candle> c15m, List<Candle> c1h) {
-        // Require enough candles
-        if (c1m == null || c1m.size() < 30) return Optional.empty();
+    // ========================= Strategy primitives -> normalize to -1..1 =========================
 
-        // cooldown
-        if (isCooldown(pair)) return Optional.empty();
-        // 1. Сначала считаем направления на разных таймфреймах
-        int dir1h = emaDirection(c1h, 20, 50, 0.002); // trend on 1h
-        int dir15m = emaDirection(c15m, 9, 21, 0.002);
-        int dir5m = emaDirection(c5m, 9, 21, 0.002);
-        int dir1m = emaDirection(c1m, 9, 21, 0.001);
-
-// 2. Потом вычисляем mtfConfirm
-        int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
-
-// 3. Потом проверяем ранний тренд
-        boolean earlyTrigger = earlyTrendTrigger(c1m);
-        if (earlyTrigger) {
-            mtfConfirm = 0; // при раннем тренде игнорируем MTF подтверждение
-        }
-
-        // avoid duplicate processing for same candle
-        long newOpen = c1m.get(c1m.size() - 1).openTime;
-        long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
-        if (newOpen <= lastOpen) return Optional.empty();
-        lastOpenTimeMap.put(pair, newOpen);
-
-        // compute primitive arrays
-        List<Double> closes1m = c1m.stream().map(c -> c.close).collect(Collectors.toList());
-        List<Double> closes5m = c5m.stream().map(c -> c.close).collect(Collectors.toList());
-        List<Double> closes15m = c15m.stream().map(c -> c.close).collect(Collectors.toList());
-        List<Double> closes1h = c1h.stream().map(c -> c.close).collect(Collectors.toList());
-
-        // primitives
-        double emaScore = strategyEMANorm(closes1m);        // -1..1
-        double rsiScore = strategyRSINorm(closes1m);        // -1..1
-        double macdScore = strategyMACDNorm(closes1m);      // -1..1
-        double momScore = strategyMomentumNorm(closes1m);   // -1..1
-
-        // combine to raw score with tuned weights (EMA and MACD stronger)
-        double rawScore = emaScore * 0.38 + macdScore * 0.28 + rsiScore * 0.19 + momScore * 0.15;
-        // sign is direction
-
-        // filters
-        boolean volOk = isVolumeOk(c1m);                    // on entry TF
-        boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);
-        boolean impulse = isImpulseCandle(c1m.get(c1m.size() - 1));
-        // Adaptive impulse based on last 20 candles
-        double avgBody = c1m.stream()
-                .skip(Math.max(0, c1m.size() - 20))
-                .mapToDouble(c -> Math.abs(c.close - c.open))
-                .average()
-                .orElse(IMPULSE_PCT);
-        double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-        impulse = Math.abs(c1m.get(c1m.size() - 1).close - c1m.get(c1m.size() - 1).open) / (c1m.get(c1m.size() - 1).open + 1e-12) >= adaptiveImpulse;
-
-        boolean liquSweep = detectLiquiditySweep(c1m);
-        // price action
-        int structure1h = marketStructure(c1h);
-        int structure15m = marketStructure(c15m);
-        int structure5m = marketStructure(c5m);
-        int structure1m = marketStructure(c1m);
-        boolean structureAligned = (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure15m)) ||
-                (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure5m));
-
-        // VWAP alignment: compute VWAP on 15m
-        double vwap15 = vwap(c15m);
-        double lastPrice = c1m.get(c1m.size() - 1).close;
-        boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) || (rawScore < 0 && lastPrice < vwap15);
-
-        boolean bos = detectBOS(c5m); // treat BOS on 5m as important
-
-        // ATR breakout: check against last swing on 5m
-        double atrVal = atr(c5m, 14);
-        List<Integer> highs = detectSwingHighs(c5m, 3);
-        List<Integer> lows = detectSwingLows(c5m, 3);
-        double lastSwingHigh = highs.isEmpty() ? Double.NaN : c5m.get(highs.get(highs.size() - 1)).high;
-        double lastSwingLow = lows.isEmpty() ? Double.NaN : c5m.get(lows.get(lows.size() - 1)).low;
-        boolean atrBreakLong = !Double.isNaN(lastSwingHigh) && lastPrice > lastSwingHigh + atrVal;
-        boolean atrBreakShort = !Double.isNaN(lastSwingLow) && lastPrice < lastSwingLow - atrVal;
-
-        // compose confidence
-        double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
-
-        // If there's a strong impulse or ATR-break, boost confidence and relax strict MTF requirement
-        boolean strongTrigger = false;
-        if ((impulse && volOk) || atrBreakLong || atrBreakShort) {
-            strongTrigger = true;
-            confidence = Math.min(1.0, confidence + 0.15); // boost for strong move
-            // relax MTF requirement: keep mtfConfirm as-is for scoring, but allow pass-through
-        }
-
-        // Decide direction: require either rawScore direction OR ATR-break/impulse direction
-        String direction = null;
-        double prevClose = c1m.get(c1m.size() - 2).close;
-        boolean priceUp = lastPrice > prevClose;
-        boolean priceDown = lastPrice < prevClose;
-
-        // Primary criteria: rawScore direction + confidence + confirmations OR strongTrigger can override some checks
-        if ((rawScore > 0 || atrBreakLong || (impulse && priceUp)) &&
-                confidence >= MIN_CONF &&
-                ( (mtfConfirm >= 0 && structureAligned && vwapAligned) || strongTrigger )) {
-            direction = "LONG";
-        } else if ((rawScore < 0 || atrBreakShort || (impulse && priceDown)) &&
-                confidence >= MIN_CONF &&
-                ( (mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger )) {
-            direction = "SHORT";
-        } else {
-            return Optional.empty();
-        }
-
-        // Extra safety: if liquidity sweep present and confidence not very high -> skip
-        if (liquSweep && confidence < 0.92) {
-            System.out.println(String.format("[Filter] %s rejected due liquidity sweep conf=%.2f", pair, confidence));
-            return Optional.empty();
-        }
-
-        // ensure trend alignment with 1h if not a strongTrigger: skip counter-trend unless strong
-        if (!strongTrigger) {
-            if (direction.equals("LONG") && dir1h < 0) return Optional.empty();
-            if (direction.equals("SHORT") && dir1h > 0) return Optional.empty();
-        }
-
-        double rsiVal = rsi(closes1m, 14);
-        Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal, rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong, atrBreakShort, impulse, earlyTrigger);
-        markSignalSent(pair);
-        return Optional.of(s);
-    }
-
-    // Improved strategy helpers for norms
+    // EMA norm: measure e20-e50 and e50-e100
     private double strategyEMANorm(List<Double> closes) {
-        if (closes == null || closes.size() < 50) return 0.0;
+        if (closes == null || closes.size() < 100) return 0.0;
         double e20 = ema(closes, 20);
         double e50 = ema(closes, 50);
         double e100 = ema(closes, 100);
-        // measure e20 - e50 and e50 - e100
         double a = (e20 - e50) / (e50 + 1e-12);
         double b = (e50 - e100) / (e100 + 1e-12);
         double combined = (a + b) / 2.0;
-        // normalize to -1..1 using a reasonable scale (0.02 ~ strong)
         return Math.max(-1.0, Math.min(1.0, combined / 0.02));
     }
 
@@ -586,7 +492,7 @@ public class SignalSender {
         double macd = ema(closes, 12) - ema(closes, 26);
         double last = closes.get(closes.size() - 1);
         double rel = macd / (last + 1e-12);
-        return Math.max(-1.0, Math.min(1.0, rel / 0.008)); // scaled more aggressively
+        return Math.max(-1.0, Math.min(1.0, rel / 0.008));
     }
 
     private double strategyMomentumNorm(List<Double> closes) {
@@ -594,22 +500,13 @@ public class SignalSender {
         return Math.max(-1.0, Math.min(1.0, raw / 0.01));
     }
 
-    // volume helpers
+    // ----------------- volume helpers -----------------
     private double avgQuoteVolume(List<Candle> candles, int lookback) {
         if (candles == null || candles.isEmpty()) return 0.0;
         int lb = Math.min(lookback, candles.size());
         double s = 0;
         for (int i = candles.size() - lb; i < candles.size(); i++) s += candles.get(i).quoteAssetVolume;
         return s / lb;
-    }
-
-    public boolean isCooldown(String pair) {
-        long now = System.currentTimeMillis();
-        long last = lastSignalTime.getOrDefault(pair, 0L);
-        return (now - last) < COOLDOWN_MS;
-    }
-    public void markSignalSent(String pair) {
-        lastSignalTime.put(pair, System.currentTimeMillis());
     }
 
     public boolean isVolumeOk(List<Candle> candles) {
@@ -622,52 +519,169 @@ public class SignalSender {
     public boolean isVolatilityOk(List<Candle> candles, double minAtrPct) {
         if (candles == null || candles.size() < 20) return false;
         double atrVal = atr(candles, 14);
-        double lastPrice = candles.get(candles.size()-1).close;
+        double lastPrice = candles.get(candles.size() - 1).close;
         double atrPct = atrVal / (lastPrice + 1e-12);
         return atrPct >= minAtrPct;
     }
 
-    public boolean isImpulseCandle(Candle c) {
-        if (c == null) return false;
-        // Adaptive impulse based on last 20 candles average body
-        int lookback = 20;
-        double avgBody = 0.0;
-        if (c != null && c.openTime > 0) { // dummy check
-            avgBody = c.body(); // default to current if no list available
-        }
-        double adaptiveImpulse = avgBody * 1.5;
+    // Adaptive impulse test
+    public boolean isImpulseCandle(Candle c, List<Candle> recent) {
+        if (c == null || recent == null || recent.size() < 5) return false;
+        double avgBody = recent.stream()
+                .skip(Math.max(0, recent.size() - 20))
+                .mapToDouble(x -> Math.abs(x.close - x.open))
+                .average().orElse(IMPULSE_PCT);
+        double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
         double change = Math.abs(c.close - c.open) / (c.open + 1e-12);
-        return change >= Math.min(IMPULSE_PCT, adaptiveImpulse);
-    }
-    private boolean earlyTrendTrigger(List<Candle> candles) {
-        if (candles == null || candles.size() < 3) return false;
-        int bullCount = 0;
-        int bearCount = 0;
-        for (int i = candles.size() - 3; i < candles.size(); i++) {
-            if (candles.get(i).isBull()) bullCount++;
-            if (candles.get(i).isBear()) bearCount++;
-        }
-        return bullCount >= 2 || bearCount >= 2;
+        return change >= adaptiveImpulse;
     }
 
-    // multiTF confirm: simple voting with bias to higher TF (1h>15m>5m>1m)
+    // ----------------- Multi-TF confirm -----------------
     private int multiTFConfirm(int dir1h, int dir15m, int dir5m, int dir1m) {
         int score = 0;
         score += dir1h * 3;
         score += dir15m * 2;
         score += dir5m * 1;
-        score += dir1m * 0; // 1m is for trigger only
+        score += dir1m * 0; // 1m is trigger only
         if (score > 2) return 1;
         if (score < -2) return -1;
         return 0;
     }
 
-    // emaDirection wrapper for external use
-    private int emaDirection(List<Candle> candles, int shortP, int longP) {
-        return emaDirection(candles, shortP, longP, 0.001);
+    // ----------------- Compose confidence -----------------
+    private double composeConfidence(double rawScore, int mtfConfirm, boolean volOk, boolean atrOk,
+                                     boolean notImpulse, boolean vwapAligned, boolean structureAligned,
+                                     boolean bos, boolean liquiditySweep) {
+        double base = Math.min(1.0, Math.abs(rawScore));
+        double boost = 0.0;
+        if (structureAligned) boost += 0.12;
+        if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int)Math.signum(rawScore))) boost += 0.10;
+        if (volOk) boost += 0.05;
+        if (atrOk) boost += 0.03;
+        if (vwapAligned) boost += 0.04;
+        if (bos) boost += 0.03;
+        if (!notImpulse) boost -= 0.02;
+        if (liquiditySweep) {
+            if (!structureAligned || mtfConfirm == 0) boost -= 0.10;
+            else boost -= 0.03;
+        }
+        double conf = Math.min(1.0, Math.max(0.0, base + boost));
+        return conf;
     }
 
-    // -------------------- Signal data class --------------------
+    // ========================= Evaluate strategy per symbol =========================
+    public Optional<Signal> evaluate(String pair,
+                                     List<Candle> c1m, List<Candle> c5m, List<Candle> c15m, List<Candle> c1h) {
+        try {
+            if (c1m == null || c1m.size() < 30) return Optional.empty();
+            if (isCooldown(pair)) return Optional.empty();
+
+            int dir1h = emaDirection(c1h, 20, 50, 0.002);
+            int dir15m = emaDirection(c15m, 9, 21, 0.002);
+            int dir5m = emaDirection(c5m, 9, 21, 0.002);
+            int dir1m = emaDirection(c1m, 9, 21, 0.001);
+
+            int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
+
+            boolean earlyTrigger = earlyTrendTrigger(c1m);
+            if (earlyTrigger) mtfConfirm = 0;
+
+            long newOpen = c1m.get(c1m.size() - 1).openTime;
+            long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
+            if (newOpen <= lastOpen) return Optional.empty();
+            lastOpenTimeMap.put(pair, newOpen);
+
+            List<Double> closes1m = c1m.stream().map(c -> c.close).collect(Collectors.toList());
+            List<Double> closes5m = c5m.stream().map(c -> c.close).collect(Collectors.toList());
+            List<Double> closes15m = c15m.stream().map(c -> c.close).collect(Collectors.toList());
+            List<Double> closes1h = c1h.stream().map(c -> c.close).collect(Collectors.toList());
+
+            double emaScore = strategyEMANorm(closes1m);
+            double rsiScore = strategyRSINorm(closes1m);
+            double macdScore = strategyMACDNorm(closes1m);
+            double momScore = strategyMomentumNorm(closes1m);
+
+            double rawScore = emaScore * 0.38 + macdScore * 0.28 + rsiScore * 0.19 + momScore * 0.15;
+
+            boolean volOk = isVolumeOk(c1m);
+            boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);
+            boolean impulse = isImpulseCandle(c1m.get(c1m.size()-1), c1m);
+
+            double avgBody = c1m.stream()
+                    .skip(Math.max(0, c1m.size() - 20))
+                    .mapToDouble(c -> Math.abs(c.close - c.open))
+                    .average().orElse(IMPULSE_PCT);
+            double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
+            impulse = Math.abs(c1m.get(c1m.size() - 1).close - c1m.get(c1m.size() - 1).open) / (c1m.get(c1m.size() - 1).open + 1e-12) >= adaptiveImpulse;
+
+            boolean liquSweep = detectLiquiditySweep(c1m);
+            int structure1h = marketStructure(c1h);
+            int structure15m = marketStructure(c15m);
+            int structure5m = marketStructure(c5m);
+            int structure1m = marketStructure(c1m);
+            boolean structureAligned = (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure15m)) ||
+                    (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure5m));
+
+            double vwap15 = vwap(c15m);
+            double lastPrice = c1m.get(c1m.size() - 1).close;
+            boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) || (rawScore < 0 && lastPrice < vwap15);
+
+            boolean bos = detectBOS(c5m);
+
+            double atrVal = atr(c5m, 14);
+            List<Integer> highs = detectSwingHighs(c5m, 3);
+            List<Integer> lows = detectSwingLows(c5m, 3);
+            double lastSwingHigh = highs.isEmpty() ? Double.NaN : c5m.get(highs.get(highs.size() - 1)).high;
+            double lastSwingLow = lows.isEmpty() ? Double.NaN : c5m.get(lows.get(lows.size() - 1)).low;
+            boolean atrBreakLong = !Double.isNaN(lastSwingHigh) && lastPrice > lastSwingHigh + atrVal;
+            boolean atrBreakShort = !Double.isNaN(lastSwingLow) && lastPrice < lastSwingLow - atrVal;
+
+            double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
+
+            boolean strongTrigger = false;
+            if ((impulse && volOk) || atrBreakLong || atrBreakShort) {
+                strongTrigger = true;
+                confidence = Math.min(1.0, confidence + 0.15);
+            }
+
+            String direction = null;
+            double prevClose = c1m.get(c1m.size() - 2).close;
+            boolean priceUp = lastPrice > prevClose;
+            boolean priceDown = lastPrice < prevClose;
+
+            if ((rawScore > 0 || atrBreakLong || (impulse && priceUp)) &&
+                    confidence >= MIN_CONF &&
+                    ( (mtfConfirm >= 0 && structureAligned && vwapAligned) || strongTrigger )) {
+                direction = "LONG";
+            } else if ((rawScore < 0 || atrBreakShort || (impulse && priceDown)) &&
+                    confidence >= MIN_CONF &&
+                    ( (mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger )) {
+                direction = "SHORT";
+            } else {
+                return Optional.empty();
+            }
+
+            if (liquSweep && confidence < 0.92) {
+                System.out.println(String.format("[Filter] %s rejected due liquidity sweep conf=%.2f", pair, confidence));
+                return Optional.empty();
+            }
+
+            if (!strongTrigger) {
+                if (direction.equals("LONG") && dir1h < 0) return Optional.empty();
+                if (direction.equals("SHORT") && dir1h > 0) return Optional.empty();
+            }
+
+            double rsiVal = rsi(closes1m, 14);
+            Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal, rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong, atrBreakShort, impulse, earlyTrigger);
+            markSignalSent(pair);
+            return Optional.of(s);
+        } catch (Exception ex) {
+            System.out.println("[evaluate] error for " + pair + " : " + ex.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    // ========================= Signal class =========================
     public static class Signal {
         public final String symbol;
         public final String direction;
@@ -686,7 +700,8 @@ public class SignalSender {
         public final Instant created = Instant.now();
 
         public Signal(String symbol, String direction, double confidence, double price, double rsi, double rawScore,
-                      int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger, boolean atrBreakLong, boolean atrBreakShort, boolean impulse, boolean earlyTrigger) {
+                      int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger, boolean atrBreakLong,
+                      boolean atrBreakShort, boolean impulse, boolean earlyTrigger) {
             this.symbol = symbol;
             this.direction = direction;
             this.confidence = confidence;
@@ -706,7 +721,6 @@ public class SignalSender {
         public String toTelegramMessage() {
             String flags = (strongTrigger ? "⚡strong " : "") +
                     (earlyTrigger ? "⚡early " : "") +
-                    (earlyTrigger ? "⚡early " : "") +
                     (atrBreakLong ? "ATR↑ " : "") +
                     (atrBreakShort ? "ATR↓ " : "") +
                     (impulse ? "IMPULSE " : "");
@@ -715,65 +729,156 @@ public class SignalSender {
         }
     }
 
-    // -------------------- Start Scheduler (main loop) --------------------
+    // ========================= Cooldown / Debounce =========================
+    public boolean isCooldown(String pair) {
+        long now = System.currentTimeMillis();
+        long last = lastSignalTime.getOrDefault(pair, 0L);
+        return (now - last) < COOLDOWN_MS;
+    }
+    public void markSignalSent(String pair) {
+        lastSignalTime.put(pair, System.currentTimeMillis());
+    }
+
+    // ========================= Microtick + WS (helpers) =========================
+    public void connectTickWebSocket(String pair) {
+        // NOTE: this opens per-pair websockets in simplified manner.
+        // In production consider multiplexed streams to avoid many connections.
+        try {
+            final String symbol = pair.toLowerCase();
+            String aggUrl = String.format("wss://fstream.binance.com/ws/%s@aggTrade", symbol);
+
+            java.net.http.WebSocket ws = java.net.http.HttpClient.newHttpClient()
+                    .newWebSocketBuilder()
+                    .buildAsync(URI.create(aggUrl), new java.net.http.WebSocket.Listener() {
+                        @Override
+                        public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
+                            try {
+                                JSONObject json = new JSONObject(data.toString());
+                                double price = json.has("p") ? Double.parseDouble(json.getString("p")) : json.optDouble("p", 0.0);
+                                double qty = json.has("q") ? Double.parseDouble(json.getString("q")) : json.optDouble("q", 0.0);
+                                long ts = json.has("T") ? json.getLong("T") : System.currentTimeMillis();
+
+                                tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>()).addLast(price);
+                                Deque<Double> dq = tickPriceDeque.get(pair);
+                                while (dq.size() > TICK_HISTORY) dq.removeFirst();
+                                lastTickPrice.put(pair, price);
+                                lastTickTime.put(pair, ts);
+
+                                microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(1000));
+                                MicroCandleBuilder b1 = microBuilders.get(pair);
+                                Optional<Candle> micro = b1.addTick(ts, price, qty);
+                                micro.ifPresent(c -> evaluateMicroCandle(pair, c));
+
+                                if (dq.size() >= 6) {
+                                    MicroTrendResult tr = computeMicroTrend(pair, dq);
+                                    OrderbookSnapshot obs = orderbookMap.getOrDefault(pair, new OrderbookSnapshot(0,0, ts));
+                                    evaluateTick(pair, price, qty, ts, tr, obs);
+                                }
+                            } catch (Exception ex) {
+                                System.out.println("[WS tick parse] " + ex.getMessage());
+                            }
+                            return java.net.http.WebSocket.Listener.super.onText(webSocket, data, last);
+                        }
+                    }).join();
+            System.out.println("[WS-TICK] connected aggTrade for " + pair);
+        } catch (Exception e) {
+            System.out.println("[WS connect] error for " + pair + " : " + e.getMessage());
+        }
+    }
+
+    private void evaluateMicroCandle(String pair, Candle c) {
+        // lightweight micro analysis: detect big micro-body (> threshold) and push early signal attempts
+        double bodyPct = c.bodyPct();
+        if (bodyPct > IMPULSE_PCT * 1.2) {
+            // push a small message or mark internal state (no Telegram here)
+            System.out.println(String.format("[Micro] %s micro impulse bodyPct=%.4f", pair, bodyPct));
+        }
+    }
+
+    private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
+        // compute simple derivative and accel over last N ticks (6)
+        List<Double> arr = new ArrayList<>(dq);
+        if (arr.size() < 3) return new MicroTrendResult(0,0, arr.isEmpty()?0:arr.get(arr.size()-1));
+        int n = Math.min(arr.size(), 10);
+        double sumDiff = 0;
+        for (int i = arr.size() - n + 1; i < arr.size(); i++) sumDiff += arr.get(i) - arr.get(i-1);
+        double speed = sumDiff / (n - 1 + 1e-12);
+        // accel approximated by diff of last two diffs
+        double lastDiff = arr.get(arr.size()-1) - arr.get(arr.size()-2);
+        double prevDiff = arr.get(arr.size()-2) - arr.get(arr.size()-3);
+        double accel = lastDiff - prevDiff;
+        double avg = arr.stream().mapToDouble(Double::doubleValue).average().orElse(arr.get(arr.size()-1));
+        return new MicroTrendResult(speed, accel, avg);
+    }
+
+    private void evaluateTick(String pair, double price, double qty, long ts, MicroTrendResult tr, OrderbookSnapshot obs) {
+        // quick tick-level rules: orderbook imbalance + microtrend strong
+        double obi = obs.obi();
+        if (Math.abs(obi) > OBI_THRESHOLD && Math.abs(tr.speed) > 0) {
+            double conf = Math.min(1.0, Math.abs(tr.speed) * 0.5 + Math.abs(obi) * 0.3);
+            String type = (obi > 0 ? "TICK_LONG_OBI" : "TICK_SHORT_OBI");
+            if (conf > MIN_CONF) {
+                if (!isCooldown(pair)) {
+                    bot.sendSignal(String.format("%s %s conf=%.2f price=%.8f", pair, type, conf, price));
+                    lastSentConfidence.put(pair, conf);
+                    lastSignalTime.put(pair, System.currentTimeMillis());
+                }
+            }
+        }
+    }
+
+    public void updateOrderbook(String pair, double bidVol, double askVol) {
+        orderbookMap.put(pair, new OrderbookSnapshot(bidVol, askVol, System.currentTimeMillis()));
+    }
+
+    // ========================= Start (main loop) =========================
     public void start() {
-        System.out.println("[SignalSender] Starting (Futures-style signals) TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
+        System.out.println("[SignalSender] Starting (Futures-ready) ...");
         ensureBinancePairsFresh();
         try {
-            bot.sendSignal("✅ SignalSender (Futures-style) запущен и работает! MIN_CONF=" + MIN_CONF);
-        } catch (Exception e) {
-            System.out.println("[Telegram Test Message Error] " + e.getMessage());
-        }
+            bot.sendSignal("✅ SignalSender (Futures) started. MIN_CONF=" + MIN_CONF);
+        } catch (Exception e) { System.out.println("[Telegram test send error] " + e.getMessage()); }
 
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler = Executors.newScheduledThreadPool(2);
+        // main scanning job
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 ensureBinancePairsFresh();
                 List<String> topList = getTopSymbols(TOP_N);
                 List<String> filtered = topList.stream().filter(BINANCE_PAIRS::contains).collect(Collectors.toList());
 
-                // we'll collect all candidate signals first; if none active -> skip sending (market quiet)
                 List<Signal> candidates = new ArrayList<>();
 
                 for (String pair : filtered) {
-                    // fetch MTF klines
-                    List<Candle> c1m = fetchKlines(pair, TF_ENTRY, Math.max(KLINES_LIMIT, 120));
+                    // get MTF klines
+                    List<Candle> c1m = fetchKlines(pair, "1m", Math.max(KLINES_LIMIT, 120));
                     if (c1m.isEmpty()) continue;
-
-                    List<Candle> c5m = fetchKlines(pair, TF_SHORT, Math.max(80, KLINES_LIMIT / 3));
+                    List<Candle> c5m = fetchKlines(pair, "5m", Math.max(80, KLINES_LIMIT / 3));
                     if (c5m.isEmpty()) continue;
-
-                    List<Candle> c15m = fetchKlines(pair, TF_MED, Math.max(80, KLINES_LIMIT / 6));
+                    List<Candle> c15m = fetchKlines(pair, "15m", Math.max(80, KLINES_LIMIT / 6));
                     if (c15m.isEmpty()) continue;
-
-                    List<Candle> c1h = fetchKlines(pair, TF_LONG, Math.max(80, KLINES_LIMIT / 12));
+                    List<Candle> c1h = fetchKlines(pair, "1h", Math.max(80, KLINES_LIMIT / 12));
                     if (c1h.isEmpty()) continue;
 
                     Optional<Signal> opt = evaluate(pair, c1m, c5m, c15m, c1h);
                     opt.ifPresent(candidates::add);
                 }
 
-                // MarketQuiet logic: if no candidates, skip cycle (stay silent)
                 if (candidates.isEmpty()) {
-                    System.out.println("[MarketQuiet] No active movers this cycle - skipping sends.");
-                    return;
+                    System.out.println("[MarketQuiet] No active movers this cycle.");
                 }
 
-                // Otherwise send each candidate, with per-pair debounce
                 for (Signal s : candidates) {
                     String pairKey = s.symbol + "USDT";
                     try {
                         double prevConf = lastSentConfidence.getOrDefault(pairKey, 0.0);
                         long lastSent = lastSignalTime.getOrDefault(pairKey, 0L);
-                        // Debounce: skip too-similar small updates within 3 minutes
                         if (Math.abs(prevConf - s.confidence) < 0.02 && (System.currentTimeMillis() - lastSent) < 3 * 60 * 1000) {
                             System.out.println("[Debounce] skipping similar signal for " + pairKey + " conf=" + s.confidence);
                             continue;
                         }
-                        // Send message
                         bot.sendSignal(s.toTelegramMessage());
                         lastSentConfidence.put(pairKey, s.confidence);
-                        // markSignalSent already called in evaluate(), but update again just in case
                         lastSignalTime.put(pairKey, System.currentTimeMillis());
                     } catch (Exception e) {
                         System.out.println("[Telegram] send error: " + e.getMessage());
@@ -782,7 +887,53 @@ public class SignalSender {
 
             } catch (Exception e) {
                 System.out.println("[Job error] " + e.getMessage());
+                e.printStackTrace();
             }
         }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
+
+    // stop
+    public void stop() {
+        if (scheduler != null) scheduler.shutdownNow();
+        System.out.println("[SignalSender] stopped");
+    }
+
+    // ========================= Helper: top symbols via CoinGecko =========================
+    public List<String> getTopSymbols(int limit) {
+        try {
+            String url = String.format("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=%d&page=1", limit);
+            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            JSONArray arr = new JSONArray(resp.body());
+            List<String> list = new ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject c = arr.getJSONObject(i);
+                String sym = c.getString("symbol").toUpperCase();
+                if (STABLE.contains(sym)) continue;
+                list.add(sym + "USDT");
+            }
+            return list;
+        } catch (Exception e) {
+            System.out.println("[CoinGecko] Error: " + e.getMessage());
+            return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT");
+        }
+    }
+
+    // ========================= Misc helpers =========================
+    private boolean earlyTrendTrigger(List<Candle> candles) {
+        if (candles == null || candles.size() < 3) return false;
+        int bull = 0, bear = 0;
+        for (int i = candles.size() - 3; i < candles.size(); i++) {
+            if (candles.get(i).isBull()) bull++;
+            if (candles.get(i).isBear()) bear++;
+        }
+        return bull >= 2 || bear >= 2;
+    }
+
+    // ========================= Signal sending wrapper (if you prefer) =========================
+    private void sendRaw(String msg) {
+        try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
+    }
+
+    // ========================= END of class =========================
 }

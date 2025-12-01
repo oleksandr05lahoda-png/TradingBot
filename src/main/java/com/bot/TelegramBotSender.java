@@ -1,73 +1,50 @@
 package com.bot;
 
 import java.net.URI;
-import java.net.http.*;
-import java.net.URLEncoder;
-import java.time.Duration;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.CompletableFuture;
 
 public class TelegramBotSender {
+    private final String token;
+    private final String chatId;
+    private final HttpClient client;
 
-    private final String TOKEN;
-    private final String CHAT_ID;
-    private final HttpClient http;
-
-    public TelegramBotSender() {
-        this.TOKEN = System.getenv("TELEGRAM_TOKEN");
-        this.CHAT_ID = System.getenv("TELEGRAM_CHAT_ID");
-
-        if (TOKEN == null || TOKEN.isEmpty()) {
-            System.out.println("[Telegram] ERROR: TELEGRAM_TOKEN is null or empty!");
-        } else {
-            System.out.println("[Telegram] Token loaded OK");
-        }
-
-        if (CHAT_ID == null || CHAT_ID.isEmpty()) {
-            System.out.println("[Telegram] ERROR: TELEGRAM_CHAT_ID is null or empty!");
-        } else {
-            System.out.println("[Telegram] Chat ID loaded OK");
-        }
-
-        this.http = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+    public TelegramBotSender(String token, String chatId) {
+        this.token = token;
+        this.chatId = chatId;
+        this.client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2).build();
+    }
+    public void sendSignal(String symbol, String direction, double confidence, double price, int rsi, String flags) {
+        String message = symbol + " → " + direction + "\n" +
+                "Confidence: " + String.format("%.2f", confidence) + "\n" +
+                "Price: " + String.format("%.2f", price) + "\n" +
+                "RSI: " + rsi + "\n" +
+                "Flags: " + flags + "\n" +
+                "Time: " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        sendMessage(message);
     }
 
-    public void sendSignal(String msg) {
-        if (TOKEN == null || CHAT_ID == null) {
-            System.out.println("[Telegram] Cannot send message, token or chat_id is null");
-            return;
-        }
 
+    public void sendMessage(String message) {
         try {
-            String encodedMsg = URLEncoder.encode(msg, "UTF-8");
-            String url = String.format(
-                    "https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s&parse_mode=Markdown",
-                    TOKEN, CHAT_ID, encodedMsg
-            );
-
-            HttpRequest req = HttpRequest.newBuilder()
+            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" + chatId + "&text=" + message;
+            HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .GET()
-                    .timeout(Duration.ofSeconds(10))
                     .build();
 
-            System.out.println("[Telegram] Sending message: " + msg);
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            System.out.println("[Telegram] Response code: " + resp.statusCode());
-            System.out.println("[Telegram] Response body: " + resp.body());
-
-            if (resp.statusCode() != 200) {
-                System.out.println("[Telegram] Warning: message might not have been delivered!");
-            }
-
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                    .thenAccept(resp -> System.out.println("[TG " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "] Ответ: " + resp.body()))
+                    .exceptionally(e -> {
+                        System.out.println("[TG] Ошибка отправки: " + e.getMessage());
+                        return null;
+                    });
         } catch (Exception e) {
-            System.out.println("[Telegram] Exception sending message: " + e.getMessage());
-            e.printStackTrace();
+            System.out.println("[TG] Ошибка создания запроса: " + e.getMessage());
         }
-    }
-
-    // Тестовое сообщение сразу при запуске
-    public void testMessage() {
-        sendSignal("✅ TelegramBotSender тестовое сообщение. Bot работает!");
     }
 }
