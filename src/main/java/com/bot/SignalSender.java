@@ -878,6 +878,14 @@ public class SignalSender {
     private void sendRaw(String msg) {
         try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
     }
+    public List<Candle> fetchKlines(String symbol, String interval, int limit) {
+        try {
+            return fetchKlinesAsync(symbol, interval, limit).get(); // блокируем, ждем завершения
+        } catch (Exception e) {
+            System.out.println("[fetchKlines] error for " + symbol + " " + interval + ": " + e.getMessage());
+            return Collections.emptyList();
+        }
+    }
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
 
@@ -887,13 +895,29 @@ public class SignalSender {
                 ensureBinancePairsFresh(); // обновляем список пар
                 for (String pair : BINANCE_PAIRS) {
                     try {
-                        List<Candle> c1m = fetchKlines(pair, "1m", 50);
-                        List<Candle> c5m = fetchKlines(pair, "5m", 50);
-                        List<Candle> c15m = fetchKlines(pair, "15m", 50);
-                        List<Candle> c1h = fetchKlines(pair, "1h", 50);
+                        CompletableFuture<List<Candle>> f1m = fetchKlinesAsync(pair, "1m", 50);
+                        CompletableFuture<List<Candle>> f5m = fetchKlinesAsync(pair, "5m", 50);
+                        CompletableFuture<List<Candle>> f15m = fetchKlinesAsync(pair, "15m", 50);
+                        CompletableFuture<List<Candle>> f1h = fetchKlinesAsync(pair, "1h", 50);
 
-                        Optional<Signal> sigOpt = evaluate(pair, c1m, c5m, c15m, c1h);
-                        sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
+                        CompletableFuture.allOf(f1m, f5m, f15m, f1h).thenAccept(v -> {
+                            try {
+                                List<Candle> c1m = f1m.get();
+                                List<Candle> c5m = f5m.get();
+                                List<Candle> c15m = f15m.get();
+                                List<Candle> c1h = f1h.get();
+
+                                Optional<Signal> sigOpt = evaluate(pair, c1m, c5m, c15m, c1h);
+                                sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
+                            } catch (Exception e) {
+                                System.out.println("[async evaluate] " + e.getMessage());
+                            }
+                        });
+
+                        // <<< удалить этот вызов — он вызывает ошибку
+                        // Optional<Signal> sigOpt = evaluate(pair, c1m, c5m, c15m, c1h);
+                        // sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
+
                     } catch (Exception ex) {
                         System.out.println("[start] Error evaluating " + pair + ": " + ex.getMessage());
                     }
