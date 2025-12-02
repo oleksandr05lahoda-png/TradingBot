@@ -155,36 +155,41 @@ public class SignalSender {
 
 
     // ========================= Fetch Klines (Futures) =========================
-    public List<Candle> fetchKlines(String symbol, String interval, int limit) {
+    public CompletableFuture<List<Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
-            // small throttle
-            Thread.sleep(REQUEST_DELAY_MS);
             String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", symbol, interval, limit);
-            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            String body = resp.body();
-            if (body == null || body.isEmpty() || !body.startsWith("[")) {
-                System.out.println("[Binance] Invalid klines response for " + symbol + " " + interval + ": " + body);
-                return Collections.emptyList();
-            }
-            JSONArray arr = new JSONArray(body);
-            List<Candle> list = new ArrayList<>();
-            for (int i = 0; i < arr.length(); i++) {
-                JSONArray k = arr.getJSONArray(i);
-                long openTime = k.getLong(0);
-                double open = Double.parseDouble(k.getString(1));
-                double high = Double.parseDouble(k.getString(2));
-                double low = Double.parseDouble(k.getString(3));
-                double close = Double.parseDouble(k.getString(4));
-                double vol = Double.parseDouble(k.getString(5));
-                double qvol = Double.parseDouble(k.getString(7));
-                long closeTime = k.getLong(6);
-                list.add(new Candle(openTime, open, high, low, close, vol, qvol, closeTime));
-            }
-            return list;
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+
+            return http.sendAsync(req, HttpResponse.BodyHandlers.ofString())
+                    .thenApply(resp -> {
+                        String body = resp.body();
+                        if (body == null || body.isEmpty() || !body.startsWith("[")) {
+                            System.out.println("[Binance] Invalid klines response for " + symbol + " " + interval + ": " + body);
+                            return Collections.emptyList();
+                        }
+                        JSONArray arr = new JSONArray(body);
+                        List<Candle> list = new ArrayList<>();
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONArray k = arr.getJSONArray(i);
+                            long openTime = k.getLong(0);
+                            double open = Double.parseDouble(k.getString(1));
+                            double high = Double.parseDouble(k.getString(2));
+                            double low = Double.parseDouble(k.getString(3));
+                            double close = Double.parseDouble(k.getString(4));
+                            double vol = Double.parseDouble(k.getString(5));
+                            double qvol = Double.parseDouble(k.getString(7));
+                            long closeTime = k.getLong(6);
+                            list.add(new Candle(openTime, open, high, low, close, vol, qvol, closeTime));
+                        }
+                        return list;
+                    });
         } catch (Exception e) {
-            System.out.println("[Binance] Error fetching klines for " + symbol + " : " + e.getMessage());
-            return Collections.emptyList();
+            System.out.println("[Binance] Error preparing klines request for " + symbol + " : " + e.getMessage());
+            return CompletableFuture.completedFuture(Collections.emptyList());
         }
     }
 
