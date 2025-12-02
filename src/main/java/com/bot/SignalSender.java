@@ -79,7 +79,7 @@ public class SignalSender {
         this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
         this.VOL_MULTIPLIER = envDouble("VOL_MULT", 0.9);
         this.ATR_MIN_PCT = envDouble("ATR_MIN_PCT", 0.0007);
-        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 60000); // 3 minutes default
+        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 20000); // 3 minutes default
         long brMin = envLong("BINANCE_REFRESH_MINUTES", 60);
         this.BINANCE_REFRESH_INTERVAL_MS = brMin * 60 * 1000L;
 
