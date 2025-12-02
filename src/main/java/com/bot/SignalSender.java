@@ -659,10 +659,11 @@ public class SignalSender {
                 return Optional.empty();
             }
 
+            // добавляем раннее предупреждение, но не блокируем полностью
             if (liquSweep && confidence < 0.92) {
-                System.out.println(String.format("[Filter] %s rejected due liquidity sweep conf=%.2f", pair, confidence));
-                return Optional.empty();
+                confidence *= 0.85; // снижаем доверие, но не отменяем сигнал
             }
+
 
             if (!strongTrigger) {
                 if (direction.equals("LONG") && dir1h < 0) return Optional.empty();
@@ -816,6 +817,11 @@ public class SignalSender {
         double conf = Math.min(1.0, Math.abs(microSpeed) * 0.4 + Math.abs(obi) * 0.35 + Math.abs(microAccel) * 0.15);
 
         boolean strongTickTrigger = Math.abs(obi) > OBI_THRESHOLD && Math.abs(microSpeed) > IMPULSE_PCT;
+        // добавляем microtrend ускорение и предсказание импульса
+        double predictedMove = microSpeed * 2 + microAccel * 1.5;
+        if (predictedMove > IMPULSE_PCT && !isCooldown(pair)) {
+            strongTickTrigger = true;
+        }
 
         if (strongTickTrigger && conf > MIN_CONF && !isCooldown(pair)) {
             String type = (obi > 0) ? "TICK_LONG_OBI" : "TICK_SHORT_OBI";
