@@ -582,7 +582,10 @@ public class SignalSender {
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
 
             boolean earlyTrigger = earlyTrendTrigger(c1m);
-            if (earlyTrigger) mtfConfirm = 0;
+            if (earlyTrigger) {
+                mtfConfirm = Math.max(mtfConfirm, 1); // ранний бычий
+                mtfConfirm = Math.min(mtfConfirm, -1); // ранний медвежий
+            }
 
             long newOpen = c1m.get(c1m.size() - 1).openTime;
             long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
