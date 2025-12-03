@@ -851,12 +851,14 @@ public class SignalSender {
         // создаём будущую свечу
 
         Candle predicted = new Candle(
-                predictedTimeMillis,
+                predictedTimeMillis, // openTime
                 predictedOpen,
                 predictedHigh,
                 predictedLow,
                 predictedClose,
-                0.0
+                0.0,                // volume
+                0.0,                // quoteVolume
+                predictedTimeMillis // closeTime
         );
 
         // очередь цен для predictNextCandle
