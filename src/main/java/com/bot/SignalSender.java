@@ -1,5 +1,6 @@
 package com.bot;
 
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -830,17 +831,42 @@ public class SignalSender {
 
 
     private void evaluatePredictedCandle(String pair, List<Candle> recentCandles) {
-        if (recentCandles == null || recentCandles.isEmpty()) return;
+        if (recentCandles == null || recentCandles.size() < 2) return;
 
-        // формируем очередь цен закрытия
+        Candle last = recentCandles.get(recentCandles.size() - 1);
+        Candle prev = recentCandles.get(recentCandles.size() - 2);
+
+        // шаг свечи по времени в секундах
+        long intervalMillis = last.openTime - prev.openTime;
+
+        // время будущей свечи в миллисекундах
+        long predictedTimeMillis = last.openTime + intervalMillis;
+
+        // формируем прогнозируемые значения свечи
+        double predictedOpen = last.close;
+        double predictedHigh = predictedOpen * 1.002;  // +0.2%
+        double predictedLow  = predictedOpen * 0.998;  // -0.2%
+        double predictedClose = predictedOpen + (predictedHigh - predictedLow) / 2.0;
+
+        // создаём будущую свечу
+
+        Candle predicted = new Candle(
+                predictedTimeMillis,
+                predictedOpen,
+                predictedHigh,
+                predictedLow,
+                predictedClose,
+                0.0
+        );
+
+        // очередь цен для predictNextCandle
         Deque<Double> dq = new ArrayDeque<>();
-        for (Candle c : recentCandles) {
-            dq.addLast(c.close);
-        }
+        for (Candle c : recentCandles) dq.addLast(c.close);
+        dq.addLast(predicted.close);
 
-        // вызываем predictNextCandle с правильными аргументами
-        predictNextCandle(pair, dq);
+        predictNextCandle(pair, dq); // запускаем прогнозирование
     }
+
 
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         // compute simple derivative and accel over last N ticks (6)
