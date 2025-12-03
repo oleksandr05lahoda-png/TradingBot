@@ -810,7 +810,7 @@ public class SignalSender {
         double predictedLow = Math.min(predictedOpen, predictedClose) - Math.abs(accel) * 0.5;
         long predictedTime = System.currentTimeMillis() + 60_000;
 
-        Candle predicted = new Candle(predictedTime, predictedOpen, predictedHigh, predictedLow, predictedClose, 0.0);
+        Candle predicted = new Candle(predictedTime, predictedOpen, predictedHigh, predictedLow, predictedClose, 0.0, 0.0, predictedTime);
         return Optional.of(predicted);
     }
 
@@ -830,14 +830,16 @@ public class SignalSender {
 
 
     private void evaluatePredictedCandle(String pair, List<Candle> recentCandles) {
-        Optional<Candle> predictedOpt = predictNextCandle(recentCandles);
-        predictedOpt.ifPresent(predicted -> {
-            double bodyPct = Math.abs(predicted.close - predicted.open) / (predicted.open + 1e-12);
-            if (bodyPct > IMPULSE_PCT) {
-                System.out.println(String.format("[Predict] %s next candle predicted bodyPct=%.4f open=%.4f close=%.4f",
-                        pair, bodyPct, predicted.open, predicted.close));
-            }
-        });
+        if (recentCandles == null || recentCandles.isEmpty()) return;
+
+        // формируем очередь цен закрытия
+        Deque<Double> dq = new ArrayDeque<>();
+        for (Candle c : recentCandles) {
+            dq.addLast(c.close);
+        }
+
+        // вызываем predictNextCandle с правильными аргументами
+        predictNextCandle(pair, dq);
     }
 
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
