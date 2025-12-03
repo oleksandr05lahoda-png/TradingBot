@@ -571,9 +571,12 @@ public class SignalSender {
     public Optional<Signal> evaluate(String pair,
                                      List<Candle> c1m, List<Candle> c5m, List<Candle> c15m, List<Candle> c1h) {
         try {
+            // базовые проверки — сначала убедимся, что данные есть
             if (c1m == null || c1m.size() < 30) return Optional.empty();
+            if (c5m == null || c5m.size() < 20) return Optional.empty(); // для atr / structure
             if (isCooldown(pair)) return Optional.empty();
 
+            // direction per TF
             int dir1h = emaDirection(c1h, 20, 50, 0.002);
             int dir15m = emaDirection(c15m, 9, 21, 0.002);
             int dir5m = emaDirection(c5m, 9, 21, 0.002);
@@ -581,33 +584,37 @@ public class SignalSender {
 
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
 
-            boolean earlyTrigger = earlyTrendTrigger(c1m);
-            if (earlyTrigger) {
-                mtfConfirm = Math.max(mtfConfirm, 1); // ранний бычий
-                mtfConfirm = Math.min(mtfConfirm, -1); // ранний медвежий
-            }
-
             long newOpen = c1m.get(c1m.size() - 1).openTime;
             long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
             if (newOpen <= lastOpen) return Optional.empty();
             lastOpenTimeMap.put(pair, newOpen);
 
+            // закладываем списки закрытий
             List<Double> closes1m = c1m.stream().map(c -> c.close).collect(Collectors.toList());
             List<Double> closes5m = c5m.stream().map(c -> c.close).collect(Collectors.toList());
             List<Double> closes15m = c15m.stream().map(c -> c.close).collect(Collectors.toList());
             List<Double> closes1h = c1h.stream().map(c -> c.close).collect(Collectors.toList());
 
+            // индикаторы -> rawScore
             double emaScore = strategyEMANorm(closes1m);
             double rsiScore = strategyRSINorm(closes1m);
             double macdScore = strategyMACDNorm(closes1m);
             double momScore = strategyMomentumNorm(closes1m);
-
             double rawScore = emaScore * 0.38 + macdScore * 0.28 + rsiScore * 0.19 + momScore * 0.15;
 
-            boolean volOk = isVolumeOk(c1m);
-            boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);
-            boolean impulse = isImpulseCandle(c1m.get(c1m.size()-1), c1m);
+            // ранний триггер — теперь после rawScore (чтобы можно было смотреть знак rawScore)
+            boolean earlyTrigger = earlyTrendTrigger(c1m);
+            if (earlyTrigger) {
+                if (rawScore > 0) mtfConfirm = 1;
+                else if (rawScore < 0) mtfConfirm = -1;
+            }
 
+            // теперь вычисляем vol/atr/impulse правильно, опираясь на c1m и c5m
+            boolean volOk = isVolumeOk(c1m);                    // использует quoteAssetVolume 1m
+            boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);   // ATR на 5m
+            boolean impulse = isImpulseCandle(c1m.get(c1m.size() - 1), c1m);
+
+            // adaptive impulse (ты уже делаешь это дальше — здесь можно оставить, или убрать двойной расчёт)
             double avgBody = c1m.stream()
                     .skip(Math.max(0, c1m.size() - 20))
                     .mapToDouble(c -> Math.abs(c.close - c.open))
@@ -662,15 +669,11 @@ public class SignalSender {
                 return Optional.empty();
             }
 
-            // добавляем раннее предупреждение, но не блокируем полностью
-            if (liquSweep && confidence < 0.92) {
-                confidence *= 0.85; // снижаем доверие, но не отменяем сигнал
-            }
-
+            if (liquSweep && confidence < 0.92) confidence *= 0.85;
 
             if (!strongTrigger) {
-                if (direction.equals("LONG") && dir1h < 0) return Optional.empty();
-                if (direction.equals("SHORT") && dir1h > 0) return Optional.empty();
+                if (direction.equals("LONG") && dir1h < 0 && confidence < 0.85) return Optional.empty();
+                if (direction.equals("SHORT") && dir1h > 0 && confidence < 0.85) return Optional.empty();
             }
 
             double rsiVal = rsi(closes1m, 14);
@@ -682,6 +685,7 @@ public class SignalSender {
             return Optional.empty();
         }
     }
+
 
     // ========================= Signal class =========================
     public static class Signal {
@@ -735,8 +739,9 @@ public class SignalSender {
     public boolean isCooldown(String pair) {
         long now = System.currentTimeMillis();
         long last = lastSignalTime.getOrDefault(pair, 0L);
-        return (now - last) < COOLDOWN_MS;
+        return (now - last) < (COOLDOWN_MS / 3); // в 3 раза чаще
     }
+
     public void markSignalSent(String pair) {
         lastSignalTime.put(pair, System.currentTimeMillis());
     }
@@ -922,11 +927,6 @@ public class SignalSender {
                                 System.out.println("[async evaluate] " + e.getMessage());
                             }
                         });
-
-                        // <<< удалить этот вызов — он вызывает ошибку
-                        // Optional<Signal> sigOpt = evaluate(pair, c1m, c5m, c15m, c1h);
-                        // sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
-
                     } catch (Exception ex) {
                         System.out.println("[start] Error evaluating " + pair + ": " + ex.getMessage());
                     }
