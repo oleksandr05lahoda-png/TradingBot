@@ -97,16 +97,27 @@ public class SignalSender {
 
     // ========================= Helpers for env parsing =========================
     private int envInt(String k, int def) {
-        try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(def))); }
-        catch (Exception e) { return def; }
+        try {
+            return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(def)));
+        } catch (Exception e) {
+            return def;
+        }
     }
+
     private long envLong(String k, long def) {
-        try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(def))); }
-        catch (Exception e) { return def; }
+        try {
+            return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(def)));
+        } catch (Exception e) {
+            return def;
+        }
     }
+
     private double envDouble(String k, double def) {
-        try { return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(def))); }
-        catch (Exception e) { return def; }
+        try {
+            return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(def)));
+        } catch (Exception e) {
+            return def;
+        }
     }
 
     // ========================= Binance Helpers =========================
@@ -217,10 +228,21 @@ public class SignalSender {
             this.closeTime = closeTime;
         }
 
-        public double body() { return Math.abs(close - open); }
-        public double bodyPct() { return body() / (open + 1e-12); }
-        public boolean isBull() { return close > open; }
-        public boolean isBear() { return close < open; }
+        public double body() {
+            return Math.abs(close - open);
+        }
+
+        public double bodyPct() {
+            return body() / (open + 1e-12);
+        }
+
+        public boolean isBull() {
+            return close > open;
+        }
+
+        public boolean isBear() {
+            return close < open;
+        }
     }
 
     // ========================= Micro candle builder (ticks -> tiny candles) =========================
@@ -231,13 +253,20 @@ public class SignalSender {
         private double volume = 0.0;
         private long closeTime = -1;
 
-        public MicroCandleBuilder(int intervalMs) { this.intervalMs = intervalMs; }
+        public MicroCandleBuilder(int intervalMs) {
+            this.intervalMs = intervalMs;
+        }
 
         public Optional<Candle> addTick(long tsMillis, double price, double qty) {
             long bucket = (tsMillis / intervalMs) * intervalMs;
             if (currentBucketStart == -1) {
                 currentBucketStart = bucket;
-                open = price; high = price; low = price; close = price; volume = qty; closeTime = bucket + intervalMs - 1;
+                open = price;
+                high = price;
+                low = price;
+                close = price;
+                volume = qty;
+                closeTime = bucket + intervalMs - 1;
                 return Optional.empty();
             }
             if (bucket == currentBucketStart) {
@@ -249,7 +278,12 @@ public class SignalSender {
             } else {
                 Candle c = new Candle(currentBucketStart, open, high, low, close, volume, volume, closeTime);
                 currentBucketStart = bucket;
-                open = price; high = price; low = price; close = price; volume = qty; closeTime = bucket + intervalMs - 1;
+                open = price;
+                high = price;
+                low = price;
+                close = price;
+                volume = qty;
+                closeTime = bucket + intervalMs - 1;
                 return Optional.of(c);
             }
         }
@@ -278,8 +312,11 @@ public class SignalSender {
         public final double speed;
         public final double accel;
         public final double avgTick;
+
         public MicroTrendResult(double speed, double accel, double avgTick) {
-            this.speed = speed; this.accel = accel; this.avgTick = avgTick;
+            this.speed = speed;
+            this.accel = accel;
+            this.avgTick = avgTick;
         }
     }
 
@@ -308,7 +345,8 @@ public class SignalSender {
         double gain = 0, loss = 0;
         for (int i = prices.size() - period; i < prices.size(); i++) {
             double diff = prices.get(i) - prices.get(i - 1);
-            if (diff > 0) gain += diff; else loss -= diff;
+            if (diff > 0) gain += diff;
+            else loss -= diff;
         }
         if (gain + loss == 0) return 50.0;
         double rs = gain / (loss + 1e-12);
@@ -375,7 +413,10 @@ public class SignalSender {
             double v = candles.get(i).high;
             boolean isHigh = true;
             for (int l = i - leftRight; l <= i + leftRight; l++) {
-                if (candles.get(l).high > v) { isHigh = false; break; }
+                if (candles.get(l).high > v) {
+                    isHigh = false;
+                    break;
+                }
             }
             if (isHigh) res.add(i);
         }
@@ -388,7 +429,10 @@ public class SignalSender {
             double v = candles.get(i).low;
             boolean isLow = true;
             for (int l = i - leftRight; l <= i + leftRight; l++) {
-                if (candles.get(l).low < v) { isLow = false; break; }
+                if (candles.get(l).low < v) {
+                    isLow = false;
+                    break;
+                }
             }
             if (isLow) res.add(i);
         }
@@ -554,7 +598,7 @@ public class SignalSender {
         double base = Math.min(1.0, Math.abs(rawScore));
         double boost = 0.0;
         if (structureAligned) boost += 0.12;
-        if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int)Math.signum(rawScore))) boost += 0.10;
+        if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) boost += 0.10;
         if (volOk) boost += 0.05;
         if (atrOk) boost += 0.03;
         if (vwapAligned) boost += 0.04;
@@ -570,14 +614,15 @@ public class SignalSender {
 
     // ========================= Evaluate strategy per symbol =========================
     public Optional<Signal> evaluate(String pair,
-                                     List<Candle> c1m, List<Candle> c5m, List<Candle> c15m, List<Candle> c1h) {
+                                     List<Candle> c1m, List<Candle> c5m,
+                                     List<Candle> c15m, List<Candle> c1h) {
         try {
-            // базовые проверки — сначала убедимся, что данные есть
+            // Базовые проверки
             if (c1m == null || c1m.size() < 30) return Optional.empty();
-            if (c5m == null || c5m.size() < 20) return Optional.empty(); // для atr / structure
+            if (c5m == null || c5m.size() < 20) return Optional.empty();
             if (isCooldown(pair)) return Optional.empty();
 
-            // direction per TF
+            // Направление по таймфреймам
             int dir1h = emaDirection(c1h, 20, 50, 0.002);
             int dir15m = emaDirection(c15m, 9, 21, 0.002);
             int dir5m = emaDirection(c5m, 9, 21, 0.002);
@@ -585,58 +630,72 @@ public class SignalSender {
 
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
 
+            // Проверка новой свечи
             long newOpen = c1m.get(c1m.size() - 1).openTime;
             long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
             if (newOpen <= lastOpen) return Optional.empty();
             lastOpenTimeMap.put(pair, newOpen);
 
-            // закладываем списки закрытий
-            List<Double> closes1m = c1m.stream().map(c -> c.close).collect(Collectors.toList());
-            List<Double> closes5m = c5m.stream().map(c -> c.close).collect(Collectors.toList());
-            List<Double> closes15m = c15m.stream().map(c -> c.close).collect(Collectors.toList());
-            List<Double> closes1h = c1h.stream().map(c -> c.close).collect(Collectors.toList());
+            // Списки закрытий
+            List<Double> closes1m = new ArrayList<>();
+            for (Candle c : c1m) closes1m.add(c.close);
 
-            // индикаторы -> rawScore
+            List<Double> closes5m = new ArrayList<>();
+            for (Candle c : c5m) closes5m.add(c.close);
+
+            List<Double> closes15m = new ArrayList<>();
+            for (Candle c : c15m) closes15m.add(c.close);
+
+            List<Double> closes1h = new ArrayList<>();
+            for (Candle c : c1h) closes1h.add(c.close);
+
+            // Индикаторы -> rawScore
             double emaScore = strategyEMANorm(closes1m);
             double rsiScore = strategyRSINorm(closes1m);
             double macdScore = strategyMACDNorm(closes1m);
             double momScore = strategyMomentumNorm(closes1m);
             double rawScore = emaScore * 0.38 + macdScore * 0.28 + rsiScore * 0.19 + momScore * 0.15;
 
-            // ранний триггер — теперь после rawScore (чтобы можно было смотреть знак rawScore)
+            // Ранний триггер
             boolean earlyTrigger = earlyTrendTrigger(c1m);
             if (earlyTrigger) {
                 if (rawScore > 0) mtfConfirm = 1;
                 else if (rawScore < 0) mtfConfirm = -1;
             }
 
-            // теперь вычисляем vol/atr/impulse правильно, опираясь на c1m и c5m
-            boolean volOk = isVolumeOk(c1m);                    // использует quoteAssetVolume 1m
-            boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);   // ATR на 5m
-            boolean impulse = isImpulseCandle(c1m.get(c1m.size() - 1), c1m);
+            // Объёмы и волатильность
+            boolean volOk = isVolumeOk(c1m);
+            boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);
 
-            // adaptive impulse (ты уже делаешь это дальше — здесь можно оставить, или убрать двойной расчёт)
-            double avgBody = c1m.stream()
-                    .skip(Math.max(0, c1m.size() - 20))
-                    .mapToDouble(c -> Math.abs(c.close - c.open))
-                    .average().orElse(IMPULSE_PCT);
+            // Adaptive impulse
+            int startIdx = Math.max(0, c1m.size() - 20);
+            double sumBody = 0.0;
+            for (int i = startIdx; i < c1m.size(); i++) {
+                Candle c = c1m.get(i);
+                sumBody += Math.abs(c.close - c.open);
+            }
+            double avgBody = sumBody / (c1m.size() - startIdx);
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-            impulse = Math.abs(c1m.get(c1m.size() - 1).close - c1m.get(c1m.size() - 1).open) / (c1m.get(c1m.size() - 1).open + 1e-12) >= adaptiveImpulse;
+            Candle lastCandle = c1m.get(c1m.size() - 1);
+            boolean impulse = Math.abs(lastCandle.close - lastCandle.open) / (lastCandle.open + 1e-12) >= adaptiveImpulse;
 
             boolean liquSweep = detectLiquiditySweep(c1m);
+
+            // Market structure
             int structure1h = marketStructure(c1h);
             int structure15m = marketStructure(c15m);
             int structure5m = marketStructure(c5m);
             int structure1m = marketStructure(c1m);
-            boolean structureAligned = (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure15m)) ||
-                    (Integer.signum((int)Math.signum(rawScore)) == Integer.signum(structure5m));
+            boolean structureAligned = (Integer.signum((int) Math.signum(rawScore)) == Integer.signum(structure15m)) ||
+                    (Integer.signum((int) Math.signum(rawScore)) == Integer.signum(structure5m));
 
             double vwap15 = vwap(c15m);
-            double lastPrice = c1m.get(c1m.size() - 1).close;
+            double lastPrice = lastCandle.close;
             boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) || (rawScore < 0 && lastPrice < vwap15);
 
             boolean bos = detectBOS(c5m);
 
+            // ATR Break
             double atrVal = atr(c5m, 14);
             List<Integer> highs = detectSwingHighs(c5m, 3);
             List<Integer> lows = detectSwingLows(c5m, 3);
@@ -645,7 +704,8 @@ public class SignalSender {
             boolean atrBreakLong = !Double.isNaN(lastSwingHigh) && lastPrice > lastSwingHigh + atrVal;
             boolean atrBreakShort = !Double.isNaN(lastSwingLow) && lastPrice < lastSwingLow - atrVal;
 
-            double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
+            double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned,
+                    structureAligned, bos, liquSweep);
 
             boolean strongTrigger = false;
             if ((impulse && volOk) || atrBreakLong || atrBreakShort) {
@@ -653,6 +713,7 @@ public class SignalSender {
                 confidence = Math.min(1.0, confidence + 0.15);
             }
 
+            // Определяем направление
             String direction = null;
             double prevClose = c1m.get(c1m.size() - 2).close;
             boolean priceUp = lastPrice > prevClose;
@@ -660,33 +721,59 @@ public class SignalSender {
 
             if ((rawScore > 0 || atrBreakLong || (impulse && priceUp)) &&
                     confidence >= MIN_CONF &&
-                    ( (mtfConfirm >= 0 && structureAligned && vwapAligned) || strongTrigger )) {
+                    ((mtfConfirm >= 0 && structureAligned && vwapAligned) || strongTrigger)) {
                 direction = "LONG";
             } else if ((rawScore < 0 || atrBreakShort || (impulse && priceDown)) &&
                     confidence >= MIN_CONF &&
-                    ( (mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger )) {
+                    ((mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger)) {
                 direction = "SHORT";
             } else {
                 return Optional.empty();
             }
 
             if (liquSweep && confidence < 0.92) confidence *= 0.85;
-
             if (!strongTrigger) {
                 if (direction.equals("LONG") && dir1h < 0 && confidence < 0.85) return Optional.empty();
                 if (direction.equals("SHORT") && dir1h > 0 && confidence < 0.85) return Optional.empty();
             }
 
             double rsiVal = rsi(closes1m, 14);
-            Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal, rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong, atrBreakShort, impulse, earlyTrigger);
+            Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal,
+                    rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong,
+                    atrBreakShort, impulse, earlyTrigger);
             markSignalSent(pair);
+
+            // --- прогноз будущей свечи ---
+            try {
+                // создаём массив double из closes1m
+                double[] closesArray = new double[closes1m.size()];
+                for (int i = 0; i < closes1m.size(); i++) {
+                    closesArray[i] = closes1m.get(i);
+                }
+
+                // передаем массив в FuturePredictor
+                double nextPrice = FuturePredictor.predictNextPrice(closesArray);
+
+                double diffPct = (nextPrice - lastPrice) / lastPrice;
+
+                if (Math.abs(diffPct) > 0.004) {
+                    String dir = (diffPct > 0) ? "FUTURE_LONG" : "FUTURE_SHORT";
+                    String msg = String.format("%s %s predictedMove=%.4f%% nextPrice=%.8f",
+                            pair, dir, diffPct * 100, nextPrice);
+                    bot.sendSignal(msg);
+                    System.out.println("[FuturePredictor] " + msg);
+                }
+            } catch (Exception ex) {
+                System.out.println("[FuturePredictor ERROR] " + ex.getMessage());
+            }
+
             return Optional.of(s);
+
         } catch (Exception ex) {
             System.out.println("[evaluate] error for " + pair + " : " + ex.getMessage());
             return Optional.empty();
         }
     }
-
 
     // ========================= Signal class =========================
     public static class Signal {
@@ -774,13 +861,14 @@ public class SignalSender {
                                 Optional<Candle> micro = b1.addTick(ts, price, qty);
 
                                 // вместо evaluateMicroCandle вызываем predictNextCandle
-                                micro.ifPresent(c -> predictNextCandle(pair, dq));
-
-                                if (dq.size() >= 6) {
-                                    MicroTrendResult tr = computeMicroTrend(pair, dq);
-                                    OrderbookSnapshot obs = orderbookMap.getOrDefault(pair, new OrderbookSnapshot(0,0, ts));
-                                    evaluateTick(pair, price, qty, ts, tr, obs);
-                                }
+                                micro.ifPresent(c -> {
+                                    List<Double> recentPrices = new ArrayList<>(dq); // берем последние цены
+                                    Optional<Candle> predicted = predictNextCandleFromPrices(recentPrices);
+                                    predicted.ifPresent(pred -> {
+                                        // можно логировать или отправлять сигнал
+                                        System.out.println("[Predicted Candle] " + pred);
+                                    });
+                                });
                             } catch (Exception ex) {
                                 System.out.println("[WS tick parse] " + ex.getMessage());
                             }
@@ -813,60 +901,6 @@ public class SignalSender {
 
         Candle predicted = new Candle(predictedTime, predictedOpen, predictedHigh, predictedLow, predictedClose, 0.0, 0.0, predictedTime);
         return Optional.of(predicted);
-    }
-
-    private void predictNextCandle(String pair, Deque<Double> recentPrices) {
-        List<Double> arr = new ArrayList<>(recentPrices);
-        predictNextCandleFromPrices(arr).ifPresent(predicted -> {
-            double bodyPct = Math.abs(predicted.close - predicted.open) / (predicted.open + 1e-12);
-            if (bodyPct > IMPULSE_PCT * 1.2 && !isCooldown(pair)) {
-                String msg = String.format("[Predicted] %s → predicted close: %.8f high: %.8f low: %.8f bodyPct=%.4f",
-                        pair, predicted.close, predicted.high, predicted.low, bodyPct);
-                bot.sendSignal(msg);
-                lastSignalTime.put(pair, System.currentTimeMillis());
-                System.out.println(msg);
-            }
-        });
-    }
-
-
-    private void evaluatePredictedCandle(String pair, List<Candle> recentCandles) {
-        if (recentCandles == null || recentCandles.size() < 2) return;
-
-        Candle last = recentCandles.get(recentCandles.size() - 1);
-        Candle prev = recentCandles.get(recentCandles.size() - 2);
-
-        // шаг свечи по времени в секундах
-        long intervalMillis = last.openTime - prev.openTime;
-
-        // время будущей свечи в миллисекундах
-        long predictedTimeMillis = last.openTime + intervalMillis;
-
-        // формируем прогнозируемые значения свечи
-        double predictedOpen = last.close;
-        double predictedHigh = predictedOpen * 1.002;  // +0.2%
-        double predictedLow  = predictedOpen * 0.998;  // -0.2%
-        double predictedClose = predictedOpen + (predictedHigh - predictedLow) / 2.0;
-
-        // создаём будущую свечу
-
-        Candle predicted = new Candle(
-                predictedTimeMillis, // openTime
-                predictedOpen,
-                predictedHigh,
-                predictedLow,
-                predictedClose,
-                0.0,                // volume
-                0.0,                // quoteVolume
-                predictedTimeMillis // closeTime
-        );
-
-        // очередь цен для predictNextCandle
-        Deque<Double> dq = new ArrayDeque<>();
-        for (Candle c : recentCandles) dq.addLast(c.close);
-        dq.addLast(predicted.close);
-
-        predictNextCandle(pair, dq); // запускаем прогнозирование
     }
 
 
