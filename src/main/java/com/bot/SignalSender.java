@@ -746,10 +746,7 @@ public class SignalSender {
         lastSignalTime.put(pair, System.currentTimeMillis());
     }
 
-    // ========================= Microtick + WS (helpers) =========================
     public void connectTickWebSocket(String pair) {
-        // NOTE: this opens per-pair websockets in simplified manner.
-        // In production consider multiplexed streams to avoid many connections.
         try {
             final String symbol = pair.toLowerCase();
             String aggUrl = String.format("wss://fstream.binance.com/ws/%s@aggTrade", symbol);
@@ -774,7 +771,9 @@ public class SignalSender {
                                 microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(1000));
                                 MicroCandleBuilder b1 = microBuilders.get(pair);
                                 Optional<Candle> micro = b1.addTick(ts, price, qty);
-                                micro.ifPresent(c -> evaluateMicroCandle(pair, c));
+
+                                // вместо evaluateMicroCandle вызываем predictNextCandle
+                                micro.ifPresent(c -> predictNextCandle(pair, dq));
 
                                 if (dq.size() >= 6) {
                                     MicroTrendResult tr = computeMicroTrend(pair, dq);
@@ -793,13 +792,52 @@ public class SignalSender {
         }
     }
 
-    private void evaluateMicroCandle(String pair, Candle c) {
-        // lightweight micro analysis: detect big micro-body (> threshold) and push early signal attempts
-        double bodyPct = c.bodyPct();
-        if (bodyPct > IMPULSE_PCT * 1.2) {
-            // push a small message or mark internal state (no Telegram here)
-            System.out.println(String.format("[Micro] %s micro impulse bodyPct=%.4f", pair, bodyPct));
-        }
+    // ----------------- Predict next candle (returns Optional) -----------------
+    private Optional<Candle> predictNextCandleFromPrices(List<Double> recentPrices) {
+        if (recentPrices.size() < 3) return Optional.empty(); // мало данных
+
+        int n = recentPrices.size();
+        double lastPrice = recentPrices.get(n - 1);
+        double prevPrice = recentPrices.get(n - 2);
+        double prevPrevPrice = recentPrices.get(n - 3);
+
+        double speed = lastPrice - prevPrice;
+        double accel = (lastPrice - prevPrice) - (prevPrice - prevPrevPrice);
+
+        double predictedOpen = lastPrice;
+        double predictedClose = lastPrice + speed + accel;
+        double predictedHigh = Math.max(predictedOpen, predictedClose) + Math.abs(accel) * 0.5;
+        double predictedLow = Math.min(predictedOpen, predictedClose) - Math.abs(accel) * 0.5;
+        long predictedTime = System.currentTimeMillis() + 60_000;
+
+        Candle predicted = new Candle(predictedTime, predictedOpen, predictedHigh, predictedLow, predictedClose, 0.0);
+        return Optional.of(predicted);
+    }
+
+    private void predictNextCandle(String pair, Deque<Double> recentPrices) {
+        List<Double> arr = new ArrayList<>(recentPrices);
+        predictNextCandleFromPrices(arr).ifPresent(predicted -> {
+            double bodyPct = Math.abs(predicted.close - predicted.open) / (predicted.open + 1e-12);
+            if (bodyPct > IMPULSE_PCT * 1.2 && !isCooldown(pair)) {
+                String msg = String.format("[Predicted] %s → predicted close: %.8f high: %.8f low: %.8f bodyPct=%.4f",
+                        pair, predicted.close, predicted.high, predicted.low, bodyPct);
+                bot.sendSignal(msg);
+                lastSignalTime.put(pair, System.currentTimeMillis());
+                System.out.println(msg);
+            }
+        });
+    }
+
+
+    private void evaluatePredictedCandle(String pair, List<Candle> recentCandles) {
+        Optional<Candle> predictedOpt = predictNextCandle(recentCandles);
+        predictedOpt.ifPresent(predicted -> {
+            double bodyPct = Math.abs(predicted.close - predicted.open) / (predicted.open + 1e-12);
+            if (bodyPct > IMPULSE_PCT) {
+                System.out.println(String.format("[Predict] %s next candle predicted bodyPct=%.4f open=%.4f close=%.4f",
+                        pair, bodyPct, predicted.open, predicted.close));
+            }
+        });
     }
 
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
