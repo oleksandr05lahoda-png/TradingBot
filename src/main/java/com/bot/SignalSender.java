@@ -73,7 +73,7 @@ public class SignalSender {
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
         this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.6); // user earlier wanted >=0.5 default
-        this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 1); // quick cycles for futures (1 min)
+        this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 3); // quick cycles for futures (1 min)
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
 
@@ -626,11 +626,11 @@ public class SignalSender {
 
     // ========================= Evaluate strategy per symbol =========================
     public Optional<Signal> evaluate(String pair,
-                                     List<Candle> c1m, List<Candle> c5m,
+                                     List<Candle> c3m, List<Candle> c5m,
                                      List<Candle> c15m, List<Candle> c1h) {
         try {
             // Базовые проверки
-            if (c1m == null || c1m.size() < 30) return Optional.empty();
+            if (c3m == null || c3m.size() < 30) return Optional.empty();
             if (c5m == null || c5m.size() < 20) return Optional.empty();
             if (isCooldown(pair)) return Optional.empty();
 
@@ -638,19 +638,26 @@ public class SignalSender {
             int dir1h = emaDirection(c1h, 20, 50, 0.002);
             int dir15m = emaDirection(c15m, 9, 21, 0.002);
             int dir5m = emaDirection(c5m, 9, 21, 0.002);
-            int dir1m = emaDirection(c1m, 9, 21, 0.001);
+            int dir1m = emaDirection(c3m, 9, 21, 0.001);
 
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m, dir1m);
 
             // Проверка новой свечи
-            long newOpen = c1m.get(c1m.size() - 1).openTime;
+            long newOpen = c3m.get(c3m.size() - 1).openTime;
             long lastOpen = lastOpenTimeMap.getOrDefault(pair, 0L);
             if (newOpen <= lastOpen) return Optional.empty();
             lastOpenTimeMap.put(pair, newOpen);
 
             // Списки закрытий
-            List<Double> closes1m = new ArrayList<>();
-            for (Candle c : c1m) closes1m.add(c.close);
+            List<Double> closes3m = new ArrayList<>();
+            for (Candle c : c3m) closes3m.add(c.close);
+            try {
+                double nextPrice = FuturePredictor.predictNextPrice(closes3m.stream().mapToDouble(d -> d).toArray());
+                closes3m.add(nextPrice); // теперь индикаторы будут видеть прогнозную свечу
+            } catch (Exception ex) {
+                System.out.println("[ForwardPredict] " + ex.getMessage());
+            }
+
 
             List<Double> closes5m = new ArrayList<>();
             for (Candle c : c5m) closes5m.add(c.close);
@@ -662,42 +669,53 @@ public class SignalSender {
             for (Candle c : c1h) closes1h.add(c.close);
 
             // Индикаторы -> rawScore
-            double emaScore = strategyEMANorm(closes1m);
-            double rsiScore = strategyRSINorm(closes1m);
-            double macdScore = strategyMACDNorm(closes1m);
-            double momScore = strategyMomentumNorm(closes1m);
+            double emaScore = strategyEMANorm(closes3m);
+            double rsiScore = strategyRSINorm(closes3m);
+            double macdScore = strategyMACDNorm(closes3m);
+            double momScore = strategyMomentumNorm(closes3m);
             double rawScore = emaScore * 0.38 + macdScore * 0.28 + rsiScore * 0.19 + momScore * 0.15;
 
             // Ранний триггер
-            boolean earlyTrigger = earlyTrendTrigger(c1m);
+            boolean earlyTrigger = earlyTrendTrigger(c3m);
             if (earlyTrigger) {
                 if (rawScore > 0) mtfConfirm = 1;
                 else if (rawScore < 0) mtfConfirm = -1;
             }
 
             // Объёмы и волатильность
-            boolean volOk = isVolumeOk(c1m);
+            boolean volOk = isVolumeOk(c3m);
             boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);
 
             // Adaptive impulse
-            int startIdx = Math.max(0, c1m.size() - 20);
+            int startIdx = Math.max(0, c3m.size() - 20);
             double sumBody = 0.0;
-            for (int i = startIdx; i < c1m.size(); i++) {
-                Candle c = c1m.get(i);
+            for (int i = startIdx; i < c3m.size(); i++) {
+                Candle c = c3m.get(i);
                 sumBody += Math.abs(c.close - c.open);
             }
-            double avgBody = sumBody / (c1m.size() - startIdx);
+            double avgBody = sumBody / (c3m.size() - startIdx);
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-            Candle lastCandle = c1m.get(c1m.size() - 1);
+            Candle lastCandle = c3m.get(c3m.size() - 1);
+            lastCandle = new Candle(
+                    lastCandle.openTime,
+                    lastCandle.open,
+                    lastCandle.high,
+                    lastCandle.low,
+                    closes3m.get(closes3m.size() - 1), // прогнозная цена
+                    lastCandle.volume,
+                    lastCandle.quoteAssetVolume,
+                    lastCandle.closeTime
+            );
+
             boolean impulse = Math.abs(lastCandle.close - lastCandle.open) / (lastCandle.open + 1e-12) >= adaptiveImpulse;
 
-            boolean liquSweep = detectLiquiditySweep(c1m);
+            boolean liquSweep = detectLiquiditySweep(c3m);
 
             // Market structure
             int structure1h = marketStructure(c1h);
             int structure15m = marketStructure(c15m);
             int structure5m = marketStructure(c5m);
-            int structure1m = marketStructure(c1m);
+            int structure1m = marketStructure(c3m);
             boolean structureAligned = (Integer.signum((int) Math.signum(rawScore)) == Integer.signum(structure15m)) ||
                     (Integer.signum((int) Math.signum(rawScore)) == Integer.signum(structure5m));
 
@@ -720,7 +738,7 @@ public class SignalSender {
 
             // адаптивное усиление confidence: если сигнал сильнее минимального порога
             if (Math.abs(rawScore) > MIN_CONF) {
-                confidence = Math.min(1.0, confidence + (rawScore - MIN_CONF) * 0.2);
+                confidence = Math.min(3.0, confidence + (rawScore - MIN_CONF) * 0.2);
             }
 
             boolean strongTrigger = (impulse && volOk) || atrBreakLong || atrBreakShort;
@@ -730,7 +748,7 @@ public class SignalSender {
 
             // Определяем направление
             String direction = null;
-            double prevClose = c1m.get(c1m.size() - 2).close;
+            double prevClose = c3m.get(c3m.size() - 2).close;
             boolean priceUp = lastPrice > prevClose;
             boolean priceDown = lastPrice < prevClose;
 
@@ -752,7 +770,7 @@ public class SignalSender {
                 if (direction.equals("SHORT") && dir1h > 0 && confidence < 0.85) return Optional.empty();
             }
 
-            double rsiVal = rsi(closes1m, 14);
+            double rsiVal = rsi(closes3m, 14);
             Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal,
                     rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong,
                     atrBreakShort, impulse, earlyTrigger);
@@ -761,9 +779,9 @@ public class SignalSender {
             // --- прогноз будущей свечи ---
             try {
                 // создаём массив double из closes1m
-                double[] closesArray = new double[closes1m.size()];
-                for (int i = 0; i < closes1m.size(); i++) {
-                    closesArray[i] = closes1m.get(i);
+                double[] closesArray = new double[closes3m.size()];
+                for (int i = 0; i < closes3m.size(); i++) {
+                    closesArray[i] = closes3m.get(i);
                 }
 
                 // передаем массив в FuturePredictor
@@ -1026,19 +1044,19 @@ public class SignalSender {
                 ensureBinancePairsFresh(); // обновляем список пар
                 for (String pair : BINANCE_PAIRS) {
                     try {
-                        CompletableFuture<List<Candle>> f1m = fetchKlinesAsync(pair, "1m", 50);
-                        CompletableFuture<List<Candle>> f5m = fetchKlinesAsync(pair, "5m", 50);
-                        CompletableFuture<List<Candle>> f15m = fetchKlinesAsync(pair, "15m", 50);
-                        CompletableFuture<List<Candle>> f1h = fetchKlinesAsync(pair, "1h", 50);
+                        CompletableFuture<List<Candle>> f3m = fetchKlinesAsync(pair, "3m", 100);
+                        CompletableFuture<List<Candle>> f5m = fetchKlinesAsync(pair, "5m", 100);
+                        CompletableFuture<List<Candle>> f15m = fetchKlinesAsync(pair, "15m", 100);
+                        CompletableFuture<List<Candle>> f1h = fetchKlinesAsync(pair, "1h", 100);
 
-                        CompletableFuture.allOf(f1m, f5m, f15m, f1h).thenAccept(v -> {
+                        CompletableFuture.allOf(f3m, f5m, f15m, f1h).thenAccept(v -> {
                             try {
-                                List<Candle> c1m = f1m.get();
+                                List<Candle> c3m = f3m.get();
                                 List<Candle> c5m = f5m.get();
                                 List<Candle> c15m = f15m.get();
                                 List<Candle> c1h = f1h.get();
 
-                                Optional<Signal> sigOpt = evaluate(pair, c1m, c5m, c15m, c1h);
+                                Optional<Signal> sigOpt = evaluate(pair, c3m, c5m, c15m, c1h);
                                 sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
                             } catch (Exception e) {
                                 System.out.println("[async evaluate] " + e.getMessage());
