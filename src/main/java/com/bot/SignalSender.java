@@ -119,6 +119,18 @@ public class SignalSender {
             return def;
         }
     }
+    // ---------------- Helper: последний Swing High / Low ----------------
+    private double getLastSwingHigh(List<Candle> candles) {
+        List<Integer> highs = detectSwingHighs(candles, 3); // используем существующий метод
+        if (highs.isEmpty()) return Double.NaN;
+        return candles.get(highs.get(highs.size() - 1)).high;
+    }
+
+    private double getLastSwingLow(List<Candle> candles) {
+        List<Integer> lows = detectSwingLows(candles, 3); // используем существующий метод
+        if (lows.isEmpty()) return Double.NaN;
+        return candles.get(lows.get(lows.size() - 1)).low;
+    }
 
     // ========================= Binance Helpers =========================
     public Set<String> getBinanceSymbolsFutures() {
@@ -704,13 +716,11 @@ public class SignalSender {
             boolean atrBreakLong = !Double.isNaN(lastSwingHigh) && lastPrice > lastSwingHigh + atrVal;
             boolean atrBreakShort = !Double.isNaN(lastSwingLow) && lastPrice < lastSwingLow - atrVal;
 
-            double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned,
-                    structureAligned, bos, liquSweep);
+            double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
 
-            boolean strongTrigger = false;
-            if ((impulse && volOk) || atrBreakLong || atrBreakShort) {
-                strongTrigger = true;
-                confidence = Math.min(1.0, confidence + 0.15);
+            boolean strongTrigger = (impulse && volOk) || atrBreakLong || atrBreakShort;
+            if (strongTrigger) {
+                confidence = Math.min(1.0, confidence + 0.15); // усиливаем confidence при сильном сигнале
             }
 
             // Определяем направление
