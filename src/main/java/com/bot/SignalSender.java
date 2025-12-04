@@ -718,6 +718,11 @@ public class SignalSender {
 
             double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
 
+            // адаптивное усиление confidence: если сигнал сильнее минимального порога
+            if (Math.abs(rawScore) > MIN_CONF) {
+                confidence = Math.min(1.0, confidence + (rawScore - MIN_CONF) * 0.2);
+            }
+
             boolean strongTrigger = (impulse && volOk) || atrBreakLong || atrBreakShort;
             if (strongTrigger) {
                 confidence = Math.min(1.0, confidence + 0.15); // усиливаем confidence при сильном сигнале
