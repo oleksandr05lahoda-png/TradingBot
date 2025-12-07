@@ -530,16 +530,14 @@ public class SignalSender {
         double a = (e20 - e50) / (e50 + 1e-12);
         double b = (e50 - e100) / (e100 + 1e-12);
         double combined = (a + b) / 2.0;
-        return Math.max(-1.0, Math.min(1.0, combined / 0.02));
+        return Math.max(-1.0, Math.min(1.0, combined)); // делим уже внутри a и b, нормализируем до [-1,1]
     }
 
     private double strategyRSINorm(List<Double> closes) {
         double r = rsi(closes, 14);
-        if (r < 20) return 0.9;
-        if (r < 30) return 0.5;
-        if (r > 80) return -0.9;
-        if (r > 70) return -0.5;
-        return 0.0;
+        // 50 -> нейтрально, >50 -> LONG, <50 -> SHORT
+        double score = (r - 50) / 50.0;  // теперь результат в [-1,1]
+        return Math.max(-1.0, Math.min(1.0, score));
     }
 
     private double strategyMACDNorm(List<Double> closes) {
@@ -736,9 +734,8 @@ public class SignalSender {
 
             double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
 
-            // адаптивное усиление confidence: если сигнал сильнее минимального порога
-            if (Math.abs(rawScore) > MIN_CONF) {
-                confidence = Math.min(3.0, confidence + (rawScore - MIN_CONF) * 0.2);
+            if (rawScore < -MIN_CONF) {
+                confidence = Math.min(3.0, confidence + (-rawScore - MIN_CONF) * 0.2);
             }
 
             boolean strongTrigger = (impulse && volOk) || atrBreakLong || atrBreakShort;
@@ -752,13 +749,17 @@ public class SignalSender {
             boolean priceUp = lastPrice > prevClose;
             boolean priceDown = lastPrice < prevClose;
 
-            if ((rawScore > 0 || atrBreakLong || (impulse && priceUp)) &&
+            boolean canGoLong = (rawScore > 0 || atrBreakLong || (impulse && priceUp)) &&
                     confidence >= MIN_CONF &&
-                    ((mtfConfirm >= 0 && structureAligned && vwapAligned) || strongTrigger)) {
+                    ((mtfConfirm >= 0 && structureAligned && vwapAligned) || strongTrigger);
+
+            boolean canGoShort = (rawScore < 0 || atrBreakShort || (impulse && priceDown)) &&
+                    confidence >= MIN_CONF &&
+                    ((mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger);
+
+            if (canGoLong) {
                 direction = "LONG";
-            } else if ((rawScore < 0 || atrBreakShort || (impulse && priceDown)) &&
-                    confidence >= MIN_CONF &&
-                    ((mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger)) {
+            } else if (canGoShort) {
                 direction = "SHORT";
             } else {
                 return Optional.empty();
