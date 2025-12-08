@@ -1,6 +1,4 @@
 package com.bot;
-
-
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -646,15 +644,29 @@ public class SignalSender {
             if (newOpen <= lastOpen) return Optional.empty();
             lastOpenTimeMap.put(pair, newOpen);
 
-            // Списки закрытий
             List<Double> closes3m = new ArrayList<>();
             for (Candle c : c3m) closes3m.add(c.close);
+
+            double[] volumes = c3m.stream().mapToDouble(c -> c.volume).toArray();
+            double avgVol = Arrays.stream(volumes).average().orElse(0);
+            double lastVol = volumes[volumes.length - 1];
+            if (lastVol < avgVol * 0.8) return Optional.empty(); // рынок "пустой", сигнал не идёт
+
+            Candle lastCandleTmp = c3m.get(c3m.size() - 1);
+            double body = Math.abs(lastCandleTmp.close - lastCandleTmp.open);
+            double range = lastCandleTmp.high - lastCandleTmp.low;
+            if (body < range * 0.2) return Optional.empty(); // манипуляция
+
             try {
                 double nextPrice = FuturePredictor.predictNextPrice(closes3m.stream().mapToDouble(d -> d).toArray());
-                closes3m.add(nextPrice); // теперь индикаторы будут видеть прогнозную свечу
+                closes3m.add(nextPrice); // теперь индикаторы видят прогноз
             } catch (Exception ex) {
                 System.out.println("[ForwardPredict] " + ex.getMessage());
             }
+            // --- EMA10 / EMA30 для дополнительного фильтра ---
+            double[] closesArr = closes3m.stream().mapToDouble(d -> d).toArray();
+            double ema10 = Indicator.calcEMA(closesArr, 10);
+            double ema30 = Indicator.calcEMA(closesArr, 30);
 
 
             List<Double> closes5m = new ArrayList<>();
@@ -685,6 +697,7 @@ public class SignalSender {
             boolean atrOk = isVolatilityOk(c5m, ATR_MIN_PCT);
 
             // Adaptive impulse
+            // Средняя длина тела свечей для adaptiveImpulse
             int startIdx = Math.max(0, c3m.size() - 20);
             double sumBody = 0.0;
             for (int i = startIdx; i < c3m.size(); i++) {
@@ -693,23 +706,28 @@ public class SignalSender {
             }
             double avgBody = sumBody / (c3m.size() - startIdx);
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-            Candle lastCandle = c3m.get(c3m.size() - 1);
-            lastCandle = new Candle(
-                    lastCandle.openTime,
-                    lastCandle.open,
-                    lastCandle.high,
-                    lastCandle.low,
+
+// Берём последнюю свечу
+            Candle rawLast = c3m.get(c3m.size() - 1);
+            Candle lastCandle = new Candle(
+                    rawLast.openTime,
+                    rawLast.open,
+                    rawLast.high,
+                    rawLast.low,
                     closes3m.get(closes3m.size() - 1), // прогнозная цена
-                    lastCandle.volume,
-                    lastCandle.quoteAssetVolume,
-                    lastCandle.closeTime
+                    rawLast.volume,
+                    rawLast.quoteAssetVolume,
+                    rawLast.closeTime
             );
 
-            boolean impulse = Math.abs(lastCandle.close - lastCandle.open) / (lastCandle.open + 1e-12) >= adaptiveImpulse;
+            if (range <= 0) return Optional.empty();
+            if (body < range * 0.2) return Optional.empty();
+            boolean impulse = body / (lastCandle.open + 1e-12) >= adaptiveImpulse;
+
 
             boolean liquSweep = detectLiquiditySweep(c3m);
 
-            // Market structure
+
             int structure1h = marketStructure(c1h);
             int structure15m = marketStructure(c15m);
             int structure5m = marketStructure(c5m);
@@ -771,11 +789,14 @@ public class SignalSender {
                 if (direction.equals("SHORT") && dir1h > 0 && confidence < 0.85) return Optional.empty();
             }
 
-            double rsiVal = rsi(closes3m, 14);
-            Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsiVal,
+            double rsi14 = rsi(closes3m, 14);
+            double rsi7  = rsi(closes3m, 7);
+            double rsi4  = rsi(closes3m, 4);
+            Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsi14,
                     rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong,
-                    atrBreakShort, impulse, earlyTrigger);
+                    atrBreakShort, impulse, earlyTrigger, rsi7, rsi4);
             markSignalSent(pair);
+
 
             // --- прогноз будущей свечи ---
             try {
@@ -816,6 +837,8 @@ public class SignalSender {
         public final double confidence;
         public final double price;
         public final double rsi;
+        public final double rsi7;
+        public final double rsi4;
         public final double rawScore;
         public final int mtfConfirm;
         public final boolean volOk;
@@ -827,9 +850,10 @@ public class SignalSender {
         public final boolean earlyTrigger;
         public final Instant created = Instant.now();
 
-        public Signal(String symbol, String direction, double confidence, double price, double rsi, double rawScore,
-                      int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger, boolean atrBreakLong,
-                      boolean atrBreakShort, boolean impulse, boolean earlyTrigger) {
+        public Signal(String symbol, String direction, double confidence, double price, double rsi,
+                      double rawScore, int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger,
+                      boolean atrBreakLong, boolean atrBreakShort, boolean impulse, boolean earlyTrigger,
+                      double rsi7, double rsi4) {
             this.symbol = symbol;
             this.direction = direction;
             this.confidence = confidence;
@@ -844,6 +868,8 @@ public class SignalSender {
             this.atrBreakShort = atrBreakShort;
             this.impulse = impulse;
             this.earlyTrigger = earlyTrigger;
+            this.rsi7 = rsi7;
+            this.rsi4 = rsi4;
         }
 
         public String toTelegramMessage() {
