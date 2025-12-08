@@ -70,7 +70,7 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
-        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.7); // user earlier wanted >=0.5 default
+        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.6); // user earlier wanted >=0.5 default
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 3); // quick cycles for futures (1 min)
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
