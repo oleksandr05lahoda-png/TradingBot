@@ -12,9 +12,8 @@ public class Candle {
     public final double quoteVolume;
     public final long closeTime;
 
-    // Конструктор для полного заполнения всех полей
-    public Candle(Instant openTime, double open, double high, double low, double close, double volume, double quoteVolume, long closeTime) {
-        this.openTime = openTime;
+    public Candle(long openTimeMillis, double open, double high, double low, double close, double volume, double quoteVolume, long closeTime) {
+        this.openTime = Instant.ofEpochMilli(openTimeMillis);
         this.open = open;
         this.high = high;
         this.low = low;

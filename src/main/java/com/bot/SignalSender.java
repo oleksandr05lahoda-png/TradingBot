@@ -1032,30 +1032,24 @@ public class SignalSender {
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 ensureBinancePairsFresh(); // обновляем список пар
+                ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+
                 for (String pair : BINANCE_PAIRS) {
-                    try {
-                        CompletableFuture<List<Candle>> f3m = fetchKlinesAsync(pair, "3m", 100);
-                        CompletableFuture<List<Candle>> f5m = fetchKlinesAsync(pair, "5m", 100);
-                        CompletableFuture<List<Candle>> f15m = fetchKlinesAsync(pair, "15m", 100);
-                        CompletableFuture<List<Candle>> f1h = fetchKlinesAsync(pair, "1h", 100);
+                    executor.submit(() -> {
+                        try {
+                            List<Candle> c3m = fetchKlines(pair, "3m", 100);
+                            List<Candle> c5m = fetchKlines(pair, "5m", 100);
+                            List<Candle> c15m = fetchKlines(pair, "15m", 100);
+                            List<Candle> c1h = fetchKlines(pair, "1h", 100);
 
-                        CompletableFuture.allOf(f3m, f5m, f15m, f1h).thenAccept(v -> {
-                            try {
-                                List<Candle> c3m = f3m.get();
-                                List<Candle> c5m = f5m.get();
-                                List<Candle> c15m = f15m.get();
-                                List<Candle> c1h = f1h.get();
-
-                                Optional<Signal> sigOpt = evaluate(pair, c3m, c5m, c15m, c1h);
-                                sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
-                            } catch (Exception e) {
-                                System.out.println("[async evaluate] " + e.getMessage());
-                            }
-                        });
-                    } catch (Exception ex) {
-                        System.out.println("[start] Error evaluating " + pair + ": " + ex.getMessage());
-                    }
+                            Optional<Signal> sigOpt = evaluate(pair, c3m, c5m, c15m, c1h);
+                            sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
+                        } catch (Exception e) {
+                            System.out.println("[Parallel evaluate] " + e.getMessage());
+                        }
+                    });
                 }
+                executor.shutdown();
             } catch (Exception e) {
                 System.out.println("[start] Scheduler error: " + e.getMessage());
             }

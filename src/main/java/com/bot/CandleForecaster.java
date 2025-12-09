@@ -52,16 +52,18 @@ public class CandleForecaster {
         double predictedClose = lastCandle.close + speed + accel;
         double predictedHigh = Math.max(predictedOpen, predictedClose) + Math.abs(accel) * 0.5;
         double predictedLow = Math.min(predictedOpen, predictedClose) - Math.abs(accel) * 0.5;
-        long predictedTime = System.currentTimeMillis() + (lastCandle.closeTime - lastCandle.openTime);
+        long candleDuration = lastCandle.closeTime - lastCandle.getOpenTimeMillis();
+        if (candleDuration <= 0) candleDuration = 60_000;
 
+        long predictedTime = System.currentTimeMillis() + candleDuration;
         Candle predictedCandle = new Candle(
                 predictedTime,
                 predictedOpen,
                 predictedHigh,
                 predictedLow,
                 predictedClose,
-                lastCandle.volume,          // можно прогнозировать объем отдельно
-                lastCandle.quoteAssetVolume,
+                lastCandle.volume,
+                lastCandle.quoteVolume, // совпадает с полем
                 predictedTime
         );
 
