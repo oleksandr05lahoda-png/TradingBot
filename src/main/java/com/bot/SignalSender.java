@@ -84,7 +84,7 @@ public class SignalSender {
 
         this.VWAP_SESSION_START = LocalTime.parse(System.getenv().getOrDefault("SESSION_START", "00:00"));
 
-        this.TICK_HISTORY = envInt("TICK_HISTORY", 300);
+        this.TICK_HISTORY = envInt("TICK_HISTORY", 100);
         this.OBI_THRESHOLD = envDouble("OBI_THRESHOLD", 0.28);
         this.VOLUME_SPIKE_MULT = envDouble("VOL_SPIKE_MULT", 1.4);
 
