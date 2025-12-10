@@ -1044,23 +1044,37 @@ public class SignalSender {
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 ensureBinancePairsFresh(); // обновляем список пар
+
                 ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 
                 for (String pair : BINANCE_PAIRS) {
                     executor.submit(() -> {
                         try {
+                            // --- Получаем свечи ---
                             List<Candle> c5m = fetchKlines(pair, "5m", 100);
                             List<Candle> c15m = fetchKlines(pair, "15m", 100);
                             List<Candle> c1h = fetchKlines(pair, "1h", 100);
 
+                            // --- Генерация сигнала ---
                             Optional<Signal> sigOpt = evaluate(pair, c5m, c15m, c1h);
-                            sigOpt.ifPresent(sig -> bot.sendSignal(sig.toTelegramMessage()));
+
+                            // --- Если сигнал есть, отправляем ---
+                            sigOpt.ifPresent(sig -> {
+                                System.out.println("[Signal ready] " + pair + " → " + sig.direction
+                                        + " confidence: " + sig.confidence);
+                                bot.sendSignal(sig.toTelegramMessage());
+                            });
+
                         } catch (Exception e) {
-                            System.out.println("[Parallel evaluate] " + e.getMessage());
+                            System.out.println("[Parallel evaluate] " + pair + " error: " + e.getMessage());
                         }
                     });
                 }
+
                 executor.shutdown();
+                // Ждём завершения всех задач, чтобы избежать утечки потоков
+                executor.awaitTermination(1, TimeUnit.MINUTES);
+
             } catch (Exception e) {
                 System.out.println("[start] Scheduler error: " + e.getMessage());
             }
