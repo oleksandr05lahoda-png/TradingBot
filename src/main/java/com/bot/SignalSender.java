@@ -416,6 +416,44 @@ public class SignalSender {
         return pv / vol;
     }
 
+    // Trend prediction based on linear regression of last N candles
+    public TrendPrediction predictTrend(List<Candle> candles) {
+        if (candles == null || candles.size() < 30) {
+            return new TrendPrediction("NONE", 0.0);
+        }
+
+        int N = Math.min(60, candles.size());
+        List<Double> closes = new ArrayList<>();
+        for (int i = candles.size() - N; i < candles.size(); i++) {
+            closes.add(candles.get(i).close);
+        }
+
+        // Linear regression y = a*x + b
+        int size = closes.size();
+        double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+
+        for (int i = 0; i < size; i++) {
+            sumX += i;
+            sumY += closes.get(i);
+            sumXY += i * closes.get(i);
+            sumXX += i * i;
+        }
+
+        double slope = (size * sumXY - sumX * sumY) / (size * sumXX - sumX * sumX + 1e-12);
+
+        double avgClose = closes.stream().mapToDouble(Double::doubleValue).average().orElse(closes.get(size - 1));
+        double slopePct = slope / (avgClose + 1e-12);
+
+        double conf = Math.min(1.0, Math.abs(slopePct) * 12);
+
+        if (conf < 0.1)
+            return new TrendPrediction("NONE", conf);
+
+        String dir = slopePct > 0 ? "LONG" : "SHORT";
+
+        return new TrendPrediction(dir, conf);
+    }
+
     // ========================= Price Action helpers =========================
     public static List<Integer> detectSwingHighs(List<Candle> candles, int leftRight) {
         List<Integer> res = new ArrayList<>();
@@ -763,6 +801,19 @@ public class SignalSender {
             double rsi7  = rsi(closes5m, 7);
             double rsi4  = rsi(closes5m, 4);
 
+            // ================== Trend prediction inject ==================
+            TrendPrediction tp = predictTrend(c5m);
+
+            if (!tp.direction.equals("NONE") && tp.confidence > 0.55) {
+                if (tp.direction.equals("LONG")) {
+                    rawScore += 0.4;
+                    confidence += tp.confidence * 0.4;
+                } else {
+                    rawScore -= 0.4;
+                    confidence += tp.confidence * 0.4;
+                }
+            }
+
             Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsi14,
                     rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong,
                     atrBreakShort, impulse, earlyTrigger, rsi7, rsi4);
@@ -845,6 +896,17 @@ public class SignalSender {
                     symbol, direction, confidence, price, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk, created.toString());
         }
     }
+
+    public static class TrendPrediction {
+        public final String direction;
+        public final double confidence;
+
+        public TrendPrediction(String direction, double confidence) {
+            this.direction = direction;
+            this.confidence = confidence;
+        }
+    }
+
 
     // ========================= Cooldown / Debounce =========================
     public boolean isCooldown(String pair) {
