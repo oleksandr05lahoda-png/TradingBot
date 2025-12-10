@@ -654,8 +654,9 @@ public class SignalSender {
 
             // --- Прогноз будущей цены ---
             try {
-                double nextPrice = FuturePredictor.predictNextPrice(closes5m.stream().mapToDouble(d -> d).toArray());
-                closes5m.add(nextPrice); // прогнозная цена добавлена для индикаторов
+                double[] closesArray = closes5m.stream().mapToDouble(d -> d).toArray();
+                double nextPrice = FuturePredictor.predictNextPrice(closesArray, 5, 0.005); // 5 свечей вперед, порог 0.5%
+                closes5m.add(nextPrice); // добавляем прогноз для индикаторов
             } catch (Exception ex) {
                 System.out.println("[ForwardPredict] " + ex.getMessage());
             }
