@@ -3,9 +3,6 @@ import os, sys, json, math, requests
 import numpy as np
 import pandas as pd
 import mplfinance as mpf
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
 
 # CONFIG from ENV or defaults
 COINS_ENV = os.getenv("COINS")
@@ -88,31 +85,10 @@ def add_features(df):
 def prepare_dataset(df_ohlc, lookback=CANDLES):
     df_feat = add_features(df_ohlc)
     df_feat = df_feat.iloc[-(lookback+5):].reset_index(drop=True)
-    df_feat['target'] = (df_feat['close'].shift(-1) > df_feat['close']).astype(int)
     df_feat = df_feat.dropna().reset_index(drop=True)
     X = df_feat[['ret1','ret3','ema_diff','macd_hist','rsi14','mom3','vol5']].values
     y = df_feat['target'].values
     return X, y, df_feat
-
-def train_models(X,y):
-    if len(y) < 12:
-        return None, None
-    X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2,shuffle=True,random_state=42)
-    lr = LogisticRegression(max_iter=1000)
-    rf = RandomForestClassifier(n_estimators=100, random_state=42)
-    try:
-        lr.fit(X_train,y_train)
-        rf.fit(X_train,y_train)
-    except:
-        return None, None
-    return lr, rf
-
-def predict_ensemble(models, x_last):
-    lr, rf = models
-    probs=[]
-    if lr: probs.append(lr.predict_proba(x_last.reshape(1,-1))[0][1])
-    if rf: probs.append(rf.predict_proba(x_last.reshape(1,-1))[0][1])
-    return float(np.mean(probs)) if probs else 0.5
 
 def draw_candles(df_ohlc, symbol, signal):
     chart_path = os.path.join(OUT_DIR, f"{symbol}_chart.png")
@@ -123,26 +99,42 @@ def draw_candles(df_ohlc, symbol, signal):
 
 def analyze(symbol):
     try:
+        # 1️⃣ Загружаем данные
         df_ohlc = fetch_ohlc(symbol, interval=INTERVAL, limit=max(200, CANDLES+20))
         closes = df_ohlc['close'].values
         if len(closes) < CANDLES+2:
             return f"{symbol}|ERROR|0.0|-"
-        X,y,df_feat = prepare_dataset(df_ohlc, lookback=CANDLES)
+
+        # 2️⃣ Подготавливаем фичи
+        X, y, df_feat = prepare_dataset(df_ohlc, lookback=CANDLES)
         if X.shape[0] < 10:
             return f"{symbol}|NEUTRAL|0.0|-"
-        models = train_models(X,y)
-        # if models None, still handle gracefully
-        prob = predict_ensemble(models, X[-1]) if models != (None,None) else 0.5
-        # signal interpretation with thresholds
-        if prob > 0.55:
-            signal = "LONG"
-        elif prob < 0.45:
-            signal = "SHORT"
-        else:
-            signal = "NEUTRAL"
-        confidence = abs(prob - 0.5) * 2  # 0..1
+
+        # 3️⃣ Фильтр аномалий через ATR
+        atr = ATR(df_ohlc, 14)
+        last_range = df_ohlc['high'].iloc[-1] - df_ohlc['low'].iloc[-1]
+        if last_range > 2.5 * atr.iloc[-1]:
+            return f"{symbol}|NO_TRADE|0.0|ANOMALY"
+
+        # 4️⃣ Новая логика сигналов без моделей
+        ema9 = df_feat['ema9'].iloc[-1]
+        ema21 = df_feat['ema21'].iloc[-1]
+        rsi = df_feat['rsi14'].iloc[-1]
+
+        signal = "NO_TRADE"
+        if ema9 > ema21 and rsi < 65:
+            signal = "WATCH_LONG"
+        elif ema9 < ema21 and rsi > 35:
+            signal = "WATCH_SHORT"
+
+        # 5️⃣ Конфиденс (можно оставить простым для сигналов без ML)
+        confidence = 0.7 if signal.startswith("WATCH") else 0.0
+
+        # 6️⃣ Рисуем график
         chart = draw_candles(df_ohlc, symbol, signal)
-        return f"{symbol}|{signal}|{confidence:.3f}|{chart}"
+
+return f"{symbol}|{signal}|{confidence:.2f}|RSI={int(rsi)}"
+
     except Exception as e:
         return f"{symbol}|ERROR|0.0|-"
 

@@ -25,54 +25,17 @@ public class CandleForecaster {
         double prev = recent.get(n - 2);
         double prevPrev = recent.get(n - 3);
 
-        double speed = last - prev;
-        double accel = (last - prev) - (prev - prevPrev);
+        double emaFast = Indicator.calcEMA(
+                closes.stream().mapToDouble(Double::doubleValue).toArray(), 9);
+        double emaSlow = Indicator.calcEMA(
+                closes.stream().mapToDouble(Double::doubleValue).toArray(), 21);
 
-        double predicted = last + speed + accel; // прогноз с учетом ускорения
+        double trend = emaFast - emaSlow;
+        double predicted = last + trend * 0.3;
+
         return Optional.of(predicted);
     }
 
-    /**
-     * Прогноз следующей свечи (Candle)
-     */
-    public Optional<Candle> predictNextCandle(List<Candle> recentCandles) {
-        if (recentCandles.size() < 3) return Optional.empty();
-
-        int n = Math.min(recentCandles.size(), lookback);
-        List<Candle> recent = recentCandles.subList(recentCandles.size() - n, recentCandles.size());
-
-        Candle lastCandle = recent.get(recent.size() - 1);
-        Candle prevCandle = recent.get(recent.size() - 2);
-        Candle prevPrevCandle = recent.get(recent.size() - 3);
-
-        double speed = lastCandle.close - prevCandle.close;
-        double accel = (lastCandle.close - prevCandle.close) - (prevCandle.close - prevPrevCandle.close);
-
-        double predictedOpen = lastCandle.close;
-        double predictedClose = lastCandle.close + speed + accel;
-        double predictedHigh = Math.max(predictedOpen, predictedClose) + Math.abs(accel) * 0.5;
-        double predictedLow = Math.min(predictedOpen, predictedClose) - Math.abs(accel) * 0.5;
-        long candleDuration = lastCandle.closeTime - lastCandle.getOpenTimeMillis();
-        if (candleDuration <= 0) candleDuration = 60_000;
-
-        long predictedTime = System.currentTimeMillis() + candleDuration;
-        Candle predictedCandle = new Candle(
-                predictedTime,
-                predictedOpen,
-                predictedHigh,
-                predictedLow,
-                predictedClose,
-                lastCandle.volume,
-                lastCandle.quoteVolume, // совпадает с полем
-                predictedTime
-        );
-
-        return Optional.of(predictedCandle);
-    }
-
-    /**
-     * Возвращает вероятность движения вверх/вниз на основе линейного прогноза
-     */
     public double predictProbability(List<Double> closes) {
         Optional<Double> predictedOpt = predictNextPrice(closes);
         if (predictedOpt.isEmpty()) return 0.5; // нейтрально

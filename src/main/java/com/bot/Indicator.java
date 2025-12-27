@@ -11,17 +11,18 @@ public class Indicator {
         }
         return ema;
     }
-
-    // Пример: RSI
     public static double calcRSI(double[] closes, int period) {
         if (closes.length < period + 1) return 50.0;
+
         double gain = 0, loss = 0;
         for (int i = closes.length - period; i < closes.length; i++) {
             double diff = closes[i] - closes[i - 1];
             if (diff > 0) gain += diff;
             else loss -= diff;
         }
-        double rs = (loss == 0) ? 100 : gain / loss;
+
+        if (loss == 0) return 100.0;
+        double rs = gain / loss;
         return 100 - (100 / (1 + rs));
     }
 }
