@@ -7,8 +7,7 @@
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/CandleForecaster.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/CandleForecaster.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/FuturePredictor.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/FuturePredictor.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/python-core/analysis.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/python-core/analysis.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -204,7 +203,8 @@
       <workItem from="1765368859987" duration="887000" />
       <workItem from="1765382304220" duration="5439000" />
       <workItem from="1766167300544" duration="797000" />
-      <workItem from="1766837509134" duration="2893000" />
+      <workItem from="1766837509134" duration="4991000" />
+      <workItem from="1767516005059" duration="2997000" />
     </task>
     <servers />
   </component>

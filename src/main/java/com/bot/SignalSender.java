@@ -690,15 +690,6 @@ public class SignalSender {
             double lastVol = volumes[volumes.length - 1];
             if (lastVol < avgVol * 0.8) return Optional.empty(); // рынок "пустой"
 
-            // --- Прогноз будущей цены ---
-            try {
-                double[] closesArray = closes5m.stream().mapToDouble(d -> d).toArray();
-                double nextPrice = FuturePredictor.predictNextPrice(closesArray, 5, 0.005); // 5 свечей вперед, порог 0.5%
-                closes5m.add(nextPrice); // добавляем прогноз для индикаторов
-            } catch (Exception ex) {
-                System.out.println("[ForwardPredict] " + ex.getMessage());
-            }
-
             // --- Индикаторы ---
             double emaScore = strategyEMANorm(closes5m);
             double rsiScore = strategyRSINorm(closes5m);
@@ -819,7 +810,6 @@ public class SignalSender {
                     atrBreakShort, impulse, earlyTrigger, rsi7, rsi4);
             markSignalSent(pair);
 
-            // --- FUTURE PREDICTOR SIGNAL ---
             try {
                 double[] closesArray = closes5m.stream().mapToDouble(d -> d).toArray();
                 double nextPrice = FuturePredictor.predictNextPrice(closesArray);

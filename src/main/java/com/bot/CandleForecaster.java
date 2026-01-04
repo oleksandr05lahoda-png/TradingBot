@@ -35,17 +35,4 @@ public class CandleForecaster {
 
         return Optional.of(predicted);
     }
-
-    public double predictProbability(List<Double> closes) {
-        Optional<Double> predictedOpt = predictNextPrice(closes);
-        if (predictedOpt.isEmpty()) return 0.5; // нейтрально
-
-        double predicted = predictedOpt.get();
-        double last = closes.get(closes.size() - 1);
-        double diffPct = (predicted - last) / (last + 1e-12);
-
-        // Простой перевод изменения в вероятность: 0-1
-        double prob = 0.5 + diffPct * 50; // если diffPct = 0.01 -> +0.5% к вероятности
-        return Math.max(0.0, Math.min(1.0, prob));
-    }
 }
