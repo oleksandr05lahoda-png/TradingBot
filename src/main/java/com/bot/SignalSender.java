@@ -339,8 +339,6 @@ public class SignalSender {
         for (int i = prices.size() - period; i < prices.size(); i++) sum += prices.get(i);
         return sum / period;
     }
-
-    // EMA
     public static double ema(List<Double> prices, int period) {
         if (prices == null || prices.isEmpty()) return 0.0;
         double k = 2.0 / (period + 1);
@@ -667,8 +665,6 @@ public class SignalSender {
             if (c15m == null || c15m.size() < 20) return Optional.empty(); // старший TF
             if (c1h == null || c1h.size() < 20) return Optional.empty(); // ещё старший TF
             if (isCooldown(pair)) return Optional.empty(); // дебаунс сигналов
-
-            // --- Направление по таймфреймам ---
             int dir1h = emaDirection(c1h, 20, 50, 0.002);
             int dir15m = emaDirection(c15m, 9, 21, 0.002);
             int dir5m = emaDirection(c5m, 9, 21, 0.002);
@@ -698,9 +694,8 @@ public class SignalSender {
             double rawScore = emaScore * 0.38 + macdScore * 0.28 + rsiScore * 0.19 + momScore * 0.15;
 
             boolean earlyTrigger = earlyTrendTrigger(c5m);
-            if (earlyTrigger) {
-                if (rawScore > 0) mtfConfirm = 1;
-                else if (rawScore < 0) mtfConfirm = -1;
+            if (earlyTrigger && Math.abs(rawScore) > 0.25) {
+                mtfConfirm = Integer.signum((int)Math.signum(rawScore));
             }
 
             // --- Объёмы и волатильность ---
@@ -759,9 +754,20 @@ public class SignalSender {
             boolean atrBreakShort = !Double.isNaN(lastSwingLow) && lastPrice < lastSwingLow - atrVal;
 
             double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, !impulse, vwapAligned, structureAligned, bos, liquSweep);
-            if (rawScore < -MIN_CONF) confidence = Math.min(3.0, confidence + (-rawScore - MIN_CONF) * 0.2);
+            double cap;
+            if (impulse && atrBreakLong || atrBreakShort) {
+                cap = 0.88;
+            } else if (earlyTrigger) {
+                cap = 0.82;
+            } else {
+                cap = 0.78;
+            }
+            confidence = Math.min(confidence, cap);
+
             boolean strongTrigger = (impulse && volOk) || atrBreakLong || atrBreakShort;
-            if (strongTrigger) confidence = Math.min(1.0, confidence + 0.15);
+            if (strongTrigger) {
+                confidence = Math.min(confidence, 0.85);
+            }
 
             // --- Определяем направление ---
             String direction = null;
@@ -776,12 +782,32 @@ public class SignalSender {
             boolean canGoShort = (rawScore < 0 || atrBreakShort || (impulse && priceDown)) &&
                     confidence >= MIN_CONF &&
                     ((mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger);
-
+            if (canGoLong && canGoShort) {
+                return Optional.empty(); // лучше НЕТ сигнала, чем ложный
+            }
             if (canGoLong) direction = "LONG";
             else if (canGoShort) direction = "SHORT";
             else return Optional.empty();
 
-            if (liquSweep && confidence < 0.92) confidence *= 0.85;
+            // ================== FUTURE FILTER (NOT SIGNAL) ==================
+            try {
+                double[] closesArray = closes5m.stream().mapToDouble(d -> d).toArray();
+                double futurePrice = FuturePredictor.predictNextPrice(
+                        closesArray,
+                        5,      // 5 свечей
+                        0.002   // 0.2% минимум
+                );
+
+                double futureDiffPct = (futurePrice - lastPrice) / lastPrice;
+
+                if (direction.equals("LONG") && futureDiffPct < 0) return Optional.empty();
+                if (direction.equals("SHORT") && futureDiffPct > 0) return Optional.empty();
+
+            } catch (Exception ignore) {}
+
+            if (liquSweep && confidence < 0.90) {
+                return Optional.empty();
+            }
             if (!strongTrigger) {
                 if (direction.equals("LONG") && dir1h < 0 && confidence < 0.85) return Optional.empty();
                 if (direction.equals("SHORT") && dir1h > 0 && confidence < 0.85) return Optional.empty();
@@ -792,40 +818,16 @@ public class SignalSender {
             double rsi7  = rsi(closes5m, 7);
             double rsi4  = rsi(closes5m, 4);
 
-            // ================== Trend prediction inject ==================
             TrendPrediction tp = predictTrend(c5m);
-
-            if (!tp.direction.equals("NONE") && tp.confidence > 0.55) {
-                if (tp.direction.equals("LONG")) {
-                    rawScore += 0.4;
-                    confidence += tp.confidence * 0.4;
-                } else {
-                    rawScore -= 0.4;
-                    confidence += tp.confidence * 0.4;
-                }
+            if (!tp.direction.equals("NONE") && tp.confidence > 0.6) {
+                if (direction.equals("LONG") && tp.direction.equals("SHORT")) return Optional.empty();
+                if (direction.equals("SHORT") && tp.direction.equals("LONG")) return Optional.empty();
             }
 
             Signal s = new Signal(pair.replace("USDT", ""), direction, confidence, lastPrice, rsi14,
                     rawScore, mtfConfirm, volOk, atrOk, strongTrigger, atrBreakLong,
                     atrBreakShort, impulse, earlyTrigger, rsi7, rsi4);
             markSignalSent(pair);
-
-            try {
-                double[] closesArray = closes5m.stream().mapToDouble(d -> d).toArray();
-                double nextPrice = FuturePredictor.predictNextPrice(closesArray);
-                double diffPct = (nextPrice - lastPrice) / lastPrice;
-
-                if (Math.abs(diffPct) > 0.005) {
-                    String dir = (diffPct > 0) ? "FUTURE_LONG" : "FUTURE_SHORT";
-                    String msg = String.format("%s %s predictedMove=%.4f%% nextPrice=%.8f",
-                            pair, dir, diffPct * 100, nextPrice);
-                    bot.sendSignal(msg);
-                    System.out.println("[FuturePredictor] " + msg);
-                }
-            } catch (Exception ex) {
-                System.out.println("[FuturePredictor ERROR] " + ex.getMessage());
-            }
-
             return Optional.of(s);
 
         } catch (Exception ex) {
@@ -1007,6 +1009,7 @@ public class SignalSender {
         return new MicroTrendResult(speed, accel, avg);
     }
 
+
     private void evaluateTick(String pair, double price, double qty, long ts, MicroTrendResult tr, OrderbookSnapshot obs) {
         double obi = obs.obi();
         double microSpeed = tr.speed;
@@ -1016,6 +1019,7 @@ public class SignalSender {
         boolean strongTickTrigger = Math.abs(obi) > OBI_THRESHOLD && Math.abs(microSpeed) > IMPULSE_PCT;
         // добавляем microtrend ускорение и предсказание импульса
         double predictedMove = microSpeed * 2 + microAccel * 1.5;
+        if (lastSignalTime.containsKey(pair)) return;
         if (predictedMove > IMPULSE_PCT && !isCooldown(pair)) {
             strongTickTrigger = true;
         }
