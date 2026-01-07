@@ -2,10 +2,11 @@ package com.bot;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.net.URI;
 import java.net.http.*;
 import java.time.*;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -100,6 +101,11 @@ public class SignalSender {
         } catch (Exception e) {
             return def;
         }
+    }
+    private String getLocalTimeString() {
+        LocalDateTime now = LocalDateTime.now(); // локальное системное время
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss");
+        return now.format(fmt);
     }
 
     private long envLong(String k, long def) {
@@ -889,8 +895,12 @@ public class SignalSender {
                     (atrBreakLong ? "ATR↑ " : "") +
                     (atrBreakShort ? "ATR↓ " : "") +
                     (impulse ? "IMPULSE " : "");
+
+            // вместо created.toString() используем локальное время
+            String localTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+
             return String.format("*%s* → *%s*\nConfidence: *%.2f*\nPrice: %.8f\nRSI(14): %.2f\n_flags_: %s\n_raw: %.3f mtf:%d vol:%b atr:%b_\n_time: %s_",
-                    symbol, direction, confidence, price, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk, created.toString());
+                    symbol, direction, confidence, price, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk, localTime);
         }
     }
 
