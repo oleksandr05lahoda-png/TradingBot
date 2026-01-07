@@ -763,19 +763,21 @@ public class SignalSender {
             boolean atrBreakShort = !Double.isNaN(lastSwingLow) && lastPrice < lastSwingLow - atrVal;
 
             double cap = (impulse && atrBreakLong || atrBreakShort) ? 0.88 : (earlyTrigger ? 0.82 : 0.78);
+            String direction = null;
             confidence = Math.min(confidence, cap);
 
 
             boolean strongTrigger = (impulse && volOk) || atrBreakLong || atrBreakShort;
-            // NEW: проверяем, что нет противоречащего сигнала на тот же актив
+
             if (lastSignalTime.containsKey(p)) {
+                long lastTs = lastSignalTime.get(p);
                 double lastConf = lastSentConfidence.getOrDefault(p, 0.0);
-                // Если предыдущий сигнал был противоположного направления с высокой уверенностью, уменьшаем strongTrigger
-                if ((rawScore > 0 && lastConf > 0 && lastSignalTime.get(p) + COOLDOWN_MS > System.currentTimeMillis() && lastSentConfidence.get(p) < 0)
-                        || (rawScore < 0 && lastConf < 0 && lastSignalTime.get(p) + COOLDOWN_MS > System.currentTimeMillis() && lastSentConfidence.get(p) > 0)) {
-                    strongTrigger = false;
+                if (lastTs + COOLDOWN_MS > System.currentTimeMillis()) {
+                    direction = lastConf >= 0 ? "LONG" : "SHORT";
                 }
             }
+
+
             strongTrigger = strongTrigger && isVolumeStrong(p, lastPrice); // <--- новая проверка
             if (strongTrigger) confidence = Math.min(confidence, 0.85);
 
@@ -787,17 +789,15 @@ public class SignalSender {
             boolean canGoShort = (rawScore < 0 || atrBreakShort || impulse) &&
                     confidence >= MIN_CONF &&
                     ((mtfConfirm <= 0 && structureAligned && vwapAligned) || strongTrigger);
-
-            String direction;
-            if (canGoLong && !canGoShort) direction = "LONG";
-            else if (!canGoLong && canGoShort) direction = "SHORT";
-            else if (canGoLong && canGoShort) {
-                // сравниваем силу сигналов
-                double confLong = confidence * (rawScore > 0 ? 1 : 0.9) * (mt.speed > 0 ? 1.05 : 0.95);
-                double confShort = confidence * (rawScore < 0 ? 1 : 0.9) * (mt.speed < 0 ? 1.05 : 0.95);
-                direction = confLong >= confShort ? "LONG" : "SHORT";
-            } else return Optional.empty();
-// NEW: избегаем отправки противоположных сигналов подряд
+            if (direction == null) {
+                if (canGoLong && !canGoShort) direction = "LONG";
+                else if (!canGoLong && canGoShort) direction = "SHORT";
+                else if (canGoLong && canGoShort) {
+                    double confLong = confidence * (rawScore > 0 ? 1 : 0.9) * (mt.speed > 0 ? 1.05 : 0.95);
+                    double confShort = confidence * (rawScore < 0 ? 1 : 0.9) * (mt.speed < 0 ? 1.05 : 0.95);
+                    direction = confLong >= confShort ? "LONG" : "SHORT";
+                } else return Optional.empty();
+            }
             if (lastSignalTime.containsKey(p)) {
                 long lastTs = lastSignalTime.get(p);
                 double lastConf = lastSentConfidence.getOrDefault(p, 0.0);
@@ -817,10 +817,10 @@ public class SignalSender {
                     return Optional.empty();
             } catch (Exception ignore) {}
 
-            if (liquSweep && confidence < 0.90) return Optional.empty();
+            if (liquSweep && confidence < 0.80) return Optional.empty();
             if (!strongTrigger) {
-                if (direction.equals("LONG") && dir1h < 0 && confidence < 0.85) return Optional.empty();
-                if (direction.equals("SHORT") && dir1h > 0 && confidence < 0.85) return Optional.empty();
+                if (direction.equals("LONG") && dir1h < 0 && confidence < 0.7) return Optional.empty();
+                if (direction.equals("SHORT") && dir1h > 0 && confidence < 0.7) return Optional.empty();
             }
 
             double rsi14 = rsi(closes5m, 14);
@@ -988,7 +988,7 @@ public class SignalSender {
         double accel = (lastPrice - prevPrice) - (prevPrice - prevPrevPrice);
 
         // Ограничиваем экстремальные скачки
-        double maxChangePct = 0.02;
+        double maxChangePct = 0.05;
         speed = Math.max(-lastPrice * maxChangePct, Math.min(speed, lastPrice * maxChangePct));
         accel = Math.max(-lastPrice * maxChangePct, Math.min(accel, lastPrice * maxChangePct));
 
@@ -1041,17 +1041,22 @@ public class SignalSender {
         double microAccel = tr.accel;
         double conf = Math.min(1.0, Math.abs(microSpeed) * 0.4 + Math.abs(obi) * 0.35 + Math.abs(microAccel) * 0.15);
 
-        boolean strongTickTrigger = Math.abs(obi) > OBI_THRESHOLD && Math.abs(microSpeed) > IMPULSE_PCT;
+        // Мягкий порог для частых сигналов
+        boolean strongTickTrigger = Math.abs(obi) > 0.005 || Math.abs(microSpeed) > 0.001; // вместо жестких OBI_THRESHOLD и IMPULSE_PCT
 
         double predictedMove = microSpeed * 2 + microAccel * 1.5;
 
         // --- Фильтр крупной свечи ---
         double lastCandleRangePct = (lastCandle.high - lastCandle.low) / lastCandle.close;
-        if (lastCandleRangePct > 0.02) strongTickTrigger = true;
+        if (lastCandleRangePct > 0.01) strongTickTrigger = true;
 
         if (predictedMove > IMPULSE_PCT && !isCooldown(pair)) strongTickTrigger = true;
 
-        if (strongTickTrigger && conf > MIN_CONF) {
+        if (!strongTickTrigger && Math.abs(microSpeed) > 0.0005) {
+            strongTickTrigger = true;
+        }
+
+        if (strongTickTrigger && conf > 0.05) {
             String direction = (obi > 0) ? "LONG" : "SHORT";
             sendSignalIfAllowed(pair, direction, conf, price);
         }
@@ -1117,12 +1122,9 @@ public class SignalSender {
         long ts = System.currentTimeMillis();
 
         if (last != null && ts - last.timestamp < SIGNAL_COOLDOWN_MS) {
-            if (!last.direction.equals(direction)) {
-                System.out.println("[SignalBlock] skip " + direction + " for " + pair +
-                        " because " + last.direction + " is still active (" + (ts - last.timestamp) + "ms)");
-                return;
-            }
+            // не блокируем по направлению, просто даем сигнал чаще
         }
+
 
         lastSignals.put(pair, new LastSignal(){{
             this.direction = direction;
@@ -1191,5 +1193,5 @@ public class SignalSender {
     }
 
     private final Map<String, LastSignal> lastSignals = new ConcurrentHashMap<>();
-    private final long SIGNAL_COOLDOWN_MS = 45_000; // 1 минута блокировки противоположного сигнала
+    private final long SIGNAL_COOLDOWN_MS = 20_000; // 1 минута блокировки противоположного сигнала
 }
