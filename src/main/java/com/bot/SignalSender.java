@@ -1100,23 +1100,30 @@ public class SignalSender {
         try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
     }
     private void sendSignalIfAllowed(String pair, String direction, double confidence, double price) {
-        LastSignal last = lastSignals.get(pair);
-        long now = System.currentTimeMillis();
+        ZonedDateTime now = ZonedDateTime.now(ZoneId.systemDefault());
+        String time = now.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
 
-        if (last != null && now - last.timestamp < SIGNAL_COOLDOWN_MS) {
+        LastSignal last = lastSignals.get(pair);
+        long ts = System.currentTimeMillis();
+
+        if (last != null && ts - last.timestamp < SIGNAL_COOLDOWN_MS) {
             if (!last.direction.equals(direction)) {
                 System.out.println("[SignalBlock] skip " + direction + " for " + pair +
-                        " because " + last.direction + " is still active (" + (now - last.timestamp) + "ms)");
+                        " because " + last.direction + " is still active (" + (ts - last.timestamp) + "ms)");
                 return;
             }
         }
+
         lastSignals.put(pair, new LastSignal(){{
             this.direction = direction;
-            this.timestamp = now;
+            this.timestamp = ts;
         }});
 
-        // Отправляем в Telegram / лог
-        String msg = String.format("%s %s conf=%.2f price=%.8f", pair, direction, confidence, price);
+        String msg = String.format(
+                "[%s] %s %s conf=%.2f price=%.8f",
+                time, pair, direction, confidence, price
+        );
+
         bot.sendSignal(msg);
         System.out.println("[SignalSent] " + msg);
     }
