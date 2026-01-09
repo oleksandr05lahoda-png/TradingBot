@@ -14,6 +14,9 @@ import java.util.stream.Collectors;
 
 public class SignalSender {
 
+    // ===== Active trade idea state =====
+    private final Map<String, Integer> ideaDirection = new ConcurrentHashMap<>();
+    private final Map<String, Double> ideaInvalidation = new ConcurrentHashMap<>();
     private final TelegramBotSender bot;
     private final HttpClient http;
 
@@ -783,10 +786,19 @@ public class SignalSender {
                     rsi(closes5m, 7),
                     rsi(closes5m, 4)
             );
+            // === SAVE MAIN TRADE IDEA ===
+            int dirVal = direction.equals("LONG") ? 1 : -1;
+            ideaDirection.put(p, dirVal);
 
-            markSignalSent(p, confidence);
+// invalidation = противоположный свинг + ATR
+            double invalidation;
+            if (dirVal == 1) {
+                invalidation = lastSwingLow(c5m) - atrVal * 0.3;
+            } else {
+                invalidation = lastSwingHigh(c5m) + atrVal * 0.3;
+            }
+            ideaInvalidation.put(p, invalidation);
             return Optional.of(s);
-
         } catch (Exception e) {
             System.out.println("[evaluate] " + p + " error: " + e.getMessage());
             return Optional.empty();
@@ -1025,8 +1037,10 @@ public class SignalSender {
         double microAccel = tr.accel;
         double conf = Math.min(1.0, Math.abs(microSpeed) * 0.4 + Math.abs(obi) * 0.35 + Math.abs(microAccel) * 0.15);
 
-        // Мягкий порог для частых сигналов
-        boolean strongTickTrigger = Math.abs(obi) > 0.005 || Math.abs(microSpeed) > 0.001; // вместо жестких OBI_THRESHOLD и IMPULSE_PCT
+        boolean strongTickTrigger =
+                Math.abs(obi) > 0.015 ||
+                        Math.abs(microSpeed) > 0.002 ||
+                        Math.abs(microAccel) > 0.001;
 
         double predictedMove = microSpeed * 2 + microAccel * 1.5;
 
@@ -1041,7 +1055,29 @@ public class SignalSender {
 
 
         if (strongTickTrigger && conf > 0.05) {
+
             String direction = (obi > 0) ? "LONG" : "SHORT";
+            int newDir = direction.equals("LONG") ? 1 : -1;
+
+            Integer prevDir = ideaDirection.get(pair);
+            Double invalidation = ideaInvalidation.get(pair);
+
+            // 🚫 ЗАПРЕТ ПЕРЕВОРОТА, ЕСЛИ ИДЕЯ НЕ СЛОМАНА
+            if (prevDir != null && prevDir != newDir && invalidation != null) {
+                if (
+                        (prevDir == 1 && price > invalidation) ||
+                                (prevDir == -1 && price < invalidation)
+                ) {
+                    return; // <-- КЛЮЧЕВАЯ СТРОКА
+                }
+            }
+            ideaDirection.put(pair, newDir);
+            ideaInvalidation.put(
+                    pair,
+                    newDir == 1
+                            ? price - price * 0.003
+                            : price + price * 0.003
+            );
             sendSignalIfAllowed(pair, direction, conf, price);
         }
     }
