@@ -13,8 +13,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class SignalSender {
-
-    // ===== Active trade idea state =====
+    // ===== Anti-spam / cooldown =====
+    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
     private final Map<String, Integer> ideaDirection = new ConcurrentHashMap<>();
     private final Map<String, Double> ideaInvalidation = new ConcurrentHashMap<>();
     private final TelegramBotSender bot;
@@ -46,7 +46,6 @@ public class SignalSender {
     private long lastBinancePairsRefresh = 0L;
 
     private final Map<String, Long> lastOpenTimeMap = new ConcurrentHashMap<>();   // openTime per symbol processed
-    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();     // last sent timestamp
     private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
     private final Map<String, Double> lastPriceMap = new ConcurrentHashMap<>();
 
@@ -724,27 +723,28 @@ public class SignalSender {
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
 
             // ===== CONFIDENCE (ГЛАВНОЕ ИЗМЕНЕНИЕ) =====
-            double confidence = 0.55;
+            double confidence = 0.6;
 
-            if (rawScore * mt.speed > 0) confidence += 0.10;
+            if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) {
+                confidence += 0.08;  // новый бонус
+            }
+            double atrVal = atr(c5m, 14);
+            double atrPct = atrVal / (lastPrice + 1e-12);
+            if (atrPct < ATR_MIN_PCT && Math.abs(rawScore) < 0.25) confidence -= 0.05;
+            if (rawScore * mt.speed > 0) confidence += 0.12;
             if (structureAligned) confidence += 0.10;
             if (vwapAligned) confidence += 0.05;
-            if (impulse) confidence += 0.10;
+            if (impulse) confidence += 0.12;
             if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
             if (earlyTrigger) confidence += 0.05;
 
-            if (weakCandle) confidence -= 0.10;
-            if (volWeak) confidence -= 0.10;
+            if (weakCandle) confidence -= 0.03;
+            if (volWeak) confidence -= 0.05;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
-
-            // ===== ATR BREAK =====
-            double atrVal = atr(c5m, 14);
-            if (atrVal <= 0) {
-                atrVal = lastPrice * 0.001; // fallback 0.1%
-            }
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
+            if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
             boolean strongTrigger =
                     impulse ||
                             atrBreakLong ||
@@ -823,6 +823,51 @@ public class SignalSender {
             low = Math.min(low, candles.get(i).low);
         }
         return low;
+    }
+    // ===== Build trade with SL/TP =====
+    private TradeSignal buildTrade(
+            String symbol,
+            String side,
+            double price,
+            double atr,
+            double confidence,
+            String reason
+    ) {
+        TradeSignal s = new TradeSignal();
+        s.symbol = symbol;
+        s.side = side;
+        s.entry = price;
+
+        double risk = atr * 1.2; // базовый риск
+
+        if (side.equals("LONG")) {
+            s.stop = price - risk;
+            s.take = price + risk * 2.5;
+        } else {
+            s.stop = price + risk;
+            s.take = price - risk * 2.5;
+        }
+
+        s.confidence = confidence;
+        s.reason = reason;
+        return s;
+    }
+    // ===== Real confidence =====
+    private double calcConfidence(
+            double emaFast,
+            double emaSlow,
+            double rsi,
+            double atrPct
+    ) {
+        double score = 0.0;
+
+        double trend = Math.abs(emaFast - emaSlow) / emaSlow;
+        score += Math.min(trend * 80, 30);
+
+        if (rsi > 45 && rsi < 65) score += 20;
+        if (atrPct > 0.002 && atrPct < 0.01) score += 20;
+
+        return Math.min(score / 70.0, 1.0);
     }
 
     public static class Signal {
@@ -1214,12 +1259,14 @@ public class SignalSender {
             }
         }, 0, 60, TimeUnit.SECONDS); // <--- проверка каждые 30 секунд
     }
-    // ----------------- Tracking last signals -----------------
-    private static class LastSignal {
-        String direction; // "LONG" или "SHORT"
-        long timestamp;   // когда отправлен
+    // ===== Trade signal model =====
+    static class TradeSignal {
+        String symbol;
+        String side;      // LONG / SHORT
+        double entry;     // вход
+        double stop;      // стоп
+        double take;      // тейк
+        double confidence;
+        String reason;
     }
-
-    private final Map<String, LastSignal> lastSignals = new ConcurrentHashMap<>();
-    private final long SIGNAL_COOLDOWN_MS = 20_000; // 1 минута блокировки противоположного сигнала
 }
