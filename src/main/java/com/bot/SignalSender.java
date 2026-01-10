@@ -661,7 +661,6 @@ public class SignalSender {
             if (c5m == null || c5m.size() < 20) return Optional.empty();
             if (c15m == null || c15m.size() < 20) return Optional.empty();
             if (c1h == null || c1h.size() < 20) return Optional.empty();
-            if (isCooldown(p)) return Optional.empty();
 
             // ===== MTF =====
             int dir1h = emaDirection(c1h, 20, 50, 0.002);
@@ -954,25 +953,17 @@ public class SignalSender {
     }
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
+    private boolean isCooldown(String pair, String direction, double confidence) {
+        // высоко уверенные сигналы игнорируют cooldown
+        if (confidence > 0.7) return false;
 
-    // Полная версия для sendSignalIfAllowed
-    public boolean isCooldown(String pair, String direction, double conf) {
         long now = System.currentTimeMillis();
-        long last = lastSignalTimeDir
-                .computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
-                .getOrDefault(direction, 0L);
-        long effectiveCooldown = (long)(COOLDOWN_MS * (1.0 - conf));
-        return (now - last) < effectiveCooldown;
-    }
-
-    // Простая версия для Optional.empty() и проверок без direction/conf
-    public boolean isCooldown(String pair) {
-        long now = System.currentTimeMillis();
-        Map<String, Long> dirMap = lastSignalTimeDir.get(pair);
-        if (dirMap == null) return false;
-        long last = dirMap.values().stream().max(Long::compare).orElse(0L);
+        // lastSignalTimeDir — Map<String, Map<String, Long>>; добавь если нет
+        lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
+        long last = lastSignalTimeDir.get(pair).getOrDefault(direction, 0L);
         return (now - last) < COOLDOWN_MS;
     }
+
 
     public void markSignalSent(String pair, String direction, double confidence) {
         lastSignalTimeDir
@@ -1120,9 +1111,9 @@ public class SignalSender {
 
         double lastCandleRangePct = (lastCandle.high - lastCandle.low) / (lastCandle.close + 1e-12);
         if (lastCandleRangePct > 0.01) strongTickTrigger = true;
-
-        if (predictedMove > IMPULSE_PCT && !isCooldown(pair)) strongTickTrigger = true;
-
+        if (predictedMove > IMPULSE_PCT) {
+            strongTickTrigger = true;
+        }
         if (!strongTickTrigger && Math.abs(microSpeed) > 0.0005) {
             strongTickTrigger = true;
         }
