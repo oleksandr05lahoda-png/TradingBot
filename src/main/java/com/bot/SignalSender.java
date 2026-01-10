@@ -721,8 +721,11 @@ public class SignalSender {
 
             // ===== MICRO TREND =====
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
-
-            // ===== CONFIDENCE (ГЛАВНОЕ ИЗМЕНЕНИЕ) =====
+            if (Math.abs(rawScore) < 0.15
+                    && mtfConfirm == 0
+                    && Math.abs(mt.speed) < 0.0001) {
+                return Optional.empty();
+            }
             double confidence = 0.6;
 
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) {
