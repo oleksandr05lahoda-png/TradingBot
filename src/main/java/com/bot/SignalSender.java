@@ -154,23 +154,6 @@ public class SignalSender {
             return Set.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
         }
     }
-
-    private void ensureBinancePairsFresh() {
-        long now = System.currentTimeMillis();
-        if (BINANCE_PAIRS.isEmpty() || (now - lastBinancePairsRefresh) > BINANCE_REFRESH_INTERVAL_MS) {
-            // Получаем топ 100 монет CoinGecko
-            List<String> topSymbols = getTopSymbols(TOP_N); // TOP_N = 100
-            // Оставляем только те, которые есть на Binance USDT фьючерсах
-            Set<String> allBinance = getBinanceSymbolsFutures();
-            BINANCE_PAIRS = topSymbols.stream()
-                    .filter(allBinance::contains)
-                    .collect(Collectors.toSet());
-            lastBinancePairsRefresh = now;
-            System.out.println("[BinanceFutures] Using TOP " + BINANCE_PAIRS.size() + " pairs");
-        }
-    }
-
-
     // ========================= Fetch Klines (Futures) =========================
     public CompletableFuture<List<Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
@@ -325,9 +308,6 @@ public class SignalSender {
         }
     }
 
-    // ========================= Indicator implementations =========================
-
-    // SMA
     public static double sma(List<Double> prices, int period) {
         if (prices == null || prices.size() < period) return prices.get(prices.size() - 1);
         double sum = 0;
@@ -383,20 +363,6 @@ public class SignalSender {
         return (last - prev) / (prev + 1e-12);
     }
 
-    // OBV
-    public static double obv(List<Candle> candles) {
-        if (candles == null || candles.isEmpty()) return 0.0;
-        double val = 0.0;
-        for (int i = 1; i < candles.size(); i++) {
-            Candle p = candles.get(i - 1);
-            Candle c = candles.get(i);
-            if (c.close > p.close) val += c.volume;
-            else if (c.close < p.close) val -= c.volume;
-        }
-        return val;
-    }
-
-    // VWAP (simple across list)
     public static double vwap(List<Candle> candles) {
         if (candles == null || candles.isEmpty()) return 0.0;
         double pv = 0.0, vol = 0.0;
@@ -543,14 +509,6 @@ public class SignalSender {
         return 0;
     }
 
-    // Overload with default hysteresis
-    private int emaDirection(List<Candle> candles, int shortP, int longP) {
-        return emaDirection(candles, shortP, longP, 0.001);
-    }
-
-    // ========================= Strategy primitives -> normalize to -1..1 =========================
-
-    // EMA norm: measure e20-e50 and e50-e100
     private double strategyEMANorm(List<Double> closes) {
         if (closes == null || closes.size() < 100) return 0.0;
         double e20 = ema(closes, 20);
@@ -582,43 +540,6 @@ public class SignalSender {
         return Math.max(-1.0, Math.min(1.0, raw / 0.01));
     }
 
-    // ----------------- volume helpers -----------------
-    private double avgQuoteVolume(List<Candle> candles, int lookback) {
-        if (candles == null || candles.isEmpty()) return 0.0;
-        int lb = Math.min(lookback, candles.size());
-        double s = 0;
-        for (int i = candles.size() - lb; i < candles.size(); i++) s += candles.get(i).quoteAssetVolume;
-        return s / lb;
-    }
-
-    public boolean isVolumeOk(List<Candle> candles) {
-        if (candles == null || candles.size() < 10) return false;
-        double avg = avgQuoteVolume(candles, 20);
-        double lastQ = candles.get(candles.size() - 1).quoteAssetVolume;
-        return lastQ >= avg * VOL_MULTIPLIER;
-    }
-
-    public boolean isVolatilityOk(List<Candle> candles, double minAtrPct) {
-        if (candles == null || candles.size() < 20) return false;
-        double atrVal = atr(candles, 14);
-        double lastPrice = candles.get(candles.size() - 1).close;
-        double atrPct = atrVal / (lastPrice + 1e-12);
-        return atrPct >= minAtrPct;
-    }
-
-    public boolean isImpulseCandle(Candle c, List<Candle> recent) {
-        if (c == null || recent == null || recent.size() < 5) return false;
-        double avgBody = recent.stream().skip(Math.max(0, recent.size() - 20))
-                .mapToDouble(x -> Math.abs(x.close - x.open)).average().orElse(IMPULSE_PCT);
-        double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-        double change = Math.abs(c.close - c.open) / (c.open + 1e-12);
-        // Бонус: только если объём свечи выше среднего
-        double avgQ = recent.stream().mapToDouble(x -> x.quoteAssetVolume).average().orElse(1.0);
-        if(c.quoteAssetVolume < avgQ * VOL_MULTIPLIER) return false;
-        return change >= adaptiveImpulse;
-    }
-
-    // ----------------- Multi-TF confirm -----------------
     private int multiTFConfirm(int dir1h, int dir15m, int dir5m) {
         int score = 0;
         score += dir1h * 3;
@@ -629,8 +550,6 @@ public class SignalSender {
         return 0;
     }
 
-
-    // ----------------- Compose confidence -----------------
     private double composeConfidence(double rawScore, int mtfConfirm, boolean volOk, boolean atrOk,
                                      boolean notImpulse, boolean vwapAligned, boolean structureAligned,
                                      boolean bos, boolean liquiditySweep) {
@@ -961,11 +880,9 @@ public class SignalSender {
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
     private boolean isCooldown(String pair, String direction, double confidence) {
-        // высоко уверенные сигналы игнорируют cooldown
         if (confidence > 0.7) return false;
 
         long now = System.currentTimeMillis();
-        // lastSignalTimeDir — Map<String, Map<String, Long>>; добавь если нет
         lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
         long last = lastSignalTimeDir.get(pair).getOrDefault(direction, 0L);
         return (now - last) < COOLDOWN_MS;
@@ -976,11 +893,6 @@ public class SignalSender {
         lastSignalTimeDir
                 .computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
                 .put(direction, System.currentTimeMillis());
-        lastSentConfidence.put(pair, confidence);
-    }
-
-    public void markSignalSent(String pair, double confidence) {
-        lastSignalTime.put(pair, System.currentTimeMillis());
         lastSentConfidence.put(pair, confidence);
     }
     public void connectTickWebSocket(String pair) {
@@ -1013,8 +925,7 @@ public class SignalSender {
                                     List<Double> recentPrices = new ArrayList<>(dq);
                                     Optional<Candle> predictedOpt = predictNextCandleFromPrices(recentPrices);
                                     predictedOpt.ifPresent(pred -> {
-                                        // записываем прогноз в lastTickPrice и выводим лог
-                                        lastTickPrice.put(pair, pred.close);
+                                        lastTickPrice.put(pair, pred.close); // сохраняем прогноз
                                         System.out.println("[Predicted Candle] pair=" + pair + " -> predictedClose=" + pred.close);
                                     });
                                 });
@@ -1096,41 +1007,29 @@ public class SignalSender {
         return new MicroTrendResult(speed, accel, avg);
     }
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
-
-    private boolean candlePatternConfirm(List<Candle> candles, String direction) {
-        if (candles == null || candles.size() < 3) return true;
-        int bull = 0, bear = 0;
-        for (int i = candles.size() - 3; i < candles.size(); i++) {
-            if (candles.get(i).isBull()) bull++;
-            if (candles.get(i).isBear()) bear++;
-        }
-        if (direction.equals("LONG")) return bull >= 2;
-        else if (direction.equals("SHORT")) return bear >= 2;
-        return true;
-    }
     private void evaluateTick(String pair, double price, double qty, long ts, MicroTrendResult tr, OrderbookSnapshot obs, Candle lastCandle) {
         double obi = obs.obi();
         double microSpeed = tr.speed;
         double microAccel = tr.accel;
 
-        // Переменная conf: рассчитана нормально
+        // --- confidence ---
         double conf = Math.min(1.0, Math.abs(microSpeed) * 0.4 + Math.abs(obi) * 0.35 + Math.abs(microAccel) * 0.15);
 
-        // lastCandleRangePct должен быть объявлен до использования
+        // --- свечной диапазон ---
         double lastCandleRangePct = (lastCandle.high - lastCandle.low) / (lastCandle.close + 1e-12);
+        double vol = lastCandleRangePct; // или среднее за несколько свечей
 
-        double vol = lastCandleRangePct; // или среднее за 5-10 свечей
+        // --- пороги ---
         double tickThresholdSpeed = Math.max(0.001, vol * 0.2);
         double tickThresholdAccel = Math.max(0.0005, vol * 0.1);
         double tickThresholdObi = Math.max(0.01, Math.abs(obi) * 0.8);
 
-        // strongTickTrigger объявляем один раз, а не дважды
         boolean strongTickTrigger =
                 Math.abs(obi) > tickThresholdObi ||
                         Math.abs(microSpeed) > tickThresholdSpeed ||
                         Math.abs(microAccel) > tickThresholdAccel;
 
-        // Дополнительные жесткие пороги (объединяем в предыдущий триггер)
+        // дополнительные жёсткие пороги
         strongTickTrigger = strongTickTrigger ||
                 Math.abs(obi) > 0.015 ||
                 Math.abs(microSpeed) > 0.002 ||
@@ -1139,52 +1038,32 @@ public class SignalSender {
         double predictedMove = microSpeed * 2 + microAccel * 1.5;
 
         if (lastCandleRangePct > 0.01) strongTickTrigger = true;
+        if (predictedMove > IMPULSE_PCT) strongTickTrigger = true;
+        if (!strongTickTrigger && Math.abs(microSpeed) > 0.0005) strongTickTrigger = true;
 
-        // Предполагаем, что IMPULSE_PCT объявлена глобально или как константа
-        if (predictedMove > IMPULSE_PCT) {
-            strongTickTrigger = true;
-        }
-
-        if (!strongTickTrigger && Math.abs(microSpeed) > 0.0005) {
-            strongTickTrigger = true;
-        }
-
+        // --- main logic ---
         if (strongTickTrigger && conf > 0.05) {
-            Integer mainDir = ideaDirection.get(pair);
-            if (mainDir == null) {
-                return;
-            }
-
-            double lastConf = lastSentConfidence.getOrDefault(pair, 0.0);
-            if (lastConf < 0.65) {
-                return;
-            }
-
             String direction = (obi > 0) ? "LONG" : "SHORT";
             int newDir = direction.equals("LONG") ? 1 : -1;
 
             Integer prevDir = ideaDirection.get(pair);
             Double invalidation = ideaInvalidation.get(pair);
 
+            // ослабляем сигнал, если направление меняется, но цена ещё не пробила стоп
             if (prevDir != null && prevDir != newDir && invalidation != null) {
                 if ((prevDir == 1 && price > invalidation) || (prevDir == -1 && price < invalidation)) {
-                    // уменьшаем confidence вместо игнора
                     conf *= 0.6; // сигнал ослаблен
                 }
             }
 
+            // обновляем направление и стоп
             ideaDirection.put(pair, newDir);
             ideaInvalidation.put(
                     pair,
-                    newDir == 1
-                            ? price - price * 0.003
-                            : price + price * 0.003
+                    newDir == 1 ? price - price * 0.003 : price + price * 0.003
             );
+            sendSignalIfAllowed(pair, direction, conf, price);
         }
-    }
-
-    public void updateOrderbook(String pair, double bidVol, double askVol) {
-        orderbookMap.put(pair, new OrderbookSnapshot(bidVol, askVol, System.currentTimeMillis()));
     }
     private boolean isVolumeStrong(String pair, double lastPrice) {
         OrderbookSnapshot obs = orderbookMap.get(pair);
