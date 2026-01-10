@@ -895,6 +895,8 @@ public class SignalSender {
         try {
             final String symbol = pair.toLowerCase();
             String aggUrl = String.format("wss://fstream.binance.com/ws/%s@aggTrade", symbol);
+            System.out.println("[WS] Connecting to " + aggUrl);
+
 
             java.net.http.WebSocket ws = java.net.http.HttpClient.newHttpClient()
                     .newWebSocketBuilder()
@@ -1166,9 +1168,8 @@ public class SignalSender {
             try {
                 List<String> topSymbols = getTopSymbols(TOP_N);
                 Set<String> allBinance = getBinanceSymbolsFutures();
-                BINANCE_PAIRS = topSymbols.stream()
-                        .filter(allBinance::contains)
-                        .collect(Collectors.toSet());
+                BINANCE_PAIRS = new HashSet<>(topSymbols);
+                System.out.println("[DEBUG] BINANCE_PAIRS=" + BINANCE_PAIRS);
                 ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
                 for (String pair : BINANCE_PAIRS) {
                     executor.submit(() -> {
