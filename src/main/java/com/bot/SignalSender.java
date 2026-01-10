@@ -636,12 +636,12 @@ public class SignalSender {
                                      boolean bos, boolean liquiditySweep) {
         double base = Math.min(1.0, Math.abs(rawScore));
         double boost = 0.0;
-        if (structureAligned) boost += 0.12;
-        if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) boost += 0.10;
-        if (volOk) boost += 0.05;
-        if (atrOk) boost += 0.03;
-        if (vwapAligned) boost += 0.04;
-        if (bos) boost += 0.03;
+        if (structureAligned) boost += 0.15;
+        if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) boost += 0.12;
+        if (volOk) boost += 0.07;
+        if (atrOk) boost += 0.05;
+        if (vwapAligned) boost += 0.06;
+        if (bos) boost += 0.04;
         if (!notImpulse) boost -= 0.02;
         if (liquiditySweep) {
             if (!structureAligned || mtfConfirm == 0) boost -= 0.10;
@@ -656,6 +656,12 @@ public class SignalSender {
                                      List<Candle> c15m,
                                      List<Candle> c1h) {
         final String p = pair;
+        Optional<Candle> predictedCandle = predictNextCandleFromPrices(new ArrayList<>(tickPriceDeque.get(pair)));
+        predictedCandle.ifPresent(pred -> {
+            List<Candle> extended5m = new ArrayList<>(c5m);
+            extended5m.set(extended5m.size() - 1, pred); // заменяем последнюю на прогноз
+            evaluate(pair, extended5m, c15m, c1h);
+        });
         try {
             // ===== БАЗОВЫЕ ПРОВЕРКИ =====
             if (c5m == null || c5m.size() < 20) return Optional.empty();
@@ -751,11 +757,12 @@ public class SignalSender {
             if (structureAligned) confidence += 0.10;
             if (vwapAligned) confidence += 0.05;
             if (impulse) confidence += 0.12;
+            if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
             if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
             if (earlyTrigger) confidence += 0.05;
 
-            if (weakCandle) confidence -= 0.03;
-            if (volWeak) confidence -= 0.05;
+            if (weakCandle) confidence -= 0.01;
+            if (volWeak) confidence -= 0.03;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
@@ -1066,18 +1073,23 @@ public class SignalSender {
         if (dq.size() < 3) return new MicroTrendResult(0, 0, dq.isEmpty() ? 0 : dq.getLast());
 
         List<Double> arr = new ArrayList<>(dq);
-        int n = Math.min(arr.size(), 10);
+        int n = Math.min(arr.size(), 10); // берем последние 10 цен или меньше
 
-        double sumDiff = 0;
+        // --- Адаптивная скользящая скорость ---
+        double alpha = 0.5; // сглаживание, можно менять от 0.3 до 0.7
+        double speed = 0;
         for (int i = arr.size() - n + 1; i < arr.size(); i++) {
-            sumDiff += arr.get(i) - arr.get(i - 1);
+            double diff = arr.get(i) - arr.get(i - 1);
+            speed = alpha * diff + (1 - alpha) * speed;
         }
 
-        double speed = sumDiff / Math.max(1, (n - 1));
-
-        double lastDiff = arr.get(arr.size() - 1) - arr.get(arr.size() - 2);
-        double prevDiff = arr.get(arr.size() - 2) - arr.get(arr.size() - 3);
-        double accel = lastDiff - prevDiff;
+        // --- Адаптивное ускорение ---
+        double accel = 0;
+        if (arr.size() >= 3) {
+            double lastDiff = arr.get(arr.size() - 1) - arr.get(arr.size() - 2);
+            double prevDiff = arr.get(arr.size() - 2) - arr.get(arr.size() - 3);
+            accel = alpha * (lastDiff - prevDiff) + (1 - alpha) * accel;
+        }
 
         double avg = arr.stream().mapToDouble(Double::doubleValue).average().orElse(arr.get(arr.size() - 1));
 
@@ -1100,30 +1112,49 @@ public class SignalSender {
         double obi = obs.obi();
         double microSpeed = tr.speed;
         double microAccel = tr.accel;
+
+        // Переменная conf: рассчитана нормально
         double conf = Math.min(1.0, Math.abs(microSpeed) * 0.4 + Math.abs(obi) * 0.35 + Math.abs(microAccel) * 0.15);
 
+        // lastCandleRangePct должен быть объявлен до использования
+        double lastCandleRangePct = (lastCandle.high - lastCandle.low) / (lastCandle.close + 1e-12);
+
+        double vol = lastCandleRangePct; // или среднее за 5-10 свечей
+        double tickThresholdSpeed = Math.max(0.001, vol * 0.2);
+        double tickThresholdAccel = Math.max(0.0005, vol * 0.1);
+        double tickThresholdObi = Math.max(0.01, Math.abs(obi) * 0.8);
+
+        // strongTickTrigger объявляем один раз, а не дважды
         boolean strongTickTrigger =
+                Math.abs(obi) > tickThresholdObi ||
+                        Math.abs(microSpeed) > tickThresholdSpeed ||
+                        Math.abs(microAccel) > tickThresholdAccel;
+
+        // Дополнительные жесткие пороги (объединяем в предыдущий триггер)
+        strongTickTrigger = strongTickTrigger ||
                 Math.abs(obi) > 0.015 ||
-                        Math.abs(microSpeed) > 0.002 ||
-                        Math.abs(microAccel) > 0.001;
+                Math.abs(microSpeed) > 0.002 ||
+                Math.abs(microAccel) > 0.001;
 
         double predictedMove = microSpeed * 2 + microAccel * 1.5;
 
-        double lastCandleRangePct = (lastCandle.high - lastCandle.low) / (lastCandle.close + 1e-12);
         if (lastCandleRangePct > 0.01) strongTickTrigger = true;
+
+        // Предполагаем, что IMPULSE_PCT объявлена глобально или как константа
         if (predictedMove > IMPULSE_PCT) {
             strongTickTrigger = true;
         }
+
         if (!strongTickTrigger && Math.abs(microSpeed) > 0.0005) {
             strongTickTrigger = true;
         }
-
 
         if (strongTickTrigger && conf > 0.05) {
             Integer mainDir = ideaDirection.get(pair);
             if (mainDir == null) {
                 return;
             }
+
             double lastConf = lastSentConfidence.getOrDefault(pair, 0.0);
             if (lastConf < 0.65) {
                 return;
@@ -1141,6 +1172,7 @@ public class SignalSender {
                     conf *= 0.6; // сигнал ослаблен
                 }
             }
+
             ideaDirection.put(pair, newDir);
             ideaInvalidation.put(
                     pair,
@@ -1238,7 +1270,8 @@ public class SignalSender {
         for (int i = history.size() - 1; i >= 0; i--) {
             Signal s = history.get(i);
             if (!s.direction.equals(direction)) continue;
-            if (now - s.created.toEpochMilli() > windowMs) break;
+            // окно теперь 5 минут для повторного сигнала
+            if (now - s.created.toEpochMilli() > 5 * 60_000) break;
             if (Math.abs(s.confidence - conf) < 0.05) return true;
         }
         return false;
