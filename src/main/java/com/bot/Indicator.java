@@ -20,7 +20,6 @@ public class Indicator {
             if (diff > 0) gain += diff;
             else loss -= diff;
         }
-
         if (loss == 0) return 100.0;
         double rs = gain / loss;
         return 100 - (100 / (1 + rs));

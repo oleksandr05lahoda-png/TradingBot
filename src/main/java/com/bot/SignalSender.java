@@ -1140,7 +1140,7 @@ public class SignalSender {
         // сохраняем сигнал
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
         markSignalSent(pair, direction, conf);
-
+        System.out.println("[DEBUG] Отправка сигнала: " + pair + " " + direction + " conf=" + conf + " price=" + price);
         bot.sendMessage(s.toTelegramMessage());
     }
     private boolean recentlySentSimilar(String pair, String direction, double conf, long windowMs) {
