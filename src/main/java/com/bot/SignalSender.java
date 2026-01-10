@@ -73,15 +73,15 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
-        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.6); // user earlier wanted >=0.5 default
-        this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5); // quick cycles for futures (1 min)
+        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.55);
+        this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
 
         this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
         this.VOL_MULTIPLIER = envDouble("VOL_MULT", 0.9);
         this.ATR_MIN_PCT = envDouble("ATR_MIN_PCT", 0.0007);
-        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 30000); // 3 minutes default
+        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 30000);
         long brMin = envLong("BINANCE_REFRESH_MINUTES", 60);
         this.BINANCE_REFRESH_INTERVAL_MS = brMin * 60 * 1000L;
 
@@ -652,9 +652,9 @@ public class SignalSender {
 
             // ===== MICRO TREND =====
             MicroTrendResult mt2 = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
-            if (Math.abs(rawScore) < 0.15
+            if (Math.abs(rawScore) < 0.10
                     && mtfConfirm == 0
-                    && Math.abs(mt.speed) < 0.0001) {
+                    && Math.abs(mt.speed) < 0.00005) {
                 return Optional.empty();
             }
             double confidence = composeConfidence(
@@ -880,7 +880,7 @@ public class SignalSender {
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
     private boolean isCooldown(String pair, String direction, double confidence) {
-        if (confidence > 0.7) return false;
+        if (confidence > 0.6) return false;
 
         long now = System.currentTimeMillis();
         lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
@@ -1121,7 +1121,6 @@ public class SignalSender {
     private void sendSignalIfAllowed(String pair, String direction, double conf, double price){
         Integer mainDir = ideaDirection.get(pair);
         if (mainDir == null) return;
-        if (conf < 0.5) return;
         if (recentlySentSimilar(pair, direction, conf, 10_000)) return; // 10 секунд окно
         if (conf < MIN_CONF) return;
         if (isCooldown(pair, direction, conf)) return;
@@ -1150,7 +1149,7 @@ public class SignalSender {
             Signal s = history.get(i);
             if (!s.direction.equals(direction)) continue;
             // окно теперь 5 минут для повторного сигнала
-            if (now - s.created.toEpochMilli() > 5 * 60_000) break;
+            if (now - s.created.toEpochMilli() > 90_000) break;
             if (Math.abs(s.confidence - conf) < 0.05) return true;
         }
         return false;

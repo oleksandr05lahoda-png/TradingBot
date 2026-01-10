@@ -68,19 +68,15 @@ def analyze_symbol(symbol):
         candidate_long = ema9_15 >= ema21_15 * 0.998 and ema9_5 >= ema21_5 * 0.998
         candidate_short = ema9_15 <= ema21_15 * 1.002 and ema9_5 <= ema21_5 * 1.002
 
-        if not (candidate_long or candidate_short):
-            return None  # не кандидат
-
-        # ===== Жёсткая логика сигнала =====
         signal = None
         confidence = 0.0
 
         if ema_slope > 0 and rsi < 60 and candidate_long:
             signal = "LONG"
             confidence = min(1.0, 0.5 + abs(ema_slope)/0.5)
-        elif ema_slope < 0 and rsi > 40 and candidate_short:
+        elif ema_slope < 0.02 and rsi > 35 and candidate_short:
             signal = "SHORT"
-            confidence = min(1.0, 0.5 + abs(ema_slope)/0.5)
+            confidence = 0.55 + min(0.25, abs(ema_slope) * 2)
 
         if signal is None:
             return None
