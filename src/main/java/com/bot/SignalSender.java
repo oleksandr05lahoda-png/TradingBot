@@ -652,9 +652,9 @@ public class SignalSender {
 
             // ===== MICRO TREND =====
             MicroTrendResult mt2 = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
-            if (Math.abs(rawScore) < 0.10
+            if (Math.abs(rawScore) < 0.05
                     && mtfConfirm == 0
-                    && Math.abs(mt.speed) < 0.00005) {
+                    && Math.abs(mt.speed) < 0.00001) {
                 return Optional.empty();
             }
             double confidence = composeConfidence(
@@ -1165,7 +1165,6 @@ public class SignalSender {
 
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
-
         scheduler = Executors.newScheduledThreadPool(1);
         scheduler.scheduleAtFixedRate(() -> {
             try {
@@ -1199,7 +1198,6 @@ public class SignalSender {
 
                 executor.shutdown();
                 executor.awaitTermination(1, TimeUnit.MINUTES);
-
             } catch (Exception e) {
                 System.out.println("[start] Scheduler error: " + e.getMessage());
             }
