@@ -678,7 +678,7 @@ public class SignalSender {
             // ===== ОБЪЁМ (НЕ УБИВАЕМ СИГНАЛ, ТОЛЬКО ШТРАФ) =====
             double avgVol = c5m.stream().mapToDouble(c -> c.volume).average().orElse(0);
             double lastVol = c5m.get(c5m.size() - 1).volume;
-            boolean volWeak = lastVol < avgVol * 0.8;
+            boolean volWeak = lastVol < avgVol * 0.7;
 
             // ===== RAW SCORE =====
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
@@ -687,6 +687,11 @@ public class SignalSender {
                             strategyMACDNorm(closes5m) * 0.28 +
                             strategyRSINorm(closes5m) * 0.19 +
                             strategyMomentumNorm(closes5m) * 0.15;
+            // --- Enhancement: microtrend bonus ---
+            MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
+            if (Math.signum(rawScore) == Math.signum(mt.speed)) {
+                rawScore += 0.05 * Math.signum(rawScore); // небольшой бонус, увеличивает количество сигналов
+            }
 
             boolean earlyTrigger = earlyTrendTrigger(c5m);
             if (earlyTrigger && Math.abs(rawScore) > 0.25) {
@@ -696,6 +701,8 @@ public class SignalSender {
             // ===== LAST CANDLE =====
             Candle lastCandle = c5m.get(c5m.size() - 1);
             double lastPrice = lastCandle.close;
+            double atrVal = atr(c5m, 14);
+            double atrPct = atrVal / (lastPrice + 1e-12);
 
             double candleBody = Math.abs(lastCandle.close - lastCandle.open);
             double candleRange = lastCandle.high - lastCandle.low;
@@ -720,19 +727,26 @@ public class SignalSender {
                             (rawScore < 0 && lastPrice < vwap15);
 
             // ===== MICRO TREND =====
-            MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
+            MicroTrendResult mt2 = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             if (Math.abs(rawScore) < 0.15
                     && mtfConfirm == 0
                     && Math.abs(mt.speed) < 0.0001) {
                 return Optional.empty();
             }
-            double confidence = 0.6;
-
+            double confidence = composeConfidence(
+                    rawScore,
+                    mtfConfirm,
+                    !volWeak,
+                    atrPct >= ATR_MIN_PCT,
+                    !impulse,
+                    vwapAligned,
+                    structureAligned,
+                    detectBOS(c5m),
+                    detectLiquiditySweep(c5m)
+            );
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) {
                 confidence += 0.08;  // новый бонус
             }
-            double atrVal = atr(c5m, 14);
-            double atrPct = atrVal / (lastPrice + 1e-12);
             if (atrPct < ATR_MIN_PCT && Math.abs(rawScore) < 0.25) confidence -= 0.05;
             if (rawScore * mt.speed > 0) confidence += 0.12;
             if (structureAligned) confidence += 0.10;
@@ -1006,7 +1020,6 @@ public class SignalSender {
                                         System.out.println("[Predicted Candle] pair=" + pair + " -> predictedClose=" + pred.close);
                                     });
                                 });
-
                             } catch (Exception ex) {
                                 System.out.println("[WS tick parse] " + ex.getMessage());
                             }
@@ -1030,7 +1043,20 @@ public class SignalSender {
 
         double speed = lastPrice - prevPrice;
         double accel = (lastPrice - prevPrice) - (prevPrice - prevPrevPrice);
-
+// --- SMA сглаживание скорости и ускорения ---
+        int smoothN = Math.min(5, recentPrices.size() - 1);
+        double sumSpeed = 0;
+        double sumAccel = 0;
+        for (int i = recentPrices.size() - smoothN; i < recentPrices.size() - 1; i++) {
+            double sp = recentPrices.get(i + 1) - recentPrices.get(i);
+            sumSpeed += sp;
+            if (i > recentPrices.size() - smoothN) {
+                double prevSp = recentPrices.get(i) - recentPrices.get(i - 1);
+                sumAccel += sp - prevSp;
+            }
+        }
+        speed = sumSpeed / smoothN;
+        accel = sumAccel / Math.max(1, smoothN - 1);
         // Ограничиваем экстремальные скачки
         double maxChangePct = 0.05;
         speed = Math.max(-lastPrice * maxChangePct, Math.min(speed, lastPrice * maxChangePct));
@@ -1118,13 +1144,10 @@ public class SignalSender {
             Integer prevDir = ideaDirection.get(pair);
             Double invalidation = ideaInvalidation.get(pair);
 
-            // 🚫 ЗАПРЕТ ПЕРЕВОРОТА, ЕСЛИ ИДЕЯ НЕ СЛОМАНА
             if (prevDir != null && prevDir != newDir && invalidation != null) {
-                if (
-                        (prevDir == 1 && price > invalidation) ||
-                                (prevDir == -1 && price < invalidation)
-                ) {
-                    return; // <-- КЛЮЧЕВАЯ СТРОКА
+                if ((prevDir == 1 && price > invalidation) || (prevDir == -1 && price < invalidation)) {
+                    // уменьшаем confidence вместо игнора
+                    conf *= 0.6; // сигнал ослаблен
                 }
             }
             ideaDirection.put(pair, newDir);
@@ -1134,7 +1157,6 @@ public class SignalSender {
                             ? price - price * 0.003
                             : price + price * 0.003
             );
-            sendSignalIfAllowed(pair, direction, conf, price);
         }
     }
 
@@ -1145,8 +1167,12 @@ public class SignalSender {
         OrderbookSnapshot obs = orderbookMap.get(pair);
         if (obs == null) return false;
         double obi = obs.obi();
-        // минимальный порог дисбаланса для сильного сигнала
-        return Math.abs(obi) > 0.02; // 2% imbalance
+        Deque<Double> history = tickPriceDeque.getOrDefault(pair, new ArrayDeque<>());
+        double avgObi = 0.02; // базовый fallback
+        if (!history.isEmpty()) {
+            avgObi = history.stream().mapToDouble(p -> p).average().orElse(0.02) * 0.5;
+        }
+        return Math.abs(obi) > avgObi;
     }
     // stop
     public void stop() {
@@ -1190,7 +1216,10 @@ public class SignalSender {
     private void sendRaw(String msg) {
         try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
     }
-    private void sendSignalIfAllowed(String pair, String direction, double conf, double price) {
+    private void sendSignalIfAllowed(String pair, String direction, double conf, double price){
+        Integer mainDir = ideaDirection.get(pair);
+        if (mainDir == null) return;
+        if (conf < 0.7) return;
         if (recentlySentSimilar(pair, direction, conf, 10_000)) return; // 10 секунд окно
         if (conf < MIN_CONF) return;
         if (isCooldown(pair, direction, conf)) return;
@@ -1254,8 +1283,12 @@ public class SignalSender {
 
                             // --- Генерация сигнала ---
                             Optional<Signal> sigOpt = evaluate(pair, c5m, c15m, c1h);
-                            sigOpt.ifPresent(sig -> sendSignalIfAllowed(pair, sig.direction, sig.confidence, sig.price));
-
+                            sigOpt.ifPresent(sig -> sendSignalIfAllowed(
+                                    pair,
+                                    sig.direction,
+                                    sig.confidence,
+                                    sig.price
+                            ));
                         } catch (Exception e) {
                             System.out.println("[Parallel evaluate] " + pair + " error: " + e.getMessage());
                         }
