@@ -880,8 +880,6 @@ public class SignalSender {
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
     private boolean isCooldown(String pair, String direction, double confidence) {
-        if (confidence > 0.6) return false;
-
         long now = System.currentTimeMillis();
         lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
         long last = lastSignalTimeDir.get(pair).getOrDefault(direction, 0L);
