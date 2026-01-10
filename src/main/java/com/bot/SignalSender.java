@@ -1103,6 +1103,14 @@ public class SignalSender {
 
 
         if (strongTickTrigger && conf > 0.05) {
+            Integer mainDir = ideaDirection.get(pair);
+            if (mainDir == null) {
+                return;
+            }
+            double lastConf = lastSentConfidence.getOrDefault(pair, 0.0);
+            if (lastConf < 0.65) {
+                return;
+            }
 
             String direction = (obi > 0) ? "LONG" : "SHORT";
             int newDir = direction.equals("LONG") ? 1 : -1;
