@@ -8,7 +8,6 @@ BASE_URL = "https://fapi.binance.com"
 
 # ===== Функции работы с Binance =====
 def get_top_symbols(limit=50):
-    """Возвращает топ монет по объему торгов 24ч"""
     try:
         data = requests.get(f"{BASE_URL}/fapi/v1/ticker/24hr").json()
         df = pd.DataFrame(data)
@@ -20,7 +19,6 @@ def get_top_symbols(limit=50):
         return []
 
 def fetch_klines(symbol, interval="5m", limit=200):
-    """Получаем свечи с Binance Futures"""
     url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     data = requests.get(url).json()
     df = pd.DataFrame(data, columns=[
@@ -66,14 +64,21 @@ def analyze_symbol(symbol):
         # RSI
         rsi = RSI(df5['close'], 14).iloc[-1]
 
-        # Сигналы
+        # ===== Мягкие фильтры для отбора кандидатов =====
+        candidate_long = ema9_15 >= ema21_15 * 0.998 and ema9_5 >= ema21_5 * 0.998
+        candidate_short = ema9_15 <= ema21_15 * 1.002 and ema9_5 <= ema21_5 * 1.002
+
+        if not (candidate_long or candidate_short):
+            return None  # не кандидат
+
+        # ===== Жёсткая логика сигнала =====
         signal = None
         confidence = 0.0
 
-        if ema9_15 > ema21_15 and ema9_5 > ema21_5 and ema_slope > 0 and rsi < 60:
+        if ema_slope > 0 and rsi < 60 and candidate_long:
             signal = "LONG"
             confidence = min(1.0, 0.5 + abs(ema_slope)/0.5)
-        elif ema9_15 < ema21_15 and ema9_5 < ema21_5 and ema_slope < 0 and rsi > 40:
+        elif ema_slope < 0 and rsi > 40 and candidate_short:
             signal = "SHORT"
             confidence = min(1.0, 0.5 + abs(ema_slope)/0.5)
 
@@ -102,10 +107,10 @@ def main():
         if res:
             results.append(res)
 
-    # сортируем по confidence и берём топ 10
-    results = sorted(results, key=lambda x: x['confidence'], reverse=True)[:10]
+    # сортируем по confidence
+    results = sorted(results, key=lambda x: x['confidence'], reverse=True)
 
-    # сохраняем в JSON, чтобы Java могла прочитать
+    # сохраняем в JSON
     with open("signals.json", "w") as f:
         json.dump(results, f, indent=2)
 
