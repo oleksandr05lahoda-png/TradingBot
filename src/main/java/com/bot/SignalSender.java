@@ -1121,7 +1121,7 @@ public class SignalSender {
     private void sendSignalIfAllowed(String pair, String direction, double conf, double price){
         Integer mainDir = ideaDirection.get(pair);
         if (mainDir == null) return;
-        if (conf < 0.7) return;
+        if (conf < 0.5) return;
         if (recentlySentSimilar(pair, direction, conf, 10_000)) return; // 10 секунд окно
         if (conf < MIN_CONF) return;
         if (isCooldown(pair, direction, conf)) return;
