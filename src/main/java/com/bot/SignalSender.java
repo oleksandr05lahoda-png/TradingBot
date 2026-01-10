@@ -73,7 +73,7 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
-        this.MIN_CONF = envDouble("MIN_CONFIDENCE", 0.55);
+        this.MIN_CONF = 0.45;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
@@ -561,7 +561,6 @@ public class SignalSender {
         if (atrOk) boost += 0.05;
         if (vwapAligned) boost += 0.06;
         if (bos) boost += 0.04;
-        if (!notImpulse) boost -= 0.02;
         if (liquiditySweep) {
             if (!structureAligned || mtfConfirm == 0) boost -= 0.10;
             else boost -= 0.03;
@@ -587,16 +586,13 @@ public class SignalSender {
             if (c15m == null || c15m.size() < 20) return Optional.empty();
             if (c1h == null || c1h.size() < 20) return Optional.empty();
 
-            // ===== MTF =====
-            int dir1h = emaDirection(c1h, 20, 50, 0.002);
-            int dir15m = emaDirection(c15m, 9, 21, 0.002);
-            int dir5m = emaDirection(c5m, 9, 21, 0.002);
+            int dir1h = emaDirection(c1h, 20, 50, 0.001);
+            int dir15m = emaDirection(c15m, 9, 21, 0.001);
+            int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
 
-            // ===== НОВАЯ СВЕЧА =====
+            // ❗ отключаем жёсткую привязку к новой свече
             long newOpen = c5m.get(c5m.size() - 1).openTime;
-            long lastOpen = lastOpenTimeMap.getOrDefault(p, 0L);
-            if (newOpen <= lastOpen) return Optional.empty();
             lastOpenTimeMap.put(p, newOpen);
 
             // ===== ОБЪЁМ (НЕ УБИВАЕМ СИГНАЛ, ТОЛЬКО ШТРАФ) =====
@@ -652,9 +648,7 @@ public class SignalSender {
 
             // ===== MICRO TREND =====
             MicroTrendResult mt2 = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
-            if (Math.abs(rawScore) < 0.05
-                    && mtfConfirm == 0
-                    && Math.abs(mt.speed) < 0.00001) {
+            if (Math.abs(rawScore) < 0.01 && Math.abs(mt.speed) < 0.00001) {
                 return Optional.empty();
             }
             double confidence = composeConfidence(
@@ -684,6 +678,10 @@ public class SignalSender {
             if (volWeak) confidence -= 0.03;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
+            // === scanner normalization (как раньше) ===
+            if (confidence >= 0.45 && confidence <= 0.75) {
+                confidence = 0.65;
+            }
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
             if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
@@ -1147,7 +1145,7 @@ public class SignalSender {
             Signal s = history.get(i);
             if (!s.direction.equals(direction)) continue;
             // окно теперь 5 минут для повторного сигнала
-            if (now - s.created.toEpochMilli() > 90_000) break;
+            if (now - s.created.toEpochMilli() > 20_000) break;
             if (Math.abs(s.confidence - conf) < 0.05) return true;
         }
         return false;
