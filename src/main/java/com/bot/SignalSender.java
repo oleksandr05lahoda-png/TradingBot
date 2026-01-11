@@ -1147,15 +1147,15 @@ public class SignalSender {
         return false;
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
-        List<Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
-        if (candles.isEmpty()) {
-            System.out.println("[KLİNES] Пустой ответ для " + symbol + " интервал " + interval);
-        } else {
-            System.out.println("[KLİNES] Получено " + candles.size() + " свечей для " + symbol + " интервал " + interval);
-        }
         try {
-            return fetchKlinesAsync(symbol, interval, limit).get(); // блокируем, ждем завершения
-        } catch (Exception e) {
+            List<Candle> candles = fetchKlinesAsync(symbol, interval, limit).get(); // блокируем, ждем завершения
+            if (candles.isEmpty()) {
+                System.out.println("[KLINES] Пустой ответ для " + symbol + " интервал " + interval);
+            } else {
+                System.out.println("[KLINES] Получено " + candles.size() + " свечей для " + symbol + " интервал " + interval);
+            }
+            return candles; // возвращаем результат один раз
+        } catch (InterruptedException | ExecutionException e) {
             System.out.println("[fetchKlines] error for " + symbol + " " + interval + ": " + e.getMessage());
             return Collections.emptyList();
         }
