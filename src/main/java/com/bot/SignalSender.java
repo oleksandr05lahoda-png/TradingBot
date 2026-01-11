@@ -1006,6 +1006,26 @@ public class SignalSender {
                                      int mtfConfirm,
                                      double rsi14,
                                      List<Double> closes5m) {
+
+        Signal s = new Signal(
+                pair.replace("USDT", ""),
+                direction,
+                confidence,
+                price,
+                rsi14,
+                rawScore,
+                mtfConfirm,
+                true,  // volOk (можно изменить логику)
+                true,  // atrOk
+                false, // strongTrigger
+                false, // atrBreakLong
+                false, // atrBreakShort
+                false, // impulse
+                false, // earlyTrigger
+                rsi(closes5m, 7),
+                rsi(closes5m, 4)
+        );
+
         long now = System.currentTimeMillis();
         lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
         Map<String, Long> dirMap = lastSignalTimeDir.get(pair);
@@ -1020,9 +1040,8 @@ public class SignalSender {
             return;
         }
 
-        // Отправка сигнала
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
-        dirMap.put(s.direction, now); // сразу ставим cooldown
+        dirMap.put(s.direction, now);
         lastSentConfidence.put(pair, s.confidence);
 
         System.out.println("[SEND] " + pair + " → " + s.direction + " confidence=" + s.confidence);
