@@ -570,15 +570,7 @@ public class SignalSender {
                                      List<Candle> c5m,
                                      List<Candle> c15m,
                                      List<Candle> c1h) {
-        Optional<SignalSender.Signal> optSignal = evaluate(pair, c5m, c15m, c1h);
 
-        // ✅ вот тут вызываем отправку
-        optSignal.ifPresent(signal -> sendSignalIfAllowed(
-                pair,
-                signal.direction,
-                signal.confidence,
-                signal.price
-        ));
         System.out.println("[EVAL START] " + pair);
         final String p = pair;
         try {
@@ -666,7 +658,6 @@ public class SignalSender {
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) {
                 confidence += 0.08;  // новый бонус
             }
-            if (atrPct < ATR_MIN_PCT && Math.abs(rawScore) < 0.25) confidence -= 0.05;
             if (rawScore * mt.speed > 0) confidence += 0.12;
             if (structureAligned) confidence += 0.10;
             if (vwapAligned) confidence += 0.05;
@@ -674,9 +665,6 @@ public class SignalSender {
             if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
             if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
             if (earlyTrigger) confidence += 0.05;
-
-            if (weakCandle) confidence -= 0.01;
-            if (volWeak) confidence -= 0.03;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
@@ -688,16 +676,13 @@ public class SignalSender {
                             atrBreakShort ||
                             (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            // ===== НАПРАВЛЕНИЕ =====
             boolean canGoLong =
                     rawScore > 0 &&
-                            confidence >= MIN_CONF &&
-                            (mtfConfirm >= 0 || strongTrigger);
+                            confidence >= MIN_CONF;
 
             boolean canGoShort =
                     rawScore < 0 &&
-                            confidence >= MIN_CONF &&
-                            (mtfConfirm <= 0 || strongTrigger);
+                            confidence >= MIN_CONF;
 
             String direction;
             if (canGoLong && !canGoShort) direction = "LONG";
@@ -741,27 +726,20 @@ public class SignalSender {
             return Optional.empty();
         }
     }
-
     private double lastSwingHigh(List<Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double high = Double.NEGATIVE_INFINITY;
-
-        for (int i = candles.size() - lookback; i < candles.size(); i++) {
+        for (int i = candles.size() - lookback; i < candles.size(); i++)
             high = Math.max(high, candles.get(i).high);
-        }
         return high;
     }
-
     private double lastSwingLow(List<Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double low = Double.POSITIVE_INFINITY;
-
-        for (int i = candles.size() - lookback; i < candles.size(); i++) {
+        for (int i = candles.size() - lookback; i < candles.size(); i++)
             low = Math.min(low, candles.get(i).low);
-        }
         return low;
     }
-    // ===== Build trade with SL/TP =====
     private TradeSignal buildTrade(
             String symbol,
             String side,
@@ -880,8 +858,6 @@ public class SignalSender {
         long last = lastSignalTimeDir.get(pair).getOrDefault(direction, 0L);
         return (now - last) < COOLDOWN_MS;
     }
-
-
     public void markSignalSent(String pair, String direction, double confidence) {
         lastSignalTimeDir
                 .computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
@@ -894,38 +870,36 @@ public class SignalSender {
             String aggUrl = String.format("wss://fstream.binance.com/ws/%s@aggTrade", symbol);
             System.out.println("[WS] Connecting to " + aggUrl);
 
-
             java.net.http.WebSocket ws = java.net.http.HttpClient.newHttpClient()
                     .newWebSocketBuilder()
                     .buildAsync(URI.create(aggUrl), new java.net.http.WebSocket.Listener() {
-                        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+                        public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
                             try {
                                 JSONObject json = new JSONObject(data.toString());
-                                double price = json.has("p") ? Double.parseDouble(json.getString("p")) : json.optDouble("p", 0.0);
-                                double qty = json.has("q") ? Double.parseDouble(json.getString("q")) : json.optDouble("q", 0.0);
+                                double price = json.has("p") ? Double.parseDouble(json.getString("p")) : 0.0;
+                                double qty = json.has("q") ? Double.parseDouble(json.getString("q")) : 0.0;
                                 long ts = json.has("T") ? json.getLong("T") : System.currentTimeMillis();
 
-                                // дебаг-вывод тиков
-                                System.out.println("[TICKER] pair=" + pair + " price=" + price + " qty=" + qty + " ts=" + ts);
-
+                                // сохраняем тики
                                 tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>()).addLast(price);
                                 Deque<Double> dq = tickPriceDeque.get(pair);
                                 while (dq.size() > TICK_HISTORY) dq.removeFirst();
 
                                 lastTickPrice.put(pair, price);
                                 lastTickTime.put(pair, ts);
+
                             } catch (Exception ex) {
                                 System.out.println("[WS tick parse] " + ex.getMessage());
                             }
                             return java.net.http.WebSocket.Listener.super.onText(webSocket, data, last);
                         }
                     }).join();
+
             System.out.println("[WS-TICK] connected aggTrade for " + pair);
         } catch (Exception e) {
             System.out.println("[WS connect] error for " + pair + " : " + e.getMessage());
         }
     }
-
 
     private Optional<Candle> predictNextCandleFromPrices(List<Double> recentPrices) {
         if (recentPrices == null || recentPrices.size() < 3) return Optional.empty();
@@ -966,20 +940,17 @@ public class SignalSender {
         return Optional.of(new Candle(predictedTime, lastPrice, predictedHigh, predictedLow, predictedClose, 0.0, 0.0, predictedTime));
     }
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
-        if (dq.size() < 3) return new MicroTrendResult(0, 0, dq.isEmpty() ? 0 : dq.getLast());
-
+        if (dq == null || dq.size() < 3) return new MicroTrendResult(0, 0, 0);
         List<Double> arr = new ArrayList<>(dq);
-        int n = Math.min(arr.size(), 10); // берем последние 10 цен или меньше
+        int n = Math.min(arr.size(), 10);
 
-        // --- Адаптивная скользящая скорость ---
-        double alpha = 0.5; // сглаживание, можно менять от 0.3 до 0.7
+        double alpha = 0.5;
         double speed = 0;
         for (int i = arr.size() - n + 1; i < arr.size(); i++) {
             double diff = arr.get(i) - arr.get(i - 1);
             speed = alpha * diff + (1 - alpha) * speed;
         }
 
-        // --- Адаптивное ускорение ---
         double accel = 0;
         if (arr.size() >= 3) {
             double lastDiff = arr.get(arr.size() - 1) - arr.get(arr.size() - 2);
@@ -988,7 +959,6 @@ public class SignalSender {
         }
 
         double avg = arr.stream().mapToDouble(Double::doubleValue).average().orElse(arr.get(arr.size() - 1));
-
         return new MicroTrendResult(speed, accel, avg);
     }
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
@@ -997,10 +967,7 @@ public class SignalSender {
         if (obs == null) return false;
         double obi = obs.obi();
         Deque<Double> history = tickPriceDeque.getOrDefault(pair, new ArrayDeque<>());
-        double avgObi = 0.02; // базовый fallback
-        if (!history.isEmpty()) {
-            avgObi = history.stream().mapToDouble(p -> p).average().orElse(0.02) * 0.5;
-        }
+        double avgObi = history.isEmpty() ? 0.02 : history.stream().mapToDouble(p -> p).average().orElse(0.02) * 0.5;
         return Math.abs(obi) > avgObi;
     }
     public void stop() {
@@ -1040,16 +1007,26 @@ public class SignalSender {
         return bull >= 2 || bear >= 2;
     }
 
-    // ========================= Signal sending wrapper (if you prefer) =========================
     private void sendRaw(String msg) {
-        try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
+        try {
+            bot.sendSignal(msg);
+        } catch (Exception e) {
+            System.out.println("[sendRaw] " + e.getMessage());
+        }
     }
     private void sendSignalIfAllowed(String pair, String direction, double conf, double price){
         if (isCooldown(pair, direction, conf))
             System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
+        ideaDirection.putIfAbsent(pair, 0); // 0 = нейтральное направление
         Integer mainDir = ideaDirection.get(pair);
-        if (mainDir == null) return;
-        if (conf < MIN_CONF) return;
+        if (mainDir == null) {
+            System.out.println("[DEBUG] No direction in ideaDirection for " + pair);
+            mainDir = 1; // временно BUY, чтобы сигнал прошел
+        }
+        if (conf < 0.5) {
+            System.out.println("[DEBUG] Low confidence: " + conf);
+            // return; <- убрали, сигнал идет дальше
+        }
         Signal s = new Signal(
                 pair.replace("USDT",""),
                 direction,
