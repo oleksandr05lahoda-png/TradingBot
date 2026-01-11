@@ -573,11 +573,6 @@ public class SignalSender {
         System.out.println("[EVAL START] " + pair);
         final String p = pair;
         Optional<Candle> predictedCandle = predictNextCandleFromPrices(new ArrayList<>(tickPriceDeque.get(pair)));
-        predictedCandle.ifPresent(pred -> {
-            List<Candle> extended5m = new ArrayList<>(c5m);
-            extended5m.set(extended5m.size() - 1, pred); // заменяем последнюю на прогноз
-            evaluate(pair, extended5m, c15m, c1h);
-        });
         try {
             // ===== БАЗОВЫЕ ПРОВЕРКИ =====
             if (c5m == null || c5m.size() < 20) return Optional.empty();
@@ -676,10 +671,6 @@ public class SignalSender {
             if (volWeak) confidence -= 0.03;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
-            // === scanner normalization (как раньше) ===
-            if (confidence >= 0.45 && confidence <= 0.75) {
-                confidence = 0.65;
-            }
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
             if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
@@ -1105,14 +1096,11 @@ public class SignalSender {
         try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
     }
     private void sendSignalIfAllowed(String pair, String direction, double conf, double price){
-        if (isCooldown(pair, direction, conf)) System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
-        if (recentlySentSimilar(pair, direction, conf, 10_000)) System.out.println("[RECENT] " + pair + " " + direction + " уже отправлялся");
+        if (isCooldown(pair, direction, conf))
+            System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
         Integer mainDir = ideaDirection.get(pair);
         if (mainDir == null) return;
-        if (recentlySentSimilar(pair, direction, conf, 10_000)) return; // 10 секунд окно
         if (conf < MIN_CONF) return;
-        if (isCooldown(pair, direction, conf)) return;
-
         Signal s = new Signal(
                 pair.replace("USDT",""),
                 direction,
@@ -1130,18 +1118,6 @@ public class SignalSender {
         System.out.println("[DEBUG] Отправка сигнала: " + pair + " " + direction + " conf=" + conf + " price=" + price);
         System.out.println("[SEND SIGNAL] pair=" + pair + " direction=" + direction + " confidence=" + conf + " price=" + price);
         bot.sendMessage(s.toTelegramMessage());
-    }
-    private boolean recentlySentSimilar(String pair, String direction, double conf, long windowMs) {
-        List<Signal> history = signalHistory.getOrDefault(pair, List.of());
-        long now = System.currentTimeMillis();
-        for (int i = history.size() - 1; i >= 0; i--) {
-            Signal s = history.get(i);
-            if (!s.direction.equals(direction)) continue;
-            // окно теперь 5 минут для повторного сигнала
-            if (now - s.created.toEpochMilli() > 20_000) break;
-            if (Math.abs(s.confidence - conf) < 0.05) return true;
-        }
-        return false;
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
