@@ -573,37 +573,31 @@ public class SignalSender {
 
         System.out.println("[EVAL START] " + pair);
         final String p = pair;
+
         try {
-            // ===== БАЗОВЫЕ ПРОВЕРКИ =====
+            // ===== 1. БАЗОВЫЕ ПРОВЕРКИ =====
             if (c5m == null || c5m.size() < 20) return Optional.empty();
             if (c15m == null || c15m.size() < 20) return Optional.empty();
             if (c1h == null || c1h.size() < 20) return Optional.empty();
 
+            // ===== 2. НАПРАВЛЕНИЕ EMA =====
             int dir1h = emaDirection(c1h, 20, 50, 0.001);
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
 
-            // ❗ отключаем жёсткую привязку к новой свече
-            long newOpen = c5m.get(c5m.size() - 1).openTime;
-            lastOpenTimeMap.put(p, newOpen);
+            lastOpenTimeMap.put(p, c5m.get(c5m.size() - 1).openTime);
 
-            // ===== ОБЪЁМ (НЕ УБИВАЕМ СИГНАЛ, ТОЛЬКО ШТРАФ) =====
-            double avgVol = c5m.stream().mapToDouble(c -> c.volume).average().orElse(0);
-            double lastVol = c5m.get(c5m.size() - 1).volume;
-            boolean volWeak = lastVol < avgVol * 0.7;
-
-            // ===== RAW SCORE =====
+            // ===== 3. RAW SCORE + MICRO TREND =====
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
-            double rawScore =
-                    strategyEMANorm(closes5m) * 0.38 +
-                            strategyMACDNorm(closes5m) * 0.28 +
-                            strategyRSINorm(closes5m) * 0.19 +
-                            strategyMomentumNorm(closes5m) * 0.15;
-            // --- Enhancement: microtrend bonus ---
+            double rawScore = strategyEMANorm(closes5m) * 0.38 +
+                    strategyMACDNorm(closes5m) * 0.28 +
+                    strategyRSINorm(closes5m) * 0.19 +
+                    strategyMomentumNorm(closes5m) * 0.15;
+
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
-                rawScore += 0.05 * Math.signum(rawScore); // небольшой бонус, увеличивает количество сигналов
+                rawScore += 0.05 * Math.signum(rawScore); // бонус microtrend
             }
 
             boolean earlyTrigger = earlyTrendTrigger(c5m);
@@ -611,7 +605,7 @@ public class SignalSender {
                 mtfConfirm = Integer.signum((int) Math.signum(rawScore));
             }
 
-            // ===== LAST CANDLE =====
+            // ===== 4. СВЕЧА =====
             Candle lastCandle = c5m.get(c5m.size() - 1);
             double lastPrice = lastCandle.close;
             double atrVal = atr(c5m, 14);
@@ -620,34 +614,28 @@ public class SignalSender {
             double candleBody = Math.abs(lastCandle.close - lastCandle.open);
             double candleRange = lastCandle.high - lastCandle.low;
             if (candleRange <= 0) return Optional.empty();
-            boolean weakCandle = (candleBody / candleRange) < 0.15;
+            boolean weakCandle = candleBody / candleRange < 0.15;
 
-            // ===== IMPULSE =====
+            // ===== 5. IMPULSE =====
             double avgBody = c5m.subList(Math.max(0, c5m.size() - 20), c5m.size())
                     .stream().mapToDouble(c -> Math.abs(c.close - c.open)).average().orElse(0);
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
             boolean impulse = candleBody / (lastCandle.open + 1e-12) >= adaptiveImpulse;
 
-            // ===== STRUCTURE + VWAP =====
-            boolean structureAligned =
-                    marketStructure(c1h) * rawScore > 0 ||
-                            marketStructure(c15m) * rawScore > 0 ||
-                            marketStructure(c5m) * rawScore > 0;
+            // ===== 6. СТРУКТУРА И VWAP =====
+            boolean structureAligned = marketStructure(c1h) * rawScore > 0 ||
+                    marketStructure(c15m) * rawScore > 0 ||
+                    marketStructure(c5m) * rawScore > 0;
 
             double vwap15 = vwap(c15m);
-            boolean vwapAligned =
-                    (rawScore > 0 && lastPrice > vwap15) ||
-                            (rawScore < 0 && lastPrice < vwap15);
+            boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) ||
+                    (rawScore < 0 && lastPrice < vwap15);
 
-            // ===== MICRO TREND =====
-            MicroTrendResult mt2 = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
-            if (Math.abs(rawScore) < 0.01 && Math.abs(mt.speed) < 0.00001) {
-                return Optional.empty();
-            }
+            // ===== 7. CONFIDENCE =====
             double confidence = composeConfidence(
                     rawScore,
                     mtfConfirm,
-                    !volWeak,
+                    !weakCandle,
                     atrPct >= ATR_MIN_PCT,
                     !impulse,
                     vwapAligned,
@@ -655,9 +643,10 @@ public class SignalSender {
                     detectBOS(c5m),
                     detectLiquiditySweep(c5m)
             );
-            if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) {
-                confidence += 0.08;  // новый бонус
-            }
+
+            // Бонусы
+            if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore)))
+                confidence += 0.08;
             if (rawScore * mt.speed > 0) confidence += 0.12;
             if (structureAligned) confidence += 0.10;
             if (vwapAligned) confidence += 0.05;
@@ -667,22 +656,18 @@ public class SignalSender {
             if (earlyTrigger) confidence += 0.05;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
+
+            // ===== 8. ATR BREAK =====
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
             if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
-            boolean strongTrigger =
-                    impulse ||
-                            atrBreakLong ||
-                            atrBreakShort ||
-                            (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            boolean canGoLong =
-                    rawScore > 0 &&
-                            confidence >= MIN_CONF;
+            boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
+                    (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            boolean canGoShort =
-                    rawScore < 0 &&
-                            confidence >= MIN_CONF;
+            // ===== 9. ОПРЕДЕЛЕНИЕ НАПРАВЛЕНИЯ =====
+            boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
+            boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
 
             String direction;
             if (canGoLong && !canGoShort) direction = "LONG";
@@ -690,6 +675,7 @@ public class SignalSender {
             else if (canGoLong) direction = mt.speed >= 0 ? "LONG" : "SHORT";
             else return Optional.empty();
 
+            // ===== 10. СОЗДАНИЕ СИГНАЛА =====
             Signal s = new Signal(
                     p.replace("USDT", ""),
                     direction,
@@ -698,7 +684,7 @@ public class SignalSender {
                     rsi(closes5m, 14),
                     rawScore,
                     mtfConfirm,
-                    !volWeak,
+                    !weakCandle,
                     true,
                     strongTrigger,
                     atrBreakLong,
@@ -708,19 +694,17 @@ public class SignalSender {
                     rsi(closes5m, 7),
                     rsi(closes5m, 4)
             );
-            // === SAVE MAIN TRADE IDEA ===
+
+            // ===== 11. СОХРАНЕНИЕ НАПРАВЛЕНИЯ И ИНВАЛИДАЦИЯ =====
             int dirVal = direction.equals("LONG") ? 1 : -1;
             ideaDirection.put(p, dirVal);
-
-// invalidation = противоположный свинг + ATR
-            double invalidation;
-            if (dirVal == 1) {
-                invalidation = lastSwingLow(c5m) - atrVal * 0.3;
-            } else {
-                invalidation = lastSwingHigh(c5m) + atrVal * 0.3;
-            }
+            double invalidation = dirVal == 1
+                    ? lastSwingLow(c5m) - atrVal * 0.3
+                    : lastSwingHigh(c5m) + atrVal * 0.3;
             ideaInvalidation.put(p, invalidation);
+
             return Optional.of(s);
+
         } catch (Exception e) {
             System.out.println("[evaluate] " + p + " error: " + e.getMessage());
             return Optional.empty();
@@ -1017,17 +1001,13 @@ public class SignalSender {
     private void sendSignalIfAllowed(String pair, String direction, double confidence,
                                      double price, double rawScore, int mtfConfirm,
                                      double rsi14, List<Double> closes5m) {
-        // ===== 1. Кулдаун =====
+
+        // ===== Кулдаун по конкретному направлению =====
         if (isCooldown(pair, direction, confidence)) {
             System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
             return;
         }
 
-        // ===== 2. Направление идеи (если нет) =====
-        ideaDirection.putIfAbsent(pair, 0);
-        int mainDir = ideaDirection.get(pair);
-
-        // ===== 3. Создаём объект сигнала =====
         Signal s = new Signal(
                 pair.replace("USDT", ""),
                 direction,
@@ -1036,25 +1016,16 @@ public class SignalSender {
                 rsi14,
                 rawScore,
                 mtfConfirm,
-                true,  // volOk
-                true,  // atrOk
-                true,  // strongTrigger
-                false, false, false, false, // atrBreakLong, atrBreakShort, impulse, earlyTrigger
+                true, true, true,
+                false, false, false, false,
                 rsi(closes5m, 7),
                 rsi(closes5m, 4)
         );
 
-        // ===== 4. Сохраняем сигнал в истории =====
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
-
-        // ===== 5. Отмечаем сигнал для кулдауна =====
         markSignalSent(pair, direction, confidence);
 
-        // ===== 6. Сохраняем основное направление идеи =====
-        ideaDirection.put(pair, direction.equals("LONG") ? 1 : -1);
-
-        sendRaw(s.toTelegramMessage());
-        System.out.println("[SENT] " + pair + " " + direction + " confidence=" + confidence);
+        System.out.println("[SEND] " + pair + " → " + direction + " confidence=" + confidence);
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
