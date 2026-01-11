@@ -836,7 +836,7 @@ public class SignalSender {
     }
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
-    private boolean isCooldown(String pair, String direction, double confidence) {
+    private boolean isCooldown(String pair, String direction) {
         long now = System.currentTimeMillis();
         lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
         long last = lastSignalTimeDir.get(pair).getOrDefault(direction, 0L);
@@ -998,33 +998,34 @@ public class SignalSender {
             System.out.println("[sendRaw] " + e.getMessage());
         }
     }
-    private void sendSignalIfAllowed(String pair, String direction, double confidence,
-                                     double price, double rawScore, int mtfConfirm,
-                                     double rsi14, List<Double> closes5m) {
+    private void sendSignalIfAllowed(String pair,
+                                     String direction,
+                                     double confidence,
+                                     double price,
+                                     double rawScore,
+                                     int mtfConfirm,
+                                     double rsi14,
+                                     List<Double> closes5m) {
+        long now = System.currentTimeMillis();
+        lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
+        Map<String, Long> dirMap = lastSignalTimeDir.get(pair);
 
-        // ===== Кулдаун по конкретному направлению =====
-        if (isCooldown(pair, direction, confidence)) {
-            System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
+        List<String> reasons = new ArrayList<>();
+        Long lastTime = dirMap.get(s.direction);
+        if (lastTime != null && (now - lastTime) < COOLDOWN_MS) reasons.add("COOLDOWN");
+        if (s.confidence < MIN_CONF) reasons.add("CONF < MIN_CONF");
+
+        if (!reasons.isEmpty()) {
+            System.out.println("[SKIP] " + pair + " → " + s.direction + " reasons: " + String.join(", ", reasons));
             return;
         }
 
-        Signal s = new Signal(
-                pair.replace("USDT", ""),
-                direction,
-                confidence,
-                price,
-                rsi14,
-                rawScore,
-                mtfConfirm,
-                true, true, true,
-                false, false, false, false,
-                rsi(closes5m, 7),
-                rsi(closes5m, 4)
-        );
-
+        // Отправка сигнала
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
-        markSignalSent(pair, direction, confidence);
-        System.out.println("[SEND] " + pair + " → " + direction + " confidence=" + confidence);
+        dirMap.put(s.direction, now); // сразу ставим cooldown
+        lastSentConfidence.put(pair, s.confidence);
+
+        System.out.println("[SEND] " + pair + " → " + s.direction + " confidence=" + s.confidence);
         sendRaw(s.toTelegramMessage());
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
