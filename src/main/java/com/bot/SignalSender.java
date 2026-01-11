@@ -70,7 +70,7 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
-        this.MIN_CONF = 0.45;
+        this.MIN_CONF = 0.35;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
@@ -575,12 +575,10 @@ public class SignalSender {
         final String p = pair;
 
         try {
-            // ===== 1. БАЗОВЫЕ ПРОВЕРКИ =====
-            if (c5m == null || c5m.size() < 20) return Optional.empty();
-            if (c15m == null || c15m.size() < 20) return Optional.empty();
-            if (c1h == null || c1h.size() < 20) return Optional.empty();
+            if (c5m.size() < 10) return Optional.empty();
+            if (c15m.size() < 10) return Optional.empty();
+            if (c1h.size() < 10) return Optional.empty();
 
-            // ===== 2. НАПРАВЛЕНИЕ EMA =====
             int dir1h = emaDirection(c1h, 20, 50, 0.001);
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
@@ -622,10 +620,9 @@ public class SignalSender {
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
             boolean impulse = candleBody / (lastCandle.open + 1e-12) >= adaptiveImpulse;
 
-            // ===== 6. СТРУКТУРА И VWAP =====
-            boolean structureAligned = marketStructure(c1h) * rawScore > 0 ||
-                    marketStructure(c15m) * rawScore > 0 ||
-                    marketStructure(c5m) * rawScore > 0;
+            boolean structureAligned = marketStructure(c1h) != 0 ||
+                    marketStructure(c15m) != 0 ||
+                    marketStructure(c5m) != 0;
 
             double vwap15 = vwap(c15m);
             boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) ||
@@ -670,12 +667,11 @@ public class SignalSender {
             boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
 
             String direction;
-            if (canGoLong && !canGoShort) direction = "LONG";
-            else if (!canGoLong && canGoShort) direction = "SHORT";
-            else if (canGoLong) direction = mt.speed >= 0 ? "LONG" : "SHORT";
-            else return Optional.empty();
+            if (rawScore > 0) direction = "LONG";
+            else if (rawScore < 0) direction = "SHORT";
+            else direction = "NONE";
 
-            // ===== 10. СОЗДАНИЕ СИГНАЛА =====
+            if ("NONE".equals(direction)) return Optional.empty();
             Signal s = new Signal(
                     p.replace("USDT", ""),
                     direction,
