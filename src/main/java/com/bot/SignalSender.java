@@ -546,26 +546,6 @@ public class SignalSender {
         if (score < -2) return -1;
         return 0;
     }
-
-    private double composeConfidence(double rawScore, int mtfConfirm, boolean volOk, boolean atrOk,
-                                     boolean notImpulse, boolean vwapAligned, boolean structureAligned,
-                                     boolean bos, boolean liquiditySweep) {
-        double base = Math.min(1.0, Math.abs(rawScore));
-        double boost = 0.0;
-        if (structureAligned) boost += 0.15;
-        if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore))) boost += 0.12;
-        if (volOk) boost += 0.07;
-        if (atrOk) boost += 0.05;
-        if (vwapAligned) boost += 0.06;
-        if (bos) boost += 0.04;
-        if (liquiditySweep) {
-            if (!structureAligned || mtfConfirm == 0) boost -= 0.10;
-            else boost -= 0.03;
-        }
-        double conf = Math.min(1.0, Math.max(0.0, base + boost));
-        return conf;
-    }
-
     public Optional<Signal> evaluate(String pair,
                                      List<Candle> c5m,
                                      List<Candle> c15m,
@@ -575,9 +555,9 @@ public class SignalSender {
         final String p = pair;
 
         try {
-            if (c5m.size() < 10) return Optional.empty();
-            if (c15m.size() < 10) return Optional.empty();
-            if (c1h.size() < 10) return Optional.empty();
+            if (c5m.size() < 20) return Optional.empty();
+            if (c15m.size() < 20) return Optional.empty();
+            if (c1h.size() < 20) return Optional.empty();
 
             int dir1h = emaDirection(c1h, 20, 50, 0.001);
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
@@ -611,15 +591,13 @@ public class SignalSender {
 
             double candleBody = Math.abs(lastCandle.close - lastCandle.open);
             double candleRange = lastCandle.high - lastCandle.low;
-            if (candleRange <= 0) return Optional.empty();
             boolean weakCandle = candleBody / candleRange < 0.15;
 
             // ===== 5. IMPULSE =====
             double avgBody = c5m.subList(Math.max(0, c5m.size() - 20), c5m.size())
                     .stream().mapToDouble(c -> Math.abs(c.close - c.open)).average().orElse(0);
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-            boolean impulse = candleBody / (lastCandle.open + 1e-12) >= adaptiveImpulse;
-
+            boolean impulse = false; // временно выключаем
             boolean structureAligned = marketStructure(c1h) != 0 ||
                     marketStructure(c15m) != 0 ||
                     marketStructure(c5m) != 0;
@@ -665,13 +643,19 @@ public class SignalSender {
             // ===== 9. ОПРЕДЕЛЕНИЕ НАПРАВЛЕНИЯ =====
             boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
             boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
+            String direction = rawScore >= 0 ? "LONG" : "SHORT";
 
-            String direction;
-            if (rawScore > 0) direction = "LONG";
-            else if (rawScore < 0) direction = "SHORT";
-            else direction = "NONE";
-
-            if ("NONE".equals(direction)) return Optional.empty();
+            int dirVal = direction.equals("LONG") ? 1 : -1;
+            ideaDirection.put(p, dirVal);
+            double invalidation = dirVal == 1
+                    ? lastSwingLow(c5m) - atrVal * 0.3
+                    : lastSwingHigh(c5m) + atrVal * 0.3;
+            ideaInvalidation.put(p, invalidation);
+            if (confidence < MIN_CONF) {
+                System.out.println("[DROP CONF] " + p + " conf=" + confidence);
+                return Optional.empty();
+            }
+            System.out.println("[SIGNAL OK] " + p + " " + direction + " conf=" + confidence + " raw=" + rawScore);
             Signal s = new Signal(
                     p.replace("USDT", ""),
                     direction,
@@ -680,8 +664,8 @@ public class SignalSender {
                     rsi(closes5m, 14),
                     rawScore,
                     mtfConfirm,
-                    !weakCandle,
                     true,
+                    atrPct >= ATR_MIN_PCT,
                     strongTrigger,
                     atrBreakLong,
                     atrBreakShort,
@@ -690,21 +674,12 @@ public class SignalSender {
                     rsi(closes5m, 7),
                     rsi(closes5m, 4)
             );
-
-            // ===== 11. СОХРАНЕНИЕ НАПРАВЛЕНИЯ И ИНВАЛИДАЦИЯ =====
-            int dirVal = direction.equals("LONG") ? 1 : -1;
-            ideaDirection.put(p, dirVal);
-            double invalidation = dirVal == 1
-                    ? lastSwingLow(c5m) - atrVal * 0.3
-                    : lastSwingHigh(c5m) + atrVal * 0.3;
-            ideaInvalidation.put(p, invalidation);
-
             return Optional.of(s);
-
         } catch (Exception e) {
             System.out.println("[evaluate] " + p + " error: " + e.getMessage());
             return Optional.empty();
         }
+
     }
     private double lastSwingHigh(List<Candle> candles) {
         int lookback = Math.min(20, candles.size());
@@ -1029,8 +1004,6 @@ public class SignalSender {
         List<String> reasons = new ArrayList<>();
         Long lastTime = dirMap.get(s.direction);
         if (lastTime != null && (now - lastTime) < COOLDOWN_MS) reasons.add("COOLDOWN");
-        if (s.confidence < MIN_CONF) reasons.add("CONF < MIN_CONF");
-
         if (!reasons.isEmpty()) {
             System.out.println("[SKIP] " + pair + " → " + s.direction + " reasons: " + String.join(", ", reasons));
             return;
@@ -1067,6 +1040,11 @@ public class SignalSender {
     }
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
+
+        if (BINANCE_PAIRS.isEmpty()) {
+            BINANCE_PAIRS = getBinanceSymbolsFutures();
+            System.out.println("[INIT] Loaded pairs: " + BINANCE_PAIRS.size());
+        }
         scheduler = Executors.newScheduledThreadPool(1);
         scheduler.scheduleAtFixedRate(() -> {
             try {
