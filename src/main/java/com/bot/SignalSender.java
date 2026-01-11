@@ -546,6 +546,34 @@ public class SignalSender {
         if (score < -2) return -1;
         return 0;
     }
+    private double composeConfidence(
+            double rawScore,
+            int mtfConfirm,
+            boolean volOk,
+            boolean atrOk,
+            boolean impulse,
+            boolean vwapAligned,
+            boolean structureAligned,
+            boolean bos,
+            boolean liquiditySweep
+    ) {
+        double conf = 0.0;
+
+        // базовое значение confidence
+        conf += Math.min(1.0, Math.abs(rawScore));
+
+        if (mtfConfirm != 0) conf += 0.1;
+        if (volOk) conf += 0.1;
+        if (atrOk) conf += 0.1;
+        if (impulse) conf += 0.05;
+        if (vwapAligned) conf += 0.05;
+        if (structureAligned) conf += 0.1;
+        if (bos) conf += 0.05;
+        if (liquiditySweep) conf += 0.05;
+
+        // лимит 0..1
+        return Math.max(0.0, Math.min(1.0, conf));
+    }
     public Optional<Signal> evaluate(String pair,
                                      List<Candle> c5m,
                                      List<Candle> c15m,
@@ -564,9 +592,6 @@ public class SignalSender {
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
 
-            lastOpenTimeMap.put(p, c5m.get(c5m.size() - 1).openTime);
-
-            // ===== 3. RAW SCORE + MICRO TREND =====
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rawScore = strategyEMANorm(closes5m) * 0.38 +
                     strategyMACDNorm(closes5m) * 0.28 +
@@ -1040,9 +1065,12 @@ public class SignalSender {
     }
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
+        if (BINANCE_PAIRS == null || BINANCE_PAIRS.isEmpty()) {
+            BINANCE_PAIRS = getTopSymbols(TOP_N)
+                    .stream()
+                    .filter(p -> p.endsWith("USDT"))
+                    .collect(Collectors.toSet());
 
-        if (BINANCE_PAIRS.isEmpty()) {
-            BINANCE_PAIRS = getBinanceSymbolsFutures();
             System.out.println("[INIT] Loaded pairs: " + BINANCE_PAIRS.size());
         }
         scheduler = Executors.newScheduledThreadPool(1);
