@@ -49,9 +49,6 @@ public class SignalSender {
     private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
     private final Map<String, Double> lastPriceMap = new ConcurrentHashMap<>();
 
-    private final DateTimeFormatter dtf = DateTimeFormatter.ISO_INSTANT;
-
-    // tick / ws state
     private java.net.http.WebSocket wsTick; // optional single ws used per pair connect model
     private final Map<String, Deque<Double>> tickPriceDeque = new ConcurrentHashMap<>();
     private final Map<String, Double> lastTickPrice = new ConcurrentHashMap<>();
@@ -1148,26 +1145,26 @@ public class SignalSender {
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
-            List<Candle> candles = fetchKlinesAsync(symbol, interval, limit).get(); // блокируем, ждем завершения
+            List<Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
             if (candles.isEmpty()) {
-                System.out.println("[KLINES] Пустой ответ для " + symbol + " интервал " + interval);
+                System.out.println("[KLİNES] Пустой ответ для " + symbol + " интервал " + interval);
             } else {
-                System.out.println("[KLINES] Получено " + candles.size() + " свечей для " + symbol + " интервал " + interval);
+                System.out.println("[KLİNES] Получено " + candles.size() + " свечей для " + symbol + " интервал " + interval);
             }
-            return candles; // возвращаем результат один раз
-        } catch (InterruptedException | ExecutionException e) {
+            return candles;
+        } catch (Exception e) {
             System.out.println("[fetchKlines] error for " + symbol + " " + interval + ": " + e.getMessage());
             return Collections.emptyList();
         }
     }
-
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
         scheduler = Executors.newScheduledThreadPool(1);
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 List<String> topSymbols = getTopSymbols(TOP_N);
-                Set<String> allBinance = getBinanceSymbolsFutures();
+                Set<String> symbols = getBinanceSymbolsFutures();
+                System.out.println("[DEBUG] Symbols: " + symbols);
                 BINANCE_PAIRS = new HashSet<>(topSymbols);
                 System.out.println("[DEBUG] BINANCE_PAIRS=" + BINANCE_PAIRS);
                 ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
