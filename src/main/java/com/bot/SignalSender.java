@@ -573,6 +573,7 @@ public class SignalSender {
                                      List<Candle> c5m,
                                      List<Candle> c15m,
                                      List<Candle> c1h) {
+        System.out.println("[EVAL START] " + pair);
         final String p = pair;
         Optional<Candle> predictedCandle = predictNextCandleFromPrices(new ArrayList<>(tickPriceDeque.get(pair)));
         predictedCandle.ifPresent(pred -> {
@@ -901,32 +902,22 @@ public class SignalSender {
             java.net.http.WebSocket ws = java.net.http.HttpClient.newHttpClient()
                     .newWebSocketBuilder()
                     .buildAsync(URI.create(aggUrl), new java.net.http.WebSocket.Listener() {
-                        @Override
-                        public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
+                        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
                             try {
                                 JSONObject json = new JSONObject(data.toString());
                                 double price = json.has("p") ? Double.parseDouble(json.getString("p")) : json.optDouble("p", 0.0);
                                 double qty = json.has("q") ? Double.parseDouble(json.getString("q")) : json.optDouble("q", 0.0);
                                 long ts = json.has("T") ? json.getLong("T") : System.currentTimeMillis();
 
+                                // дебаг-вывод тиков
+                                System.out.println("[TICKER] pair=" + pair + " price=" + price + " qty=" + qty + " ts=" + ts);
+
                                 tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>()).addLast(price);
                                 Deque<Double> dq = tickPriceDeque.get(pair);
                                 while (dq.size() > TICK_HISTORY) dq.removeFirst();
+
                                 lastTickPrice.put(pair, price);
                                 lastTickTime.put(pair, ts);
-
-                                microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(1000));
-                                MicroCandleBuilder b1 = microBuilders.get(pair);
-                                Optional<Candle> micro = b1.addTick(ts, price, qty);
-
-                                micro.ifPresent(c -> {
-                                    List<Double> recentPrices = new ArrayList<>(dq);
-                                    Optional<Candle> predictedOpt = predictNextCandleFromPrices(recentPrices);
-                                    predictedOpt.ifPresent(pred -> {
-                                        lastTickPrice.put(pair, pred.close); // сохраняем прогноз
-                                        System.out.println("[Predicted Candle] pair=" + pair + " -> predictedClose=" + pred.close);
-                                    });
-                                });
                             } catch (Exception ex) {
                                 System.out.println("[WS tick parse] " + ex.getMessage());
                             }
@@ -1117,6 +1108,8 @@ public class SignalSender {
         try { bot.sendSignal(msg); } catch (Exception e) { System.out.println("[sendRaw] " + e.getMessage()); }
     }
     private void sendSignalIfAllowed(String pair, String direction, double conf, double price){
+        if (isCooldown(pair, direction, conf)) System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
+        if (recentlySentSimilar(pair, direction, conf, 10_000)) System.out.println("[RECENT] " + pair + " " + direction + " уже отправлялся");
         Integer mainDir = ideaDirection.get(pair);
         if (mainDir == null) return;
         if (recentlySentSimilar(pair, direction, conf, 10_000)) return; // 10 секунд окно
@@ -1138,6 +1131,7 @@ public class SignalSender {
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
         markSignalSent(pair, direction, conf);
         System.out.println("[DEBUG] Отправка сигнала: " + pair + " " + direction + " conf=" + conf + " price=" + price);
+        System.out.println("[SEND SIGNAL] pair=" + pair + " direction=" + direction + " confidence=" + conf + " price=" + price);
         bot.sendMessage(s.toTelegramMessage());
     }
     private boolean recentlySentSimilar(String pair, String direction, double conf, long windowMs) {
@@ -1153,6 +1147,12 @@ public class SignalSender {
         return false;
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
+        List<Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
+        if (candles.isEmpty()) {
+            System.out.println("[KLİNES] Пустой ответ для " + symbol + " интервал " + interval);
+        } else {
+            System.out.println("[KLİNES] Получено " + candles.size() + " свечей для " + symbol + " интервал " + interval);
+        }
         try {
             return fetchKlinesAsync(symbol, interval, limit).get(); // блокируем, ждем завершения
         } catch (Exception e) {
