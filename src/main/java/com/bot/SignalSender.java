@@ -1024,8 +1024,8 @@ public class SignalSender {
 
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
         markSignalSent(pair, direction, confidence);
-
         System.out.println("[SEND] " + pair + " → " + direction + " confidence=" + confidence);
+        sendRaw(s.toTelegramMessage());
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
