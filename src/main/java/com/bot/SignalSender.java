@@ -1017,17 +1017,17 @@ public class SignalSender {
     private void sendSignalIfAllowed(String pair, String direction, double confidence,
                                      double price, double rawScore, int mtfConfirm,
                                      double rsi14, List<Double> closes5m) {
-        // проверка кулдауна
+        // ===== 1. Кулдаун =====
         if (isCooldown(pair, direction, confidence)) {
             System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
             return;
         }
 
-        // сохраняем направление идеи, если нет
+        // ===== 2. Направление идеи (если нет) =====
         ideaDirection.putIfAbsent(pair, 0);
-        int mainDir = ideaDirection.getOrDefault(pair, 0);
+        int mainDir = ideaDirection.get(pair);
 
-        // создаём сигнал
+        // ===== 3. Создаём объект сигнала =====
         Signal s = new Signal(
                 pair.replace("USDT", ""),
                 direction,
@@ -1039,21 +1039,24 @@ public class SignalSender {
                 true,  // volOk
                 true,  // atrOk
                 true,  // strongTrigger
-                false, false, false, false, // atrBreakLong/Short, impulse, earlyTrigger
+                false, false, false, false, // atrBreakLong, atrBreakShort, impulse, earlyTrigger
                 rsi(closes5m, 7),
                 rsi(closes5m, 4)
         );
 
-        // сохраняем сигнал
+        // ===== 4. Сохраняем сигнал в истории =====
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
-        // отмечаем, что сигнал отправлен (для кулдауна)
+        // ===== 5. Отмечаем сигнал для кулдауна =====
         markSignalSent(pair, direction, confidence);
 
-        // сохраняем направление идеи
+        // ===== 6. Сохраняем основное направление идеи =====
         ideaDirection.put(pair, direction.equals("LONG") ? 1 : -1);
+
+        // ===== 7. Отправка сигнала в Telegram =====
         sendRaw(s.toTelegramMessage());
-        System.out.println("[SEND SIGNAL] " + pair + " " + direction + " conf=" + confidence + " price=" + price);
+
+        System.out.println("[SIGNAL SENT] " + pair + " → " + direction + " conf=" + confidence);
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
