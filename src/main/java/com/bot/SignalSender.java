@@ -63,7 +63,6 @@ public class SignalSender {
     // scheduler
     private ScheduledExecutorService scheduler;
 
-    // Constructor
     public SignalSender(TelegramBotSender bot) {
         this.bot = bot;
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
@@ -151,7 +150,54 @@ public class SignalSender {
             return Set.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
         }
     }
-    // ========================= Fetch Klines (Futures) =========================
+    // Вставляем в SignalAnalyzer.java (например после строки 120 или в том же классе)
+    public double computeRealConfidence(List<Candle> pastCandles, int horizon, String dir) {
+        // horizon = сколько свечей вперед прогнозируем, например 5
+        int success = 0;
+        int total = 0;
+
+        for (int i = horizon; i < pastCandles.size(); i++) {
+            Candle entry = pastCandles.get(i - horizon);
+            Candle exit = pastCandles.get(i);
+
+            if (dir.equals("LONG") && exit.close > entry.close) success++;
+            if (dir.equals("SHORT") && exit.close < entry.close) success++;
+
+            total++;
+        }
+
+        return total == 0 ? 0.0 : ((double) success / total);
+    }
+    // Прогноз цены на следующие n свечей (линейная регрессия по закрытиям)
+    public List<Double> predictNextNCandles(List<Candle> candles, int n) {
+        if(candles == null || candles.size() < 3) return Collections.emptyList(); // защита от пустых данных
+        int size = candles.size();
+        List<Double> closes = candles.stream().map(c -> c.close).toList();
+        double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+        for (int i = 0; i < size; i++) {
+            sumX += i;
+            sumY += closes.get(i);
+            sumXY += i * closes.get(i);
+            sumXX += i * i;
+        }
+        double slope = (size*sumXY - sumX*sumY) / (size*sumXX - sumX*sumX + 1e-12);
+        double lastClose = closes.get(size-1);
+        List<Double> forecast = new ArrayList<>();
+        for (int i = 1; i <= n; i++) forecast.add(lastClose + slope*i);
+        return forecast;
+    }
+    public String predictNext5CandlesDirection(List<Candle> c5m) {
+        List<Double> forecast = predictNextNCandles(c5m, 5); // прогноз закрытий 5 свечей
+        int longCount = 0;
+        int shortCount = 0;
+        double lastClose = c5m.get(c5m.size() - 1).close;
+        for (double f : forecast) {
+            if (f > lastClose) longCount++;
+            else shortCount++;
+            lastClose = f;
+        }
+        return longCount > shortCount ? "LONG" : "SHORT";
+    }
     public CompletableFuture<List<Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
             String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", symbol, interval, limit);
@@ -555,11 +601,12 @@ public class SignalSender {
             boolean vwapAligned,
             boolean structureAligned,
             boolean bos,
-            boolean liquiditySweep
+            boolean liquiditySweep,
+            String pair // добавляем pair для истории
     ) {
         double conf = 0.0;
 
-        // базовое значение confidence
+        // ===== Базовая оценка =====
         conf += Math.min(1.0, Math.abs(rawScore));
 
         if (mtfConfirm != 0) conf += 0.1;
@@ -571,14 +618,22 @@ public class SignalSender {
         if (bos) conf += 0.05;
         if (liquiditySweep) conf += 0.05;
 
-        // лимит 0..1
+        // Ограничение 0..1
+        conf = Math.max(0.0, Math.min(1.0, conf));
+
+        // ===== Сглаживание по истории последних сигналов =====
+        List<Signal> history = signalHistory.getOrDefault(pair, new ArrayList<>());
+        if (!history.isEmpty()) {
+            double avgConf = history.stream().mapToDouble(s -> s.confidence).average().orElse(conf);
+            conf = (conf + avgConf) / 2.0; // усредняем текущую и историческую
+        }
+
         return Math.max(0.0, Math.min(1.0, conf));
     }
     public Optional<Signal> evaluate(String pair,
                                      List<Candle> c5m,
                                      List<Candle> c15m,
                                      List<Candle> c1h) {
-
         System.out.println("[EVAL START] " + pair);
         final String p = pair;
 
@@ -587,11 +642,13 @@ public class SignalSender {
             if (c15m.size() < 20) return Optional.empty();
             if (c1h.size() < 20) return Optional.empty();
 
+            // ================= Multi-TF EMA confirmation =================
             int dir1h = emaDirection(c1h, 20, 50, 0.001);
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
 
+            // ================= Raw score from indicators =================
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rawScore = strategyEMANorm(closes5m) * 0.38 +
                     strategyMACDNorm(closes5m) * 0.28 +
@@ -608,7 +665,7 @@ public class SignalSender {
                 mtfConfirm = Integer.signum((int) Math.signum(rawScore));
             }
 
-            // ===== 4. СВЕЧА =====
+            // ================= Last candle analysis =================
             Candle lastCandle = c5m.get(c5m.size() - 1);
             double lastPrice = lastCandle.close;
             double atrVal = atr(c5m, 14);
@@ -618,7 +675,7 @@ public class SignalSender {
             double candleRange = lastCandle.high - lastCandle.low;
             boolean weakCandle = candleBody / candleRange < 0.15;
 
-            // ===== 5. IMPULSE =====
+            // ================= Impulse & structure =================
             double avgBody = c5m.subList(Math.max(0, c5m.size() - 20), c5m.size())
                     .stream().mapToDouble(c -> Math.abs(c.close - c.open)).average().orElse(0);
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
@@ -631,7 +688,7 @@ public class SignalSender {
             boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) ||
                     (rawScore < 0 && lastPrice < vwap15);
 
-            // ===== 7. CONFIDENCE =====
+            // ================= Confidence calculation =================
             double confidence = composeConfidence(
                     rawScore,
                     mtfConfirm,
@@ -641,10 +698,11 @@ public class SignalSender {
                     vwapAligned,
                     structureAligned,
                     detectBOS(c5m),
-                    detectLiquiditySweep(c5m)
+                    detectLiquiditySweep(c5m),
+                    pair // добавляем pair для истории сигналов
             );
 
-            // Бонусы
+            // ================= Additional bonuses =================
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore)))
                 confidence += 0.08;
             if (rawScore * mt.speed > 0) confidence += 0.12;
@@ -657,7 +715,7 @@ public class SignalSender {
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
 
-            // ===== 8. ATR BREAK =====
+            // ================= ATR break check =================
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
             if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
@@ -665,7 +723,7 @@ public class SignalSender {
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            // ===== 9. ОПРЕДЕЛЕНИЕ НАПРАВЛЕНИЯ =====
+            // ================= Determine direction =================
             boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
             boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
             String direction = rawScore >= 0 ? "LONG" : "SHORT";
@@ -676,11 +734,19 @@ public class SignalSender {
                     ? lastSwingLow(c5m) - atrVal * 0.3
                     : lastSwingHigh(c5m) + atrVal * 0.3;
             ideaInvalidation.put(p, invalidation);
+            String futureDir = predictNext5CandlesDirection(c5m);
+            if (!futureDir.equals(direction)) {
+                confidence *= 0.85; // немного снижаем, если прогноз на следующие 5 свечей против текущего сигнала
+            } else {
+                confidence *= 1.05; // небольшой бонус, если совпадает
+            }
             if (confidence < MIN_CONF) {
                 System.out.println("[DROP CONF] " + p + " conf=" + confidence);
                 return Optional.empty();
             }
+
             System.out.println("[SIGNAL OK] " + p + " " + direction + " conf=" + confidence + " raw=" + rawScore);
+
             Signal s = new Signal(
                     p.replace("USDT", ""),
                     direction,
@@ -689,7 +755,7 @@ public class SignalSender {
                     rsi(closes5m, 14),
                     rawScore,
                     mtfConfirm,
-                    true,
+                    true,  // volOk
                     atrPct >= ATR_MIN_PCT,
                     strongTrigger,
                     atrBreakLong,
@@ -699,19 +765,14 @@ public class SignalSender {
                     rsi(closes5m, 7),
                     rsi(closes5m, 4)
             );
+
             return Optional.of(s);
+
         } catch (Exception e) {
             System.out.println("[evaluate] " + p + " error: " + e.getMessage());
             return Optional.empty();
         }
 
-    }
-    private double lastSwingHigh(List<Candle> candles) {
-        int lookback = Math.min(20, candles.size());
-        double high = Double.NEGATIVE_INFINITY;
-        for (int i = candles.size() - lookback; i < candles.size(); i++)
-            high = Math.max(high, candles.get(i).high);
-        return high;
     }
     private double lastSwingLow(List<Candle> candles) {
         int lookback = Math.min(20, candles.size());
@@ -719,6 +780,13 @@ public class SignalSender {
         for (int i = candles.size() - lookback; i < candles.size(); i++)
             low = Math.min(low, candles.get(i).low);
         return low;
+    }
+    private double lastSwingHigh(List<Candle> candles) {
+        int lookback = Math.min(20, candles.size());
+        double high = Double.NEGATIVE_INFINITY;
+        for (int i = candles.size() - lookback; i < candles.size(); i++)
+            high = Math.max(high, candles.get(i).high);
+        return high;
     }
     private TradeSignal buildTrade(
             String symbol,
@@ -880,45 +948,6 @@ public class SignalSender {
             System.out.println("[WS connect] error for " + pair + " : " + e.getMessage());
         }
     }
-
-    private Optional<Candle> predictNextCandleFromPrices(List<Double> recentPrices) {
-        if (recentPrices == null || recentPrices.size() < 3) return Optional.empty();
-
-        int n = recentPrices.size();
-        double lastPrice = recentPrices.get(n - 1);
-        double prevPrice = recentPrices.get(n - 2);
-        double prevPrevPrice = recentPrices.get(n - 3);
-
-        double speed = lastPrice - prevPrice;
-        double accel = (lastPrice - prevPrice) - (prevPrice - prevPrevPrice);
-// --- SMA сглаживание скорости и ускорения ---
-        int smoothN = Math.min(5, recentPrices.size() - 1);
-        double sumSpeed = 0;
-        double sumAccel = 0;
-        for (int i = recentPrices.size() - smoothN; i < recentPrices.size() - 1; i++) {
-            double sp = recentPrices.get(i + 1) - recentPrices.get(i);
-            sumSpeed += sp;
-            if (i > recentPrices.size() - smoothN) {
-                double prevSp = recentPrices.get(i) - recentPrices.get(i - 1);
-                sumAccel += sp - prevSp;
-            }
-        }
-        speed = sumSpeed / smoothN;
-        accel = sumAccel / Math.max(1, smoothN - 1);
-        // Ограничиваем экстремальные скачки
-        double maxChangePct = 0.05;
-        speed = Math.max(-lastPrice * maxChangePct, Math.min(speed, lastPrice * maxChangePct));
-        accel = Math.max(-lastPrice * maxChangePct, Math.min(accel, lastPrice * maxChangePct));
-
-        double predictedClose = lastPrice + speed + accel;
-
-        double predictedHigh = Math.max(lastPrice, predictedClose) * 1.001;
-        double predictedLow = Math.min(lastPrice, predictedClose) * 0.999;
-
-        long predictedTime = System.currentTimeMillis() + 60_000;
-
-        return Optional.of(new Candle(predictedTime, lastPrice, predictedHigh, predictedLow, predictedClose, 0.0, 0.0, predictedTime));
-    }
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         if (dq == null || dq.size() < 3) return new MicroTrendResult(0, 0, 0);
         List<Double> arr = new ArrayList<>(dq);
@@ -1026,6 +1055,7 @@ public class SignalSender {
         lastSignalTimeDir.putIfAbsent(pair, new ConcurrentHashMap<>());
         Map<String, Long> dirMap = lastSignalTimeDir.get(pair);
 
+
         List<String> reasons = new ArrayList<>();
         Long lastTime = dirMap.get(s.direction);
         if (lastTime != null && (now - lastTime) < COOLDOWN_MS) reasons.add("COOLDOWN");
@@ -1057,58 +1087,98 @@ public class SignalSender {
     }
     private List<Candle> fetchKlinesSync(String symbol, String interval, int limit) {
         try {
-            return fetchKlinesAsync(symbol, interval, limit).join();
+            return fetchKlinesAsync(symbol, interval, limit).get();
         } catch (Exception e) {
-            System.out.println("[fetchKlinesSync] error for " + symbol + ": " + e.getMessage());
+            System.out.println("[fetchKlinesSync] error for " + symbol + " " + interval + ": " + e.getMessage());
             return Collections.emptyList();
         }
     }
+    private void runAnalysisCycle() {
+        Set<String> pairs = getBinanceSymbolsFutures(); // или getTopSymbols(TOP_N)
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (String pair : pairs) {
+            futures.add(
+                    CompletableFuture.allOf(
+                            fetchKlinesAsync(pair, "5m", KLINES_LIMIT),
+                            fetchKlinesAsync(pair, "15m", KLINES_LIMIT),
+                            fetchKlinesAsync(pair, "1h", KLINES_LIMIT)
+                    ).thenAccept(v -> {
+                        try {
+                            List<Candle> c5m = fetchKlinesAsync(pair, "5m", KLINES_LIMIT).join();
+                            List<Candle> c15m = fetchKlinesAsync(pair, "15m", KLINES_LIMIT).join();
+                            List<Candle> c1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT).join();
+
+                            Optional<Signal> optSignal = evaluate(pair, c5m, c15m, c1h);
+                            if (optSignal.isPresent()) {
+                                Signal s = optSignal.get();
+                                if (!isCooldown(pair, s.direction)) {
+                                    sendRaw(s.toTelegramMessage());
+                                    markSignalSent(pair, s.direction, s.confidence);
+                                }
+                            }
+                        } catch (Exception e) {
+                            System.out.println("[runAnalysisCycle] " + pair + " error: " + e.getMessage());
+                        }
+                    })
+            );
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+    }
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
+
         if (BINANCE_PAIRS == null || BINANCE_PAIRS.isEmpty()) {
-            BINANCE_PAIRS = getTopSymbols(TOP_N)
+            BINANCE_PAIRS = getTopSymbolsSet(TOP_N)
                     .stream()
                     .filter(p -> p.endsWith("USDT"))
                     .collect(Collectors.toSet());
 
             System.out.println("[INIT] Loaded pairs: " + BINANCE_PAIRS.size());
         }
-        scheduler = Executors.newScheduledThreadPool(1);
+
+        scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> {
             try {
-                for (String pair : BINANCE_PAIRS) {
-                    try {
-                        List<Candle> c5m = fetchKlinesSync(pair, "5m", KLINES_LIMIT);
-                        List<Candle> c15m = fetchKlinesSync(pair, "15m", KLINES_LIMIT);
-                        List<Candle> c1h = fetchKlinesSync(pair, "1h", KLINES_LIMIT);
-
-                        evaluate(pair, c5m, c15m, c1h)
-                                .ifPresent(sig -> {
-                                    List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
-                                    double rsi14 = rsi(closes5m, 14);
-                                    int mtfConfirm = sig.mtfConfirm;
-                                    double rawScore = sig.rawScore;
-
-                                    sendSignalIfAllowed(
-                                            pair,
-                                            sig.direction,
-                                            sig.confidence,
-                                            sig.price,
-                                            rawScore,
-                                            mtfConfirm,
-                                            rsi14,
-                                            closes5m
-                                    );
-                                });
-                    } catch (Exception e) {
-                        System.out.println("[Scheduler] Error for " + pair + " : " + e.getMessage());
-                    }
-                }
+                runSchedulerCycle();
             } catch (Exception e) {
-                System.out.println("[Scheduler] General error: " + e.getMessage());
+                System.out.println("[Scheduler] error: " + e.getMessage());
+                e.printStackTrace();
             }
         }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
+    public Set<String> getTopSymbolsSet(int limit) {
+        List<String> list = getTopSymbols(limit); // используем существующий метод List<String>
+        return new HashSet<>(list); // конвертируем в Set
+    }
+
+    private void runSchedulerCycle() {
+        Set<String> symbols = getTopSymbolsSet(TOP_N);
+        for (String pair : symbols) {
+            try {
+                List<Candle> c5m = fetchKlinesAsync(pair, "5m", KLINES_LIMIT).join();
+                List<Candle> c15m = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3).join();
+                List<Candle> c1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12).join();
+
+                Optional<Signal> s = evaluate(pair, c5m, c15m, c1h);
+                s.ifPresent(sig -> sendSignalIfAllowed(
+                        pair,
+                        sig.direction,
+                        sig.confidence,
+                        sig.price,
+                        sig.rawScore,
+                        sig.mtfConfirm,
+                        sig.rsi,
+                        c5m.stream().map(c -> c.close).toList()
+                ));
+
+            } catch (Exception e) {
+                System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+    }
+
     static class TradeSignal {
         String symbol;
         String side;      // LONG / SHORT
