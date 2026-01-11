@@ -1014,36 +1014,46 @@ public class SignalSender {
             System.out.println("[sendRaw] " + e.getMessage());
         }
     }
-    private void sendSignalIfAllowed(String pair, String direction, double conf, double price){
-        if (isCooldown(pair, direction, conf))
+    private void sendSignalIfAllowed(String pair, String direction, double confidence,
+                                     double price, double rawScore, int mtfConfirm,
+                                     double rsi14, List<Double> closes5m) {
+        // проверка кулдауна
+        if (isCooldown(pair, direction, confidence)) {
             System.out.println("[COOLDOWN] " + pair + " " + direction + " заблокирован по кулдауну");
-        ideaDirection.putIfAbsent(pair, 0); // 0 = нейтральное направление
-        Integer mainDir = ideaDirection.get(pair);
-        if (mainDir == null) {
-            System.out.println("[DEBUG] No direction in ideaDirection for " + pair);
-            mainDir = 1; // временно BUY, чтобы сигнал прошел
+            return;
         }
-        if (conf < 0.5) {
-            System.out.println("[DEBUG] Low confidence: " + conf);
-            // return; <- убрали, сигнал идет дальше
-        }
+
+        // сохраняем направление идеи, если нет
+        ideaDirection.putIfAbsent(pair, 0);
+        int mainDir = ideaDirection.getOrDefault(pair, 0);
+
+        // создаём сигнал
         Signal s = new Signal(
-                pair.replace("USDT",""),
+                pair.replace("USDT", ""),
                 direction,
-                conf,
+                confidence,
                 price,
-                50.0, // RSI placeholder
-                0.0,  // rawScore placeholder
-                0,    // mtfConfirm placeholder
-                true, true, true, false, false, false, false, 50.0, 50.0
+                rsi14,
+                rawScore,
+                mtfConfirm,
+                true,  // volOk
+                true,  // atrOk
+                true,  // strongTrigger
+                false, false, false, false, // atrBreakLong/Short, impulse, earlyTrigger
+                rsi(closes5m, 7),
+                rsi(closes5m, 4)
         );
 
         // сохраняем сигнал
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
-        markSignalSent(pair, direction, conf);
-        System.out.println("[DEBUG] Отправка сигнала: " + pair + " " + direction + " conf=" + conf + " price=" + price);
-        System.out.println("[SEND SIGNAL] pair=" + pair + " direction=" + direction + " confidence=" + conf + " price=" + price);
-        bot.sendMessage(s.toTelegramMessage());
+
+        // отмечаем, что сигнал отправлен (для кулдауна)
+        markSignalSent(pair, direction, confidence);
+
+        // сохраняем направление идеи
+        ideaDirection.put(pair, direction.equals("LONG") ? 1 : -1);
+
+        System.out.println("[SEND SIGNAL] " + pair + " " + direction + " conf=" + confidence + " price=" + price);
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
@@ -1059,47 +1069,52 @@ public class SignalSender {
             return Collections.emptyList();
         }
     }
+    private List<Candle> fetchKlinesSync(String symbol, String interval, int limit) {
+        try {
+            return fetchKlinesAsync(symbol, interval, limit).join();
+        } catch (Exception e) {
+            System.out.println("[fetchKlinesSync] error for " + symbol + ": " + e.getMessage());
+            return Collections.emptyList();
+        }
+    }
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
         scheduler = Executors.newScheduledThreadPool(1);
         scheduler.scheduleAtFixedRate(() -> {
             try {
-                List<String> topSymbols = getTopSymbols(TOP_N);
-                Set<String> symbols = getBinanceSymbolsFutures();
-                System.out.println("[DEBUG] Symbols: " + symbols);
-                BINANCE_PAIRS = new HashSet<>(topSymbols);
-                System.out.println("[DEBUG] BINANCE_PAIRS=" + BINANCE_PAIRS);
-                ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
                 for (String pair : BINANCE_PAIRS) {
-                    executor.submit(() -> {
-                        try {
-                            // --- Получаем свечи ---
-                            List<Candle> c5m = fetchKlines(pair, "5m", 100);
-                            List<Candle> c15m = fetchKlines(pair, "15m", 100);
-                            List<Candle> c1h = fetchKlines(pair, "1h", 100);
+                    try {
+                        List<Candle> c5m = fetchKlinesSync(pair, "5m", KLINES_LIMIT);
+                        List<Candle> c15m = fetchKlinesSync(pair, "15m", KLINES_LIMIT);
+                        List<Candle> c1h = fetchKlinesSync(pair, "1h", KLINES_LIMIT);
 
-                            // --- Генерация сигнала ---
-                            Optional<Signal> sigOpt = evaluate(pair, c5m, c15m, c1h);
-                            sigOpt.ifPresent(sig -> sendSignalIfAllowed(
-                                    pair,
-                                    sig.direction,
-                                    sig.confidence,
-                                    sig.price
-                            ));
-                        } catch (Exception e) {
-                            System.out.println("[Parallel evaluate] " + pair + " error: " + e.getMessage());
-                        }
-                    });
+                        evaluate(pair, c5m, c15m, c1h)
+                                .ifPresent(sig -> {
+                                    List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
+                                    double rsi14 = rsi(closes5m, 14);
+                                    int mtfConfirm = sig.mtfConfirm;
+                                    double rawScore = sig.rawScore;
+
+                                    sendSignalIfAllowed(
+                                            pair,
+                                            sig.direction,
+                                            sig.confidence,
+                                            sig.price,
+                                            rawScore,
+                                            mtfConfirm,
+                                            rsi14,
+                                            closes5m
+                                    );
+                                });
+                    } catch (Exception e) {
+                        System.out.println("[Scheduler] Error for " + pair + " : " + e.getMessage());
+                    }
                 }
-
-                executor.shutdown();
-                executor.awaitTermination(1, TimeUnit.MINUTES);
             } catch (Exception e) {
-                System.out.println("[start] Scheduler error: " + e.getMessage());
+                System.out.println("[Scheduler] General error: " + e.getMessage());
             }
-        }, 0, 60, TimeUnit.SECONDS); // <--- проверка каждые 30 секунд
+        }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
-    // ===== Trade signal model =====
     static class TradeSignal {
         String symbol;
         String side;      // LONG / SHORT
