@@ -69,7 +69,7 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
-        this.MIN_CONF = 0.55;
+        this.MIN_CONF = 0.65;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
@@ -615,10 +615,6 @@ public class SignalSender {
         if (impulse) conf += 0.05;
         if (vwapAligned) conf += 0.05;
         if (structureAligned) conf += 0.1;
-        if (bos) conf += 0.05;
-        if (liquiditySweep) conf += 0.05;
-
-        // Ограничение 0..1
         conf = Math.max(0.0, Math.min(1.0, conf));
 
         // ===== Сглаживание по истории последних сигналов =====
@@ -679,11 +675,16 @@ public class SignalSender {
             double avgBody = c5m.subList(Math.max(0, c5m.size() - 20), c5m.size())
                     .stream().mapToDouble(c -> Math.abs(c.close - c.open)).average().orElse(0);
             double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-            boolean impulse = false; // временно выключаем
-            boolean structureAligned = marketStructure(c1h) != 0 ||
-                    marketStructure(c15m) != 0 ||
-                    marketStructure(c5m) != 0;
+            boolean impulse =
+                    Math.abs(mt.speed) > adaptiveImpulse &&
+                            Math.signum(mt.speed) == Math.signum(rawScore);
+            int struct5 = marketStructure(c5m);
+            int struct15 = marketStructure(c15m);
 
+            boolean structureAligned =
+                    struct5 != 0 &&
+                            struct15 != 0 &&
+                            Integer.signum(struct5) == Integer.signum(struct15);
             double vwap15 = vwap(c15m);
             boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) ||
                     (rawScore < 0 && lastPrice < vwap15);
@@ -694,7 +695,7 @@ public class SignalSender {
                     mtfConfirm,
                     !weakCandle,
                     atrPct >= ATR_MIN_PCT,
-                    !impulse,
+                    impulse,
                     vwapAligned,
                     structureAligned,
                     detectBOS(c5m),
@@ -706,9 +707,6 @@ public class SignalSender {
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore)))
                 confidence += 0.08;
             if (rawScore * mt.speed > 0) confidence += 0.12;
-            if (structureAligned) confidence += 0.10;
-            if (vwapAligned) confidence += 0.05;
-            if (impulse) confidence += 0.12;
             if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
             if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
             if (earlyTrigger) confidence += 0.05;
@@ -736,9 +734,9 @@ public class SignalSender {
             ideaInvalidation.put(p, invalidation);
             String futureDir = predictNext5CandlesDirection(c5m);
             if (!futureDir.equals(direction)) {
-                confidence *= 0.85; // немного снижаем, если прогноз на следующие 5 свечей против текущего сигнала
+                confidence *= 0.93; // мягкое снижение
             } else {
-                confidence *= 1.05; // небольшой бонус, если совпадает
+                confidence *= 1.03; // лёгкий бонус
             }
             if (confidence < MIN_CONF) {
                 System.out.println("[DROP CONF] " + p + " conf=" + confidence);
@@ -974,10 +972,9 @@ public class SignalSender {
     private boolean isVolumeStrong(String pair, double lastPrice) {
         OrderbookSnapshot obs = orderbookMap.get(pair);
         if (obs == null) return false;
-        double obi = obs.obi();
-        Deque<Double> history = tickPriceDeque.getOrDefault(pair, new ArrayDeque<>());
-        double avgObi = history.isEmpty() ? 0.02 : history.stream().mapToDouble(p -> p).average().orElse(0.02) * 0.5;
-        return Math.abs(obi) > avgObi;
+
+        double obi = Math.abs(obs.obi());
+        return obi > OBI_THRESHOLD;
     }
     public void stop() {
         if (scheduler != null) scheduler.shutdownNow();
@@ -1013,7 +1010,7 @@ public class SignalSender {
             if (candles.get(i).isBull()) bull++;
             if (candles.get(i).isBear()) bear++;
         }
-        return bull >= 2 || bear >= 2;
+        return (bull >= 2 && bear == 0) || (bear >= 2 && bull == 0);
     }
 
     private void sendRaw(String msg) {
@@ -1096,32 +1093,35 @@ public class SignalSender {
     private void runAnalysisCycle() {
         Set<String> pairs = getBinanceSymbolsFutures(); // или getTopSymbols(TOP_N)
         List<CompletableFuture<Void>> futures = new ArrayList<>();
-
         for (String pair : pairs) {
-            futures.add(
-                    CompletableFuture.allOf(
-                            fetchKlinesAsync(pair, "5m", KLINES_LIMIT),
-                            fetchKlinesAsync(pair, "15m", KLINES_LIMIT),
-                            fetchKlinesAsync(pair, "1h", KLINES_LIMIT)
-                    ).thenAccept(v -> {
+
+            CompletableFuture<List<Candle>> f5 =
+                    fetchKlinesAsync(pair, "5m", KLINES_LIMIT);
+            CompletableFuture<List<Candle>> f15 =
+                    fetchKlinesAsync(pair, "15m", KLINES_LIMIT);
+            CompletableFuture<List<Candle>> f1h =
+                    fetchKlinesAsync(pair, "1h", KLINES_LIMIT);
+
+            CompletableFuture<Void> f =
+                    CompletableFuture.allOf(f5, f15, f1h).thenAccept(v -> {
                         try {
-                            List<Candle> c5m = fetchKlinesAsync(pair, "5m", KLINES_LIMIT).join();
-                            List<Candle> c15m = fetchKlinesAsync(pair, "15m", KLINES_LIMIT).join();
-                            List<Candle> c1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT).join();
+                            List<Candle> c5m = f5.join();
+                            List<Candle> c15m = f15.join();
+                            List<Candle> c1h = f1h.join();
 
                             Optional<Signal> optSignal = evaluate(pair, c5m, c15m, c1h);
-                            if (optSignal.isPresent()) {
-                                Signal s = optSignal.get();
+                            optSignal.ifPresent(s -> {
                                 if (!isCooldown(pair, s.direction)) {
                                     sendRaw(s.toTelegramMessage());
                                     markSignalSent(pair, s.direction, s.confidence);
                                 }
-                            }
+                            });
                         } catch (Exception e) {
                             System.out.println("[runAnalysisCycle] " + pair + " error: " + e.getMessage());
                         }
-                    })
-            );
+                    });
+
+            futures.add(f);
         }
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
     }
@@ -1156,9 +1156,19 @@ public class SignalSender {
         Set<String> symbols = getTopSymbolsSet(TOP_N);
         for (String pair : symbols) {
             try {
-                List<Candle> c5m = fetchKlinesAsync(pair, "5m", KLINES_LIMIT).join();
-                List<Candle> c15m = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3).join();
-                List<Candle> c1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12).join();
+                CompletableFuture<List<Candle>> f5 =
+                        fetchKlinesAsync(pair, "5m", KLINES_LIMIT);
+                CompletableFuture<List<Candle>> f15 =
+                        fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
+                CompletableFuture<List<Candle>> f1h =
+                        fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
+
+                CompletableFuture.allOf(f5, f15, f1h).join();
+
+                List<Candle> c5m = f5.join();
+                List<Candle> c15m = f15.join();
+                List<Candle> c1h = f1h.join();
+
 
                 Optional<Signal> s = evaluate(pair, c5m, c15m, c1h);
                 s.ifPresent(sig -> sendSignalIfAllowed(
