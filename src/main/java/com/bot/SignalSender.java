@@ -570,9 +570,17 @@ public class SignalSender {
                                      List<Candle> c5m,
                                      List<Candle> c15m,
                                      List<Candle> c1h) {
+        Optional<SignalSender.Signal> optSignal = evaluate(pair, c5m, c15m, c1h);
+
+        // ✅ вот тут вызываем отправку
+        optSignal.ifPresent(signal -> sendSignalIfAllowed(
+                pair,
+                signal.direction,
+                signal.confidence,
+                signal.price
+        ));
         System.out.println("[EVAL START] " + pair);
         final String p = pair;
-        Optional<Candle> predictedCandle = predictNextCandleFromPrices(new ArrayList<>(tickPriceDeque.get(pair)));
         try {
             // ===== БАЗОВЫЕ ПРОВЕРКИ =====
             if (c5m == null || c5m.size() < 20) return Optional.empty();
@@ -984,64 +992,6 @@ public class SignalSender {
         return new MicroTrendResult(speed, accel, avg);
     }
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
-    private void evaluateTick(String pair, double price, double qty, long ts, MicroTrendResult tr, OrderbookSnapshot obs, Candle lastCandle) {
-        double obi = obs.obi();
-        double microSpeed = tr.speed;
-        double microAccel = tr.accel;
-
-        // --- confidence ---
-        double conf = Math.min(1.0, Math.abs(microSpeed) * 0.4 + Math.abs(obi) * 0.35 + Math.abs(microAccel) * 0.15);
-
-        // --- свечной диапазон ---
-        double lastCandleRangePct = (lastCandle.high - lastCandle.low) / (lastCandle.close + 1e-12);
-        double vol = lastCandleRangePct; // или среднее за несколько свечей
-
-        // --- пороги ---
-        double tickThresholdSpeed = Math.max(0.001, vol * 0.2);
-        double tickThresholdAccel = Math.max(0.0005, vol * 0.1);
-        double tickThresholdObi = Math.max(0.01, Math.abs(obi) * 0.8);
-
-        boolean strongTickTrigger =
-                Math.abs(obi) > tickThresholdObi ||
-                        Math.abs(microSpeed) > tickThresholdSpeed ||
-                        Math.abs(microAccel) > tickThresholdAccel;
-
-        // дополнительные жёсткие пороги
-        strongTickTrigger = strongTickTrigger ||
-                Math.abs(obi) > 0.015 ||
-                Math.abs(microSpeed) > 0.002 ||
-                Math.abs(microAccel) > 0.001;
-
-        double predictedMove = microSpeed * 2 + microAccel * 1.5;
-
-        if (lastCandleRangePct > 0.01) strongTickTrigger = true;
-        if (predictedMove > IMPULSE_PCT) strongTickTrigger = true;
-        if (!strongTickTrigger && Math.abs(microSpeed) > 0.0005) strongTickTrigger = true;
-
-        // --- main logic ---
-        if (strongTickTrigger && conf > 0.05) {
-            String direction = (obi > 0) ? "LONG" : "SHORT";
-            int newDir = direction.equals("LONG") ? 1 : -1;
-
-            Integer prevDir = ideaDirection.get(pair);
-            Double invalidation = ideaInvalidation.get(pair);
-
-            // ослабляем сигнал, если направление меняется, но цена ещё не пробила стоп
-            if (prevDir != null && prevDir != newDir && invalidation != null) {
-                if ((prevDir == 1 && price > invalidation) || (prevDir == -1 && price < invalidation)) {
-                    conf *= 0.6; // сигнал ослаблен
-                }
-            }
-
-            // обновляем направление и стоп
-            ideaDirection.put(pair, newDir);
-            ideaInvalidation.put(
-                    pair,
-                    newDir == 1 ? price - price * 0.003 : price + price * 0.003
-            );
-            sendSignalIfAllowed(pair, direction, conf, price);
-        }
-    }
     private boolean isVolumeStrong(String pair, double lastPrice) {
         OrderbookSnapshot obs = orderbookMap.get(pair);
         if (obs == null) return false;
@@ -1053,7 +1003,6 @@ public class SignalSender {
         }
         return Math.abs(obi) > avgObi;
     }
-    // stop
     public void stop() {
         if (scheduler != null) scheduler.shutdownNow();
         System.out.println("[SignalSender] stopped");
