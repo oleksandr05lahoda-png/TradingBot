@@ -1052,7 +1052,7 @@ public class SignalSender {
 
         // сохраняем направление идеи
         ideaDirection.put(pair, direction.equals("LONG") ? 1 : -1);
-
+        sendRaw(s.toTelegramMessage());
         System.out.println("[SEND SIGNAL] " + pair + " " + direction + " conf=" + confidence + " price=" + price);
     }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
