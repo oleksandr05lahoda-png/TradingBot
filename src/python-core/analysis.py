@@ -25,9 +25,7 @@ def fetch_klines(symbol, interval="5m", limit=200):
         "open_time","open","high","low","close","volume","close_time",
         "quote_asset_volume","trades","taker_buy_base","taker_buy_quote","ignore"
     ])
-    df = df.astype({
-        "open":"float","high":"float","low":"float","close":"float","volume":"float"
-    })
+    df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
     return df
 
 # ===== Индикаторы =====
@@ -44,49 +42,74 @@ def RSI(series, period=14):
     rsi = 100 - (100/(1+rs))
     return rsi
 
-# ===== Анализ одного символа =====
-def analyze_symbol(symbol):
+def ATR(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr
+
+# ===== Анализ символа и прогноз =====
+def analyze_symbol(symbol, forecast_bars=5):
     try:
         df5 = fetch_klines(symbol, "5m", 200)
         df15 = fetch_klines(symbol, "15m", 200)
         if len(df5) < 60 or len(df15) < 60:
             return None
 
-        # EMA
-        ema9_5 = EMA(df5['close'], 9).iloc[-1]
-        ema21_5 = EMA(df5['close'], 21).iloc[-1]
+        # ===== EMA =====
+        ema9_5 = EMA(df5['close'], 9)
+        ema21_5 = EMA(df5['close'], 21)
         ema9_15 = EMA(df15['close'], 9).iloc[-1]
         ema21_15 = EMA(df15['close'], 21).iloc[-1]
 
         # EMA наклон
-        ema_slope = EMA(df5['close'], 9).iloc[-1] - EMA(df5['close'], 9).iloc[-4]
+        ema_slope = ema9_5.diff(3).iloc[-1]
 
         # RSI
         rsi = RSI(df5['close'], 14).iloc[-1]
-         candidate_long = ema9_5 > ema21_5
-         candidate_short = ema9_5 < ema21_5
 
-        signal = None
-        confidence = 0.0
+        # ATR
+        atr = ATR(df5, 14).iloc[-1]
+        current_range = df5['high'].iloc[-1] - df5['low'].iloc[-1]
 
-        if candidate_long:
-              signal = "LONG"
-              confidence = 0.55
-          elif candidate_short:
-              signal = "SHORT"
-              confidence = 0.55
-
-        if signal is None:
+        # ===== Фильтры: флет, сильный импульс, неопределенность RSI =====
+        if 40 < rsi < 60:  # рынок не решил
             return None
+        if current_range > 1.5 * atr:  # сильный импульс - не входить
+            return None
+        trend_15m = "UP" if ema9_15 > ema21_15 else "DOWN"
 
-        return {
-            "symbol": symbol,
-            "signal": signal,
-            "confidence": round(confidence, 2),
-            "price": df5['close'].iloc[-1],
-            "rsi": int(rsi),
-            "timestamp": datetime.utcnow().isoformat()
-        }
+        # ===== Контртрендовые входы =====
+        signals = []
+        for i in range(forecast_bars):
+            sig = None
+            conf = 0.55
+
+            # Лонг: истощение вниз, готов разворот
+            if rsi < 35 and ema9_5.iloc[-1] < ema21_5.iloc[-1] and ema_slope > 0 and trend_15m == "UP":
+                sig = "LONG"
+                conf += 0.05
+            # Шорт: истощение вверх, готов разворот
+            elif rsi > 65 and ema9_5.iloc[-1] > ema21_5.iloc[-1] and ema_slope < 0 and trend_15m == "DOWN":
+                sig = "SHORT"
+                conf += 0.05
+
+            if sig:
+                signals.append({
+                    "symbol": symbol,
+                    "signal": sig,
+                    "confidence": round(min(conf, 0.65), 2),
+                    "price": df5['close'].iloc[-1],
+                    "rsi": int(rsi),
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "forecast_bar": i+1
+                })
+
+        if not signals:
+            return None
+        return signals
 
     except Exception as e:
         print(f"Ошибка анализа {symbol}: {e}")
@@ -95,20 +118,20 @@ def analyze_symbol(symbol):
 # ===== Основной анализ =====
 def main():
     symbols = get_top_symbols(50)
-    results = []
+    all_signals = []
     for s in symbols:
         res = analyze_symbol(s)
         if res:
-            results.append(res)
+            all_signals.extend(res)
 
     # сортируем по confidence
-    results = sorted(results, key=lambda x: x['confidence'], reverse=True)
+    all_signals = sorted(all_signals, key=lambda x: x['confidence'], reverse=True)
 
     # сохраняем в JSON
     with open("signals.json", "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(all_signals, f, indent=2)
 
-    print(f"{len(results)} сигналов записано в signals.json")
+    print(f"{len(all_signals)} сигналов записано в signals.json")
 
 if __name__ == "__main__":
     main()
