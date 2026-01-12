@@ -13,8 +13,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class SignalSender {
-    // ===== Anti-spam / cooldown =====
-    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
     private final Map<String, Integer> ideaDirection = new ConcurrentHashMap<>();
     private final Map<String, Double> ideaInvalidation = new ConcurrentHashMap<>();
     private final TelegramBotSender bot;
@@ -617,13 +615,6 @@ public class SignalSender {
         if (structureAligned) conf += 0.1;
         conf = Math.max(0.0, Math.min(1.0, conf));
 
-        // ===== Сглаживание по истории последних сигналов =====
-        List<Signal> history = signalHistory.getOrDefault(pair, new ArrayList<>());
-        if (!history.isEmpty()) {
-            double avgConf = history.stream().mapToDouble(s -> s.confidence).average().orElse(conf);
-            conf = (conf + avgConf) / 2.0; // усредняем текущую и историческую
-        }
-
         return Math.max(0.0, Math.min(1.0, conf));
     }
     public Optional<Signal> evaluate(String pair,
@@ -712,18 +703,23 @@ public class SignalSender {
             if (earlyTrigger) confidence += 0.05;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
+            double rawConfidence = confidence;
+            double calibratedConfidence =
+                    com.bot.ConfidenceCalibrator.calibrate(rawConfidence);
 
             // ================= ATR break check =================
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
-            if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
+            if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) rawConfidence -= 0.05;
+            rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
+            calibratedConfidence = com.bot.ConfidenceCalibrator.calibrate(rawConfidence);
 
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            // ================= Determine direction =================
-            boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
-            boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
+            boolean canGoLong = rawScore > 0 && calibratedConfidence >= MIN_CONF;
+            boolean canGoShort = rawScore < 0 && calibratedConfidence >= MIN_CONF;
+
             String direction = rawScore >= 0 ? "LONG" : "SHORT";
 
             int dirVal = direction.equals("LONG") ? 1 : -1;
@@ -734,12 +730,14 @@ public class SignalSender {
             ideaInvalidation.put(p, invalidation);
             String futureDir = predictNext5CandlesDirection(c5m);
             if (!futureDir.equals(direction)) {
-                confidence *= 0.93; // мягкое снижение
+                rawConfidence *= 0.93;
             } else {
-                confidence *= 1.03; // лёгкий бонус
+                rawConfidence *= 1.03;
             }
-            if (confidence < MIN_CONF) {
-                System.out.println("[DROP CONF] " + p + " conf=" + confidence);
+            rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
+            calibratedConfidence = com.bot.ConfidenceCalibrator.calibrate(rawConfidence);
+            if (calibratedConfidence < MIN_CONF) {
+                System.out.println("[DROP CONF] " + p + " prob=" + calibratedConfidence);
                 return Optional.empty();
             }
 
@@ -748,7 +746,7 @@ public class SignalSender {
             Signal s = new Signal(
                     p.replace("USDT", ""),
                     direction,
-                    confidence,
+                    calibratedConfidence,
                     lastPrice,
                     rsi(closes5m, 14),
                     rawScore,
@@ -770,7 +768,6 @@ public class SignalSender {
             System.out.println("[evaluate] " + p + " error: " + e.getMessage());
             return Optional.empty();
         }
-
     }
     private double lastSwingLow(List<Candle> candles) {
         int lookback = Math.min(20, candles.size());
@@ -1188,7 +1185,6 @@ public class SignalSender {
             }
         }
     }
-
     static class TradeSignal {
         String symbol;
         String side;      // LONG / SHORT
