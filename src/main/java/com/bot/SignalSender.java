@@ -603,11 +603,8 @@ public class SignalSender {
             String pair // добавляем pair для истории
     ) {
         double conf = 0.0;
-
-        // ===== Базовая оценка =====
-        conf += Math.min(1.0, Math.abs(rawScore));
-
-        if (mtfConfirm != 0) conf += 0.1;
+        conf += Math.min(1.0, Math.abs(rawScore)) * 0.6;
+        conf += mtfConfirm * 0.04;
         if (volOk) conf += 0.1;
         if (atrOk) conf += 0.1;
         if (impulse) conf += 0.05;
@@ -639,8 +636,8 @@ public class SignalSender {
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rawScore = strategyEMANorm(closes5m) * 0.38 +
                     strategyMACDNorm(closes5m) * 0.28 +
-                    strategyRSINorm(closes5m) * 0.19 +
-                    strategyMomentumNorm(closes5m) * 0.15;
+                    strategyRSINorm(closes5m) * 0.22 +
+                    strategyMomentumNorm(closes5m) * 0.18;
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
@@ -648,11 +645,7 @@ public class SignalSender {
             }
 
             boolean earlyTrigger = earlyTrendTrigger(c5m);
-            if (earlyTrigger && Math.abs(rawScore) > 0.25) {
-                mtfConfirm = Integer.signum((int) Math.signum(rawScore));
-            }
 
-            // ================= Last candle analysis =================
             Candle lastCandle = c5m.get(c5m.size() - 1);
             double lastPrice = lastCandle.close;
             double atrVal = atr(c5m, 14);
@@ -680,8 +673,7 @@ public class SignalSender {
             boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) ||
                     (rawScore < 0 && lastPrice < vwap15);
 
-            // ================= Confidence calculation =================
-            double confidence = composeConfidence(
+            double rawConfidence = composeConfidence(
                     rawScore,
                     mtfConfirm,
                     !weakCandle,
@@ -696,14 +688,14 @@ public class SignalSender {
 
             // ================= Additional bonuses =================
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore)))
-                confidence += 0.08;
-            if (rawScore * mt.speed > 0) confidence += 0.12;
-            if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
-            if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
-            if (earlyTrigger) confidence += 0.05;
+                rawConfidence += 0.08;
+            if (rawScore * mt.speed > 0) rawConfidence += 0.12;
+            if (earlyTrigger && Math.abs(rawScore) > 0.2) rawConfidence += 0.05;
+            if (isVolumeStrong(p, lastPrice)) rawConfidence += 0.10;
+            if (earlyTrigger) rawConfidence += 0.05;
 
-            confidence = Math.max(0.0, Math.min(1.0, confidence));
-            double rawConfidence = confidence;
+            rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
+            double confidence = rawConfidence;
             double calibratedConfidence =
                     com.bot.ConfidenceCalibrator.calibrate(rawConfidence);
 
@@ -712,7 +704,6 @@ public class SignalSender {
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
             if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) rawConfidence -= 0.05;
             rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
-            calibratedConfidence = com.bot.ConfidenceCalibrator.calibrate(rawConfidence);
 
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
@@ -735,7 +726,6 @@ public class SignalSender {
                 rawConfidence *= 1.03;
             }
             rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
-            calibratedConfidence = com.bot.ConfidenceCalibrator.calibrate(rawConfidence);
             if (calibratedConfidence < MIN_CONF) {
                 System.out.println("[DROP CONF] " + p + " prob=" + calibratedConfidence);
                 return Optional.empty();
