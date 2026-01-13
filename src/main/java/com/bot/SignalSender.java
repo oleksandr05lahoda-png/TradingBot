@@ -849,7 +849,6 @@ public class SignalSender {
             s.stop = price + risk;
             s.take = price - risk * 2.5;
         }
-
         s.confidence = confidence;
         s.reason = reason;
         return s;
