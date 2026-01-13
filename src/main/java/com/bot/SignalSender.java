@@ -642,35 +642,37 @@ public class SignalSender {
             int dir1h = emaDirection(c1h, 20, 50, 0.001);
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
+            List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
+
+            double rawScore =
+                    strategyEMANorm(closes5m) * 0.38 +
+                            strategyMACDNorm(closes5m) * 0.28 +
+                            strategyRSINorm(closes5m) * 0.19 +
+                            strategyMomentumNorm(closes5m) * 0.15;
+
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
-            if (mtfConfirm == 0) {
+            if (mtfConfirm == 0 && Math.abs(rawScore) > 0.22) {
                 System.out.println("[FILTER] drop signal, no multi-TF agreement: " + pair);
                 return Optional.empty();
             }
-            List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rsi14 = rsi(closes5m, 14);
             boolean rsiOverheated = rsi14 >= 60;
             boolean rsiOversold = rsi14 <= 40;
-            double rawScore = strategyEMANorm(closes5m) * 0.38 +
-                    strategyMACDNorm(closes5m) * 0.28 +
-                    strategyRSINorm(closes5m) * 0.19 +
-                    strategyMomentumNorm(closes5m) * 0.15;
-
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             int dirVotes = 0;
             if (Math.abs(rawScore) > 0.18) {
                 dirVotes += rawScore > 0 ? 1 : -1;
             }
+            double rawScoreAdj = rawScore;
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
-                rawScore += 0.05 * Math.signum(rawScore); // бонус microtrend
+                rawScoreAdj += 0.05 * Math.signum(rawScore);
             }
-
             boolean earlyTrigger = earlyTrendTrigger(c5m);
             if (earlyTrigger && Math.abs(rawScore) > 0.25) {
-                mtfConfirm = Integer.signum((int) Math.signum(rawScore));
+                if ((rawScore > 0 && rsi14 < 60) || (rawScore < 0 && rsi14 > 40)) {
+                    mtfConfirm = (int) Math.signum(rawScore);
+                }
             }
-
-            // ================= Last candle analysis =================
             Candle lastCandle = c5m.get(c5m.size() - 1);
             double lastPrice = lastCandle.close;
             double atrVal = atr(c5m, 14);
@@ -687,15 +689,21 @@ public class SignalSender {
             boolean impulse =
                     Math.abs(mt.speed) > adaptiveImpulse &&
                             Math.signum(mt.speed) == Math.signum(rawScore);
-            boolean overextension =
+            boolean overLong =
                     Math.abs(mt.speed) > adaptiveImpulse * 1.8 &&
-                            rsiOverheated;
-            if (Math.abs(mt.speed) > adaptiveImpulse) {
-                dirVotes += mt.speed > 0 ? 2 : -2;
+                            rsiOverheated &&
+                            rawScore > 0;
+
+            boolean overShort =
+                    Math.abs(mt.speed) > adaptiveImpulse * 1.8 &&
+                            rsiOversold &&
+                            rawScore < 0;
+
+            if (overLong) {
+                dirVotes -= 2; // ломаем перегретый LONG
             }
-            // Контртренд после перегретого импульса
-            if (overextension) {
-                dirVotes -= 2; // ломаем ложный LONG
+            if (overShort) {
+                dirVotes -= 2; // усиливаем SHORT после выноса
             }
             int struct5 = marketStructure(c5m);
             int struct15 = marketStructure(c15m);
@@ -728,7 +736,7 @@ public class SignalSender {
             // ================= Additional bonuses =================
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore)))
                 confidence += 0.08;
-            if (rawScore * mt.speed > 0) confidence += 0.12;
+            if (rawScore * mt.speed > 0) confidence += 0.06;
             if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
             if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
             if (earlyTrigger) confidence += 0.05;
@@ -748,19 +756,17 @@ public class SignalSender {
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
             String direction;
-
-            if (dirVotes >= 2 && !rsiOverheated) {
+            boolean allowLong  = rsi14 > 45;
+            boolean allowShort = rsi14 < 55;
+            if (dirVotes >= 2 && allowLong) {
                 direction = "LONG";
-            } else if (dirVotes <= -2 && !rsiOversold) {
+            } else if (dirVotes <= -2 && allowShort) {
                 direction = "SHORT";
             } else {
-                if (Math.abs(mt.speed) > adaptiveImpulse * 0.8) { // меньше порог
-                    if (mt.speed > 0) direction = "LONG";
-                    else direction = "SHORT";
-                } else if (dirVotes >= 2 && !rsiOverheated) {
-                    direction = "LONG";
-                } else if (dirVotes <= -2 && !rsiOversold) {
-                    direction = "SHORT";
+                if (Math.abs(mt.speed) > adaptiveImpulse * 0.8
+                        && Math.signum(mt.speed) == Math.signum(rawScore)
+                        && Math.abs(rawScore) > 0.15) {
+                    direction = mt.speed > 0 ? "LONG" : "SHORT";
                 } else {
                     return Optional.empty();
                 }
@@ -773,7 +779,7 @@ public class SignalSender {
             ideaInvalidation.put(p, invalidation);
             String futureDir = predictNext5CandlesDirection(c5m);
             if (!futureDir.equals(direction)) {
-                confidence *= 0.93; // мягкое снижение
+                if (direction.equals("LONG")) confidence *= 0.93;
             } else {
                 confidence *= 1.03; // лёгкий бонус
             }
@@ -781,7 +787,6 @@ public class SignalSender {
                 System.out.println("[DROP CONF] " + p + " conf=" + confidence);
                 return Optional.empty();
             }
-
             System.out.println("[SIGNAL OK] " + p + " " + direction + " conf=" + confidence + " raw=" + rawScore);
 
             Signal s = new Signal(
@@ -1092,8 +1097,13 @@ public class SignalSender {
 
 
         List<String> reasons = new ArrayList<>();
-        Long lastTime = dirMap.get(s.direction);
-        if (lastTime != null && (now - lastTime) < COOLDOWN_MS) reasons.add("COOLDOWN");
+        String lastDir = dirMap.keySet().stream()
+                .max(Comparator.comparing(dirMap::get))
+                .orElse(null);
+
+        if (lastDir != null && lastDir.equals(s.direction) && (now - dirMap.get(lastDir) < COOLDOWN_MS)) {
+            reasons.add("COOLDOWN_SAME_DIRECTION");
+        }
         if (!reasons.isEmpty()) {
             System.out.println("[SKIP] " + pair + " → " + s.direction + " reasons: " + String.join(", ", reasons));
             return;
