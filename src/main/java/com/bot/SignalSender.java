@@ -958,7 +958,6 @@ public class SignalSender {
             final String symbol = pair.toLowerCase();
             String aggUrl = String.format("wss://fstream.binance.com/ws/%s@aggTrade", symbol);
             System.out.println("[WS] Connecting to " + aggUrl);
-
             java.net.http.WebSocket ws = java.net.http.HttpClient.newHttpClient()
                     .newWebSocketBuilder()
                     .buildAsync(URI.create(aggUrl), new java.net.http.WebSocket.Listener() {
@@ -1000,14 +999,12 @@ public class SignalSender {
             double diff = arr.get(i) - arr.get(i - 1);
             speed = alpha * diff + (1 - alpha) * speed;
         }
-
         double accel = 0;
         if (arr.size() >= 3) {
             double lastDiff = arr.get(arr.size() - 1) - arr.get(arr.size() - 2);
             double prevDiff = arr.get(arr.size() - 2) - arr.get(arr.size() - 3);
             accel = alpha * (lastDiff - prevDiff) + (1 - alpha) * accel;
         }
-
         double avg = arr.stream().mapToDouble(Double::doubleValue).average().orElse(arr.get(arr.size() - 1));
         return new MicroTrendResult(speed, accel, avg);
     }
@@ -1023,7 +1020,6 @@ public class SignalSender {
         if (scheduler != null) scheduler.shutdownNow();
         System.out.println("[SignalSender] stopped");
     }
-
     // ========================= Helper: top symbols via CoinGecko =========================
     public List<String> getTopSymbols(int limit) {
         try {
@@ -1044,7 +1040,6 @@ public class SignalSender {
             return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT");
         }
     }
-
     // ========================= Misc helpers =========================
     private boolean earlyTrendTrigger(List<Candle> candles) {
         if (candles == null || candles.size() < 3) return false;
@@ -1055,7 +1050,6 @@ public class SignalSender {
         }
         return (bull >= 2 && bear <= 1) || (bear >= 2 && bull <= 1);
     }
-
     private void sendRaw(String msg) {
         try {
             bot.sendSignal(msg);
