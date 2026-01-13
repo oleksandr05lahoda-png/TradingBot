@@ -565,9 +565,10 @@ public class SignalSender {
 
     private double strategyRSINorm(List<Double> closes) {
         double r = rsi(closes, 14);
-        // 50 -> нейтрально, >50 -> LONG, <50 -> SHORT
-        double score = (r - 50) / 50.0;  // теперь результат в [-1,1]
-        return Math.max(-1.0, Math.min(1.0, score));
+        if (r > 45 && r < 65) return 0.3;
+        if (r >= 65) return 0.1;
+        if (r <= 35) return -0.1;
+        return 0.0;
     }
 
     private double strategyMACDNorm(List<Double> closes) {
@@ -606,8 +607,7 @@ public class SignalSender {
     ) {
         double conf = 0.0;
 
-        // ===== Базовая оценка =====
-        conf += Math.min(1.0, Math.abs(rawScore));
+        conf += Math.min(0.6, Math.abs(rawScore) * 0.7);
 
         if (mtfConfirm != 0) conf += 0.1;
         if (volOk) conf += 0.1;
@@ -643,13 +643,21 @@ public class SignalSender {
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
+            if (dir1h == 0 || dir15m == 0) {
+                System.out.println("[DROP] " + p + " no HTF trend");
+                return Optional.empty();
+            }
 
-            // ================= Raw score from indicators =================
+            if (dir1h * dir15m < 0) {
+                System.out.println("[DROP] " + p + " HTF conflict");
+                return Optional.empty();
+            }
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
-            double rawScore = strategyEMANorm(closes5m) * 0.38 +
-                    strategyMACDNorm(closes5m) * 0.28 +
-                    strategyRSINorm(closes5m) * 0.19 +
-                    strategyMomentumNorm(closes5m) * 0.15;
+            double rawScore =
+                    strategyEMANorm(closes5m) * 0.55 +
+                            strategyMACDNorm(closes5m) * 0.25 +
+                            strategyMomentumNorm(closes5m) * 0.15 +
+                            strategyRSINorm(closes5m) * 0.05;
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
@@ -721,10 +729,13 @@ public class SignalSender {
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            // ================= Determine direction =================
-            boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
-            boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
-            String direction = rawScore >= 0 ? "LONG" : "SHORT";
+            String direction;
+            if (mtfConfirm > 0) direction = "LONG";
+            else if (mtfConfirm < 0) direction = "SHORT";
+            else return Optional.empty();
+
+            boolean canGoLong = direction.equals("LONG") && confidence >= MIN_CONF;
+            boolean canGoShort = direction.equals("SHORT") && confidence >= MIN_CONF;
 
             int dirVal = direction.equals("LONG") ? 1 : -1;
             ideaDirection.put(p, dirVal);
@@ -732,12 +743,6 @@ public class SignalSender {
                     ? lastSwingLow(c5m) - atrVal * 0.3
                     : lastSwingHigh(c5m) + atrVal * 0.3;
             ideaInvalidation.put(p, invalidation);
-            String futureDir = predictNext5CandlesDirection(c5m);
-            if (!futureDir.equals(direction)) {
-                confidence *= 0.93; // мягкое снижение
-            } else {
-                confidence *= 1.03; // лёгкий бонус
-            }
             if (confidence < MIN_CONF) {
                 System.out.println("[DROP CONF] " + p + " conf=" + confidence);
                 return Optional.empty();
