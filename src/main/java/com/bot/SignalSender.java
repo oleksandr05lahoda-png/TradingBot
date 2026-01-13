@@ -988,6 +988,7 @@ public class SignalSender {
             System.out.println("[WS connect] error for " + pair + " : " + e.getMessage());
         }
     }
+
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         if (dq == null || dq.size() < 3) return new MicroTrendResult(0, 0, 0);
         List<Double> arr = new ArrayList<>(dq);
