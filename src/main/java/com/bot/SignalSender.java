@@ -672,9 +672,8 @@ public class SignalSender {
                 dirVotes += rawScore > 0 ? 1 : -1;
             }
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
-                rawScore += 0.05 * Math.signum(rawScore); // бонус microtrend
+                rawScore += 0.08 * Math.signum(rawScore);
             }
-
             boolean earlyTrigger = earlyTrendTrigger(c5m);
             if (earlyTrigger && Math.abs(rawScore) > 0.25) {
                 mtfConfirm = Integer.signum((int) Math.signum(rawScore));
@@ -740,8 +739,8 @@ public class SignalSender {
                 confidence += 0.08;
             if (rawScore * mt.speed > 0) confidence += 0.12;
             if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
-            if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
-            if (earlyTrigger) confidence += 0.05;
+            if (isVolumeStrong(p, lastPrice)) confidence += 0.12;
+            if (earlyTrigger) confidence += 0.08;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
             if (Math.signum(mt.speed) != Math.signum(rawScore)
@@ -759,16 +758,16 @@ public class SignalSender {
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
             String direction;
 
-            if (dirVotes >= 2 && !rsiOverheated) {
+            if (dirVotes >= 2) {
                 direction = "LONG";
-            } else if (dirVotes <= -2 && !rsiOversold) {
+                if (rsiOverheated) confidence *= 0.90; // лёгкое снижение
+            } else if (dirVotes <= -2) {
                 direction = "SHORT";
+                if (rsiOversold) confidence *= 0.90;
             } else {
-                // импульсный вход учитываем ATR и RSI, не отбрасываем сигнал
+                // импульсный вход
                 if (Math.abs(mt.speed) > adaptiveImpulse * 1.2) {
-                    if (mt.speed > 0 && !rsiOverheated) direction = "LONG";
-                    else if (mt.speed < 0 && !rsiOversold) direction = "SHORT";
-                    else direction = "NONE"; // только если противоречие
+                    direction = mt.speed > 0 ? "LONG" : "SHORT";
                 } else {
                     direction = "NONE";
                 }
@@ -776,9 +775,9 @@ public class SignalSender {
             if (direction.equals("NONE")) return Optional.empty();
             String futureDir = predictNext5CandlesDirection(c5m);
             if (futureDir.equals(direction)) {
-                confidence *= 1.05; // бонус если совпадает
+                confidence *= 1.08;
             } else {
-                confidence *= 0.95; // лёгкий штраф
+                confidence *= 0.95;
             }
             int dirVal = direction.equals("LONG") ? 1 : -1;
 
