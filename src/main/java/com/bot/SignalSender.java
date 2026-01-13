@@ -186,25 +186,17 @@ public class SignalSender {
         for (int i = 1; i <= n; i++) forecast.add(lastClose + slope*i);
         return forecast;
     }
-    public String predictNext5CandlesDirection(List<Candle> candles) {
-        if (candles == null || candles.size() < 5) return "NONE";
-
-        int N = Math.min(10, candles.size());
-        List<Double> closes = candles.subList(candles.size() - N, candles.size())
-                .stream().map(c -> c.close).toList();
-
-        double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-        for (int i = 0; i < closes.size(); i++) {
-            sumX += i;
-            sumY += closes.get(i);
-            sumXY += i * closes.get(i);
-            sumXX += i * i;
+    public String predictNext5CandlesDirection(List<Candle> c5m) {
+        List<Double> forecast = predictNextNCandles(c5m, 5); // прогноз закрытий 5 свечей
+        int longCount = 0;
+        int shortCount = 0;
+        double lastClose = c5m.get(c5m.size() - 1).close;
+        for (double f : forecast) {
+            if (f > lastClose) longCount++;
+            else shortCount++;
+            lastClose = f;
         }
-        double slope = (N * sumXY - sumX * sumY) / (N * sumXX - sumX * sumX + 1e-12);
-        double avgClose = closes.stream().mapToDouble(Double::doubleValue).average().orElse(closes.get(N - 1));
-
-        double slopePct = slope / (avgClose + 1e-12);
-        return slopePct > 0 ? "LONG" : "SHORT";
+        return longCount > shortCount ? "LONG" : "SHORT";
     }
     public CompletableFuture<List<Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
@@ -651,20 +643,18 @@ public class SignalSender {
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
-            // не отбрасываем полностью, просто даём слабый бонус
             if (mtfConfirm == 0) {
-                System.out.println("[FILTER] no multi-TF agreement, but continue: " + pair);
-                mtfConfirm = 0; // оставляем 0, без штрафа
+                System.out.println("[FILTER] drop signal, no multi-TF agreement: " + pair);
+                return Optional.empty();
             }
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rsi14 = rsi(closes5m, 14);
             boolean rsiOverheated = rsi14 >= 60;
             boolean rsiOversold = rsi14 <= 40;
-            double rawScore = strategyEMANorm(closes5m) * 0.30 +
-                    strategyMACDNorm(closes5m) * 0.20 +
-                    strategyRSINorm(closes5m) * 0.25 +
-                    strategyMomentumNorm(closes5m) * 0.25;
-
+            double rawScore = strategyEMANorm(closes5m) * 0.38 +
+                    strategyMACDNorm(closes5m) * 0.28 +
+                    strategyRSINorm(closes5m) * 0.19 +
+                    strategyMomentumNorm(closes5m) * 0.15;
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             int dirVotes = 0;
@@ -672,8 +662,9 @@ public class SignalSender {
                 dirVotes += rawScore > 0 ? 1 : -1;
             }
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
-                rawScore += 0.08 * Math.signum(rawScore);
+                rawScore += 0.05 * Math.signum(rawScore); // бонус microtrend
             }
+
             boolean earlyTrigger = earlyTrendTrigger(c5m);
             if (earlyTrigger && Math.abs(rawScore) > 0.25) {
                 mtfConfirm = Integer.signum((int) Math.signum(rawScore));
@@ -739,8 +730,8 @@ public class SignalSender {
                 confidence += 0.08;
             if (rawScore * mt.speed > 0) confidence += 0.12;
             if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
-            if (isVolumeStrong(p, lastPrice)) confidence += 0.12;
-            if (earlyTrigger) confidence += 0.08;
+            if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
+            if (earlyTrigger) confidence += 0.05;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
             if (Math.signum(mt.speed) != Math.signum(rawScore)
@@ -758,42 +749,31 @@ public class SignalSender {
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
             String direction;
 
-            if (dirVotes >= 2) {
+            if (dirVotes >= 2 && !rsiOverheated) {
                 direction = "LONG";
-                if (rsiOverheated) confidence *= 0.90; // лёгкое снижение
-            } else if (dirVotes <= -2) {
+            } else if (dirVotes <= -2 && !rsiOversold) {
                 direction = "SHORT";
-                if (rsiOversold) confidence *= 0.90;
             } else {
-                // импульсный вход
+                // импульсный вход только если RSI НЕ против
                 if (Math.abs(mt.speed) > adaptiveImpulse * 1.2) {
-                    direction = mt.speed > 0 ? "LONG" : "SHORT";
+                    if (mt.speed > 0 && !rsiOverheated) {
+                        direction = "LONG";
+                    } else if (mt.speed < 0 && !rsiOversold) {
+                        direction = "SHORT";
+                    } else {
+                        return Optional.empty();
+                    }
                 } else {
-                    direction = "NONE";
+                    return Optional.empty();
                 }
             }
-            if (direction.equals("NONE")) return Optional.empty();
-            String futureDir = predictNext5CandlesDirection(c5m);
-            if (futureDir.equals(direction)) {
-                confidence *= 1.08;
-            } else {
-                confidence *= 0.95;
-            }
             int dirVal = direction.equals("LONG") ? 1 : -1;
-
-            if (!futureDir.equals(direction)) {
-                dirVotes -= dirVal;
-                confidence *= 0.95; // мягкое снижение уверенности
-            } else {
-                dirVotes += dirVal / 2;
-                confidence *= 1.03;
-            }
-            direction = futureDir;
             ideaDirection.put(p, dirVal);
             double invalidation = dirVal == 1
                     ? lastSwingLow(c5m) - atrVal * 0.3
                     : lastSwingHigh(c5m) + atrVal * 0.3;
             ideaInvalidation.put(p, invalidation);
+            String futureDir = predictNext5CandlesDirection(c5m);
             if (!futureDir.equals(direction)) {
                 confidence *= 0.93; // мягкое снижение
             } else {
