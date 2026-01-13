@@ -754,15 +754,13 @@ public class SignalSender {
             } else if (dirVotes <= -2 && !rsiOversold) {
                 direction = "SHORT";
             } else {
-                // импульсный вход только если RSI НЕ против
-                if (Math.abs(mt.speed) > adaptiveImpulse * 1.2) {
-                    if (mt.speed > 0 && !rsiOverheated) {
-                        direction = "LONG";
-                    } else if (mt.speed < 0 && !rsiOversold) {
-                        direction = "SHORT";
-                    } else {
-                        return Optional.empty();
-                    }
+                if (Math.abs(mt.speed) > adaptiveImpulse * 0.8) { // меньше порог
+                    if (mt.speed > 0) direction = "LONG";
+                    else direction = "SHORT";
+                } else if (dirVotes >= 2 && !rsiOverheated) {
+                    direction = "LONG";
+                } else if (dirVotes <= -2 && !rsiOversold) {
+                    direction = "SHORT";
                 } else {
                     return Optional.empty();
                 }
