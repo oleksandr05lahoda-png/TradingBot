@@ -122,20 +122,6 @@ public class SignalSender {
         }
     }
 
-    public double testSignalAccuracy(List<Candle> candles, int horizon) {
-        int correct = 0, total = 0;
-        for (int i = horizon; i < candles.size(); i++) {
-            Candle entry = candles.get(i - horizon);
-            Candle exit = candles.get(i);
-            if ((exit.close > entry.close && predictNext5CandlesDirection(candles.subList(0, i - 1)).equals("LONG")) ||
-                    (exit.close < entry.close && predictNext5CandlesDirection(candles.subList(0, i - 1)).equals("SHORT"))) {
-                correct++;
-            }
-            total++;
-        }
-        return total == 0 ? 0 : ((double) correct / total);
-    }
-
     public Set<String> getBinanceSymbolsFutures() {
         try {
             HttpRequest req = HttpRequest.newBuilder()
@@ -182,12 +168,11 @@ public class SignalSender {
 
         return total == 0 ? 0.0 : ((double) success / total);
     }
+    // Прогноз цены на следующие n свечей (линейная регрессия по закрытиям)
     public List<Double> predictNextNCandles(List<Candle> candles, int n) {
-        if (candles == null || candles.size() < 3) return Collections.emptyList();
+        if(candles == null || candles.size() < 3) return Collections.emptyList(); // защита от пустых данных
         int size = candles.size();
         List<Double> closes = candles.stream().map(c -> c.close).toList();
-
-        // линейная регрессия y = a*x + b
         double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
         for (int i = 0; i < size; i++) {
             sumX += i;
@@ -195,13 +180,10 @@ public class SignalSender {
             sumXY += i * closes.get(i);
             sumXX += i * i;
         }
-        double a = (size * sumXY - sumX * sumY) / (size * sumXX - sumX * sumX + 1e-12);
-        double b = (sumY - a * sumX) / size;
-
+        double slope = (size*sumXY - sumX*sumY) / (size*sumXX - sumX*sumX + 1e-12);
+        double lastClose = closes.get(size-1);
         List<Double> forecast = new ArrayList<>();
-        for (int i = size; i < size + n; i++) {
-            forecast.add(a * i + b);
-        }
+        for (int i = 1; i <= n; i++) forecast.add(lastClose + slope*i);
         return forecast;
     }
     public String predictNext5CandlesDirection(List<Candle> c5m) {
@@ -967,7 +949,7 @@ public class SignalSender {
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         if (dq == null || dq.size() < 3) return new MicroTrendResult(0, 0, 0);
         List<Double> arr = new ArrayList<>(dq);
-        int n = Math.min(arr.size(), 30);
+        int n = Math.min(arr.size(), 10);
 
         double alpha = 0.5;
         double speed = 0;
