@@ -614,10 +614,9 @@ public class SignalSender {
         if (atrOk) conf += 0.1;
         if (impulse) conf += 0.05;
         if (vwapAligned) conf += 0.05;
-        if (structureAligned) conf += 0.1;
-        conf = Math.max(0.0, Math.min(1.0, conf));
-
-        // ===== Сглаживание по истории последних сигналов =====
+        if (liquiditySweep && Math.abs(rawScore) > 0.2) {
+            conf -= 0.25;
+        }
         List<Signal> history = signalHistory.getOrDefault(pair, new ArrayList<>());
         if (!history.isEmpty()) {
             double avgConf = history.stream().mapToDouble(s -> s.confidence).average().orElse(conf);
@@ -667,6 +666,9 @@ public class SignalSender {
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
                 rawScoreAdj += 0.05 * Math.signum(rawScore);
             }
+            if (rsi14 > 65 && rawScore > 0) rawScoreAdj *= 0.5;
+            if (rsi14 < 35 && rawScore < 0) rawScoreAdj *= 0.5;
+            rawScore = rawScoreAdj;
             boolean earlyTrigger = earlyTrendTrigger(c5m);
             if (earlyTrigger && Math.abs(rawScore) > 0.25) {
                 if ((rawScore > 0 && rsi14 < 60) || (rawScore < 0 && rsi14 > 40)) {
@@ -700,10 +702,10 @@ public class SignalSender {
                             rawScore < 0;
 
             if (overLong) {
-                dirVotes -= 2; // ломаем перегретый LONG
+                dirVotes -= 3; // ломаем перегретый LONG
             }
             if (overShort) {
-                dirVotes -= 2; // усиливаем SHORT после выноса
+                dirVotes += 3; // усиливаем SHORT после выноса
             }
             int struct5 = marketStructure(c5m);
             int struct15 = marketStructure(c15m);
@@ -756,8 +758,8 @@ public class SignalSender {
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
             String direction;
-            boolean allowLong  = rsi14 > 45;
-            boolean allowShort = rsi14 < 55;
+            boolean allowLong  = rsi14 < 60;
+            boolean allowShort = rsi14 > 40;
             if (dirVotes >= 2 && allowLong) {
                 direction = "LONG";
             } else if (dirVotes <= -2 && allowShort) {
