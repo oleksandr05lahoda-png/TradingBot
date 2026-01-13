@@ -1071,7 +1071,6 @@ public class SignalSender {
                                      int mtfConfirm,
                                      double rsi14,
                                      List<Double> closes5m) {
-
         Signal s = new Signal(
                 pair.replace("USDT", ""),
                 direction,
