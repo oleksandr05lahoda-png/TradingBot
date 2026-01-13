@@ -654,6 +654,8 @@ public class SignalSender {
                     strategyMomentumNorm(closes5m) * 0.15;
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
+            int dirVotes = 0;
+            dirVotes += rawScore > 0 ? 1 : -1;
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
                 rawScore += 0.05 * Math.signum(rawScore); // бонус microtrend
             }
@@ -680,8 +682,14 @@ public class SignalSender {
             boolean impulse =
                     Math.abs(mt.speed) > adaptiveImpulse &&
                             Math.signum(mt.speed) == Math.signum(rawScore);
+            if (Math.abs(mt.speed) > adaptiveImpulse) {
+                dirVotes += mt.speed > 0 ? 2 : -2;
+            }
             int struct5 = marketStructure(c5m);
             int struct15 = marketStructure(c15m);
+            dirVotes += struct5 * 2;
+            dirVotes += struct15;
+            dirVotes += mtfConfirm * 2;
 
             boolean structureAligned =
                     struct5 != 0 &&
@@ -714,20 +722,32 @@ public class SignalSender {
             if (earlyTrigger) confidence += 0.05;
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
+            if (Math.signum(mt.speed) != Math.signum(rawScore)
+                    && Math.abs(mt.speed) > adaptiveImpulse) {
+                confidence -= 0.18;
+            }
 
-            // ================= ATR break check =================
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
+            if (atrBreakLong) dirVotes += 2;
+            if (atrBreakShort) dirVotes -= 2;
             if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
 
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
-
-            // ================= Determine direction =================
-            boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
-            boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
-            String direction = rawScore >= 0 ? "LONG" : "SHORT";
-
+            String direction;
+            if (dirVotes >= 2) {
+                direction = "LONG";
+            } else if (dirVotes <= -2) {
+                direction = "SHORT";
+            } else {
+                // ⚠️ если сильный импульс — всё равно даём сигнал
+                if (Math.abs(mt.speed) > adaptiveImpulse * 1.2) {
+                    direction = mt.speed > 0 ? "LONG" : "SHORT";
+                } else {
+                    return Optional.empty();
+                }
+            }
             int dirVal = direction.equals("LONG") ? 1 : -1;
             ideaDirection.put(p, dirVal);
             double invalidation = dirVal == 1
@@ -1148,7 +1168,6 @@ public class SignalSender {
                         sig.rsi,
                         c5m.stream().map(c -> c.close).toList()
                 ));
-
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
                 e.printStackTrace();
