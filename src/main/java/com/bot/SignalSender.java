@@ -651,9 +651,10 @@ public class SignalSender {
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
+            // не отбрасываем полностью, просто даём слабый бонус
             if (mtfConfirm == 0) {
-                System.out.println("[FILTER] drop signal, no multi-TF agreement: " + pair);
-                return Optional.empty();
+                System.out.println("[FILTER] no multi-TF agreement, but continue: " + pair);
+                mtfConfirm = 0; // оставляем 0, без штрафа
             }
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rsi14 = rsi(closes5m, 14);
@@ -774,6 +775,11 @@ public class SignalSender {
             }
             if (direction.equals("NONE")) return Optional.empty();
             String futureDir = predictNext5CandlesDirection(c5m);
+            if (futureDir.equals(direction)) {
+                confidence *= 1.05; // бонус если совпадает
+            } else {
+                confidence *= 0.95; // лёгкий штраф
+            }
             int dirVal = direction.equals("LONG") ? 1 : -1;
 
             if (!futureDir.equals(direction)) {
