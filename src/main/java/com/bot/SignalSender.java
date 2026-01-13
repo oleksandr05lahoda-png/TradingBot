@@ -643,8 +643,10 @@ public class SignalSender {
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
-
-            // ================= Raw score from indicators =================
+            if (mtfConfirm == 0) {
+                System.out.println("[FILTER] drop signal, no multi-TF agreement: " + pair);
+                return Optional.empty();
+            }
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rawScore = strategyEMANorm(closes5m) * 0.38 +
                     strategyMACDNorm(closes5m) * 0.28 +
