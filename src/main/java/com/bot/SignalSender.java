@@ -69,7 +69,7 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 100);
-        this.MIN_CONF = 0.65;
+        this.MIN_CONF = 0.55;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
         this.KLINES_LIMIT = envInt("KLINES", 240);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
@@ -588,8 +588,8 @@ public class SignalSender {
         score += dir1h * 3;
         score += dir15m * 2;
         score += dir5m * 1;
-        if (score > 2) return 1;
-        if (score < -2) return -1;
+        if (score > 1) return 1;   // раньше было >2
+        if (score < -1) return -1; // раньше было <-2
         return 0;
     }
     private double composeConfidence(
@@ -1012,7 +1012,7 @@ public class SignalSender {
             if (candles.get(i).isBull()) bull++;
             if (candles.get(i).isBear()) bear++;
         }
-        return (bull >= 2 && bear == 0) || (bear >= 2 && bull == 0);
+        return (bull >= 2 && bear <= 1) || (bear >= 2 && bull <= 1);
     }
 
     private void sendRaw(String msg) {
