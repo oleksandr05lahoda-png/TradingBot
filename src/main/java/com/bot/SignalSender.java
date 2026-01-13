@@ -71,7 +71,7 @@ public class SignalSender {
         this.TOP_N = envInt("TOP_N", 100);
         this.MIN_CONF = 0.55;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
-        this.KLINES_LIMIT = envInt("KLINES", 240);
+        this.KLINES_LIMIT = envInt("KLINES", 100);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
 
         this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
@@ -186,17 +186,25 @@ public class SignalSender {
         for (int i = 1; i <= n; i++) forecast.add(lastClose + slope*i);
         return forecast;
     }
-    public String predictNext5CandlesDirection(List<Candle> c5m) {
-        List<Double> forecast = predictNextNCandles(c5m, 5); // прогноз закрытий 5 свечей
-        int longCount = 0;
-        int shortCount = 0;
-        double lastClose = c5m.get(c5m.size() - 1).close;
-        for (double f : forecast) {
-            if (f > lastClose) longCount++;
-            else shortCount++;
-            lastClose = f;
+    public String predictNext5CandlesDirection(List<Candle> candles) {
+        if (candles == null || candles.size() < 5) return "NONE";
+
+        int N = Math.min(10, candles.size());
+        List<Double> closes = candles.subList(candles.size() - N, candles.size())
+                .stream().map(c -> c.close).toList();
+
+        double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+        for (int i = 0; i < closes.size(); i++) {
+            sumX += i;
+            sumY += closes.get(i);
+            sumXY += i * closes.get(i);
+            sumXX += i * i;
         }
-        return longCount > shortCount ? "LONG" : "SHORT";
+        double slope = (N * sumXY - sumX * sumY) / (N * sumXX - sumX * sumX + 1e-12);
+        double avgClose = closes.stream().mapToDouble(Double::doubleValue).average().orElse(closes.get(N - 1));
+
+        double slopePct = slope / (avgClose + 1e-12);
+        return slopePct > 0 ? "LONG" : "SHORT";
     }
     public CompletableFuture<List<Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
@@ -651,10 +659,11 @@ public class SignalSender {
             double rsi14 = rsi(closes5m, 14);
             boolean rsiOverheated = rsi14 >= 60;
             boolean rsiOversold = rsi14 <= 40;
-            double rawScore = strategyEMANorm(closes5m) * 0.38 +
-                    strategyMACDNorm(closes5m) * 0.28 +
-                    strategyRSINorm(closes5m) * 0.19 +
-                    strategyMomentumNorm(closes5m) * 0.15;
+            double rawScore = strategyEMANorm(closes5m) * 0.30 +
+                    strategyMACDNorm(closes5m) * 0.20 +
+                    strategyRSINorm(closes5m) * 0.25 +
+                    strategyMomentumNorm(closes5m) * 0.25;
+
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             int dirVotes = 0;
@@ -754,26 +763,32 @@ public class SignalSender {
             } else if (dirVotes <= -2 && !rsiOversold) {
                 direction = "SHORT";
             } else {
-                // импульсный вход только если RSI НЕ против
+                // импульсный вход учитываем ATR и RSI, не отбрасываем сигнал
                 if (Math.abs(mt.speed) > adaptiveImpulse * 1.2) {
-                    if (mt.speed > 0 && !rsiOverheated) {
-                        direction = "LONG";
-                    } else if (mt.speed < 0 && !rsiOversold) {
-                        direction = "SHORT";
-                    } else {
-                        return Optional.empty();
-                    }
+                    if (mt.speed > 0 && !rsiOverheated) direction = "LONG";
+                    else if (mt.speed < 0 && !rsiOversold) direction = "SHORT";
+                    else direction = "NONE"; // только если противоречие
                 } else {
-                    return Optional.empty();
+                    direction = "NONE";
                 }
             }
+            if (direction.equals("NONE")) return Optional.empty();
+            String futureDir = predictNext5CandlesDirection(c5m);
             int dirVal = direction.equals("LONG") ? 1 : -1;
+
+            if (!futureDir.equals(direction)) {
+                dirVotes -= dirVal;
+                confidence *= 0.95; // мягкое снижение уверенности
+            } else {
+                dirVotes += dirVal / 2;
+                confidence *= 1.03;
+            }
+            direction = futureDir;
             ideaDirection.put(p, dirVal);
             double invalidation = dirVal == 1
                     ? lastSwingLow(c5m) - atrVal * 0.3
                     : lastSwingHigh(c5m) + atrVal * 0.3;
             ideaInvalidation.put(p, invalidation);
-            String futureDir = predictNext5CandlesDirection(c5m);
             if (!futureDir.equals(direction)) {
                 confidence *= 0.93; // мягкое снижение
             } else {
