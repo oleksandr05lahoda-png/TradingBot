@@ -648,6 +648,9 @@ public class SignalSender {
                 return Optional.empty();
             }
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
+            double rsi14 = rsi(closes5m, 14);
+            boolean rsiOverheated = rsi14 >= 60;
+            boolean rsiOversold = rsi14 <= 40;
             double rawScore = strategyEMANorm(closes5m) * 0.38 +
                     strategyMACDNorm(closes5m) * 0.28 +
                     strategyRSINorm(closes5m) * 0.19 +
@@ -655,7 +658,9 @@ public class SignalSender {
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             int dirVotes = 0;
-            dirVotes += rawScore > 0 ? 1 : -1;
+            if (Math.abs(rawScore) > 0.18) {
+                dirVotes += rawScore > 0 ? 1 : -1;
+            }
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
                 rawScore += 0.05 * Math.signum(rawScore); // бонус microtrend
             }
@@ -682,8 +687,15 @@ public class SignalSender {
             boolean impulse =
                     Math.abs(mt.speed) > adaptiveImpulse &&
                             Math.signum(mt.speed) == Math.signum(rawScore);
+            boolean overextension =
+                    Math.abs(mt.speed) > adaptiveImpulse * 1.8 &&
+                            rsiOverheated;
             if (Math.abs(mt.speed) > adaptiveImpulse) {
                 dirVotes += mt.speed > 0 ? 2 : -2;
+            }
+            // Контртренд после перегретого импульса
+            if (overextension) {
+                dirVotes -= 2; // ломаем ложный LONG
             }
             int struct5 = marketStructure(c5m);
             int struct15 = marketStructure(c15m);
@@ -736,14 +748,21 @@ public class SignalSender {
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
             String direction;
-            if (dirVotes >= 2) {
+
+            if (dirVotes >= 2 && !rsiOverheated) {
                 direction = "LONG";
-            } else if (dirVotes <= -2) {
+            } else if (dirVotes <= -2 && !rsiOversold) {
                 direction = "SHORT";
             } else {
-                // ⚠️ если сильный импульс — всё равно даём сигнал
+                // импульсный вход только если RSI НЕ против
                 if (Math.abs(mt.speed) > adaptiveImpulse * 1.2) {
-                    direction = mt.speed > 0 ? "LONG" : "SHORT";
+                    if (mt.speed > 0 && !rsiOverheated) {
+                        direction = "LONG";
+                    } else if (mt.speed < 0 && !rsiOversold) {
+                        direction = "SHORT";
+                    } else {
+                        return Optional.empty();
+                    }
                 } else {
                     return Optional.empty();
                 }
