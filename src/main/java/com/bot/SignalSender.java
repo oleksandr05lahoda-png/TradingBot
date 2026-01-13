@@ -187,16 +187,16 @@ public class SignalSender {
         return forecast;
     }
     public String predictNext5CandlesDirection(List<Candle> c5m) {
-        List<Double> forecast = predictNextNCandles(c5m, 5);
-        if(forecast.isEmpty()) return "NONE"; // защита от пустого прогноза
-
-        double firstClose = c5m.get(c5m.size() - 1).close;
-        double lastForecast = forecast.get(forecast.size() - 1);
-        double changePct = (lastForecast - firstClose) / (firstClose + 1e-12);
-
-        if(changePct > 0.003) return "LONG";    // рост >0.3%
-        if(changePct < -0.003) return "SHORT";  // падение >0.3%
-        return "NONE";                          // малое изменение
+        List<Double> forecast = predictNextNCandles(c5m, 5); // прогноз закрытий 5 свечей
+        int longCount = 0;
+        int shortCount = 0;
+        double lastClose = c5m.get(c5m.size() - 1).close;
+        for (double f : forecast) {
+            if (f > lastClose) longCount++;
+            else shortCount++;
+            lastClose = f;
+        }
+        return longCount > shortCount ? "LONG" : "SHORT";
     }
     public CompletableFuture<List<Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
@@ -219,12 +219,12 @@ public class SignalSender {
                         for (int i = 0; i < arr.length(); i++) {
                             JSONArray k = arr.getJSONArray(i);
                             long openTime = k.getLong(0);
-                            double open = k.getDouble(1);
-                            double high = k.getDouble(2);
-                            double low = k.getDouble(3);
-                            double close = k.getDouble(4);
-                            double vol = k.getDouble(5);
-                            double qvol = k.getDouble(7);
+                            double open = Double.parseDouble(k.getString(1));
+                            double high = Double.parseDouble(k.getString(2));
+                            double low = Double.parseDouble(k.getString(3));
+                            double close = Double.parseDouble(k.getString(4));
+                            double vol = Double.parseDouble(k.getString(5));
+                            double qvol = Double.parseDouble(k.getString(7));
                             long closeTime = k.getLong(6);
                             list.add(new Candle(openTime, open, high, low, close, vol, qvol, closeTime));
                         }
@@ -565,10 +565,9 @@ public class SignalSender {
 
     private double strategyRSINorm(List<Double> closes) {
         double r = rsi(closes, 14);
-        if (r > 45 && r < 65) return 0.3;
-        if (r >= 65) return 0.1;
-        if (r <= 35) return -0.1;
-        return 0.0;
+        // 50 -> нейтрально, >50 -> LONG, <50 -> SHORT
+        double score = (r - 50) / 50.0;  // теперь результат в [-1,1]
+        return Math.max(-1.0, Math.min(1.0, score));
     }
 
     private double strategyMACDNorm(List<Double> closes) {
@@ -607,7 +606,8 @@ public class SignalSender {
     ) {
         double conf = 0.0;
 
-        conf += Math.min(0.6, Math.abs(rawScore) * 0.7);
+        // ===== Базовая оценка =====
+        conf += Math.min(1.0, Math.abs(rawScore));
 
         if (mtfConfirm != 0) conf += 0.1;
         if (volOk) conf += 0.1;
@@ -643,21 +643,13 @@ public class SignalSender {
             int dir15m = emaDirection(c15m, 9, 21, 0.001);
             int dir5m = emaDirection(c5m, 9, 21, 0.001);
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
-            if (dir1h == 0 || dir15m == 0) {
-                System.out.println("[DROP] " + p + " no HTF trend");
-                return Optional.empty();
-            }
 
-            if (dir1h * dir15m < 0) {
-                System.out.println("[DROP] " + p + " HTF conflict");
-                return Optional.empty();
-            }
+            // ================= Raw score from indicators =================
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
-            double rawScore =
-                    strategyEMANorm(closes5m) * 0.55 +
-                            strategyMACDNorm(closes5m) * 0.25 +
-                            strategyMomentumNorm(closes5m) * 0.15 +
-                            strategyRSINorm(closes5m) * 0.05;
+            double rawScore = strategyEMANorm(closes5m) * 0.38 +
+                    strategyMACDNorm(closes5m) * 0.28 +
+                    strategyRSINorm(closes5m) * 0.19 +
+                    strategyMomentumNorm(closes5m) * 0.15;
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
@@ -729,13 +721,10 @@ public class SignalSender {
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            String direction;
-            if (mtfConfirm > 0) direction = "LONG";
-            else if (mtfConfirm < 0) direction = "SHORT";
-            else return Optional.empty();
-
-            boolean canGoLong = direction.equals("LONG") && confidence >= MIN_CONF;
-            boolean canGoShort = direction.equals("SHORT") && confidence >= MIN_CONF;
+            // ================= Determine direction =================
+            boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
+            boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
+            String direction = rawScore >= 0 ? "LONG" : "SHORT";
 
             int dirVal = direction.equals("LONG") ? 1 : -1;
             ideaDirection.put(p, dirVal);
@@ -743,6 +732,12 @@ public class SignalSender {
                     ? lastSwingLow(c5m) - atrVal * 0.3
                     : lastSwingHigh(c5m) + atrVal * 0.3;
             ideaInvalidation.put(p, invalidation);
+            String futureDir = predictNext5CandlesDirection(c5m);
+            if (!futureDir.equals(direction)) {
+                confidence *= 0.93; // мягкое снижение
+            } else {
+                confidence *= 1.03; // лёгкий бонус
+            }
             if (confidence < MIN_CONF) {
                 System.out.println("[DROP CONF] " + p + " conf=" + confidence);
                 return Optional.empty();
@@ -954,11 +949,11 @@ public class SignalSender {
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         if (dq == null || dq.size() < 3) return new MicroTrendResult(0, 0, 0);
         List<Double> arr = new ArrayList<>(dq);
-        int n = Math.min(arr.size() - 1, 10); // безопасный размер
+        int n = Math.min(arr.size(), 10);
 
         double alpha = 0.5;
         double speed = 0;
-        for (int i = arr.size() - n; i < arr.size(); i++) { // исправлено начало цикла
+        for (int i = arr.size() - n + 1; i < arr.size(); i++) {
             double diff = arr.get(i) - arr.get(i - 1);
             speed = alpha * diff + (1 - alpha) * speed;
         }
@@ -978,18 +973,8 @@ public class SignalSender {
         OrderbookSnapshot obs = orderbookMap.get(pair);
         if (obs == null) return false;
 
-        double obi = obs.obi();
-        double threshold = OBI_THRESHOLD;
-
-        // проверяем направление с последним движением цены
-        Double last = lastTickPrice.get(pair);
-        if(last != null) {
-            if(obi > threshold && last > lastPrice) return true;
-            if(obi < -threshold && last < lastPrice) return true;
-            return false;
-        }
-
-        return Math.abs(obi) > threshold;
+        double obi = Math.abs(obs.obi());
+        return obi > OBI_THRESHOLD;
     }
     public void stop() {
         if (scheduler != null) scheduler.shutdownNow();
