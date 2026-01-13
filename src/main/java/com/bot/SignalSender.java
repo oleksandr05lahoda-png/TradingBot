@@ -13,6 +13,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class SignalSender {
+    // ===== Anti-spam / cooldown =====
+    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
     private final Map<String, Integer> ideaDirection = new ConcurrentHashMap<>();
     private final Map<String, Double> ideaInvalidation = new ConcurrentHashMap<>();
     private final TelegramBotSender bot;
@@ -603,14 +605,24 @@ public class SignalSender {
             String pair // добавляем pair для истории
     ) {
         double conf = 0.0;
-        conf += Math.min(1.0, Math.abs(rawScore)) * 0.6;
-        conf += mtfConfirm * 0.04;
+
+        // ===== Базовая оценка =====
+        conf += Math.min(1.0, Math.abs(rawScore));
+
+        if (mtfConfirm != 0) conf += 0.1;
         if (volOk) conf += 0.1;
         if (atrOk) conf += 0.1;
         if (impulse) conf += 0.05;
         if (vwapAligned) conf += 0.05;
         if (structureAligned) conf += 0.1;
         conf = Math.max(0.0, Math.min(1.0, conf));
+
+        // ===== Сглаживание по истории последних сигналов =====
+        List<Signal> history = signalHistory.getOrDefault(pair, new ArrayList<>());
+        if (!history.isEmpty()) {
+            double avgConf = history.stream().mapToDouble(s -> s.confidence).average().orElse(conf);
+            conf = (conf + avgConf) / 2.0; // усредняем текущую и историческую
+        }
 
         return Math.max(0.0, Math.min(1.0, conf));
     }
@@ -636,8 +648,8 @@ public class SignalSender {
             List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
             double rawScore = strategyEMANorm(closes5m) * 0.38 +
                     strategyMACDNorm(closes5m) * 0.28 +
-                    strategyRSINorm(closes5m) * 0.22 +
-                    strategyMomentumNorm(closes5m) * 0.18;
+                    strategyRSINorm(closes5m) * 0.19 +
+                    strategyMomentumNorm(closes5m) * 0.15;
 
             MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
             if (Math.signum(rawScore) == Math.signum(mt.speed)) {
@@ -645,7 +657,11 @@ public class SignalSender {
             }
 
             boolean earlyTrigger = earlyTrendTrigger(c5m);
+            if (earlyTrigger && Math.abs(rawScore) > 0.25) {
+                mtfConfirm = Integer.signum((int) Math.signum(rawScore));
+            }
 
+            // ================= Last candle analysis =================
             Candle lastCandle = c5m.get(c5m.size() - 1);
             double lastPrice = lastCandle.close;
             double atrVal = atr(c5m, 14);
@@ -673,7 +689,8 @@ public class SignalSender {
             boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) ||
                     (rawScore < 0 && lastPrice < vwap15);
 
-            double rawConfidence = composeConfidence(
+            // ================= Confidence calculation =================
+            double confidence = composeConfidence(
                     rawScore,
                     mtfConfirm,
                     !weakCandle,
@@ -688,29 +705,25 @@ public class SignalSender {
 
             // ================= Additional bonuses =================
             if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore)))
-                rawConfidence += 0.08;
-            if (rawScore * mt.speed > 0) rawConfidence += 0.12;
-            if (earlyTrigger && Math.abs(rawScore) > 0.2) rawConfidence += 0.05;
-            if (isVolumeStrong(p, lastPrice)) rawConfidence += 0.10;
-            if (earlyTrigger) rawConfidence += 0.05;
+                confidence += 0.08;
+            if (rawScore * mt.speed > 0) confidence += 0.12;
+            if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
+            if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
+            if (earlyTrigger) confidence += 0.05;
 
-            rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
-            double confidence = rawConfidence;
-            double calibratedConfidence =
-                    com.bot.ConfidenceCalibrator.calibrate(rawConfidence);
+            confidence = Math.max(0.0, Math.min(1.0, confidence));
 
             // ================= ATR break check =================
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
-            if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) rawConfidence -= 0.05;
-            rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
+            if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
 
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
 
-            boolean canGoLong = rawScore > 0 && calibratedConfidence >= MIN_CONF;
-            boolean canGoShort = rawScore < 0 && calibratedConfidence >= MIN_CONF;
-
+            // ================= Determine direction =================
+            boolean canGoLong = rawScore > 0 && confidence >= MIN_CONF;
+            boolean canGoShort = rawScore < 0 && confidence >= MIN_CONF;
             String direction = rawScore >= 0 ? "LONG" : "SHORT";
 
             int dirVal = direction.equals("LONG") ? 1 : -1;
@@ -721,13 +734,12 @@ public class SignalSender {
             ideaInvalidation.put(p, invalidation);
             String futureDir = predictNext5CandlesDirection(c5m);
             if (!futureDir.equals(direction)) {
-                rawConfidence *= 0.93;
+                confidence *= 0.93; // мягкое снижение
             } else {
-                rawConfidence *= 1.03;
+                confidence *= 1.03; // лёгкий бонус
             }
-            rawConfidence = Math.max(0.0, Math.min(1.0, rawConfidence));
-            if (calibratedConfidence < MIN_CONF) {
-                System.out.println("[DROP CONF] " + p + " prob=" + calibratedConfidence);
+            if (confidence < MIN_CONF) {
+                System.out.println("[DROP CONF] " + p + " conf=" + confidence);
                 return Optional.empty();
             }
 
@@ -736,7 +748,7 @@ public class SignalSender {
             Signal s = new Signal(
                     p.replace("USDT", ""),
                     direction,
-                    calibratedConfidence,
+                    confidence,
                     lastPrice,
                     rsi(closes5m, 14),
                     rawScore,
@@ -758,6 +770,7 @@ public class SignalSender {
             System.out.println("[evaluate] " + p + " error: " + e.getMessage());
             return Optional.empty();
         }
+
     }
     private double lastSwingLow(List<Candle> candles) {
         int lookback = Math.min(20, candles.size());
@@ -1077,41 +1090,6 @@ public class SignalSender {
             return Collections.emptyList();
         }
     }
-    private void runAnalysisCycle() {
-        Set<String> pairs = getBinanceSymbolsFutures(); // или getTopSymbols(TOP_N)
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        for (String pair : pairs) {
-
-            CompletableFuture<List<Candle>> f5 =
-                    fetchKlinesAsync(pair, "5m", KLINES_LIMIT);
-            CompletableFuture<List<Candle>> f15 =
-                    fetchKlinesAsync(pair, "15m", KLINES_LIMIT);
-            CompletableFuture<List<Candle>> f1h =
-                    fetchKlinesAsync(pair, "1h", KLINES_LIMIT);
-
-            CompletableFuture<Void> f =
-                    CompletableFuture.allOf(f5, f15, f1h).thenAccept(v -> {
-                        try {
-                            List<Candle> c5m = f5.join();
-                            List<Candle> c15m = f15.join();
-                            List<Candle> c1h = f1h.join();
-
-                            Optional<Signal> optSignal = evaluate(pair, c5m, c15m, c1h);
-                            optSignal.ifPresent(s -> {
-                                if (!isCooldown(pair, s.direction)) {
-                                    sendRaw(s.toTelegramMessage());
-                                    markSignalSent(pair, s.direction, s.confidence);
-                                }
-                            });
-                        } catch (Exception e) {
-                            System.out.println("[runAnalysisCycle] " + pair + " error: " + e.getMessage());
-                        }
-                    });
-
-            futures.add(f);
-        }
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-    }
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
 
@@ -1175,6 +1153,7 @@ public class SignalSender {
             }
         }
     }
+
     static class TradeSignal {
         String symbol;
         String side;      // LONG / SHORT
