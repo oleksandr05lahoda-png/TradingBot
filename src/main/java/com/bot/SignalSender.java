@@ -1153,7 +1153,6 @@ public class SignalSender {
             }
         }
     }
-
     static class TradeSignal {
         String symbol;
         String side;      // LONG / SHORT
