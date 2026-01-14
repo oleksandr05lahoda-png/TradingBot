@@ -5,8 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/bot/DirectionalBiasAnalyzer.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -232,7 +232,13 @@
       <workItem from="1768329900296" duration="1351000" />
       <workItem from="1768333102159" duration="966000" />
       <workItem from="1768335284060" duration="4000" />
-      <workItem from="1768338257152" duration="2276000" />
+      <workItem from="1768338257152" duration="3521000" />
+      <workItem from="1768345419838" duration="2418000" />
+      <workItem from="1768384230038" duration="6198000" />
+      <workItem from="1768413023549" duration="2136000" />
+      <workItem from="1768415241433" duration="8000" />
+      <workItem from="1768415267290" duration="1917000" />
+      <workItem from="1768427486727" duration="2318000" />
     </task>
     <servers />
   </component>

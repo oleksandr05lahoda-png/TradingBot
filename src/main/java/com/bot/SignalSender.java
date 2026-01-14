@@ -55,8 +55,7 @@ public class SignalSender {
     private final Map<String, Long> lastTickTime = new ConcurrentHashMap<>();
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
-
-    // daily request tracking / rate limiting
+    private final DirectionalBiasAnalyzer biasAnalyzer = new DirectionalBiasAnalyzer();
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private long dailyResetTs = System.currentTimeMillis();
 
