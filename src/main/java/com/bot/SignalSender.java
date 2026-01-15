@@ -639,13 +639,13 @@ public class SignalSender {
             List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
 
             double rawScore =
-                    strategyEMANorm(closes5m) * 0.38 +
-                            strategyMACDNorm(closes5m) * 0.28 +
-                            strategyRSINorm(closes5m) * 0.19 +
-                            strategyMomentumNorm(closes5m) * 0.15;
+                    strategyEMANorm(closes5m) * 0.45 +  // +0.07
+                            strategyMACDNorm(closes5m) * 0.2 +  // -0.08
+                            strategyRSINorm(closes5m) * 0.15 +
+                            strategyMomentumNorm(closes5m) * 0.2; // +0.05
 
             int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
-            if (mtfConfirm == 0 && Math.abs(rawScore) > 0.22) {
+            if (mtfConfirm == 0 && Math.abs(rawScore) > 0.15) {
                 System.out.println("[FILTER] drop signal, no multi-TF agreement: " + pair);
                 return Optional.empty();
             }
@@ -704,8 +704,8 @@ public class SignalSender {
             }
             int struct5 = marketStructure(c5m);
             int struct15 = marketStructure(c15m);
-            dirVotes += struct5 * 2;
-            dirVotes += struct15;
+            dirVotes += struct5 * 3;
+            dirVotes += struct15 * 2;
             dirVotes += mtfConfirm * 2;
 
             boolean structureAligned =
@@ -740,10 +740,9 @@ public class SignalSender {
 
             confidence = Math.max(0.0, Math.min(1.0, confidence));
             if (Math.signum(mt.speed) != Math.signum(rawScore)
-                    && Math.abs(mt.speed) > adaptiveImpulse) {
-                confidence -= 0.18;
+                    && Math.abs(mt.speed) > adaptiveImpulse * 1.5) { // усилили порог
+                confidence -= 0.08; // уменьшили штраф
             }
-
             boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
             boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
             if (atrBreakLong) dirVotes += 2;
@@ -753,8 +752,8 @@ public class SignalSender {
             boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
                     (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
             String direction;
-            boolean allowLong  = rsi14 < 60;
-            boolean allowShort = rsi14 > 40;
+            boolean allowLong  = rsi14 < 70;
+            boolean allowShort = rsi14 > 30;
             if (dirVotes >= 2 && allowLong) {
                 direction = "LONG";
             } else if (dirVotes <= -2 && allowShort) {
