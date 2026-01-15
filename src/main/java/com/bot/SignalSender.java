@@ -6,6 +6,7 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.net.URI;
 import java.net.http.*;
+import com.bot.RiskEngine;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -58,8 +59,7 @@ public class SignalSender {
     private final DirectionalBiasAnalyzer biasAnalyzer = new DirectionalBiasAnalyzer();
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private long dailyResetTs = System.currentTimeMillis();
-
-    // scheduler
+    private final RiskEngine riskEngine = new RiskEngine(10.0); // maxLeverage = 10, можешь изменить
     private ScheduledExecutorService scheduler;
 
     public SignalSender(TelegramBotSender bot) {
@@ -120,7 +120,6 @@ public class SignalSender {
             return def;
         }
     }
-
     public Set<String> getBinanceSymbolsFutures() {
         try {
             HttpRequest req = HttpRequest.newBuilder()
@@ -789,7 +788,6 @@ public class SignalSender {
                 return Optional.empty();
             }
             System.out.println("[SIGNAL OK] " + p + " " + direction + " conf=" + confidence + " raw=" + rawScore);
-
             Signal s = new Signal(
                     p.replace("USDT", ""),
                     direction,
@@ -809,8 +807,19 @@ public class SignalSender {
                     rsi(closes5m, 4)
             );
 
+// ---------------- Вставляем RiskEngine ----------------
+            RiskEngine.TradeSignal tradeSignal = riskEngine.applyRisk(
+                    s.symbol,
+                    s.direction,
+                    s.price,
+                    atr(c5m, 14),
+                    s.confidence,
+                    "AutoRiskEngine"
+            );
+            s.stop = tradeSignal.stop;
+            s.take = tradeSignal.take;
+            System.out.println("[TRADE SIGNAL] " + tradeSignal);
             return Optional.of(s);
-
         } catch (Exception e) {
             System.out.println("[evaluate] " + p + " error: " + e.getMessage());
             return Optional.empty();
@@ -857,24 +866,6 @@ public class SignalSender {
         s.reason = reason;
         return s;
     }
-    // ===== Real confidence =====
-    private double calcConfidence(
-            double emaFast,
-            double emaSlow,
-            double rsi,
-            double atrPct
-    ) {
-        double score = 0.0;
-
-        double trend = Math.abs(emaFast - emaSlow) / emaSlow;
-        score += Math.min(trend * 80, 30);
-
-        if (rsi > 45 && rsi < 65) score += 20;
-        if (atrPct > 0.002 && atrPct < 0.01) score += 20;
-
-        return Math.min(score / 70.0, 1.0);
-    }
-
     public static class Signal {
         public final String symbol;
         public final String direction;
@@ -891,6 +882,8 @@ public class SignalSender {
         public final boolean atrBreakLong;
         public final boolean atrBreakShort;
         public final boolean impulse;
+        public Double stop; // используем Double, чтобы можно было оставить null
+        public Double take;
         public final boolean earlyTrigger;
         public final Instant created = Instant.now();
 
