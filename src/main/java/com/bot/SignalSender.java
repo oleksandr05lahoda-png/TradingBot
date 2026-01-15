@@ -806,8 +806,6 @@ public class SignalSender {
                     rsi(closes5m, 7),
                     rsi(closes5m, 4)
             );
-
-// ---------------- Вставляем RiskEngine ----------------
             RiskEngine.TradeSignal tradeSignal = riskEngine.applyRisk(
                     s.symbol,
                     s.direction,
@@ -816,8 +814,12 @@ public class SignalSender {
                     s.confidence,
                     "AutoRiskEngine"
             );
+
+            tradeSignal = addStopTake(tradeSignal, s.direction, s.price, atr(c5m, 14));
+
             s.stop = tradeSignal.stop;
             s.take = tradeSignal.take;
+
             System.out.println("[TRADE SIGNAL] " + tradeSignal);
             return Optional.of(s);
         } catch (Exception e) {
@@ -839,6 +841,18 @@ public class SignalSender {
         for (int i = candles.size() - lookback; i < candles.size(); i++)
             high = Math.max(high, candles.get(i).high);
         return high;
+    }
+    private RiskEngine.TradeSignal addStopTake(RiskEngine.TradeSignal ts, String direction, double price, double atr) {
+        double risk = atr * 1.2; // базовый риск
+
+        if ("LONG".equals(direction)) {
+            ts.stop = price - risk;
+            ts.take = price + risk * 2.5;
+        } else if ("SHORT".equals(direction)) {
+            ts.stop = price + risk;
+            ts.take = price - risk * 2.5;
+        }
+        return ts;
     }
     private TradeSignal buildTrade(
             String symbol,
@@ -886,7 +900,6 @@ public class SignalSender {
         public Double take;
         public final boolean earlyTrigger;
         public final Instant created = Instant.now();
-
         public Signal(String symbol, String direction, double confidence, double price, double rsi,
                       double rawScore, int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger,
                       boolean atrBreakLong, boolean atrBreakShort, boolean impulse, boolean earlyTrigger,
