@@ -3,13 +3,9 @@ package com.bot;
 public class RiskEngine {
 
     private final double maxLeverage;
-
-    // Конструктор RiskEngine
     public RiskEngine(double maxLeverage) {
         this.maxLeverage = maxLeverage;
     }
-
-    // Внутренний класс TradeSignal
     public static class TradeSignal {
         public String symbol;
         public String side;      // "LONG" или "SHORT"
