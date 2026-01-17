@@ -6,22 +6,20 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.net.URI;
 import java.net.http.*;
-import com.bot.RiskEngine;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
+import com.bot.SignalSender.Candle;
 
 public class SignalSender {
-    // ===== Anti-spam / cooldown =====
-    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
     private final Map<String, Integer> ideaDirection = new ConcurrentHashMap<>();
     private final Map<String, Double> ideaInvalidation = new ConcurrentHashMap<>();
     private final TelegramBotSender bot;
     private final HttpClient http;
+    MarketContext ctx = null; // инициализируем позже в evaluate
 
-    // ---------------- CONFIG (env or defaults) ----------------
     private final int TOP_N;
     private final double MIN_CONF;            // 0..1
     private final int INTERVAL_MIN;           // scheduler interval minutes
@@ -48,9 +46,6 @@ public class SignalSender {
 
     private final Map<String, Long> lastOpenTimeMap = new ConcurrentHashMap<>();   // openTime per symbol processed
     private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
-    private final Map<String, Double> lastPriceMap = new ConcurrentHashMap<>();
-
-    private java.net.http.WebSocket wsTick; // optional single ws used per pair connect model
     private final Map<String, Deque<Double>> tickPriceDeque = new ConcurrentHashMap<>();
     private final Map<String, Double> lastTickPrice = new ConcurrentHashMap<>();
     private final Map<String, Long> lastTickTime = new ConcurrentHashMap<>();
@@ -58,6 +53,10 @@ public class SignalSender {
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
     private final DirectionalBiasAnalyzer biasAnalyzer = new DirectionalBiasAnalyzer();
     private final AtomicLong dailyRequests = new AtomicLong(0);
+    Backtester backtester = new Backtester();
+    PositionSizer sizer = new PositionSizer(0.005); // 0.5%
+    MarketRegime regime = new MarketRegime();
+    private final DecisionEngineV2 decisionEngine = new DecisionEngineV2();
     private long dailyResetTs = System.currentTimeMillis();
     private final RiskEngine riskEngine = new RiskEngine(10.0); // maxLeverage = 10, можешь изменить
     private ScheduledExecutorService scheduler;
@@ -619,202 +618,6 @@ public class SignalSender {
         }
         return Math.max(0.0, Math.min(1.0, conf));
     }
-    public Optional<Signal> evaluate(String pair,
-                                     List<Candle> c5m,
-                                     List<Candle> c15m,
-                                     List<Candle> c1h) {
-        System.out.println("[EVAL START] " + pair);
-        final String p = pair;
-
-        try {
-            if (c5m.size() < 20) return Optional.empty();
-            if (c15m.size() < 20) return Optional.empty();
-            if (c1h.size() < 20) return Optional.empty();
-
-            // ================= Multi-TF EMA confirmation =================
-            int dir1h = emaDirection(c1h, 20, 50, 0.001);
-            int dir15m = emaDirection(c15m, 9, 21, 0.001);
-            int dir5m = emaDirection(c5m, 9, 21, 0.001);
-            List<Double> closes5m = c5m.stream().map(c -> c.close).toList();
-            List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
-
-            double rawScore =
-                    strategyEMANorm(closes5m) * 0.45 +  // +0.07
-                            strategyMACDNorm(closes5m) * 0.2 +  // -0.08
-                            strategyRSINorm(closes5m) * 0.15 +
-                            strategyMomentumNorm(closes5m) * 0.2; // +0.05
-
-            int mtfConfirm = multiTFConfirm(dir1h, dir15m, dir5m);
-            if (mtfConfirm == 0 && Math.abs(rawScore) > 0.15) {
-                System.out.println("[FILTER] drop signal, no multi-TF agreement: " + pair);
-                return Optional.empty();
-            }
-            double rsi14 = rsi(closes5m, 14);
-            boolean rsiOverheated = rsi14 >= 60;
-            boolean rsiOversold = rsi14 <= 40;
-            MicroTrendResult mt = computeMicroTrend(p, tickPriceDeque.getOrDefault(p, new ArrayDeque<>()));
-            int dirVotes = 0;
-            if (Math.abs(rawScore) > 0.18) {
-                dirVotes += rawScore > 0 ? 1 : -1;
-            }
-            double rawScoreAdj = rawScore;
-            if (Math.signum(rawScore) == Math.signum(mt.speed)) {
-                rawScoreAdj += 0.05 * Math.signum(rawScore);
-            }
-            if (rsi14 > 65 && rawScore > 0) rawScoreAdj *= 0.5;
-            if (rsi14 < 35 && rawScore < 0) rawScoreAdj *= 0.5;
-            rawScore = rawScoreAdj;
-            boolean earlyTrigger = earlyTrendTrigger(c5m);
-            if (earlyTrigger && Math.abs(rawScore) > 0.25) {
-                if ((rawScore > 0 && rsi14 < 60) || (rawScore < 0 && rsi14 > 40)) {
-                    mtfConfirm = (int) Math.signum(rawScore);
-                }
-            }
-            Candle lastCandle = c5m.get(c5m.size() - 1);
-            double lastPrice = lastCandle.close;
-            double atrVal = atr(c5m, 14);
-            double atrPct = atrVal / (lastPrice + 1e-12);
-
-            double candleBody = Math.abs(lastCandle.close - lastCandle.open);
-            double candleRange = lastCandle.high - lastCandle.low;
-            boolean weakCandle = candleBody / candleRange < 0.15;
-
-            // ================= Impulse & structure =================
-            double avgBody = c5m.subList(Math.max(0, c5m.size() - 20), c5m.size())
-                    .stream().mapToDouble(c -> Math.abs(c.close - c.open)).average().orElse(0);
-            double adaptiveImpulse = Math.max(IMPULSE_PCT, avgBody * 1.5);
-            boolean impulse =
-                    Math.abs(mt.speed) > adaptiveImpulse &&
-                            Math.signum(mt.speed) == Math.signum(rawScore);
-            boolean overLong =
-                    Math.abs(mt.speed) > adaptiveImpulse * 1.8 &&
-                            rsiOverheated &&
-                            rawScore > 0;
-
-            boolean overShort =
-                    Math.abs(mt.speed) > adaptiveImpulse * 1.8 &&
-                            rsiOversold &&
-                            rawScore < 0;
-
-            if (overLong) {
-                dirVotes -= 3; // ломаем перегретый LONG
-            }
-            if (overShort) {
-                dirVotes += 3; // усиливаем SHORT после выноса
-            }
-            int struct5 = marketStructure(c5m);
-            int struct15 = marketStructure(c15m);
-            dirVotes += struct5 * 3;
-            dirVotes += struct15 * 2;
-            dirVotes += mtfConfirm * 2;
-
-            boolean structureAligned =
-                    struct5 != 0 &&
-                            struct15 != 0 &&
-                            Integer.signum(struct5) == Integer.signum(struct15);
-            double vwap15 = vwap(c15m);
-            boolean vwapAligned = (rawScore > 0 && lastPrice > vwap15) ||
-                    (rawScore < 0 && lastPrice < vwap15);
-
-            // ================= Confidence calculation =================
-            double confidence = composeConfidence(
-                    rawScore,
-                    mtfConfirm,
-                    !weakCandle,
-                    atrPct >= ATR_MIN_PCT,
-                    impulse,
-                    vwapAligned,
-                    structureAligned,
-                    detectBOS(c5m),
-                    detectLiquiditySweep(c5m),
-                    pair // добавляем pair для истории сигналов
-            );
-
-            // ================= Additional bonuses =================
-            if (mtfConfirm != 0 && Integer.signum(mtfConfirm) == Integer.signum((int) Math.signum(rawScore)))
-                confidence += 0.08;
-            if (rawScore * mt.speed > 0) confidence += 0.06;
-            if (earlyTrigger && Math.abs(rawScore) > 0.2) confidence += 0.05;
-            if (isVolumeStrong(p, lastPrice)) confidence += 0.10;
-            if (earlyTrigger) confidence += 0.05;
-
-            confidence = Math.max(0.0, Math.min(1.0, confidence));
-            if (Math.signum(mt.speed) != Math.signum(rawScore)
-                    && Math.abs(mt.speed) > adaptiveImpulse * 1.5) { // усилили порог
-                confidence -= 0.08; // уменьшили штраф
-            }
-            boolean atrBreakLong = lastPrice > lastSwingHigh(c5m) + atrVal * 0.4;
-            boolean atrBreakShort = lastPrice < lastSwingLow(c5m) - atrVal * 0.4;
-            if (atrBreakLong) dirVotes += 2;
-            if (atrBreakShort) dirVotes -= 2;
-            if ((atrBreakLong && rawScore < 0) || (atrBreakShort && rawScore > 0)) confidence -= 0.05;
-
-            boolean strongTrigger = impulse || atrBreakLong || atrBreakShort ||
-                    (isVolumeStrong(p, lastPrice) && Math.abs(mt.speed) > adaptiveImpulse * 0.5);
-            String direction;
-            boolean allowLong  = rsi14 < 70;
-            boolean allowShort = rsi14 > 30;
-            if (dirVotes >= 2 && allowLong) {
-                direction = "LONG";
-            } else if (dirVotes <= -2 && allowShort) {
-                direction = "SHORT";
-            } else {
-                if (Math.abs(mt.speed) > adaptiveImpulse * 0.8
-                        && Math.signum(mt.speed) == Math.signum(rawScore)
-                        && Math.abs(rawScore) > 0.15) {
-                    direction = mt.speed > 0 ? "LONG" : "SHORT";
-                } else {
-                    return Optional.empty();
-                }
-            }
-            int dirVal = direction.equals("LONG") ? 1 : -1;
-            ideaDirection.put(p, dirVal);
-            double invalidation = dirVal == 1
-                    ? lastSwingLow(c5m) - atrVal * 0.3
-                    : lastSwingHigh(c5m) + atrVal * 0.3;
-            ideaInvalidation.put(p, invalidation);
-            if (confidence < MIN_CONF) {
-                System.out.println("[DROP CONF] " + p + " conf=" + confidence);
-                return Optional.empty();
-            }
-            System.out.println("[SIGNAL OK] " + p + " " + direction + " conf=" + confidence + " raw=" + rawScore);
-            Signal s = new Signal(
-                    p.replace("USDT", ""),
-                    direction,
-                    confidence,
-                    lastPrice,
-                    rsi(closes5m, 14),
-                    rawScore,
-                    mtfConfirm,
-                    true,  // volOk
-                    atrPct >= ATR_MIN_PCT,
-                    strongTrigger,
-                    atrBreakLong,
-                    atrBreakShort,
-                    impulse,
-                    earlyTrigger,
-                    rsi(closes5m, 7),
-                    rsi(closes5m, 4),
-                    next5 // ✅ передаём прогноз
-            );
-            RiskEngine.TradeSignal tradeSignal = riskEngine.applyRisk(
-                    s.symbol,
-                    s.direction,
-                    s.price,
-                    atr(c5m, 14),
-                    s.confidence,
-                    "AutoRiskEngine"
-            );
-            tradeSignal = addStopTake(tradeSignal, s.direction, s.price, atr(c5m, 14));
-            s.stop = tradeSignal.stop;
-            s.take = tradeSignal.take;
-            System.out.println("[TRADE SIGNAL] " + tradeSignal);
-            return Optional.of(s);
-        } catch (Exception e) {
-            System.out.println("[evaluate] " + p + " error: " + e.getMessage());
-            return Optional.empty();
-        }
-    }
     private double lastSwingLow(List<Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double low = Double.POSITIVE_INFINITY;
@@ -981,6 +784,7 @@ public class SignalSender {
         if (scheduler != null) scheduler.shutdownNow();
         System.out.println("[SignalSender] stopped");
     }
+
     // ========================= Helper: top symbols via CoinGecko =========================
     public List<String> getTopSymbols(int limit) {
         try {
@@ -1131,19 +935,49 @@ public class SignalSender {
                 List<Candle> c5m = f5.join();
                 List<Candle> c15m = f15.join();
                 List<Candle> c1h = f1h.join();
+                Optional<DecisionEngineV2.TradeIdea> idea =
+                        decisionEngine.evaluate(pair, c5m, c15m);
 
+                idea.ifPresent(i -> {
+                    RiskEngine.TradeSignal ts = riskEngine.applyRisk(
+                            i.symbol.replace("USDT", ""),
+                            i.side,
+                            i.entry,
+                            i.atr,
+                            i.confidence,
+                            i.reason
+                    );
 
-                Optional<Signal> s = evaluate(pair, c5m, c15m, c1h);
-                s.ifPresent(sig -> sendSignalIfAllowed(
-                        pair,
-                        sig.direction,
-                        sig.confidence,
-                        sig.price,
-                        sig.rawScore,
-                        sig.mtfConfirm,
-                        sig.rsi,
-                        c5m  // передаём List<Candle>
-                ));
+                    ts = addStopTake(ts, i.side, i.entry, i.atr);
+
+                    Signal s = new Signal(
+                            i.symbol.replace("USDT", ""),
+                            i.side,
+                            i.confidence,
+                            i.entry,
+                            SignalSender.rsi(
+                                    c5m.stream().map(c -> c.close).toList(), 14
+                            ),
+                            0.0,     // rawScore (пока 0)
+                            0,       // mtfConfirm (не нужен)
+                            true,
+                            true,
+                            true,
+                            false,
+                            false,
+                            true,
+                            false,
+                            0,
+                            0,
+                            null
+                    );
+
+                    s.stop = ts.stop;
+                    s.take = ts.take;
+
+                    sendRaw(s.toTelegramMessage());
+                    markSignalSent(pair, i.side, i.confidence);
+                });
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
                 e.printStackTrace();

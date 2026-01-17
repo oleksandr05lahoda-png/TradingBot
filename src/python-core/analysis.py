@@ -64,15 +64,16 @@ def analyze_symbol(symbol, forecast_bars=5):
         ema9_15 = EMA(df15['close'], 9).iloc[-1]
         ema21_15 = EMA(df15['close'], 21).iloc[-1]
 
-        # EMA наклон
-        ema_slope = ema9_5.diff(3).iloc[-1]
+        ema_slope = ema9_5.iloc[-1] - ema9_5.iloc[-5]
 
         # RSI
         rsi = RSI(df5['close'], 14).iloc[-1]
 
         # ATR
         atr = ATR(df5, 14).iloc[-1]
-        current_range = df5['high'].iloc[-1] - df5['low'].iloc[-1]
+        last_3_range = (df5['high'].iloc[-3:] - df5['low'].iloc[-3:]).mean()
+        if last_3_range > 1.5 * atr:
+            return None
 
         # ===== Фильтры: флет, сильный импульс, неопределенность RSI =====
         if 40 < rsi < 60:  # рынок не решил
@@ -83,7 +84,6 @@ def analyze_symbol(symbol, forecast_bars=5):
 
         # ===== Контртрендовые входы =====
         signals = []
-        for i in range(forecast_bars):
             sig = None
             conf = 0.55
 
