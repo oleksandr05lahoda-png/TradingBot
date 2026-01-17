@@ -143,26 +143,25 @@ public class SignalSender {
     }
     public class CandlePredictor {
 
-        // Прогноз на N свечей вперед на основе EMA/RSI/Momentum
         public List<String> predictNextNCandlesDirection(List<Candle> candles, int n) {
-            if (candles == null || candles.size() < 10) return Collections.emptyList();
+            List<String> res = new ArrayList<>();
+            if (candles.size() < 5) return res;
 
-            List<Double> closes = candles.stream().map(c -> c.close).collect(Collectors.toList());
-            double lastClose = closes.get(closes.size() - 1);
-            List<String> forecast = new ArrayList<>();
+            Candle last = candles.get(candles.size() - 1);
+            Candle prev = candles.get(candles.size() - 2);
 
-            // простая линейная регрессия / EMA тренд
-            double slope = (closes.get(closes.size() - 1) - closes.get(0)) / (closes.size() - 1 + 1e-12);
+            double atr = atr(candles, 14);
+            double body = Math.abs(last.close - last.open);
 
-            for (int i = 1; i <= n; i++) {
-                double nextPrice = lastClose + slope * i;
-                forecast.add(nextPrice > lastClose ? "LONG" : "SHORT");
-                lastClose = nextPrice;
-            }
-            return forecast;
+            String dir;
+            if (last.close < prev.low && body > atr) dir = "SHORT";
+            else if (last.close > prev.high && body > atr) dir = "LONG";
+            else dir = last.close > prev.close ? "LONG" : "SHORT";
+
+            for (int i = 0; i < n; i++) res.add(dir);
+            return res;
         }
 
-        // Уверенность по прогнозу на N свечей
         public double computeForecastConfidence(List<Candle> pastCandles, int horizon, String dir) {
             if (pastCandles == null || pastCandles.size() < horizon) return 0.5;
             int success = 0;
@@ -836,6 +835,39 @@ public class SignalSender {
         List<String> list = getTopSymbols(limit); // используем существующий метод List<String>
         return new HashSet<>(list); // конвертируем в Set
     }
+    private void sendFastSignal(String pair, String dir, double price, double atr, List<Candle> c5m) {
+
+        double rsi14 = rsi(c5m.stream().map(c -> c.close).toList(), 14);
+        List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
+
+        Signal s = new Signal(
+                pair.replace("USDT",""),
+                dir,
+                0.72,              // фикс confidence
+                price,
+                rsi14,
+                0.0,
+                0,
+                true,
+                true,
+                true,              // strongTrigger
+                dir.equals("LONG"),
+                dir.equals("SHORT"),
+                true,              // impulse
+                false,
+                rsi(c5m.stream().map(c->c.close).toList(),7),
+                rsi(c5m.stream().map(c->c.close).toList(),4),
+                next5
+        );
+
+        RiskEngine.TradeSignal ts =
+                riskEngine.applyRisk(s.symbol, s.direction, price, atr, s.confidence, "FAST-MOMENTUM");
+
+        s.stop = ts.stop;
+        s.take = ts.take;
+
+        sendRaw(s.toTelegramMessage());
+    }
     private void runSchedulerCycle() {
         Set<String> symbols = getTopSymbolsSet(TOP_N);
         for (String pair : symbols) {
@@ -853,7 +885,71 @@ public class SignalSender {
                 List<Candle> c15m = f15.join();
                 List<Candle> c1h = f1h.join();
 
-                if (c5m.isEmpty() || c15m.isEmpty()) continue;
+                if (c5m.size() < 20 || c15m.isEmpty()) continue;
+
+                // ================= FAST MOMENTUM STRATEGY =================
+                Candle last = c5m.get(c5m.size() - 1);
+                Candle prev = c5m.get(c5m.size() - 2);
+
+                double atr5 = SignalSender.atr(c5m, 14);
+                double body = Math.abs(last.close - last.open);
+
+                boolean crashDown =
+                        last.close < prev.low &&
+                                body > 1.2 * atr5;
+
+                boolean crashUp =
+                        last.close > prev.high &&
+                                body > 1.2 * atr5;
+
+                if (crashDown || crashUp) {
+                    String side = crashDown ? "SHORT" : "LONG";
+
+                    List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
+                    double rsi14 = SignalSender.rsi(closes5, 14);
+                    double rsi7 = SignalSender.rsi(closes5, 7);
+                    double rsi4 = SignalSender.rsi(closes5, 4);
+
+                    List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
+
+                    RiskEngine.TradeSignal ts = riskEngine.applyRisk(
+                            pair.replace("USDT",""),
+                            side,
+                            last.close,
+                            atr5,
+                            0.72,
+                            "FAST-MOMENTUM"
+                    );
+
+                    Signal s = new Signal(
+                            pair.replace("USDT",""),
+                            side,
+                            0.72,
+                            last.close,
+                            rsi14,
+                            0.0,
+                            0,
+                            true,
+                            true,
+                            true,
+                            side.equals("LONG"),
+                            side.equals("SHORT"),
+                            true,
+                            false,
+                            rsi7,
+                            rsi4,
+                            next5
+                    );
+
+                    s.stop = ts.stop;
+                    s.take = ts.take;
+
+                    sendRaw(s.toTelegramMessage());
+                    markSignalSent(pair, side, 0.72);
+
+                    continue; // ❗ НЕ идём в DecisionEngine
+                }
+                // ===========================================================
 
                 Optional<DecisionEngineV2.TradeIdea> idea =
                         decisionEngine.evaluate(pair, c5m, c15m);
@@ -883,15 +979,15 @@ public class SignalSender {
                             i.confidence,
                             i.entry,
                             rsi14,
-                            0.0,     // rawScore
-                            0,       // mtfConfirm
-                            true,    // volOk
-                            true,    // atrOk
-                            true,    // strongTrigger
-                            false,   // atrBreakLong
-                            false,   // atrBreakShort
-                            true,    // impulse
-                            false,   // earlyTrigger
+                            0.0,
+                            0,
+                            true,
+                            true,
+                            true,
+                            false,
+                            false,
+                            true,
+                            false,
                             rsi7,
                             rsi4,
                             next5
@@ -903,6 +999,7 @@ public class SignalSender {
                     sendRaw(s.toTelegramMessage());
                     markSignalSent(pair, i.side, i.confidence);
                 });
+
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
                 e.printStackTrace();
