@@ -15,7 +15,7 @@ public class DecisionEngineV2 {
         public double confidence;
         public String reason;
 
-        static TradeIdea longIdea(String s, double e, double atr, String r, double conf) {
+        public static TradeIdea longIdea(String s, double e, double atr, String r, double conf) {
             TradeIdea i = new TradeIdea();
             i.symbol = s;
             i.side = "LONG";
@@ -26,7 +26,7 @@ public class DecisionEngineV2 {
             return i;
         }
 
-        static TradeIdea shortIdea(String s, double e, double atr, String r, double conf) {
+        public static TradeIdea shortIdea(String s, double e, double atr, String r, double conf) {
             TradeIdea i = new TradeIdea();
             i.symbol = s;
             i.side = "SHORT";
@@ -75,12 +75,18 @@ public class DecisionEngineV2 {
     }
 
     // ================== Main Evaluate ==================
-    public Optional<TradeIdea> evaluate(String symbol, List<Candle> candles5m, List<Candle> candles15m, List<Candle> candles1h, List<Candle> candles4h) {
+    // минимально 3 таймфрейма: 5m, 15m, 1h. 4h опционально.
+    public Optional<TradeIdea> evaluate(String symbol,
+                                        List<Candle> candles5m,
+                                        List<Candle> candles15m,
+                                        List<Candle> candles1h,
+                                        List<Candle> candles4h) {
         if (candles5m.size() < 50 || candles15m.size() < 50) return Optional.empty();
 
         // --- Контекст 15m ---
-        double emaFast15 = TechnicalAnalysis.ema(candles15m.stream().map(c -> c.close).collect(Collectors.toList()), 20);
-        double emaSlow15 = TechnicalAnalysis.ema(candles15m.stream().map(c -> c.close).collect(Collectors.toList()), 50);
+        List<Double> closes15 = candles15m.stream().map(c -> c.close).collect(Collectors.toList());
+        double emaFast15 = TechnicalAnalysis.ema(closes15, 20);
+        double emaSlow15 = TechnicalAnalysis.ema(closes15, 50);
         int contextDir = 0;
         if (emaFast15 > emaSlow15) contextDir = 1;
         if (emaFast15 < emaSlow15) contextDir = -1;
@@ -88,10 +94,12 @@ public class DecisionEngineV2 {
 
         // --- Multi-TF фильтр ---
         if (!candles1h.isEmpty() && !candles4h.isEmpty()) {
-            double emaFast1h = TechnicalAnalysis.ema(candles1h.stream().map(c -> c.close).collect(Collectors.toList()), 20);
-            double emaSlow1h = TechnicalAnalysis.ema(candles1h.stream().map(c -> c.close).collect(Collectors.toList()), 50);
-            double emaFast4h = TechnicalAnalysis.ema(candles4h.stream().map(c -> c.close).collect(Collectors.toList()), 20);
-            double emaSlow4h = TechnicalAnalysis.ema(candles4h.stream().map(c -> c.close).collect(Collectors.toList()), 50);
+            List<Double> closes1h = candles1h.stream().map(c -> c.close).collect(Collectors.toList());
+            List<Double> closes4h = candles4h.stream().map(c -> c.close).collect(Collectors.toList());
+            double emaFast1h = TechnicalAnalysis.ema(closes1h, 20);
+            double emaSlow1h = TechnicalAnalysis.ema(closes1h, 50);
+            double emaFast4h = TechnicalAnalysis.ema(closes4h, 20);
+            double emaSlow4h = TechnicalAnalysis.ema(closes4h, 50);
 
             if ((contextDir == 1 && (emaFast1h < emaSlow1h || emaFast4h < emaSlow4h)) ||
                     (contextDir == -1 && (emaFast1h > emaSlow1h || emaFast4h > emaSlow4h))) {
@@ -100,7 +108,8 @@ public class DecisionEngineV2 {
         }
 
         // --- Состояние 5m ---
-        double rsi5 = TechnicalAnalysis.rsi(candles5m.stream().map(c -> c.close).collect(Collectors.toList()), 14);
+        List<Double> closes5 = candles5m.stream().map(c -> c.close).collect(Collectors.toList());
+        double rsi5 = TechnicalAnalysis.rsi(closes5, 14);
         double atr5 = TechnicalAnalysis.atr(candles5m, 14);
 
         Candle last = candles5m.get(candles5m.size() - 1);
@@ -134,5 +143,12 @@ public class DecisionEngineV2 {
         }
 
         return Optional.empty();
+    }
+
+    // перегрузка без 4h для SignalSender
+    public Optional<TradeIdea> evaluate(String symbol,
+                                        List<Candle> candles5m,
+                                        List<Candle> candles15m) {
+        return evaluate(symbol, candles5m, candles15m, List.of(), List.of());
     }
 }

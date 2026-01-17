@@ -1,12 +1,13 @@
 package com.bot;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import com.bot.Candle;
-
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.net.URI;
 import java.net.http.*;
+import com.bot.DecisionEngineV2;
+import com.bot.DecisionEngine;
+import java.util.Optional;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -835,7 +836,6 @@ public class SignalSender {
         List<String> list = getTopSymbols(limit); // используем существующий метод List<String>
         return new HashSet<>(list); // конвертируем в Set
     }
-
     private void runSchedulerCycle() {
         Set<String> symbols = getTopSymbolsSet(TOP_N);
         for (String pair : symbols) {
@@ -852,6 +852,9 @@ public class SignalSender {
                 List<Candle> c5m = f5.join();
                 List<Candle> c15m = f15.join();
                 List<Candle> c1h = f1h.join();
+
+                if (c5m.isEmpty() || c15m.isEmpty()) continue;
+
                 Optional<DecisionEngineV2.TradeIdea> idea =
                         decisionEngine.evaluate(pair, c5m, c15m);
 
@@ -867,26 +870,31 @@ public class SignalSender {
 
                     ts = addStopTake(ts, i.side, i.entry, i.atr);
 
+                    List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
+                    double rsi14 = SignalSender.rsi(closes5, 14);
+                    double rsi7 = SignalSender.rsi(closes5, 7);
+                    double rsi4 = SignalSender.rsi(closes5, 4);
+
+                    List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
+
                     Signal s = new Signal(
-                            i.symbol.replace("USDT", ""),
+                            i.symbol.replace("USDT",""),
                             i.side,
                             i.confidence,
                             i.entry,
-                            SignalSender.rsi(
-                                    c5m.stream().map(c -> c.close).toList(), 14
-                            ),
-                            0.0,     // rawScore (пока 0)
-                            0,       // mtfConfirm (не нужен)
-                            true,
-                            true,
-                            true,
-                            false,
-                            false,
-                            true,
-                            false,
-                            0,
-                            0,
-                            null
+                            rsi14,
+                            0.0,     // rawScore
+                            0,       // mtfConfirm
+                            true,    // volOk
+                            true,    // atrOk
+                            true,    // strongTrigger
+                            false,   // atrBreakLong
+                            false,   // atrBreakShort
+                            true,    // impulse
+                            false,   // earlyTrigger
+                            rsi7,
+                            rsi4,
+                            next5
                     );
 
                     s.stop = ts.stop;
