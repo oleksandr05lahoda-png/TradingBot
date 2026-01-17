@@ -1,6 +1,7 @@
 package com.bot;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import com.bot.Candle;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -11,11 +12,8 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
-import com.bot.SignalSender.Candle;
 
 public class SignalSender {
-    private final Map<String, Integer> ideaDirection = new ConcurrentHashMap<>();
-    private final Map<String, Double> ideaInvalidation = new ConcurrentHashMap<>();
     private final TelegramBotSender bot;
     private final HttpClient http;
     MarketContext ctx = null; // инициализируем позже в evaluate
@@ -43,19 +41,13 @@ public class SignalSender {
     private final Set<String> STABLE; // tokens to skip
     private Set<String> BINANCE_PAIRS = new HashSet<>();
     private long lastBinancePairsRefresh = 0L;
-
-    private final Map<String, Long> lastOpenTimeMap = new ConcurrentHashMap<>();   // openTime per symbol processed
     private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
     private final Map<String, Deque<Double>> tickPriceDeque = new ConcurrentHashMap<>();
     private final Map<String, Double> lastTickPrice = new ConcurrentHashMap<>();
     private final Map<String, Long> lastTickTime = new ConcurrentHashMap<>();
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
-    private final DirectionalBiasAnalyzer biasAnalyzer = new DirectionalBiasAnalyzer();
     private final AtomicLong dailyRequests = new AtomicLong(0);
-    Backtester backtester = new Backtester();
-    PositionSizer sizer = new PositionSizer(0.005); // 0.5%
-    MarketRegime regime = new MarketRegime();
     private final DecisionEngineV2 decisionEngine = new DecisionEngineV2();
     private long dailyResetTs = System.currentTimeMillis();
     private final RiskEngine riskEngine = new RiskEngine(10.0); // maxLeverage = 10, можешь изменить
@@ -182,33 +174,6 @@ public class SignalSender {
             return (double) success / (pastCandles.size() - horizon);
         }
     }
-    public class ConfidenceCalculator {
-
-        public static double calculate(
-                double rawScore,
-                int mtfConfirm,
-                boolean volOk,
-                boolean atrOk,
-                boolean impulse,
-                boolean vwapAligned,
-                boolean structureAligned,
-                boolean bos,
-                boolean liquiditySweep
-        ) {
-            double conf = 0.0;
-            conf += Math.min(1.0, Math.abs(rawScore));
-
-            if (mtfConfirm != 0) conf += 0.1;
-            if (volOk) conf += 0.1;
-            if (atrOk) conf += 0.1;
-            if (impulse) conf += 0.05;
-            if (vwapAligned) conf += 0.05;
-            if (liquiditySweep && Math.abs(rawScore) > 0.2) conf -= 0.25;
-            if (bos) conf += 0.05;
-
-            return Math.max(0.0, Math.min(1.0, conf));
-        }
-    }
     public class MarketContext {
         public final double vwapDev;
         public final boolean higherLows;
@@ -271,46 +236,6 @@ public class SignalSender {
         } catch (Exception e) {
             System.out.println("[Binance] Error preparing klines request for " + symbol + " : " + e.getMessage());
             return CompletableFuture.completedFuture(Collections.emptyList());
-        }
-    }
-
-    // ========================= Candle data class =========================
-    public static class Candle {
-        public final long openTime;
-        public final double open;
-        public final double high;
-        public final double low;
-        public final double close;
-        public final double volume;
-        public final double quoteAssetVolume;
-        public final long closeTime;
-
-        public Candle(long openTime, double open, double high, double low, double close,
-                      double volume, double quoteAssetVolume, long closeTime) {
-            this.openTime = openTime;
-            this.open = open;
-            this.high = high;
-            this.low = low;
-            this.close = close;
-            this.volume = volume;
-            this.quoteAssetVolume = quoteAssetVolume;
-            this.closeTime = closeTime;
-        }
-
-        public double body() {
-            return Math.abs(close - open);
-        }
-
-        public double bodyPct() {
-            return body() / (open + 1e-12);
-        }
-
-        public boolean isBull() {
-            return close > open;
-        }
-
-        public boolean isBear() {
-            return close < open;
         }
     }
 
@@ -884,14 +809,6 @@ public class SignalSender {
             return Collections.emptyList();
         }
     }
-    private List<Candle> fetchKlinesSync(String symbol, String interval, int limit) {
-        try {
-            return fetchKlinesAsync(symbol, interval, limit).get();
-        } catch (Exception e) {
-            System.out.println("[fetchKlinesSync] error for " + symbol + " " + interval + ": " + e.getMessage());
-            return Collections.emptyList();
-        }
-    }
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
 
@@ -983,14 +900,5 @@ public class SignalSender {
                 e.printStackTrace();
             }
         }
-    }
-    static class TradeSignal {
-        String symbol;
-        String side;      // LONG / SHORT
-        double entry;     // вход
-        double stop;      // стоп
-        double take;      // тейк
-        double confidence;
-        String reason;
     }
 }

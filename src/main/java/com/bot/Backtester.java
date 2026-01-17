@@ -1,6 +1,5 @@
 package com.bot;
 
-import com.bot.SignalSender.Candle;
 import java.util.List;
 
 public class Backtester {
