@@ -39,7 +39,7 @@ public class DecisionEngine {
     }
 
     // ================== MarketState ==================
-    public class MarketState {
+    public static class MarketState {
 
         public enum Bias {
             LONG,
@@ -54,7 +54,7 @@ public class DecisionEngine {
         }
     }
 
-    // ================== Evaluate logic ==================
+    // ================== Evaluate ==================
     public Optional<TradeIdea> evaluate(
             String symbol,
             List<Candle> candles5m,
@@ -68,9 +68,7 @@ public class DecisionEngine {
             return Optional.empty();
 
         double rsi5 = TechnicalAnalysis.rsi(
-                candles5m.stream()
-                        .map(c -> c.close)
-                        .collect(Collectors.toList()),
+                candles5m.stream().map(c -> c.close).collect(Collectors.toList()),
                 14
         );
 
@@ -82,7 +80,26 @@ public class DecisionEngine {
         boolean impulseUp = last.close > last.open && last.close > prev.high;
         boolean impulseDown = last.close < last.open && last.close < prev.low;
 
-        double confidence = 0.6;
+        boolean trend = TechnicalAnalysis.isTrend(candles15m);
+
+        // ===== Base confidence =====
+        double confidence = 0.55;
+
+        // ===== Trend bonus =====
+        if (trend) confidence += 0.05;
+
+        // ===== Impulse bonus =====
+        if (impulseUp || impulseDown) confidence += 0.05;
+
+        // ===== RSI positioning bonus =====
+        if (market.bias == MarketState.Bias.LONG && rsi5 >= 40 && rsi5 <= 48)
+            confidence += 0.05;
+
+        if (market.bias == MarketState.Bias.SHORT && rsi5 <= 60 && rsi5 >= 52)
+            confidence += 0.05;
+
+        // ===== Hard limits =====
+        confidence = Math.max(0.55, Math.min(0.80, confidence));
 
         if (market.bias == MarketState.Bias.LONG && rsi5 > 35 && rsi5 < 50 && impulseUp)
             return Optional.of(
@@ -100,7 +117,6 @@ public class DecisionEngine {
     // ================== TechnicalAnalysis ==================
     public static class TechnicalAnalysis {
 
-        // ===== RSI =====
         public static double rsi(List<Double> closes, int period) {
             if (closes.size() <= period) return 50.0;
 
@@ -119,7 +135,6 @@ public class DecisionEngine {
             return 100.0 - (100.0 / (1.0 + rs));
         }
 
-        // ===== ATR =====
         public static double atr(List<Candle> candles, int period) {
             if (candles.size() <= period) return 0;
 
@@ -131,7 +146,6 @@ public class DecisionEngine {
             return sum / period;
         }
 
-        // ===== EMA =====
         public static double ema(List<Double> values, int period) {
             if (values.isEmpty()) return 0;
 
@@ -144,16 +158,14 @@ public class DecisionEngine {
             return ema;
         }
 
-        // ===== TREND CHECK =====
         public static boolean isTrend(List<Candle> candles) {
-            if (candles.size() < 20) return false;
+            if (candles.size() < 30) return false;
 
-            double emaFast = ema(
-                    candles.stream().map(c -> c.close).toList(), 10);
-            double emaSlow = ema(
-                    candles.stream().map(c -> c.close).toList(), 30);
+            List<Double> closes = candles.stream().map(c -> c.close).toList();
+            double emaFast = ema(closes, 10);
+            double emaSlow = ema(closes, 30);
 
-            return Math.abs(emaFast - emaSlow) / emaSlow > 0.001;
+            return Math.abs(emaFast - emaSlow) / emaSlow > 0.0015;
         }
     }
 }

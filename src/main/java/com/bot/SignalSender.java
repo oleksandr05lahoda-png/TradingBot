@@ -51,6 +51,7 @@ public class SignalSender {
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private final DecisionEngineV2 decisionEngine = new DecisionEngineV2();
     private long dailyResetTs = System.currentTimeMillis();
+    private final AdaptiveBrain brain = new AdaptiveBrain();
     private final RiskEngine riskEngine = new RiskEngine(10.0); // maxLeverage = 10, можешь изменить
     private ScheduledExecutorService scheduler;
     CandlePredictor predictor = new CandlePredictor();
@@ -528,7 +529,14 @@ public class SignalSender {
             boolean liquiditySweep,
             String pair // добавляем pair для истории
     ) {
-        double conf = 0.0;
+        double conf = brain.adaptConfidence("FAST-MOMENTUM", 0.72);
+
+        conf = brain.adaptConfidence("FAST-MOMENTUM", conf);
+        conf += brain.impulsePenalty(pair);
+        conf += brain.sessionBoost();
+
+        conf = Math.max(0.55, Math.min(0.85, conf));
+
 
         // ===== Базовая оценка =====
         conf += Math.min(1.0, Math.abs(rawScore));
@@ -904,6 +912,7 @@ public class SignalSender {
 
                 if (crashDown || crashUp) {
                     String side = crashDown ? "SHORT" : "LONG";
+                    double conf = 0.72; // добавлено
 
                     List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
                     double rsi14 = SignalSender.rsi(closes5, 14);
@@ -917,14 +926,14 @@ public class SignalSender {
                             side,
                             last.close,
                             atr5,
-                            0.72,
+                            conf,
                             "FAST-MOMENTUM"
                     );
 
                     Signal s = new Signal(
                             pair.replace("USDT",""),
                             side,
-                            0.72,
+                            conf,
                             last.close,
                             rsi14,
                             0.0,
@@ -945,9 +954,9 @@ public class SignalSender {
                     s.take = ts.take;
 
                     sendRaw(s.toTelegramMessage());
-                    markSignalSent(pair, side, 0.72);
+                    markSignalSent(pair, side, conf);
 
-                    continue; // ❗ НЕ идём в DecisionEngine
+                    continue;
                 }
                 // ===========================================================
 
