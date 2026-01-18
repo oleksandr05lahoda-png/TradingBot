@@ -896,10 +896,15 @@ public class SignalSender {
 
                 if (crashDown || crashUp) {
                     String side = crashDown ? "SHORT" : "LONG";
-                    double conf = 0.72; // добавлено
 
                     List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
                     double rsi14 = SignalSender.rsi(closes5, 14);
+
+                    // 🚫 блокировка по RSI
+                    if (side.equals("LONG") && rsi14 > 75) continue;
+                    if (side.equals("SHORT") && rsi14 < 25) continue;
+
+                    double conf = 0.72;
                     double rsi7 = SignalSender.rsi(closes5, 7);
                     double rsi4 = SignalSender.rsi(closes5, 4);
 
