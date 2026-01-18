@@ -78,7 +78,8 @@ def analyze_symbol(symbol, forecast_bars=5):
         # ===== Фильтры: флет, сильный импульс, неопределенность RSI =====
         if 40 < rsi < 60:  # рынок не решил
             return None
-        if current_range > 1.5 * atr:  # сильный импульс - не входить
+        current_range = df5['high'].iloc[-1] - df5['low'].iloc[-1]
+        if current_range > 1.5 * atr:
             return None
         trend_15m = "UP" if ema9_15 > ema21_15 else "DOWN"
 

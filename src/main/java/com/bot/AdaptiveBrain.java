@@ -17,7 +17,8 @@ public class AdaptiveBrain {
     public void recordOutcome(String strategy, boolean win) {
         strategyStats.putIfAbsent(strategy, new OutcomeStat());
         OutcomeStat s = strategyStats.get(strategy);
-        if (win) s.wins++; else s.losses++;
+        if (win) s.wins++;
+        else s.losses++;
     }
 
     private double winrate(String strategy) {
@@ -27,6 +28,7 @@ public class AdaptiveBrain {
         if (total < 20) return 0.5;
         return (double) s.wins / total;
     }
+
     // ====== 2. ADAPTIVE CONFIDENCE ======
     public double adaptConfidence(String strategy, double baseConf) {
         double wr = winrate(strategy);
@@ -34,8 +36,21 @@ public class AdaptiveBrain {
         if (wr < 0.45) return Math.max(0.55, baseConf - 0.05);
         return baseConf;
     }
+
     // ====== 3. IMPULSE SESSION CONTROL ======
     private final Map<String, Deque<Long>> impulseHistory = new ConcurrentHashMap<>();
+
+    public boolean canTrade(String pair) {
+        impulseHistory.putIfAbsent(pair, new ArrayDeque<>());
+        Deque<Long> q = impulseHistory.get(pair);
+
+        long now = System.currentTimeMillis();
+        q.addLast(now);
+        while (!q.isEmpty() && now - q.peekFirst() > 20 * 60_000)
+            q.pollFirst();
+
+        return q.size() < 3;  // если 3 и больше — блокируем
+    }
 
     public double impulsePenalty(String pair) {
         impulseHistory.putIfAbsent(pair, new ArrayDeque<>());
@@ -46,8 +61,8 @@ public class AdaptiveBrain {
         while (!q.isEmpty() && now - q.peekFirst() > 20 * 60_000)
             q.pollFirst();
 
-        if (q.size() >= 3) return -0.07;
-        if (q.size() == 2) return -0.03;
+        if (q.size() >= 3) return -0.10;
+        if (q.size() == 2) return -0.05;
         return 0.0;
     }
 
@@ -75,5 +90,15 @@ public class AdaptiveBrain {
         if ((h >= 7 && h <= 10) || (h >= 13 && h <= 16))
             return 0.05;
         return 0.0;
+    }
+
+    // ====== 6. FINAL CONFIDENCE ======
+    public double applyAllAdjustments(String strategy, String pair, double baseConf) {
+        double conf = baseConf;
+        conf = adaptConfidence(strategy, conf);
+        conf += sessionBoost();
+        conf += impulsePenalty(pair);
+        conf = Math.max(0.45, Math.min(0.85, conf));
+        return conf;
     }
 }

@@ -564,6 +564,7 @@ public class SignalSender {
         return high;
     }
     private RiskEngine.TradeSignal addStopTake(RiskEngine.TradeSignal ts, String direction, double price, double atr) {
+
         double risk = atr * 1.2; // базовый риск
 
         if ("LONG".equals(direction)) {
@@ -574,6 +575,38 @@ public class SignalSender {
             ts.take = price - risk * 2.5;
         }
         return ts;
+    }
+    private void sendSignalIfAllowed(String pair,
+                                     Signal s,
+                                     List<Candle> closes5m) {
+
+        // 1) Минимальная уверенность
+        if (s.confidence < MIN_CONF) return;
+
+        // 2) cooldown
+        if (isCooldown(pair, s.direction)) return;
+
+        // 3) risk + stop/take
+        RiskEngine.TradeSignal ts = riskEngine.applyRisk(
+                s.symbol,
+                s.direction,
+                s.price,
+                atr(closes5m, 14),
+                s.confidence,
+                "AutoRiskEngine"
+        );
+        ts = addStopTake(ts, s.direction, s.price, atr(closes5m, 14));
+        s.stop = ts.stop;
+        s.take = ts.take;
+
+        // 4) save history
+        signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
+
+        // 5) send
+        sendRaw(s.toTelegramMessage());
+
+        // 6) mark cooldown
+        markSignalSent(pair, s.direction, s.confidence);
     }
     public static class Signal {
         public final String symbol;
@@ -753,54 +786,6 @@ public class SignalSender {
             System.out.println("[sendRaw] " + e.getMessage());
         }
     }
-    private void sendSignalIfAllowed(String pair,
-                                     String direction,
-                                     double confidence,
-                                     double price,
-                                     double rawScore,
-                                     int mtfConfirm,
-                                     double rsi14,
-                                     List<Candle> closes5m) {
-        List<String> next5 = predictor.predictNextNCandlesDirection(closes5m, 5);
-        Signal s = new Signal(
-                pair.replace("USDT", ""),
-                direction,
-                confidence,
-                price,
-                rsi14,
-                rawScore,
-                mtfConfirm,
-                true,  // volOk
-                true,  // atrOk
-                false, // strongTrigger
-                false, // atrBreakLong
-                false, // atrBreakShort
-                false, // impulse
-                false, // earlyTrigger
-                rsi(closes5m.stream().map(c -> c.close).collect(Collectors.toList()), 7),
-                rsi(closes5m.stream().map(c -> c.close).collect(Collectors.toList()), 4),
-                next5 // ✅ прогноз на 5 свечей
-        );
-        // ✅ RiskEngine и stop/take остаются без изменений
-        RiskEngine.TradeSignal tradeSignal = riskEngine.applyRisk(
-                s.symbol,
-                s.direction,
-                s.price,
-                atr(closes5m, 14),
-                s.confidence,
-                "AutoRiskEngine"
-        );
-        tradeSignal = addStopTake(tradeSignal, s.direction, s.price, atr(closes5m, 14));
-        s.stop = tradeSignal.stop;
-        s.take = tradeSignal.take;
-
-        // Сохраняем историю
-        signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
-
-        // Отправка в телеграм
-        sendRaw(s.toTelegramMessage());
-        markSignalSent(pair, direction, confidence);
-    }
     public List<Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
             List<Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
@@ -896,17 +881,18 @@ public class SignalSender {
                 // ================= FAST MOMENTUM STRATEGY =================
                 Candle last = c5m.get(c5m.size() - 1);
                 Candle prev = c5m.get(c5m.size() - 2);
+                Candle prev2 = c5m.get(c5m.size() - 3);
 
                 double atr5 = SignalSender.atr(c5m, 14);
                 double body = Math.abs(last.close - last.open);
 
                 boolean crashDown =
-                        last.close < prev.low &&
-                                body > 0.9 * atr5;
+                        prev.close < c5m.get(c5m.size() - 3).low &&
+                                Math.abs(prev.close - prev.open) > 0.9 * atr5;
 
                 boolean crashUp =
-                        last.close > prev.high &&
-                                body > 0.9 * atr5;
+                        prev.close > c5m.get(c5m.size() - 3).high &&
+                                Math.abs(prev.close - prev.open) > 0.9 * atr5;
 
                 if (crashDown || crashUp) {
                     String side = crashDown ? "SHORT" : "LONG";
@@ -953,7 +939,6 @@ public class SignalSender {
 
                     sendRaw(s.toTelegramMessage());
                     markSignalSent(pair, side, conf);
-
                     continue;
                 }
                 Optional<DecisionEngineV2.TradeIdea> idea =
@@ -961,51 +946,37 @@ public class SignalSender {
 
                 idea.ifPresent(i -> {
 
-                    // ===== ADAPTIVE CONFIDENCE =====
                     double conf = i.confidence;
-
-                    // обучение по истории
                     conf = brain.adaptConfidence(i.reason, conf);
-
-                    // бонус активных сессий (Лондон / NY)
                     conf += brain.sessionBoost();
-
-                    // штраф за частые фейлы по монете
                     conf += brain.impulsePenalty(pair);
-
-                    // жёсткие рамки
                     conf = Math.max(0.50, Math.min(0.88, conf));
 
-                    // ===== COOLDOWN =====
-                    if (isCooldown(pair, i.side)) {
-                        return;
-                    }
+                    if (isCooldown(pair, i.side)) return;
 
-                    // ===== ATR / RISK =====
+                    double entryPrice = i.entry;
+
+                    // risk + stop/take
                     RiskEngine.TradeSignal ts = riskEngine.applyRisk(
-                            i.symbol.replace("USDT", ""),
+                            pair.replace("USDT",""),
                             i.side,
-                            i.entry,
+                            entryPrice,
                             i.atr,
                             conf,
-                            i.reason
+                            "FAST-MOMENTUM"
                     );
+                    ts = addStopTake(ts, i.side, entryPrice, i.atr);
 
-                    ts = addStopTake(ts, i.side, i.entry, i.atr);
-
-                    // ===== INDICATORS =====
-                    List<Double> closes5 = c5m.stream()
-                            .map(c -> c.close)
-                            .toList();
-
+                    // indicators
+                    List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
                     double rsi14 = SignalSender.rsi(closes5, 14);
                     double rsi7  = SignalSender.rsi(closes5, 7);
                     double rsi4  = SignalSender.rsi(closes5, 4);
 
-                    // ===== NEXT 5 CANDLES FORECAST =====
+                    // next 5 forecast
                     List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
 
-                    // ===== BUILD SIGNAL =====
+                    // build signal
                     Signal s = new Signal(
                             i.symbol.replace("USDT", ""),
                             i.side,
@@ -1029,9 +1000,7 @@ public class SignalSender {
                     s.stop = ts.stop;
                     s.take = ts.take;
 
-                    // ===== SEND =====
-                    sendRaw(s.toTelegramMessage());
-                    markSignalSent(pair, i.side, conf);
+                    sendSignalIfAllowed(pair, s, c5m);
                 });
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());

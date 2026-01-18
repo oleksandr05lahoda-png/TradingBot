@@ -132,10 +132,14 @@ public class DecisionEngine {
             double sum = 0;
             for (int i = candles.size() - period; i < candles.size(); i++) {
                 Candle c = candles.get(i);
-                sum += (c.high - c.low);
+                Candle prev = candles.get(i - 1);
+                double tr = Math.max(c.high - c.low,
+                        Math.max(Math.abs(c.high - prev.close), Math.abs(c.low - prev.close)));
+                sum += tr;
             }
             return sum / period;
         }
+
 
         public static double ema(List<Double> values, int period) {
             double k = 2.0 / (period + 1);

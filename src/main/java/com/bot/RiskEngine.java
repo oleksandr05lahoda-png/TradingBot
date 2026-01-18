@@ -28,6 +28,16 @@ public class RiskEngine {
         s.reason = reason;
 
         double risk = atr * (confidence > 0.65 ? 0.9 : 1.2);
+
+        if (side.equalsIgnoreCase("LONG")) {
+            s.entry = entryPrice;
+            s.stop = entryPrice - risk;
+            s.take = entryPrice + risk * 2;
+        } else {
+            s.entry = entryPrice;
+            s.stop = entryPrice + risk;
+            s.take = entryPrice - risk * 2;
+        }
         if (risk < entryPrice * 0.001)
             risk = entryPrice * 0.001;
         if (side.equalsIgnoreCase("LONG")) {
