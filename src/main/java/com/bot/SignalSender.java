@@ -956,9 +956,8 @@ public class SignalSender {
 
                     continue;
                 }
-                // ===========================================================
                 Optional<DecisionEngineV2.TradeIdea> idea =
-                        decisionEngine.evaluate(pair, c5m, c15m);
+                        decisionEngine.evaluate(pair, c5m, c15m, c1h);
 
                 idea.ifPresent(i -> {
 

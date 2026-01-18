@@ -40,21 +40,12 @@ public class DecisionEngine {
 
     // ================== MarketState ==================
     public static class MarketState {
-
-        public enum Bias {
-            LONG,
-            SHORT,
-            NEUTRAL
-        }
-
+        public enum Bias { LONG, SHORT, NEUTRAL }
         public final Bias bias;
-
-        public MarketState(Bias bias) {
-            this.bias = bias;
-        }
+        public MarketState(Bias bias) { this.bias = bias; }
     }
 
-    // ================== Evaluate ==================
+    // ================== EVALUATE ==================
     public Optional<TradeIdea> evaluate(
             String symbol,
             List<Candle> candles5m,
@@ -77,39 +68,46 @@ public class DecisionEngine {
         Candle last = candles5m.get(candles5m.size() - 1);
         Candle prev = candles5m.get(candles5m.size() - 2);
 
-        boolean impulseUp = last.close > last.open && last.close > prev.high;
-        boolean impulseDown = last.close < last.open && last.close < prev.low;
+        // ===== STRUCTURE BREAK (ANTI-LATE) =====
+        boolean structureBreakUp =
+                prev.close < prev.open &&
+                        last.close > prev.high &&
+                        (last.high - last.low) < atr5 * 1.2;
+
+        boolean structureBreakDown =
+                prev.close > prev.open &&
+                        last.close < prev.low &&
+                        (last.high - last.low) < atr5 * 1.2;
 
         boolean trend = TechnicalAnalysis.isTrend(candles15m);
 
-        // ===== Base confidence =====
+        // ===== RSI HARD BLOCK =====
+        if (market.bias == MarketState.Bias.SHORT && rsi5 < 30) return Optional.empty();
+        if (market.bias == MarketState.Bias.LONG  && rsi5 > 70) return Optional.empty();
+
         double confidence = 0.55;
-
-        // ===== Trend bonus =====
         if (trend) confidence += 0.05;
+        if (structureBreakUp || structureBreakDown) confidence += 0.05;
+        confidence = Math.min(confidence, 0.75);
 
-        // ===== Impulse bonus =====
-        if (impulseUp || impulseDown) confidence += 0.05;
+        // ===== ENTRY =====
+        if (market.bias == MarketState.Bias.LONG &&
+                rsi5 > 35 && rsi5 < 50 &&
+                structureBreakUp) {
 
-        // ===== RSI positioning bonus =====
-        if (market.bias == MarketState.Bias.LONG && rsi5 >= 40 && rsi5 <= 48)
-            confidence += 0.05;
-
-        if (market.bias == MarketState.Bias.SHORT && rsi5 <= 60 && rsi5 >= 52)
-            confidence += 0.05;
-
-        // ===== Hard limits =====
-        confidence = Math.max(0.55, Math.min(0.80, confidence));
-
-        if (market.bias == MarketState.Bias.LONG && rsi5 > 35 && rsi5 < 50 && impulseUp)
             return Optional.of(
-                    TradeIdea.longIdea(symbol, last.close, atr5, "Trend pullback", confidence)
+                    TradeIdea.longIdea(symbol, last.close, atr5, "Structure pullback LONG", confidence)
             );
+        }
 
-        if (market.bias == MarketState.Bias.SHORT && rsi5 < 65 && rsi5 > 50 && impulseDown)
+        if (market.bias == MarketState.Bias.SHORT &&
+                rsi5 < 65 && rsi5 > 50 &&
+                structureBreakDown) {
+
             return Optional.of(
-                    TradeIdea.shortIdea(symbol, last.close, atr5, "Trend pullback", confidence)
+                    TradeIdea.shortIdea(symbol, last.close, atr5, "Structure pullback SHORT", confidence)
             );
+        }
 
         return Optional.empty();
     }
@@ -119,25 +117,18 @@ public class DecisionEngine {
 
         public static double rsi(List<Double> closes, int period) {
             if (closes.size() <= period) return 50.0;
-
-            double gain = 0;
-            double loss = 0;
-
+            double gain = 0, loss = 0;
             for (int i = closes.size() - period; i < closes.size() - 1; i++) {
                 double diff = closes.get(i + 1) - closes.get(i);
                 if (diff > 0) gain += diff;
                 else loss -= diff;
             }
-
             if (loss == 0) return 100.0;
-
             double rs = gain / loss;
             return 100.0 - (100.0 / (1.0 + rs));
         }
 
         public static double atr(List<Candle> candles, int period) {
-            if (candles.size() <= period) return 0;
-
             double sum = 0;
             for (int i = candles.size() - period; i < candles.size(); i++) {
                 Candle c = candles.get(i);
@@ -147,25 +138,19 @@ public class DecisionEngine {
         }
 
         public static double ema(List<Double> values, int period) {
-            if (values.isEmpty()) return 0;
-
             double k = 2.0 / (period + 1);
             double ema = values.get(0);
-
-            for (int i = 1; i < values.size(); i++) {
+            for (int i = 1; i < values.size(); i++)
                 ema = values.get(i) * k + ema * (1 - k);
-            }
             return ema;
         }
 
         public static boolean isTrend(List<Candle> candles) {
             if (candles.size() < 30) return false;
-
             List<Double> closes = candles.stream().map(c -> c.close).toList();
-            double emaFast = ema(closes, 10);
-            double emaSlow = ema(closes, 30);
-
-            return Math.abs(emaFast - emaSlow) / emaSlow > 0.0015;
+            double fast = ema(closes, 10);
+            double slow = ema(closes, 30);
+            return Math.abs(fast - slow) / slow > 0.0015;
         }
     }
 }

@@ -38,171 +38,116 @@ public class DecisionEngineV2 {
         }
     }
 
-    // ================== Technical Analysis ==================
+    // ================== TA ==================
     public static class TA {
 
         public static double ema(List<Double> values, int period) {
-            if (values.isEmpty()) return 0;
             double k = 2.0 / (period + 1);
             double ema = values.get(0);
-            for (int i = 1; i < values.size(); i++) {
+            for (int i = 1; i < values.size(); i++)
                 ema = values.get(i) * k + ema * (1 - k);
-            }
             return ema;
         }
 
         public static double rsi(List<Double> closes, int period) {
-            if (closes.size() <= period) return 50.0;
             double gain = 0, loss = 0;
             for (int i = closes.size() - period; i < closes.size() - 1; i++) {
-                double diff = closes.get(i + 1) - closes.get(i);
-                if (diff > 0) gain += diff;
-                else loss -= diff;
+                double d = closes.get(i + 1) - closes.get(i);
+                if (d > 0) gain += d;
+                else loss -= d;
             }
-            if (loss == 0) return 100.0;
+            if (loss == 0) return 100;
             double rs = gain / loss;
-            return 100.0 - (100.0 / (1.0 + rs));
+            return 100 - (100 / (1 + rs));
         }
 
         public static double atr(List<Candle> candles, int period) {
-            if (candles.size() <= period) return 0;
             double sum = 0;
-            for (int i = candles.size() - period; i < candles.size(); i++) {
-                Candle c = candles.get(i);
-                sum += (c.high - c.low);
-            }
+            for (int i = candles.size() - period; i < candles.size(); i++)
+                sum += (candles.get(i).high - candles.get(i).low);
             return sum / period;
         }
     }
 
-    // ================== MAIN EVALUATE ==================
-    public Optional<TradeIdea> evaluate(String symbol,
-                                        List<Candle> candles5m,
-                                        List<Candle> candles15m,
-                                        List<Candle> candles1h,
-                                        List<Candle> candles4h) {
-
+    // ================== EVALUATE ==================
+    public Optional<TradeIdea> evaluate(
+            String symbol,
+            List<Candle> candles5m,
+            List<Candle> candles15m,
+            List<Candle> candles1h
+    ) {
         if (candles5m.size() < 50 || candles15m.size() < 50)
             return Optional.empty();
 
         // ===== 15m CONTEXT =====
         List<Double> closes15 = candles15m.stream().map(c -> c.close).collect(Collectors.toList());
-        double emaFast15 = TA.ema(closes15, 20);
-        double emaSlow15 = TA.ema(closes15, 50);
+        int contextDir =
+                TA.ema(closes15, 20) > TA.ema(closes15, 50) ? 1 :
+                        TA.ema(closes15, 20) < TA.ema(closes15, 50) ? -1 : 0;
 
-        int contextDir = 0;
-        if (emaFast15 > emaSlow15) contextDir = 1;
-        if (emaFast15 < emaSlow15) contextDir = -1;
         if (contextDir == 0) return Optional.empty();
 
-        // ===== HTF CONFIRMATION =====
-        if (!candles1h.isEmpty()) {
-            List<Double> closes1h = candles1h.stream().map(c -> c.close).collect(Collectors.toList());
-            double emaFast1h = TA.ema(closes1h, 20);
-            double emaSlow1h = TA.ema(closes1h, 50);
+        double confidence = 0.60;
 
-            if ((contextDir == 1 && emaFast1h < emaSlow1h) ||
-                    (contextDir == -1 && emaFast1h > emaSlow1h))
-                return Optional.empty();
+        // ===== HTF BIAS ONLY =====
+        if (!candles1h.isEmpty()) {
+            List<Double> closes1h = candles1h.stream().map(c -> c.close).toList();
+            boolean htfConflict =
+                    (contextDir == 1 && TA.ema(closes1h, 20) < TA.ema(closes1h, 50)) ||
+                            (contextDir == -1 && TA.ema(closes1h, 20) > TA.ema(closes1h, 50));
+            if (htfConflict) confidence -= 0.10;
         }
 
         // ===== 5m STATE =====
-        List<Double> closes5 = candles5m.stream().map(c -> c.close).collect(Collectors.toList());
+        List<Double> closes5 = candles5m.stream().map(c -> c.close).toList();
         double rsi5 = TA.rsi(closes5, 14);
         double atr5 = TA.atr(candles5m, 14);
 
         Candle last = candles5m.get(candles5m.size() - 1);
         Candle prev = candles5m.get(candles5m.size() - 2);
 
-        boolean impulseUp = last.close > last.open && last.close > prev.high;
-        boolean impulseDown = last.close < last.open && last.close < prev.low;
+        boolean structureBreakUp =
+                prev.close < prev.open &&
+                        last.close > prev.high &&
+                        (last.high - last.low) < atr5 * 1.2;
 
-        // ===== ATR FALLING (ANTI-LATE ENTRY) =====
-        double atrPrev1 = TA.atr(candles5m.subList(0, candles5m.size() - 1), 14);
-        double atrPrev2 = TA.atr(candles5m.subList(0, candles5m.size() - 2), 14);
+        boolean structureBreakDown =
+                prev.close > prev.open &&
+                        last.close < prev.low &&
+                        (last.high - last.low) < atr5 * 1.2;
 
-        boolean atrFalling = atr5 < atrPrev1 && atrPrev1 < atrPrev2;
+        // ===== ATR PHASE =====
+        double atrAvg = TA.atr(candles5m.subList(0, candles5m.size() - 5), 14);
+        boolean atrCompression = atr5 < atrAvg * 0.85;
+        if (atr5 > atrAvg * 1.5) return Optional.empty();
 
-        // ===== POST-CRASH REVERSAL (LONG ONLY) =====
-        double rangeSum = 0;
-        for (int i = candles5m.size() - 6; i < candles5m.size(); i++) {
-            Candle c = candles5m.get(i);
-            rangeSum += (c.high - c.low);
-        }
-        double avgRange = rangeSum / 6.0;
+        // ===== HARD RSI BLOCK =====
+        if (contextDir == 1 && rsi5 > 75) return Optional.empty();
+        if (contextDir == -1 && rsi5 < 25) return Optional.empty();
 
-        boolean flatAfterDump = avgRange < atr5 * 0.6;
-        boolean bullishClose =
-                last.close > last.open &&
-                        last.close > candles5m.get(candles5m.size() - 3).close;
+        confidence = Math.min(confidence + 0.10, 0.75);
 
-        if (contextDir == 1 && flatAfterDump && bullishClose) {
-            return Optional.of(
-                    TradeIdea.longIdea(
-                            symbol,
-                            last.close,
-                            atr5,
-                            "Post-crash reversal",
-                            0.65
-                    )
-            );
-        }
-
-        // ===== NOISE FILTER =====
-        if (rsi5 > 40 && rsi5 < 60)
-            return Optional.empty();
-
-        double candleRange = last.high - last.low;
-        if (candleRange > 1.5 * atr5)
-            return Optional.empty();
-
-        // ===== CONFIDENCE =====
-        double confidence = 0.60;
-        if (impulseUp || impulseDown) confidence += 0.10;
-        if (rsi5 < 20 || rsi5 > 80) confidence += 0.05;
-        if (contextDir == 1 && last.close > last.open) confidence += 0.05;
-        if (contextDir == -1 && last.close < last.open) confidence += 0.05;
-        confidence = Math.min(confidence, 0.75);
-
-        // ===== TREND PULLBACK =====
+        // ===== ENTRY =====
         if (contextDir == 1 &&
+                atrCompression &&
                 rsi5 > 35 && rsi5 < 50 &&
-                impulseUp) {
+                structureBreakUp) {
 
             return Optional.of(
-                    TradeIdea.longIdea(
-                            symbol,
-                            last.close,
-                            atr5,
-                            "Trend pullback (15m up)",
-                            confidence
-                    )
+                    TradeIdea.longIdea(symbol, last.close, atr5, "MTF structure LONG", confidence)
             );
         }
 
         if (contextDir == -1 &&
+                atrCompression &&
                 rsi5 < 65 && rsi5 > 50 &&
-                impulseDown &&
-                !atrFalling) {
+                structureBreakDown) {
 
             return Optional.of(
-                    TradeIdea.shortIdea(
-                            symbol,
-                            last.close,
-                            atr5,
-                            "Trend pullback (15m down)",
-                            confidence
-                    )
+                    TradeIdea.shortIdea(symbol, last.close, atr5, "MTF structure SHORT", confidence)
             );
         }
 
         return Optional.empty();
-    }
-
-    // ===== OVERLOAD =====
-    public Optional<TradeIdea> evaluate(String symbol,
-                                        List<Candle> candles5m,
-                                        List<Candle> candles15m) {
-        return evaluate(symbol, candles5m, candles15m, List.of(), List.of());
     }
 }

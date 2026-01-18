@@ -27,7 +27,7 @@ public class RiskEngine {
         s.confidence = confidence;
         s.reason = reason;
 
-        double risk = atr;
+        double risk = atr * (confidence > 0.65 ? 0.9 : 1.2);
         if (risk < entryPrice * 0.001)
             risk = entryPrice * 0.001;
         if (side.equalsIgnoreCase("LONG")) {
