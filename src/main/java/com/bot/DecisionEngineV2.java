@@ -39,7 +39,8 @@ public class DecisionEngineV2 {
     }
 
     // ================== Technical Analysis ==================
-    public static class TechnicalAnalysis {
+    public static class TA {
+
         public static double ema(List<Double> values, int period) {
             if (values.isEmpty()) return 0;
             double k = 2.0 / (period + 1);
@@ -74,43 +75,41 @@ public class DecisionEngineV2 {
         }
     }
 
-    // ================== Main Evaluate ==================
-    // минимально 3 таймфрейма: 5m, 15m, 1h. 4h опционально.
+    // ================== MAIN EVALUATE ==================
     public Optional<TradeIdea> evaluate(String symbol,
                                         List<Candle> candles5m,
                                         List<Candle> candles15m,
                                         List<Candle> candles1h,
                                         List<Candle> candles4h) {
-        if (candles5m.size() < 50 || candles15m.size() < 50) return Optional.empty();
 
-        // --- Контекст 15m ---
+        if (candles5m.size() < 50 || candles15m.size() < 50)
+            return Optional.empty();
+
+        // ===== 15m CONTEXT =====
         List<Double> closes15 = candles15m.stream().map(c -> c.close).collect(Collectors.toList());
-        double emaFast15 = TechnicalAnalysis.ema(closes15, 20);
-        double emaSlow15 = TechnicalAnalysis.ema(closes15, 50);
+        double emaFast15 = TA.ema(closes15, 20);
+        double emaSlow15 = TA.ema(closes15, 50);
+
         int contextDir = 0;
         if (emaFast15 > emaSlow15) contextDir = 1;
         if (emaFast15 < emaSlow15) contextDir = -1;
         if (contextDir == 0) return Optional.empty();
 
-        // --- Multi-TF фильтр ---
-        if (!candles1h.isEmpty() && !candles4h.isEmpty()) {
+        // ===== HTF CONFIRMATION =====
+        if (!candles1h.isEmpty()) {
             List<Double> closes1h = candles1h.stream().map(c -> c.close).collect(Collectors.toList());
-            List<Double> closes4h = candles4h.stream().map(c -> c.close).collect(Collectors.toList());
-            double emaFast1h = TechnicalAnalysis.ema(closes1h, 20);
-            double emaSlow1h = TechnicalAnalysis.ema(closes1h, 50);
-            double emaFast4h = TechnicalAnalysis.ema(closes4h, 20);
-            double emaSlow4h = TechnicalAnalysis.ema(closes4h, 50);
+            double emaFast1h = TA.ema(closes1h, 20);
+            double emaSlow1h = TA.ema(closes1h, 50);
 
-            if ((contextDir == 1 && (emaFast1h < emaSlow1h || emaFast4h < emaSlow4h)) ||
-                    (contextDir == -1 && (emaFast1h > emaSlow1h || emaFast4h > emaSlow4h))) {
+            if ((contextDir == 1 && emaFast1h < emaSlow1h) ||
+                    (contextDir == -1 && emaFast1h > emaSlow1h))
                 return Optional.empty();
-            }
         }
 
-        // --- Состояние 5m ---
+        // ===== 5m STATE =====
         List<Double> closes5 = candles5m.stream().map(c -> c.close).collect(Collectors.toList());
-        double rsi5 = TechnicalAnalysis.rsi(closes5, 14);
-        double atr5 = TechnicalAnalysis.atr(candles5m, 14);
+        double rsi5 = TA.rsi(closes5, 14);
+        double atr5 = TA.atr(candles5m, 14);
 
         Candle last = candles5m.get(candles5m.size() - 1);
         Candle prev = candles5m.get(candles5m.size() - 2);
@@ -118,34 +117,89 @@ public class DecisionEngineV2 {
         boolean impulseUp = last.close > last.open && last.close > prev.high;
         boolean impulseDown = last.close < last.open && last.close < prev.low;
 
-        // --- Фильтр флетового рынка ---
-        if (rsi5 > 40 && rsi5 < 60) return Optional.empty();
+        // ===== ATR FALLING (ANTI-LATE ENTRY) =====
+        double atrPrev1 = TA.atr(candles5m.subList(0, candles5m.size() - 1), 14);
+        double atrPrev2 = TA.atr(candles5m.subList(0, candles5m.size() - 2), 14);
 
-        // --- Фильтр шумных свечей ---
-        double range = last.high - last.low;
-        if (range > 1.5 * atr5) return Optional.empty();
+        boolean atrFalling = atr5 < atrPrev1 && atrPrev1 < atrPrev2;
 
-        // --- Динамический confidence ---
-        double confidence = 0.6;
-        if (impulseUp || impulseDown) confidence += 0.1;
+        // ===== POST-CRASH REVERSAL (LONG ONLY) =====
+        double rangeSum = 0;
+        for (int i = candles5m.size() - 6; i < candles5m.size(); i++) {
+            Candle c = candles5m.get(i);
+            rangeSum += (c.high - c.low);
+        }
+        double avgRange = rangeSum / 6.0;
+
+        boolean flatAfterDump = avgRange < atr5 * 0.6;
+        boolean bullishClose =
+                last.close > last.open &&
+                        last.close > candles5m.get(candles5m.size() - 3).close;
+
+        if (contextDir == 1 && flatAfterDump && bullishClose) {
+            return Optional.of(
+                    TradeIdea.longIdea(
+                            symbol,
+                            last.close,
+                            atr5,
+                            "Post-crash reversal",
+                            0.65
+                    )
+            );
+        }
+
+        // ===== NOISE FILTER =====
+        if (rsi5 > 40 && rsi5 < 60)
+            return Optional.empty();
+
+        double candleRange = last.high - last.low;
+        if (candleRange > 1.5 * atr5)
+            return Optional.empty();
+
+        // ===== CONFIDENCE =====
+        double confidence = 0.60;
+        if (impulseUp || impulseDown) confidence += 0.10;
         if (rsi5 < 20 || rsi5 > 80) confidence += 0.05;
         if (contextDir == 1 && last.close > last.open) confidence += 0.05;
         if (contextDir == -1 && last.close < last.open) confidence += 0.05;
         confidence = Math.min(confidence, 0.75);
 
-        // --- Сетап: Trend Pullback ---
-        if (contextDir == 1 && rsi5 > 35 && rsi5 < 50 && impulseUp) {
-            return Optional.of(TradeIdea.longIdea(symbol, last.close, atr5, "Trend pullback (15m up)", confidence));
+        // ===== TREND PULLBACK =====
+        if (contextDir == 1 &&
+                rsi5 > 35 && rsi5 < 50 &&
+                impulseUp) {
+
+            return Optional.of(
+                    TradeIdea.longIdea(
+                            symbol,
+                            last.close,
+                            atr5,
+                            "Trend pullback (15m up)",
+                            confidence
+                    )
+            );
         }
 
-        if (contextDir == -1 && rsi5 < 65 && rsi5 > 50 && impulseDown) {
-            return Optional.of(TradeIdea.shortIdea(symbol, last.close, atr5, "Trend pullback (15m down)", confidence));
+        if (contextDir == -1 &&
+                rsi5 < 65 && rsi5 > 50 &&
+                impulseDown &&
+                !atrFalling) {
+
+            return Optional.of(
+                    TradeIdea.shortIdea(
+                            symbol,
+                            last.close,
+                            atr5,
+                            "Trend pullback (15m down)",
+                            confidence
+                    )
+            );
         }
 
         return Optional.empty();
     }
 
-    // перегрузка без 4h для SignalSender
+    // ===== OVERLOAD =====
     public Optional<TradeIdea> evaluate(String symbol,
                                         List<Candle> candles5m,
                                         List<Candle> candles15m) {

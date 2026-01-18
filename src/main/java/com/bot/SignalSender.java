@@ -957,33 +957,60 @@ public class SignalSender {
                     continue;
                 }
                 // ===========================================================
-
                 Optional<DecisionEngineV2.TradeIdea> idea =
                         decisionEngine.evaluate(pair, c5m, c15m);
 
                 idea.ifPresent(i -> {
+
+                    // ===== ADAPTIVE CONFIDENCE =====
+                    double conf = i.confidence;
+
+                    // обучение по истории
+                    conf = brain.adaptConfidence(i.reason, conf);
+
+                    // бонус активных сессий (Лондон / NY)
+                    conf += brain.sessionBoost();
+
+                    // штраф за частые фейлы по монете
+                    conf += brain.impulsePenalty(pair);
+
+                    // жёсткие рамки
+                    conf = Math.max(0.50, Math.min(0.88, conf));
+
+                    // ===== COOLDOWN =====
+                    if (isCooldown(pair, i.side)) {
+                        return;
+                    }
+
+                    // ===== ATR / RISK =====
                     RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                             i.symbol.replace("USDT", ""),
                             i.side,
                             i.entry,
                             i.atr,
-                            i.confidence,
+                            conf,
                             i.reason
                     );
 
                     ts = addStopTake(ts, i.side, i.entry, i.atr);
 
-                    List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
-                    double rsi14 = SignalSender.rsi(closes5, 14);
-                    double rsi7 = SignalSender.rsi(closes5, 7);
-                    double rsi4 = SignalSender.rsi(closes5, 4);
+                    // ===== INDICATORS =====
+                    List<Double> closes5 = c5m.stream()
+                            .map(c -> c.close)
+                            .toList();
 
+                    double rsi14 = SignalSender.rsi(closes5, 14);
+                    double rsi7  = SignalSender.rsi(closes5, 7);
+                    double rsi4  = SignalSender.rsi(closes5, 4);
+
+                    // ===== NEXT 5 CANDLES FORECAST =====
                     List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
 
+                    // ===== BUILD SIGNAL =====
                     Signal s = new Signal(
-                            i.symbol.replace("USDT",""),
+                            i.symbol.replace("USDT", ""),
                             i.side,
-                            i.confidence,
+                            conf,
                             i.entry,
                             rsi14,
                             0.0,
@@ -1003,10 +1030,10 @@ public class SignalSender {
                     s.stop = ts.stop;
                     s.take = ts.take;
 
+                    // ===== SEND =====
                     sendRaw(s.toTelegramMessage());
-                    markSignalSent(pair, i.side, i.confidence);
+                    markSignalSent(pair, i.side, conf);
                 });
-
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
                 e.printStackTrace();
