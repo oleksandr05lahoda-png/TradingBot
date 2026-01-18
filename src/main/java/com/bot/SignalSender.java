@@ -59,7 +59,7 @@ public class SignalSender {
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
         // defaults (use env to override)
-        this.TOP_N = envInt("TOP_N", 90);
+        this.TOP_N = envInt("TOP_N", 80);
         this.MIN_CONF = 0.55;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
         this.KLINES_LIMIT = envInt("KLINES", 240);
@@ -902,11 +902,11 @@ public class SignalSender {
 
                 boolean crashDown =
                         last.close < prev.low &&
-                                body > 1.2 * atr5;
+                                body > 0.9 * atr5;
 
                 boolean crashUp =
                         last.close > prev.high &&
-                                body > 1.2 * atr5;
+                                body > 0.9 * atr5;
 
                 if (crashDown || crashUp) {
                     String side = crashDown ? "SHORT" : "LONG";
