@@ -6,6 +6,8 @@ import java.time.format.DateTimeFormatter;
 import java.net.URI;
 import java.net.http.*;
 import java.util.Optional;
+import com.bot.TradingCore;
+import com.bot.DecisionEngineMerged;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -47,10 +49,10 @@ public class SignalSender {
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
     private final AtomicLong dailyRequests = new AtomicLong(0);
-    private final DecisionEngineV2 decisionEngine = new DecisionEngineV2();
+    private final DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
+    private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
+    private final TradingCore.AdaptiveBrain adaptive = new TradingCore.AdaptiveBrain();
     private long dailyResetTs = System.currentTimeMillis();
-    private final AdaptiveBrain brain = new AdaptiveBrain();
-    private final RiskEngine riskEngine = new RiskEngine(10.0); // maxLeverage = 10, можешь изменить
     private ScheduledExecutorService scheduler;
     CandlePredictor predictor = new CandlePredictor();
 
@@ -142,12 +144,12 @@ public class SignalSender {
     }
     public class CandlePredictor {
 
-        public List<String> predictNextNCandlesDirection(List<Candle> candles, int n) {
+        public List<String> predictNextNCandlesDirection(List<TradingCore.Candle> candles, int n) {
             List<String> res = new ArrayList<>();
             if (candles.size() < 5) return res;
 
-            Candle last = candles.get(candles.size() - 1);
-            Candle prev = candles.get(candles.size() - 2);
+            TradingCore.Candle last = candles.get(candles.size() - 1);
+            TradingCore.Candle prev = candles.get(candles.size() - 2);
 
             double atr = atr(candles, 14);
             double body = Math.abs(last.close - last.open);
@@ -159,14 +161,15 @@ public class SignalSender {
 
             for (int i = 0; i < n; i++) res.add(dir);
             return res;
+
         }
 
-        public double computeForecastConfidence(List<Candle> pastCandles, int horizon, String dir) {
+        public double computeForecastConfidence(List<TradingCore.Candle> pastCandles, int horizon, String dir) {
             if (pastCandles == null || pastCandles.size() < horizon) return 0.5;
             int success = 0;
             for (int i = horizon; i < pastCandles.size(); i++) {
-                Candle start = pastCandles.get(i - horizon);
-                Candle end = pastCandles.get(i);
+                TradingCore.Candle start = pastCandles.get(i - horizon);
+                TradingCore.Candle end = pastCandles.get(i);
                 if ("LONG".equals(dir) && end.close > start.close) success++;
                 if ("SHORT".equals(dir) && end.close < start.close) success++;
             }
@@ -200,7 +203,7 @@ public class SignalSender {
             this.higherTFTrend = higherTFTrend;
         }
     }
-    public CompletableFuture<List<Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
+    public CompletableFuture<List<TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
             String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", symbol, interval, limit);
             HttpRequest req = HttpRequest.newBuilder()
@@ -217,7 +220,7 @@ public class SignalSender {
                             return Collections.emptyList();
                         }
                         JSONArray arr = new JSONArray(body);
-                        List<Candle> list = new ArrayList<>();
+                        List<TradingCore.Candle> list = new ArrayList<>();
                         for (int i = 0; i < arr.length(); i++) {
                             JSONArray k = arr.getJSONArray(i);
                             long openTime = k.getLong(0);
@@ -228,7 +231,7 @@ public class SignalSender {
                             double vol = Double.parseDouble(k.getString(5));
                             double qvol = Double.parseDouble(k.getString(7));
                             long closeTime = k.getLong(6);
-                            list.add(new Candle(openTime, open, high, low, close, vol, qvol, closeTime));
+                            list.add(new TradingCore.Candle(openTime, open, high, low, close, vol, qvol, closeTime));
                         }
                         return list;
                     });
@@ -250,7 +253,7 @@ public class SignalSender {
             this.intervalMs = intervalMs;
         }
 
-        public Optional<Candle> addTick(long tsMillis, double price, double qty) {
+        public Optional<TradingCore.Candle> addTick(long tsMillis, double price, double qty) {
             long bucket = (tsMillis / intervalMs) * intervalMs;
             if (currentBucketStart == -1) {
                 currentBucketStart = bucket;
@@ -269,7 +272,7 @@ public class SignalSender {
                 volume += qty;
                 return Optional.empty();
             } else {
-                Candle c = new Candle(currentBucketStart, open, high, low, close, volume, volume, closeTime);
+                TradingCore.Candle c = new TradingCore.Candle(currentBucketStart, open, high, low, close, volume, volume, closeTime);
                 currentBucketStart = bucket;
                 open = price;
                 high = price;
@@ -342,12 +345,12 @@ public class SignalSender {
     }
 
     // ATR
-    public static double atr(List<Candle> candles, int period) {
+    public static double atr(List<TradingCore.Candle> candles, int period) {
         if (candles == null || candles.size() <= period) return 0.0;
         List<Double> trs = new ArrayList<>();
         for (int i = 1; i < candles.size(); i++) {
-            Candle prev = candles.get(i - 1);
-            Candle cur = candles.get(i);
+            TradingCore.Candle prev = candles.get(i - 1);
+            TradingCore.Candle cur = candles.get(i);
             double highLow = cur.high - cur.low;
             double highClose = Math.abs(cur.high - prev.close);
             double lowClose = Math.abs(cur.low - prev.close);
@@ -368,10 +371,10 @@ public class SignalSender {
         return (last - prev) / (prev + 1e-12);
     }
 
-    public static double vwap(List<Candle> candles) {
+    public static double vwap(List<TradingCore.Candle> candles) {
         if (candles == null || candles.isEmpty()) return 0.0;
         double pv = 0.0, vol = 0.0;
-        for (Candle c : candles) {
+        for (TradingCore.Candle c : candles) {
             double tp = (c.high + c.low + c.close) / 3.0;
             pv += tp * c.volume;
             vol += c.volume;
@@ -380,7 +383,7 @@ public class SignalSender {
         return pv / vol;
     }
     // ========================= Price Action helpers =========================
-    public static List<Integer> detectSwingHighs(List<Candle> candles, int leftRight) {
+    public static List<Integer> detectSwingHighs(List<TradingCore.Candle> candles, int leftRight) {
         List<Integer> res = new ArrayList<>();
         for (int i = leftRight; i < candles.size() - leftRight; i++) {
             double v = candles.get(i).high;
@@ -396,7 +399,7 @@ public class SignalSender {
         return res;
     }
 
-    public static List<Integer> detectSwingLows(List<Candle> candles, int leftRight) {
+    public static List<Integer> detectSwingLows(List<TradingCore.Candle> candles, int leftRight) {
         List<Integer> res = new ArrayList<>();
         for (int i = leftRight; i < candles.size() - leftRight; i++) {
             double v = candles.get(i).low;
@@ -412,7 +415,7 @@ public class SignalSender {
         return res;
     }
 
-    public static int marketStructure(List<Candle> candles) {
+    public static int marketStructure(List<TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 20) return 0;
         List<Integer> highs = detectSwingHighs(candles, 3);
         List<Integer> lows = detectSwingLows(candles, 3);
@@ -434,12 +437,12 @@ public class SignalSender {
         return 0;
     }
 
-    public static boolean detectBOS(List<Candle> candles) {
+    public static boolean detectBOS(List<TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 10) return false;
         List<Integer> highs = detectSwingHighs(candles, 3);
         List<Integer> lows = detectSwingLows(candles, 3);
         if (highs.size() < 2 && lows.size() < 2) return false;
-        Candle last = candles.get(candles.size() - 1);
+        TradingCore.Candle last = candles.get(candles.size() - 1);
         if (highs.size() >= 2) {
             double lastSwingHigh = candles.get(highs.get(highs.size() - 1)).high;
             if (last.close > lastSwingHigh * 1.0006) return true;
@@ -451,11 +454,11 @@ public class SignalSender {
         return false;
     }
 
-    public static boolean detectLiquiditySweep(List<Candle> candles) {
+    public static boolean detectLiquiditySweep(List<TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 6) return false;
         int n = candles.size();
-        Candle last = candles.get(n - 1);
-        Candle prev = candles.get(n - 2);
+        TradingCore.Candle last = candles.get(n - 1);
+        TradingCore.Candle prev = candles.get(n - 2);
         double upperWick = last.high - Math.max(last.open, last.close);
         double lowerWick = Math.min(last.open, last.close) - last.low;
         double body = Math.abs(last.close - last.open);
@@ -465,7 +468,7 @@ public class SignalSender {
     }
 
     // EMA direction helper (with hysteresis)
-    private int emaDirection(List<Candle> candles, int shortP, int longP, double hysteresis) {
+    private int emaDirection(List<TradingCore.Candle> candles, int shortP, int longP, double hysteresis) {
         if (candles == null || candles.size() < longP + 2) return 0;
         List<Double> closes = candles.stream().map(c -> c.close).collect(Collectors.toList());
         double s = ema(closes, shortP);
@@ -527,11 +530,11 @@ public class SignalSender {
             boolean liquiditySweep,
             String pair // добавляем pair для истории
     ) {
-        double conf = brain.adaptConfidence("FAST-MOMENTUM", 0.72);
+        double conf = adaptive.adaptConfidence("FAST-MOMENTUM", 0.72);
 
-        conf = brain.adaptConfidence("FAST-MOMENTUM", conf);
-        conf += brain.impulsePenalty(pair);
-        conf += brain.sessionBoost();
+        conf = adaptive.adaptConfidence("FAST-MOMENTUM", conf);
+        conf += adaptive.impulsePenalty(pair);
+        conf += adaptive.sessionBoost();
 
         conf = Math.max(0.55, Math.min(0.85, conf));
 
@@ -549,21 +552,21 @@ public class SignalSender {
         }
         return Math.max(0.0, Math.min(1.0, conf));
     }
-    private double lastSwingLow(List<Candle> candles) {
+    private double lastSwingLow(List<TradingCore.Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double low = Double.POSITIVE_INFINITY;
         for (int i = candles.size() - lookback; i < candles.size(); i++)
             low = Math.min(low, candles.get(i).low);
         return low;
     }
-    private double lastSwingHigh(List<Candle> candles) {
+    private double lastSwingHigh(List<TradingCore.Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double high = Double.NEGATIVE_INFINITY;
         for (int i = candles.size() - lookback; i < candles.size(); i++)
             high = Math.max(high, candles.get(i).high);
         return high;
     }
-    private RiskEngine.TradeSignal addStopTake(RiskEngine.TradeSignal ts, String direction, double price, double atr) {
+    private TradingCore.RiskEngine.TradeSignal addStopTake(TradingCore.RiskEngine.TradeSignal ts, String direction, double price, double atr) {
 
         double risk = atr * 1.2; // базовый риск
 
@@ -578,7 +581,7 @@ public class SignalSender {
     }
     private void sendSignalIfAllowed(String pair,
                                      Signal s,
-                                     List<Candle> closes5m) {
+                                     List<TradingCore.Candle> closes5m) {
 
         // 1) Минимальная уверенность
         if (s.confidence < MIN_CONF) return;
@@ -587,7 +590,7 @@ public class SignalSender {
         if (isCooldown(pair, s.direction)) return;
 
         // 3) risk + stop/take
-        RiskEngine.TradeSignal ts = riskEngine.applyRisk(
+        TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                 s.symbol,
                 s.direction,
                 s.price,
@@ -770,7 +773,7 @@ public class SignalSender {
         }
     }
     // ========================= Misc helpers =========================
-    private boolean earlyTrendTrigger(List<Candle> candles) {
+    private boolean earlyTrendTrigger(List<TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 3) return false;
         int bull = 0, bear = 0;
         for (int i = candles.size() - 3; i < candles.size(); i++) {
@@ -786,9 +789,9 @@ public class SignalSender {
             System.out.println("[sendRaw] " + e.getMessage());
         }
     }
-    public List<Candle> fetchKlines(String symbol, String interval, int limit) {
+    public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
-            List<Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
+            List<TradingCore.Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
             if (candles.isEmpty()) {
                 System.out.println("[KLİNES] Пустой ответ для " + symbol + " интервал " + interval);
             } else {
@@ -826,7 +829,7 @@ public class SignalSender {
         List<String> list = getTopSymbols(limit); // используем существующий метод List<String>
         return new HashSet<>(list); // конвертируем в Set
     }
-    private void sendFastSignal(String pair, String dir, double price, double atr, List<Candle> c5m) {
+    private void sendFastSignal(String pair, String dir, double price, double atr, List<TradingCore.Candle> c5m) {
 
         double rsi14 = rsi(c5m.stream().map(c -> c.close).toList(), 14);
         List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
@@ -851,7 +854,7 @@ public class SignalSender {
                 next5
         );
 
-        RiskEngine.TradeSignal ts =
+        TradingCore.RiskEngine.TradeSignal ts =
                 riskEngine.applyRisk(s.symbol, s.direction, price, atr, s.confidence, "FAST-MOMENTUM");
 
         s.stop = ts.stop;
@@ -863,25 +866,25 @@ public class SignalSender {
         Set<String> symbols = getTopSymbolsSet(TOP_N);
         for (String pair : symbols) {
             try {
-                CompletableFuture<List<Candle>> f5 =
+                CompletableFuture<List<TradingCore.Candle>> f5 =
                         fetchKlinesAsync(pair, "5m", KLINES_LIMIT);
-                CompletableFuture<List<Candle>> f15 =
+                CompletableFuture<List<TradingCore.Candle>> f15 =
                         fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
-                CompletableFuture<List<Candle>> f1h =
+                CompletableFuture<List<TradingCore.Candle>> f1h =
                         fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
 
                 CompletableFuture.allOf(f5, f15, f1h).join();
 
-                List<Candle> c5m = f5.join();
-                List<Candle> c15m = f15.join();
-                List<Candle> c1h = f1h.join();
+                List<TradingCore.Candle> c5m = f5.join();
+                List<TradingCore.Candle> c15m = f15.join();
+                List<TradingCore.Candle> c1h = f1h.join();
 
                 if (c5m.size() < 20 || c15m.isEmpty()) continue;
 
                 // ================= FAST MOMENTUM STRATEGY =================
-                Candle last = c5m.get(c5m.size() - 1);
-                Candle prev = c5m.get(c5m.size() - 2);
-                Candle prev2 = c5m.get(c5m.size() - 3);
+                TradingCore.Candle last = c5m.get(c5m.size() - 1);
+                TradingCore.Candle prev = c5m.get(c5m.size() - 2);
+                TradingCore.Candle prev2 = c5m.get(c5m.size() - 3);
 
                 double atr5 = SignalSender.atr(c5m, 14);
                 double body = Math.abs(last.close - last.open);
@@ -910,7 +913,7 @@ public class SignalSender {
 
                     List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
 
-                    RiskEngine.TradeSignal ts = riskEngine.applyRisk(
+                    TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                             pair.replace("USDT",""),
                             side,
                             last.close,
@@ -946,15 +949,15 @@ public class SignalSender {
                     markSignalSent(pair, side, conf);
                     continue;
                 }
-                Optional<DecisionEngineV2.TradeIdea> idea =
+                Optional<DecisionEngineMerged.TradeIdea> idea =
                         decisionEngine.evaluate(pair, c5m, c15m, c1h);
 
                 idea.ifPresent(i -> {
 
                     double conf = i.confidence;
-                    conf = brain.adaptConfidence(i.reason, conf);
-                    conf += brain.sessionBoost();
-                    conf += brain.impulsePenalty(pair);
+                    conf = adaptive.adaptConfidence(i.reason, conf);
+                    conf += adaptive.sessionBoost();
+                    conf += adaptive.impulsePenalty(pair);
                     conf = Math.max(0.50, Math.min(0.88, conf));
 
                     if (isCooldown(pair, i.side)) return;
@@ -962,7 +965,7 @@ public class SignalSender {
                     double entryPrice = i.entry;
 
                     // risk + stop/take
-                    RiskEngine.TradeSignal ts = riskEngine.applyRisk(
+                    TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                             pair.replace("USDT",""),
                             i.side,
                             entryPrice,
@@ -1012,5 +1015,88 @@ public class SignalSender {
                 e.printStackTrace();
             }
         }
+    }
+    // ========================= BACKTEST (5m only) =========================
+    public void backtest5m(String pair, int historyCandles) {
+        List<TradingCore.Candle> candles = fetchKlines(pair, "5m", historyCandles);
+
+        if (candles.size() < 200) {
+            System.out.println("[BACKTEST] not enough candles for " + pair);
+            return;
+        }
+
+        int wins = 0, losses = 0, total = 0;
+        double profit = 0.0;
+
+        // Прогоняем свечи как будто мы в прошлом:
+        // i = 100, чтобы хватало данных для индикаторов
+        for (int i = 100; i < candles.size(); i++) {
+
+            List<TradingCore.Candle> window = candles.subList(0, i + 1); // до текущей свечи
+
+            // 5m candles
+            List<TradingCore.Candle> c5m = new ArrayList<>(window);
+
+            // 15m/1h нам не нужны (у тебя backtest только 5m)
+            List<TradingCore.Candle> c15m = Collections.emptyList();
+            List<TradingCore.Candle> c1h = Collections.emptyList();
+
+            Optional<DecisionEngineMerged.TradeIdea> idea =
+                    decisionEngine.evaluate(pair, c5m, c15m, c1h);
+
+            if (idea.isEmpty()) continue;
+
+            DecisionEngineMerged.TradeIdea iIdea = idea.get();
+
+            double conf = iIdea.confidence;
+            conf = adaptive.adaptConfidence(iIdea.reason, conf);
+            conf += adaptive.sessionBoost();
+            conf += adaptive.impulsePenalty(pair);
+            conf = Math.max(0.50, Math.min(0.88, conf));
+
+            // simulate signal
+            double entry = iIdea.entry;
+            double atr = iIdea.atr;
+
+            TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
+                    pair.replace("USDT",""),
+                    iIdea.side,
+                    entry,
+                    atr,
+                    conf,
+                    "BACKTEST"
+            );
+            ts = addStopTake(ts, iIdea.side, entry, atr);
+
+            // считаем результат через 1 свечу (упрощённо)
+            TradingCore.Candle nextCandle = candles.get(i + 1);
+
+            boolean win = false;
+            boolean loss = false;
+
+            if (iIdea.side.equals("LONG")) {
+                if (nextCandle.low <= ts.stop) loss = true;
+                else if (nextCandle.high >= ts.take) win = true;
+            } else {
+                if (nextCandle.high >= ts.stop) loss = true;
+                else if (nextCandle.low <= ts.take) win = true;
+            }
+
+            if (win) {
+                wins++;
+                profit += Math.abs(ts.take - entry);
+            } else if (loss) {
+                losses++;
+                profit -= Math.abs(entry - ts.stop);
+            }
+
+            if (win || loss) total++;
+        }
+
+        System.out.println("[BACKTEST] " + pair +
+                " total=" + total +
+                " wins=" + wins +
+                " losses=" + losses +
+                " profit=" + String.format("%.4f", profit));
     }
 }
