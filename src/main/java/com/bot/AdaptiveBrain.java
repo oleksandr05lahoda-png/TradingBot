@@ -27,7 +27,6 @@ public class AdaptiveBrain {
         if (total < 20) return 0.5;
         return (double) s.wins / total;
     }
-
     // ====== 2. ADAPTIVE CONFIDENCE ======
     public double adaptConfidence(String strategy, double baseConf) {
         double wr = winrate(strategy);
@@ -35,7 +34,6 @@ public class AdaptiveBrain {
         if (wr < 0.45) return Math.max(0.55, baseConf - 0.05);
         return baseConf;
     }
-
     // ====== 3. IMPULSE SESSION CONTROL ======
     private final Map<String, Deque<Long>> impulseHistory = new ConcurrentHashMap<>();
 

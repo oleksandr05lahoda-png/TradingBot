@@ -30,7 +30,6 @@ public class RiskEngine {
         double risk = atr;
         if (risk < entryPrice * 0.001)
             risk = entryPrice * 0.001;
-
         if (side.equalsIgnoreCase("LONG")) {
             s.stop = entryPrice - risk;
             s.take = entryPrice + risk * 2;
