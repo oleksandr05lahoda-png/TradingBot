@@ -59,7 +59,7 @@ public class SignalSender {
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
         // defaults (use env to override)
-        this.TOP_N = envInt("TOP_N", 60);
+        this.TOP_N = envInt("TOP_N", 90);
         this.MIN_CONF = 0.55;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 5);
         this.KLINES_LIMIT = envInt("KLINES", 240);
