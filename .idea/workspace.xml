@@ -6,12 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/AdaptiveBrain.java" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/Candle.java" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngine.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineV2.java" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/RiskEngine.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -265,7 +260,8 @@
       <workItem from="1768693340064" duration="6000" />
       <workItem from="1768697554017" duration="6802000" />
       <workItem from="1768735573846" duration="3445000" />
-      <workItem from="1768745214059" duration="10280000" />
+      <workItem from="1768745214059" duration="11088000" />
+      <workItem from="1768759695630" duration="327000" />
     </task>
     <servers />
   </component>

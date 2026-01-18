@@ -136,6 +136,25 @@ public class DecisionEngineMerged {
         public String reason;
     }
 
+    // ================== MultiTF helpers ==================
+    private int emaDirection(List<TradingCore.Candle> candles, int fast, int slow) {
+        List<Double> closes = candles.stream().map(c -> c.close).collect(Collectors.toList());
+        double emaFast = TA.ema(closes, fast);
+        double emaSlow = TA.ema(closes, slow);
+        if (emaFast > emaSlow) return 1;
+        if (emaFast < emaSlow) return -1;
+        return 0;
+    }
+
+    private int multiTFConfirm(List<TradingCore.Candle> c5m, List<TradingCore.Candle> c15m, List<TradingCore.Candle> c1h) {
+        int dir5 = emaDirection(c5m, 20, 50);
+        int dir15 = emaDirection(c15m, 20, 50);
+        int dir1h = (c1h != null && c1h.size() >= 50) ? emaDirection(c1h, 20, 50) : 0;
+
+        // Вес 5m=1, 15m=2, 1h=3
+        return dir5 * 1 + dir15 * 2 + dir1h * 3;
+    }
+
     // ================== EVALUATE ==================
     public Optional<TradeIdea> evaluate(
             String symbol,
@@ -148,7 +167,18 @@ public class DecisionEngineMerged {
         if (candles5m.size() < 50 || candles15m.size() < 50)
             return Optional.empty();
 
+        if (candles1h != null && candles1h.size() < 50)
+            candles1h = null;
+
+        List<Double> closes5 = candles5m.stream().map(c -> c.close).collect(Collectors.toList());
         List<Double> closes15 = candles15m.stream().map(c -> c.close).collect(Collectors.toList());
+
+        double rsi5 = TA.rsi(closes5, 14);
+        double rsi15 = TA.rsi(closes15, 14);
+
+        double atr5 = TA.atr(candles5m, 14);
+        double atrAvg = TA.atr(candles5m.subList(0, candles5m.size() - 5), 14);
+
         int contextDir =
                 TA.ema(closes15, 20) > TA.ema(closes15, 50) ? 1 :
                         TA.ema(closes15, 20) < TA.ema(closes15, 50) ? -1 : 0;
@@ -157,10 +187,6 @@ public class DecisionEngineMerged {
 
         AdaptiveBrain.Regime regime = adaptive.detectRegime(candles5m);
         if (regime == AdaptiveBrain.Regime.CHAOS) return Optional.empty();
-
-        List<Double> closes5 = candles5m.stream().map(c -> c.close).collect(Collectors.toList());
-        double rsi5 = TA.rsi(closes5, 14);
-        double atr5 = TA.atr(candles5m, 14);
 
         TradingCore.Candle last = candles5m.get(candles5m.size() - 1);
         TradingCore.Candle prev = candles5m.get(candles5m.size() - 2);
@@ -185,22 +211,36 @@ public class DecisionEngineMerged {
                         last.close < prev.close &&
                         last.close > prev.low;
 
-        double atrAvg = TA.atr(candles5m.subList(0, candles5m.size() - 5), 14);
         boolean atrCompression = atr5 < atrAvg * 0.85;
         if (atr5 > atrAvg * 1.5) return Optional.empty();
 
-        double rsi15 = TA.rsi(closes15, 14);
+        // Убираем резкие свечи
+        double lastRange = last.high - last.low;
+        if (lastRange > atr5 * 2.0) return Optional.empty();
+
         if (contextDir == 1 && rsi15 > 70) return Optional.empty();
         if (contextDir == -1 && rsi15 < 30) return Optional.empty();
 
         if (contextDir == 1 && rsi5 > 75) return Optional.empty();
         if (contextDir == -1 && rsi5 < 25) return Optional.empty();
 
-        double confidence = 0.60;
+        double confidence = 0.30;
+
+        int mtf = multiTFConfirm(candles5m, candles15m, candles1h);
+        confidence += mtf * 0.15;
+
+        if (rsi5 < 25 || rsi5 > 75) confidence -= 0.05;
+        else confidence += 0.05;
+
+        if (atr5 < atrAvg * 0.85) confidence += 0.05;
+
         confidence += adaptive.sessionBoost();
         confidence += adaptive.impulsePenalty(symbol);
-        confidence = Math.min(confidence + 0.10, 0.80);
-        confidence = adaptive.adaptConfidence("decisionMerged", confidence);
+
+        // адаптация по winrate
+        confidence = adaptive.adaptConfidence("MTF", confidence);
+
+        confidence = Math.max(0.50, Math.min(0.90, confidence));
 
         if (contextDir == 1 &&
                 atrCompression &&
@@ -233,5 +273,87 @@ public class DecisionEngineMerged {
         }
 
         return Optional.empty();
+    }
+
+
+    // ================== BACKTEST ==================
+
+    public static class BacktestResult {
+        public int trades = 0;
+        public int wins = 0;
+        public int losses = 0;
+        public double totalPnL = 0;
+        public double maxDrawdown = 0;
+
+        @Override
+        public String toString() {
+            double winrate = trades == 0 ? 0 : (double) wins / trades;
+            return "BacktestResult{" +
+                    "trades=" + trades +
+                    ", wins=" + wins +
+                    ", losses=" + losses +
+                    ", winrate=" + String.format("%.2f", winrate * 100) + "%" +
+                    ", totalPnL=" + String.format("%.4f", totalPnL) +
+                    ", maxDrawdown=" + String.format("%.4f", maxDrawdown) +
+                    '}';
+        }
+    }
+
+    /**
+     * Backtest based on fixed stop/take
+     * Stop = entry - ATR
+     * Take = entry + ATR*2
+     */
+    public BacktestResult backtest(
+            String symbol,
+            List<TradingCore.Candle> candles5m,
+            List<TradingCore.Candle> candles15m,
+            List<TradingCore.Candle> candles1h
+    ) {
+
+        BacktestResult result = new BacktestResult();
+        if (candles5m == null || candles15m == null) return result;
+        if (candles5m.size() < 60 || candles15m.size() < 60) return result;
+
+        // step by step through candles
+        for (int i = 60; i < candles5m.size(); i++) {
+
+            List<TradingCore.Candle> slice5 = candles5m.subList(0, i);
+            List<TradingCore.Candle> slice15 = candles15m.size() >= i ? candles15m.subList(0, i / 3) : candles15m;
+            List<TradingCore.Candle> slice1h = (candles1h != null && candles1h.size() >= i / 12) ? candles1h.subList(0, i / 12) : null;
+
+            Optional<TradeIdea> ideaOpt = evaluate(symbol, slice5, slice15, slice1h);
+
+            if (ideaOpt.isEmpty()) continue;
+
+            TradeIdea idea = ideaOpt.get();
+
+            double stop = idea.side.equals("LONG") ? idea.entry - idea.atr : idea.entry + idea.atr;
+            double take = idea.side.equals("LONG") ? idea.entry + idea.atr * 2 : idea.entry - idea.atr * 2;
+
+            // simulate next candle only
+            TradingCore.Candle next = candles5m.get(i);
+            boolean win = idea.side.equals("LONG")
+                    ? (next.high >= take)
+                    : (next.low <= take);
+
+            boolean loss = idea.side.equals("LONG")
+                    ? (next.low <= stop)
+                    : (next.high >= stop);
+
+            // if both hit, assume worst case: stop first
+            if (win && loss) win = false;
+
+            result.trades++;
+            if (win) result.wins++;
+            else if (loss) result.losses++;
+            result.totalPnL += win ? (take - idea.entry) : (idea.entry - stop);
+
+            // drawdown simple calc
+            double equity = result.totalPnL;
+            if (equity < result.maxDrawdown) result.maxDrawdown = equity;
+        }
+
+        return result;
     }
 }
