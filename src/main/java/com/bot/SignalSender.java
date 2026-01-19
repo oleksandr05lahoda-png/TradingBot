@@ -527,33 +527,24 @@ public class SignalSender {
             boolean vwapAligned,
             boolean structureAligned,
             boolean bos,
-            boolean liquiditySweep,
-            String pair // добавляем pair для истории
+            boolean liquiditySweep
     ) {
-        double conf = 0.55;
-        conf += 0.05; // + тренд
-        conf += 0.05; // + импульс
-        conf = Math.max(0.50, Math.min(0.88, conf));
+        double conf = 0.45;
 
-        conf = adaptive.adaptConfidence("FAST-MOMENTUM", conf);
-        conf += adaptive.impulsePenalty(pair);
-        conf += adaptive.sessionBoost();
-
-        conf = Math.max(0.55, Math.min(0.85, conf));
-
-
-        // ===== Базовая оценка =====
-        conf += Math.min(1.0, Math.abs(rawScore));
-
-        if (mtfConfirm != 0) conf += 0.1;
-        if (volOk) conf += 0.1;
-        if (atrOk) conf += 0.1;
+        conf += Math.abs(rawScore) * 0.35; // основной вклад
+        if (mtfConfirm != 0) conf += 0.08;
+        if (volOk) conf += 0.06;
+        if (atrOk) conf += 0.06;
         if (impulse) conf += 0.05;
-        if (vwapAligned) conf += 0.05;
-        if (liquiditySweep && Math.abs(rawScore) > 0.2) {
-            conf -= 0.25;
-        }
-        return Math.max(0.0, Math.min(1.0, conf));
+        if (vwapAligned) conf += 0.04;
+        if (structureAligned) conf += 0.05;
+        if (bos) conf += 0.04;
+
+        // ликвидность как штраф
+        if (liquiditySweep) conf -= 0.10;
+
+        conf = Math.max(0.40, Math.min(0.90, conf));
+        return conf;
     }
     private double lastSwingLow(List<TradingCore.Candle> candles) {
         int lookback = Math.min(20, candles.size());
@@ -606,7 +597,7 @@ public class SignalSender {
 
         bot.sendSignal(s.toTelegramMessage());  // отправка
 
-        markSignalSent(pair, s.direction, s.confidence);
+        markSignalSent(pair, s.direction);
     }
     public static class Signal {
         public final String symbol;
@@ -670,14 +661,16 @@ public class SignalSender {
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
     private boolean isCooldown(String pair, String direction) {
         long now = System.currentTimeMillis();
-        long last = lastSignalTimeDir.getOrDefault(pair, new ConcurrentHashMap<>())
-                .getOrDefault("ANY", 0L);
+        long last = lastSignalTimeDir
+                .getOrDefault(pair, new ConcurrentHashMap<>())
+                .getOrDefault(direction, 0L);
+
         return (now - last) < COOLDOWN_MS;
     }
 
-    public void markSignalSent(String pair, String direction, double confidence) {
+    private void markSignalSent(String pair, String direction) {
         lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
-                .put("ANY", System.currentTimeMillis());
+                .put(direction, System.currentTimeMillis());
     }
     public void connectTickWebSocket(String pair) {
         try {
@@ -931,9 +924,6 @@ public class SignalSender {
                             .map(c -> c.close)
                             .collect(Collectors.toList());
                     double rsi14 = SignalSender.rsi(closes5, 14);
-
-                    if (side.equals("LONG") && rsi14 > 70) continue;
-                    if (side.equals("SHORT") && rsi14 < 30) continue;
 
                     double conf = 0.55;
                     conf += 0.05; // + тренд

@@ -32,12 +32,20 @@ public class DecisionEngineMerged {
             return 100 - (100 / (1 + rs));
         }
 
+        // ==== TRUE ATR (правильный) ====
         public static double atr(List<TradingCore.Candle> candles, int period) {
-            if (candles == null || candles.size() < period) return 0;
-            double sum = 0;
-            for (int i = candles.size() - period; i < candles.size(); i++)
-                sum += (candles.get(i).high - candles.get(i).low);
-            return sum / period;
+            if (candles == null || candles.size() < period + 1) return 0;
+            List<Double> trs = new ArrayList<>();
+            for (int i = candles.size() - period; i < candles.size(); i++) {
+                TradingCore.Candle cur = candles.get(i);
+                TradingCore.Candle prev = candles.get(i - 1);
+                double tr = Math.max(
+                        cur.high - cur.low,
+                        Math.max(Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close))
+                );
+                trs.add(tr);
+            }
+            return trs.stream().mapToDouble(Double::doubleValue).average().orElse(0);
         }
 
         public static int marketStructure(List<TradingCore.Candle> candles) {
@@ -52,7 +60,7 @@ public class DecisionEngineMerged {
         }
     }
 
-    // ================== AdaptiveBrain (из SuperBrain) ==================
+    // ================== AdaptiveBrain ==================
     public static class AdaptiveBrain {
 
         private static class OutcomeStat {
@@ -79,8 +87,8 @@ public class DecisionEngineMerged {
 
         public double adaptConfidence(String strategy, double baseConf) {
             double wr = winrate(strategy);
-            if (wr > 0.60) return Math.min(0.85, baseConf + 0.05);
-            if (wr < 0.45) return Math.max(0.55, baseConf - 0.05);
+            if (wr > 0.60) return Math.min(0.90, baseConf + 0.06);
+            if (wr < 0.45) return Math.max(0.45, baseConf - 0.06);
             return baseConf;
         }
 
@@ -164,7 +172,7 @@ public class DecisionEngineMerged {
     ) {
 
         if (candles5m == null || candles15m == null) return Optional.empty();
-        if (candles5m.size() < 50 || candles15m.size() < 50)
+        if (candles5m.size() < 60 || candles15m.size() < 60)
             return Optional.empty();
 
         if (candles1h != null && candles1h.size() < 50)
@@ -179,27 +187,25 @@ public class DecisionEngineMerged {
         double atr5 = TA.atr(candles5m, 14);
         double atrAvg = TA.atr(candles5m.subList(0, candles5m.size() - 5), 14);
 
+        // ================= CONTEXT TREND (15m) =================
         int contextDir =
                 TA.ema(closes15, 20) > TA.ema(closes15, 50) ? 1 :
                         TA.ema(closes15, 20) < TA.ema(closes15, 50) ? -1 : 0;
 
-        if (contextDir == 0) return Optional.empty();
-
+        // ================= REGIME (only affects confidence) =================
         AdaptiveBrain.Regime regime = adaptive.detectRegime(candles5m);
-        if (regime == AdaptiveBrain.Regime.CHAOS) return Optional.empty();
 
+        // ================= STRUCTURE (5m) =================
         TradingCore.Candle last = candles5m.get(candles5m.size() - 1);
         TradingCore.Candle prev = candles5m.get(candles5m.size() - 2);
 
         boolean structureBreakUp =
                 prev.close < prev.open &&
-                        last.close > prev.high &&
-                        (last.high - last.low) < atr5 * 1.2;
+                        last.close > prev.high;
 
         boolean structureBreakDown =
                 prev.close > prev.open &&
-                        last.close < prev.low &&
-                        (last.high - last.low) < atr5 * 1.2;
+                        last.close < prev.low;
 
         boolean pullbackLong =
                 prev.close < prev.open &&
@@ -212,72 +218,90 @@ public class DecisionEngineMerged {
                         last.close > prev.low;
 
         boolean atrCompression = atr5 < atrAvg * 0.85;
-        if (atr5 > atrAvg * 1.5) return Optional.empty();
+        if (atr5 > atrAvg * 1.7) return Optional.empty(); // too volatile
 
-        // Убираем резкие свечи
         double lastRange = last.high - last.low;
-        if (lastRange > atr5 * 2.0) return Optional.empty();
+        if (lastRange > atr5 * 2.5) return Optional.empty();
 
-        if (contextDir == 1 && rsi15 > 70) return Optional.empty();
-        if (contextDir == -1 && rsi15 < 30) return Optional.empty();
+        // ================= RSI soft filter =================
+        double rsiPenalty = 0;
+        if (contextDir == 1 && rsi15 > 75) rsiPenalty -= 0.05;
+        if (contextDir == -1 && rsi15 < 25) rsiPenalty -= 0.05;
+        if (contextDir == 1 && rsi5 > 80) rsiPenalty -= 0.05;
+        if (contextDir == -1 && rsi5 < 20) rsiPenalty -= 0.05;
 
-        if (contextDir == 1 && rsi5 > 75) return Optional.empty();
-        if (contextDir == -1 && rsi5 < 25) return Optional.empty();
-
-        double confidence = 0.30;
-
+        // ================= MULTITF =================
         int mtf = multiTFConfirm(candles5m, candles15m, candles1h);
-        confidence += mtf * 0.15;
 
-        if (rsi5 < 25 || rsi5 > 75) confidence -= 0.05;
-        else confidence += 0.05;
+        // ================= CONFIDENCE (scoring) =================
+        double confidence = 0.45;
 
-        if (atr5 < atrAvg * 0.85) confidence += 0.05;
+        // trend factor
+        confidence += contextDir == 1 ? 0.10 : contextDir == -1 ? 0.10 : 0.00;
 
+        // MTF factor
+        confidence += Math.max(-0.15, Math.min(0.15, mtf * 0.04));
+
+        // structure factor
+        if (structureBreakUp || structureBreakDown) confidence += 0.07;
+        if (pullbackLong || pullbackShort) confidence += 0.05;
+        if (atrCompression) confidence += 0.04;
+
+        // RSI factor
+        if (rsi5 > 55 && contextDir == 1) confidence += 0.03;
+        if (rsi5 < 45 && contextDir == -1) confidence += 0.03;
+        confidence += rsiPenalty;
+
+        // regime penalty
+        if (regime == AdaptiveBrain.Regime.CHAOS) confidence -= 0.08;
+        if (regime == AdaptiveBrain.Regime.RANGE) confidence -= 0.03;
+
+        // session/impulse/adaptive
         confidence += adaptive.sessionBoost();
         confidence += adaptive.impulsePenalty(symbol);
-
-        // адаптация по winrate
         confidence = adaptive.adaptConfidence("MTF", confidence);
 
-        confidence = Math.max(0.50, Math.min(0.90, confidence));
+        confidence = Math.max(0.45, Math.min(0.90, confidence));
 
-        if (contextDir == 1 &&
-                atrCompression &&
-                rsi5 > 35 && rsi5 < 50 &&
-                (structureBreakUp || pullbackLong)) {
+        // ================= ENTRIES (больше сигналов, но с фильтрами) =================
+        boolean longSignal =
+                (contextDir == 1 && (structureBreakUp || pullbackLong || atrCompression)) ||
+                        (contextDir == 0 && (structureBreakUp || pullbackLong));
 
+        boolean shortSignal =
+                (contextDir == -1 && (structureBreakDown || pullbackShort || atrCompression)) ||
+                        (contextDir == 0 && (structureBreakDown || pullbackShort));
+
+        // RSI safety
+        if (longSignal && !(rsi5 > 25 && rsi5 < 85)) longSignal = false;
+        if (shortSignal && !(rsi5 > 15 && rsi5 < 75)) shortSignal = false;
+
+        if (longSignal && confidence >= 0.50) {
             TradeIdea idea = new TradeIdea();
             idea.symbol = symbol;
             idea.side = "LONG";
             idea.entry = last.close;
             idea.atr = atr5;
             idea.confidence = confidence;
-            idea.reason = "MTF structure LONG";
+            idea.reason = "MTF+structure LONG";
             return Optional.of(idea);
         }
 
-        if (contextDir == -1 &&
-                atrCompression &&
-                rsi5 < 65 && rsi5 > 50 &&
-                (structureBreakDown || pullbackShort)) {
-
+        if (shortSignal && confidence >= 0.50) {
             TradeIdea idea = new TradeIdea();
             idea.symbol = symbol;
             idea.side = "SHORT";
             idea.entry = last.close;
             idea.atr = atr5;
             idea.confidence = confidence;
-            idea.reason = "MTF structure SHORT";
+            idea.reason = "MTF+structure SHORT";
             return Optional.of(idea);
         }
 
         return Optional.empty();
     }
 
-
     // ================== BACKTEST ==================
-
     public static class BacktestResult {
         public int trades = 0;
         public int wins = 0;
@@ -299,11 +323,6 @@ public class DecisionEngineMerged {
         }
     }
 
-    /**
-     * Backtest based on fixed stop/take
-     * Stop = entry - ATR
-     * Take = entry + ATR*2
-     */
     public BacktestResult backtest(
             String symbol,
             List<TradingCore.Candle> candles5m,
@@ -315,7 +334,6 @@ public class DecisionEngineMerged {
         if (candles5m == null || candles15m == null) return result;
         if (candles5m.size() < 60 || candles15m.size() < 60) return result;
 
-        // step by step through candles
         for (int i = 60; i < candles5m.size(); i++) {
 
             List<TradingCore.Candle> slice5 = candles5m.subList(0, i);
@@ -323,7 +341,6 @@ public class DecisionEngineMerged {
             List<TradingCore.Candle> slice1h = (candles1h != null && candles1h.size() >= i / 12) ? candles1h.subList(0, i / 12) : null;
 
             Optional<TradeIdea> ideaOpt = evaluate(symbol, slice5, slice15, slice1h);
-
             if (ideaOpt.isEmpty()) continue;
 
             TradeIdea idea = ideaOpt.get();
@@ -331,7 +348,6 @@ public class DecisionEngineMerged {
             double stop = idea.side.equals("LONG") ? idea.entry - idea.atr : idea.entry + idea.atr;
             double take = idea.side.equals("LONG") ? idea.entry + idea.atr * 2 : idea.entry - idea.atr * 2;
 
-            // simulate next candle only
             TradingCore.Candle next = candles5m.get(i);
             boolean win = idea.side.equals("LONG")
                     ? (next.high >= take)
@@ -341,7 +357,6 @@ public class DecisionEngineMerged {
                     ? (next.low <= stop)
                     : (next.high >= stop);
 
-            // if both hit, assume worst case: stop first
             if (win && loss) win = false;
 
             result.trades++;
@@ -349,7 +364,6 @@ public class DecisionEngineMerged {
             else if (loss) result.losses++;
             result.totalPnL += win ? (take - idea.entry) : (idea.entry - stop);
 
-            // drawdown simple calc
             double equity = result.totalPnL;
             if (equity < result.maxDrawdown) result.maxDrawdown = equity;
         }
