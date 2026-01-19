@@ -6,8 +6,6 @@ import java.time.format.DateTimeFormatter;
 import java.net.URI;
 import java.net.http.*;
 import java.util.Optional;
-import com.bot.TradingCore;
-import com.bot.DecisionEngineMerged;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -49,6 +47,7 @@ public class SignalSender {
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
     private final AtomicLong dailyRequests = new AtomicLong(0);
+    private final Map<String, String> lastSideByPair = new ConcurrentHashMap<>();
     private final DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
     private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
     private final TradingCore.AdaptiveBrain adaptive = new TradingCore.AdaptiveBrain();
@@ -158,8 +157,11 @@ public class SignalSender {
                 if (lastWindow.get(i).close > lastWindow.get(i - 1).close) longCount++;
                 else shortCount++;
             }
+            String dir;
+            if (longCount > shortCount + 3) dir = "LONG";
+            else if (shortCount > longCount + 3) dir = "SHORT";
+            else dir = "MIXED";
 
-            String dir = longCount >= shortCount ? "LONG" : "SHORT";
             for (int i = 0; i < n; i++) res.add(dir);
             return res;
         }
@@ -467,17 +469,18 @@ public class SignalSender {
         return false;
     }
 
-    // EMA direction helper (with hysteresis)
-    private int emaDirection(List<TradingCore.Candle> candles, int shortP, int longP, double hysteresis) {
-        if (candles == null || candles.size() < longP + 2) return 0;
-        List<Double> closes = candles.stream().map(c -> c.close).collect(Collectors.toList());
-        double s = ema(closes, shortP);
-        double l = ema(closes, longP);
-        if (s > l * (1 + hysteresis)) return 1;
-        if (s < l * (1 - hysteresis)) return -1;
-        return 0;
-    }
+    private int emaDirection(List<TradingCore.Candle> candles, int fast, int slow) {
+        if (candles == null || candles.size() < Math.max(slow + 5, 60)) return 0;
 
+        List<Double> closes = candles.subList(candles.size() - 60, candles.size())
+                .stream()
+                .map(c -> c.close)
+                .collect(Collectors.toList());
+
+        double emaFast = ema(closes, fast);
+        double emaSlow = ema(closes, slow);
+        return Double.compare(emaFast, emaSlow);
+    }
     private double strategyEMANorm(List<Double> closes) {
         if (closes == null || closes.size() < 100) return 0.0;
         double e20 = ema(closes, 20);
@@ -573,13 +576,22 @@ public class SignalSender {
         }
         return ts;
     }
+
     private void sendSignalIfAllowed(String pair,
                                      Signal s,
                                      List<TradingCore.Candle> closes5m) {
 
         if (s.confidence < MIN_CONF) return;
 
+        // ❗ анти-дубль — ГЛОБАЛЬНЫЙ
+        String lastSide = lastSideByPair.get(pair);
+        if (lastSide != null && lastSide.equals(s.direction)) {
+            return;
+        }
+
         if (isCooldown(pair, s.direction)) return;
+
+        lastSideByPair.put(pair, s.direction);
 
         TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                 pair,
@@ -617,13 +629,12 @@ public class SignalSender {
         public final boolean impulse;
         public Double stop;
         public Double take;
-        public final boolean earlyTrigger;
         public final Instant created = Instant.now();
         public final List<String> next5Candles;
 
         public Signal(String symbol, String direction, double confidence, double price, double rsi,
                       double rawScore, int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger,
-                      boolean atrBreakLong, boolean atrBreakShort, boolean impulse, boolean earlyTrigger,
+                      boolean atrBreakLong, boolean atrBreakShort, boolean impulse,
                       double rsi7, double rsi4, List<String> next5Candles) {
             this.symbol = symbol;
             this.direction = direction;
@@ -638,7 +649,6 @@ public class SignalSender {
             this.atrBreakLong = atrBreakLong;
             this.atrBreakShort = atrBreakShort;
             this.impulse = impulse;
-            this.earlyTrigger = earlyTrigger;
             this.rsi7 = rsi7;
             this.rsi4 = rsi4;
             this.next5Candles = next5Candles;
@@ -646,7 +656,6 @@ public class SignalSender {
 
         public String toTelegramMessage() {
             String flags = (strongTrigger ? "⚡strong " : "") +
-                    (earlyTrigger ? "⚡early " : "") +
                     (atrBreakLong ? "ATR↑ " : "") +
                     (atrBreakShort ? "ATR↓ " : "") +
                     (impulse ? "IMPULSE " : "");
@@ -761,16 +770,6 @@ public class SignalSender {
             return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT");
         }
     }
-    // ========================= Misc helpers =========================
-    private boolean earlyTrendTrigger(List<TradingCore.Candle> candles) {
-        if (candles == null || candles.size() < 3) return false;
-        int bull = 0, bear = 0;
-        for (int i = candles.size() - 3; i < candles.size(); i++) {
-            if (candles.get(i).isBull()) bull++;
-            if (candles.get(i).isBear()) bear++;
-        }
-        return (bull >= 2 && bear <= 1) || (bear >= 2 && bull <= 1);
-    }
     private void sendRaw(String msg) {
         try {
             bot.sendSignal(msg);
@@ -819,7 +818,7 @@ public class SignalSender {
         return new HashSet<>(list); // конвертируем в Set
     }
     private void sendFastSignal(String pair, String dir, double price, double atr, List<TradingCore.Candle> c5m) {
-        double rsi14 = rsi(c5m.stream().map(c -> c.close).toList(), 14);
+        double rsi14 = rsi(c5m.stream().map(c -> c.close).collect(Collectors.toList()), 14);
         List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
 
         double conf = 0.60; // или композить
@@ -832,17 +831,17 @@ public class SignalSender {
                 rsi14,
                 0.0,
                 0,
-                true,
-                true,
-                true,
-                dir.equals("LONG"),
-                dir.equals("SHORT"),
-                true,
-                false,
-                rsi(c5m.stream().map(c->c.close).toList(),7),
-                rsi(c5m.stream().map(c->c.close).toList(),4),
+                true,                             // volOk
+                true,                             // atrOk
+                true,                             // strongTrigger
+                dir.equals("LONG"),               // atrBreakLong
+                dir.equals("SHORT"),              // atrBreakShort
+                true,                             // impulse
+                rsi(c5m.stream().map(c -> c.close).collect(Collectors.toList()), 7),
+                rsi(c5m.stream().map(c -> c.close).collect(Collectors.toList()), 4),
                 next5
         );
+
 
         sendSignalIfAllowed(pair, s, c5m);
     }
@@ -901,13 +900,11 @@ public class SignalSender {
 
                 if (c5m.size() < 20 || c15m.isEmpty()) continue;
 
-                // ================= FAST MOMENTUM STRATEGY =================
+                // ================= FAST MOMENTUM STRATEGY (ONLY IF ALIGN WITH HTF) =================
                 TradingCore.Candle last = c5m.get(c5m.size() - 1);
                 TradingCore.Candle prev = c5m.get(c5m.size() - 2);
-                TradingCore.Candle prev2 = c5m.get(c5m.size() - 3);
 
                 double atr5 = SignalSender.atr(c5m, 14);
-                double body = Math.abs(last.close - last.open);
 
                 boolean crashDown =
                         prev.close < c5m.get(c5m.size() - 3).low &&
@@ -917,22 +914,23 @@ public class SignalSender {
                         prev.close > c5m.get(c5m.size() - 3).high * 1.003 &&
                                 Math.abs(prev.close - prev.open) > 1.2 * atr5;
 
-                if (crashDown || crashUp) {
+// HIGHER TF STRUCTURE (15m)
+                int htf15 = marketStructure(c15m); // 1=bull, -1=bear, 0=sideways
+
+                if (crashUp && htf15 == -1) { /* против тренда — запрещено */ }
+                else if (crashDown && htf15 == 1) { /* против тренда — запрещено */ }
+                else if (crashUp || crashDown) {
+
                     String side = crashDown ? "SHORT" : "LONG";
 
-                    List<Double> closes5 = c5m.stream()
-                            .map(c -> c.close)
-                            .collect(Collectors.toList());
+                    // Сильный фильтр: RSI не должен быть в зоне перекуп/перепрод
+                    List<Double> closes5 = c5m.stream().map(c -> c.close).collect(Collectors.toList());
                     double rsi14 = SignalSender.rsi(closes5, 14);
+                    if (side.equals("LONG") && rsi14 > 75) continue;
+                    if (side.equals("SHORT") && rsi14 < 25) continue;
 
-                    double conf = 0.55;
-                    conf += 0.05; // + тренд
-                    conf += 0.05; // + импульс
-                    conf = Math.max(0.50, Math.min(0.88, conf));
-
-
-                    double rsi7 = SignalSender.rsi(closes5, 7);
-                    double rsi4 = SignalSender.rsi(closes5, 4);
+                    double conf = 0.62; // сразу выше порога
+                    conf = Math.max(0.60, Math.min(0.88, conf));
 
                     List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
 
@@ -959,9 +957,8 @@ public class SignalSender {
                             side.equals("LONG"),
                             side.equals("SHORT"),
                             true,
-                            false,
-                            rsi7,
-                            rsi4,
+                            SignalSender.rsi(new ArrayList<>(closes5), 7),
+                            SignalSender.rsi(new ArrayList<>(closes5), 4),
                             next5
                     );
 
@@ -975,7 +972,6 @@ public class SignalSender {
                         decisionEngine.evaluate(pair, c5m, c15m, c1h);
 
                 idea.ifPresent(i -> {
-
                     double conf = i.confidence;
                     conf = adaptive.adaptConfidence(i.reason, conf);
                     conf += adaptive.sessionBoost();
@@ -984,7 +980,6 @@ public class SignalSender {
 
                     double entryPrice = i.entry;
 
-                    // risk + stop/take
                     TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                             pair,
                             i.side,
@@ -995,16 +990,13 @@ public class SignalSender {
                     );
                     ts = addStopTake(ts, i.side, entryPrice, i.atr);
 
-                    // indicators
-                    List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
+                    List<Double> closes5 = c5m.stream().map(c -> c.close).collect(Collectors.toList());
                     double rsi14 = SignalSender.rsi(closes5, 14);
                     double rsi7  = SignalSender.rsi(closes5, 7);
                     double rsi4  = SignalSender.rsi(closes5, 4);
 
-                    // next 5 forecast
                     List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
 
-                    // build signal
                     Signal s = new Signal(
                             i.symbol,
                             i.side,
@@ -1013,22 +1005,22 @@ public class SignalSender {
                             rsi14,
                             0.0,
                             0,
-                            true,
-                            true,
-                            true,
-                            false,
-                            false,
-                            true,
-                            false,
+                            true,              // volOk
+                            true,              // atrOk
+                            true,              // strongTrigger
+                            false,             // atrBreakLong
+                            false,             // atrBreakShort
+                            true,              // impulse
                             rsi7,
                             rsi4,
                             next5
                     );
 
+
                     s.stop = ts.stop;
                     s.take = ts.take;
 
-                    sendSignalIfAllowed(pair, s, c5m);
+                    sendSignalIfAllowed(pair, s, c5m); // <-- ВАЖНО!!!
                 });
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
