@@ -145,8 +145,13 @@ public class DecisionEngineMerged {
 
         if (context == 0) return Optional.empty();
 
-        boolean bosUp = prev.close < prev.open && last.close > prev.high;
-        boolean bosDown = prev.close > prev.open && last.close < prev.low;
+        boolean bosUp =
+                last.close > prev.high ||
+                        (last.high > prev.high && last.close > prev.close + atr * 0.3);
+
+        boolean bosDown =
+                last.close < prev.low ||
+                        (last.low < prev.low && last.close < prev.close - atr * 0.3);
 
         boolean acceptLong =
                 last.close > prev.high &&
@@ -157,30 +162,37 @@ public class DecisionEngineMerged {
                         (last.high - last.low) < atr * 1.5;
 
         int mtf = mtfScore(c5, c15, c1h);
-
         boolean longSig =
                 context == 1 &&
-                        mtf >= 2 &&
+                        mtf >= 1 &&
                         bosUp &&
-                        acceptLong &&
-                        rsi5 < 75 &&
-                        rsi15 < 70;
+                        acceptLong;
 
         boolean shortSig =
                 context == -1 &&
-                        mtf <= -2 &&
+                        mtf <= -1 &&
                         bosDown &&
-                        acceptShort &&
-                        rsi5 > 25 &&
-                        rsi15 > 30;
+                        acceptShort;
 
         if (!longSig && !shortSig) return Optional.empty();
 
         String side = longSig ? "LONG" : "SHORT";
-        if (side.equals(lastSignal.get(symbol))) return Optional.empty();
-        lastSignal.put(symbol, side);
 
         double conf = 0.55;
+
+        if (side.equals(lastSignal.get(symbol))) {
+            conf -= 0.07;
+        }
+        lastSignal.put(symbol, side);
+
+        // RSI penalties instead of hard filters
+        if (side.equals("LONG")) {
+            if (rsi5 > 75) conf -= 0.05;
+            if (rsi15 > 70) conf -= 0.05;
+        } else {
+            if (rsi5 < 25) conf -= 0.05;
+            if (rsi15 < 30) conf -= 0.05;
+        }
         conf += Math.min(0.20, Math.abs(mtf) * 0.05);
         if (bosUp || bosDown) conf += 0.08;
         conf += adaptive.sessionBoost();

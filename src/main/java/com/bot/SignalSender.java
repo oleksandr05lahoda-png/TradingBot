@@ -50,7 +50,8 @@ public class SignalSender {
     private final Map<String, String> lastSideByPair = new ConcurrentHashMap<>();
     private final DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
     private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
-    private final TradingCore.AdaptiveBrain adaptive = new TradingCore.AdaptiveBrain();
+    private final DecisionEngineMerged.AdaptiveBrain adaptive = new DecisionEngineMerged.AdaptiveBrain();
+    private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     private long dailyResetTs = System.currentTimeMillis();
     private ScheduledExecutorService scheduler;
     CandlePredictor predictor = new CandlePredictor();
@@ -580,14 +581,16 @@ public class SignalSender {
     private void sendSignalIfAllowed(String pair,
                                      Signal s,
                                      List<TradingCore.Candle> closes5m) {
+        if (signalsThisCycle >= 3) return; // <-- ДОБАВИТЬ
 
         if (s.confidence < MIN_CONF) return;
 
         // ❗ анти-дубль — ГЛОБАЛЬНЫЙ
         String lastSide = lastSideByPair.get(pair);
         if (lastSide != null && lastSide.equals(s.direction)) {
-            return;
+            if (s.confidence < 0.75) return;
         }
+
 
         if (isCooldown(pair, s.direction)) return;
 
@@ -607,8 +610,8 @@ public class SignalSender {
 
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
-        bot.sendSignal(s.toTelegramMessage());  // отправка
-
+        bot.sendSignal(s.toTelegramMessage());
+        signalsThisCycle++;// отправка
         markSignalSent(pair, s.direction);
     }
     public static class Signal {
@@ -882,6 +885,7 @@ public class SignalSender {
         return res;
     }
     private void runSchedulerCycle() {
+        signalsThisCycle = 0; // <-- ДОБАВИТЬ
         Set<String> symbols = getTopSymbolsSet(TOP_N);
         for (String pair : symbols) {
             try {
@@ -973,9 +977,6 @@ public class SignalSender {
 
                 idea.ifPresent(i -> {
                     double conf = i.confidence;
-                    conf = adaptive.adaptConfidence(i.reason, conf);
-                    conf += adaptive.sessionBoost();
-                    conf += adaptive.impulsePenalty(pair);
                     conf = Math.max(0.50, Math.min(0.88, conf));
 
                     double entryPrice = i.entry;
@@ -1057,9 +1058,8 @@ public class SignalSender {
             DecisionEngineMerged.TradeIdea iIdea = idea.get();
 
             double conf = iIdea.confidence;
-            conf = adaptive.adaptConfidence(iIdea.reason, conf);
+            conf = adaptive.adapt("CORE", conf);
             conf += adaptive.sessionBoost();
-            conf += adaptive.impulsePenalty(pair);
             conf = Math.max(0.50, Math.min(0.88, conf));
 
             // simulate signal
