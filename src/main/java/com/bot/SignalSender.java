@@ -1106,7 +1106,6 @@ public class SignalSender {
                 e.printStackTrace();
             }
         }
-
         System.out.println("[Cycle] signals sent: " + signalsThisCycle);
     }
 
