@@ -47,6 +47,7 @@ public class SignalSender {
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
     private final Map<String, Long> lastSignalCandleTs = new ConcurrentHashMap<>();
+    private final Intraday5BarEngine intraday5 = new Intraday5BarEngine();
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private final DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
     private Set<String> cachedPairs = new HashSet<>();
@@ -71,7 +72,7 @@ public class SignalSender {
         this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
         this.VOL_MULTIPLIER = envDouble("VOL_MULT", 0.9);
         this.ATR_MIN_PCT = envDouble("ATR_MIN_PCT", 0.0007);
-        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 300000);
+        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 120000);
         long brMin = envLong("BINANCE_REFRESH_MINUTES", 60);
         this.BINANCE_REFRESH_INTERVAL_MS = brMin * 60 * 1000L;
 
@@ -505,7 +506,28 @@ public class SignalSender {
         double score = (r - 50) / 50.0;  // теперь результат в [-1,1]
         return Math.max(-1.0, Math.min(1.0, score));
     }
+    private double holdProbability5Bars(
+            List<TradingCore.Candle> c5m,
+            String direction
+    ) {
+        if (c5m.size() < 30) return 0.5;
 
+        List<Double> closes = c5m.stream().map(c -> c.close).toList();
+
+        double emaScore = strategyEMANorm(closes);
+        double momScore = strategyMomentumNorm(closes);
+        double rsi = rsi(closes, 14);
+
+        double dir = direction.equals("LONG") ? 1 : -1;
+
+        double score =
+                dir * emaScore * 0.45 +
+                        dir * momScore * 0.35 +
+                        (dir == 1 ? (50 - rsi) : (rsi - 50)) / 50 * 0.20;
+
+        double prob = 0.5 + score * 0.4;
+        return Math.max(0.1, Math.min(0.9, prob));
+    }
     private double strategyMACDNorm(List<Double> closes) {
         if (closes == null || closes.size() < 26) return 0.0;
         double macd = ema(closes, 12) - ema(closes, 26);
@@ -591,7 +613,8 @@ public class SignalSender {
         if (isCooldown(pair, s.direction)) return;
         if (closes5m.size() < 4) return;
         long candleTs = closes5m.get(closes5m.size() - 2).openTime;
-        if (lastSignalCandleTs.getOrDefault(pair, 0L) == candleTs) return;
+        Long lastTs = lastSignalCandleTs.get(pair);
+        if (lastTs != null && Math.abs(candleTs - lastTs) < 2 * 60_000) return;
         lastSignalCandleTs.put(pair, candleTs);
 
         TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
@@ -939,8 +962,6 @@ public class SignalSender {
                     );
 
                     List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
-                    String forecast = next5.get(0);
-
 
                     TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                             pair,
@@ -972,9 +993,6 @@ public class SignalSender {
 
                     s.stop = ts.stop;
                     s.take = ts.take;
-                    if (forecast.equals("MIXED")) continue;
-                    if (forecast.equals("LONG") && s.direction.equals("SHORT")) continue;
-                    if (forecast.equals("SHORT") && s.direction.equals("LONG")) continue;
 
                     sendSignalIfAllowed(pair, s, c5m);
                     continue;
@@ -1009,7 +1027,6 @@ public class SignalSender {
                             + strategyMomentumNorm(closes5) * 0.20
                             + strategyMACDNorm(closes5) * 0.20;
 
-                    List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
                     double atrVal = atr(c5m, 14);
                     double atrPct = atrVal / (i.entry + 1e-12);
                     boolean atrOk = atrPct > ATR_MIN_PCT;
@@ -1021,7 +1038,7 @@ public class SignalSender {
                     int dir15 = marketStructure(c15m);
                     int dir1h = marketStructure(c1h);
                     int mtfConfirm = multiTFConfirm(dir1h, dir15, dir5);
-
+                    List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
                     Signal s = new Signal(
                             i.symbol,
                             i.side,
@@ -1044,11 +1061,10 @@ public class SignalSender {
                     s.stop = ts.stop;
                     s.take = ts.take;
 
-                    String forecast = next5.get(0);
-                    if (forecast.equals("LONG") && s.direction.equals("SHORT")) return;
-                    if (forecast.equals("SHORT") && s.direction.equals("LONG")) return;
+                    double p5 = holdProbability5Bars(c5m, s.direction);
+                    if (p5 < 0.58) return;
 
-                    sendSignalIfAllowed(pair, s, c5m); // <-- ВАЖНО!!!
+                    sendSignalIfAllowed(pair, s, c5m);
                 });
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
