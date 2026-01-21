@@ -95,7 +95,6 @@ public class DecisionEngineMerged {
     }
 
     private final AdaptiveBrain adaptive = new AdaptiveBrain();
-    private final Map<String, String> lastSignal = new ConcurrentHashMap<>();
 
     /* ============================ DTO =========================== */
     public static class TradeIdea {
@@ -138,52 +137,43 @@ public class DecisionEngineMerged {
         double rsi5 = TA.rsi(cl5, 14);
         double rsi15 = TA.rsi(cl15, 14);
         double atr = TA.atr(c5, 14);
+        double rsiPrev = TA.rsi(cl5.subList(0, cl5.size() - 3), 14);
+
+        double priceNow = last.close;
+        double pricePrev = c5.get(c5.size() - 4).close;
+
+        boolean bearishDiv =
+                priceNow > pricePrev &&
+                        rsi5 < rsiPrev &&
+                        rsi5 > 55;
+
+        boolean bullishDiv =
+                priceNow < pricePrev &&
+                        rsi5 > rsiPrev &&
+                        rsi5 < 45;
 
         int context =
                 TA.ema(cl15, 20) > TA.ema(cl15, 50) ? 1 :
                         TA.ema(cl15, 20) < TA.ema(cl15, 50) ? -1 : 0;
 
-        if (context == 0) return Optional.empty();
-
-        boolean bosUp =
-                last.close > prev.high ||
-                        (last.high > prev.high && last.close > prev.close + atr * 0.3);
-
-        boolean bosDown =
-                last.close < prev.low ||
-                        (last.low < prev.low && last.close < prev.close - atr * 0.3);
-
-        boolean acceptLong =
-                last.close > prev.high &&
-                        (last.high - last.low) < atr * 1.5;
-
-        boolean acceptShort =
-                last.close < prev.low &&
-                        (last.high - last.low) < atr * 1.5;
-
         int mtf = mtfScore(c5, c15, c1h);
         boolean longSig =
-                context == 1 &&
-                        mtf >= 1 &&
-                        bosUp &&
-                        acceptLong;
+                bullishDiv &&
+                        context <= 0 &&
+                        mtf >= -2 &&
+                        (last.high - last.low) < atr * 1.3;
 
         boolean shortSig =
-                context == -1 &&
-                        mtf <= -1 &&
-                        bosDown &&
-                        acceptShort;
+                bearishDiv &&
+                        context >= 0 &&
+                        mtf <= 2 &&
+                        (last.high - last.low) < atr * 1.3;
 
         if (!longSig && !shortSig) return Optional.empty();
 
         String side = longSig ? "LONG" : "SHORT";
 
         double conf = 0.55;
-
-        if (side.equals(lastSignal.get(symbol))) {
-            conf -= 0.07;
-        }
-        lastSignal.put(symbol, side);
 
         // RSI penalties instead of hard filters
         if (side.equals("LONG")) {
@@ -193,8 +183,7 @@ public class DecisionEngineMerged {
             if (rsi5 < 25) conf -= 0.05;
             if (rsi15 < 30) conf -= 0.05;
         }
-        conf += Math.min(0.20, Math.abs(mtf) * 0.05);
-        if (bosUp || bosDown) conf += 0.08;
+        conf += Math.min(0.10, Math.abs(mtf) * 0.03);
         conf += adaptive.sessionBoost();
         conf += adaptive.impulsePenalty(symbol);
         conf = adaptive.adapt("CORE", conf);
@@ -206,7 +195,7 @@ public class DecisionEngineMerged {
         t.entry = last.close;
         t.atr = atr;
         t.confidence = conf;
-        t.reason = "HTF trend + BOS + acceptance";
+        t.reason = "RSI divergence + exhaustion (5-bar forecast)";
 
         return Optional.of(t);
     }

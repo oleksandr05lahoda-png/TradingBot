@@ -43,18 +43,25 @@ public class Intraday5BarEngine {
 
         // ===== 5. Score
         double score = 0.0;
-        if (bull >= 4 && emaVel > 0) score += 0.35;
-        if (bear >= 4 && emaVel < 0) score += 0.35;
+        if (bull >= 4 && emaVel < 0) score += 0.40;
+        if (bear >= 4 && emaVel > 0) score += 0.40;
         if (Math.abs(emaVel) > atr * 0.15) score += 0.20;
         if (htfBias != 0) score += 0.10;
 
         if (score < 0.60) return Optional.empty();
 
-        String side = bull > bear ? "LONG" : "SHORT";
+        boolean exhaustionUp =
+                bull >= 4 &&
+                        emaVel < 0;
 
-        // ❌ запрет против сильного HTF
-        if (side.equals("LONG") && htfBias < 0) return Optional.empty();
-        if (side.equals("SHORT") && htfBias > 0) return Optional.empty();
+        boolean exhaustionDown =
+                bear >= 4 &&
+                        emaVel > 0;
+
+        String side;
+        if (exhaustionUp) side = "SHORT";
+        else if (exhaustionDown) side = "LONG";
+        else return Optional.empty();
 
         DecisionEngineMerged.TradeIdea t = new DecisionEngineMerged.TradeIdea();
         t.symbol = symbol;
