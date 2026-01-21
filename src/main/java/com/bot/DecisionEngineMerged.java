@@ -85,7 +85,7 @@ public class DecisionEngineMerged {
             q.addLast(now);
             while (!q.isEmpty() && now - q.peekFirst() > 20 * 60_000)
                 q.pollFirst();
-            return q.size() >= 2 ? -0.05 : 0;
+            return q.size() >= 4 ? -0.04 : 0;
         }
 
         public double sessionBoost() {
@@ -137,19 +137,16 @@ public class DecisionEngineMerged {
         double rsi5 = TA.rsi(cl5, 14);
         double rsi15 = TA.rsi(cl15, 14);
         double atr = TA.atr(c5, 14);
-        double rsiPrev = TA.rsi(cl5.subList(0, cl5.size() - 3), 14);
-
-        double priceNow = last.close;
-        double pricePrev = c5.get(c5.size() - 4).close;
+        double rsiPrevLocal = TA.rsi(cl5.subList(0, cl5.size() - 1), 14);
 
         boolean bearishDiv =
-                priceNow > pricePrev &&
-                        rsi5 < rsiPrev &&
+                last.close > prev.close &&
+                        rsi5 < rsiPrevLocal &&
                         rsi5 > 55;
 
         boolean bullishDiv =
-                priceNow < pricePrev &&
-                        rsi5 > rsiPrev &&
+                last.close < prev.close &&
+                        rsi5 > rsiPrevLocal &&
                         rsi5 < 45;
 
         int context =
@@ -158,16 +155,13 @@ public class DecisionEngineMerged {
 
         int mtf = mtfScore(c5, c15, c1h);
         boolean longSig =
-                bullishDiv &&
-                        context <= 0 &&
-                        mtf >= -2 &&
-                        (last.high - last.low) < atr * 1.3;
+                (bullishDiv || rsi5 < 35 || mtf > 0) &&
+                        (last.high - last.low) < atr * 2.2;
 
         boolean shortSig =
-                bearishDiv &&
-                        context >= 0 &&
-                        mtf <= 2 &&
-                        (last.high - last.low) < atr * 1.3;
+                (bearishDiv || rsi5 > 65 || mtf < 0) &&
+                        (last.high - last.low) < atr * 2.2;
+
 
         if (!longSig && !shortSig) return Optional.empty();
 
@@ -177,17 +171,19 @@ public class DecisionEngineMerged {
 
         // RSI penalties instead of hard filters
         if (side.equals("LONG")) {
-            if (rsi5 > 75) conf -= 0.05;
-            if (rsi15 > 70) conf -= 0.05;
+            if (rsi5 > 80) conf -= 0.03;
+            if (rsi15 > 70) conf -= 0.03;
         } else {
             if (rsi5 < 25) conf -= 0.05;
             if (rsi15 < 30) conf -= 0.05;
         }
         conf += Math.min(0.10, Math.abs(mtf) * 0.03);
         conf += adaptive.sessionBoost();
-        conf += adaptive.impulsePenalty(symbol);
+        conf += adaptive.impulsePenalty(symbol + side);
+        if (side.equals("LONG") && context > 0) conf += 0.05;
+        if (side.equals("SHORT") && context < 0) conf += 0.05;
         conf = adaptive.adapt("CORE", conf);
-        conf = Math.max(0.50, Math.min(0.85, conf));
+        conf = Math.max(0.47, Math.min(0.85, conf));
 
         TradeIdea t = new TradeIdea();
         t.symbol = symbol;

@@ -8,6 +8,7 @@
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/Intraday5BarEngine.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/Intraday5BarEngine.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -272,7 +273,7 @@
       <workItem from="1768941788903" duration="5143000" />
       <workItem from="1768951698851" duration="3923000" />
       <workItem from="1768957728074" duration="2744000" />
-      <workItem from="1768990610695" duration="10740000" />
+      <workItem from="1768990610695" duration="15766000" />
     </task>
     <servers />
   </component>

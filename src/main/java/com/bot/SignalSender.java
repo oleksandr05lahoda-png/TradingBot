@@ -46,7 +46,7 @@ public class SignalSender {
     private final Map<String, Long> lastTickTime = new ConcurrentHashMap<>();
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
-    private final Map<String, Long> lastSignalCandleTs = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, Long>> lastSignalCandleTs = new ConcurrentHashMap<>();
     private final Intraday5BarEngine intraday5 = new Intraday5BarEngine();
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private final DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
@@ -616,10 +616,16 @@ public class SignalSender {
         if (s.confidence < MIN_CONF) return;
         if (isCooldown(pair, s.direction)) return;
         if (closes5m.size() < 4) return;
-        long candleTs = closes5m.get(closes5m.size() - 2).openTime;
-        Long lastTs = lastSignalCandleTs.get(pair);
-        if (lastTs != null && Math.abs(candleTs - lastTs) < 2 * 60_000) return;
-        lastSignalCandleTs.put(pair, candleTs);
+        long candleTs = closes5m.get(closes5m.size() - 1).openTime;
+        Long lastTs = lastSignalCandleTs
+                .getOrDefault(pair, new ConcurrentHashMap<>())
+                .getOrDefault(s.direction, 0L);
+
+        if (Math.abs(candleTs - lastTs) < 5 * 60_000) return;
+
+        lastSignalCandleTs.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
+                .put(s.direction, candleTs);
+
 
         TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                 pair,
@@ -1066,7 +1072,7 @@ public class SignalSender {
                     s.take = ts.take;
 
                     double p5 = holdProbability5Bars(c5m, s.direction);
-                    if (p5 < 0.58) return;
+                    if (p5 < 0.52) return;
 
                     sendSignalIfAllowed(pair, s, c5m);
                 });
