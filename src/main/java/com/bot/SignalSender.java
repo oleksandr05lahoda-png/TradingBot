@@ -46,8 +46,8 @@ public class SignalSender {
     private final Map<String, Long> lastTickTime = new ConcurrentHashMap<>();
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastSignalCandleTs = new ConcurrentHashMap<>();
     private final AtomicLong dailyRequests = new AtomicLong(0);
-    private final Map<String, String> lastSideByPair = new ConcurrentHashMap<>();
     private final DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
     private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
     private final DecisionEngineMerged.AdaptiveBrain adaptive = new DecisionEngineMerged.AdaptiveBrain();
@@ -581,20 +581,10 @@ public class SignalSender {
     private void sendSignalIfAllowed(String pair,
                                      Signal s,
                                      List<TradingCore.Candle> closes5m) {
-        if (signalsThisCycle >= 3) return; // <-- ДОБАВИТЬ
-
         if (s.confidence < MIN_CONF) return;
-
-        // ❗ анти-дубль — ГЛОБАЛЬНЫЙ
-        String lastSide = lastSideByPair.get(pair);
-        if (lastSide != null && lastSide.equals(s.direction)) {
-            if (s.confidence < 0.75) return;
-        }
-
-
-        if (isCooldown(pair, s.direction)) return;
-
-        lastSideByPair.put(pair, s.direction);
+        long candleTs = closes5m.get(closes5m.size() - 2).closeTime;
+        if (lastSignalCandleTs.getOrDefault(pair, 0L) == candleTs) return;
+        lastSignalCandleTs.put(pair, candleTs);
 
         TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                 pair,
@@ -623,6 +613,7 @@ public class SignalSender {
         public final double rsi7;
         public final double rsi4;
         public final double rawScore;
+        public final List<String> next5;
         public final int mtfConfirm;
         public final boolean volOk;
         public final boolean atrOk;
@@ -633,7 +624,6 @@ public class SignalSender {
         public Double stop;
         public Double take;
         public final Instant created = Instant.now();
-        public final List<String> next5Candles;
 
         public Signal(String symbol, String direction, double confidence, double price, double rsi,
                       double rawScore, int mtfConfirm, boolean volOk, boolean atrOk, boolean strongTrigger,
@@ -642,6 +632,7 @@ public class SignalSender {
             this.symbol = symbol;
             this.direction = direction;
             this.confidence = confidence;
+            this.next5 = next5Candles;
             this.price = price;
             this.rsi = rsi;
             this.rawScore = rawScore;
@@ -654,7 +645,6 @@ public class SignalSender {
             this.impulse = impulse;
             this.rsi7 = rsi7;
             this.rsi4 = rsi4;
-            this.next5Candles = next5Candles;
         }
 
         public String toTelegramMessage() {
@@ -662,12 +652,13 @@ public class SignalSender {
                     (atrBreakLong ? "ATR↑ " : "") +
                     (atrBreakShort ? "ATR↓ " : "") +
                     (impulse ? "IMPULSE " : "");
-
-            String next5Str = next5Candles != null ? String.join(" → ", next5Candles) : "N/A";
             String localTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
 
-            return String.format("*%s* → *%s*\nNext 5: %s\nConfidence: *%.2f*\nPrice: %.8f\nRSI(14): %.2f\n_flags_: %s\n_raw: %.3f mtf:%d vol:%b atr:%b_\n_time: %s_",
-                    symbol, direction, next5Str, confidence, price, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk, localTime);
+            return String.format(
+                    "*%s* → *%s*\nNext 5: %s\nConfidence: *%.2f*\nPrice: %.8f\nRSI(14): %.2f\n_flags_: %s\n_raw: %.3f mtf:%d vol:%b atr:%b_\n_time: %s_",
+                    symbol, direction, next5, confidence, price, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk, localTime
+            );
+
         }
     }
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
@@ -821,9 +812,8 @@ public class SignalSender {
         return new HashSet<>(list); // конвертируем в Set
     }
     private void sendFastSignal(String pair, String dir, double price, double atr, List<TradingCore.Candle> c5m) {
-        double rsi14 = rsi(c5m.stream().map(c -> c.close).collect(Collectors.toList()), 14);
         List<String> next5 = predictor.predictNextNCandlesDirection(c5m, 5);
-
+        double rsi14 = rsi(c5m.stream().map(c -> c.close).collect(Collectors.toList()), 14);
         double conf = 0.60; // или композить
 
         Signal s = new Signal(
