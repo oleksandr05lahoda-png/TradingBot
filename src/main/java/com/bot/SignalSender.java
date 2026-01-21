@@ -146,39 +146,43 @@ public class SignalSender {
     }
     public class CandlePredictor {
 
-        // прогноз по 5m свечам на 5 следующих свечей
+        // прогноз по N свечам
         public List<String> predictNextNCandlesDirection(List<TradingCore.Candle> candles, int n) {
             List<String> res = new ArrayList<>();
-            if (candles.size() < 100) {
+            if (candles == null || candles.size() < 50) {
                 for (int i = 0; i < n; i++) res.add("MIXED");
                 return res;
             }
 
+            // закрытия
             List<Double> closes = candles.stream().map(c -> c.close).collect(Collectors.toList());
 
+            // основные индикаторы
             double rsi14 = SignalSender.rsi(closes, 14);
             double atr14 = SignalSender.atr(candles, 14);
             double atrPct = atr14 / (closes.get(closes.size() - 1) + 1e-12);
 
-            int ms = SignalSender.marketStructure(candles);
-            int emaDir = emaDirection(closes, 20, 50); // 1=long, -1=short
+            int ms = SignalSender.marketStructure(candles); // 1=HH/HL, -1=LL/LH
+            int emaDir = emaDirection(closes, 20, 50);       // 1=fast>slow, -1=fast<slow
+            double momentum = SignalSender.momentumPct(closes, 3);
 
+            // логика тренда
             String dir;
             if (rsi14 > 70 && ms <= 0) dir = "SHORT";
             else if (rsi14 < 30 && ms >= 0) dir = "LONG";
-            else if (emaDir > 0 && atrPct > 0.0005) dir = "LONG";
-            else if (emaDir < 0 && atrPct > 0.0005) dir = "SHORT";
+            else if (emaDir > 0 && momentum > 0 && atrPct > 0.0005) dir = "LONG";
+            else if (emaDir < 0 && momentum < 0 && atrPct > 0.0005) dir = "SHORT";
             else dir = "MIXED";
 
+            // прогноз на следующие N свечей
             for (int i = 0; i < n; i++) {
-                if (atrPct < 0.0006) res.add("MIXED");
-                else if (i < 2) res.add(dir);
-                else res.add("MIXED");
+                double adjustedAtr = atrPct * (1 + 0.2 * i); // дальше свечи менее точны
+                if (adjustedAtr < 0.0005) res.add("MIXED");
+                else res.add(dir);
             }
+
             return res;
         }
-
-        // нужна вспомогательная функция (поставить внутри CandlePredictor)
         private int emaDirection(List<Double> closes, int fast, int slow) {
             if (closes.size() < slow + 5) return 0;
             double fastEma = SignalSender.ema(closes, fast);
