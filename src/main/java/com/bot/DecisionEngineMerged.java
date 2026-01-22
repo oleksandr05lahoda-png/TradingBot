@@ -19,6 +19,19 @@ public class DecisionEngineMerged {
             return e;
         }
 
+        public static double rsi(List<Double> c, int p) {
+            if (c == null || c.size() < p + 1) return 50;
+            double g = 0, l = 0;
+            for (int i = c.size() - p - 1; i < c.size() - 1; i++) {
+                double d = c.get(i + 1) - c.get(i);
+                if (d > 0) g += d;
+                else l -= d;
+            }
+            if (l == 0) return 100;
+            double rs = g / l;
+            return 100 - (100 / (1 + rs));
+        }
+
         public static double atr(List<TradingCore.Candle> c, int p) {
             if (c == null || c.size() < p + 1) return 0;
             double sum = 0;
@@ -38,42 +51,23 @@ public class DecisionEngineMerged {
         }
     }
 
-    /* ======================= ADAPTIVE CORE ====================== */
-    public static class AdaptiveBrain {
+    /* ======================= ADAPTIVE ========================== */
+    private final Map<String, Deque<Long>> impulse = new ConcurrentHashMap<>();
 
-        private static class Stat { int w, l; }
-
-        private final Map<String, Stat> stats = new ConcurrentHashMap<>();
-        private final Map<String, Deque<Long>> impulse = new ConcurrentHashMap<>();
-
-        public double adapt(String k, double c) {
-            Stat s = stats.get(k);
-            if (s == null) return c;
-            int t = s.w + s.l;
-            if (t < 40) return c;
-            double wr = (double) s.w / t;
-            if (wr > 0.60) return Math.min(0.75, c + 0.02);
-            if (wr < 0.45) return Math.max(0.55, c - 0.02);
-            return c;
-        }
-
-        public double impulsePenalty(String key) {
-            impulse.putIfAbsent(key, new ArrayDeque<>());
-            Deque<Long> q = impulse.get(key);
-            long now = System.currentTimeMillis();
-            q.addLast(now);
-            while (!q.isEmpty() && now - q.peekFirst() > 20 * 60_000)
-                q.pollFirst();
-            return q.size() >= 3 ? -0.05 : 0;
-        }
-
-        public double sessionBoost() {
-            int h = LocalTime.now(ZoneOffset.UTC).getHour();
-            return (h >= 7 && h <= 10) || (h >= 13 && h <= 16) ? 0.04 : 0;
-        }
+    private double impulsePenalty(String key) {
+        impulse.putIfAbsent(key, new ArrayDeque<>());
+        Deque<Long> q = impulse.get(key);
+        long now = System.currentTimeMillis();
+        q.addLast(now);
+        while (!q.isEmpty() && now - q.peekFirst() > 15 * 60_000)
+            q.pollFirst();
+        return q.size() >= 3 ? -0.06 : 0;
     }
 
-    private final AdaptiveBrain adaptive = new AdaptiveBrain();
+    private double sessionBoost() {
+        int h = LocalTime.now(ZoneOffset.UTC).getHour();
+        return (h >= 7 && h <= 10) || (h >= 13 && h <= 16) ? 0.04 : 0;
+    }
 
     /* ============================ DTO =========================== */
     public static class TradeIdea {
@@ -81,24 +75,37 @@ public class DecisionEngineMerged {
         public double entry, atr, confidence;
     }
 
-    /* ========================= REGIME ========================== */
+    /* ======================= MARKET REGIME ===================== */
     enum Regime { TREND, RANGE, DEAD }
 
     private Regime detectRegime(List<TradingCore.Candle> c15) {
         List<Double> cl = c15.stream().map(x -> x.close).toList();
 
-        double atrNow  = TA.atr(c15, 14);
-        double atrPrev = TA.atr(c15.subList(0, c15.size() - 10), 14);
-
+        double atr = TA.atr(c15, 14);
         double ema20 = TA.ema(cl, 20);
         double ema50 = TA.ema(cl, 50);
-        double slope = ema20 - TA.ema(
-                cl.subList(0, cl.size() - 10), 20
-        );
+        double slope = ema20 - TA.ema(cl.subList(0, cl.size() - 10), 20);
 
-        if (atrNow < atrPrev * 0.8) return Regime.DEAD;
-        if (Math.abs(slope) < atrNow * 0.05) return Regime.RANGE;
+        if (atr <= 0) return Regime.DEAD;
+        if (Math.abs(slope) < atr * 0.04) return Regime.RANGE;
         return Regime.TREND;
+    }
+
+    /* ========================= TREND BIAS ====================== */
+    private int trendBias(List<TradingCore.Candle> c15, List<TradingCore.Candle> c1h) {
+        List<Double> cl15 = c15.stream().map(x -> x.close).toList();
+        int dir = Double.compare(
+                TA.ema(cl15, 20),
+                TA.ema(cl15, 50)
+        );
+        if (c1h != null && c1h.size() > 60) {
+            List<Double> cl1h = c1h.stream().map(x -> x.close).toList();
+            dir += Double.compare(
+                    TA.ema(cl1h, 20),
+                    TA.ema(cl1h, 50)
+            );
+        }
+        return dir;
     }
 
     /* ============================ CORE ========================== */
@@ -108,67 +115,48 @@ public class DecisionEngineMerged {
             List<TradingCore.Candle> c15,
             List<TradingCore.Candle> c1h) {
 
-        if (c5 == null || c15 == null || c1h == null ||
-                c5.size() < 60 || c15.size() < 60 || c1h.size() < 60)
+        if (c5 == null || c15 == null || c5.size() < 120 || c15.size() < 120)
             return Optional.empty();
 
-        if (detectRegime(c15) != Regime.TREND)
-            return Optional.empty();
+        Regime regime = detectRegime(c15);
+        if (regime != Regime.TREND) return Optional.empty();
+
+        int bias = trendBias(c15, c1h);
+        if (bias == 0) return Optional.empty();
 
         TradingCore.Candle last = c5.get(c5.size() - 1);
         TradingCore.Candle prev = c5.get(c5.size() - 2);
 
-        List<Double> cl5  = c5.stream().map(x -> x.close).toList();
-        List<Double> cl15 = c15.stream().map(x -> x.close).toList();
-        List<Double> cl1h = c1h.stream().map(x -> x.close).toList();
-
-        double ema5_20   = TA.ema(cl5, 20);
-        double ema15_20  = TA.ema(cl15, 20);
-        double ema15_50  = TA.ema(cl15, 50);
-        double ema1h_20  = TA.ema(cl1h, 20);
-        double ema1h_50  = TA.ema(cl1h, 50);
-
-        boolean trendUp =
-                ema1h_20 > ema1h_50 &&
-                        ema15_20 > ema15_50;
-
-        boolean trendDown =
-                ema1h_20 < ema1h_50 &&
-                        ema15_20 < ema15_50;
-
-        if (!trendUp && !trendDown)
-            return Optional.empty();
+        List<Double> cl5 = c5.stream().map(x -> x.close).collect(Collectors.toList());
 
         double atr = TA.atr(c5, 14);
+        if (atr <= 0) return Optional.empty();
 
-        if (atr < last.close * 0.002)
-            return Optional.empty();
+        double body = Math.abs(last.close - last.open);
+        boolean impulse =
+                body > atr * 0.6 &&
+                        (last.high - last.low) < atr * 1.8;
 
-        boolean pullbackLong =
-                trendUp &&
-                        last.low <= ema5_20 &&
-                        prev.isBear() &&
-                        last.isBull() &&
-                        (last.high - last.low) < atr * 1.2;
+        double rsi5 = TA.rsi(cl5, 14);
 
-        boolean pullbackShort =
-                trendDown &&
-                        last.high >= ema5_20 &&
-                        prev.isBull() &&
-                        last.isBear() &&
-                        (last.high - last.low) < atr * 1.2;
+        boolean longSig =
+                bias > 0 &&
+                        impulse &&
+                        rsi5 < 72;
 
-        if (!pullbackLong && !pullbackShort)
-            return Optional.empty();
+        boolean shortSig =
+                bias < 0 &&
+                        impulse &&
+                        rsi5 > 28;
 
-        String side = pullbackLong ? "LONG" : "SHORT";
+        if (!longSig && !shortSig) return Optional.empty();
 
-        double conf = 0.55;
-        conf += Math.abs(ema15_20 - ema15_50) > atr * 0.5 ? 0.05 : 0;
-        conf += adaptive.sessionBoost();
-        conf += adaptive.impulsePenalty(symbol + side);
-        conf = adaptive.adapt("PULLBACK", conf);
-        conf = Math.max(0.55, Math.min(0.75, conf));
+        String side = longSig ? "LONG" : "SHORT";
+
+        double conf = 0.60;
+        conf += sessionBoost();
+        conf += impulsePenalty(symbol + side);
+        conf = Math.max(0.50, Math.min(0.85, conf));
 
         TradeIdea t = new TradeIdea();
         t.symbol = symbol;
@@ -176,7 +164,7 @@ public class DecisionEngineMerged {
         t.entry = last.close;
         t.atr = atr;
         t.confidence = conf;
-        t.reason = "HTF trend + pullback continuation";
+        t.reason = "TREND+IMPULSE+ATR";
 
         return Optional.of(t);
     }
