@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class SignalSender {
-    private final TelegramBotSender bot;
+    private final com.bot.TelegramBotSender bot;
     private final HttpClient http;
     MarketContext ctx = null; // инициализируем позже в evaluate
 
@@ -47,18 +47,18 @@ public class SignalSender {
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Long>> lastSignalCandleTs = new ConcurrentHashMap<>();
-    private final Intraday5BarEngine intraday5 = new Intraday5BarEngine();
     private final AtomicLong dailyRequests = new AtomicLong(0);
-    private final DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
     private Set<String> cachedPairs = new HashSet<>();
+    private final DecisionEngineMerged decisionEngine;
+    private final Elite5MinAnalyzer elite5MinAnalyzer;
+    private final TradingCore.AdaptiveBrain adaptiveBrain;
     private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
-    private final DecisionEngineMerged.AdaptiveBrain adaptive = new DecisionEngineMerged.AdaptiveBrain();
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     private long dailyResetTs = System.currentTimeMillis();
     private ScheduledExecutorService scheduler;
     CandlePredictor predictor = new CandlePredictor();
 
-    public SignalSender(TelegramBotSender bot) {
+    public SignalSender(com.bot.TelegramBotSender bot) {
         this.bot = bot;
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
@@ -83,7 +83,9 @@ public class SignalSender {
         this.VOLUME_SPIKE_MULT = envDouble("VOL_SPIKE_MULT", 1.4);
 
         this.STABLE = Set.of("USDT", "USDC", "BUSD");
-
+        this.decisionEngine = new DecisionEngineMerged();
+        this.adaptiveBrain = new TradingCore.AdaptiveBrain();
+        this.elite5MinAnalyzer = new Elite5MinAnalyzer(decisionEngine, 0.001);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
     }
 
@@ -574,20 +576,6 @@ public class SignalSender {
             high = Math.max(high, candles.get(i).high);
         return high;
     }
-    private TradingCore.RiskEngine.TradeSignal addStopTake(TradingCore.RiskEngine.TradeSignal ts, String direction, double price, double atr) {
-
-        double risk = atr * 1.2; // базовый риск
-
-        if ("LONG".equals(direction)) {
-            ts.stop = price - risk;
-            ts.take = price + risk * 2.5;
-        } else if ("SHORT".equals(direction)) {
-            ts.stop = price + risk;
-            ts.take = price - risk * 2.5;
-        }
-        return ts;
-    }
-
     private void sendSignalIfAllowed(String pair,
                                      Signal s,
                                      List<TradingCore.Candle> closes5m) {
@@ -603,19 +591,6 @@ public class SignalSender {
 
         lastSignalCandleTs.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
                 .put(s.direction, candleTs);
-
-
-        TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
-                pair,
-                s.direction,
-                s.price,
-                atr(closes5m, 14),
-                s.confidence,
-                "AutoRiskEngine"
-        );
-        ts = addStopTake(ts, s.direction, s.price, atr(closes5m, 14));
-        s.stop = ts.stop;
-        s.take = ts.take;
 
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
@@ -989,11 +964,12 @@ public class SignalSender {
                     TradingCore.RiskEngine.TradeSignal ts = riskEngine.applyRisk(
                             pair,
                             side,
-                            last.close,
-                            atr5,
+                            last.close,   // entry price
+                            atr5,         // atr
                             conf,
                             "FAST-MOMENTUM"
                     );
+
 
                     Signal s = new Signal(
                             pair,
@@ -1021,8 +997,8 @@ public class SignalSender {
                     continue;
                 }
 
-                Optional<DecisionEngineMerged.TradeIdea> idea =
-                        decisionEngine.evaluate(pair, c5m, c15m, c1h);
+                Optional<Elite5MinAnalyzer.TradeSignal> idea =
+                        elite5MinAnalyzer.analyze(pair, c5m, c15m);
 
                 idea.ifPresent(i -> {
                     double conf = i.confidence;
@@ -1034,11 +1010,10 @@ public class SignalSender {
                             pair,
                             i.side,
                             entryPrice,
-                            i.atr,
+                            atr5,
                             conf,
                             "FAST-MOMENTUM"
                     );
-                    ts = addStopTake(ts, i.side, entryPrice, i.atr);
 
                     List<Double> closes5 = c5m.stream().map(c -> c.close).collect(Collectors.toList());
                     double rsi14 = SignalSender.rsi(closes5, 14);
@@ -1137,8 +1112,7 @@ public class SignalSender {
             DecisionEngineMerged.TradeIdea iIdea = idea.get();
 
             double conf = iIdea.confidence;
-            conf = adaptive.adapt("CORE", conf);
-            conf += adaptive.sessionBoost();
+            conf = adaptiveBrain.applyAllAdjustments("CORE", pair, conf);
             conf = Math.max(0.50, Math.min(0.88, conf));
 
             // simulate signal
@@ -1153,7 +1127,6 @@ public class SignalSender {
                     conf,
                     "BACKTEST"
             );
-            ts = addStopTake(ts, iIdea.side, entry, atr);
 
             // считаем результат через 1 свечу (упрощённо)
             TradingCore.Candle nextCandle = candles.get(i + 1);
