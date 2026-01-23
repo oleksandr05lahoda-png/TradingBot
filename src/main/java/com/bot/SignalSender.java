@@ -162,9 +162,10 @@ public class SignalSender {
 
             // score в диапазоне примерно [-1..1]
             double score = 0;
-            score += (rsi - 50) / 50.0 * 0.6;     // RSI даёт до ±0.6
-            score += mom / 0.02 * 0.4;            // momentum до ±0.4
-            score += Math.signum(atrPct - 0.0004) * 0.1; // если волатильность выше — добавляем
+            score += (rsi - 50) / 50.0 * 0.4;
+            score += mom / 0.02 * 0.5;
+            score += Math.signum(atrPct - 0.0004) * 0.15;
+
 
             return Math.max(-1.0, Math.min(1.0, score));
         }
@@ -876,7 +877,7 @@ public class SignalSender {
                 // ---------------------------
                 // НЕ использовать последнюю свечу (она ещё формируется)
                 // ---------------------------
-                List<TradingCore.Candle> c5m = new ArrayList<>(c5mFull.subList(0, c5mFull.size() - 1));
+                List<TradingCore.Candle> c5m = new ArrayList<>(c5mFull.subList(Math.max(0, c5mFull.size() - 60), c5mFull.size() - 1));
                 List<TradingCore.Candle> c15m = c15mFull.size() > 1
                         ? new ArrayList<>(c15mFull.subList(0, c15mFull.size() - 1))
                         : new ArrayList<>(c15mFull);
@@ -952,9 +953,24 @@ public class SignalSender {
 
                     // ---- формируем next5 ----
                     List<String> next5 = new ArrayList<>();
+                    List<TradingCore.Candle> tempCandles = new ArrayList<>(c5m);
                     for (int k = 0; k < 5; k++) {
-                        double s = predictor.predictNextCandleScore(c5m);
-                        next5.add(s > 0 ? "LONG" : "SHORT");
+                        double score = predictor.predictNextCandleScore(tempCandles);
+                        next5.add(score > 0 ? "LONG" : "SHORT");
+
+                        // Можно добавить фиктивную свечу для следующей итерации (чтобы метод не падал)
+                        TradingCore.Candle lastC = tempCandles.get(tempCandles.size() - 1);
+                        double fakeClose = lastC.close * (score > 0 ? 1.001 : 0.999);
+                        tempCandles.add(new TradingCore.Candle(
+                                lastC.openTime + 5 * 60_000,
+                                lastC.close,
+                                Math.max(lastC.high, fakeClose),
+                                Math.min(lastC.low, fakeClose),
+                                fakeClose,
+                                lastC.volume,
+                                lastC.quoteAssetVolume,
+                                lastC.closeTime + 5 * 60_000
+                        ));
                     }
 
                     // ---- добавляем небольшую вариативность confidence ----

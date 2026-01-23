@@ -70,10 +70,20 @@ public class DecisionEngineMerged {
 
         Trend trend1h = detectTrend(c1h);
         Trend trend15m = detectTrend(c15m);
-        Entry entry5m = detectEntry(c5m);
+        Entry entry5m = detectImpulseEntry(c5m, atr5);
 
-        // --- фьючерсы: ТОЛЬКО по старшему тренду
-        if (trend1h == Trend.NONE || entry5m == Entry.NONE)
+        boolean impulse = entry5m == Entry.IMPULSE_LONG || entry5m == Entry.IMPULSE_SHORT;
+
+// если не импульс — fallback на старую логику
+        if (!impulse) {
+            entry5m = detectEntry(c5m);
+        }
+
+
+        if (entry5m == Entry.NONE)
+            return Optional.empty();
+
+        if (!impulse && trend1h == Trend.NONE)
             return Optional.empty();
 
         if (!trendAligned(trend1h, trend15m, entry5m))
@@ -188,6 +198,35 @@ public class DecisionEngineMerged {
     }
 
     private enum Entry {
-        LONG, SHORT, NONE
+        LONG, SHORT, IMPULSE_LONG, IMPULSE_SHORT, NONE
+    }
+    private Entry detectImpulseEntry(List<TradingCore.Candle> c5m, double atr) {
+        TradingCore.Candle last = c5m.get(c5m.size() - 1);
+
+        double body = Math.abs(last.close - last.open);
+        double range = last.high - last.low;
+
+        // защита
+        if (atr <= 0) return Entry.NONE;
+
+        // 🔥 импульсный шорт
+        if (
+                last.close < last.open &&           // красная
+                        body > atr * 1.2 &&                 // тело больше ATR
+                        range > atr * 1.5                  // свеча аномальная
+        ) {
+            return Entry.IMPULSE_SHORT;
+        }
+
+        // 🔥 импульсный лонг
+        if (
+                last.close > last.open &&
+                        body > atr * 1.2 &&
+                        range > atr * 1.5
+        ) {
+            return Entry.IMPULSE_LONG;
+        }
+
+        return Entry.NONE;
     }
 }
