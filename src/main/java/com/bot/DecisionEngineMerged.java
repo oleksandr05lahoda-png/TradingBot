@@ -8,225 +8,190 @@ public class DecisionEngineMerged {
     // ================== TRADE IDEA ==================
     public static class TradeIdea {
         public final String symbol;
-        public final String side; // "LONG" | "SHORT"
+        public final String side;
         public final double entry;
         public final double atr;
         public final double confidence;
         public final String reason;
 
-        public TradeIdea(
-                String symbol,
-                String side,
-                double entry,
-                double atr,
-                double confidence,
-                String reason
-        ) {
-            this.symbol = symbol;
+        public TradeIdea(String s, String side, double e, double a, double c, String r) {
+            this.symbol = s;
             this.side = side;
-            this.entry = entry;
-            this.atr = atr;
-            this.confidence = confidence;
-            this.reason = reason;
+            this.entry = e;
+            this.atr = a;
+            this.confidence = c;
+            this.reason = r;
         }
 
-        public static TradeIdea longIdea(
-                String symbol,
-                double entry,
-                double atr,
-                double confidence,
-                String reason
-        ) {
-            return new TradeIdea(symbol, "LONG", entry, atr, confidence, reason);
+        public static TradeIdea longIdea(String s, double e, double a, double c, String r) {
+            return new TradeIdea(s, "LONG", e, a, c, r);
         }
 
-        public static TradeIdea shortIdea(
-                String symbol,
-                double entry,
-                double atr,
-                double confidence,
-                String reason
-        ) {
-            return new TradeIdea(symbol, "SHORT", entry, atr, confidence, reason);
+        public static TradeIdea shortIdea(String s, double e, double a, double c, String r) {
+            return new TradeIdea(s, "SHORT", e, a, c, r);
         }
     }
 
-    // ================== MAIN ENTRY POINT ==================
+    // ================== MAIN ==================
     public Optional<TradeIdea> evaluate(
             String symbol,
-            List<TradingCore.Candle> c5m,
-            List<TradingCore.Candle> c15m,
+            List<TradingCore.Candle> c5,
+            List<TradingCore.Candle> c15,
             List<TradingCore.Candle> c1h
     ) {
-        // --- базовая валидация
-        if (!valid(c5m, 30) || !valid(c15m, 30) || !valid(c1h, 30))
+        if (!valid(c5, 50) || !valid(c15, 50) || !valid(c1h, 50))
             return Optional.empty();
 
-        TradingCore.Candle last5 = last(c5m);
+        TradingCore.Candle last = last(c5);
+        double atr = SignalSender.atr(c5, 14);
+        if (atr <= 0) return Optional.empty();
 
-        double atr5 = SignalSender.atr(c5m, 14);
-        if (atr5 <= 0)
+        // === 1. АНТИ-DUMP / АНТИ-PUMP ===
+        if (isClimacticCandle(c5, atr))
             return Optional.empty();
 
-        Trend trend1h = detectTrend(c1h);
-        Trend trend15m = detectTrend(c15m);
-        Entry entry5m = detectImpulseEntry(c5m, atr5);
+        // === 2. СТРУКТУРА ===
+        MarketStructure structure = detectStructure(c5);
 
-        boolean impulse = entry5m == Entry.IMPULSE_LONG || entry5m == Entry.IMPULSE_SHORT;
+        // === 3. ТРЕНДЫ ===
+        Trend t1h = detectTrend(c1h);
+        Trend t15 = detectTrend(c15);
 
-// если не импульс — fallback на старую логику
-        if (!impulse) {
-            entry5m = detectEntry(c5m);
-        }
+        // === 4. ЛИКВИДНОСТЬ ===
+        LiquidityEvent liquidity = detectLiquiditySweep(c5, atr);
 
-
-        if (entry5m == Entry.NONE)
+        // === 5. ENTRY ===
+        Entry entry = resolveEntry(c5, structure, liquidity);
+        if (entry == Entry.NONE)
             return Optional.empty();
 
-        if (!impulse && trend1h == Trend.NONE)
+        // === 6. ФИЛЬТР ПО HTF ===
+        if (!trendAllows(entry, t1h))
             return Optional.empty();
 
-        if (!trendAligned(trend1h, trend15m, entry5m))
+        // === 7. CONFIDENCE ===
+        double conf = buildConfidence(entry, structure, liquidity, t1h, t15, atr);
+        if (conf < 0.65)
             return Optional.empty();
-
-        double confidence = buildConfidence(trend1h, trend15m, entry5m, atr5);
-
-        if (confidence < 0.60)
-            return Optional.empty();
-
-        String side = entry5m == Entry.LONG ? "LONG" : "SHORT";
 
         return Optional.of(
-                side.equals("LONG")
-                        ? TradeIdea.longIdea(
-                        symbol,
-                        last5.close,
-                        atr5,
-                        confidence,
-                        "HTF trend + MTF momentum + 5m breakout"
-                )
-                        : TradeIdea.shortIdea(
-                        symbol,
-                        last5.close,
-                        atr5,
-                        confidence,
-                        "HTF trend + MTF momentum + 5m breakdown"
-                )
+                entry == Entry.LONG
+                        ? TradeIdea.longIdea(symbol, last.close, atr, conf,
+                        "Structure + Liquidity + HTF safe")
+                        : TradeIdea.shortIdea(symbol, last.close, atr, conf,
+                        "Structure + Liquidity + HTF safe")
         );
     }
 
-    // ================== TREND (HTF / MTF) ==================
-    private Trend detectTrend(List<TradingCore.Candle> candles) {
-        int lookback = 25;
-        TradingCore.Candle first = candles.get(candles.size() - lookback);
-        TradingCore.Candle last = candles.get(candles.size() - 1);
+    // ================== STRUCTURE ==================
+    private MarketStructure detectStructure(List<TradingCore.Candle> c) {
+        TradingCore.Candle a = c.get(c.size() - 6);
+        TradingCore.Candle b = c.get(c.size() - 3);
+        TradingCore.Candle l = last(c);
 
-        double pct = (last.close - first.close) / (first.close + 1e-12);
+        if (l.high > b.high && b.high > a.high) return MarketStructure.HH;
+        if (l.low < b.low && b.low < a.low) return MarketStructure.LL;
 
-        if (pct > 0.004) return Trend.UP;
-        if (pct < -0.004) return Trend.DOWN;
-        return Trend.NONE;
+        return MarketStructure.RANGE;
     }
 
-    // ================== ENTRY (5m) ==================
-    private Entry detectEntry(List<TradingCore.Candle> c5m) {
-        TradingCore.Candle prev = c5m.get(c5m.size() - 2);
-        TradingCore.Candle last = c5m.get(c5m.size() - 1);
+    // ================== LIQUIDITY ==================
+    private LiquidityEvent detectLiquiditySweep(List<TradingCore.Candle> c, double atr) {
+        TradingCore.Candle last = last(c);
+        TradingCore.Candle prev = c.get(c.size() - 2);
 
-        // импульс + пробой
-        if (last.close > prev.high && last.close > last.open)
+        if (last.low < prev.low && (prev.high - prev.low) < atr)
+            return LiquidityEvent.SELL_SIDE_SWEEP;
+
+        if (last.high > prev.high && (prev.high - prev.low) < atr)
+            return LiquidityEvent.BUY_SIDE_SWEEP;
+
+        return LiquidityEvent.NONE;
+    }
+
+    // ================== ENTRY ==================
+    private Entry resolveEntry(
+            List<TradingCore.Candle> c,
+            MarketStructure s,
+            LiquidityEvent l
+    ) {
+        TradingCore.Candle last = last(c);
+
+        if (l == LiquidityEvent.SELL_SIDE_SWEEP && s != MarketStructure.LL)
             return Entry.LONG;
 
-        if (last.close < prev.low && last.close < last.open)
+        if (l == LiquidityEvent.BUY_SIDE_SWEEP && s != MarketStructure.HH)
+            return Entry.SHORT;
+
+        if (last.close > last.open && s == MarketStructure.HH)
+            return Entry.LONG;
+
+        if (last.close < last.open && s == MarketStructure.LL)
             return Entry.SHORT;
 
         return Entry.NONE;
     }
 
-    // ================== ALIGNMENT ==================
-    private boolean trendAligned(
+    // ================== CONFIDENCE ==================
+    private double buildConfidence(
+            Entry e,
+            MarketStructure s,
+            LiquidityEvent l,
             Trend t1h,
-            Trend t15m,
-            Entry entry
+            Trend t15,
+            double atr
     ) {
-        if (entry == Entry.LONG)
-            return t1h == Trend.UP && t15m != Trend.DOWN;
+        double c = 0.55;
 
-        if (entry == Entry.SHORT)
-            return t1h == Trend.DOWN && t15m != Trend.UP;
+        if (l != LiquidityEvent.NONE) c += 0.10;
+        if ((e == Entry.LONG && s == MarketStructure.HH) ||
+                (e == Entry.SHORT && s == MarketStructure.LL))
+            c += 0.10;
 
+        if ((e == Entry.LONG && t1h == Trend.UP) ||
+                (e == Entry.SHORT && t1h == Trend.DOWN))
+            c += 0.10;
+
+        if ((e == Entry.LONG && t15 == Trend.UP) ||
+                (e == Entry.SHORT && t15 == Trend.DOWN))
+            c += 0.05;
+
+        return Math.min(c, 0.85);
+    }
+
+    // ================== SAFETY ==================
+    private boolean isClimacticCandle(List<TradingCore.Candle> c, double atr) {
+        TradingCore.Candle last = last(c);
+        return (last.high - last.low) > atr * 1.9;
+    }
+
+    private boolean trendAllows(Entry e, Trend t) {
+        if (e == Entry.LONG) return t != Trend.DOWN;
+        if (e == Entry.SHORT) return t != Trend.UP;
         return false;
     }
 
-    // ================== CONFIDENCE ==================
-    private double buildConfidence(
-            Trend t1h,
-            Trend t15m,
-            Entry entry,
-            double atr
-    ) {
-        double conf = 0.50;
+    private Trend detectTrend(List<TradingCore.Candle> c) {
+        TradingCore.Candle f = c.get(c.size() - 30);
+        TradingCore.Candle l = last(c);
+        double pct = (l.close - f.close) / f.close;
 
-        // HTF alignment
-        conf += 0.15;
-
-        // MTF confirmation
-        if ((entry == Entry.LONG && t15m == Trend.UP) ||
-                (entry == Entry.SHORT && t15m == Trend.DOWN)) {
-            conf += 0.10;
-        }
-
-        // volatility presence
-        if (atr > 0)
-            conf += 0.05;
-
-        return Math.min(conf, 0.85);
+        if (pct > 0.005) return Trend.UP;
+        if (pct < -0.005) return Trend.DOWN;
+        return Trend.FLAT;
     }
 
-    // ================== UTILS ==================
-    private boolean valid(List<?> list, int min) {
-        return list != null && list.size() >= min;
+    private TradingCore.Candle last(List<TradingCore.Candle> c) {
+        return c.get(c.size() - 1);
     }
 
-    private TradingCore.Candle last(List<TradingCore.Candle> list) {
-        return list.get(list.size() - 1);
+    private boolean valid(List<?> l, int n) {
+        return l != null && l.size() >= n;
     }
 
     // ================== ENUMS ==================
-    private enum Trend {
-        UP, DOWN, NONE
-    }
-
-    private enum Entry {
-        LONG, SHORT, IMPULSE_LONG, IMPULSE_SHORT, NONE
-    }
-    private Entry detectImpulseEntry(List<TradingCore.Candle> c5m, double atr) {
-        TradingCore.Candle last = c5m.get(c5m.size() - 1);
-
-        double body = Math.abs(last.close - last.open);
-        double range = last.high - last.low;
-
-        // защита
-        if (atr <= 0) return Entry.NONE;
-
-        // 🔥 импульсный шорт
-        if (
-                last.close < last.open &&           // красная
-                        body > atr * 1.2 &&                 // тело больше ATR
-                        range > atr * 1.5                  // свеча аномальная
-        ) {
-            return Entry.IMPULSE_SHORT;
-        }
-
-        // 🔥 импульсный лонг
-        if (
-                last.close > last.open &&
-                        body > atr * 1.2 &&
-                        range > atr * 1.5
-        ) {
-            return Entry.IMPULSE_LONG;
-        }
-
-        return Entry.NONE;
-    }
+    private enum Trend { UP, DOWN, FLAT }
+    private enum Entry { LONG, SHORT, NONE }
+    private enum MarketStructure { HH, LL, RANGE }
+    private enum LiquidityEvent { BUY_SIDE_SWEEP, SELL_SIDE_SWEEP, NONE }
 }
