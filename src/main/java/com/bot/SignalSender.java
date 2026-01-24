@@ -1004,9 +1004,17 @@ public class SignalSender {
                     boolean bos = detectBOS(recent);
                     boolean liqSweep = detectLiquiditySweep(recent);
 
+                    // корректируем, но не запрещаем сигнал
                     if (endOfTrend && !bos && !liqSweep) {
-                        conf *= 0.85;
+                        conf *= 0.80; // чуть сильнее снижено
                     }
+
+                    if (next1 != side) {
+                        conf *= 0.9;
+                    }
+
+                    conf = Math.max(0.50, conf);
+
 
                     if (next1 != side) continue;
 
