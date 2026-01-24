@@ -605,15 +605,30 @@ public class SignalSender {
                                      List<TradingCore.Candle> closes5m) {
 
         if (s.confidence < MIN_CONF) return;
-        // === Дополнительно фильтруем развороты ===
+
         List<TradingCore.Candle> recent = new ArrayList<>(closes5m);
         boolean bos = detectBOS(recent);
         boolean liqSweep = detectLiquiditySweep(recent);
         MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
-        if ((micro.speed < 0.0003 && s.direction.equals("LONG")) ||
-                (micro.speed > -0.0003 && s.direction.equals("SHORT"))) {
-            if (!bos && !liqSweep) return; // не отправляем сигнал если тренд замедляется и нет подтверждения
+
+        // Пересчитываем конец тренда прямо здесь
+        double lastHigh = lastSwingHigh(recent);
+        double lastLow = lastSwingLow(recent);
+        boolean nearSwingHigh = s.direction.equals("LONG") && recent.get(recent.size() - 1).close >= lastHigh * 0.995;
+        boolean nearSwingLow = s.direction.equals("SHORT") && recent.get(recent.size() - 1).close <= lastLow * 1.005;
+        boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
+
+        boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
+
+        // Блокировка микро-тренда только для конца тренда
+        if (endOfTrend) {
+            if ((micro.speed < 0.0003 && s.direction.equals("LONG")) ||
+                    (micro.speed > -0.0003 && s.direction.equals("SHORT"))) {
+                if (!bos && !liqSweep) return; // блокируем только для разворотов
+            }
         }
+
+        // Дальше обычные проверки
         if (isCooldown(pair, s.direction)) return;
         if (closes5m.size() < 4) return;
 
@@ -634,7 +649,6 @@ public class SignalSender {
         signalsThisCycle++; // отправка
         markSignalSent(pair, s.direction);
     }
-
     public static class Signal {
         public final String symbol;
         public final String direction;
@@ -984,11 +998,15 @@ public class SignalSender {
                     MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
                     boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
 
-                    if (nearSwingHigh || nearSwingLow || trendSlowing) {
-                        conf *= 0.6; // уменьшаем доверие
-                        if (conf < MIN_CONF) continue; // не отправляем сигнал
-                    }
+                    boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
 
+                    List<TradingCore.Candle> recent = new ArrayList<>(c5m.subList(Math.max(0, c5m.size() - 30), c5m.size()));
+                    boolean bos = detectBOS(recent);
+                    boolean liqSweep = detectLiquiditySweep(recent);
+
+                    if (endOfTrend && !bos && !liqSweep) {
+                        conf *= 0.85;
+                    }
 
                     if (next1 != side) continue;
 
