@@ -15,6 +15,7 @@ public class DecisionEngineMerged {
         public final double takeProfit2;
         public final double probability;
         public final double atr;
+        public final String confidence;
         public final String context;
 
         public TradeIdea(
@@ -26,6 +27,7 @@ public class DecisionEngineMerged {
                 double tp2,
                 double prob,
                 double atr,
+                String confidence,
                 String ctx
         ) {
             this.symbol = symbol;
@@ -36,6 +38,7 @@ public class DecisionEngineMerged {
             this.takeProfit2 = tp2;
             this.probability = prob;
             this.atr = atr;
+            this.confidence = confidence;
             this.context = ctx;
         }
     }
@@ -47,7 +50,7 @@ public class DecisionEngineMerged {
             List<TradingCore.Candle> c15,
             List<TradingCore.Candle> c1h
     ) {
-        if (!valid(c5, 120) || !valid(c15, 120) || !valid(c1h, 150))
+        if (!valid(c5, 50) || !valid(c15, 50) || !valid(c1h, 80))
             return Optional.empty();
 
         double atr = SignalSender.atr(c5, 14);
@@ -60,12 +63,9 @@ public class DecisionEngineMerged {
             return Optional.empty();
 
         TradeRisk risk = buildRisk(c5, atr, setup);
-        if (risk.rr < 1.6)
-            return Optional.empty();
+        double probability = estimateProbability(ctx, setup, risk);
 
-        double probability = estimateProbability(ctx, setup);
-        if (probability < 0.58)
-            return Optional.empty();
+        String confidence = mapConfidence(probability);
 
         return Optional.of(new TradeIdea(
                 symbol,
@@ -76,29 +76,26 @@ public class DecisionEngineMerged {
                 risk.tp2,
                 probability,
                 atr,
+                confidence,
                 setup.reason + " | " + ctx.explain()
         ));
     }
 
     // ===================== SETUP =====================
-    private Setup detectSetup(
-            List<TradingCore.Candle> c5,
-            double atr,
-            MarketContext ctx
-    ) {
+    private Setup detectSetup(List<TradingCore.Candle> c5, double atr, MarketContext ctx) {
         TradingCore.Candle l = last(c5);
 
-        // === 1. REVERSAL (приоритет) ===
+        // ==== REVERSAL ====
         boolean reversalTop =
                 ctx.trend1h == Trend.UP &&
-                        ctx.strength > 0.6 &&
-                        sweepHigh(c5, atr) &&
+                        ctx.strength > 0.5 &&
+                        sweepHigh(c5, atr * 0.7) &&
                         momentumShiftDown(c5);
 
         boolean reversalBottom =
                 ctx.trend1h == Trend.DOWN &&
-                        ctx.strength > 0.6 &&
-                        sweepLow(c5, atr) &&
+                        ctx.strength > 0.5 &&
+                        sweepLow(c5, atr * 0.7) &&
                         momentumShiftUp(c5);
 
         if (reversalTop)
@@ -107,7 +104,7 @@ public class DecisionEngineMerged {
         if (reversalBottom)
             return new Setup(TradingCore.Side.LONG, "HTF exhaustion reversal");
 
-        // === 2. TREND CONTINUATION (НЕ поздний!) ===
+        // ==== TREND CONTINUATION ====
         if (!ctx.late) {
             if (ctx.trend1h == Trend.UP && continuationUp(c5))
                 return new Setup(TradingCore.Side.LONG, "Trend continuation");
@@ -116,15 +113,18 @@ public class DecisionEngineMerged {
                 return new Setup(TradingCore.Side.SHORT, "Trend continuation");
         }
 
+        // ==== MINI SIGNALS (быстрые движения) ====
+        if (breakoutUp(c5))
+            return new Setup(TradingCore.Side.LONG, "Quick breakout up");
+
+        if (breakoutDown(c5))
+            return new Setup(TradingCore.Side.SHORT, "Quick breakout down");
+
         return Setup.NONE;
     }
 
     // ===================== RISK =====================
-    private TradeRisk buildRisk(
-            List<TradingCore.Candle> c5,
-            double atr,
-            Setup setup
-    ) {
+    private TradeRisk buildRisk(List<TradingCore.Candle> c5, double atr, Setup setup) {
         TradingCore.Candle l = last(c5);
         double entry = l.close;
 
@@ -132,12 +132,12 @@ public class DecisionEngineMerged {
 
         if (setup.side == TradingCore.Side.LONG) {
             stop = recentSwingLow(c5) - atr * 0.3;
-            tp1 = entry + atr * 1.4;
-            tp2 = entry + atr * 2.6;
+            tp1 = entry + atr * 1.2;
+            tp2 = entry + atr * 2.2;
         } else {
             stop = recentSwingHigh(c5) + atr * 0.3;
-            tp1 = entry - atr * 1.4;
-            tp2 = entry - atr * 2.6;
+            tp1 = entry - atr * 1.2;
+            tp2 = entry - atr * 2.2;
         }
 
         double rr = Math.abs(tp2 - entry) / Math.abs(entry - stop);
@@ -145,26 +145,30 @@ public class DecisionEngineMerged {
     }
 
     // ===================== PROBABILITY =====================
-    private double estimateProbability(
-            MarketContext ctx,
-            Setup setup
-    ) {
+    private double estimateProbability(MarketContext ctx, Setup setup, TradeRisk risk) {
         double p = 0.55;
 
         if (setup.reason.contains("reversal")) p += 0.10;
         if (setup.reason.contains("continuation")) p += 0.08;
+        if (setup.reason.contains("breakout")) p += 0.06;
 
         if (ctx.trend15 == ctx.trend1h) p += 0.05;
         if (ctx.late) p -= 0.05;
 
-        return Math.min(p, 0.82);
+        if (risk.rr < 1.0) p -= 0.08;
+        else if (risk.rr > 2.0) p += 0.05;
+
+        return Math.min(Math.max(p, 0.50), 0.90);
+    }
+
+    private String mapConfidence(double probability) {
+        if (probability >= 0.70) return "[S]";
+        if (probability >= 0.58) return "[M]";
+        return "[W]";
     }
 
     // ===================== CONTEXT =====================
-    private MarketContext buildMarketContext(
-            List<TradingCore.Candle> c15,
-            List<TradingCore.Candle> c1h
-    ) {
+    private MarketContext buildMarketContext(List<TradingCore.Candle> c15, List<TradingCore.Candle> c1h) {
         Trend t1h = trend(c1h);
         Trend t15 = trend(c15);
         double strength = trendStrength(c1h);
@@ -176,44 +180,62 @@ public class DecisionEngineMerged {
     // ===================== HELPERS =====================
     private boolean sweepLow(List<TradingCore.Candle> c, double atr) {
         TradingCore.Candle l = last(c);
-        TradingCore.Candle p = c.get(c.size() - 3);
+        TradingCore.Candle p = c.get(Math.max(0, c.size() - 3));
         return l.low < p.low && (l.high - l.low) > atr;
     }
 
     private boolean sweepHigh(List<TradingCore.Candle> c, double atr) {
         TradingCore.Candle l = last(c);
-        TradingCore.Candle p = c.get(c.size() - 3);
+        TradingCore.Candle p = c.get(Math.max(0, c.size() - 3));
         return l.high > p.high && (l.high - l.low) > atr;
     }
 
     private boolean momentumShiftDown(List<TradingCore.Candle> c) {
-        return last(c).close < c.get(c.size() - 4).close;
+        return last(c).close < c.get(Math.max(0, c.size() - 4)).close;
     }
 
     private boolean momentumShiftUp(List<TradingCore.Candle> c) {
-        return last(c).close > c.get(c.size() - 4).close;
+        return last(c).close > c.get(Math.max(0, c.size() - 4)).close;
     }
 
     private boolean continuationUp(List<TradingCore.Candle> c) {
-        return last(c).close > c.get(c.size() - 2).high;
+        return last(c).close > c.get(Math.max(0, c.size() - 2)).high;
     }
 
     private boolean continuationDown(List<TradingCore.Candle> c) {
-        return last(c).close < c.get(c.size() - 2).low;
+        return last(c).close < c.get(Math.max(0, c.size() - 2)).low;
+    }
+
+    private boolean breakoutUp(List<TradingCore.Candle> c) {
+        return last(c).close > recentHigh(c, 5);
+    }
+
+    private boolean breakoutDown(List<TradingCore.Candle> c) {
+        return last(c).close < recentLow(c, 5);
     }
 
     private double recentSwingLow(List<TradingCore.Candle> c) {
-        return c.subList(c.size() - 10, c.size())
+        return c.subList(Math.max(0, c.size() - 10), c.size())
                 .stream().mapToDouble(x -> x.low).min().orElse(last(c).low);
     }
 
     private double recentSwingHigh(List<TradingCore.Candle> c) {
-        return c.subList(c.size() - 10, c.size())
+        return c.subList(Math.max(0, c.size() - 10), c.size())
                 .stream().mapToDouble(x -> x.high).max().orElse(last(c).high);
     }
 
+    private double recentHigh(List<TradingCore.Candle> c, int lookback) {
+        return c.subList(Math.max(0, c.size() - lookback), c.size())
+                .stream().mapToDouble(x -> x.high).max().orElse(last(c).high);
+    }
+
+    private double recentLow(List<TradingCore.Candle> c, int lookback) {
+        return c.subList(Math.max(0, c.size() - lookback), c.size())
+                .stream().mapToDouble(x -> x.low).min().orElse(last(c).low);
+    }
+
     private Trend trend(List<TradingCore.Candle> c) {
-        TradingCore.Candle f = c.get(c.size() - 80);
+        TradingCore.Candle f = c.get(Math.max(0, c.size() - 80));
         TradingCore.Candle l = last(c);
         double pct = (l.close - f.close) / f.close;
 
@@ -223,13 +245,13 @@ public class DecisionEngineMerged {
     }
 
     private double trendStrength(List<TradingCore.Candle> c) {
-        TradingCore.Candle f = c.get(c.size() - 100);
+        TradingCore.Candle f = c.get(Math.max(0, c.size() - 100));
         TradingCore.Candle l = last(c);
         return Math.min(Math.abs((l.close - f.close) / f.close) * 7, 1.0);
     }
 
     private boolean isTrendLate(List<TradingCore.Candle> c) {
-        TradingCore.Candle f = c.get(c.size() - 120);
+        TradingCore.Candle f = c.get(Math.max(0, c.size() - 120));
         TradingCore.Candle l = last(c);
         return Math.abs((l.close - f.close) / f.close) > 0.06;
     }

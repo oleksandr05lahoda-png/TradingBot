@@ -24,11 +24,11 @@ public class Elite5MinAnalyzer {
         public final double entry;
         public final double stop;
         public final double take;
-        public final double confidence;
+        public final String confidence; // [S], [M], [W]
         public final String reason;
 
         public TradeSignal(String symbol, TradingCore.Side side, double entry,
-                           double stop, double take, double confidence, String reason) {
+                           double stop, double take, String confidence, String reason) {
             this.symbol = symbol;
             this.side = side;
             this.entry = entry;
@@ -59,7 +59,6 @@ public class Elite5MinAnalyzer {
             List<TradingCore.Candle> candles15m,
             List<TradingCore.Candle> candles1h
     ) {
-        // ---- получаем идею ----
         Optional<DecisionEngineMerged.TradeIdea> ideaOpt =
                 decisionEngine.evaluate(symbol, candles5m, candles15m, candles1h);
 
@@ -67,35 +66,33 @@ public class Elite5MinAnalyzer {
 
         DecisionEngineMerged.TradeIdea idea = ideaOpt.get();
 
-        // ---- confidence adjustment ----
-        double adjustedConf = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
+        // ---- adjust confidence using AdaptiveBrain ----
+        double baseProb = idea.probability;
+        double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, baseProb);
 
-        // ---- validate entry and ATR ----
-        double atr = idea.atr;
-        if (atr <= 0 || idea.entry <= 0) return Optional.empty();
+        // ---- map probability to confidence string ----
+        String conf = adjustedProb >= 0.70 ? "[S]" :
+                adjustedProb >= 0.58 ? "[M]" : "[W]";
 
-        TradingCore.Side sideEnum = idea.side;
-        if (sideEnum == null) return Optional.empty();
-
-        // ---- apply risk ----
+        // ---- apply risk engine ----
         RiskEngine.TradeSignal riskSignal = riskEngine.applyRisk(
                 idea.symbol,
-                sideEnum,
+                idea.side,
                 idea.entry,
-                atr,
-                adjustedConf,
+                idea.atr,
+                adjustedProb,
                 idea.context
         );
 
-        // ---- build final TradeSignal ----
+        // ---- build final signal ----
         TradeSignal finalSignal = new TradeSignal(
-                riskSignal.symbol,
-                sideEnum,
+                idea.symbol,
+                idea.side,
                 riskSignal.entry,
                 riskSignal.stop,
                 riskSignal.take,
-                riskSignal.confidence,
-                riskSignal.reason
+                conf,
+                idea.context
         );
 
         return Optional.of(finalSignal);
@@ -133,7 +130,7 @@ public class Elite5MinAnalyzer {
                                      double entry, double atr,
                                      double confidence, String reason) {
 
-            // ---- адаптивный риск ----
+            // адаптивный риск по ATR и уверенности
             double risk = atr * (confidence > 0.65 ? 0.9 : 1.2);
             double minRisk = entry * minRiskPct;
             if (risk < minRisk) risk = minRisk;
