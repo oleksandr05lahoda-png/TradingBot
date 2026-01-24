@@ -169,6 +169,16 @@ public class SignalSender {
             score += mom / 0.02 * 0.5;
             score += Math.signum(atrPct - 0.0004) * 0.15;
 
+            // === Развороты через свинг-хай/лоу ===
+            double lastClose = closes.get(closes.size() - 1);
+            double maxClose = closes.stream().mapToDouble(d -> d).max().orElse(lastClose);
+            double minClose = closes.stream().mapToDouble(d -> d).min().orElse(lastClose);
+
+// если цена близка к локальному максимуму и импульс снижается -> score вниз
+            if (lastClose >= maxClose * 0.995 && mom < 0) score -= 0.3;
+// если цена близка к локальному минимуму и импульс растет -> score вверх
+            if (lastClose <= minClose * 1.005 && mom > 0) score += 0.3;
+
 
             return Math.max(-1.0, Math.min(1.0, score));
         }
@@ -595,6 +605,15 @@ public class SignalSender {
                                      List<TradingCore.Candle> closes5m) {
 
         if (s.confidence < MIN_CONF) return;
+        // === Дополнительно фильтруем развороты ===
+        List<TradingCore.Candle> recent = new ArrayList<>(closes5m);
+        boolean bos = detectBOS(recent);
+        boolean liqSweep = detectLiquiditySweep(recent);
+        MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
+        if ((micro.speed < 0.0003 && s.direction.equals("LONG")) ||
+                (micro.speed > -0.0003 && s.direction.equals("SHORT"))) {
+            if (!bos && !liqSweep) return; // не отправляем сигнал если тренд замедляется и нет подтверждения
+        }
         if (isCooldown(pair, s.direction)) return;
         if (closes5m.size() < 4) return;
 
@@ -956,6 +975,20 @@ public class SignalSender {
                     TradingCore.Side next1 = predictor != null
                             ? (predictor.predictNextCandleScore(c5m) > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT)
                             : side;
+                    // === Проверка конца тренда / возможного разворота ===
+                    double lastHigh = lastSwingHigh(c5m);
+                    double lastLow = lastSwingLow(c5m);
+                    boolean nearSwingHigh = side == TradingCore.Side.LONG && last.close >= lastHigh * 0.995;
+                    boolean nearSwingLow = side == TradingCore.Side.SHORT && last.close <= lastLow * 1.005;
+
+                    MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
+                    boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
+
+                    if (nearSwingHigh || nearSwingLow || trendSlowing) {
+                        conf *= 0.6; // уменьшаем доверие
+                        if (conf < MIN_CONF) continue; // не отправляем сигнал
+                    }
+
 
                     if (next1 != side) continue;
 
@@ -1047,6 +1080,14 @@ public class SignalSender {
                                 : sSide;
 
                         if (next1 != sSide) return;
+                        double lastHigh = lastSwingHigh(c5m);
+                        double lastLow = lastSwingLow(c5m);
+                        boolean nearSwingHigh = sSide == TradingCore.Side.LONG && c5m.get(c5m.size()-1).close >= lastHigh * 0.995;
+                        boolean nearSwingLow = sSide == TradingCore.Side.SHORT && c5m.get(c5m.size()-1).close <= lastLow * 1.005;
+                        MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
+                        boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
+
+                        if (nearSwingHigh || nearSwingLow || trendSlowing) return;
 
                         Signal s = new Signal(
                                 pair,
