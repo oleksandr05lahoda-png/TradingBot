@@ -59,6 +59,7 @@ public class Elite5MinAnalyzer {
             List<TradingCore.Candle> candles15m,
             List<TradingCore.Candle> candles1h
     ) {
+        // ---- получаем идею ----
         Optional<DecisionEngineMerged.TradeIdea> ideaOpt =
                 decisionEngine.evaluate(symbol, candles5m, candles15m, candles1h);
 
@@ -132,6 +133,7 @@ public class Elite5MinAnalyzer {
                                      double entry, double atr,
                                      double confidence, String reason) {
 
+            // ---- адаптивный риск ----
             double risk = atr * (confidence > 0.65 ? 0.9 : 1.2);
             double minRisk = entry * minRiskPct;
             if (risk < minRisk) risk = minRisk;

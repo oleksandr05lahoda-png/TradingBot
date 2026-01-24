@@ -5,9 +5,10 @@ import java.util.Optional;
 
 public class DecisionEngineMerged {
 
+    // ===================== TRADE IDEA =====================
     public static class TradeIdea {
         public final String symbol;
-        public final TradingCore.Side side;   // <- единственный Side в проекте
+        public final TradingCore.Side side;
         public final double entry;
         public final double stopLoss;
         public final double takeProfit1;
@@ -54,20 +55,16 @@ public class DecisionEngineMerged {
 
         MarketContext ctx = buildMarketContext(c15, c1h);
 
-        Direction direction = chooseDirection(ctx);
-        if (direction == Direction.NONE)
-            return Optional.empty();
-
-        Setup setup = detectSetup(c5, atr, ctx, direction);
+        Setup setup = detectSetup(c5, atr, ctx);
         if (setup == Setup.NONE)
             return Optional.empty();
 
         TradeRisk risk = buildRisk(c5, atr, setup);
-        if (risk.rr < 2.0)
+        if (risk.rr < 1.6)
             return Optional.empty();
 
         double probability = estimateProbability(ctx, setup);
-        if (probability < 0.65)
+        if (probability < 0.58)
             return Optional.empty();
 
         return Optional.of(new TradeIdea(
@@ -79,46 +76,45 @@ public class DecisionEngineMerged {
                 risk.tp2,
                 probability,
                 atr,
-                ctx.explain() + " | " + setup
+                setup.reason + " | " + ctx.explain()
         ));
-    }
-
-    // ===================== DIRECTION =====================
-    private Direction chooseDirection(MarketContext ctx) {
-
-        if (ctx.late) return Direction.NONE;
-        if (ctx.trend1h == Trend.UP) return Direction.LONG;
-        if (ctx.trend1h == Trend.FLAT) return Direction.NONE;
-        if (ctx.trend1h == Trend.DOWN && ctx.strength > 0.5) return Direction.SHORT;
-
-        return Direction.NONE;
     }
 
     // ===================== SETUP =====================
     private Setup detectSetup(
             List<TradingCore.Candle> c5,
             double atr,
-            MarketContext ctx,
-            Direction direction
+            MarketContext ctx
     ) {
         TradingCore.Candle l = last(c5);
 
-        boolean liquiditySweepDown =
-                sweepLow(c5, atr) && l.close > l.open;
+        // === 1. REVERSAL (приоритет) ===
+        boolean reversalTop =
+                ctx.trend1h == Trend.UP &&
+                        ctx.strength > 0.6 &&
+                        sweepHigh(c5, atr) &&
+                        momentumShiftDown(c5);
 
-        boolean continuationUp =
-                momentumContinuation(c5) && l.close > l.open;
+        boolean reversalBottom =
+                ctx.trend1h == Trend.DOWN &&
+                        ctx.strength > 0.6 &&
+                        sweepLow(c5, atr) &&
+                        momentumShiftUp(c5);
 
-        boolean exhaustionTop =
-                sweepHigh(c5, atr) && l.close < l.open;
+        if (reversalTop)
+            return new Setup(TradingCore.Side.SHORT, "HTF exhaustion reversal");
 
-        if (direction == Direction.LONG &&
-                (liquiditySweepDown || continuationUp))
-            return new Setup(TradingCore.Side.LONG);
+        if (reversalBottom)
+            return new Setup(TradingCore.Side.LONG, "HTF exhaustion reversal");
 
-        if (direction == Direction.SHORT &&
-                exhaustionTop)
-            return new Setup(TradingCore.Side.SHORT);
+        // === 2. TREND CONTINUATION (НЕ поздний!) ===
+        if (!ctx.late) {
+            if (ctx.trend1h == Trend.UP && continuationUp(c5))
+                return new Setup(TradingCore.Side.LONG, "Trend continuation");
+
+            if (ctx.trend1h == Trend.DOWN && continuationDown(c5))
+                return new Setup(TradingCore.Side.SHORT, "Trend continuation");
+        }
 
         return Setup.NONE;
     }
@@ -135,13 +131,13 @@ public class DecisionEngineMerged {
         double stop, tp1, tp2;
 
         if (setup.side == TradingCore.Side.LONG) {
-            stop = recentSwingLow(c5) - atr * 0.2;
-            tp1 = entry + atr * 1.8;
-            tp2 = entry + atr * 3.5;
+            stop = recentSwingLow(c5) - atr * 0.3;
+            tp1 = entry + atr * 1.4;
+            tp2 = entry + atr * 2.6;
         } else {
-            stop = recentSwingHigh(c5) + atr * 0.2;
-            tp1 = entry - atr * 1.8;
-            tp2 = entry - atr * 3.5;
+            stop = recentSwingHigh(c5) + atr * 0.3;
+            tp1 = entry - atr * 1.4;
+            tp2 = entry - atr * 2.6;
         }
 
         double rr = Math.abs(tp2 - entry) / Math.abs(entry - stop);
@@ -153,17 +149,15 @@ public class DecisionEngineMerged {
             MarketContext ctx,
             Setup setup
     ) {
-        double p = 0.58;
+        double p = 0.55;
 
-        if (setup.side == TradingCore.Side.LONG && ctx.trend1h == Trend.UP) p += 0.15;
-        if (setup.side == TradingCore.Side.LONG && ctx.trend15 == Trend.UP) p += 0.10;
+        if (setup.reason.contains("reversal")) p += 0.10;
+        if (setup.reason.contains("continuation")) p += 0.08;
 
-        if (setup.side == TradingCore.Side.SHORT) p -= 0.12;
+        if (ctx.trend15 == ctx.trend1h) p += 0.05;
+        if (ctx.late) p -= 0.05;
 
-        if (ctx.strength > 0.7) p += 0.05;
-        if (ctx.late) p -= 0.08;
-
-        return Math.min(p, 0.85);
+        return Math.min(p, 0.82);
     }
 
     // ===================== CONTEXT =====================
@@ -183,28 +177,38 @@ public class DecisionEngineMerged {
     private boolean sweepLow(List<TradingCore.Candle> c, double atr) {
         TradingCore.Candle l = last(c);
         TradingCore.Candle p = c.get(c.size() - 3);
-        return l.low < p.low && (l.high - l.low) > atr * 0.8;
+        return l.low < p.low && (l.high - l.low) > atr;
     }
 
     private boolean sweepHigh(List<TradingCore.Candle> c, double atr) {
         TradingCore.Candle l = last(c);
         TradingCore.Candle p = c.get(c.size() - 3);
-        return l.high > p.high && (l.high - l.low) > atr * 0.8;
+        return l.high > p.high && (l.high - l.low) > atr;
     }
 
-    private boolean momentumContinuation(List<TradingCore.Candle> c) {
-        TradingCore.Candle a = c.get(c.size() - 4);
-        TradingCore.Candle b = last(c);
-        return b.close > a.close;
+    private boolean momentumShiftDown(List<TradingCore.Candle> c) {
+        return last(c).close < c.get(c.size() - 4).close;
+    }
+
+    private boolean momentumShiftUp(List<TradingCore.Candle> c) {
+        return last(c).close > c.get(c.size() - 4).close;
+    }
+
+    private boolean continuationUp(List<TradingCore.Candle> c) {
+        return last(c).close > c.get(c.size() - 2).high;
+    }
+
+    private boolean continuationDown(List<TradingCore.Candle> c) {
+        return last(c).close < c.get(c.size() - 2).low;
     }
 
     private double recentSwingLow(List<TradingCore.Candle> c) {
-        return c.subList(c.size() - 12, c.size())
+        return c.subList(c.size() - 10, c.size())
                 .stream().mapToDouble(x -> x.low).min().orElse(last(c).low);
     }
 
     private double recentSwingHigh(List<TradingCore.Candle> c) {
-        return c.subList(c.size() - 12, c.size())
+        return c.subList(c.size() - 10, c.size())
                 .stream().mapToDouble(x -> x.high).max().orElse(last(c).high);
     }
 
@@ -213,21 +217,21 @@ public class DecisionEngineMerged {
         TradingCore.Candle l = last(c);
         double pct = (l.close - f.close) / f.close;
 
-        if (pct > 0.006) return Trend.UP;
-        if (pct < -0.006) return Trend.DOWN;
+        if (pct > 0.004) return Trend.UP;
+        if (pct < -0.004) return Trend.DOWN;
         return Trend.FLAT;
     }
 
     private double trendStrength(List<TradingCore.Candle> c) {
         TradingCore.Candle f = c.get(c.size() - 100);
         TradingCore.Candle l = last(c);
-        return Math.min(Math.abs((l.close - f.close) / f.close) * 8, 1.0);
+        return Math.min(Math.abs((l.close - f.close) / f.close) * 7, 1.0);
     }
 
     private boolean isTrendLate(List<TradingCore.Candle> c) {
         TradingCore.Candle f = c.get(c.size() - 120);
         TradingCore.Candle l = last(c);
-        return Math.abs((l.close - f.close) / f.close) > 0.07;
+        return Math.abs((l.close - f.close) / f.close) > 0.06;
     }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
@@ -273,19 +277,15 @@ public class DecisionEngineMerged {
 
     private static class Setup {
         TradingCore.Side side;
+        String reason;
 
-        Setup(TradingCore.Side s) {
+        Setup(TradingCore.Side s, String r) {
             side = s;
+            reason = r;
         }
 
         static final Setup NONE = null;
-
-        public String toString() {
-            return side.name();
-        }
     }
-
-    private enum Direction {LONG, SHORT, NONE}
 
     private enum Trend {UP, DOWN, FLAT}
 }
