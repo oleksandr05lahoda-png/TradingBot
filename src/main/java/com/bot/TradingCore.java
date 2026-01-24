@@ -35,6 +35,12 @@ public class TradingCore {
         }
     }
 
+    // ===================== SIDE =====================
+    public enum Side {
+        LONG,
+        SHORT
+    }
+
     // ===================== RISK ENGINE =====================
     public static class RiskEngine {
 
@@ -45,48 +51,55 @@ public class TradingCore {
         }
 
         public static class TradeSignal {
-            public String symbol;
-            public String side;     // LONG / SHORT
-            public double entry;
-            public double stop;
-            public double take;
-            public double confidence;
-            public String reason;
+            public final String symbol;
+            public final Side side;
+            public final double entry;
+            public final double stop;
+            public final double take;
+            public final double confidence;
+            public final String reason;
+
+            public TradeSignal(String symbol, Side side, double entry,
+                               double stop, double take, double confidence, String reason) {
+                this.symbol = symbol;
+                this.side = side;
+                this.entry = entry;
+                this.stop = stop;
+                this.take = take;
+                this.confidence = confidence;
+                this.reason = reason;
+            }
+
+            @Override
+            public String toString() {
+                return "TradeSignal{" +
+                        "symbol='" + symbol + '\'' +
+                        ", side=" + side +
+                        ", entry=" + entry +
+                        ", stop=" + stop +
+                        ", take=" + take +
+                        ", confidence=" + confidence +
+                        ", reason='" + reason + '\'' +
+                        '}';
+            }
         }
 
-        public TradeSignal applyRisk(
-                String symbol,
-                String side,
-                double entry,
-                double atr,
-                double confidence,
-                String reason
-        ) {
-            TradeSignal ts = new TradeSignal();
-            ts.symbol = symbol;
-            ts.side = side;
-            ts.entry = entry;
-            ts.confidence = confidence;
-            ts.reason = reason;
+        public TradeSignal applyRisk(String symbol, Side side, double entry, double atr, double confidence, String reason) {
 
-            // базовый риск через ATR
             double risk = atr * 1.2;
-
-            // защита от микроскопического ATR
             double minRisk = entry * minRiskPct;
-            if (risk < minRisk) {
-                risk = minRisk;
-            }
+            if (risk < minRisk) risk = minRisk;
 
-            if ("LONG".equalsIgnoreCase(side)) {
-                ts.stop = entry - risk;
-                ts.take = entry + risk * 2.5;
+            double stop, take;
+            if (side == Side.LONG) {
+                stop = entry - risk;
+                take = entry + risk * 2.5;
             } else {
-                ts.stop = entry + risk;
-                ts.take = entry - risk * 2.5;
+                stop = entry + risk;
+                take = entry - risk * 2.5;
             }
 
-            return ts;
+            return new TradeSignal(symbol, side, entry, stop, take, confidence, reason);
         }
     }
 
@@ -96,60 +109,39 @@ public class TradingCore {
         private final Map<String, Double> symbolBias = new ConcurrentHashMap<>();
         private final Map<String, Integer> streaks = new ConcurrentHashMap<>();
 
-        /**
-         * Основной метод, который ты используешь ВЕЗДЕ
-         */
-        public double applyAllAdjustments(
-                String strategy,
-                String symbol,
-                double baseConfidence
-        ) {
+        public double applyAllAdjustments(String strategy, String symbol, double baseConfidence) {
             double conf = baseConfidence;
-
-            conf = adapt(strategy, conf);
-            conf += symbolBias(symbol);
+            conf = adaptStrategy(strategy, conf);
+            conf += getSymbolBias(symbol);
             conf += sessionBoost();
-
             return clamp(conf, 0.0, 0.95);
         }
 
-        /**
-         * Адаптация под стратегию (можно расширять)
-         */
-        public double adapt(String strategy, double confidence) {
+        private double adaptStrategy(String strategy, double confidence) {
             if ("ELITE5".equalsIgnoreCase(strategy)) {
                 return confidence + 0.02;
             }
             return confidence;
         }
 
-        /**
-         * Усиление / ослабление по истории символа
-         */
-        private double symbolBias(String symbol) {
+        private double getSymbolBias(String symbol) {
             return symbolBias.getOrDefault(symbol, 0.0);
         }
 
-        /**
-         * Лёгкий буст, если серия удачная
-         */
-        public double sessionBoost() {
+        private double sessionBoost() {
             int streak = streaks.values().stream().mapToInt(i -> i).sum();
             if (streak > 3) return 0.03;
             if (streak < -3) return -0.03;
             return 0.0;
         }
 
-        /**
-         * Вызывай после закрытия сделки
-         */
         public void registerResult(String symbol, boolean win) {
             streaks.merge(symbol, win ? 1 : -1, Integer::sum);
             symbolBias.merge(symbol, win ? 0.01 : -0.01, Double::sum);
         }
 
-        private double clamp(double v, double min, double max) {
-            return Math.max(min, Math.min(max, v));
+        private double clamp(double value, double min, double max) {
+            return Math.max(min, Math.min(max, value));
         }
     }
 }
