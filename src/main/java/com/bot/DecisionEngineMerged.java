@@ -44,6 +44,7 @@ public class DecisionEngineMerged {
     }
 
     // ===================== MAIN EVALUATION =====================
+    // Метод для списка идей
     public List<TradeIdea> evaluateAll(String symbol,
                                        List<TradingCore.Candle> c5,
                                        List<TradingCore.Candle> c15,
@@ -55,7 +56,6 @@ public class DecisionEngineMerged {
         if (atr <= 0) return Collections.emptyList();
 
         MarketContext ctx = buildMarketContext(c15, c1h);
-
         List<Setup> setups = detectAllSetups(c5, atr, ctx);
         if (setups.isEmpty()) return Collections.emptyList();
 
@@ -79,12 +79,21 @@ public class DecisionEngineMerged {
             ));
         }
 
-        // Сортировка по вероятности и фильтр слабых
         return ideas.stream()
                 .filter(i -> i.probability >= 0.55)
                 .sorted((a, b) -> Double.compare(b.probability, a.probability))
-                .limit(5) // максимум 5 сигналов на символ за 5 минут
+                .limit(5)
                 .collect(Collectors.toList());
+    }
+
+    // ===================== Новый метод для одного сигнала =====================
+    public Optional<TradeIdea> evaluate(String symbol,
+                                        List<TradingCore.Candle> c5,
+                                        List<TradingCore.Candle> c15,
+                                        List<TradingCore.Candle> c1h) {
+        List<TradeIdea> ideas = evaluateAll(symbol, c5, c15, c1h);
+        if (ideas.isEmpty()) return Optional.empty();
+        return Optional.of(ideas.get(0)); // возвращаем лучший сигнал
     }
 
     // ===================== SETUP =====================
@@ -92,14 +101,14 @@ public class DecisionEngineMerged {
         List<Setup> setups = new ArrayList<>();
         TradingCore.Candle l = last(c5);
 
-        // ==== REVERSALS ====
+        // REVERSALS
         if (ctx.trend1h == Trend.UP && ctx.strength > 0.5 && sweepHigh(c5, atr * 0.7) && momentumShiftDown(c5))
             setups.add(new Setup(TradingCore.Side.SHORT, "HTF exhaustion reversal"));
 
         if (ctx.trend1h == Trend.DOWN && ctx.strength > 0.5 && sweepLow(c5, atr * 0.7) && momentumShiftUp(c5))
             setups.add(new Setup(TradingCore.Side.LONG, "HTF exhaustion reversal"));
 
-        // ==== TREND CONTINUATION ====
+        // TREND CONTINUATION
         if (!ctx.late) {
             if (ctx.trend1h == Trend.UP && continuationUp(c5))
                 setups.add(new Setup(TradingCore.Side.LONG, "Trend continuation"));
@@ -107,7 +116,7 @@ public class DecisionEngineMerged {
                 setups.add(new Setup(TradingCore.Side.SHORT, "Trend continuation"));
         }
 
-        // ==== MINI SIGNALS ====
+        // MINI SIGNALS
         if (breakoutUp(c5)) setups.add(new Setup(TradingCore.Side.LONG, "Quick breakout up"));
         if (breakoutDown(c5)) setups.add(new Setup(TradingCore.Side.SHORT, "Quick breakout down"));
 
@@ -152,7 +161,7 @@ public class DecisionEngineMerged {
         return "[W]";
     }
 
-    // ===================== CONTEXT =====================
+    // ===================== MARKET CONTEXT =====================
     private MarketContext buildMarketContext(List<TradingCore.Candle> c15, List<TradingCore.Candle> c1h) {
         Trend t1h = trend(c1h);
         Trend t15 = trend(c15);
