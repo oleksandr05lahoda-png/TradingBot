@@ -2,14 +2,14 @@ package com.bot;
 
 import java.time.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.*;
 
 public class Elite5MinAnalyzer {
 
     private final DecisionEngineMerged decisionEngine;
     private final RiskEngine riskEngine;
     private final AdaptiveBrain brain;
+    private final Set<String> recentSignals = ConcurrentHashMap.newKeySet(); // для фильтра дублей
 
     public Elite5MinAnalyzer(DecisionEngineMerged decisionEngine, double minRiskPct) {
         this.decisionEngine = decisionEngine;
@@ -40,62 +40,66 @@ public class Elite5MinAnalyzer {
 
         @Override
         public String toString() {
-            return "TradeSignal{" +
-                    "symbol='" + symbol + '\'' +
-                    ", side=" + side +
-                    ", entry=" + entry +
-                    ", stop=" + stop +
-                    ", take=" + take +
-                    ", confidence=" + confidence +
-                    ", reason='" + reason + '\'' +
-                    '}';
+            return String.format("%s → %s | Entry: %.5f Stop: %.5f Take: %.5f %s | %s",
+                    symbol, side, entry, stop, take, confidence, reason);
         }
     }
 
     // ================== MAIN ANALYSIS ==================
-    public Optional<TradeSignal> analyze(
-            String symbol,
-            List<TradingCore.Candle> candles5m,
-            List<TradingCore.Candle> candles15m,
-            List<TradingCore.Candle> candles1h
-    ) {
-        Optional<DecisionEngineMerged.TradeIdea> ideaOpt =
-                decisionEngine.evaluate(symbol, candles5m, candles15m, candles1h);
+    public List<TradeSignal> analyzeAll(List<String> symbols,
+                                        Map<String, List<TradingCore.Candle>> candles5m,
+                                        Map<String, List<TradingCore.Candle>> candles15m,
+                                        Map<String, List<TradingCore.Candle>> candles1h) {
 
-        if (ideaOpt.isEmpty()) return Optional.empty();
+        List<TradeSignal> signals = new ArrayList<>();
 
-        DecisionEngineMerged.TradeIdea idea = ideaOpt.get();
+        for (String sym : symbols) {
+            List<TradingCore.Candle> c5 = candles5m.get(sym);
+            List<TradingCore.Candle> c15 = candles15m.get(sym);
+            List<TradingCore.Candle> c1h = candles1h.get(sym);
 
-        // ---- adjust confidence using AdaptiveBrain ----
-        double baseProb = idea.probability;
-        double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, baseProb);
+            if (c5 == null || c15 == null || c1h == null) continue;
 
-        // ---- map probability to confidence string ----
-        String conf = adjustedProb >= 0.70 ? "[S]" :
-                adjustedProb >= 0.58 ? "[M]" : "[W]";
+            Optional<DecisionEngineMerged.TradeIdea> ideaOpt =
+                    decisionEngine.evaluate(sym, c5, c15, c1h);
 
-        // ---- apply risk engine ----
-        RiskEngine.TradeSignal riskSignal = riskEngine.applyRisk(
-                idea.symbol,
-                idea.side,
-                idea.entry,
-                idea.atr,
-                adjustedProb,
-                idea.context
-        );
+            if (ideaOpt.isEmpty()) continue;
+            DecisionEngineMerged.TradeIdea idea = ideaOpt.get();
 
-        // ---- build final signal ----
-        TradeSignal finalSignal = new TradeSignal(
-                idea.symbol,
-                idea.side,
-                riskSignal.entry,
-                riskSignal.stop,
-                riskSignal.take,
-                conf,
-                idea.context
-        );
+            // ---- адаптивная уверенность ----
+            double baseProb = idea.probability;
+            double adjustedProb = brain.applyAllAdjustments("ELITE5", sym, baseProb);
 
-        return Optional.of(finalSignal);
+            if (adjustedProb < 0.55) continue; // фильтр слабых сигналов
+
+            // ---- применение риск-движка ----
+            RiskEngine.TradeSignal riskSig = riskEngine.applyRisk(
+                    idea.symbol, idea.side, idea.entry, idea.atr, adjustedProb, idea.context);
+
+            TradeSignal ts = new TradeSignal(
+                    sym, idea.side, riskSig.entry, riskSig.stop, riskSig.take,
+                    mapConfidence(adjustedProb), idea.context
+            );
+
+            // ---- фильтр дублей ----
+            String key = sym + "_" + idea.side;
+            if (!recentSignals.contains(key)) {
+                recentSignals.add(key);
+                signals.add(ts);
+            }
+        }
+
+        // ---- очистка старых сигналов через 10 минут ----
+        ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
+        cleaner.schedule(() -> recentSignals.clear(), 10, TimeUnit.MINUTES);
+
+        return signals;
+    }
+
+    private String mapConfidence(double probability) {
+        if (probability >= 0.75) return "[S]";
+        if (probability >= 0.60) return "[M]";
+        return "[W]";
     }
 
     // ================== RISK ENGINE ==================
@@ -109,14 +113,12 @@ public class Elite5MinAnalyzer {
 
         public static class TradeSignal {
             public final String symbol;
-            public final double entry;
-            public final double stop;
-            public final double take;
+            public final double entry, stop, take;
             public final double confidence;
             public final String reason;
 
-            public TradeSignal(String symbol, double entry, double stop,
-                               double take, double confidence, String reason) {
+            public TradeSignal(String symbol, double entry, double stop, double take,
+                               double confidence, String reason) {
                 this.symbol = symbol;
                 this.entry = entry;
                 this.stop = stop;
@@ -130,8 +132,7 @@ public class Elite5MinAnalyzer {
                                      double entry, double atr,
                                      double confidence, String reason) {
 
-            // адаптивный риск по ATR и уверенности
-            double risk = atr * (confidence > 0.65 ? 0.9 : 1.2);
+            double risk = atr * (confidence > 0.65 ? 0.9 : 1.1);
             double minRisk = entry * minRiskPct;
             if (risk < minRisk) risk = minRisk;
 
@@ -184,13 +185,9 @@ public class Elite5MinAnalyzer {
         private double impulsePenalty(String pair) {
             impulseHistory.putIfAbsent(pair, new ConcurrentLinkedDeque<>());
             Deque<Long> q = impulseHistory.get(pair);
-
             long now = System.currentTimeMillis();
             q.addLast(now);
-
-            while (!q.isEmpty() && now - q.peekFirst() > 20 * 60_000)
-                q.pollFirst();
-
+            while (!q.isEmpty() && now - q.peekFirst() > 20 * 60_000) q.pollFirst();
             if (q.size() >= 3) return -0.07;
             if (q.size() == 2) return -0.03;
             return 0.0;
@@ -198,8 +195,7 @@ public class Elite5MinAnalyzer {
 
         private double sessionBoost() {
             int hour = LocalTime.now(ZoneOffset.UTC).getHour();
-            if ((hour >= 7 && hour < 11) || (hour >= 13 && hour < 17))
-                return 0.05;
+            if ((hour >= 7 && hour < 11) || (hour >= 13 && hour < 17)) return 0.05;
             return 0.0;
         }
 
