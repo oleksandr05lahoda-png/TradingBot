@@ -6,7 +6,7 @@ from datetime import datetime
 
 BASE_URL = "https://fapi.binance.com"
 
-# ===== Binance =====
+# ===================== FETCH DATA =====================
 def get_top_symbols(limit=50):
     try:
         data = requests.get(f"{BASE_URL}/fapi/v1/ticker/24hr", timeout=10).json()
@@ -28,7 +28,7 @@ def fetch_klines(symbol, interval="5m", limit=200):
     df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
     return df
 
-# ===== Indicators =====
+# ===================== INDICATORS =====================
 def EMA(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -48,9 +48,7 @@ def ATR(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-# ==========================================================
-# =================== PRO FUTURES BRAIN ====================
-# ==========================================================
+# ===================== PRO FUTURES ENGINE =====================
 def analyze_symbol(symbol, forecast_bars=5):
     try:
         df5 = fetch_klines(symbol, "5m", 200)
@@ -58,92 +56,82 @@ def analyze_symbol(symbol, forecast_bars=5):
         if len(df5) < 100 or len(df15) < 100:
             return None
 
-        # ===== Indicators =====
-        ema5_5 = EMA(df5['close'], 5)
-        ema9_5 = EMA(df5['close'], 9)
-        ema21_5 = EMA(df5['close'], 21)
-        ema50_5 = EMA(df5['close'], 50)
-        ema9_15 = EMA(df15['close'], 9).iloc[-1]
-        ema21_15 = EMA(df15['close'], 21).iloc[-1]
-
-        rsi = RSI(df5['close'], 14).iloc[-1]
-        atr = ATR(df5, 14).iloc[-1]
+        # ===== EMA & Trend =====
+        ema5_5, ema9_5, ema21_5, ema50_5 = [EMA(df5['close'], p) for p in (5,9,21,50)]
+        ema9_15, ema21_15 = EMA(df15['close'], 9).iloc[-1], EMA(df15['close'], 21).iloc[-1]
         price = df5['close'].iloc[-1]
+        atr = ATR(df5, 14).iloc[-1]
+        rsi = RSI(df5['close'], 14).iloc[-1]
         ema_slope = ema9_5.iloc[-1] - ema9_5.iloc[-5]
-
         trend_15m = "UP" if ema9_15 > ema21_15 else "DOWN"
 
-        # ===== Volatility filter =====
+        # ===== FILTER VOLATILITY =====
         candle_range = df5['high'].iloc[-1] - df5['low'].iloc[-1]
-        if candle_range < 0.3 * atr or candle_range > 4.0 * atr:
+        if candle_range < 0.2 * atr or candle_range > 4.0 * atr:
             return None
 
         signals = []
 
-        # ===== Цикл прогнозов =====
         for i in range(forecast_bars):
             sig = None
             conf = 0.50
             score = 0
             reason = ""
 
-            # ===== Trend continuation =====
+            # ===== TREND CONTINUATION =====
             if (trend_15m == "UP" and
                 ema5_5.iloc[-1] > ema9_5.iloc[-1] > ema21_5.iloc[-1] > ema50_5.iloc[-1] and
-                ema_slope > 0 and
-                45 < rsi < 78):
+                ema_slope > 0 and 45 < rsi < 78):
                 sig = "LONG"
                 score += 3
                 conf += 0.08
-                reason = f"Trend continuation LONG, forecast +{i+1}"
+                reason = f"Trend continuation LONG +{i+1}"
 
             elif (trend_15m == "DOWN" and
                   ema5_5.iloc[-1] < ema9_5.iloc[-1] < ema21_5.iloc[-1] < ema50_5.iloc[-1] and
-                  ema_slope < 0 and
-                  22 < rsi < 55):
+                  ema_slope < 0 and 22 < rsi < 55):
                 sig = "SHORT"
                 score += 3
                 conf += 0.08
-                reason = f"Trend continuation SHORT, forecast +{i+1}"
+                reason = f"Trend continuation SHORT +{i+1}"
 
-            # ===== Pullback entry =====
+            # ===== PULLBACK ENTRY (ранний вход) =====
             if sig is None:
                 if trend_15m == "UP" and ema21_5.iloc[-1] < price < ema9_5.iloc[-1] and rsi > 45:
                     sig = "LONG"
                     score += 2
-                    conf += 0.05
-                    reason = f"Pullback LONG, forecast +{i+1}"
+                    conf += 0.06
+                    reason = f"Pullback LONG +{i+1}"
                 elif trend_15m == "DOWN" and ema9_5.iloc[-1] < price < ema21_5.iloc[-1] and rsi < 55:
                     sig = "SHORT"
                     score += 2
-                    conf += 0.05
-                    reason = f"Pullback SHORT, forecast +{i+1}"
+                    conf += 0.06
+                    reason = f"Pullback SHORT +{i+1}"
 
-            # ===== Counter-trend (редко) =====
+            # ===== COUNTER-TREND (редко, для ловли разворотов) =====
             if sig is None:
                 if rsi < 28 and trend_15m == "UP" and ema_slope > 0:
                     sig = "LONG"
                     score += 2
-                    conf += 0.06
-                    reason = f"Exhaustion LONG, forecast +{i+1}"
+                    conf += 0.07
+                    reason = f"Exhaustion LONG +{i+1}"
                 elif rsi > 72 and trend_15m == "DOWN" and ema_slope < 0:
                     sig = "SHORT"
                     score += 2
-                    conf += 0.06
-                    reason = f"Exhaustion SHORT, forecast +{i+1}"
+                    conf += 0.07
+                    reason = f"Exhaustion SHORT +{i+1}"
 
-            # ===== Добавляем сигнал =====
             if sig and score >= 2:
                 signals.append({
                     "symbol": symbol,
                     "signal": sig,
-                    "confidence": round(min(conf, 0.85), 2),
-                    "price": round(price, 6),
+                    "confidence": round(min(conf, 0.88),2),
+                    "price": round(price,6),
                     "rsi": int(rsi),
                     "trend_15m": trend_15m,
                     "reason": reason,
                     "timestamp": datetime.utcnow().isoformat(),
-                    "forecast_bar": i + 1
+                    "forecast_bar": i+1
                 })
 
         if not signals:
@@ -154,7 +142,7 @@ def analyze_symbol(symbol, forecast_bars=5):
         print(f"Ошибка анализа {symbol}: {e}")
         return None
 
-# ===== MAIN =====
+# ===================== MAIN =====================
 def main():
     symbols = get_top_symbols(50)
     all_signals = []
