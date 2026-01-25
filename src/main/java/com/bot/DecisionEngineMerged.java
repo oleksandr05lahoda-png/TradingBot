@@ -15,7 +15,7 @@ public class DecisionEngineMerged {
         public final double probability;
         public final double atr;
         public final String confidence;
-        public final String context;
+        public final String reason;
 
         public TradeIdea(String symbol,
                          TradingCore.Side side,
@@ -26,7 +26,7 @@ public class DecisionEngineMerged {
                          double probability,
                          double atr,
                          String confidence,
-                         String context) {
+                         String reason) {
             this.symbol = symbol;
             this.side = side;
             this.entry = entry;
@@ -36,7 +36,7 @@ public class DecisionEngineMerged {
             this.probability = probability;
             this.atr = atr;
             this.confidence = confidence;
-            this.context = context;
+            this.reason = reason;
         }
     }
 
@@ -46,53 +46,55 @@ public class DecisionEngineMerged {
                                        List<TradingCore.Candle> c15,
                                        List<TradingCore.Candle> c1h) {
 
-        if (!valid(c5, 20)) return Collections.emptyList(); // меньше минимальных свечей
+        if (!valid(c5, 20)) return Collections.emptyList();
 
         double atr = SignalSender.atr(c5, 14);
         if (atr <= 0) return Collections.emptyList();
 
         MarketContext ctx = buildMarketContext(c15, c1h);
+        if (ctx.late) return Collections.emptyList(); // блокируем слишком поздний тренд
+
         List<TradeIdea> ideas = new ArrayList<>();
         TradingCore.Candle last = last(c5);
         double entry = last.close;
 
         // ===== EARLY REVERSAL =====
-        if (ctx.trend1h == Trend.UP && liquiditySweepHigh(c5, atr) && rejectionDown(c5)) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.6, "HTF reversal DOWN"));
+        if (ctx.trend1h == Trend.UP && ctx.trend15 != Trend.DOWN && liquiditySweepHigh(c5, atr) && rejectionDown(c5, atr)) {
+            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.65, "HTF reversal DOWN"));
         }
-        if (ctx.trend1h == Trend.DOWN && liquiditySweepLow(c5, atr) && rejectionUp(c5)) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.6, "HTF reversal UP"));
+        if (ctx.trend1h == Trend.DOWN && ctx.trend15 != Trend.UP && liquiditySweepLow(c5, atr) && rejectionUp(c5, atr)) {
+            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.65, "HTF reversal UP"));
         }
 
         // ===== COMPRESSION → EXPANSION =====
-        if (volatilityCompression(c5, atr) && impulseUp(c5) && ctx.trend15 != Trend.DOWN) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.58, "Compression → expansion UP"));
+        if (volatilityCompression(c5, atr) && impulseUp(c5, atr) && ctx.trend15 != Trend.DOWN) {
+            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.6, "Compression → expansion UP"));
         }
-        if (volatilityCompression(c5, atr) && impulseDown(c5) && ctx.trend15 != Trend.UP) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.58, "Compression → expansion DOWN"));
+        if (volatilityCompression(c5, atr) && impulseDown(c5, atr) && ctx.trend15 != Trend.UP) {
+            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.6, "Compression → expansion DOWN"));
         }
 
         // ===== MOMENTUM FLIP =====
-        if (momentumFlipUp(c5) && ctx.trend1h != Trend.DOWN) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.55, "Momentum flip UP"));
+        if (momentumFlipUp(c5, atr) && ctx.trend1h != Trend.DOWN) {
+            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.6, "Momentum flip UP"));
         }
-        if (momentumFlipDown(c5) && ctx.trend1h != Trend.UP) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.55, "Momentum flip DOWN"));
+        if (momentumFlipDown(c5, atr) && ctx.trend1h != Trend.UP) {
+            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.6, "Momentum flip DOWN"));
         }
 
         // ===== TREND CONTINUATION =====
         if (ctx.trend15 == Trend.UP && continuationUp(c5)) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.52, "Trend continuation UP"));
+            ideas.add(buildIdea(symbol, TradingCore.Side.LONG, entry, atr, 0.58, "Trend continuation UP"));
         }
         if (ctx.trend15 == Trend.DOWN && continuationDown(c5)) {
-            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.52, "Trend continuation DOWN"));
+            ideas.add(buildIdea(symbol, TradingCore.Side.SHORT, entry, atr, 0.58, "Trend continuation DOWN"));
         }
 
         // ===== FILTER + SORT =====
         return ideas.stream()
-                .filter(i -> i.probability >= 0.5) // ниже порога для большего числа сигналов
+                .filter(i -> i.probability >= 0.6) // повышенный порог
                 .sorted(Comparator.comparingDouble(i -> -i.probability))
-                .limit(10) // больше сигналов для анализа
+                .limit(10)
                 .collect(Collectors.toList());
     }
 
@@ -106,7 +108,7 @@ public class DecisionEngineMerged {
 
         double stop, tp1, tp2;
         if (side == TradingCore.Side.LONG) {
-            stop = entry - atr * 0.6; // чуть свободнее стоп
+            stop = entry - atr * 0.6;
             tp1 = entry + atr * 1.2;
             tp2 = entry + atr * 2.0;
         } else {
@@ -116,69 +118,66 @@ public class DecisionEngineMerged {
         }
 
         return new TradeIdea(
-                symbol,
-                side,
-                entry,
-                stop,
-                tp1,
-                tp2,
-                probability,
-                atr,
-                mapConfidence(probability),
-                reason
+                symbol, side, entry, stop, tp1, tp2, probability, atr, mapConfidence(probability), reason
         );
     }
 
     // ===================== LOGIC =====================
     private boolean liquiditySweepHigh(List<TradingCore.Candle> c, double atr) {
         TradingCore.Candle l = last(c);
-        double prevHigh = recentHigh(c, 5); // меньше свечей для частых сигналов
+        double prevHigh = recentHigh(c, 10);
         return l.high > prevHigh && (l.high - l.close) > atr * 0.2;
     }
 
     private boolean liquiditySweepLow(List<TradingCore.Candle> c, double atr) {
         TradingCore.Candle l = last(c);
-        double prevLow = recentLow(c, 5);
+        double prevLow = recentLow(c, 10);
         return l.low < prevLow && (l.close - l.low) > atr * 0.2;
     }
 
-    private boolean rejectionDown(List<TradingCore.Candle> c) {
-        TradingCore.Candle l = last(c);
-        return l.close < (l.high + l.low) / 2;
+    private boolean rejectionDown(TradingCore.Candle l, double atr) {
+        return l.close < (l.high + l.low) / 2 - atr * 0.05;
     }
 
-    private boolean rejectionUp(List<TradingCore.Candle> c) {
-        TradingCore.Candle l = last(c);
-        return l.close > (l.high + l.low) / 2;
+    private boolean rejectionDown(List<TradingCore.Candle> c, double atr) {
+        return rejectionDown(last(c), atr);
+    }
+
+    private boolean rejectionUp(TradingCore.Candle l, double atr) {
+        return l.close > (l.high + l.low) / 2 + atr * 0.05;
+    }
+
+    private boolean rejectionUp(List<TradingCore.Candle> c, double atr) {
+        return rejectionUp(last(c), atr);
     }
 
     private boolean volatilityCompression(List<TradingCore.Candle> c, double atr) {
         double range = last(c).high - last(c).low;
-        return range < atr * 0.85; // смягчено
+        return range < atr * 0.85;
     }
 
-    private boolean impulseUp(List<TradingCore.Candle> c) {
-        return last(c).close > recentHigh(c, 2); // меньше свечей
+    private boolean impulseUp(List<TradingCore.Candle> c, double atr) {
+        return last(c).close > recentHigh(c, 3) + atr * 0.1;
     }
 
-    private boolean impulseDown(List<TradingCore.Candle> c) {
-        return last(c).close < recentLow(c, 2);
+    private boolean impulseDown(List<TradingCore.Candle> c, double atr) {
+        return last(c).close < recentLow(c, 3) - atr * 0.1;
     }
 
-    private boolean momentumFlipUp(List<TradingCore.Candle> c) {
-        return last(c).close > c.get(Math.max(c.size() - 3, 0)).close;
+    private boolean momentumFlipUp(List<TradingCore.Candle> c, double atr) {
+        return last(c).close > c.get(Math.max(c.size() - 3, 0)).close + atr * 0.05;
     }
 
-    private boolean momentumFlipDown(List<TradingCore.Candle> c) {
-        return last(c).close < c.get(Math.max(c.size() - 3, 0)).close;
+    private boolean momentumFlipDown(List<TradingCore.Candle> c, double atr) {
+        return last(c).close < c.get(Math.max(c.size() - 3, 0)).close - atr * 0.05;
     }
 
     private boolean continuationUp(List<TradingCore.Candle> c) {
-        return last(c).close > recentHigh(c, 3); // меньше свечей
+        return last(c).close > recentHigh(c, 5);
     }
 
     private boolean continuationDown(List<TradingCore.Candle> c) {
-        return last(c).close < recentLow(c, 3);
+        return last(c).close < recentLow(c, 5);
     }
 
     // ===================== HELPERS =====================
@@ -202,7 +201,7 @@ public class DecisionEngineMerged {
 
     private String mapConfidence(double p) {
         if (p >= 0.65) return "[S]";
-        if (p >= 0.58) return "[M]";
+        if (p >= 0.6) return "[M]";
         return "[W]";
     }
 

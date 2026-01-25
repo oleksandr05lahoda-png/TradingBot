@@ -11,13 +11,13 @@ public class Elite5MinAnalyzer {
     private final RiskEngine riskEngine;
     private final AdaptiveBrain brain;
     private final Set<String> recentSignals = ConcurrentHashMap.newKeySet();
-
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
     public Elite5MinAnalyzer(DecisionEngineMerged decisionEngine, double minRiskPct) {
         this.decisionEngine = decisionEngine;
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
+        // Чистим старые сигналы каждые 10 минут
         cleaner.scheduleAtFixedRate(recentSignals::clear, 10, 10, TimeUnit.MINUTES);
     }
 
@@ -57,20 +57,24 @@ public class Elite5MinAnalyzer {
 
         if (c5m == null || c15m == null || c1h == null) return Optional.empty();
 
+        // Получаем все идеи от DecisionEngineMerged
         List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluateAll(symbol, c5m, c15m, c1h);
         if (ideas.isEmpty()) return Optional.empty();
 
         // Берем лучшую идею по вероятности
         DecisionEngineMerged.TradeIdea bestIdea = ideas.stream()
                 .max(Comparator.comparingDouble(i -> i.probability))
-                .get();
+                .orElse(null);
 
+        if (bestIdea == null) return Optional.empty();
+
+        // Адаптируем через AdaptiveBrain
         double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, bestIdea.probability);
-        if (adjustedProb < 0.50) return Optional.empty(); // минимальный порог для большего числа сигналов
+        if (adjustedProb < 0.55) return Optional.empty(); // минимальный порог
 
         // Применяем RiskEngine
         RiskEngine.TradeSignal riskSig = riskEngine.applyRisk(
-                bestIdea.symbol, bestIdea.side, bestIdea.entry, bestIdea.atr, adjustedProb, bestIdea.context
+                bestIdea.symbol, bestIdea.side, bestIdea.entry, bestIdea.atr, adjustedProb, bestIdea.reason
         );
 
         TradeSignal ts = new TradeSignal(
@@ -80,7 +84,7 @@ public class Elite5MinAnalyzer {
                 riskSig.stop,
                 riskSig.take,
                 mapConfidence(adjustedProb),
-                bestIdea.context
+                bestIdea.reason
         );
 
         // Фильтр дублей
@@ -129,7 +133,7 @@ public class Elite5MinAnalyzer {
                                      double entry, double atr,
                                      double confidence, String reason) {
 
-            double risk = atr * (confidence > 0.65 ? 0.9 : 1.1);
+            double risk = atr * (confidence >= 0.65 ? 0.9 : 1.1);
             double minRisk = entry * minRiskPct;
             if (risk < minRisk) risk = minRisk;
 

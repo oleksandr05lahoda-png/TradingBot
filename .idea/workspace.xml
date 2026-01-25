@@ -7,6 +7,7 @@
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/Elite5MinAnalyzer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/Elite5MinAnalyzer.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -296,7 +297,7 @@
       <workItem from="1769215190214" duration="5809000" />
       <workItem from="1769221210740" duration="22000" />
       <workItem from="1769293338015" duration="10326000" />
-      <workItem from="1769343886508" duration="3954000" />
+      <workItem from="1769343886508" duration="9062000" />
     </task>
     <servers />
   </component>
