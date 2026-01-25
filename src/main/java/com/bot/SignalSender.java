@@ -1015,8 +1015,9 @@ public class SignalSender {
 
                     conf = Math.max(0.50, conf);
 
-
-                    if (next1 != side) continue;
+                    if (next1 != side) {
+                        conf *= 0.85; // чуть снижаем уверенность, но не отбрасываем
+                    }
 
                     List<String> next5 = new ArrayList<>();
                     List<TradingCore.Candle> temp = new ArrayList<>(c5m);
@@ -1080,25 +1081,26 @@ public class SignalSender {
 
                 // ================= ELITE5 =================
                 if (elite5MinAnalyzer != null) {
-                    Optional<Elite5MinAnalyzer.TradeSignal> idea =
+
+                    List<Elite5MinAnalyzer.TradeSignal> ideas =
                             elite5MinAnalyzer.analyze(pair, c5m, c15m, c1h);
-                    idea.ifPresent(i -> {
-                        // определяем сторону
-                        TradingCore.Side sSide = null;
-                        if (i.side != null) {
-                            if (i.side == TradingCore.Side.LONG) sSide = TradingCore.Side.LONG;
-                            else if (i.side == TradingCore.Side.SHORT) sSide = TradingCore.Side.SHORT;
-                        }
-                        if (sSide == null) return; // если сторона неизвестна, выходим
+
+                    // если сигналов много — отправляем максимум 1-2 (чтобы не спамить)
+                    for (Elite5MinAnalyzer.TradeSignal i : ideas) {
+
+                        if (signalsThisCycle >= 2) break;
+
+                        TradingCore.Side sSide = i.side;
+                        if (sSide == null) continue;
 
                         // безопасное значение confidence
                         double baseConf;
                         try {
-                            baseConf = Double.parseDouble(i.confidence); // преобразуем строку в число
+                            baseConf = Double.parseDouble(i.confidence);
                         } catch (NumberFormatException e) {
-                            baseConf = 0.50; // если некорректно, ставим дефолт
+                            baseConf = 0.50;
                         }
-                        baseConf = Math.max(0.50, Math.min(0.88, baseConf)); // ограничиваем диапазон
+                        baseConf = Math.max(0.50, Math.min(0.88, baseConf));
 
                         // применяем riskEngine, если он есть
                         TradingCore.RiskEngine.TradeSignal ts =
@@ -1106,37 +1108,35 @@ public class SignalSender {
                                         ? riskEngine.applyRisk(pair, sSide, i.entry, atr5, baseConf, "ELITE5")
                                         : null;
 
-                        // final confidence для сигнала: берем из ts, если есть
                         double finalConf = (ts != null ? Math.max(0.50, Math.min(0.88, ts.confidence)) : baseConf);
 
-                        // список закрытий для RSI
                         List<Double> closes5 = c5m.stream().map(c -> c.close).collect(Collectors.toList());
                         double rsi14 = SignalSender.rsi(closes5, 14);
 
-                        // прогноз следующей свечи
                         TradingCore.Side next1 = predictor != null
                                 ? (predictor.predictNextCandleScore(c5m) > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT)
                                 : sSide;
-                        if (next1 != sSide) return; // если прогноз не совпадает с текущей стороной, выходим
+                        if (next1 != sSide) {
+                            finalConf *= 0.85;
+                        }
 
-                        // проверка на сильные уровни
                         double lastHigh = lastSwingHigh(c5m);
                         double lastLow = lastSwingLow(c5m);
                         boolean nearSwingHigh = sSide == TradingCore.Side.LONG && c5m.get(c5m.size() - 1).close >= lastHigh * 0.995;
                         boolean nearSwingLow = sSide == TradingCore.Side.SHORT && c5m.get(c5m.size() - 1).close <= lastLow * 1.005;
 
-                        // микро-тренд
                         MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
                         boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
 
-                        if (nearSwingHigh || nearSwingLow || trendSlowing) return;
+                        if (nearSwingHigh || nearSwingLow || trendSlowing) {
+                            finalConf *= 0.8;
+                        }
 
-                        // создаем сигнал
                         Signal s = new Signal(
                                 pair,
                                 sSide.toString(),
                                 finalConf,
-                                i.entry, // <-- если i.entry может быть null, заменить на безопасное значение
+                                i.entry,
                                 rsi14,
                                 0,
                                 1,
@@ -1157,7 +1157,7 @@ public class SignalSender {
                         }
 
                         sendSignalIfAllowed(pair, s, c5m);
-                    });
+                    }
                 }
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());

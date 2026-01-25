@@ -10,15 +10,22 @@ public class Elite5MinAnalyzer {
     private final DecisionEngineMerged decisionEngine;
     private final RiskEngine riskEngine;
     private final AdaptiveBrain brain;
-    private final Set<String> recentSignals = ConcurrentHashMap.newKeySet();
+
+    // Чтобы не спамить один и тот же символ слишком часто
+    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
+
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
     public Elite5MinAnalyzer(DecisionEngineMerged decisionEngine, double minRiskPct) {
         this.decisionEngine = decisionEngine;
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
-        // Чистим старые сигналы каждые 10 минут
-        cleaner.scheduleAtFixedRate(recentSignals::clear, 10, 10, TimeUnit.MINUTES);
+
+        // чистим старые таймстампы каждые 10 минут
+        cleaner.scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            lastSignalTime.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
+        }, 10, 10, TimeUnit.MINUTES);
     }
 
     // ================== TRADE SIGNAL ==================
@@ -50,51 +57,62 @@ public class Elite5MinAnalyzer {
     }
 
     // ================== MAIN ANALYSIS ==================
-    public Optional<TradeSignal> analyze(String symbol,
-                                         List<TradingCore.Candle> c5m,
-                                         List<TradingCore.Candle> c15m,
-                                         List<TradingCore.Candle> c1h) {
+    public List<TradeSignal> analyze(String symbol,
+                                     List<TradingCore.Candle> c5m,
+                                     List<TradingCore.Candle> c15m,
+                                     List<TradingCore.Candle> c1h) {
 
-        if (c5m == null || c15m == null || c1h == null) return Optional.empty();
+        if (c5m == null || c15m == null || c1h == null) return Collections.emptyList();
 
         // Получаем все идеи от DecisionEngineMerged
         List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluateAll(symbol, c5m, c15m, c1h);
-        if (ideas.isEmpty()) return Optional.empty();
+        if (ideas.isEmpty()) return Collections.emptyList();
 
-        // Берем лучшую идею по вероятности
-        DecisionEngineMerged.TradeIdea bestIdea = ideas.stream()
-                .max(Comparator.comparingDouble(i -> i.probability))
-                .orElse(null);
-
-        if (bestIdea == null) return Optional.empty();
-
-        // Адаптируем через AdaptiveBrain
-        double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, bestIdea.probability);
-        if (adjustedProb < 0.55) return Optional.empty(); // минимальный порог
-
-        // Применяем RiskEngine
-        RiskEngine.TradeSignal riskSig = riskEngine.applyRisk(
-                bestIdea.symbol, bestIdea.side, bestIdea.entry, bestIdea.atr, adjustedProb, bestIdea.reason
-        );
-
-        TradeSignal ts = new TradeSignal(
-                symbol,
-                bestIdea.side,
-                riskSig.entry,
-                riskSig.stop,
-                riskSig.take,
-                mapConfidence(adjustedProb),
-                bestIdea.reason
-        );
-
-        // Фильтр дублей
-        String key = symbol + "_" + bestIdea.side;
-        if (!recentSignals.contains(key)) {
-            recentSignals.add(key);
-            return Optional.of(ts);
+        // Фильтр дублей по времени: один символ не чаще 8-10 минут
+        long now = System.currentTimeMillis();
+        if (lastSignalTime.containsKey(symbol) && now - lastSignalTime.get(symbol) < 8 * 60_000) {
+            return Collections.emptyList();
         }
 
-        return Optional.empty();
+        // Сортируем идеи по вероятности
+        ideas.sort(Comparator.comparingDouble(i -> -i.probability));
+
+        List<TradeSignal> result = new ArrayList<>();
+
+        for (DecisionEngineMerged.TradeIdea idea : ideas) {
+
+            // Адаптация confidence
+            double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
+
+            // минимальный порог 0.52 (чтобы сигналы были чаще, но не фейковые)
+            if (adjustedProb < 0.52) continue;
+
+            // RiskEngine
+            RiskEngine.TradeSignal riskSig = riskEngine.applyRisk(
+                    idea.symbol, idea.side, idea.entry, idea.atr, adjustedProb, idea.reason
+            );
+
+            TradeSignal ts = new TradeSignal(
+                    symbol,
+                    idea.side,
+                    riskSig.entry,
+                    riskSig.stop,
+                    riskSig.take,
+                    mapConfidence(adjustedProb),
+                    idea.reason
+            );
+
+            result.add(ts);
+
+            // если нашли 2-3 сигнала — выходим (чтобы не спамить)
+            if (result.size() >= 3) break;
+        }
+
+        if (!result.isEmpty()) {
+            lastSignalTime.put(symbol, now);
+        }
+
+        return result;
     }
 
     private String mapConfidence(double probability) {
@@ -133,7 +151,10 @@ public class Elite5MinAnalyzer {
                                      double entry, double atr,
                                      double confidence, String reason) {
 
-            double risk = atr * (confidence >= 0.65 ? 0.9 : 1.1);
+            // Более агрессивный риск при сильных сигналах
+            double riskMultiplier = confidence >= 0.65 ? 0.85 : 1.05;
+            double risk = atr * riskMultiplier;
+
             double minRisk = entry * minRiskPct;
             if (risk < minRisk) risk = minRisk;
 
