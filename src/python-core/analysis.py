@@ -51,7 +51,7 @@ def ATR(df, period=14):
 # ==========================================================
 # =================== PRO FUTURES BRAIN ====================
 # ==========================================================
-def analyze_symbol(symbol):
+def analyze_symbol(symbol, forecast_bars=5):
     try:
         df5 = fetch_klines(symbol, "5m", 200)
         df15 = fetch_klines(symbol, "15m", 200)
@@ -59,119 +59,95 @@ def analyze_symbol(symbol):
             return None
 
         # ===== Indicators =====
+        ema5_5 = EMA(df5['close'], 5)
         ema9_5 = EMA(df5['close'], 9)
         ema21_5 = EMA(df5['close'], 21)
         ema50_5 = EMA(df5['close'], 50)
-
         ema9_15 = EMA(df15['close'], 9).iloc[-1]
         ema21_15 = EMA(df15['close'], 21).iloc[-1]
 
         rsi = RSI(df5['close'], 14).iloc[-1]
         atr = ATR(df5, 14).iloc[-1]
-
         price = df5['close'].iloc[-1]
         ema_slope = ema9_5.iloc[-1] - ema9_5.iloc[-5]
 
         trend_15m = "UP" if ema9_15 > ema21_15 else "DOWN"
 
-        # ===== Volatility filter (not too dead, not too crazy) =====
+        # ===== Volatility filter =====
         candle_range = df5['high'].iloc[-1] - df5['low'].iloc[-1]
-        if candle_range < 0.4 * atr:
-            return None
-        if candle_range > 3.0 * atr:
+        if candle_range < 0.3 * atr or candle_range > 4.0 * atr:
             return None
 
         signals = []
 
-        # =========================
-        # TREND CONTINUATION (основа частоты)
-        # =========================
-        score = 0
-        conf = 0.50
-        sig = None
-        reason = ""
+        # ===== Цикл прогнозов =====
+        for i in range(forecast_bars):
+            sig = None
+            conf = 0.50
+            score = 0
+            reason = ""
 
-        # LONG trend
-        if (trend_15m == "UP" and
-            ema9_5.iloc[-1] > ema21_5.iloc[-1] > ema50_5.iloc[-1] and
-            ema_slope > 0 and
-            50 < rsi < 75):
-
-            score += 3
-            conf += 0.08
-            sig = "LONG"
-            reason = "Trend continuation LONG"
-
-        # SHORT trend
-        elif (trend_15m == "DOWN" and
-              ema9_5.iloc[-1] < ema21_5.iloc[-1] < ema50_5.iloc[-1] and
-              ema_slope < 0 and
-              25 < rsi < 50):
-
-            score += 3
-            conf += 0.08
-            sig = "SHORT"
-            reason = "Trend continuation SHORT"
-
-        # =========================
-        # PULLBACK ENTRY
-        # =========================
-        if sig is None:
-            # LONG pullback
+            # ===== Trend continuation =====
             if (trend_15m == "UP" and
-                ema21_5.iloc[-1] < price < ema9_5.iloc[-1] and
-                rsi > 45):
-
-                score += 2
-                conf += 0.05
+                ema5_5.iloc[-1] > ema9_5.iloc[-1] > ema21_5.iloc[-1] > ema50_5.iloc[-1] and
+                ema_slope > 0 and
+                45 < rsi < 78):
                 sig = "LONG"
-                reason = "Pullback LONG"
+                score += 3
+                conf += 0.08
+                reason = f"Trend continuation LONG, forecast +{i+1}"
 
-            # SHORT pullback
             elif (trend_15m == "DOWN" and
-                  ema9_5.iloc[-1] < price < ema21_5.iloc[-1] and
-                  rsi < 55):
-
-                score += 2
-                conf += 0.05
+                  ema5_5.iloc[-1] < ema9_5.iloc[-1] < ema21_5.iloc[-1] < ema50_5.iloc[-1] and
+                  ema_slope < 0 and
+                  22 < rsi < 55):
                 sig = "SHORT"
-                reason = "Pullback SHORT"
+                score += 3
+                conf += 0.08
+                reason = f"Trend continuation SHORT, forecast +{i+1}"
 
-        # =========================
-        # COUNTER-TREND (редко, но мощно)
-        # =========================
-        if sig is None:
-            if (rsi < 28 and trend_15m == "UP" and ema_slope > 0):
-                score += 2
-                conf += 0.06
-                sig = "LONG"
-                reason = "Exhaustion LONG"
+            # ===== Pullback entry =====
+            if sig is None:
+                if trend_15m == "UP" and ema21_5.iloc[-1] < price < ema9_5.iloc[-1] and rsi > 45:
+                    sig = "LONG"
+                    score += 2
+                    conf += 0.05
+                    reason = f"Pullback LONG, forecast +{i+1}"
+                elif trend_15m == "DOWN" and ema9_5.iloc[-1] < price < ema21_5.iloc[-1] and rsi < 55:
+                    sig = "SHORT"
+                    score += 2
+                    conf += 0.05
+                    reason = f"Pullback SHORT, forecast +{i+1}"
 
-            elif (rsi > 72 and trend_15m == "DOWN" and ema_slope < 0):
-                score += 2
-                conf += 0.06
-                sig = "SHORT"
-                reason = "Exhaustion SHORT"
+            # ===== Counter-trend (редко) =====
+            if sig is None:
+                if rsi < 28 and trend_15m == "UP" and ema_slope > 0:
+                    sig = "LONG"
+                    score += 2
+                    conf += 0.06
+                    reason = f"Exhaustion LONG, forecast +{i+1}"
+                elif rsi > 72 and trend_15m == "DOWN" and ema_slope < 0:
+                    sig = "SHORT"
+                    score += 2
+                    conf += 0.06
+                    reason = f"Exhaustion SHORT, forecast +{i+1}"
 
-        # =========================
-        # FINAL FILTER
-        # =========================
-        if sig and score >= 2:
-            confidence = round(min(conf, 0.85), 2)
-            signals.append({
-                "symbol": symbol,
-                "signal": sig,
-                "confidence": confidence,
-                "price": round(price, 6),
-                "rsi": int(rsi),
-                "trend_15m": trend_15m,
-                "reason": reason,
-                "timestamp": datetime.utcnow().isoformat()
-            })
+            # ===== Добавляем сигнал =====
+            if sig and score >= 2:
+                signals.append({
+                    "symbol": symbol,
+                    "signal": sig,
+                    "confidence": round(min(conf, 0.85), 2),
+                    "price": round(price, 6),
+                    "rsi": int(rsi),
+                    "trend_15m": trend_15m,
+                    "reason": reason,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "forecast_bar": i + 1
+                })
 
         if not signals:
             return None
-
         return signals
 
     except Exception as e:
