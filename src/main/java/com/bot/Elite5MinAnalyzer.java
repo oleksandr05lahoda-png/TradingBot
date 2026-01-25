@@ -10,17 +10,14 @@ public class Elite5MinAnalyzer {
     private final DecisionEngineMerged decisionEngine;
     private final RiskEngine riskEngine;
     private final AdaptiveBrain brain;
-    private final Set<String> recentSignals = ConcurrentHashMap.newKeySet(); // фильтр дублей
+    private final Set<String> recentSignals = ConcurrentHashMap.newKeySet();
 
-    // Один планировщик для очистки дублей
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
     public Elite5MinAnalyzer(DecisionEngineMerged decisionEngine, double minRiskPct) {
         this.decisionEngine = decisionEngine;
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
-
-        // Планируем очистку дублей каждые 10 минут
         cleaner.scheduleAtFixedRate(recentSignals::clear, 10, 10, TimeUnit.MINUTES);
     }
 
@@ -31,7 +28,7 @@ public class Elite5MinAnalyzer {
         public final double entry;
         public final double stop;
         public final double take;
-        public final String confidence; // [S], [M], [W]
+        public final String confidence;
         public final String reason;
 
         public TradeSignal(String symbol, TradingCore.Side side, double entry,
@@ -53,7 +50,6 @@ public class Elite5MinAnalyzer {
     }
 
     // ================== MAIN ANALYSIS ==================
-    // Метод для одного символа, возвращает Optional<TradeSignal>
     public Optional<TradeSignal> analyze(String symbol,
                                          List<TradingCore.Candle> c5m,
                                          List<TradingCore.Candle> c15m,
@@ -61,19 +57,18 @@ public class Elite5MinAnalyzer {
 
         if (c5m == null || c15m == null || c1h == null) return Optional.empty();
 
-        // получаем все идеи от DecisionEngineMerged
         List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluateAll(symbol, c5m, c15m, c1h);
         if (ideas.isEmpty()) return Optional.empty();
 
-        // берем лучшую идею по вероятности
+        // Берем лучшую идею по вероятности
         DecisionEngineMerged.TradeIdea bestIdea = ideas.stream()
                 .max(Comparator.comparingDouble(i -> i.probability))
                 .get();
 
         double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, bestIdea.probability);
-        if (adjustedProb < 0.55) return Optional.empty();
+        if (adjustedProb < 0.50) return Optional.empty(); // минимальный порог для большего числа сигналов
 
-        // применяем riskEngine
+        // Применяем RiskEngine
         RiskEngine.TradeSignal riskSig = riskEngine.applyRisk(
                 bestIdea.symbol, bestIdea.side, bestIdea.entry, bestIdea.atr, adjustedProb, bestIdea.context
         );
@@ -88,7 +83,7 @@ public class Elite5MinAnalyzer {
                 bestIdea.context
         );
 
-        // фильтр дублей
+        // Фильтр дублей
         String key = symbol + "_" + bestIdea.side;
         if (!recentSignals.contains(key)) {
             recentSignals.add(key);
@@ -99,8 +94,8 @@ public class Elite5MinAnalyzer {
     }
 
     private String mapConfidence(double probability) {
-        if (probability >= 0.75) return "[S]";
-        if (probability >= 0.60) return "[M]";
+        if (probability >= 0.65) return "[S]";
+        if (probability >= 0.55) return "[M]";
         return "[W]";
     }
 
@@ -180,7 +175,7 @@ public class Elite5MinAnalyzer {
         private double adaptConfidence(String strategy, double baseConf) {
             double wr = winrate(strategy);
             if (wr > 0.60) return Math.min(0.85, baseConf + 0.05);
-            if (wr < 0.45) return Math.max(0.55, baseConf - 0.05);
+            if (wr < 0.45) return Math.max(0.50, baseConf - 0.05);
             return baseConf;
         }
 
