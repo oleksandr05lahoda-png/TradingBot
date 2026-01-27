@@ -48,45 +48,71 @@ public class DecisionEngineMerged {
         double atr = SignalSender.atr(c5, 14);
         if (atr <= 0) return List.of();
 
-        MarketMode mode = marketMode(c1h, c15, atr);
+        MarketMode mode = marketMode(c1h, c15, c5, atr);
         EMA ema = emaContext(c5);
         TradingCore.Candle last = last(c5);
 
         List<TradeIdea> ideas = new ArrayList<>();
 
-        /* ========================== TREND ========================== */
-        if (mode == MarketMode.TREND) {
+        // ===== TREND + PULLBACK CORE =====
+        if (mode == MarketMode.TREND || mode == MarketMode.HIGH_VOL_TREND) {
 
             if (ema.bullish) {
                 ideas.add(scored(buildLong(symbol, last.close, atr),
-                        scoreTrend(c5, atr, true),
+                        scoreTrend(c5, atr, true, mode),
                         "TREND LONG"));
             }
 
             if (ema.bearish) {
                 ideas.add(scored(buildShort(symbol, last.close, atr),
-                        scoreTrend(c5, atr, false),
+                        scoreTrend(c5, atr, false, mode),
                         "TREND SHORT"));
             }
-        }
-
-        /* ========================== PULLBACK ========================== */
-        if (mode == MarketMode.EXHAUSTION) {
 
             if (pullbackLong(c5, ema)) {
                 ideas.add(scored(buildLong(symbol, last.close, atr),
-                        scorePullback(c5),
+                        scorePullback(c5, atr),
                         "PULLBACK LONG"));
             }
 
             if (pullbackShort(c5, ema)) {
                 ideas.add(scored(buildShort(symbol, last.close, atr),
-                        scorePullback(c5),
+                        scorePullback(c5, atr),
                         "PULLBACK SHORT"));
             }
         }
 
-        /* ========================== REVERSAL ========================== */
+        // ===== MOMENTUM IMPULSE =====
+        if (impulseBreakout(c5, atr)) {
+            if (ema.bullish) {
+                ideas.add(scored(buildLong(symbol, last.close, atr),
+                        scoreMomentum(c5, atr),
+                        "MOMENTUM LONG"));
+            }
+            if (ema.bearish) {
+                ideas.add(scored(buildShort(symbol, last.close, atr),
+                        scoreMomentum(c5, atr),
+                        "MOMENTUM SHORT"));
+            }
+        }
+
+        // ===== RANGE FADE =====
+        if (mode == MarketMode.RANGE) {
+
+            if (rangeFadeShort(c5, atr)) {
+                ideas.add(scored(buildShort(symbol, last.close, atr),
+                        scoreRange(c5),
+                        "RANGE FADE SHORT"));
+            }
+
+            if (rangeFadeLong(c5, atr)) {
+                ideas.add(scored(buildLong(symbol, last.close, atr),
+                        scoreRange(c5),
+                        "RANGE FADE LONG"));
+            }
+        }
+
+        // ===== REVERSAL / LIQUIDITY SWEEP =====
         if (mode == MarketMode.REVERSAL) {
 
             if (sweepHigh(c5, atr) && rejectionDown(c5)) {
@@ -102,10 +128,12 @@ public class DecisionEngineMerged {
             }
         }
 
+        double minProb = adaptiveThreshold(mode);
+
         return ideas.stream()
-                .filter(i -> i.probability >= 0.60)
+                .filter(i -> i.probability >= minProb)
                 .sorted(Comparator.comparingDouble(i -> -i.probability))
-                .limit(2)
+                .limit(3)
                 .collect(Collectors.toList());
     }
 
@@ -113,18 +141,37 @@ public class DecisionEngineMerged {
 
     private MarketMode marketMode(List<TradingCore.Candle> c1h,
                                   List<TradingCore.Candle> c15,
+                                  List<TradingCore.Candle> c5,
                                   double atr) {
 
         double htfMove = Math.abs(last(c1h).close - c1h.get(c1h.size() - 80).close) / atr;
         double mtfMove = Math.abs(last(c15).close - c15.get(c15.size() - 40).close) / atr;
 
+        double atr5 = avgRange(c5) / atr;
+        boolean highVol = atr5 > 1.4;
+        boolean compress = rangeCompression(c5);
+
         if (htfMove > 7.5 && mtfMove < 2.0)
             return MarketMode.REVERSAL;
 
-        if (htfMove > 6.0)
-            return MarketMode.EXHAUSTION;
+        if (compress)
+            return MarketMode.RANGE;
+
+        if (highVol)
+            return MarketMode.HIGH_VOL_TREND;
 
         return MarketMode.TREND;
+    }
+
+    /* ========================== ADAPTIVE THRESHOLD ========================== */
+
+    private double adaptiveThreshold(MarketMode mode) {
+        return switch (mode) {
+            case HIGH_VOL_TREND -> 0.56;
+            case TREND -> 0.58;
+            case RANGE -> 0.62;
+            case REVERSAL -> 0.60;
+        };
     }
 
     /* ========================== SCORING ========================== */
@@ -143,22 +190,37 @@ public class DecisionEngineMerged {
         );
     }
 
-    private double scoreTrend(List<TradingCore.Candle> c, double atr, boolean up) {
-        double s = 0.58;
+    private double scoreTrend(List<TradingCore.Candle> c, double atr, boolean up, MarketMode mode) {
+        double s = 0.56;
         if (volumeBoost(c)) s += 0.06;
-        if (impulse(c, atr)) s += 0.06;
-        if (structureBreak(c, up)) s += 0.05;
+        if (impulse(c, atr)) s += 0.05;
+        if (structureBreak(c, up)) s += 0.06;
+        if (mode == MarketMode.HIGH_VOL_TREND) s += 0.04;
         return s;
     }
 
-    private double scorePullback(List<TradingCore.Candle> c) {
+    private double scorePullback(List<TradingCore.Candle> c, double atr) {
+        double s = 0.58;
+        if (volumeDry(c)) s += 0.05;
+        if (smallRange(c, atr)) s += 0.04;
+        return s;
+    }
+
+    private double scoreMomentum(List<TradingCore.Candle> c, double atr) {
+        double s = 0.57;
+        if (volumeClimax(c)) s += 0.08;
+        if (rangeExpansion(c)) s += 0.06;
+        return s;
+    }
+
+    private double scoreRange(List<TradingCore.Candle> c) {
         double s = 0.60;
-        if (volumeDry(c)) s += 0.06;
+        if (volumeDry(c)) s += 0.05;
         return s;
     }
 
     private double scoreReversal(List<TradingCore.Candle> c) {
-        double s = 0.62;
+        double s = 0.61;
         if (volumeClimax(c)) s += 0.08;
         if (rangeExpansion(c)) s += 0.05;
         return s;
@@ -167,15 +229,15 @@ public class DecisionEngineMerged {
     /* ========================== BUILD ========================== */
 
     private TradeIdea buildLong(String s, double e, double atr) {
-        double r = atr * 0.6;
+        double r = atr * 0.55;
         return new TradeIdea(s, TradingCore.Side.LONG,
-                e, e - r, e + r * 1.6, e + r * 2.8, 0, atr, "");
+                e, e - r, e + r * 1.5, e + r * 2.6, 0, atr, "");
     }
 
     private TradeIdea buildShort(String s, double e, double atr) {
-        double r = atr * 0.6;
+        double r = atr * 0.55;
         return new TradeIdea(s, TradingCore.Side.SHORT,
-                e, e + r, e - r * 1.6, e - r * 2.8, 0, atr, "");
+                e, e + r, e - r * 1.5, e - r * 2.6, 0, atr, "");
     }
 
     /* ========================== CONDITIONS ========================== */
@@ -188,6 +250,18 @@ public class DecisionEngineMerged {
     private boolean pullbackShort(List<TradingCore.Candle> c, EMA e) {
         double p = last(c).close;
         return p < e.ema21 && p > e.ema9;
+    }
+
+    private boolean impulseBreakout(List<TradingCore.Candle> c, double atr) {
+        return Math.abs(last(c).close - c.get(c.size() - 3).close) > atr * 1.2;
+    }
+
+    private boolean rangeFadeShort(List<TradingCore.Candle> c, double atr) {
+        return last(c).high > recentHigh(c, 20) - atr * 0.2;
+    }
+
+    private boolean rangeFadeLong(List<TradingCore.Candle> c, double atr) {
+        return last(c).low < recentLow(c, 20) + atr * 0.2;
     }
 
     private boolean sweepHigh(List<TradingCore.Candle> c, double atr) {
@@ -237,7 +311,7 @@ public class DecisionEngineMerged {
     /* ========================== UTILS ========================== */
 
     private boolean volumeBoost(List<TradingCore.Candle> c) {
-        return last(c).volume > avgVol(c) * 1.3;
+        return last(c).volume > avgVol(c) * 1.25;
     }
 
     private boolean volumeDry(List<TradingCore.Candle> c) {
@@ -245,21 +319,29 @@ public class DecisionEngineMerged {
     }
 
     private boolean volumeClimax(List<TradingCore.Candle> c) {
-        return last(c).volume > avgVol(c) * 1.7;
+        return last(c).volume > avgVol(c) * 1.6;
     }
 
     private boolean impulse(List<TradingCore.Candle> c, double atr) {
-        return Math.abs(last(c).close - c.get(c.size() - 5).close) > atr * 1.1;
+        return Math.abs(last(c).close - c.get(c.size() - 5).close) > atr * 1.0;
     }
 
     private boolean rangeExpansion(List<TradingCore.Candle> c) {
-        return (last(c).high - last(c).low) > avgRange(c) * 1.5;
+        return (last(c).high - last(c).low) > avgRange(c) * 1.4;
+    }
+
+    private boolean smallRange(List<TradingCore.Candle> c, double atr) {
+        return (last(c).high - last(c).low) < atr * 0.8;
     }
 
     private boolean structureBreak(List<TradingCore.Candle> c, boolean up) {
         return up
-                ? last(c).close > recentHigh(c, 10)
-                : last(c).close < recentLow(c, 10);
+                ? last(c).close > recentHigh(c, 12)
+                : last(c).close < recentLow(c, 12);
+    }
+
+    private boolean rangeCompression(List<TradingCore.Candle> c) {
+        return avgRange(c) < avgRange(c.subList(0, c.size() - 20)) * 0.75;
     }
 
     private double avgRange(List<TradingCore.Candle> c) {
@@ -294,7 +376,12 @@ public class DecisionEngineMerged {
 
     /* ========================== STRUCT ========================== */
 
-    private enum MarketMode { TREND, EXHAUSTION, REVERSAL }
+    private enum MarketMode {
+        TREND,
+        HIGH_VOL_TREND,
+        RANGE,
+        REVERSAL
+    }
 
     private static class EMA {
         double ema9, ema21, ema50;
