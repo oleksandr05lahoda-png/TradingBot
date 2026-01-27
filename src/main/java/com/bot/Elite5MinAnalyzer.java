@@ -11,9 +11,7 @@ public class Elite5MinAnalyzer {
     private final RiskEngine riskEngine;
     private final AdaptiveBrain brain;
 
-    // Защита от спама по символам
     private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
-
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
     public Elite5MinAnalyzer(DecisionEngineMerged decisionEngine, double minRiskPct) {
@@ -21,7 +19,6 @@ public class Elite5MinAnalyzer {
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
 
-        // Чистка старых сигналов каждые 10 минут
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
             lastSignalTime.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
@@ -64,11 +61,13 @@ public class Elite5MinAnalyzer {
 
         if (c5m == null || c15m == null || c1h == null) return Collections.emptyList();
 
-        // Получаем идеи
+        // Получаем идеи от DecisionEngineMerged
         List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluate(symbol, c5m, c15m, c1h);
         if (ideas.isEmpty()) return Collections.emptyList();
 
-        // Ограничение по времени для одного символа
+        // Определяем тренд по старшему таймфрейму
+        TradingCore.Side trend = determineTrend(c1h, c15m);
+
         long now = System.currentTimeMillis();
         long minInterval = dynamicSignalInterval(symbol);
         if (lastSignalTime.containsKey(symbol) && now - lastSignalTime.get(symbol) < minInterval) {
@@ -82,12 +81,13 @@ public class Elite5MinAnalyzer {
 
         for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
-            // Адаптация confidence с учетом истории
+            // Синхронизация с трендом
+            if (trend != null && idea.side != trend) continue; // отбрасываем сигналы против тренда
+
             double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
 
-            if (adjustedProb < 0.50) continue; // фильтруем слабые сигналы
+            if (adjustedProb < 0.50) continue;
 
-            // RiskEngine с адаптивным стопом и тейком
             RiskEngine.TradeSignal riskSig = riskEngine.applyRisk(
                     idea.symbol, idea.side, idea.entry, idea.atr, adjustedProb, idea.reason
             );
@@ -104,7 +104,7 @@ public class Elite5MinAnalyzer {
 
             result.add(ts);
 
-            if (result.size() >= dynamicMaxSignals()) break; // лимит сигналов
+            if (result.size() >= dynamicMaxSignals()) break;
         }
 
         if (!result.isEmpty()) {
@@ -112,6 +112,19 @@ public class Elite5MinAnalyzer {
         }
 
         return result;
+    }
+
+    private TradingCore.Side determineTrend(List<TradingCore.Candle> c1h, List<TradingCore.Candle> c15m) {
+        // простой тренд по закрытию: UP, DOWN или null (flat)
+        double diffH = c1h.get(c1h.size() - 1).close - c1h.get(c1h.size() - 80).close;
+        if (diffH > 0.003 * c1h.get(c1h.size() - 80).close) return TradingCore.Side.LONG;
+        if (diffH < -0.003 * c1h.get(c1h.size() - 80).close) return TradingCore.Side.SHORT;
+
+        double diff15 = c15m.get(c15m.size() - 1).close - c15m.get(c15m.size() - 80).close;
+        if (diff15 > 0.003 * c15m.get(c15m.size() - 80).close) return TradingCore.Side.LONG;
+        if (diff15 < -0.003 * c15m.get(c15m.size() - 80).close) return TradingCore.Side.SHORT;
+
+        return null; // flat
     }
 
     private String mapConfidence(double probability) {
@@ -122,7 +135,6 @@ public class Elite5MinAnalyzer {
 
     // ================== RISK ENGINE ==================
     public static class RiskEngine {
-
         private final double minRiskPct;
 
         public RiskEngine(double minRiskPct) {
@@ -150,7 +162,6 @@ public class Elite5MinAnalyzer {
                                      double entry, double atr,
                                      double confidence, String reason) {
 
-            // Динамический риск и тейк
             double riskMultiplier = confidence >= 0.65 ? 0.85 : 1.1;
             double risk = atr * riskMultiplier;
             double minRisk = entry * minRiskPct;
@@ -174,10 +185,7 @@ public class Elite5MinAnalyzer {
     // ================== ADAPTIVE BRAIN ==================
     public static class AdaptiveBrain {
 
-        private static class OutcomeStat {
-            int wins = 0;
-            int losses = 0;
-        }
+        private static class OutcomeStat { int wins = 0, losses = 0; }
 
         private final Map<String, OutcomeStat> stats = new ConcurrentHashMap<>();
         private final Map<String, Deque<Long>> impulseHistory = new ConcurrentHashMap<>();
@@ -229,10 +237,7 @@ public class Elite5MinAnalyzer {
         }
     }
 
-    // ================== ДИНАМИКА СИГНАЛОВ ==================
-    private long dynamicSignalInterval(String symbol) {
-        return 5 * 60_000; // минимум 5 минут
-    }
+    private long dynamicSignalInterval(String symbol) { return 5 * 60_000; }
 
     private int dynamicMaxSignals() {
         int hour = LocalTime.now(ZoneOffset.UTC).getHour();
@@ -240,8 +245,5 @@ public class Elite5MinAnalyzer {
         return 3;
     }
 
-    // ================== CLEANUP ==================
-    public void shutdown() {
-        cleaner.shutdown();
-    }
+    public void shutdown() { cleaner.shutdown(); }
 }
