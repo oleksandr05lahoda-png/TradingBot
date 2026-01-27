@@ -18,6 +18,7 @@ public class Elite5MinAnalyzer {
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
 
+        // чистка старых сигналов каждые 10 минут
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
             lastSignalTime.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
@@ -90,6 +91,7 @@ public class Elite5MinAnalyzer {
             return List.of();
         }
 
+        // сортировка по вероятности
         ideas.sort(Comparator.comparingDouble(i -> -i.probability));
 
         List<TradeSignal> result = new ArrayList<>();
@@ -120,13 +122,10 @@ public class Elite5MinAnalyzer {
                     mode.name(),
                     idea.reason + contextReason(ctx)
             ));
-
-            if (result.size() >= maxSignals(ctx)) break;
         }
 
-        if (!result.isEmpty()) {
-            lastSignalTime.put(symbol, now);
-        }
+        // сохраняем время сигнала
+        if (!result.isEmpty()) lastSignalTime.put(symbol, now);
 
         return result;
     }
@@ -148,16 +147,16 @@ public class Elite5MinAnalyzer {
         ctx.atrPct = atrPct;
         ctx.rangePct = currRange / price;
 
-        ctx.highVol = atrPct > 0.0022; // чуть ниже
-        ctx.lowVol = atrPct < 0.0015;  // чуть выше
+        ctx.highVol = atrPct > 0.0022;
+        ctx.lowVol = atrPct < 0.0015;
 
-        ctx.compressed = currRange < avgRange * 0.75; // чуть мягче
-        ctx.impulse = currRange > avgRange * 1.5;     // чуть мягче
+        ctx.compressed = currRange < avgRange * 0.75;
+        ctx.impulse = currRange > avgRange * 1.5;
 
         ctx.microTrendUp = emaFastSlope > 0;
         ctx.microTrendDown = emaFastSlope < 0;
 
-        ctx.tradable = true; // ослаблено ограничение
+        ctx.tradable = true;
 
         return ctx;
     }
@@ -197,7 +196,7 @@ public class Elite5MinAnalyzer {
         if (counterTrend) c -= 0.04;
         if (ctx.lowVol) c -= 0.08;
 
-        return clamp(c, 0.45, 0.95); // немного расширен верхний cap
+        return clamp(c, 0.45, 0.95);
     }
 
     private double dynamicMinConfidence(TradeMode mode, MarketContext ctx) {
@@ -255,7 +254,7 @@ public class Elite5MinAnalyzer {
                               double conf, TradeMode mode) {
 
             double atr = i.atr;
-            double risk = Math.max(atr * 0.55, i.entry * minRiskPct); // чуть мягче
+            double risk = Math.max(atr * 0.55, i.entry * minRiskPct);
 
             double tpMult = switch (mode) {
                 case TREND -> conf > 0.63 ? 3.0 : 2.5;
@@ -303,14 +302,7 @@ public class Elite5MinAnalyzer {
     private long dynamicCooldown(MarketContext ctx) {
         if (ctx.highVol) return 50_000;
         if (ctx.compressed) return 80_000;
-        return 90_000; // чуть меньше общий cooldown
-    }
-
-    private int maxSignals(MarketContext ctx) {
-        int h = LocalTime.now(ZoneOffset.UTC).getHour();
-        int base = (h >= 7 && h <= 17) ? 5 : 3;
-        if (ctx.highVol) base += 1; // чуть мягче
-        return base;
+        return 90_000;
     }
 
     private String mapConfidence(double p) {
@@ -329,19 +321,13 @@ public class Elite5MinAnalyzer {
 
     private double atr(List<TradingCore.Candle> c, int n) {
         double sum = 0;
-        for (int i = c.size() - n; i < c.size(); i++) {
-            TradingCore.Candle x = c.get(i);
-            sum += (x.high - x.low);
-        }
+        for (int i = c.size() - n; i < c.size(); i++) sum += c.get(i).high - c.get(i).low;
         return sum / n;
     }
 
     private double avgRange(List<TradingCore.Candle> c, int n) {
         double sum = 0;
-        for (int i = c.size() - n; i < c.size(); i++) {
-            TradingCore.Candle x = c.get(i);
-            sum += (x.high - x.low);
-        }
+        for (int i = c.size() - n; i < c.size(); i++) sum += c.get(i).high - c.get(i).low;
         return sum / n;
     }
 

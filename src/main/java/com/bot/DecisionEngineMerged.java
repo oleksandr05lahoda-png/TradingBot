@@ -1,6 +1,7 @@
 package com.bot;
 
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 public class DecisionEngineMerged {
@@ -35,12 +36,21 @@ public class DecisionEngineMerged {
         }
     }
 
+    /* ========================== ANTI-DUPLICATION ========================== */
+    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
+    private final long cooldownMs = 5 * 60_000; // 5 минут
+
     /* ========================== MAIN ========================== */
 
     public List<TradeIdea> evaluate(String symbol,
                                     List<TradingCore.Candle> c5,
                                     List<TradingCore.Candle> c15,
                                     List<TradingCore.Candle> c1h) {
+
+        long now = System.currentTimeMillis();
+        if (lastSignalTime.containsKey(symbol) && now - lastSignalTime.get(symbol) < cooldownMs) {
+            return List.of(); // антидублирование
+        }
 
         if (!valid(c5, 120) || !valid(c15, 120) || !valid(c1h, 120))
             return List.of();
@@ -56,25 +66,21 @@ public class DecisionEngineMerged {
 
         // ===== TREND + PULLBACK CORE =====
         if (mode == MarketMode.TREND || mode == MarketMode.HIGH_VOL_TREND) {
-
             if (ema.bullish) {
                 ideas.add(scored(buildLong(symbol, last.close, atr),
                         scoreTrend(c5, atr, true, mode),
                         "TREND LONG"));
             }
-
             if (ema.bearish) {
                 ideas.add(scored(buildShort(symbol, last.close, atr),
                         scoreTrend(c5, atr, false, mode),
                         "TREND SHORT"));
             }
-
             if (pullbackLong(c5, ema)) {
                 ideas.add(scored(buildLong(symbol, last.close, atr),
                         scorePullback(c5, atr),
                         "PULLBACK LONG"));
             }
-
             if (pullbackShort(c5, ema)) {
                 ideas.add(scored(buildShort(symbol, last.close, atr),
                         scorePullback(c5, atr),
@@ -103,7 +109,6 @@ public class DecisionEngineMerged {
                         scoreRange(c5),
                         "RANGE FADE SHORT"));
             }
-
             if (rangeFadeLong(c5, atr)) {
                 ideas.add(scored(buildLong(symbol, last.close, atr),
                         scoreRange(c5),
@@ -118,7 +123,6 @@ public class DecisionEngineMerged {
                         scoreReversal(c5),
                         "REVERSAL SHORT"));
             }
-
             if (sweepLow(c5, atr) && rejectionUp(c5)) {
                 ideas.add(scored(buildLong(symbol, last.close, atr),
                         scoreReversal(c5),
@@ -128,10 +132,15 @@ public class DecisionEngineMerged {
 
         double minProb = adaptiveThreshold(mode);
 
+        // сохраняем время сигнала для антидублирования
+        if (!ideas.isEmpty()) {
+            lastSignalTime.put(symbol, now);
+        }
+
+        // возвращаем **все сигналы**, отсортированные по вероятности
         return ideas.stream()
                 .filter(i -> i.probability >= minProb)
                 .sorted(Comparator.comparingDouble(i -> -i.probability))
-                .limit(5) // чуть больше сигналов для выбора
                 .collect(Collectors.toList());
     }
 
@@ -188,6 +197,7 @@ public class DecisionEngineMerged {
         );
     }
 
+    // ===== scoring functions =====
     private double scoreTrend(List<TradingCore.Candle> c, double atr, boolean up, MarketMode mode) {
         double s = 0.55;
         if (volumeBoost(c)) s += 0.06;
