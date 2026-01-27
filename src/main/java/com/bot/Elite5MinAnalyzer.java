@@ -11,7 +11,7 @@ public class Elite5MinAnalyzer {
     private final RiskEngine riskEngine;
     private final AdaptiveBrain brain;
 
-    // Чтобы не спамить один и тот же символ слишком часто
+    // Защита от спама по символам
     private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
 
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
@@ -21,7 +21,7 @@ public class Elite5MinAnalyzer {
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
 
-        // чистим старые таймстампы каждые 10 минут
+        // Чистка старых сигналов каждые 10 минут
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
             lastSignalTime.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
@@ -64,30 +64,30 @@ public class Elite5MinAnalyzer {
 
         if (c5m == null || c15m == null || c1h == null) return Collections.emptyList();
 
-        // Получаем все идеи от DecisionEngineMerged
-        List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluateAll(symbol, c5m, c15m, c1h);
+        // Получаем идеи
+        List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluate(symbol, c5m, c15m, c1h);
         if (ideas.isEmpty()) return Collections.emptyList();
 
-        // Фильтр дублей по времени: один символ не чаще 8-10 минут
+        // Ограничение по времени для одного символа
         long now = System.currentTimeMillis();
-        if (lastSignalTime.containsKey(symbol) && now - lastSignalTime.get(symbol) < 8 * 60_000) {
+        long minInterval = dynamicSignalInterval(symbol);
+        if (lastSignalTime.containsKey(symbol) && now - lastSignalTime.get(symbol) < minInterval) {
             return Collections.emptyList();
         }
 
-        // Сортируем идеи по вероятности
+        // Сортировка идей по вероятности
         ideas.sort(Comparator.comparingDouble(i -> -i.probability));
 
         List<TradeSignal> result = new ArrayList<>();
 
         for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
-            // Адаптация confidence
+            // Адаптация confidence с учетом истории
             double adjustedProb = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
 
-            // минимальный порог 0.52 (чтобы сигналы были чаще, но не фейковые)
-            if (adjustedProb < 0.52) continue;
+            if (adjustedProb < 0.50) continue; // фильтруем слабые сигналы
 
-            // RiskEngine
+            // RiskEngine с адаптивным стопом и тейком
             RiskEngine.TradeSignal riskSig = riskEngine.applyRisk(
                     idea.symbol, idea.side, idea.entry, idea.atr, adjustedProb, idea.reason
             );
@@ -104,8 +104,7 @@ public class Elite5MinAnalyzer {
 
             result.add(ts);
 
-            // если нашли 2-3 сигнала — выходим (чтобы не спамить)
-            if (result.size() >= 3) break;
+            if (result.size() >= dynamicMaxSignals()) break; // лимит сигналов
         }
 
         if (!result.isEmpty()) {
@@ -116,7 +115,7 @@ public class Elite5MinAnalyzer {
     }
 
     private String mapConfidence(double probability) {
-        if (probability >= 0.65) return "[S]";
+        if (probability >= 0.70) return "[S]";
         if (probability >= 0.55) return "[M]";
         return "[W]";
     }
@@ -151,20 +150,21 @@ public class Elite5MinAnalyzer {
                                      double entry, double atr,
                                      double confidence, String reason) {
 
-            // Более агрессивный риск при сильных сигналах
-            double riskMultiplier = confidence >= 0.65 ? 0.85 : 1.05;
+            // Динамический риск и тейк
+            double riskMultiplier = confidence >= 0.65 ? 0.85 : 1.1;
             double risk = atr * riskMultiplier;
-
             double minRisk = entry * minRiskPct;
             if (risk < minRisk) risk = minRisk;
+
+            double takeMultiplier = confidence >= 0.65 ? 2.8 : 2.2;
 
             double stop, take;
             if (side == TradingCore.Side.LONG) {
                 stop = entry - risk;
-                take = entry + risk * 2.5;
+                take = entry + risk * takeMultiplier;
             } else {
                 stop = entry + risk;
-                take = entry - risk * 2.5;
+                take = entry - risk * takeMultiplier;
             }
 
             return new TradeSignal(symbol, entry, stop, take, confidence, reason);
@@ -199,8 +199,8 @@ public class Elite5MinAnalyzer {
 
         private double adaptConfidence(String strategy, double baseConf) {
             double wr = winrate(strategy);
-            if (wr > 0.60) return Math.min(0.85, baseConf + 0.05);
-            if (wr < 0.45) return Math.max(0.50, baseConf - 0.05);
+            if (wr > 0.60) return Math.min(0.90, baseConf + 0.06);
+            if (wr < 0.45) return Math.max(0.50, baseConf - 0.06);
             return baseConf;
         }
 
@@ -210,14 +210,14 @@ public class Elite5MinAnalyzer {
             long now = System.currentTimeMillis();
             q.addLast(now);
             while (!q.isEmpty() && now - q.peekFirst() > 20 * 60_000) q.pollFirst();
-            if (q.size() >= 3) return -0.07;
-            if (q.size() == 2) return -0.03;
+            if (q.size() >= 3) return -0.08;
+            if (q.size() == 2) return -0.04;
             return 0.0;
         }
 
         private double sessionBoost() {
             int hour = LocalTime.now(ZoneOffset.UTC).getHour();
-            if ((hour >= 7 && hour < 11) || (hour >= 13 && hour < 17)) return 0.05;
+            if ((hour >= 7 && hour < 11) || (hour >= 13 && hour < 17)) return 0.06;
             return 0.0;
         }
 
@@ -225,8 +225,19 @@ public class Elite5MinAnalyzer {
             double conf = adaptConfidence(strategy, baseConf);
             conf += sessionBoost();
             conf += impulsePenalty(pair);
-            return Math.max(0.45, Math.min(0.90, conf));
+            return Math.max(0.45, Math.min(0.92, conf));
         }
+    }
+
+    // ================== ДИНАМИКА СИГНАЛОВ ==================
+    private long dynamicSignalInterval(String symbol) {
+        return 5 * 60_000; // минимум 5 минут
+    }
+
+    private int dynamicMaxSignals() {
+        int hour = LocalTime.now(ZoneOffset.UTC).getHour();
+        if ((hour >= 7 && hour < 11) || (hour >= 13 && hour < 17)) return 4;
+        return 3;
     }
 
     // ================== CLEANUP ==================
