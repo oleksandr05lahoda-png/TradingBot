@@ -75,7 +75,6 @@ public class Elite5MinAnalyzer {
             return List.of();
 
         MarketContext ctx = buildMarketContext(c5);
-
         if (!ctx.tradable) return List.of();
 
         List<DecisionEngineMerged.TradeIdea> ideas =
@@ -97,8 +96,7 @@ public class Elite5MinAnalyzer {
 
         for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
-            boolean counterTrend =
-                    htfTrend != null && idea.side != htfTrend;
+            boolean counterTrend = htfTrend != null && idea.side != htfTrend;
 
             TradeMode mode = classifyMode(idea, counterTrend, ctx);
 
@@ -110,8 +108,7 @@ public class Elite5MinAnalyzer {
 
             if (conf < minConf) continue;
 
-            RiskEngine.TradeSignal r =
-                    riskEngine.applyRisk(idea, conf, mode);
+            RiskEngine.TradeSignal r = riskEngine.applyRisk(idea, conf, mode);
 
             result.add(new TradeSignal(
                     symbol,
@@ -151,16 +148,16 @@ public class Elite5MinAnalyzer {
         ctx.atrPct = atrPct;
         ctx.rangePct = currRange / price;
 
-        ctx.highVol = atrPct > 0.0025;
-        ctx.lowVol = atrPct < 0.0012;
+        ctx.highVol = atrPct > 0.0022; // чуть ниже
+        ctx.lowVol = atrPct < 0.0015;  // чуть выше
 
-        ctx.compressed = currRange < avgRange * 0.7;
-        ctx.impulse = currRange > avgRange * 1.6;
+        ctx.compressed = currRange < avgRange * 0.75; // чуть мягче
+        ctx.impulse = currRange > avgRange * 1.5;     // чуть мягче
 
         ctx.microTrendUp = emaFastSlope > 0;
         ctx.microTrendDown = emaFastSlope < 0;
 
-        ctx.tradable = !ctx.lowVol;
+        ctx.tradable = true; // ослаблено ограничение
 
         return ctx;
     }
@@ -193,26 +190,26 @@ public class Elite5MinAnalyzer {
 
         double c = conf;
 
-        if (ctx.highVol) c += 0.04;
-        if (ctx.impulse) c += 0.05;
+        if (ctx.highVol) c += 0.05;
+        if (ctx.impulse) c += 0.04;
         if (ctx.compressed) c += 0.03;
 
-        if (counterTrend) c -= 0.05;
-        if (ctx.lowVol) c -= 0.10;
+        if (counterTrend) c -= 0.04;
+        if (ctx.lowVol) c -= 0.08;
 
-        return clamp(c, 0.45, 0.93);
+        return clamp(c, 0.45, 0.95); // немного расширен верхний cap
     }
 
     private double dynamicMinConfidence(TradeMode mode, MarketContext ctx) {
         double base = switch (mode) {
-            case TREND -> 0.50;
-            case PULLBACK -> 0.53;
-            case BREAKOUT -> 0.55;
-            case REVERSAL -> 0.60;
+            case TREND -> 0.48;
+            case PULLBACK -> 0.50;
+            case BREAKOUT -> 0.52;
+            case REVERSAL -> 0.56;
         };
 
-        if (ctx.highVol) base -= 0.03;
-        if (ctx.lowVol) base += 0.06;
+        if (ctx.highVol) base -= 0.02;
+        if (ctx.lowVol) base += 0.04;
 
         return base;
     }
@@ -225,13 +222,13 @@ public class Elite5MinAnalyzer {
         double h = c1h.get(c1h.size() - 1).close
                 - c1h.get(c1h.size() - 80).close;
 
-        if (Math.abs(h) > 0.0035 * c1h.get(c1h.size() - 80).close)
+        if (Math.abs(h) > 0.003 * c1h.get(c1h.size() - 80).close)
             return h > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
         double m = c15.get(c15.size() - 1).close
                 - c15.get(c15.size() - 80).close;
 
-        if (Math.abs(m) > 0.0025 * c15.get(c15.size() - 80).close)
+        if (Math.abs(m) > 0.002 * c15.get(c15.size() - 80).close)
             return m > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
         return null;
@@ -258,13 +255,13 @@ public class Elite5MinAnalyzer {
                               double conf, TradeMode mode) {
 
             double atr = i.atr;
-            double risk = Math.max(atr * 0.6, i.entry * minRiskPct);
+            double risk = Math.max(atr * 0.55, i.entry * minRiskPct); // чуть мягче
 
             double tpMult = switch (mode) {
-                case TREND -> conf > 0.65 ? 3.2 : 2.7;
-                case PULLBACK -> 2.3;
-                case BREAKOUT -> 3.5;
-                case REVERSAL -> 1.5;
+                case TREND -> conf > 0.63 ? 3.0 : 2.5;
+                case PULLBACK -> 2.2;
+                case BREAKOUT -> 3.3;
+                case REVERSAL -> 1.4;
             };
 
             double stop, take;
@@ -292,33 +289,33 @@ public class Elite5MinAnalyzer {
             double adj = base;
 
             if (s >= 2) adj += 0.05;
-            if (s <= -2) adj -= 0.06;
+            if (s <= -2) adj -= 0.05;
 
             int h = LocalTime.now(ZoneOffset.UTC).getHour();
-            if (h >= 7 && h <= 17) adj += 0.04;
+            if (h >= 7 && h <= 17) adj += 0.03;
 
-            return Math.max(0.45, Math.min(0.92, adj));
+            return Math.max(0.45, Math.min(0.95, adj));
         }
     }
 
     /* ================= UTILS ================= */
 
     private long dynamicCooldown(MarketContext ctx) {
-        if (ctx.highVol) return 60_000;
-        if (ctx.compressed) return 90_000;
-        return 2 * 60_000;
+        if (ctx.highVol) return 50_000;
+        if (ctx.compressed) return 80_000;
+        return 90_000; // чуть меньше общий cooldown
     }
 
     private int maxSignals(MarketContext ctx) {
         int h = LocalTime.now(ZoneOffset.UTC).getHour();
         int base = (h >= 7 && h <= 17) ? 5 : 3;
-        if (ctx.highVol) base += 2;
+        if (ctx.highVol) base += 1; // чуть мягче
         return base;
     }
 
     private String mapConfidence(double p) {
-        if (p >= 0.72) return "[S]";
-        if (p >= 0.58) return "[M]";
+        if (p >= 0.70) return "[S]";
+        if (p >= 0.55) return "[M]";
         return "[W]";
     }
 
