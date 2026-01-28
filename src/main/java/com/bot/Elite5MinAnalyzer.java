@@ -10,7 +10,8 @@ public class Elite5MinAnalyzer {
     private final RiskEngine riskEngine;
     private final AdaptiveBrain brain;
 
-    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastLongSignal = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastShortSignal = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
     public Elite5MinAnalyzer(DecisionEngineMerged decisionEngine, double minRiskPct) {
@@ -18,15 +19,15 @@ public class Elite5MinAnalyzer {
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
 
-        // чистка старых сигналов каждые 10 минут
+        // Чистка старых сигналов каждые 10 минут
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
-            lastSignalTime.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
+            lastLongSignal.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
+            lastShortSignal.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
         }, 10, 10, TimeUnit.MINUTES);
     }
 
     /* ================= TRADE SIGNAL ================= */
-
     public static class TradeSignal {
         public final String symbol;
         public final TradingCore.Side side;
@@ -52,7 +53,6 @@ public class Elite5MinAnalyzer {
     }
 
     /* ================= MARKET CONTEXT ================= */
-
     static class MarketContext {
         boolean tradable;
         boolean highVol;
@@ -65,8 +65,7 @@ public class Elite5MinAnalyzer {
         double rangePct;
     }
 
-    /* ================= MAIN ================= */
-
+    /* ================= MAIN ANALYZE ================= */
     public List<TradeSignal> analyze(String symbol,
                                      List<TradingCore.Candle> c5,
                                      List<TradingCore.Candle> c15,
@@ -78,6 +77,7 @@ public class Elite5MinAnalyzer {
         MarketContext ctx = buildMarketContext(c5);
         if (!ctx.tradable) return List.of();
 
+        // Получаем идеи от DecisionEngine
         List<DecisionEngineMerged.TradeIdea> ideas =
                 decisionEngine.evaluate(symbol, c5, c15, c1h);
 
@@ -86,30 +86,32 @@ public class Elite5MinAnalyzer {
         TradingCore.Side htfTrend = detectTrend(c1h, c15);
         long now = System.currentTimeMillis();
 
-        if (lastSignalTime.containsKey(symbol)
-                && now - lastSignalTime.get(symbol) < dynamicCooldown(ctx)) {
-            return List.of();
-        }
-
-        // сортировка по вероятности
-        ideas.sort(Comparator.comparingDouble(i -> -i.probability));
-
         List<TradeSignal> result = new ArrayList<>();
+
+        // Сортировка по вероятности
+        ideas.sort(Comparator.comparingDouble(i -> -i.probability));
 
         for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
             boolean counterTrend = htfTrend != null && idea.side != htfTrend;
-
             TradeMode mode = classifyMode(idea, counterTrend, ctx);
 
-            double conf = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
+            // Проверяем cooldown Long/Short
+            if (idea.side == TradingCore.Side.LONG && lastLongSignal.containsKey(symbol)
+                    && now - lastLongSignal.get(symbol) < dynamicCooldown(ctx))
+                continue;
+            if (idea.side == TradingCore.Side.SHORT && lastShortSignal.containsKey(symbol)
+                    && now - lastShortSignal.get(symbol) < dynamicCooldown(ctx))
+                continue;
 
+            // Применяем адаптивный мозг
+            double conf = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
             conf = applyContextBoost(conf, ctx, idea, counterTrend);
 
             double minConf = dynamicMinConfidence(mode, ctx);
-
             if (conf < minConf) continue;
 
+            // Рассчёт риска
             RiskEngine.TradeSignal r = riskEngine.applyRisk(idea, conf, mode);
 
             result.add(new TradeSignal(
@@ -122,16 +124,16 @@ public class Elite5MinAnalyzer {
                     mode.name(),
                     idea.reason + contextReason(ctx)
             ));
-        }
 
-        // сохраняем время сигнала
-        if (!result.isEmpty()) lastSignalTime.put(symbol, now);
+            // Сохраняем время сигнала
+            if (idea.side == TradingCore.Side.LONG) lastLongSignal.put(symbol, now);
+            else lastShortSignal.put(symbol, now);
+        }
 
         return result;
     }
 
     /* ================= CONTEXT ENGINE ================= */
-
     private MarketContext buildMarketContext(List<TradingCore.Candle> c5) {
         MarketContext ctx = new MarketContext();
 
@@ -162,7 +164,6 @@ public class Elite5MinAnalyzer {
     }
 
     /* ================= MODE ================= */
-
     enum TradeMode {
         TREND,
         PULLBACK,
@@ -181,7 +182,6 @@ public class Elite5MinAnalyzer {
     }
 
     /* ================= ADAPTIVE LOGIC ================= */
-
     private double applyContextBoost(double conf,
                                      MarketContext ctx,
                                      DecisionEngineMerged.TradeIdea idea,
@@ -214,7 +214,6 @@ public class Elite5MinAnalyzer {
     }
 
     /* ================= TREND ================= */
-
     private TradingCore.Side detectTrend(List<TradingCore.Candle> c1h,
                                          List<TradingCore.Candle> c15) {
 
@@ -233,8 +232,7 @@ public class Elite5MinAnalyzer {
         return null;
     }
 
-    /* ================= RISK ================= */
-
+    /* ================= RISK ENGINE ================= */
     static class RiskEngine {
 
         private final double minRiskPct;
@@ -277,13 +275,11 @@ public class Elite5MinAnalyzer {
     }
 
     /* ================= BRAIN ================= */
-
     static class AdaptiveBrain {
 
         private final Map<String, Integer> streak = new ConcurrentHashMap<>();
 
         double applyAllAdjustments(String strat, String pair, double base) {
-
             int s = streak.getOrDefault(pair, 0);
             double adj = base;
 
@@ -298,7 +294,6 @@ public class Elite5MinAnalyzer {
     }
 
     /* ================= UTILS ================= */
-
     private long dynamicCooldown(MarketContext ctx) {
         if (ctx.highVol) return 50_000;
         if (ctx.compressed) return 80_000;
