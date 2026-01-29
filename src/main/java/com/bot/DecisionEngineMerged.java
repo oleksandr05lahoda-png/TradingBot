@@ -34,124 +34,160 @@ public class DecisionEngineMerged {
         }
     }
 
+    /* ========================== CONSTANTS ========================== */
+    private static final long COOLDOWN_MS = 5 * 60_000; // 5 минут
+    private static final int MAX_COINS = 100;
+
     /* ========================== ANTI-DUPLICATION ========================== */
     private final Map<String, Long> lastLongSignal = new ConcurrentHashMap<>();
     private final Map<String, Long> lastShortSignal = new ConcurrentHashMap<>();
-    private final long cooldownMs = 5 * 60_000; // 5 минут
 
     /* ========================== MAIN ========================== */
-    public List<TradeIdea> evaluate(String symbol,
-                                    List<TradingCore.Candle> c5,
-                                    List<TradingCore.Candle> c15,
-                                    List<TradingCore.Candle> c1h) {
+    public List<TradeIdea> evaluateAll(List<String> symbols,
+                                       Map<String, List<TradingCore.Candle>> candles5m,
+                                       Map<String, List<TradingCore.Candle>> candles15m,
+                                       Map<String, List<TradingCore.Candle>> candles1h) {
 
-        if (!valid(c5, 120) || !valid(c15, 120) || !valid(c1h, 120))
-            return List.of();
-
-        double atr = SignalSender.atr(c5, 14);
-        if (atr <= 0) return List.of();
-
-        MarketMode mode = marketMode(c1h, c15, c5, atr);
-        EMA ema5 = emaContext(c5);
-        EMA ema15 = emaContext(c15);
-        EMA ema1h = emaContext(c1h);
-        TradingCore.Candle last = last(c5);
-
-        List<TradeIdea> ideas = new ArrayList<>();
+        List<TradeIdea> allIdeas = new ArrayList<>();
         long now = System.currentTimeMillis();
-        double minProb = adaptiveThreshold(mode);
 
-        // ===== TREND + PULLBACK CORE =====
-        if (mode == MarketMode.TREND || mode == MarketMode.HIGH_VOL_TREND) {
-            // TREND SIGNALS – редкие
-            if (ema5.bullish && ema15.bullish && ema1h.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
-                double score = scoreTrend(c5, atr, true, mode);
-                if (score >= 0.60) {
-                    ideas.add(scored(buildLong(symbol, last.close, atr), score, "TREND LONG"));
-                    lastLongSignal.put(symbol, now);
-                }
-            }
-            if (ema5.bearish && ema15.bearish && ema1h.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
-                double score = scoreTrend(c5, atr, false, mode);
-                if (score >= 0.60) {
-                    ideas.add(scored(buildShort(symbol, last.close, atr), score, "TREND SHORT"));
-                    lastShortSignal.put(symbol, now);
-                }
-            }
+        int count = 0;
+        for (String symbol : symbols) {
+            if (count >= MAX_COINS) break;
+            List<TradingCore.Candle> c5 = candles5m.get(symbol);
+            List<TradingCore.Candle> c15 = candles15m.get(symbol);
+            List<TradingCore.Candle> c1h = candles1h.get(symbol);
 
-            // PULLBACK – частые сигналы
-            if (pullbackLong(c5, ema5) && ema15.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
-                double score = scorePullback(c5, atr);
-                if (score >= minProb) {
-                    ideas.add(scored(buildLong(symbol, last.close, atr), score, "PULLBACK LONG"));
-                    lastLongSignal.put(symbol, now);
-                }
+            if (!valid(c5, 120) || !valid(c15, 120) || !valid(c1h, 120)) continue;
+            double atr = SignalSender.atr(c5, 14);
+            if (atr <= 0) continue;
+
+            MarketMode mode = marketMode(c1h, c15, c5, atr);
+            EMA ema5 = emaContext(c5);
+            EMA ema15 = emaContext(c15);
+            EMA ema1h = emaContext(c1h);
+            double minProb = adaptiveThreshold(mode);
+
+            // ===== TREND & PULLBACK =====
+            generateTrendPullback(symbol, c5, ema5, ema15, ema1h, mode, atr, allIdeas, now, minProb);
+
+            // ===== MOMENTUM / IMPULSE =====
+            generateMomentum(symbol, c5, ema5, ema15, atr, allIdeas, now, minProb);
+
+            // ===== RANGE FADE =====
+            generateRange(symbol, c5, atr, mode, allIdeas, now, minProb);
+
+            // ===== REVERSAL / LIQUIDITY SWEEP =====
+            generateReversal(symbol, c5, atr, mode, allIdeas, now, minProb);
+
+            count++;
+        }
+
+        allIdeas.sort((a, b) -> Double.compare(b.probability, a.probability));
+        return allIdeas;
+    }
+
+    /* ========================== TREND & PULLBACK ========================== */
+    private void generateTrendPullback(String symbol, List<TradingCore.Candle> c5, EMA ema5, EMA ema15, EMA ema1h,
+                                       MarketMode mode, double atr, List<TradeIdea> ideas, long now, double minProb) {
+
+        // TREND SIGNALS – редкие
+        if (ema5.bullish && ema15.bullish && ema1h.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
+            double score = scoreTrend(c5, atr, true, mode);
+            if (score >= 0.60) {
+                ideas.add(scored(buildLong(symbol, last(c5).close, atr), score, "TREND LONG"));
+                lastLongSignal.put(symbol, now);
             }
-            if (pullbackShort(c5, ema5) && ema15.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
-                double score = scorePullback(c5, atr);
-                if (score >= minProb) {
-                    ideas.add(scored(buildShort(symbol, last.close, atr), score, "PULLBACK SHORT"));
-                    lastShortSignal.put(symbol, now);
-                }
+        }
+        if (ema5.bearish && ema15.bearish && ema1h.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
+            double score = scoreTrend(c5, atr, false, mode);
+            if (score >= 0.60) {
+                ideas.add(scored(buildShort(symbol, last(c5).close, atr), score, "TREND SHORT"));
+                lastShortSignal.put(symbol, now);
             }
         }
 
-        // ===== MOMENTUM / IMPULSE =====
-        if (impulseBreakout(c5, atr)) {
-            if (ema5.bullish && ema15.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
-                double score = scoreMomentum(c5, atr);
-                if (score >= minProb) {
-                    ideas.add(scored(buildLong(symbol, last.close, atr), score, "MOMENTUM LONG"));
-                    lastLongSignal.put(symbol, now);
-                }
-            }
-            if (ema5.bearish && ema15.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
-                double score = scoreMomentum(c5, atr);
-                if (score >= minProb) {
-                    ideas.add(scored(buildShort(symbol, last.close, atr), score, "MOMENTUM SHORT"));
-                    lastShortSignal.put(symbol, now);
-                }
+        // PULLBACK – частые сигналы
+        if (pullbackLong(c5, ema5) && ema15.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
+            double score = scorePullback(c5, atr);
+            if (score >= minProb) {
+                ideas.add(scored(buildLong(symbol, last(c5).close, atr), score, "PULLBACK LONG"));
+                lastLongSignal.put(symbol, now);
             }
         }
-
-        // ===== RANGE FADE =====
-        if (mode == MarketMode.RANGE) {
-            if (rangeFadeShort(c5, atr) && !recentCooldown(lastShortSignal, symbol, now)) {
-                double score = scoreRange(c5);
-                if (score >= minProb) {
-                    ideas.add(scored(buildShort(symbol, last.close, atr), score, "RANGE FADE SHORT"));
-                    lastShortSignal.put(symbol, now);
-                }
-            }
-            if (rangeFadeLong(c5, atr) && !recentCooldown(lastLongSignal, symbol, now)) {
-                double score = scoreRange(c5);
-                if (score >= minProb) {
-                    ideas.add(scored(buildLong(symbol, last.close, atr), score, "RANGE FADE LONG"));
-                    lastLongSignal.put(symbol, now);
-                }
+        if (pullbackShort(c5, ema5) && ema15.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
+            double score = scorePullback(c5, atr);
+            if (score >= minProb) {
+                ideas.add(scored(buildShort(symbol, last(c5).close, atr), score, "PULLBACK SHORT"));
+                lastShortSignal.put(symbol, now);
             }
         }
+    }
 
-        // ===== REVERSAL / LIQUIDITY SWEEP – частые сигналы =====
-        if (mode == MarketMode.REVERSAL) {
-            if (sweepHigh(c5, atr) && rejectionDown(c5) && !recentCooldown(lastShortSignal, symbol, now)) {
-                double score = scoreReversal(c5);
-                if (score >= minProb) {
-                    ideas.add(scored(buildShort(symbol, last.close, atr), score, "REVERSAL SHORT"));
-                    lastShortSignal.put(symbol, now);
-                }
-            }
-            if (sweepLow(c5, atr) && rejectionUp(c5) && !recentCooldown(lastLongSignal, symbol, now)) {
-                double score = scoreReversal(c5);
-                if (score >= minProb) {
-                    ideas.add(scored(buildLong(symbol, last.close, atr), score, "REVERSAL LONG"));
-                    lastLongSignal.put(symbol, now);
-                }
+    /* ========================== MOMENTUM ========================== */
+    private void generateMomentum(String symbol, List<TradingCore.Candle> c5, EMA ema5, EMA ema15,
+                                  double atr, List<TradeIdea> ideas, long now, double minProb) {
+
+        if (!impulseBreakout(c5, atr)) return;
+
+        if (ema5.bullish && ema15.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
+            double score = scoreMomentum(c5, atr);
+            if (score >= minProb) {
+                ideas.add(scored(buildLong(symbol, last(c5).close, atr), score, "MOMENTUM LONG"));
+                lastLongSignal.put(symbol, now);
             }
         }
+        if (ema5.bearish && ema15.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
+            double score = scoreMomentum(c5, atr);
+            if (score >= minProb) {
+                ideas.add(scored(buildShort(symbol, last(c5).close, atr), score, "MOMENTUM SHORT"));
+                lastShortSignal.put(symbol, now);
+            }
+        }
+    }
 
-        ideas.sort((a, b) -> Double.compare(b.probability, a.probability));
-        return ideas;
+    /* ========================== RANGE ========================== */
+    private void generateRange(String symbol, List<TradingCore.Candle> c5, double atr, MarketMode mode,
+                               List<TradeIdea> ideas, long now, double minProb) {
+
+        if (mode != MarketMode.RANGE) return;
+
+        if (rangeFadeShort(c5, atr) && !recentCooldown(lastShortSignal, symbol, now)) {
+            double score = scoreRange(c5);
+            if (score >= minProb) {
+                ideas.add(scored(buildShort(symbol, last(c5).close, atr), score, "RANGE FADE SHORT"));
+                lastShortSignal.put(symbol, now);
+            }
+        }
+        if (rangeFadeLong(c5, atr) && !recentCooldown(lastLongSignal, symbol, now)) {
+            double score = scoreRange(c5);
+            if (score >= minProb) {
+                ideas.add(scored(buildLong(symbol, last(c5).close, atr), score, "RANGE FADE LONG"));
+                lastLongSignal.put(symbol, now);
+            }
+        }
+    }
+
+    /* ========================== REVERSAL ========================== */
+    private void generateReversal(String symbol, List<TradingCore.Candle> c5, double atr, MarketMode mode,
+                                  List<TradeIdea> ideas, long now, double minProb) {
+
+        if (mode != MarketMode.REVERSAL) return;
+
+        if (sweepHigh(c5, atr) && rejectionDown(c5) && !recentCooldown(lastShortSignal, symbol, now)) {
+            double score = scoreReversal(c5);
+            if (score >= minProb) {
+                ideas.add(scored(buildShort(symbol, last(c5).close, atr), score, "REVERSAL SHORT"));
+                lastShortSignal.put(symbol, now);
+            }
+        }
+        if (sweepLow(c5, atr) && rejectionUp(c5) && !recentCooldown(lastLongSignal, symbol, now)) {
+            double score = scoreReversal(c5);
+            if (score >= minProb) {
+                ideas.add(scored(buildLong(symbol, last(c5).close, atr), score, "REVERSAL LONG"));
+                lastLongSignal.put(symbol, now);
+            }
+        }
     }
 
     /* ========================== MARKET MODE ========================== */
@@ -163,8 +199,7 @@ public class DecisionEngineMerged {
         double htfMove = Math.abs(last(c1h).close - c1h.get(c1h.size() - 80).close) / atr;
         double mtfMove = Math.abs(last(c15).close - c15.get(c15.size() - 40).close) / atr;
 
-        double atr5 = avgRange(c5, 20) / atr;
-        boolean highVol = atr5 > 1.4;
+        boolean highVol = avgRange(c5, 20) / atr > 1.4;
         boolean compress = rangeCompression(c5);
 
         if (htfMove > 7.0 && mtfMove < 2.0) return MarketMode.REVERSAL;
@@ -175,13 +210,12 @@ public class DecisionEngineMerged {
 
     /* ========================== ADAPTIVE THRESHOLD ========================== */
     private double adaptiveThreshold(MarketMode mode) {
-        switch (mode) {
-            case HIGH_VOL_TREND: return 0.50;
-            case TREND: return 0.58; // редкие трендовые сигналы
-            case RANGE: return 0.50;
-            case REVERSAL: return 0.52;
-        }
-        return 0.5;
+        return switch (mode) {
+            case HIGH_VOL_TREND -> 0.50;
+            case TREND -> 0.58;
+            case RANGE -> 0.50;
+            case REVERSAL -> 0.52;
+        };
     }
 
     /* ========================== SCORING ========================== */
@@ -262,25 +296,21 @@ public class DecisionEngineMerged {
     }
 
     private boolean rangeFadeShort(List<TradingCore.Candle> c, double atr) {
-        double rh = recentHigh(c, 20);
-        return last(c).high > rh - atr * 0.25;
+        return last(c).high > recentHigh(c, 20) - atr * 0.25;
     }
 
     private boolean rangeFadeLong(List<TradingCore.Candle> c, double atr) {
-        double rl = recentLow(c, 20);
-        return last(c).low < rl + atr * 0.25;
+        return last(c).low < recentLow(c, 20) + atr * 0.25;
     }
 
     private boolean sweepHigh(List<TradingCore.Candle> c, double atr) {
-        double rh = recentHigh(c, 20);
         TradingCore.Candle l = last(c);
-        return l.high > rh && (l.high - l.close) > atr * 0.20;
+        return l.high > recentHigh(c, 20) && (l.high - l.close) > atr * 0.20;
     }
 
     private boolean sweepLow(List<TradingCore.Candle> c, double atr) {
-        double rl = recentLow(c, 20);
         TradingCore.Candle l = last(c);
-        return l.low < rl && (l.close - l.low) > atr * 0.20;
+        return l.low < recentLow(c, 20) && (l.close - l.low) > atr * 0.20;
     }
 
     private boolean rejectionDown(List<TradingCore.Candle> c) {
@@ -295,22 +325,17 @@ public class DecisionEngineMerged {
 
     /* ========================== EMA ========================== */
     private EMA emaContext(List<TradingCore.Candle> c) {
-        int size = c.size();
         double e9 = ema(c, 9);
         double e21 = ema(c, 21);
         double e50 = ema(c, 50);
         double p = last(c).close;
-        return new EMA(e9, e21, e50,
-                p > e9 && e9 > e21 && e21 > e50,
-                p < e9 && e9 < e21 && e21 < e50);
+        return new EMA(e9, e21, e50, p > e9 && e9 > e21 && e21 > e50, p < e9 && e9 < e21 && e21 < e50);
     }
 
     private double ema(List<TradingCore.Candle> c, int period) {
         double k = 2.0 / (period + 1);
         double e = c.get(c.size() - period).close;
-        for (int i = c.size() - period + 1; i < c.size(); i++) {
-            e = c.get(i).close * k + e * (1 - k);
-        }
+        for (int i = c.size() - period + 1; i < c.size(); i++) e = c.get(i).close * k + e * (1 - k);
         return e;
     }
 
@@ -383,7 +408,7 @@ public class DecisionEngineMerged {
     }
 
     private boolean recentCooldown(Map<String, Long> map, String symbol, long now) {
-        return map.containsKey(symbol) && now - map.get(symbol) < cooldownMs;
+        return map.containsKey(symbol) && now - map.get(symbol) < COOLDOWN_MS;
     }
 
     /* ========================== STRUCT ========================== */
@@ -392,6 +417,7 @@ public class DecisionEngineMerged {
     private static class EMA {
         double ema9, ema21, ema50;
         boolean bullish, bearish;
+
         EMA(double e9, double e21, double e50, boolean bull, boolean bear) {
             this.ema9 = e9; this.ema21 = e21; this.ema50 = e50; this.bullish = bull; this.bearish = bear;
         }

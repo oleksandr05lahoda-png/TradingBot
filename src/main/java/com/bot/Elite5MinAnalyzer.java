@@ -4,10 +4,6 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 
-/**
- * Professional 5-minute analyzer for futures trading.
- * Designed for early entries, reversals, microtrend detection, and adaptive confidence.
- */
 public class Elite5MinAnalyzer {
 
     private final DecisionEngineMerged decisionEngine;
@@ -141,11 +137,12 @@ public class Elite5MinAnalyzer {
         MarketContext ctx = new MarketContext();
 
         ctx.price = last(c5).close;
-        ctx.atr = atr(c5, 14);
-        ctx.avgRange = avgRange(c5, 20);
+        ctx.atr = computeATR(c5, 14);
+        ctx.avgRange = computeAvgRange(c5, 20);
+
         double currRange = last(c5).high - last(c5).low;
-        double emaSlopeFast = emaSlope(c5, 9, 5);
-        double emaSlopeSlow = emaSlope(c5, 21, 5);
+        double emaSlopeFast = computeEMASlope(c5, 9, 5);
+        double emaSlopeSlow = computeEMASlope(c5, 21, 5);
         ctx.rsi = computeRSI(c5, 14);
 
         ctx.atrPct = ctx.atr / ctx.price;
@@ -222,8 +219,11 @@ public class Elite5MinAnalyzer {
         int lookback = Math.min(80, c1h.size() - 1);
         double delta = last(c1h).close - c1h.get(c1h.size() - lookback).close;
 
-        if (Math.abs(delta) > 0.003 * c1h.get(c1h.size() - lookback).close)
+        double threshold = 0.003 * c1h.get(c1h.size() - lookback).close;
+
+        if (Math.abs(delta) > threshold) {
             return delta > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
+        }
 
         return null;
     }
@@ -239,8 +239,11 @@ public class Elite5MinAnalyzer {
 
         static class TradeSignal {
             double entry, stop, take;
-            TradeSignal(double e, double s, double t) {
-                entry = e; stop = s; take = t;
+
+            TradeSignal(double entry, double stop, double take) {
+                this.entry = entry;
+                this.stop = stop;
+                this.take = take;
             }
         }
 
@@ -248,14 +251,16 @@ public class Elite5MinAnalyzer {
             double atr = i.atr;
             double risk = Math.max(atr * 0.55, i.entry * minRiskPct);
 
-            double tpMult = switch (mode) {
-                case TREND -> conf > 0.63 ? 3.0 : 2.5;
-                case PULLBACK -> 2.2;
-                case BREAKOUT -> 3.3;
-                case REVERSAL -> 1.4;
-                case REVERSAL_PULLBACK -> 1.8;
-                case EXHAUSTION -> 2.0;
-            };
+            double tpMult;
+            switch (mode) {
+                case TREND -> tpMult = conf > 0.63 ? 3.0 : 2.5;
+                case PULLBACK -> tpMult = 2.2;
+                case BREAKOUT -> tpMult = 3.3;
+                case REVERSAL -> tpMult = 1.4;
+                case REVERSAL_PULLBACK -> tpMult = 1.8;
+                case EXHAUSTION -> tpMult = 2.0;
+                default -> tpMult = 2.0;
+            }
 
             double stop, take;
             if (i.side == TradingCore.Side.LONG) {
@@ -272,6 +277,7 @@ public class Elite5MinAnalyzer {
 
     /* ================= ADAPTIVE BRAIN ================= */
     static class AdaptiveBrain {
+
         private final Map<String, Integer> streak = new ConcurrentHashMap<>();
 
         double applyAllAdjustments(String strat, String pair, double base) {
@@ -311,44 +317,47 @@ public class Elite5MinAnalyzer {
         return sb.toString();
     }
 
-    private double atr(List<TradingCore.Candle> c, int n) {
-        double sum = 0;
-        for (int i = c.size() - n; i < c.size(); i++)
+    private double computeATR(List<TradingCore.Candle> c, int period) {
+        double sum = 0.0;
+        for (int i = c.size() - period; i < c.size(); i++) {
             sum += c.get(i).high - c.get(i).low;
-        return sum / n;
-    }
-
-    private double avgRange(List<TradingCore.Candle> c, int n) {
-        double sum = 0;
-        for (int i = c.size() - n; i < c.size(); i++)
-            sum += c.get(i).high - c.get(i).low;
-        return sum / n;
-    }
-
-    private double emaSlope(List<TradingCore.Candle> c, int p, int bars) {
-        double e1 = ema(c, p, bars);
-        double e2 = ema(c, p, bars + 5);
-        return e1 - e2;
-    }
-
-    private double ema(List<TradingCore.Candle> c, int p, int back) {
-        double k = 2.0 / (p + 1);
-        double e = c.get(c.size() - back - p).close;
-        for (int i = c.size() - back - p + 1; i < c.size() - back; i++) {
-            e = c.get(i).close * k + e * (1 - k);
         }
-        return e;
+        return sum / period;
+    }
+
+    private double computeAvgRange(List<TradingCore.Candle> c, int n) {
+        double sum = 0.0;
+        for (int i = c.size() - n; i < c.size(); i++) {
+            sum += c.get(i).high - c.get(i).low;
+        }
+        return sum / n;
+    }
+
+    private double computeEMASlope(List<TradingCore.Candle> c, int period, int back) {
+        double emaNow = computeEMA(c, period, back);
+        double emaPrev = computeEMA(c, period, back + 5);
+        return emaNow - emaPrev;
+    }
+
+    private double computeEMA(List<TradingCore.Candle> c, int period, int back) {
+        double k = 2.0 / (period + 1);
+        double ema = c.get(c.size() - back - period).close;
+        for (int i = c.size() - back - period + 1; i < c.size() - back; i++) {
+            ema = c.get(i).close * k + ema * (1 - k);
+        }
+        return ema;
     }
 
     private double computeRSI(List<TradingCore.Candle> c, int period) {
-        double gain = 0, loss = 0;
+        double gain = 0.0;
+        double loss = 0.0;
         for (int i = c.size() - period; i < c.size(); i++) {
             double diff = c.get(i).close - c.get(i - 1).close;
             if (diff > 0) gain += diff;
             else loss -= diff;
         }
-        double rs = loss == 0 ? 100 : gain / loss;
-        return 100 - (100 / (1 + rs));
+        double rs = loss == 0 ? 100.0 : gain / loss;
+        return 100.0 - (100.0 / (1.0 + rs));
     }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {

@@ -83,7 +83,6 @@ public class TradingCore {
                         '}';
             }
         }
-
         public TradeSignal applyRisk(String symbol, Side side, double entry, double atr, double confidence, String reason) {
 
             double risk = atr * 1.2;
