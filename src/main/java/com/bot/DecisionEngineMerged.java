@@ -63,48 +63,41 @@ public class DecisionEngineMerged {
 
         // ===== TREND + PULLBACK CORE =====
         if (mode == MarketMode.TREND || mode == MarketMode.HIGH_VOL_TREND) {
-            // LONG
+            // TREND SIGNALS – Редкие
             if (ema5.bullish && ema15.bullish && ema1h.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
-                ideas.add(scored(buildLong(symbol, last.close, atr),
-                        scoreTrend(c5, atr, true, mode),
-                        "TREND LONG"));
-                lastLongSignal.put(symbol, now);
+                double score = scoreTrend(c5, atr, true, mode);
+                if (score >= 0.60) {
+                    ideas.add(scored(buildLong(symbol, last.close, atr), score, "TREND LONG"));
+                    lastLongSignal.put(symbol, now);
+                }
             }
-            // SHORT
             if (ema5.bearish && ema15.bearish && ema1h.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
-                ideas.add(scored(buildShort(symbol, last.close, atr),
-                        scoreTrend(c5, atr, false, mode),
-                        "TREND SHORT"));
-                lastShortSignal.put(symbol, now);
+                double score = scoreTrend(c5, atr, false, mode);
+                if (score >= 0.60) {
+                    ideas.add(scored(buildShort(symbol, last.close, atr), score, "TREND SHORT"));
+                    lastShortSignal.put(symbol, now);
+                }
             }
-            // PULLBACK LONG
+
+            // PULLBACK – частые ранние сигналы
             if (pullbackLong(c5, ema5) && ema15.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
-                ideas.add(scored(buildLong(symbol, last.close, atr),
-                        scorePullback(c5, atr),
-                        "PULLBACK LONG"));
+                ideas.add(scored(buildLong(symbol, last.close, atr), scorePullback(c5, atr), "PULLBACK LONG"));
                 lastLongSignal.put(symbol, now);
             }
-            // PULLBACK SHORT
             if (pullbackShort(c5, ema5) && ema15.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
-                ideas.add(scored(buildShort(symbol, last.close, atr),
-                        scorePullback(c5, atr),
-                        "PULLBACK SHORT"));
+                ideas.add(scored(buildShort(symbol, last.close, atr), scorePullback(c5, atr), "PULLBACK SHORT"));
                 lastShortSignal.put(symbol, now);
             }
         }
 
-        // ===== MOMENTUM IMPULSE =====
+        // ===== MOMENTUM / IMPULSE =====
         if (impulseBreakout(c5, atr)) {
             if (ema5.bullish && ema15.bullish && !recentCooldown(lastLongSignal, symbol, now)) {
-                ideas.add(scored(buildLong(symbol, last.close, atr),
-                        scoreMomentum(c5, atr),
-                        "MOMENTUM LONG"));
+                ideas.add(scored(buildLong(symbol, last.close, atr), scoreMomentum(c5, atr), "MOMENTUM LONG"));
                 lastLongSignal.put(symbol, now);
             }
             if (ema5.bearish && ema15.bearish && !recentCooldown(lastShortSignal, symbol, now)) {
-                ideas.add(scored(buildShort(symbol, last.close, atr),
-                        scoreMomentum(c5, atr),
-                        "MOMENTUM SHORT"));
+                ideas.add(scored(buildShort(symbol, last.close, atr), scoreMomentum(c5, atr), "MOMENTUM SHORT"));
                 lastShortSignal.put(symbol, now);
             }
         }
@@ -112,31 +105,23 @@ public class DecisionEngineMerged {
         // ===== RANGE FADE =====
         if (mode == MarketMode.RANGE) {
             if (rangeFadeShort(c5, atr) && !recentCooldown(lastShortSignal, symbol, now)) {
-                ideas.add(scored(buildShort(symbol, last.close, atr),
-                        scoreRange(c5),
-                        "RANGE FADE SHORT"));
+                ideas.add(scored(buildShort(symbol, last.close, atr), scoreRange(c5), "RANGE FADE SHORT"));
                 lastShortSignal.put(symbol, now);
             }
             if (rangeFadeLong(c5, atr) && !recentCooldown(lastLongSignal, symbol, now)) {
-                ideas.add(scored(buildLong(symbol, last.close, atr),
-                        scoreRange(c5),
-                        "RANGE FADE LONG"));
+                ideas.add(scored(buildLong(symbol, last.close, atr), scoreRange(c5), "RANGE FADE LONG"));
                 lastLongSignal.put(symbol, now);
             }
         }
 
-        // ===== REVERSAL / LIQUIDITY SWEEP =====
+        // ===== REVERSAL / LIQUIDITY SWEEP – Частые сигналы разворота =====
         if (mode == MarketMode.REVERSAL) {
             if (sweepHigh(c5, atr) && rejectionDown(c5) && !recentCooldown(lastShortSignal, symbol, now)) {
-                ideas.add(scored(buildShort(symbol, last.close, atr),
-                        scoreReversal(c5),
-                        "REVERSAL SHORT"));
+                ideas.add(scored(buildShort(symbol, last.close, atr), scoreReversal(c5), "REVERSAL SHORT"));
                 lastShortSignal.put(symbol, now);
             }
             if (sweepLow(c5, atr) && rejectionUp(c5) && !recentCooldown(lastLongSignal, symbol, now)) {
-                ideas.add(scored(buildLong(symbol, last.close, atr),
-                        scoreReversal(c5),
-                        "REVERSAL LONG"));
+                ideas.add(scored(buildLong(symbol, last.close, atr), scoreReversal(c5), "REVERSAL LONG"));
                 lastLongSignal.put(symbol, now);
             }
         }
@@ -178,7 +163,7 @@ public class DecisionEngineMerged {
     private double adaptiveThreshold(MarketMode mode) {
         return switch (mode) {
             case HIGH_VOL_TREND -> 0.50;
-            case TREND -> 0.48;
+            case TREND -> 0.58; // повыше, чтобы трендовые сигналы были реже
             case RANGE -> 0.50;
             case REVERSAL -> 0.52;
         };

@@ -6,8 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/Elite5MinAnalyzer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/Elite5MinAnalyzer.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/python-core/analysis.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/python-core/analysis.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -304,7 +302,8 @@
       <workItem from="1769513096190" duration="5821000" />
       <workItem from="1769539057561" duration="11295000" />
       <workItem from="1769612043726" duration="614000" />
-      <workItem from="1769685047562" duration="2038000" />
+      <workItem from="1769685047562" duration="2762000" />
+      <workItem from="1769692185028" duration="390000" />
     </task>
     <servers />
   </component>
