@@ -2,16 +2,15 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from collections import deque
 
 BASE_URL = "https://fapi.binance.com"
 
 class Elite5MinAnalyzer:
-    """Professional 5-minute futures analyzer for early entries, reversals, and trend detection"""
+    """Professional 5-minute futures analyzer optimized for safe futures entries"""
 
-    def __init__(self, min_confidence=0.45, max_confidence=0.95, cooldown_minutes=5):
-        self.min_confidence = min_confidence
-        self.max_confidence = max_confidence
+    def __init__(self, min_conf=0.45, max_conf=0.95, cooldown_minutes=3):
+        self.min_conf = min_conf
+        self.max_conf = max_conf
         self.cooldown_minutes = cooldown_minutes
         self.last_signal_time = {}
         self.history = {}
@@ -52,15 +51,14 @@ class Elite5MinAnalyzer:
 
     # ===================== CONTEXT =====================
     def build_context(self, df5, df15, df1h, df4h):
-        context = {}
+        ctx = {}
         price = df5.close.iloc[-1]
         atr = self.ATR(df5).iloc[-1]
 
-        # EMA slopes for micro trend detection
         ema9_slope = self.EMA(df5.close, 9).iloc[-1] - self.EMA(df5.close, 9).iloc[-5]
         ema21_slope = self.EMA(df5.close, 21).iloc[-1] - self.EMA(df5.close, 21).iloc[-5]
 
-        context.update({
+        ctx.update({
             "price": price,
             "atr": atr,
             "ema9_slope": ema9_slope,
@@ -70,16 +68,22 @@ class Elite5MinAnalyzer:
             "vol_climax": df5.volume.iloc[-1] > df5.volume.rolling(30).mean().iloc[-1]*1.5
         })
 
-        # Higher time frame trends
-        context["htf_15m"] = "UP" if self.EMA(df15.close, 9).iloc[-1] > self.EMA(df15.close, 21).iloc[-1] else "DOWN"
-        context["htf_1h"] = "UP" if self.EMA(df1h.close, 9).iloc[-1] > self.EMA(df1h.close, 21).iloc[-1] else "DOWN"
-        context["htf_4h"] = "UP" if self.EMA(df4h.close, 9).iloc[-1] > self.EMA(df4h.close, 21).iloc[-1] else "DOWN"
+        # Macro trends
+        ctx["htf_15m"] = "UP" if self.EMA(df15.close, 9).iloc[-1] > self.EMA(df15.close, 21).iloc[-1] else "DOWN"
+        ctx["htf_1h"] = "UP" if self.EMA(df1h.close, 9).iloc[-1] > self.EMA(df1h.close, 21).iloc[-1] else "DOWN"
+        ctx["htf_4h"] = "UP" if self.EMA(df4h.close, 9).iloc[-1] > self.EMA(df4h.close, 21).iloc[-1] else "DOWN"
 
         # Liquidity sweeps
-        context["sweep_high"] = df5.high.iloc[-1] > df5.high.iloc[-20:-1].max() and (df5.high.iloc[-1]-df5.close.iloc[-1]) > atr*0.2
-        context["sweep_low"] = df5.low.iloc[-1] < df5.low.iloc[-20:-1].min() and (df5.close.iloc[-1]-df5.low.iloc[-1]) > atr*0.2
+        ctx["sweep_high"] = df5.high.iloc[-1] > df5.high.iloc[-20:-1].max() and (df5.high.iloc[-1]-df5.close.iloc[-1]) > atr*0.2
+        ctx["sweep_low"] = df5.low.iloc[-1] < df5.low.iloc[-20:-1].min() and (df5.close.iloc[-1]-df5.low.iloc[-1]) > atr*0.2
 
-        return context
+        # Micro trend exhaustion detection
+        ctx["micro_trend_up"] = ema9_slope > 0.0 and ema21_slope > 0.0
+        ctx["micro_trend_down"] = ema9_slope < 0.0 and ema21_slope < 0.0
+        ctx["exhaustion_up"] = ctx["rsi"] > 72 and ctx["micro_trend_up"]
+        ctx["exhaustion_down"] = ctx["rsi"] < 28 and ctx["micro_trend_down"]
+
+        return ctx
 
     # ===================== SIGNAL GENERATION =====================
     def generate_signals(self, symbol):
@@ -95,28 +99,27 @@ class Elite5MinAnalyzer:
         signals = []
 
         # ===== REVERSAL LONG =====
-        if ctx["sweep_low"] and ctx["rsi"] < 35 and ctx["vol_climax"]:
-            conf = 0.58
-            conf += 0.05 if ctx["compressed"] else 0
-            conf += 0.04 if ctx["htf_15m"] == "UP" else 0
-            signals.append(self._build_signal(symbol, "LONG", price, conf, "Liquidity sweep LOW + RSI exhaustion"))
+        if ctx["sweep_low"] and ctx["rsi"] < 35 and ctx["vol_climax"] and ctx["htf_1h"] == "UP":
+            conf = 0.58 + (0.05 if ctx["compressed"] else 0)
+            signals.append(self._build_signal(symbol, "LONG", price, conf, "REVERSAL LOW + HTF UP"))
 
         # ===== REVERSAL SHORT =====
-        if ctx["sweep_high"] and ctx["rsi"] > 65 and ctx["vol_climax"]:
-            conf = 0.58
-            conf += 0.05 if ctx["compressed"] else 0
-            conf += 0.04 if ctx["htf_15m"] == "DOWN" else 0
-            signals.append(self._build_signal(symbol, "SHORT", price, conf, "Liquidity sweep HIGH + RSI exhaustion"))
+        if ctx["sweep_high"] and ctx["rsi"] > 65 and ctx["vol_climax"] and ctx["htf_1h"] == "DOWN":
+            conf = 0.58 + (0.05 if ctx["compressed"] else 0)
+            signals.append(self._build_signal(symbol, "SHORT", price, conf, "REVERSAL HIGH + HTF DOWN"))
 
-        # ===== PULLBACK & TREND =====
+        # ===== TREND / PULLBACK fallback =====
         ema9 = self.EMA(df5.close, 9).iloc[-1]
         ema21 = self.EMA(df5.close, 21).iloc[-1]
 
+        # Only enter with micro trend and not exhaustion
         if not signals:
-            if price > ema9 > ema21 and ctx["rsi"] > 50:
-                signals.append(self._build_signal(symbol, "LONG", price, 0.52, "Fallback trend continuation"))
-            if price < ema9 < ema21 and ctx["rsi"] < 50:
-                signals.append(self._build_signal(symbol, "SHORT", price, 0.52, "Fallback trend continuation"))
+            if price > ema9 > ema21 and not ctx["exhaustion_up"]:
+                conf = 0.52 + (0.03 if ctx["micro_trend_up"] else 0)
+                signals.append(self._build_signal(symbol, "LONG", price, conf, "TREND CONTINUATION"))
+            if price < ema9 < ema21 and not ctx["exhaustion_down"]:
+                conf = 0.52 + (0.03 if ctx["micro_trend_down"] else 0)
+                signals.append(self._build_signal(symbol, "SHORT", price, conf, "TREND CONTINUATION"))
 
         # ===== COOL-DOWN CHECK =====
         now = datetime.utcnow()
@@ -130,11 +133,19 @@ class Elite5MinAnalyzer:
         return final_signals
 
     def _build_signal(self, symbol, side, price, confidence, reason):
+        # Dynamic stop/take based on ATR and confidence
+        stop_mult = 1.2
+        take_mult = 2.5 + (confidence - 0.5)
+        stop = price - stop_mult * 0.001 * price if side == "LONG" else price + stop_mult * 0.001 * price
+        take = price + take_mult * 0.001 * price if side == "LONG" else price - take_mult * 0.001 * price
+
         return {
             "symbol": symbol,
             "signal": side,
             "price": round(price,6),
-            "confidence": round(min(max(confidence, self.min_confidence), self.max_confidence),2),
+            "stop": round(stop,6),
+            "take": round(take,6),
+            "confidence": round(min(max(confidence, self.min_conf), self.max_conf),2),
             "time": datetime.utcnow().isoformat(),
             "reason": reason
         }

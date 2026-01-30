@@ -676,8 +676,12 @@ public class SignalSender {
         long last = lastSignalTimeDir
                 .getOrDefault(pair, new ConcurrentHashMap<>())
                 .getOrDefault(direction, 0L);
-
-        return (now - last) < COOLDOWN_MS;
+        Double lastConf = lastSentConfidence.getOrDefault(pair + ":" + direction, 0.0);
+        if ((now - last) < COOLDOWN_MS) {
+            if (lastConf > 0.7) return true; // блокируем только сильные предыдущие сигналы
+            return true; // блокируем любые сигналы в cooldown
+        }
+        return false;
     }
 
     private void markSignalSent(String pair, String direction) {
@@ -722,7 +726,7 @@ public class SignalSender {
     }
 
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
-        if (dq == null || dq.size() < 3) return new MicroTrendResult(0, 0, 0);
+        if (dq == null || dq.size() < 5) return new MicroTrendResult(0, 0, 0);
         List<Double> arr = new ArrayList<>(dq);
         int n = Math.min(arr.size(), 10);
 
@@ -872,7 +876,6 @@ public class SignalSender {
 
         for (String pair : symbols) {
             try {
-                // ==== заглушки для CompletableFuture ====
                 CompletableFuture<List<TradingCore.Candle>> f5 = fetchKlinesAsync(pair, "5m", KLINES_LIMIT);
                 CompletableFuture<List<TradingCore.Candle>> f15 = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
                 CompletableFuture<List<TradingCore.Candle>> f1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
@@ -883,12 +886,14 @@ public class SignalSender {
                 List<TradingCore.Candle> c15mFull = f15.join();
                 List<TradingCore.Candle> c1hFull = f1h.join();
 
-                if (c5mFull.size() < 30 || c15mFull.size() < 20 || c1hFull.size() < 20) continue;
+                if (c5mFull.size() < 35 || c15mFull.size() < 25 || c1hFull.size() < 25) continue;
 
                 int start5 = Math.max(0, c5mFull.size() - 61);
                 List<TradingCore.Candle> c5m = new ArrayList<>(c5mFull.subList(start5, c5mFull.size()));
                 List<TradingCore.Candle> c15m = new ArrayList<>(c15mFull);
                 List<TradingCore.Candle> c1h = new ArrayList<>(c1hFull);
+
+                if (c5m.size() < 2) continue; // минимум для RSI
 
                 TradingCore.Candle last = c5m.get(c5m.size() - 1);
                 double atr5 = SignalSender.atr(c5m, 14);
@@ -903,6 +908,8 @@ public class SignalSender {
 
                 if (side != null) {
                     List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
+                    if (closes5.size() < 2) continue;
+
                     double rsi14 = SignalSender.rsi(closes5, 14);
 
                     if ((side == TradingCore.Side.LONG && rsi14 > 80) ||
@@ -941,6 +948,7 @@ public class SignalSender {
                         conf = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, true, true, true,
                                 detectBOS(c5m), detectLiquiditySweep(c5m));
                     }
+
                     double lastHigh = lastSwingHigh(c5m);
                     double lastLow = lastSwingLow(c5m);
                     boolean nearSwingHigh = side == TradingCore.Side.LONG && last.close >= lastHigh * 0.995;
@@ -956,14 +964,18 @@ public class SignalSender {
                     boolean liqSweep = detectLiquiditySweep(recent);
 
                     if (endOfTrend && !bos && !liqSweep) {
-                        conf *= 0.80;
+                        conf *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200);
                     }
-
                     conf = Math.max(0.50, Math.min(0.88, conf));
 
                     TradingCore.RiskEngine.TradeSignal ts = riskEngine != null
                             ? riskEngine.applyRisk(pair, side, last.close, atr5, conf, "IMPULSE")
                             : null;
+
+                    // безопасные stop/take
+                    double pct = 0.015; // 1.5%
+                    double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
+                    double take = side == TradingCore.Side.LONG ? last.close * (1 + pct) : last.close * (1 - pct);
 
                     Signal s = new Signal(
                             pair,
@@ -983,17 +995,10 @@ public class SignalSender {
                             SignalSender.rsi(closes5, 4)
                     );
 
-                    if (ts != null) {
-                        double pct = 0.015; // 1.5%
-                        if (side == TradingCore.Side.LONG) {
-                            s.stop = last.close * (1 - pct);
-                            s.take = last.close * (1 + pct);
-                        } else if (side == TradingCore.Side.SHORT) {
-                            s.stop = last.close * (1 + pct);
-                            s.take = last.close * (1 - pct);
-                        }
-                    }
+                    s.stop = stop;
+                    s.take = take;
                     s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
+
                     sendSignalIfAllowed(pair, s, c5m);
                     continue;
                 }
@@ -1001,28 +1006,22 @@ public class SignalSender {
                 // ================= ELITE5 =================
                 if (elite5MinAnalyzer != null) {
                     List<Elite5MinAnalyzer.TradeSignal> ideas = elite5MinAnalyzer.analyze(pair, c5m, c15m, c1h);
-
                     for (Elite5MinAnalyzer.TradeSignal i : ideas) {
                         TradingCore.Side sSide = i.side;
                         if (sSide == null) continue;
 
-                        double baseConf;
-                        try {
-                            baseConf = Double.parseDouble(i.confidence);
-                        } catch (NumberFormatException e) {
-                            baseConf = 0.50;
-                        }
+                        double baseConf = i.confidence;
                         baseConf = Math.max(0.50, Math.min(0.88, baseConf));
 
                         TradingCore.RiskEngine.TradeSignal ts = riskEngine != null
                                 ? riskEngine.applyRisk(pair, sSide, i.entry, atr5, baseConf, "ELITE5")
                                 : null;
 
-                        double finalConf = ts != null
-                                ? Math.max(0.50, Math.min(0.88, ts.confidence))
-                                : baseConf;
+                        double finalConf = ts != null ? Math.max(0.50, Math.min(0.88, ts.confidence)) : baseConf;
 
                         List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
+                        if (closes5.size() < 2) continue;
+
                         double rsi14 = SignalSender.rsi(closes5, 14);
 
                         double lastHigh = lastSwingHigh(c5m);
@@ -1036,6 +1035,11 @@ public class SignalSender {
                         if (nearSwingHigh || nearSwingLow || trendSlowing) {
                             finalConf *= 0.75;
                         }
+
+                        // безопасные stop/take
+                        double pct = 0.015;
+                        double stop = sSide == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
+                        double take = sSide == TradingCore.Side.LONG ? last.close * (1 + pct) : last.close * (1 - pct);
 
                         Signal s = new Signal(
                                 pair,
@@ -1055,17 +1059,10 @@ public class SignalSender {
                                 SignalSender.rsi(closes5, 4)
                         );
 
-                        if (ts != null) {
-                            double pct = 0.015; // 1.5%
-                            if (side == TradingCore.Side.LONG) {
-                                s.stop = last.close * (1 - pct);
-                                s.take = last.close * (1 + pct);
-                            } else if (side == TradingCore.Side.SHORT) {
-                                s.stop = last.close * (1 + pct);
-                                s.take = last.close * (1 - pct);
-                            }
-                        }
+                        s.stop = stop;
+                        s.take = take;
                         s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
+
                         sendSignalIfAllowed(pair, s, c5m);
                     }
                 }
