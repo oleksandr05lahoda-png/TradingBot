@@ -43,7 +43,7 @@ public class DecisionEngineMerged {
     private final Map<String, Long> lastShortSignal = new ConcurrentHashMap<>();
 
     /* ========================== MAIN ========================== */
-    public List<TradeIdea> evaluateAll(List<String> symbols,
+    public List<TradeIdea> evaluate(List<String> symbols,
                                        Map<String, List<TradingCore.Candle>> candles5m,
                                        Map<String, List<TradingCore.Candle>> candles15m,
                                        Map<String, List<TradingCore.Candle>> candles1h) {

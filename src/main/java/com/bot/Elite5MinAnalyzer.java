@@ -83,8 +83,12 @@ public class Elite5MinAnalyzer {
         MarketContext ctx = buildMarketContext(c5, c15, c1h);
         if (!ctx.tradable) return List.of();
 
-        List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluate(symbol, c5, c15, c1h);
-        if (ideas.isEmpty()) return List.of();
+        List<String> symbols = List.of(symbol);
+        Map<String, List<TradingCore.Candle>> c5Map = Map.of(symbol, c5);
+        Map<String, List<TradingCore.Candle>> c15Map = Map.of(symbol, c15);
+        Map<String, List<TradingCore.Candle>> c1hMap = Map.of(symbol, c1h);
+
+        List<DecisionEngineMerged.TradeIdea> ideas = decisionEngine.evaluate(symbols, c5Map, c15Map, c1hMap);
 
         TradingCore.Side macroTrend = detectMacroTrend(c1h);
         long now = System.currentTimeMillis();
