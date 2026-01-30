@@ -3,6 +3,7 @@ package com.bot;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.*;
 
 public class Elite5MinAnalyzer {
 
@@ -19,7 +20,7 @@ public class Elite5MinAnalyzer {
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
 
-        // Очистка старых сигналов каждые 10 минут
+        // Авто-очистка старых сигналов
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
             lastLongSignal.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
@@ -93,19 +94,20 @@ public class Elite5MinAnalyzer {
         TradingCore.Side macroTrend = detectMacroTrend(c1h);
         long now = System.currentTimeMillis();
 
-        List<TradeSignal> result = new ArrayList<>();
+        // Сортировка по вероятности
         ideas.sort(Comparator.comparingDouble(i -> -i.probability));
 
+        List<TradeSignal> result = new ArrayList<>();
         for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
             boolean counterTrend = macroTrend != null && idea.side != macroTrend;
             TradeMode mode = classifyMode(idea, counterTrend, ctx);
 
-            // Cooldown
-            if (idea.side == TradingCore.Side.LONG && lastLongSignal.containsKey(symbol)
-                    && now - lastLongSignal.get(symbol) < dynamicCooldown(ctx)) continue;
-            if (idea.side == TradingCore.Side.SHORT && lastShortSignal.containsKey(symbol)
-                    && now - lastShortSignal.get(symbol) < dynamicCooldown(ctx)) continue;
+            // Cooldown per symbol & side
+            if ((idea.side == TradingCore.Side.LONG && lastLongSignal.containsKey(symbol) &&
+                    now - lastLongSignal.get(symbol) < dynamicCooldown(ctx)) ||
+                    (idea.side == TradingCore.Side.SHORT && lastShortSignal.containsKey(symbol) &&
+                            now - lastShortSignal.get(symbol) < dynamicCooldown(ctx))) continue;
 
             // Adaptive confidence
             double conf = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
@@ -139,11 +141,9 @@ public class Elite5MinAnalyzer {
                                              List<TradingCore.Candle> c1h) {
 
         MarketContext ctx = new MarketContext();
-
         ctx.price = last(c5).close;
         ctx.atr = computeATR(c5, 14);
         ctx.avgRange = computeAvgRange(c5, 20);
-
         double currRange = last(c5).high - last(c5).low;
         double emaSlopeFast = computeEMASlope(c5, 9, 5);
         double emaSlopeSlow = computeEMASlope(c5, 21, 5);
@@ -179,7 +179,6 @@ public class Elite5MinAnalyzer {
     private TradeMode classifyMode(DecisionEngineMerged.TradeIdea idea,
                                    boolean counterTrend,
                                    MarketContext ctx) {
-
         if (ctx.exhaustionUp || ctx.exhaustionDown) return TradeMode.EXHAUSTION;
         if (ctx.impulse && ctx.compressed) return TradeMode.BREAKOUT;
         if (counterTrend) return TradeMode.REVERSAL;
@@ -192,7 +191,6 @@ public class Elite5MinAnalyzer {
                                      MarketContext ctx,
                                      DecisionEngineMerged.TradeIdea idea,
                                      boolean counterTrend) {
-
         double c = conf;
         if (ctx.highVol) c += 0.05;
         if (ctx.impulse) c += 0.04;
@@ -200,7 +198,6 @@ public class Elite5MinAnalyzer {
         if (counterTrend) c -= 0.04;
         if (ctx.lowVol) c -= 0.08;
         if (ctx.exhaustionUp || ctx.exhaustionDown) c += 0.06;
-
         return clamp(c, 0.45, 0.98);
     }
 
@@ -222,95 +219,57 @@ public class Elite5MinAnalyzer {
     private TradingCore.Side detectMacroTrend(List<TradingCore.Candle> c1h) {
         int lookback = Math.min(80, c1h.size() - 1);
         double delta = last(c1h).close - c1h.get(c1h.size() - lookback).close;
-
         double threshold = 0.003 * c1h.get(c1h.size() - lookback).close;
-
-        if (Math.abs(delta) > threshold) {
-            return delta > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
-        }
-
+        if (Math.abs(delta) > threshold) return delta > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
         return null;
     }
 
     /* ================= RISK ENGINE ================= */
     static class RiskEngine {
-
         private final double minRiskPct;
 
-        RiskEngine(double minRiskPct) {
-            this.minRiskPct = minRiskPct;
-        }
+        RiskEngine(double minRiskPct) { this.minRiskPct = minRiskPct; }
 
         static class TradeSignal {
             double entry, stop, take;
-
-            TradeSignal(double entry, double stop, double take) {
-                this.entry = entry;
-                this.stop = stop;
-                this.take = take;
-            }
+            TradeSignal(double entry, double stop, double take) { this.entry = entry; this.stop = stop; this.take = take; }
         }
 
         TradeSignal applyRisk(DecisionEngineMerged.TradeIdea i, double conf, TradeMode mode) {
             double atr = i.atr;
             double risk = Math.max(atr * 0.55, i.entry * minRiskPct);
-
-            double tpMult;
-            switch (mode) {
-                case TREND -> tpMult = conf > 0.63 ? 3.0 : 2.5;
-                case PULLBACK -> tpMult = 2.2;
-                case BREAKOUT -> tpMult = 3.3;
-                case REVERSAL -> tpMult = 1.4;
-                case REVERSAL_PULLBACK -> tpMult = 1.8;
-                case EXHAUSTION -> tpMult = 2.0;
-                default -> tpMult = 2.0;
-            }
-
-            double stop, take;
-            if (i.side == TradingCore.Side.LONG) {
-                stop = i.entry - risk;
-                take = i.entry + risk * tpMult;
-            } else {
-                stop = i.entry + risk;
-                take = i.entry - risk * tpMult;
-            }
-
+            double tpMult = switch (mode) {
+                case TREND -> conf > 0.63 ? 3.0 : 2.5;
+                case PULLBACK -> 2.2;
+                case BREAKOUT -> 3.3;
+                case REVERSAL -> 1.4;
+                case REVERSAL_PULLBACK -> 1.8;
+                case EXHAUSTION -> 2.0;
+                default -> 2.0;
+            };
+            double stop = i.side == TradingCore.Side.LONG ? i.entry - risk : i.entry + risk;
+            double take = i.side == TradingCore.Side.LONG ? i.entry + risk * tpMult : i.entry - risk * tpMult;
             return new TradeSignal(i.entry, stop, take);
         }
     }
 
     /* ================= ADAPTIVE BRAIN ================= */
     static class AdaptiveBrain {
-
         private final Map<String, Integer> streak = new ConcurrentHashMap<>();
-
         double applyAllAdjustments(String strat, String pair, double base) {
             int s = streak.getOrDefault(pair, 0);
             double adj = base;
-
             if (s >= 2) adj += 0.05;
             if (s <= -2) adj -= 0.05;
-
             int h = LocalTime.now(ZoneOffset.UTC).getHour();
             if (h >= 7 && h <= 17) adj += 0.03;
-
             return Math.max(0.45, Math.min(0.98, adj));
         }
     }
 
     /* ================= UTILS ================= */
-    private long dynamicCooldown(MarketContext ctx) {
-        if (ctx.highVol) return 50_000;
-        if (ctx.compressed) return 80_000;
-        return 90_000;
-    }
-
-    private String mapConfidence(double p) {
-        if (p >= 0.70) return "[S]";
-        if (p >= 0.55) return "[M]";
-        return "[W]";
-    }
-
+    private long dynamicCooldown(MarketContext ctx) { return ctx.highVol ? 50_000 : ctx.compressed ? 80_000 : 90_000; }
+    private String mapConfidence(double p) { return p >= 0.70 ? "[S]" : p >= 0.55 ? "[M]" : "[W]"; }
     private String contextReason(MarketContext ctx) {
         StringBuilder sb = new StringBuilder(" |CTX:");
         if (ctx.highVol) sb.append("HV ");
@@ -320,63 +279,14 @@ public class Elite5MinAnalyzer {
         if (ctx.exhaustionDown) sb.append("EXD ");
         return sb.toString();
     }
+    private double computeATR(List<TradingCore.Candle> c, int period) { double sum = 0; for (int i = c.size() - period; i < c.size(); i++) sum += c.get(i).high - c.get(i).low; return sum / period; }
+    private double computeAvgRange(List<TradingCore.Candle> c, int n) { double sum = 0; for (int i = c.size() - n; i < c.size(); i++) sum += c.get(i).high - c.get(i).low; return sum / n; }
+    private double computeEMASlope(List<TradingCore.Candle> c, int period, int back) { return computeEMA(c, period, back) - computeEMA(c, period, back + 5); }
+    private double computeEMA(List<TradingCore.Candle> c, int period, int back) { double k = 2.0 / (period + 1), ema = c.get(c.size() - back - period).close; for (int i = c.size() - back - period + 1; i < c.size() - back; i++) ema = c.get(i).close * k + ema * (1 - k); return ema; }
+    private double computeRSI(List<TradingCore.Candle> c, int period) { double gain = 0, loss = 0; for (int i = c.size() - period; i < c.size(); i++) { double diff = c.get(i).close - c.get(i - 1).close; if (diff > 0) gain += diff; else loss -= diff; } double rs = loss == 0 ? 100.0 : gain / loss; return 100.0 - (100.0 / (1.0 + rs)); }
+    private TradingCore.Candle last(List<TradingCore.Candle> c) { return c.get(c.size() - 1); }
+    private boolean valid(List<?> l, int n) { return l != null && l.size() >= n; }
+    private double clamp(double v, double min, double max) { return Math.max(min, Math.min(max, v)); }
 
-    private double computeATR(List<TradingCore.Candle> c, int period) {
-        double sum = 0.0;
-        for (int i = c.size() - period; i < c.size(); i++) {
-            sum += c.get(i).high - c.get(i).low;
-        }
-        return sum / period;
-    }
-
-    private double computeAvgRange(List<TradingCore.Candle> c, int n) {
-        double sum = 0.0;
-        for (int i = c.size() - n; i < c.size(); i++) {
-            sum += c.get(i).high - c.get(i).low;
-        }
-        return sum / n;
-    }
-
-    private double computeEMASlope(List<TradingCore.Candle> c, int period, int back) {
-        double emaNow = computeEMA(c, period, back);
-        double emaPrev = computeEMA(c, period, back + 5);
-        return emaNow - emaPrev;
-    }
-
-    private double computeEMA(List<TradingCore.Candle> c, int period, int back) {
-        double k = 2.0 / (period + 1);
-        double ema = c.get(c.size() - back - period).close;
-        for (int i = c.size() - back - period + 1; i < c.size() - back; i++) {
-            ema = c.get(i).close * k + ema * (1 - k);
-        }
-        return ema;
-    }
-
-    private double computeRSI(List<TradingCore.Candle> c, int period) {
-        double gain = 0.0;
-        double loss = 0.0;
-        for (int i = c.size() - period; i < c.size(); i++) {
-            double diff = c.get(i).close - c.get(i - 1).close;
-            if (diff > 0) gain += diff;
-            else loss -= diff;
-        }
-        double rs = loss == 0 ? 100.0 : gain / loss;
-        return 100.0 - (100.0 / (1.0 + rs));
-    }
-
-    private TradingCore.Candle last(List<TradingCore.Candle> c) {
-        return c.get(c.size() - 1);
-    }
-
-    private boolean valid(List<?> l, int n) {
-        return l != null && l.size() >= n;
-    }
-
-    private double clamp(double v, double min, double max) {
-        return Math.max(min, Math.min(max, v));
-    }
-
-    public void shutdown() {
-        cleaner.shutdown();
-    }
+    public void shutdown() { cleaner.shutdown(); }
 }

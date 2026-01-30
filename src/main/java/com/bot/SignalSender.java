@@ -56,8 +56,8 @@ public class SignalSender {
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     private long dailyResetTs = System.currentTimeMillis();
     private ScheduledExecutorService scheduler;
-
     public SignalSender(com.bot.TelegramBotSender bot) {
+
         this.bot = bot;
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
@@ -71,7 +71,7 @@ public class SignalSender {
         this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
         this.VOL_MULTIPLIER = envDouble("VOL_MULT", 0.9);
         this.ATR_MIN_PCT = envDouble("ATR_MIN_PCT", 0.0007);
-        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 120000);
+        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 60000);
         long brMin = envLong("BINANCE_REFRESH_MINUTES", 60);
         this.BINANCE_REFRESH_INTERVAL_MS = brMin * 60 * 1000L;
 
@@ -586,9 +586,8 @@ public class SignalSender {
 
         // Блокировка микро-тренда только для конца тренда
         if (endOfTrend) {
-            if ((micro.speed < 0.0003 && s.direction.equals("LONG")) ||
-                    (micro.speed > -0.0003 && s.direction.equals("SHORT"))) {
-                if (!bos && !liqSweep) return; // блокируем только для разворотов
+            if (endOfTrend && !bos && !liqSweep) {
+                s.confidence *= 0.75;
             }
         }
 
@@ -1007,8 +1006,6 @@ public class SignalSender {
 
                     // если сигналов много — отправляем максимум 1-2 (чтобы не спамить)
                     for (Elite5MinAnalyzer.TradeSignal i : ideas) {
-
-                        if (signalsThisCycle >= 2) break;
 
                         TradingCore.Side sSide = i.side;
                         if (sSide == null) continue;
