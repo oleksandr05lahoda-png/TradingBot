@@ -984,8 +984,14 @@ public class SignalSender {
                     );
 
                     if (ts != null) {
-                        s.stop = ts.stop;
-                        s.take = ts.take;
+                        double pct = 0.015; // 1.5%
+                        if (side == TradingCore.Side.LONG) {
+                            s.stop = last.close * (1 - pct);
+                            s.take = last.close * (1 + pct);
+                        } else if (side == TradingCore.Side.SHORT) {
+                            s.stop = last.close * (1 + pct);
+                            s.take = last.close * (1 - pct);
+                        }
                     }
                     s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
                     sendSignalIfAllowed(pair, s, c5m);
@@ -1050,8 +1056,14 @@ public class SignalSender {
                         );
 
                         if (ts != null) {
-                            s.stop = ts.stop;
-                            s.take = ts.take;
+                            double pct = 0.015; // 1.5%
+                            if (side == TradingCore.Side.LONG) {
+                                s.stop = last.close * (1 - pct);
+                                s.take = last.close * (1 + pct);
+                            } else if (side == TradingCore.Side.SHORT) {
+                                s.stop = last.close * (1 + pct);
+                                s.take = last.close * (1 - pct);
+                            }
                         }
                         s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
                         sendSignalIfAllowed(pair, s, c5m);
@@ -1063,7 +1075,6 @@ public class SignalSender {
                 e.printStackTrace();
             }
         }
-
         System.out.println("[Cycle] signals sent: " + signalsThisCycle);
     }
 }
