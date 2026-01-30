@@ -103,11 +103,12 @@ public class Elite5MinAnalyzer {
             boolean counterTrend = macroTrend != null && idea.side != macroTrend;
             TradeMode mode = classifyMode(idea, counterTrend, ctx);
 
-            // Cooldown per symbol & side
+            // Cooldown per symbol & side + grade boost
+            long cd = dynamicCooldown(ctx, idea.grade);
             if ((idea.side == TradingCore.Side.LONG && lastLongSignal.containsKey(symbol) &&
-                    now - lastLongSignal.get(symbol) < dynamicCooldown(ctx)) ||
+                    now - lastLongSignal.get(symbol) < cd) ||
                     (idea.side == TradingCore.Side.SHORT && lastShortSignal.containsKey(symbol) &&
-                            now - lastShortSignal.get(symbol) < dynamicCooldown(ctx))) continue;
+                            now - lastShortSignal.get(symbol) < cd)) continue;
 
             // Adaptive confidence
             double conf = brain.applyAllAdjustments("ELITE5", symbol, idea.probability);
@@ -181,7 +182,7 @@ public class Elite5MinAnalyzer {
                                    MarketContext ctx) {
         if (ctx.exhaustionUp || ctx.exhaustionDown) return TradeMode.EXHAUSTION;
         if (ctx.impulse && ctx.compressed) return TradeMode.BREAKOUT;
-        if (counterTrend) return TradeMode.REVERSAL;
+        if (counterTrend) return TradeMode.REVERSAL_PULLBACK;
         if (idea.reason.toLowerCase().contains("pullback")) return TradeMode.PULLBACK;
         return TradeMode.TREND;
     }
@@ -238,6 +239,12 @@ public class Elite5MinAnalyzer {
         TradeSignal applyRisk(DecisionEngineMerged.TradeIdea i, double conf, TradeMode mode) {
             double atr = i.atr;
             double risk = Math.max(atr * 0.55, i.entry * minRiskPct);
+
+            double gradeMult = switch (i.grade) {
+                case A -> 1.0;
+                case B -> 0.85;
+            };
+
             double tpMult = switch (mode) {
                 case TREND -> conf > 0.63 ? 3.0 : 2.5;
                 case PULLBACK -> 2.2;
@@ -247,8 +254,10 @@ public class Elite5MinAnalyzer {
                 case EXHAUSTION -> 2.0;
                 default -> 2.0;
             };
-            double stop = i.side == TradingCore.Side.LONG ? i.entry - risk : i.entry + risk;
-            double take = i.side == TradingCore.Side.LONG ? i.entry + risk * tpMult : i.entry - risk * tpMult;
+
+            double stop = i.side == TradingCore.Side.LONG ? i.entry - risk * gradeMult : i.entry + risk * gradeMult;
+            double take = i.side == TradingCore.Side.LONG ? i.entry + risk * tpMult * gradeMult : i.entry - risk * tpMult * gradeMult;
+
             return new TradeSignal(i.entry, stop, take);
         }
     }
@@ -268,8 +277,16 @@ public class Elite5MinAnalyzer {
     }
 
     /* ================= UTILS ================= */
-    private long dynamicCooldown(MarketContext ctx) { return ctx.highVol ? 50_000 : ctx.compressed ? 80_000 : 90_000; }
+    private long dynamicCooldown(MarketContext ctx, DecisionEngineMerged.SignalGrade g) {
+        long base = ctx.highVol ? 50_000 : ctx.compressed ? 80_000 : 90_000;
+        return switch (g) {
+            case A -> base / 2;
+            case B -> base;
+        };
+    }
+
     private String mapConfidence(double p) { return p >= 0.70 ? "[S]" : p >= 0.55 ? "[M]" : "[W]"; }
+
     private String contextReason(MarketContext ctx) {
         StringBuilder sb = new StringBuilder(" |CTX:");
         if (ctx.highVol) sb.append("HV ");
@@ -279,6 +296,7 @@ public class Elite5MinAnalyzer {
         if (ctx.exhaustionDown) sb.append("EXD ");
         return sb.toString();
     }
+
     private double computeATR(List<TradingCore.Candle> c, int period) { double sum = 0; for (int i = c.size() - period; i < c.size(); i++) sum += c.get(i).high - c.get(i).low; return sum / period; }
     private double computeAvgRange(List<TradingCore.Candle> c, int n) { double sum = 0; for (int i = c.size() - n; i < c.size(); i++) sum += c.get(i).high - c.get(i).low; return sum / n; }
     private double computeEMASlope(List<TradingCore.Candle> c, int period, int back) { return computeEMA(c, period, back) - computeEMA(c, period, back + 5); }

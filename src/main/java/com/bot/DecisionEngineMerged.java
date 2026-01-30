@@ -3,16 +3,16 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.*;
 
-public class DecisionEngineMerged{
+public class DecisionEngineMerged {
 
     /* ========================== MODEL ========================== */
 
-    public enum SignalGrade { A, B, C }
+    public enum SignalGrade { A, B } // C убрал, слабые сигналы не берем
 
     public static class TradeIdea {
         public final String symbol;
         public final TradingCore.Side side;
-        public final double entry, stop, tp1, tp2;
+        public final double entry, stop, take;
         public final double probability;
         public final double atr;
         public final SignalGrade grade;
@@ -22,8 +22,7 @@ public class DecisionEngineMerged{
                          TradingCore.Side side,
                          double entry,
                          double stop,
-                         double tp1,
-                         double tp2,
+                         double take,
                          double probability,
                          double atr,
                          SignalGrade grade,
@@ -32,8 +31,7 @@ public class DecisionEngineMerged{
             this.side = side;
             this.entry = entry;
             this.stop = stop;
-            this.tp1 = tp1;
-            this.tp2 = tp2;
+            this.take = take;
             this.probability = probability;
             this.atr = atr;
             this.grade = grade;
@@ -44,8 +42,12 @@ public class DecisionEngineMerged{
     /* ========================== CONSTANTS ========================== */
 
     private static final int MAX_COINS = 100;
-
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
+
+    private static final double MIN_ATR_PCT = 0.0015; // фильтр флэта
+    private static final double STOP_ATR_MULT = 1.2;
+    private static final double RR_A = 1.7;
+    private static final double RR_B = 1.4;
 
     /* ========================== MAIN ========================== */
 
@@ -68,7 +70,7 @@ public class DecisionEngineMerged{
             if (!valid(m5, 120) || !valid(m15, 80) || !valid(h1, 60)) continue;
 
             double atr = atr(m5, 14);
-            if (atr <= 0) continue;
+            if (atr <= 0 || atr / last(m5).close < MIN_ATR_PCT) continue;
 
             EMA e5 = emaContext(m5);
             EMA e15 = emaContext(m15);
@@ -76,7 +78,7 @@ public class DecisionEngineMerged{
 
             MarketMode mode = marketMode(m5, m15, atr);
 
-            // ===== MOMENTUM (основа частоты) =====
+            // ===== MOMENTUM =====
             checkMomentum(s, m5, e5, e15, e1h, atr, mode, out, now);
 
             // ===== PULLBACK =====
@@ -102,15 +104,13 @@ public class DecisionEngineMerged{
         if (!impulse(c, atr)) return;
 
         if (e5.bullish && e15.bullish && !cooldowned(s, "MOMO_L", now, 120_000)) {
-            double p = scoreMomentum(c, atr);
-            p += htfBias(e1h, true);
+            double p = scoreMomentum(c, atr) + htfBias(e1h, true);
             buildAndAdd(out, s, TradingCore.Side.LONG, c, atr, p, "MOMENTUM");
             mark(s, "MOMO_L", now);
         }
 
         if (e5.bearish && e15.bearish && !cooldowned(s, "MOMO_S", now, 120_000)) {
-            double p = scoreMomentum(c, atr);
-            p += htfBias(e1h, false);
+            double p = scoreMomentum(c, atr) + htfBias(e1h, false);
             buildAndAdd(out, s, TradingCore.Side.SHORT, c, atr, p, "MOMENTUM");
             mark(s, "MOMO_S", now);
         }
@@ -125,18 +125,14 @@ public class DecisionEngineMerged{
 
         if (price > e5.ema21 && price < e5.ema9 && e15.bullish &&
                 !cooldowned(s, "PB_L", now, 120_000)) {
-
-            double p = scorePullback(c, atr);
-            p += htfBias(e1h, true);
+            double p = scorePullback(c, atr) + htfBias(e1h, true);
             buildAndAdd(out, s, TradingCore.Side.LONG, c, atr, p, "PULLBACK");
             mark(s, "PB_L", now);
         }
 
         if (price < e5.ema21 && price > e5.ema9 && e15.bearish &&
                 !cooldowned(s, "PB_S", now, 120_000)) {
-
-            double p = scorePullback(c, atr);
-            p += htfBias(e1h, false);
+            double p = scorePullback(c, atr) + htfBias(e1h, false);
             buildAndAdd(out, s, TradingCore.Side.SHORT, c, atr, p, "PULLBACK");
             mark(s, "PB_S", now);
         }
@@ -149,7 +145,6 @@ public class DecisionEngineMerged{
 
         if (l.high > recentHigh(c, 20) - atr * 0.25 &&
                 !cooldowned(s, "R_S", now, 60_000)) {
-
             double p = scoreRange(c);
             buildAndAdd(out, s, TradingCore.Side.SHORT, c, atr, p, "RANGE");
             mark(s, "R_S", now);
@@ -157,7 +152,6 @@ public class DecisionEngineMerged{
 
         if (l.low < recentLow(c, 20) + atr * 0.25 &&
                 !cooldowned(s, "R_L", now, 60_000)) {
-
             double p = scoreRange(c);
             buildAndAdd(out, s, TradingCore.Side.LONG, c, atr, p, "RANGE");
             mark(s, "R_L", now);
@@ -174,23 +168,16 @@ public class DecisionEngineMerged{
         SignalGrade g = grade(p);
         if (g == null) return;
 
-        double r = switch (g) {
-            case A -> atr * 0.60;
-            case B -> atr * 0.50;
-            case C -> atr * 0.45;
-        };
+        double r = atr * STOP_ATR_MULT;
 
         double entry = last(c).close;
         double stop = side == TradingCore.Side.LONG ? entry - r : entry + r;
-        double tp1 = side == TradingCore.Side.LONG ? entry + r * tp1(g) : entry - r * tp1(g);
-        double tp2 = side == TradingCore.Side.LONG ? entry + r * tp2(g) : entry - r * tp2(g);
+        double take = side == TradingCore.Side.LONG
+                ? entry + r * (g == SignalGrade.A ? RR_A : RR_B)
+                : entry - r * (g == SignalGrade.A ? RR_A : RR_B);
 
-        out.add(new TradeIdea(
-                s, side, entry, stop, tp1, tp2,
-                Math.min(p, 0.75),
-                atr, g,
-                tag + " " + g
-        ));
+        out.add(new TradeIdea(s, side, entry, stop, take,
+                Math.min(p, 0.75), atr, g, tag + " " + g));
     }
 
     /* ========================== GRADING ========================== */
@@ -198,24 +185,7 @@ public class DecisionEngineMerged{
     private SignalGrade grade(double p) {
         if (p >= 0.65) return SignalGrade.A;
         if (p >= 0.58) return SignalGrade.B;
-        if (p >= 0.50) return SignalGrade.C;
         return null;
-    }
-
-    private double tp1(SignalGrade g) {
-        return switch (g) {
-            case A -> 1.2;
-            case B -> 0.9;
-            case C -> 0.6;
-        };
-    }
-
-    private double tp2(SignalGrade g) {
-        return switch (g) {
-            case A -> 2.0;
-            case B -> 1.6;
-            case C -> 1.0;
-        };
     }
 
     /* ========================== SCORING ========================== */
@@ -255,10 +225,8 @@ public class DecisionEngineMerged{
     private MarketMode marketMode(List<TradingCore.Candle> c5,
                                   List<TradingCore.Candle> c15,
                                   double atr) {
-
         boolean compress = avgRange(c5, 20) < avgRange(c5, 60) * 0.7;
-        if (compress) return MarketMode.RANGE;
-        return MarketMode.TREND;
+        return compress ? MarketMode.RANGE : MarketMode.TREND;
     }
 
     /* ========================== UTILS ========================== */
@@ -279,13 +247,10 @@ public class DecisionEngineMerged{
         return l != null && l.size() >= n;
     }
 
-    /* ===== indicators ===== */
-
     private double atr(List<TradingCore.Candle> c, int n) {
         double sum = 0;
-        for (int i = c.size() - n; i < c.size(); i++) {
+        for (int i = c.size() - n; i < c.size(); i++)
             sum += c.get(i).high - c.get(i).low;
-        }
         return sum / n;
     }
 
@@ -299,8 +264,7 @@ public class DecisionEngineMerged{
     }
 
     private boolean smallRange(List<TradingCore.Candle> c, double atr) {
-        TradingCore.Candle l = last(c);
-        return (l.high - l.low) < atr * 0.8;
+        return (last(c).high - last(c).low) < atr * 0.8;
     }
 
     private boolean volumeDry(List<TradingCore.Candle> c) {
@@ -358,8 +322,6 @@ public class DecisionEngineMerged{
             e = c.get(i).close * k + e * (1 - k);
         return e;
     }
-
-    /* ========================== STRUCT ========================== */
 
     private enum MarketMode { TREND, RANGE }
 
