@@ -12,6 +12,7 @@ public class Elite5MinAnalyzer {
 
     private final Map<String, Long> lastSignal = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
+    private static final int MAX_COINS = 100; // поддержка TOP 100 монет
 
     public Elite5MinAnalyzer(DecisionEngineMerged engine, double minRiskPct) {
         this.decisionEngine = engine;
@@ -49,58 +50,61 @@ public class Elite5MinAnalyzer {
 
     /* ================= ANALYZE ================= */
     public List<TradeSignal> analyze(
-            String symbol,
-            List<TradingCore.Candle> c5,
-            List<TradingCore.Candle> c15,
-            List<TradingCore.Candle> c1h
+            List<String> symbols,
+            Map<String, List<TradingCore.Candle>> c15,
+            Map<String, List<TradingCore.Candle>> c1h
     ) {
-        if (!valid(c5, 120) || !valid(c15, 80) || !valid(c1h, 80))
-            return List.of();
-
-        MarketContext ctx = MarketContext.build(c5, c15, c1h);
-        if (!ctx.tradable) return List.of();
-
-        Map<String, List<TradingCore.Candle>> m5 = Map.of(symbol, c5);
-        Map<String, List<TradingCore.Candle>> m15 = Map.of(symbol, c15);
-        Map<String, List<TradingCore.Candle>> m1h = Map.of(symbol, c1h);
-
-        List<DecisionEngineMerged.TradeIdea> ideas =
-                decisionEngine.evaluate(List.of(symbol), m5, m15, m1h);
-
-        ideas.sort(Comparator.comparingDouble(i -> -i.probability));
-
-        List<TradeSignal> result = new ArrayList<>();
+        List<TradeSignal> allSignals = new ArrayList<>();
         long now = System.currentTimeMillis();
+        int scanned = 0;
 
-        for (DecisionEngineMerged.TradeIdea i : ideas) {
+        for (String symbol : symbols) {
+            if (scanned++ >= MAX_COINS) break;
 
-            TradeMode mode = TradeMode.classify(i, ctx);
+            List<TradingCore.Candle> m15 = c15.get(symbol);
+            List<TradingCore.Candle> h1 = c1h.get(symbol);
 
-            long cd = dynamicCooldown(ctx, mode, i.grade);
-            if (lastSignal.containsKey(symbol)
-                    && now - lastSignal.get(symbol) < cd)
-                continue;
+            if (!valid(m15, 80) || !valid(h1, 60)) continue;
 
-            double conf = brain.adjust(symbol, i.probability, ctx, mode);
-            if (conf < mode.minConfidence(ctx)) continue;
+            MarketContext ctx = MarketContext.build(m15, h1);
+            if (!ctx.tradable) continue;
 
-            RiskEngine.Result r = riskEngine.apply(i, conf, mode, ctx);
+            List<DecisionEngineMerged.TradeIdea> ideas =
+                    decisionEngine.evaluate(List.of(symbol),
+                            Map.of(symbol, m15),
+                            Map.of(symbol, h1));
 
-            result.add(new TradeSignal(
-                    symbol,
-                    i.side,
-                    r.entry,
-                    r.stop,
-                    r.take,
-                    conf,
-                    mode.name(),
-                    i.reason + ctx.describe()
-            ));
+            ideas.sort(Comparator.comparingDouble(i -> -i.probability));
 
-            lastSignal.put(symbol, now);
+            for (DecisionEngineMerged.TradeIdea i : ideas) {
+                TradeMode mode = TradeMode.classify(i, ctx);
+
+                long cd = dynamicCooldown(ctx, mode, i.grade);
+                if (lastSignal.containsKey(symbol) && now - lastSignal.get(symbol) < cd)
+                    continue;
+
+                double conf = brain.adjust(symbol, i.probability, ctx, mode);
+                if (conf < mode.minConfidence(ctx)) continue;
+
+                RiskEngine.Result r = riskEngine.apply(i, conf, mode, ctx);
+
+                allSignals.add(new TradeSignal(
+                        symbol,
+                        i.side,
+                        r.entry,
+                        r.stop,
+                        r.take,
+                        conf,
+                        mode.name(),
+                        i.reason + ctx.describe()
+                ));
+
+                lastSignal.put(symbol, now);
+            }
         }
 
-        return result;
+        allSignals.sort((a, b) -> Double.compare(b.confidence, a.confidence));
+        return allSignals;
     }
 
     /* ================= MODES ================= */
@@ -145,20 +149,19 @@ public class Elite5MinAnalyzer {
         double emaSlope;
         double rsi;
 
-        static MarketContext build(List<TradingCore.Candle> c5,
-                                   List<TradingCore.Candle> c15,
+        static MarketContext build(List<TradingCore.Candle> c15,
                                    List<TradingCore.Candle> c1h) {
             MarketContext c = new MarketContext();
 
-            double price = last(c5).close;
-            c.atr = atr(c5, 14);
+            double price = last(c15).close;
+            c.atr = atr(c15, 14);
             c.atrPct = c.atr / price;
 
-            c.emaSlope = emaSlope(c5, 21, 5);
-            c.rsi = rsi(c5, 14);
+            c.emaSlope = emaSlope(c15, 21, 5);
+            c.rsi = rsi(c15, 14);
 
-            double range = last(c5).high - last(c5).low;
-            double avg = avgRange(c5, 20);
+            double range = last(c15).high - last(c15).low;
+            double avg = avgRange(c15, 20);
 
             c.highVol = c.atrPct > 0.0022;
             c.lowVol = c.atrPct < 0.0014;

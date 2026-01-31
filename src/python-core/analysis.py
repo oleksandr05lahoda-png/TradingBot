@@ -2,18 +2,20 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 BASE_URL = "https://fapi.binance.com"
 
 class Elite5MinAnalyzer:
     """Professional 5-minute futures analyzer optimized for safe futures entries"""
 
-    def __init__(self, min_conf=0.45, max_conf=0.95, cooldown_minutes=3):
+    def __init__(self, min_conf=0.45, max_conf=0.95, cooldown_minutes=3, max_threads=20):
         self.min_conf = min_conf
         self.max_conf = max_conf
         self.cooldown_minutes = cooldown_minutes
         self.last_signal_time = {}
-        self.history = {}
+        self.history = {}  # symbol streaks for adaptive confidence
+        self.max_threads = max_threads
 
     # ===================== FETCH =====================
     def fetch_klines(self, symbol, interval="5m", limit=500):
@@ -23,8 +25,7 @@ class Elite5MinAnalyzer:
             "open_time","open","high","low","close","volume","close_time",
             "qav","trades","tb","tq","ignore"
         ])
-        df = df.astype({"open":"float","high":"float","low":"float",
-                        "close":"float","volume":"float"})
+        df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
         return df
 
     # ===================== INDICATORS =====================
@@ -77,51 +78,56 @@ class Elite5MinAnalyzer:
         ctx["sweep_high"] = df5.high.iloc[-1] > df5.high.iloc[-20:-1].max() and (df5.high.iloc[-1]-df5.close.iloc[-1]) > atr*0.2
         ctx["sweep_low"] = df5.low.iloc[-1] < df5.low.iloc[-20:-1].min() and (df5.close.iloc[-1]-df5.low.iloc[-1]) > atr*0.2
 
-        # Micro trend exhaustion detection
-        ctx["micro_trend_up"] = ema9_slope > 0.0 and ema21_slope > 0.0
-        ctx["micro_trend_down"] = ema9_slope < 0.0 and ema21_slope < 0.0
+        # Micro trend exhaustion
+        ctx["micro_trend_up"] = ema9_slope > 0 and ema21_slope > 0
+        ctx["micro_trend_down"] = ema9_slope < 0 and ema21_slope < 0
         ctx["exhaustion_up"] = ctx["rsi"] > 72 and ctx["micro_trend_up"]
         ctx["exhaustion_down"] = ctx["rsi"] < 28 and ctx["micro_trend_down"]
 
         return ctx
 
     # ===================== SIGNAL GENERATION =====================
-    def generate_signals(self, symbol):
-        df5 = self.fetch_klines(symbol, "5m", 500)
-        df15 = self.fetch_klines(symbol, "15m", 200)
-        df1h = self.fetch_klines(symbol, "1h", 200)
-        df4h = self.fetch_klines(symbol, "4h", 100)
+    def generate_signal(self, symbol):
+        try:
+            df5 = self.fetch_klines(symbol, "5m", 500)
+            df15 = self.fetch_klines(symbol, "15m", 200)
+            df1h = self.fetch_klines(symbol, "1h", 200)
+            df4h = self.fetch_klines(symbol, "4h", 100)
+        except Exception:
+            return []
 
-        if len(df5) < 120: return []
+        if len(df5) < 120:
+            return []
 
         ctx = self.build_context(df5, df15, df1h, df4h)
         price = ctx["price"]
+        atr = ctx["atr"]
         signals = []
 
         # ===== REVERSAL LONG =====
-        if ctx["sweep_low"] and ctx["rsi"] < 35 and ctx["vol_climax"] and ctx["htf_1h"] == "UP":
-            conf = 0.58 + (0.05 if ctx["compressed"] else 0)
-            signals.append(self._build_signal(symbol, "LONG", price, conf, "REVERSAL LOW + HTF UP"))
+        if ctx["sweep_low"] and ctx["rsi"] < 35 and ctx["vol_climax"] and ctx["htf_1h"]=="UP":
+            conf = self.adaptive_conf(symbol, 0.58 + (0.05 if ctx["compressed"] else 0))
+            signals.append(self._build_signal(symbol, "LONG", price, atr, conf, "REVERSAL LOW + HTF UP"))
 
         # ===== REVERSAL SHORT =====
-        if ctx["sweep_high"] and ctx["rsi"] > 65 and ctx["vol_climax"] and ctx["htf_1h"] == "DOWN":
-            conf = 0.58 + (0.05 if ctx["compressed"] else 0)
-            signals.append(self._build_signal(symbol, "SHORT", price, conf, "REVERSAL HIGH + HTF DOWN"))
+        if ctx["sweep_high"] and ctx["rsi"] > 65 and ctx["vol_climax"] and ctx["htf_1h"]=="DOWN":
+            conf = self.adaptive_conf(symbol, 0.58 + (0.05 if ctx["compressed"] else 0))
+            signals.append(self._build_signal(symbol, "SHORT", price, atr, conf, "REVERSAL HIGH + HTF DOWN"))
 
-        # ===== TREND / PULLBACK fallback =====
+        # ===== TREND fallback =====
         ema9 = self.EMA(df5.close, 9).iloc[-1]
         ema21 = self.EMA(df5.close, 21).iloc[-1]
 
-        # Only enter with micro trend and not exhaustion
         if not signals:
             if price > ema9 > ema21 and not ctx["exhaustion_up"]:
-                conf = 0.52 + (0.03 if ctx["micro_trend_up"] else 0)
-                signals.append(self._build_signal(symbol, "LONG", price, conf, "TREND CONTINUATION"))
-            if price < ema9 < ema21 and not ctx["exhaustion_down"]:
-                conf = 0.52 + (0.03 if ctx["micro_trend_down"] else 0)
-                signals.append(self._build_signal(symbol, "SHORT", price, conf, "TREND CONTINUATION"))
+                conf = self.adaptive_conf(symbol, 0.52 + (0.03 if ctx["micro_trend_up"] else 0))
+                signals.append(self._build_signal(symbol, "LONG", price, atr, conf, "TREND CONTINUATION"))
 
-        # ===== COOL-DOWN CHECK =====
+            if price < ema9 < ema21 and not ctx["exhaustion_down"]:
+                conf = self.adaptive_conf(symbol, 0.52 + (0.03 if ctx["micro_trend_down"] else 0))
+                signals.append(self._build_signal(symbol, "SHORT", price, atr, conf, "TREND CONTINUATION"))
+
+        # ===== COOLDOWN CHECK =====
         now = datetime.utcnow()
         final_signals = []
         for s in signals:
@@ -132,12 +138,12 @@ class Elite5MinAnalyzer:
 
         return final_signals
 
-    def _build_signal(self, symbol, side, price, confidence, reason):
-        # Dynamic stop/take based on ATR and confidence
+    # ===================== BUILD SIGNAL =====================
+    def _build_signal(self, symbol, side, price, atr, confidence, reason):
         stop_mult = 1.2
         take_mult = 2.5 + (confidence - 0.5)
-        stop = price - stop_mult * 0.001 * price if side == "LONG" else price + stop_mult * 0.001 * price
-        take = price + take_mult * 0.001 * price if side == "LONG" else price - take_mult * 0.001 * price
+        stop = price - stop_mult * atr if side=="LONG" else price + stop_mult * atr
+        take = price + take_mult * atr if side=="LONG" else price - take_mult * atr
 
         return {
             "symbol": symbol,
@@ -145,16 +151,27 @@ class Elite5MinAnalyzer:
             "price": round(price,6),
             "stop": round(stop,6),
             "take": round(take,6),
-            "confidence": round(min(max(confidence, self.min_conf), self.max_conf),2),
+            "confidence": round(min(max(confidence,self.min_conf),self.max_conf),2),
             "time": datetime.utcnow().isoformat(),
             "reason": reason
         }
 
+    # ===================== ADAPTIVE CONFIDENCE =====================
+    def adaptive_conf(self, symbol, base_conf):
+        streak = self.history.get(symbol, 0)
+        if streak >= 2: base_conf += 0.03
+        if streak <= -2: base_conf -= 0.03
+        return min(max(base_conf, self.min_conf), self.max_conf)
+
+    def register_result(self, symbol, win=True):
+        self.history[symbol] = self.history.get(symbol,0) + (1 if win else -1)
+
     # ===================== BATCH ANALYSIS =====================
     def analyze_symbols(self, symbols):
         all_signals = []
-        for s in symbols:
-            sigs = self.generate_signals(s)
-            if sigs: all_signals.extend(sigs)
+        with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+            results = executor.map(self.generate_signal, symbols)
+        for r in results:
+            if r: all_signals.extend(r)
         all_signals.sort(key=lambda x: x["confidence"], reverse=True)
         return all_signals

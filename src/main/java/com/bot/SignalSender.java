@@ -72,7 +72,7 @@ public class SignalSender {
         this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
         this.VOL_MULTIPLIER = envDouble("VOL_MULT", 0.9);
         this.ATR_MIN_PCT = envDouble("ATR_MIN_PCT", 0.0007);
-        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 60000);
+        this.COOLDOWN_MS = envLong("COOLDOWN_MS", 15 * 60_000L);
         long brMin = envLong("BINANCE_REFRESH_MINUTES", 60);
         this.BINANCE_REFRESH_INTERVAL_MS = brMin * 60 * 1000L;
 
@@ -475,12 +475,12 @@ public class SignalSender {
     }
 
     private double holdProbability5Bars(
-            List<TradingCore.Candle> c5m,
+            List<TradingCore.Candle> c15m,
             String direction
     ) {
-        if (c5m.size() < 30) return 0.5;
+        if (c15m.size() < 30) return 0.5;
 
-        List<Double> closes = c5m.stream().map(c -> c.close).toList();
+        List<Double> closes = c15m.stream().map(c -> c.close).toList();
 
         double emaScore = strategyEMANorm(closes);
         double momScore = strategyMomentumNorm(closes);
@@ -510,11 +510,10 @@ public class SignalSender {
         return Math.max(-1.0, Math.min(1.0, raw / 0.01));
     }
 
-    private int multiTFConfirm(int dir1h, int dir15m, int dir5m) {
+    private int multiTFConfirm(int dir1h, int dir15m) {
         int score = 0;
         score += dir1h * 3;
         score += dir15m * 2;
-        score += dir5m * 1;
         if (score > 1) return 1;   // раньше было >2
         if (score < -1) return -1; // раньше было <-2
         return 0;
@@ -567,11 +566,11 @@ public class SignalSender {
 
     private void sendSignalIfAllowed(String pair,
                                      Signal s,
-                                     List<TradingCore.Candle> closes5m) {
+                                     List<TradingCore.Candle> closes15m) {
 
         if (s.confidence < MIN_CONF) return;
 
-        List<TradingCore.Candle> recent = new ArrayList<>(closes5m);
+        List<TradingCore.Candle> recent = new ArrayList<>(closes15m);
         boolean bos = detectBOS(recent);
         boolean liqSweep = detectLiquiditySweep(recent);
         MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
@@ -594,9 +593,9 @@ public class SignalSender {
 
         // Дальше обычные проверки
         if (isCooldown(pair, s.direction)) return;
-        if (closes5m.size() < 4) return;
+        if (closes15m.size() < 4) return;
 
-        long candleTs = closes5m.get(closes5m.size() - 1).openTime;
+        long candleTs = closes15m.get(closes15m.size() - 1).openTime;
 
         Long lastTs = lastSignalCandleTs
                 .getOrDefault(pair, new ConcurrentHashMap<>())
@@ -876,27 +875,20 @@ public class SignalSender {
 
         for (String pair : symbols) {
             try {
-                CompletableFuture<List<TradingCore.Candle>> f5 = fetchKlinesAsync(pair, "5m", KLINES_LIMIT);
                 CompletableFuture<List<TradingCore.Candle>> f15 = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
                 CompletableFuture<List<TradingCore.Candle>> f1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
 
-                CompletableFuture.allOf(f5, f15, f1h).join();
-
-                List<TradingCore.Candle> c5mFull = f5.join();
+                CompletableFuture.allOf( f15, f1h).join();
                 List<TradingCore.Candle> c15mFull = f15.join();
                 List<TradingCore.Candle> c1hFull = f1h.join();
 
-                if (c5mFull.size() < 35 || c15mFull.size() < 25 || c1hFull.size() < 25) continue;
-
-                int start5 = Math.max(0, c5mFull.size() - 61);
-                List<TradingCore.Candle> c5m = new ArrayList<>(c5mFull.subList(start5, c5mFull.size()));
                 List<TradingCore.Candle> c15m = new ArrayList<>(c15mFull);
                 List<TradingCore.Candle> c1h = new ArrayList<>(c1hFull);
 
-                if (c5m.size() < 2) continue; // минимум для RSI
+                if (c15m.size() < 2) continue; // минимум для RSI
 
-                TradingCore.Candle last = c5m.get(c5m.size() - 1);
-                double atr5 = SignalSender.atr(c5m, 14);
+                TradingCore.Candle last = c15m.get(c15m.size() - 1);
+                double atr5 = SignalSender.atr(c15m, 14);
                 if (atr5 <= 0) continue;
 
                 // ================= IMPULSE =================
@@ -907,7 +899,7 @@ public class SignalSender {
                         impulseDown ? TradingCore.Side.SHORT : null;
 
                 if (side != null) {
-                    List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
+                    List<Double> closes5 = c15m.stream().map(c -> c.close).toList();
                     if (closes5.size() < 2) continue;
 
                     double rsi14 = SignalSender.rsi(closes5, 14);
@@ -916,11 +908,9 @@ public class SignalSender {
                             (side == TradingCore.Side.SHORT && rsi14 < 20)) {
                         continue;
                     }
-
-                    int dir5 = marketStructure(c5m);
                     int dir15 = marketStructure(c15m);
                     int dir1h = marketStructure(c1h);
-                    int mtfConfirm = multiTFConfirm(dir1h, dir15, dir5);
+                    int mtfConfirm = multiTFConfirm(dir1h, dir15);
 
                     if (mtfConfirm == 0 ||
                             (side == TradingCore.Side.LONG && mtfConfirm < 0) ||
@@ -933,7 +923,7 @@ public class SignalSender {
                             strategyMomentumNorm(closes5) * 0.20 +
                             strategyMACDNorm(closes5) * 0.20;
 
-                    double avgVol = c5m.stream().mapToDouble(c -> c.volume).average().orElse(0);
+                    double avgVol = c15m.stream().mapToDouble(c -> c.volume).average().orElse(0);
                     boolean volOk = last.volume > avgVol * VOL_MULTIPLIER;
                     boolean atrOk = atr5 / last.close > ATR_MIN_PCT;
 
@@ -946,11 +936,11 @@ public class SignalSender {
                         conf = Math.max(0.50, Math.min(0.88, conf));
                     } else {
                         conf = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, true, true, true,
-                                detectBOS(c5m), detectLiquiditySweep(c5m));
+                                detectBOS(c15m), detectLiquiditySweep(c15m));
                     }
 
-                    double lastHigh = lastSwingHigh(c5m);
-                    double lastLow = lastSwingLow(c5m);
+                    double lastHigh = lastSwingHigh(c15m);
+                    double lastLow = lastSwingLow(c15m);
                     boolean nearSwingHigh = side == TradingCore.Side.LONG && last.close >= lastHigh * 0.995;
                     boolean nearSwingLow = side == TradingCore.Side.SHORT && last.close <= lastLow * 1.005;
 
@@ -959,7 +949,7 @@ public class SignalSender {
 
                     boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
 
-                    List<TradingCore.Candle> recent = new ArrayList<>(c5m.subList(Math.max(0, c5m.size() - 30), c5m.size()));
+                    List<TradingCore.Candle> recent = new ArrayList<>(c15m.subList(Math.max(0, c15m.size() - 30), c15m.size()));
                     boolean bos = detectBOS(recent);
                     boolean liqSweep = detectLiquiditySweep(recent);
 
@@ -999,33 +989,41 @@ public class SignalSender {
                     s.take = take;
                     s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
 
-                    sendSignalIfAllowed(pair, s, c5m);
+                    sendSignalIfAllowed(pair, s, c15m);
                     continue;
                 }
 
                 // ================= ELITE5 =================
                 if (elite5MinAnalyzer != null) {
-                    List<Elite5MinAnalyzer.TradeSignal> ideas = elite5MinAnalyzer.analyze(pair, c5m, c15m, c1h);
+                    // Получаем идеи только с нужного таймфрейма, например 15m
+                    List<Elite5MinAnalyzer.TradeSignal> ideas = elite5MinAnalyzer.analyze(
+                            List.of(pair),  // список символов
+                            Map.of(pair, c15m), // мапа 15мин свечей
+                            Map.of(pair, c1h)   // мапа 1ч свечей
+                    );
+                    if (ideas == null || ideas.isEmpty()) return;
                     for (Elite5MinAnalyzer.TradeSignal i : ideas) {
                         TradingCore.Side sSide = i.side;
                         if (sSide == null) continue;
 
-                        double baseConf = i.confidence;
-                        baseConf = Math.max(0.50, Math.min(0.88, baseConf));
+                        // базовая уверенность сигнала
+                        double baseConf = Math.max(0.50, Math.min(0.88, i.confidence));
 
+                        // применяем риск-менеджмент
                         TradingCore.RiskEngine.TradeSignal ts = riskEngine != null
                                 ? riskEngine.applyRisk(pair, sSide, i.entry, atr5, baseConf, "ELITE5")
                                 : null;
 
                         double finalConf = ts != null ? Math.max(0.50, Math.min(0.88, ts.confidence)) : baseConf;
 
-                        List<Double> closes5 = c5m.stream().map(c -> c.close).toList();
-                        if (closes5.size() < 2) continue;
+                        // RSI
+                        List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
+                        if (closes15.size() < 2) continue;
+                        double rsi14 = SignalSender.rsi(closes15, 14);
 
-                        double rsi14 = SignalSender.rsi(closes5, 14);
-
-                        double lastHigh = lastSwingHigh(c5m);
-                        double lastLow = lastSwingLow(c5m);
+                        // проверка на конец тренда
+                        double lastHigh = lastSwingHigh(c15m);
+                        double lastLow = lastSwingLow(c15m);
                         boolean nearSwingHigh = sSide == TradingCore.Side.LONG && last.close >= lastHigh * 0.995;
                         boolean nearSwingLow = sSide == TradingCore.Side.SHORT && last.close <= lastLow * 1.005;
 
@@ -1041,32 +1039,32 @@ public class SignalSender {
                         double stop = sSide == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
                         double take = sSide == TradingCore.Side.LONG ? last.close * (1 + pct) : last.close * (1 - pct);
 
+                        // создаём сигнал
                         Signal s = new Signal(
                                 pair,
                                 sSide.toString(),
                                 finalConf,
                                 i.entry,
                                 rsi14,
-                                0,
-                                1,
-                                true,
-                                true,
-                                true,
+                                0,      // rawScore можно оставить 0 или рассчитать отдельно
+                                1,      // mtfConfirm
+                                true,   // volOk
+                                true,   // atrOk
+                                true,   // strongTrigger
                                 sSide == TradingCore.Side.LONG,
                                 sSide == TradingCore.Side.SHORT,
-                                true,
-                                SignalSender.rsi(closes5, 7),
-                                SignalSender.rsi(closes5, 4)
+                                true,   // impulse
+                                SignalSender.rsi(closes15, 7),
+                                SignalSender.rsi(closes15, 4)
                         );
 
                         s.stop = stop;
                         s.take = take;
                         s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
 
-                        sendSignalIfAllowed(pair, s, c5m);
+                        sendSignalIfAllowed(pair, s, c15m);
                     }
                 }
-
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
                 e.printStackTrace();

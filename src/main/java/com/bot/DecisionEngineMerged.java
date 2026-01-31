@@ -50,20 +50,19 @@ public final class DecisionEngineMerged {
 
     /* ======================= CONFIG ======================= */
 
-    private static final int MAX_COINS = 80;
+    private static final int MAX_COINS = 10; // анализируем одновременно 10 монет
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
-    private static final double MIN_ATR_PCT = 0.0010;
-    private static final double STOP_ATR = 0.7;
-    private static final double RR_A = 2.2;
-    private static final double RR_B = 1.7;
+    private static final double MIN_ATR_PCT = 0.0020; // чуть выше для 15м
+    private static final double STOP_ATR = 0.6;       // чуть короче стоп
+    private static final double RR_A = 1.8;          // риск/прибыль для Grade A
+    private static final double RR_B = 1.4;          // риск/прибыль для Grade B
     private static final double MAX_EXTENSION_ATR = 1.0;
-    private static final double HARD_MIN_STOP_PCT = 0.0009;
+    private static final double HARD_MIN_STOP_PCT = 0.0010;
 
     /* ======================= MAIN ======================= */
 
     public List<TradeIdea> evaluate(List<String> symbols,
-                                    Map<String, List<TradingCore.Candle>> c5,
                                     Map<String, List<TradingCore.Candle>> c15,
                                     Map<String, List<TradingCore.Candle>> c1h) {
 
@@ -74,24 +73,20 @@ public final class DecisionEngineMerged {
         for (String s : symbols) {
             if (scanned++ >= MAX_COINS) break;
 
-            List<TradingCore.Candle> m5 = c5.get(s);
             List<TradingCore.Candle> m15 = c15.get(s);
             List<TradingCore.Candle> h1 = c1h.get(s);
 
-            if (!valid(m5, 120) || !valid(m15, 80) || !valid(h1, 60)) continue;
+            if (!valid(m15, 50) || !valid(h1, 40)) continue;
 
-            double price = last(m5).close;
-            double atr = atr(m5, 14);
+            double price = last(m15).close;
+            double atr = atr(m15, 14);
             if (atr / price < MIN_ATR_PCT) continue;
 
-            EMA e5 = emaContext(m5);
             EMA e15 = emaContext(m15);
             EMA e1h = emaContext(h1);
 
-            if (overextended(price, e5.ema21, atr)) continue;
-
-            scanMomentum(s, m5, e15, e1h, atr, result, now);
-            scanPullback(s, m5, e5, e15, e1h, atr, result, now);
+            scanMomentum(s, m15, e15, e1h, atr, result, now);
+            scanPullback(s, m15, e15, e1h, atr, result, now);
         }
 
         result.sort((a, b) -> Double.compare(b.probability, a.probability));
@@ -120,18 +115,18 @@ public final class DecisionEngineMerged {
     }
 
     private void scanPullback(String s, List<TradingCore.Candle> c,
-                              EMA e5, EMA e15, EMA e1h,
+                              EMA e15, EMA e1h,
                               double atr, List<TradeIdea> out, long now) {
 
         double price = last(c).close;
 
-        if (price < e5.ema21 && e15.bullish && !cooldowned(s, "PB_L", now)) {
+        if (price < e15.ema21 && e15.bullish && !cooldowned(s, "PB_L", now)) {
             double p = pullbackScore(c) + htfBias(e1h, true);
             build(out, s, TradingCore.Side.LONG, c, atr, p, "PULLBACK_CONT");
             mark(s, "PB_L", now);
         }
 
-        if (price > e5.ema21 && e15.bearish && !cooldowned(s, "PB_S", now)) {
+        if (price > e15.ema21 && e15.bearish && !cooldowned(s, "PB_S", now)) {
             double p = pullbackScore(c) + htfBias(e1h, false);
             build(out, s, TradingCore.Side.SHORT, c, atr, p, "PULLBACK_CONT");
             mark(s, "PB_S", now);
@@ -154,7 +149,7 @@ public final class DecisionEngineMerged {
         double price = last(c).close;
         double risk = Math.max(atr * STOP_ATR, price * HARD_MIN_STOP_PCT);
 
-        double entry = price + (side == TradingCore.Side.LONG ? atr * 0.05 : -atr * 0.05);
+        double entry = price + (side == TradingCore.Side.LONG ? atr * 0.03 : -atr * 0.03);
         double stop = side == TradingCore.Side.LONG ? entry - risk : entry + risk;
         double take = side == TradingCore.Side.LONG
                 ? entry + risk * (g == SignalGrade.A ? RR_A : RR_B)
@@ -162,7 +157,7 @@ public final class DecisionEngineMerged {
 
         out.add(new TradeIdea(
                 s, side, entry, stop, take,
-                clamp(p, 0.50, 0.72),
+                clamp(p, 0.55, 0.72), // повышаем нижний порог уверенности
                 atr,
                 g,
                 SignalAuthority.FINAL,
@@ -173,14 +168,14 @@ public final class DecisionEngineMerged {
     /* ======================= SCORING ======================= */
 
     private double momentumScore(List<TradingCore.Candle> c) {
-        double s = 0.54;
+        double s = 0.55;
         if (rangeExpansion(c)) s += 0.05;
         if (volumeClimax(c)) s += 0.05;
         return s;
     }
 
     private double pullbackScore(List<TradingCore.Candle> c) {
-        double s = 0.53;
+        double s = 0.54;
         if (volumeDry(c)) s += 0.04;
         return s;
     }
@@ -194,7 +189,7 @@ public final class DecisionEngineMerged {
     /* ======================= FILTERS ======================= */
 
     private boolean impulse(List<TradingCore.Candle> c, double atr) {
-        return Math.abs(last(c).close - c.get(c.size() - 2).close) > atr * 0.3;
+        return Math.abs(last(c).close - c.get(c.size() - 2).close) > atr * 0.25;
     }
 
     private boolean overextended(double price, double ema21, double atr) {
@@ -212,7 +207,7 @@ public final class DecisionEngineMerged {
     /* ======================= UTILS ======================= */
 
     private boolean cooldowned(String s, String k, long n) {
-        return cooldown.containsKey(s + k) && n - cooldown.get(s + k) < 55_000;
+        return cooldown.containsKey(s + k) && n - cooldown.get(s + k) < 75_000; // чуть дольше для 15м
     }
 
     private void mark(String s, String k, long n) {
