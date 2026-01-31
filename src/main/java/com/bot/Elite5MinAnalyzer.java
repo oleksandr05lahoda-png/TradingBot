@@ -12,13 +12,14 @@ public class Elite5MinAnalyzer {
 
     private final Map<String, Long> lastSignal = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
-    private static final int MAX_COINS = 100; // TOP100
+    private static final int MAX_COINS = 100;
 
     public Elite5MinAnalyzer(DecisionEngineMerged engine, double minRiskPct) {
         this.decisionEngine = engine;
         this.riskEngine = new RiskEngine(minRiskPct);
         this.brain = new AdaptiveBrain();
 
+        // Очистка старых сигналов каждые 10 минут
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
             lastSignal.entrySet().removeIf(e -> now - e.getValue() > 25 * 60_000);
@@ -74,18 +75,20 @@ public class Elite5MinAnalyzer {
 
             String type = coinTypes.getOrDefault(symbol, "ALT");
 
+            // Получаем идеи для конкретного типа монеты
             List<DecisionEngineMerged.TradeIdea> ideas =
                     decisionEngine.evaluate(List.of(symbol),
                             Map.of(symbol, m15),
                             Map.of(symbol, h1),
-                            Map.of(symbol, type)); // передаем тип монеты
+                            Map.of(symbol, type));
 
+            // Сортировка по вероятности
             ideas.sort(Comparator.comparingDouble(i -> -i.probability));
 
             for (DecisionEngineMerged.TradeIdea i : ideas) {
                 TradeMode mode = TradeMode.classify(i, ctx);
 
-                long cd = dynamicCooldown(ctx, mode, i.grade);
+                long cd = dynamicCooldown(ctx, mode, i.grade, type);
                 if (lastSignal.containsKey(symbol) && now - lastSignal.get(symbol) < cd)
                     continue;
 
@@ -116,11 +119,7 @@ public class Elite5MinAnalyzer {
 
     /* ================= MODES ================= */
     enum TradeMode {
-        TREND,
-        CONTINUATION,
-        PULLBACK,
-        BREAKOUT,
-        EXHAUSTION;
+        TREND, CONTINUATION, PULLBACK, BREAKOUT, EXHAUSTION;
 
         static TradeMode classify(DecisionEngineMerged.TradeIdea i, MarketContext ctx) {
             if (ctx.exhaustion) return EXHAUSTION;
@@ -138,6 +137,7 @@ public class Elite5MinAnalyzer {
                 case BREAKOUT -> 0.52;
                 case EXHAUSTION -> 0.58;
             };
+            // Разные пороги для типов монет
             if ("TOP".equals(type)) base -= 0.03;
             if ("MEME".equals(type)) base += 0.02;
             if (ctx.highVol) base -= 0.03;
@@ -158,10 +158,8 @@ public class Elite5MinAnalyzer {
         double emaSlope;
         double rsi;
 
-        static MarketContext build(List<TradingCore.Candle> c15,
-                                   List<TradingCore.Candle> c1h) {
+        static MarketContext build(List<TradingCore.Candle> c15, List<TradingCore.Candle> c1h) {
             MarketContext c = new MarketContext();
-
             double price = last(c15).close;
             c.atr = atr(c15, 14);
             c.atrPct = c.atr / price;
@@ -216,7 +214,13 @@ public class Elite5MinAnalyzer {
                      String type) {
 
             Result r = new Result();
-            double riskMultiplier = "MEME".equals(type) ? 0.8 : 1.0;
+
+            double riskMultiplier = switch (type) {
+                case "MEME" -> 0.75;
+                case "ALT" -> 1.0;
+                default -> 1.1; // TOP
+            };
+
             double risk = Math.max(i.atr * 0.6 * riskMultiplier, i.entry * minRiskPct);
 
             double tpMult = switch (mode) {
@@ -228,12 +232,8 @@ public class Elite5MinAnalyzer {
             };
 
             r.entry = i.entry;
-            r.stop = i.side == TradingCore.Side.LONG
-                    ? i.entry - risk
-                    : i.entry + risk;
-            r.take = i.side == TradingCore.Side.LONG
-                    ? i.entry + risk * tpMult
-                    : i.entry - risk * tpMult;
+            r.stop = i.side == TradingCore.Side.LONG ? i.entry - risk : i.entry + risk;
+            r.take = i.side == TradingCore.Side.LONG ? i.entry + risk * tpMult : i.entry - risk * tpMult;
 
             return r;
         }
@@ -248,15 +248,18 @@ public class Elite5MinAnalyzer {
             int s = streak.getOrDefault(pair, 0);
             double c = base;
 
+            // Стрик позитив / негатив
             if (s >= 2) c += 0.04;
             if (s <= -2) c -= 0.06;
 
-            if (ctx.strongTrend && mode == TradeMode.CONTINUATION)
-                c += 0.05;
+            // Сильный тренд + continuation
+            if (ctx.strongTrend && mode == TradeMode.CONTINUATION) c += 0.05;
 
+            // Тип монеты
             if ("TOP".equals(type)) c += 0.02;
             if ("MEME".equals(type)) c -= 0.02;
 
+            // Время дня
             int h = LocalTime.now(ZoneOffset.UTC).getHour();
             if (h >= 7 && h <= 18) c += 0.02;
 
@@ -266,10 +269,12 @@ public class Elite5MinAnalyzer {
 
     /* ================= UTILS ================= */
     private static long dynamicCooldown(MarketContext ctx, TradeMode m,
-                                        DecisionEngineMerged.SignalGrade g) {
+                                        DecisionEngineMerged.SignalGrade g, String type) {
         long base = ctx.highVol ? 45_000 : 80_000;
         if (m == TradeMode.CONTINUATION) base *= 0.6;
         if (g == DecisionEngineMerged.SignalGrade.A) base *= 0.7;
+        if ("MEME".equals(type)) base *= 0.85;
+        if ("TOP".equals(type)) base *= 1.2;
         return base;
     }
 
@@ -295,13 +300,11 @@ public class Elite5MinAnalyzer {
         return s / p;
     }
 
-    private static double emaSlope(List<TradingCore.Candle> c,
-                                   int period, int back) {
+    private static double emaSlope(List<TradingCore.Candle> c, int period, int back) {
         return ema(c, period, back) - ema(c, period, back + 5);
     }
 
-    private static double ema(List<TradingCore.Candle> c,
-                              int period, int back) {
+    private static double ema(List<TradingCore.Candle> c, int period, int back) {
         double k = 2.0 / (period + 1);
         double e = c.get(c.size() - back - period).close;
         for (int i = c.size() - back - period + 1; i < c.size() - back; i++)
