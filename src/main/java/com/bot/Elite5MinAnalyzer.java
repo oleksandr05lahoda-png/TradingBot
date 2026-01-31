@@ -12,7 +12,7 @@ public class Elite5MinAnalyzer {
 
     private final Map<String, Long> lastSignal = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
-    private static final int MAX_COINS = 100; // поддержка TOP 100 монет
+    private static final int MAX_COINS = 100; // TOP100
 
     public Elite5MinAnalyzer(DecisionEngineMerged engine, double minRiskPct) {
         this.decisionEngine = engine;
@@ -33,10 +33,12 @@ public class Elite5MinAnalyzer {
         public final double confidence;
         public final String mode;
         public final String reason;
+        public final String coinType;
 
         public TradeSignal(String s, TradingCore.Side side,
                            double e, double sl, double tp,
-                           double conf, String mode, String reason) {
+                           double conf, String mode, String reason,
+                           String coinType) {
             this.symbol = s;
             this.side = side;
             this.entry = e;
@@ -45,6 +47,7 @@ public class Elite5MinAnalyzer {
             this.confidence = conf;
             this.mode = mode;
             this.reason = reason;
+            this.coinType = coinType;
         }
     }
 
@@ -52,7 +55,8 @@ public class Elite5MinAnalyzer {
     public List<TradeSignal> analyze(
             List<String> symbols,
             Map<String, List<TradingCore.Candle>> c15,
-            Map<String, List<TradingCore.Candle>> c1h
+            Map<String, List<TradingCore.Candle>> c1h,
+            Map<String, String> coinTypes
     ) {
         List<TradeSignal> allSignals = new ArrayList<>();
         long now = System.currentTimeMillis();
@@ -63,16 +67,18 @@ public class Elite5MinAnalyzer {
 
             List<TradingCore.Candle> m15 = c15.get(symbol);
             List<TradingCore.Candle> h1 = c1h.get(symbol);
-
-            if (!valid(m15, 80) || !valid(h1, 60)) continue;
+            if (!valid(m15, 50) || !valid(h1, 40)) continue;
 
             MarketContext ctx = MarketContext.build(m15, h1);
             if (!ctx.tradable) continue;
 
+            String type = coinTypes.getOrDefault(symbol, "ALT");
+
             List<DecisionEngineMerged.TradeIdea> ideas =
                     decisionEngine.evaluate(List.of(symbol),
                             Map.of(symbol, m15),
-                            Map.of(symbol, h1));
+                            Map.of(symbol, h1),
+                            Map.of(symbol, type)); // передаем тип монеты
 
             ideas.sort(Comparator.comparingDouble(i -> -i.probability));
 
@@ -83,10 +89,10 @@ public class Elite5MinAnalyzer {
                 if (lastSignal.containsKey(symbol) && now - lastSignal.get(symbol) < cd)
                     continue;
 
-                double conf = brain.adjust(symbol, i.probability, ctx, mode);
-                if (conf < mode.minConfidence(ctx)) continue;
+                double conf = brain.adjust(symbol, i.probability, ctx, mode, type);
+                if (conf < mode.minConfidence(ctx, type)) continue;
 
-                RiskEngine.Result r = riskEngine.apply(i, conf, mode, ctx);
+                RiskEngine.Result r = riskEngine.apply(i, conf, mode, ctx, type);
 
                 allSignals.add(new TradeSignal(
                         symbol,
@@ -96,7 +102,8 @@ public class Elite5MinAnalyzer {
                         r.take,
                         conf,
                         mode.name(),
-                        i.reason + ctx.describe()
+                        i.reason + ctx.describe(),
+                        type
                 ));
 
                 lastSignal.put(symbol, now);
@@ -123,7 +130,7 @@ public class Elite5MinAnalyzer {
             return TREND;
         }
 
-        double minConfidence(MarketContext ctx) {
+        double minConfidence(MarketContext ctx, String type) {
             double base = switch (this) {
                 case TREND -> 0.46;
                 case CONTINUATION -> 0.44;
@@ -131,6 +138,8 @@ public class Elite5MinAnalyzer {
                 case BREAKOUT -> 0.52;
                 case EXHAUSTION -> 0.58;
             };
+            if ("TOP".equals(type)) base -= 0.03;
+            if ("MEME".equals(type)) base += 0.02;
             if (ctx.highVol) base -= 0.03;
             if (ctx.lowVol) base += 0.04;
             return base;
@@ -203,10 +212,12 @@ public class Elite5MinAnalyzer {
         Result apply(DecisionEngineMerged.TradeIdea i,
                      double conf,
                      TradeMode mode,
-                     MarketContext ctx) {
+                     MarketContext ctx,
+                     String type) {
 
             Result r = new Result();
-            double risk = Math.max(i.atr * 0.6, i.entry * minRiskPct);
+            double riskMultiplier = "MEME".equals(type) ? 0.8 : 1.0;
+            double risk = Math.max(i.atr * 0.6 * riskMultiplier, i.entry * minRiskPct);
 
             double tpMult = switch (mode) {
                 case CONTINUATION -> conf > 0.65 ? 3.2 : 2.6;
@@ -220,7 +231,6 @@ public class Elite5MinAnalyzer {
             r.stop = i.side == TradingCore.Side.LONG
                     ? i.entry - risk
                     : i.entry + risk;
-
             r.take = i.side == TradingCore.Side.LONG
                     ? i.entry + risk * tpMult
                     : i.entry - risk * tpMult;
@@ -234,7 +244,7 @@ public class Elite5MinAnalyzer {
         private final Map<String, Integer> streak = new ConcurrentHashMap<>();
 
         double adjust(String pair, double base,
-                      MarketContext ctx, TradeMode mode) {
+                      MarketContext ctx, TradeMode mode, String type) {
             int s = streak.getOrDefault(pair, 0);
             double c = base;
 
@@ -243,6 +253,9 @@ public class Elite5MinAnalyzer {
 
             if (ctx.strongTrend && mode == TradeMode.CONTINUATION)
                 c += 0.05;
+
+            if ("TOP".equals(type)) c += 0.02;
+            if ("MEME".equals(type)) c -= 0.02;
 
             int h = LocalTime.now(ZoneOffset.UTC).getHour();
             if (h >= 7 && h <= 18) c += 0.02;

@@ -41,10 +41,17 @@ public class TradingCore {
         SHORT
     }
 
+    // ===================== COIN TYPE =====================
+    public enum CoinType {
+        TOP,
+        ALT,
+        MEME
+    }
+
     // ===================== RISK ENGINE =====================
     public static class RiskEngine {
 
-        private final double minRiskPct; // минимальный риск от цены (например 0.005 = 0.5%)
+        private final double minRiskPct; // минимальный риск от цены
 
         public RiskEngine(double minRiskPct) {
             this.minRiskPct = minRiskPct;
@@ -58,9 +65,10 @@ public class TradingCore {
             public final double take;
             public final double confidence;
             public final String reason;
+            public final CoinType type;
 
             public TradeSignal(String symbol, Side side, double entry,
-                               double stop, double take, double confidence, String reason) {
+                               double stop, double take, double confidence, String reason, CoinType type) {
                 this.symbol = symbol;
                 this.side = side;
                 this.entry = entry;
@@ -68,12 +76,14 @@ public class TradingCore {
                 this.take = take;
                 this.confidence = confidence;
                 this.reason = reason;
+                this.type = type;
             }
 
             @Override
             public String toString() {
                 return "TradeSignal{" +
                         "symbol='" + symbol + '\'' +
+                        ", type=" + type +
                         ", side=" + side +
                         ", entry=" + entry +
                         ", stop=" + stop +
@@ -83,22 +93,28 @@ public class TradingCore {
                         '}';
             }
         }
-        public TradeSignal applyRisk(String symbol, Side side, double entry, double atr, double confidence, String reason) {
 
-            double risk = atr * 1.2;
-            double minRisk = entry * minRiskPct;
-            if (risk < minRisk) risk = minRisk;
+        public TradeSignal applyRisk(String symbol, Side side, double entry, double atr,
+                                     double confidence, String reason, CoinType type) {
 
-            double stop, take;
-            if (side == Side.LONG) {
-                stop = entry - risk;
-                take = entry + risk * 2.5;
-            } else {
-                stop = entry + risk;
-                take = entry - risk * 2.5;
-            }
+            // ================== DYNAMIC STOP ==================
+            double riskMultiplier = switch (type) {
+                case TOP -> 1.0;
+                case ALT -> 1.2;
+                case MEME -> 1.5;
+            };
 
-            return new TradeSignal(symbol, side, entry, stop, take, confidence, reason);
+            double takeMultiplier = switch (type) {
+                case TOP -> 2.5;
+                case ALT -> 3.0;
+                case MEME -> 4.0;
+            };
+
+            double risk = Math.max(atr * riskMultiplier, entry * minRiskPct);
+            double stop = side == Side.LONG ? entry - risk : entry + risk;
+            double take = side == Side.LONG ? entry + risk * takeMultiplier : entry - risk * takeMultiplier;
+
+            return new TradeSignal(symbol, side, entry, stop, take, confidence, reason, type);
         }
     }
 
@@ -108,19 +124,35 @@ public class TradingCore {
         private final Map<String, Double> symbolBias = new ConcurrentHashMap<>();
         private final Map<String, Integer> streaks = new ConcurrentHashMap<>();
 
-        public double applyAllAdjustments(String strategy, String symbol, double baseConfidence) {
+        public double applyAllAdjustments(String strategy, String symbol, double baseConfidence, CoinType type, boolean highVol, boolean lowVol) {
             double conf = baseConfidence;
-            conf = adaptStrategy(strategy, conf);
+
+            // ================= STRATEGY ADJUST =================
+            conf += adaptStrategy(strategy);
+
+            // ================= SYMBOL BIAS =================
             conf += getSymbolBias(symbol);
+
+            // ================= SESSION BOOST =================
             conf += sessionBoost();
+
+            // ================= COIN TYPE BOOST =================
+            conf += switch (type) {
+                case TOP -> 0.00;
+                case ALT -> 0.02;
+                case MEME -> 0.04;
+            };
+
+            // ================= VOLUME ADJUST =================
+            if (highVol) conf += 0.03;
+            if (lowVol) conf -= 0.02;
+
             return clamp(conf, 0.0, 0.95);
         }
 
-        private double adaptStrategy(String strategy, double confidence) {
-            if ("ELITE5".equalsIgnoreCase(strategy)) {
-                return confidence + 0.02;
-            }
-            return confidence;
+        private double adaptStrategy(String strategy) {
+            if ("ELITE5".equalsIgnoreCase(strategy)) return 0.02;
+            return 0.0;
         }
 
         private double getSymbolBias(String symbol) {
@@ -128,9 +160,9 @@ public class TradingCore {
         }
 
         private double sessionBoost() {
-            int streak = streaks.values().stream().mapToInt(i -> i).sum();
-            if (streak > 3) return 0.03;
-            if (streak < -3) return -0.03;
+            int totalStreak = streaks.values().stream().mapToInt(i -> i).sum();
+            if (totalStreak > 3) return 0.03;
+            if (totalStreak < -3) return -0.03;
             return 0.0;
         }
 
