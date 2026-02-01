@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -318,7 +317,9 @@
       <workItem from="1769714018315" duration="6000" />
       <workItem from="1769714038433" duration="11270000" />
       <workItem from="1769780699296" duration="21844000" />
-      <workItem from="1769857213121" duration="3314000" />
+      <workItem from="1769857213121" duration="4656000" />
+      <workItem from="1769898152907" duration="716000" />
+      <workItem from="1769972778476" duration="649000" />
     </task>
     <servers />
   </component>
