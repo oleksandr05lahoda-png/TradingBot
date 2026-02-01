@@ -68,7 +68,10 @@ public class Elite5MinAnalyzer {
             if (!valid(m15, 50) || !valid(h1, 40)) continue;
 
             MarketContext ctx = MarketContext.build(m15, h1);
-            if (!ctx.tradable) continue;
+            if (!ctx.tradable) {
+                System.out.println(symbol + " not tradable | HV=" + ctx.highVol + " | LV=" + ctx.lowVol + " | impulse=" + ctx.impulse);
+                continue;
+            }
 
             String type = coinTypes.getOrDefault(symbol, "ALT");
 
@@ -104,6 +107,7 @@ public class Elite5MinAnalyzer {
                 ));
 
                 lastSignal.put(symbol, now);
+                System.out.println("Signal: " + symbol + " | side=" + i.side + " | conf=" + conf);
             }
         }
 
@@ -124,11 +128,11 @@ public class Elite5MinAnalyzer {
 
         double minConfidence(MarketContext ctx, String type) {
             double base = switch (this) {
-                case TREND -> 0.46;
-                case CONTINUATION -> 0.44;
-                case PULLBACK -> 0.50;
-                case BREAKOUT -> 0.52;
-                case EXHAUSTION -> 0.58;
+                case TREND -> 0.44;
+                case CONTINUATION -> 0.42;
+                case PULLBACK -> 0.48;
+                case BREAKOUT -> 0.50;
+                case EXHAUSTION -> 0.55;
             };
             if ("TOP".equals(type)) base -= 0.03;
             if ("MEME".equals(type)) base += 0.02;
@@ -161,14 +165,15 @@ public class Elite5MinAnalyzer {
             double range = last(c15).high - last(c15).low;
             double avg = avgRange(c15, 20);
 
-            c.highVol = c.atrPct > 0.0020;
-            c.lowVol = c.atrPct < 0.0013;
-            c.compressed = range < avg * 0.8;
-            c.impulse = range > avg * 1.5;
+            // Смягчённые фильтры
+            c.highVol = c.atrPct > 0.0018;
+            c.lowVol = c.atrPct < 0.0010;
+            c.compressed = range < avg * 0.85;
+            c.impulse = range > avg * 1.4;
 
-            c.strongTrend = Math.abs(c.emaSlope) > price * 0.0007;
-            c.pullback = c.strongTrend && c.rsi < 48 && c.rsi > 35;
-            c.exhaustion = (c.rsi > 70 || c.rsi < 30) && c.impulse;
+            c.strongTrend = Math.abs(c.emaSlope) > price * 0.0005;
+            c.pullback = c.strongTrend && c.rsi < 50 && c.rsi > 30;
+            c.exhaustion = (c.rsi > 68 || c.rsi < 32) && c.impulse;
 
             c.tradable = !c.lowVol || c.impulse;
             return c;
@@ -188,7 +193,6 @@ public class Elite5MinAnalyzer {
 
     static class RiskEngine {
         private final double minRiskPct;
-
         RiskEngine(double minRiskPct) { this.minRiskPct = minRiskPct; }
 
         static class Result { double entry, stop, take; }
@@ -225,24 +229,24 @@ public class Elite5MinAnalyzer {
             double c = base;
 
             if (s >= 2) c += 0.04;
-            if (s <= -2) c -= 0.06;
+            if (s <= -2) c -= 0.04; // чуть меньше штраф
             if (ctx.strongTrend && mode == TradeMode.CONTINUATION) c += 0.05;
             if ("TOP".equals(type)) c += 0.02;
-            if ("MEME".equals(type)) c -= 0.02;
+            if ("MEME".equals(type)) c -= 0.01;
 
             int h = LocalTime.now(ZoneOffset.UTC).getHour();
             if (h >= 7 && h <= 18) c += 0.02;
 
-            return clamp(c, 0.42, 0.95);
+            return clamp(c, 0.40, 0.95);
         }
     }
 
     private static long dynamicCooldown(MarketContext ctx, TradeMode m, DecisionEngineMerged.SignalGrade g, String type) {
-        long base = ctx.highVol ? 45_000 : 80_000;
+        long base = ctx.highVol ? 45_000 : 70_000;
         if (m == TradeMode.CONTINUATION) base *= 0.6;
         if (g == DecisionEngineMerged.SignalGrade.A) base *= 0.7;
         if ("MEME".equals(type)) base *= 0.85;
-        if ("TOP".equals(type)) base *= 1.2;
+        if ("TOP".equals(type)) base *= 1.1;
         return base;
     }
 
