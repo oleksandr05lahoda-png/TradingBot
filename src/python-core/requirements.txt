@@ -1,6 +1,0 @@
-requests
-numpy
-pandas
-matplotlib
-mplfinance
-scikit-learn

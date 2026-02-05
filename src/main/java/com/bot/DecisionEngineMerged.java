@@ -43,11 +43,26 @@ public final class DecisionEngineMerged {
         }
     }
 
+    /* ======================= BINANCE FUTURES FILTER ======================= */
+
+    private static final Set<String> FUTURES_SYMBOLS = ConcurrentHashMap.newKeySet();
+
+    /** Вызывай ОДИН РАЗ при старте бота */
+    public static void loadFuturesSymbols(Collection<String> symbols) {
+        FUTURES_SYMBOLS.clear();
+        FUTURES_SYMBOLS.addAll(symbols);
+        System.out.println("[INIT] Loaded futures symbols: " + FUTURES_SYMBOLS.size());
+    }
+
+    private static boolean isValidFuturesSymbol(String symbol) {
+        return FUTURES_SYMBOLS.isEmpty() || FUTURES_SYMBOLS.contains(symbol);
+    }
+
     /* ======================= CONFIG ======================= */
     private static final int MAX_COINS = 70;
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
-    private static final double MIN_ATR_PCT = 0.0016;   // 🔥 снижено — фьючи живут
+    private static final double MIN_ATR_PCT = 0.0016;
     private static final double STOP_ATR = 0.55;
     private static final double RR_A = 1.8;
     private static final double RR_B = 1.4;
@@ -65,6 +80,12 @@ public final class DecisionEngineMerged {
 
         for (String s : symbols) {
             if (scanned++ >= MAX_COINS) break;
+
+            // 🔴 КРИТИЧНО: фильтр фьючерсов
+            if (!isValidFuturesSymbol(s)) {
+                System.out.println("[SKIP] Not Binance futures symbol: " + s);
+                continue;
+            }
 
             var m15 = c15.get(s);
             var h1  = c1h.get(s);
@@ -101,7 +122,7 @@ public final class DecisionEngineMerged {
         base += volumeScore(c);
         base += structureScore(c);
 
-        if (base < 0.54) return; // 🔥 единственный жёсткий порог
+        if (base < 0.54) return;
 
         TradingCore.Side side =
                 e15.bullish ? TradingCore.Side.LONG :
@@ -232,8 +253,11 @@ public final class DecisionEngineMerged {
         final double ema9, ema21, ema50;
         final boolean bullish, bearish;
         EMA(double e9, double e21, double e50, boolean b, boolean s) {
-            this.ema9 = e9; this.ema21 = e21; this.ema50 = e50;
-            this.bullish = b; this.bearish = s;
+            this.ema9 = e9;
+            this.ema21 = e21;
+            this.ema50 = e50;
+            this.bullish = b;
+            this.bearish = s;
         }
     }
 }

@@ -52,6 +52,7 @@ public class SignalSender {
     private final DecisionEngineMerged decisionEngine;
     private final Elite5MinAnalyzer elite5MinAnalyzer;
     private final TradingCore.AdaptiveBrain adaptiveBrain;
+    private final SignalOptimizer optimizer;
     private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
@@ -86,6 +87,7 @@ public class SignalSender {
         this.decisionEngine = new DecisionEngineMerged();
         this.adaptiveBrain = new TradingCore.AdaptiveBrain();
         this.elite5MinAnalyzer = new Elite5MinAnalyzer(decisionEngine, 0.001);
+        this.optimizer = new SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
     }
 
@@ -994,6 +996,8 @@ public class SignalSender {
                         s.stop = stop;
                         s.take = take;
                         s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
+                        s.confidence = optimizer.adjustConfidence(s, s.confidence);
+                        optimizer.adjustStopTake(s, atr5);
 
                         sendSignalIfAllowed(pair, s, c15m);
                     }

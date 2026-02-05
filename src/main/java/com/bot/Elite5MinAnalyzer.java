@@ -4,39 +4,44 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 
-public class Elite5MinAnalyzer {
+public final class Elite5MinAnalyzer {
 
-    private final DecisionEngineMerged decisionEngine;
-    private final RiskEngine riskEngine;
-    private final AdaptiveBrain brain;
+    private final DecisionEngineMerged engine;
+    private final AdaptiveBrain brain = new AdaptiveBrain();
 
     private final Map<String, Long> lastSignal = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
-    private static final int MAX_COINS = 100;
 
-    public Elite5MinAnalyzer(DecisionEngineMerged engine, double minRiskPct) {
-        this.decisionEngine = engine;
-        this.riskEngine = new RiskEngine(minRiskPct);
-        this.brain = new AdaptiveBrain();
+    private static final int MAX_COINS = 80;
+
+    public Elite5MinAnalyzer(DecisionEngineMerged engine) {
+        this.engine = engine;
 
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
-            lastSignal.entrySet().removeIf(e -> now - e.getValue() > 25 * 60_000);
+            lastSignal.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
         }, 10, 10, TimeUnit.MINUTES);
     }
-
-    public static class TradeSignal {
+    public Elite5MinAnalyzer(DecisionEngineMerged engine, double someThreshold) {
+        this(engine); // вызов существующего конструктора
+        // можно использовать someThreshold где-то в классе
+    }
+    /* ======================= OUTPUT MODEL ======================= */
+    public static final class TradeSignal {
         public final String symbol;
         public final TradingCore.Side side;
         public final double entry, stop, take;
         public final double confidence;
-        public final String mode;
         public final String reason;
         public final String coinType;
 
-        public TradeSignal(String s, TradingCore.Side side,
-                           double e, double sl, double tp,
-                           double conf, String mode, String reason,
+        public TradeSignal(String s,
+                           TradingCore.Side side,
+                           double e,
+                           double sl,
+                           double tp,
+                           double conf,
+                           String reason,
                            String coinType) {
             this.symbol = s;
             this.side = side;
@@ -44,219 +49,108 @@ public class Elite5MinAnalyzer {
             this.stop = sl;
             this.take = tp;
             this.confidence = conf;
-            this.mode = mode;
             this.reason = reason;
             this.coinType = coinType;
         }
     }
 
+    /* ======================= MAIN ======================= */
     public List<TradeSignal> analyze(
             List<String> symbols,
             Map<String, List<TradingCore.Candle>> c15,
             Map<String, List<TradingCore.Candle>> c1h,
             Map<String, String> coinTypes
     ) {
-        List<TradeSignal> allSignals = new ArrayList<>();
+        List<TradeSignal> out = new ArrayList<>();
         long now = System.currentTimeMillis();
         int scanned = 0;
 
-        for (String symbol : symbols) {
+        for (String s : symbols) {
             if (scanned++ >= MAX_COINS) break;
 
-            List<TradingCore.Candle> m15 = c15.get(symbol);
-            List<TradingCore.Candle> h1 = c1h.get(symbol);
-            if (!valid(m15, 50) || !valid(h1, 40)) continue;
+            var m15 = c15.get(s);
+            var h1  = c1h.get(s);
+            if (!valid(m15, 60) || !valid(h1, 40)) continue;
 
-            MarketContext ctx = MarketContext.build(m15, h1);
-            if (!ctx.tradable) {
-                System.out.println(symbol + " not tradable | HV=" + ctx.highVol + " | LV=" + ctx.lowVol + " | impulse=" + ctx.impulse);
-                continue;
-            }
-
-            String type = coinTypes.getOrDefault(symbol, "ALT");
+            String type = coinTypes.getOrDefault(s, "ALT");
 
             List<DecisionEngineMerged.TradeIdea> ideas =
-                    decisionEngine.evaluate(List.of(symbol),
-                            Map.of(symbol, m15),
-                            Map.of(symbol, h1),
-                            Map.of(symbol, type));
+                    engine.evaluate(
+                            List.of(s),
+                            Map.of(s, m15),
+                            Map.of(s, h1),
+                            Map.of(s, type)
+                    );
 
-            ideas.sort(Comparator.comparingDouble(i -> -i.probability));
+            for (var i : ideas) {
 
-            for (DecisionEngineMerged.TradeIdea i : ideas) {
-                TradeMode mode = TradeMode.classify(i, ctx);
+                long cd = cooldown(type, i.grade);
+                if (lastSignal.containsKey(s) && now - lastSignal.get(s) < cd)
+                    continue;
 
-                long cd = dynamicCooldown(ctx, mode, i.grade, type);
-                if (lastSignal.containsKey(symbol) && now - lastSignal.get(symbol) < cd) continue;
+                double conf = brain.adjust(s, i.probability, type);
+                if (conf < 0.52) continue; // 🔥 единый мягкий порог
 
-                double conf = brain.adjust(symbol, i.probability, ctx, mode, type);
-                if (conf < mode.minConfidence(ctx, type)) continue;
-
-                RiskEngine.Result r = riskEngine.apply(i, conf, mode, ctx, type);
-
-                allSignals.add(new TradeSignal(
-                        symbol,
+                out.add(new TradeSignal(
+                        s,
                         i.side,
-                        r.entry,
-                        r.stop,
-                        r.take,
+                        i.entry,
+                        i.stop,
+                        i.take,
                         conf,
-                        mode.name(),
-                        i.reason + ctx.describe(),
+                        i.reason,
                         type
                 ));
 
-                lastSignal.put(symbol, now);
-                System.out.println("Signal: " + symbol + " | side=" + i.side + " | conf=" + conf);
+                lastSignal.put(s, now);
+                System.out.println("[SIGNAL] " + s + " " + i.side + " conf=" + conf);
             }
         }
 
-        allSignals.sort((a, b) -> Double.compare(b.confidence, a.confidence));
-        return allSignals;
+        out.sort((a, b) -> Double.compare(b.confidence, a.confidence));
+        return out;
     }
 
-    enum TradeMode {
-        TREND, CONTINUATION, PULLBACK, BREAKOUT, EXHAUSTION;
-
-        static TradeMode classify(DecisionEngineMerged.TradeIdea i, MarketContext ctx) {
-            if (ctx.exhaustion) return EXHAUSTION;
-            if (ctx.impulse && ctx.compressed) return BREAKOUT;
-            if (ctx.strongTrend && !ctx.pullback) return CONTINUATION;
-            if (ctx.pullback) return PULLBACK;
-            return TREND;
-        }
-
-        double minConfidence(MarketContext ctx, String type) {
-            double base = switch (this) {
-                case TREND -> 0.44;
-                case CONTINUATION -> 0.42;
-                case PULLBACK -> 0.48;
-                case BREAKOUT -> 0.50;
-                case EXHAUSTION -> 0.55;
-            };
-            if ("TOP".equals(type)) base -= 0.03;
-            if ("MEME".equals(type)) base += 0.02;
-            if (ctx.highVol) base -= 0.03;
-            if (ctx.lowVol) base += 0.04;
-            return base;
-        }
-    }
-
-    static class MarketContext {
-        boolean tradable;
-        boolean highVol, lowVol;
-        boolean compressed, impulse;
-        boolean strongTrend;
-        boolean pullback;
-        boolean exhaustion;
-        double atr, atrPct;
-        double emaSlope;
-        double rsi;
-
-        static MarketContext build(List<TradingCore.Candle> c15, List<TradingCore.Candle> c1h) {
-            MarketContext c = new MarketContext();
-            double price = last(c15).close;
-            c.atr = atr(c15, 14);
-            c.atrPct = c.atr / price;
-
-            c.emaSlope = emaSlope(c15, 21, 5);
-            c.rsi = rsi(c15, 14);
-
-            double range = last(c15).high - last(c15).low;
-            double avg = avgRange(c15, 20);
-
-            // Смягчённые фильтры
-            c.highVol = c.atrPct > 0.0018;
-            c.lowVol = c.atrPct < 0.0010;
-            c.compressed = range < avg * 0.85;
-            c.impulse = range > avg * 1.4;
-
-            c.strongTrend = Math.abs(c.emaSlope) > price * 0.0005;
-            c.pullback = c.strongTrend && c.rsi < 50 && c.rsi > 30;
-            c.exhaustion = (c.rsi > 68 || c.rsi < 32) && c.impulse;
-
-            c.tradable = !c.lowVol || c.impulse;
-            return c;
-        }
-
-        String describe() {
-            StringBuilder sb = new StringBuilder(" |CTX:");
-            if (highVol) sb.append("HV ");
-            if (compressed) sb.append("COMP ");
-            if (impulse) sb.append("IMP ");
-            if (strongTrend) sb.append("TREND ");
-            if (pullback) sb.append("PB ");
-            if (exhaustion) sb.append("EX ");
-            return sb.toString();
-        }
-    }
-
-    static class RiskEngine {
-        private final double minRiskPct;
-        RiskEngine(double minRiskPct) { this.minRiskPct = minRiskPct; }
-
-        static class Result { double entry, stop, take; }
-
-        Result apply(DecisionEngineMerged.TradeIdea i, double conf, TradeMode mode, MarketContext ctx, String type) {
-            Result r = new Result();
-            double riskMultiplier = switch (type) {
-                case "MEME" -> 0.75;
-                case "ALT" -> 1.0;
-                default -> 1.1;
-            };
-            double risk = Math.max(i.atr * 0.6 * riskMultiplier, i.entry * minRiskPct);
-
-            double tpMult = switch (mode) {
-                case CONTINUATION -> conf > 0.65 ? 3.2 : 2.6;
-                case TREND -> 2.4;
-                case PULLBACK -> 2.1;
-                case BREAKOUT -> 3.5;
-                case EXHAUSTION -> 1.6;
-            };
-
-            r.entry = i.entry;
-            r.stop = i.side == TradingCore.Side.LONG ? i.entry - risk : i.entry + risk;
-            r.take = i.side == TradingCore.Side.LONG ? i.entry + risk * tpMult : i.entry - risk * tpMult;
-            return r;
-        }
-    }
-
-    static class AdaptiveBrain {
+    /* ======================= BRAIN ======================= */
+    static final class AdaptiveBrain {
         private final Map<String, Integer> streak = new ConcurrentHashMap<>();
 
-        double adjust(String pair, double base, MarketContext ctx, TradeMode mode, String type) {
-            int s = streak.getOrDefault(pair, 0);
+        double adjust(String s, double base, String type) {
+            int k = streak.getOrDefault(s, 0);
             double c = base;
 
-            if (s >= 2) c += 0.04;
-            if (s <= -2) c -= 0.04; // чуть меньше штраф
-            if (ctx.strongTrend && mode == TradeMode.CONTINUATION) c += 0.05;
+            if (k >= 2) c += 0.04;
+            if (k <= -2) c -= 0.04;
+
             if ("TOP".equals(type)) c += 0.02;
-            if ("MEME".equals(type)) c -= 0.01;
+            if ("MEME".equals(type)) c -= 0.02;
 
             int h = LocalTime.now(ZoneOffset.UTC).getHour();
             if (h >= 7 && h <= 18) c += 0.02;
 
-            return clamp(c, 0.40, 0.95);
+            return clamp(c, 0.45, 0.90);
         }
     }
 
-    private static long dynamicCooldown(MarketContext ctx, TradeMode m, DecisionEngineMerged.SignalGrade g, String type) {
-        long base = ctx.highVol ? 45_000 : 70_000;
-        if (m == TradeMode.CONTINUATION) base *= 0.6;
-        if (g == DecisionEngineMerged.SignalGrade.A) base *= 0.7;
-        if ("MEME".equals(type)) base *= 0.85;
-        if ("TOP".equals(type)) base *= 1.1;
+    /* ======================= COOLDOWN ======================= */
+    private static long cooldown(String type, DecisionEngineMerged.SignalGrade g) {
+        long base = 90_000;
+        if (g == DecisionEngineMerged.SignalGrade.A) base *= 0.6;
+        if ("MEME".equals(type)) base *= 0.8;
+        if ("TOP".equals(type)) base *= 1.2;
         return base;
     }
 
-    private static boolean valid(List<?> l, int n) { return l != null && l.size() >= n; }
-    private static TradingCore.Candle last(List<TradingCore.Candle> c) { return c.get(c.size() - 1); }
-    private static double atr(List<TradingCore.Candle> c, int p) { double s=0; for(int i=c.size()-p;i<c.size();i++) s+=c.get(i).high-c.get(i).low; return s/p; }
-    private static double avgRange(List<TradingCore.Candle> c,int p) { double s=0; for(int i=c.size()-p;i<c.size();i++) s+=c.get(i).high-c.get(i).low; return s/p; }
-    private static double emaSlope(List<TradingCore.Candle> c,int period,int back) { return ema(c,period,back)-ema(c,period,back+5); }
-    private static double ema(List<TradingCore.Candle> c,int period,int back) { double k=2.0/(period+1); double e=c.get(c.size()-back-period).close; for(int i=c.size()-back-period+1;i<c.size()-back;i++) e=c.get(i).close*k+e*(1-k); return e; }
-    private static double rsi(List<TradingCore.Candle> c,int p) { double g=0,l=0; for(int i=c.size()-p;i<c.size();i++){double d=c.get(i).close-c.get(i-1).close;if(d>0)g+=d;else l-=d;} if(l==0)return 100; double rs=g/l; return 100-(100/(1+rs)); }
-    private static double clamp(double v,double min,double max){ return Math.max(min,Math.min(max,v)); }
-    public void shutdown() { cleaner.shutdown(); }
+    /* ======================= UTILS ======================= */
+    private static boolean valid(List<?> l, int n) {
+        return l != null && l.size() >= n;
+    }
+
+    private static double clamp(double v, double min, double max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+    public void shutdown() {
+        cleaner.shutdown();
+    }
 }
