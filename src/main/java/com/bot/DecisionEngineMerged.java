@@ -1,78 +1,85 @@
 package com.bot;
 
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class DecisionEngineMerged {
 
-    /* ======================= CORE MODEL ======================= */
+    /* ======================= MODEL ======================= */
+
     public enum SignalGrade { A, B }
-    public enum SignalAuthority { FINAL }
 
     public static final class TradeIdea {
         public final String symbol;
         public final TradingCore.Side side;
         public final double entry, stop, take;
-        public final double probability, atr;
+        public final double confidence;
+        public final double atr;
         public final SignalGrade grade;
-        public final SignalAuthority authority;
-        public final String reason, coinType;
+        public final String reason;
+        public final String coinType;
 
-        public TradeIdea(String symbol,
-                         TradingCore.Side side,
-                         double entry,
-                         double stop,
-                         double take,
-                         double probability,
-                         double atr,
-                         SignalGrade grade,
-                         SignalAuthority authority,
-                         String reason,
-                         String coinType) {
+        public TradeIdea(
+                String symbol,
+                TradingCore.Side side,
+                double entry,
+                double stop,
+                double take,
+                double confidence,
+                double atr,
+                SignalGrade grade,
+                String reason,
+                String coinType
+        ) {
             this.symbol = symbol;
             this.side = side;
             this.entry = entry;
             this.stop = stop;
             this.take = take;
-            this.probability = probability;
+            this.confidence = confidence;
             this.atr = atr;
             this.grade = grade;
-            this.authority = authority;
             this.reason = reason;
             this.coinType = coinType;
         }
     }
 
-    /* ======================= BINANCE FUTURES FILTER ======================= */
+    /* ======================= FUTURES FILTER ======================= */
 
-    private static final Set<String> FUTURES_SYMBOLS = ConcurrentHashMap.newKeySet();
+    private static final Set<String> FUTURES = ConcurrentHashMap.newKeySet();
 
-    /** Вызывай ОДИН РАЗ при старте бота */
     public static void loadFuturesSymbols(Collection<String> symbols) {
-        FUTURES_SYMBOLS.clear();
-        FUTURES_SYMBOLS.addAll(symbols);
-        System.out.println("[INIT] Loaded futures symbols: " + FUTURES_SYMBOLS.size());
+        FUTURES.clear();
+        FUTURES.addAll(symbols);
+        System.out.println("[INIT] Futures loaded: " + FUTURES.size());
     }
 
-    private static boolean isValidFuturesSymbol(String symbol) {
-        return FUTURES_SYMBOLS.isEmpty() || FUTURES_SYMBOLS.contains(symbol);
+    private static boolean isFutures(String s) {
+        return FUTURES.isEmpty() || FUTURES.contains(s);
     }
 
     /* ======================= CONFIG ======================= */
+
     private static final int MAX_COINS = 70;
+
+    private static final double MIN_ATR_TOP  = 0.0012;
+    private static final double MIN_ATR_ALT  = 0.0010;
+    private static final double MIN_ATR_MEME = 0.0008;
+
+    private static final double STOP_ATR = 0.6;
+    private static final double RR_A = 2.0;
+    private static final double RR_B = 1.5;
+
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
-    private static final double MIN_ATR_PCT = 0.0016;
-    private static final double STOP_ATR = 0.55;
-    private static final double RR_A = 1.8;
-    private static final double RR_B = 1.4;
-    private static final double HARD_MIN_STOP = 0.0012;
-
     /* ======================= MAIN ======================= */
-    public List<TradeIdea> evaluate(List<String> symbols,
-                                    Map<String, List<TradingCore.Candle>> c15,
-                                    Map<String, List<TradingCore.Candle>> c1h,
-                                    Map<String, String> coinTypes) {
+
+    public List<TradeIdea> evaluate(
+            List<String> symbols,
+            Map<String, List<TradingCore.Candle>> m15,
+            Map<String, List<TradingCore.Candle>> h1,
+            Map<String, String> coinTypes
+    ) {
 
         List<TradeIdea> out = new ArrayList<>();
         long now = System.currentTimeMillis();
@@ -80,122 +87,134 @@ public final class DecisionEngineMerged {
 
         for (String s : symbols) {
             if (scanned++ >= MAX_COINS) break;
+            if (!isFutures(s)) continue;
 
-            // 🔴 КРИТИЧНО: фильтр фьючерсов
-            if (!isValidFuturesSymbol(s)) {
-                System.out.println("[SKIP] Not Binance futures symbol: " + s);
-                continue;
-            }
+            var c15 = m15.get(s);
+            var c1h = h1.get(s);
+            if (!valid(c15, 60) || !valid(c1h, 40)) continue;
 
-            var m15 = c15.get(s);
-            var h1  = c1h.get(s);
-            if (!valid(m15, 60) || !valid(h1, 40)) continue;
+            String type = coinTypes.getOrDefault(s, "ALT");
 
-            double price = last(m15).close;
-            double atr = atr(m15, 14);
-            if (atr / price < MIN_ATR_PCT) continue;
+            double price = last(c15).close;
+            double atr = atr(c15, 14);
 
-            EMA e15 = emaContext(m15);
-            EMA e1h = emaContext(h1);
+            double minAtr = switch (type) {
+                case "TOP"  -> MIN_ATR_TOP;
+                case "MEME" -> MIN_ATR_MEME;
+                default     -> MIN_ATR_ALT;
+            };
 
-            scan(s, m15, atr, e15, e1h, out, now, coinTypes.getOrDefault(s, "ALT"));
+            if (atr / price < minAtr) continue;
+
+            EMA ltf = emaContext(c15);
+            EMA htf = emaContext(c1h);
+
+            TradeIdea idea = scan(s, c15, atr, ltf, htf, type, now);
+            if (idea != null) out.add(idea);
         }
 
-        out.sort((a, b) -> Double.compare(b.probability, a.probability));
+        out.sort((a, b) -> Double.compare(b.confidence, a.confidence));
         return out;
     }
 
-    /* ======================= CORE SCAN ======================= */
-    private void scan(String s,
-                      List<TradingCore.Candle> c,
-                      double atr,
-                      EMA e15,
-                      EMA e1h,
-                      List<TradeIdea> out,
-                      long now,
-                      String type) {
+    /* ======================= CORE LOGIC ======================= */
 
-        double base = 0.50;
+    private TradeIdea scan(
+            String s,
+            List<TradingCore.Candle> c,
+            double atr,
+            EMA ltf,
+            EMA htf,
+            String type,
+            long now
+    ) {
 
-        base += trendScore(e15, e1h);
-        base += momentumScore(c);
-        base += volumeScore(c);
-        base += structureScore(c);
+        double score = 0.50;
 
-        if (base < 0.54) return;
+        // trend
+        if (ltf.bullish && htf.bullish) score += 0.10;
+        if (ltf.bearish && htf.bearish) score += 0.10;
+
+        // impulse candle
+        if (impulse(c)) score += 0.06;
+
+        // volume
+        if (last(c).volume > avgVol(c, 20)) score += 0.05;
+
+        if (score < 0.55) return null;
 
         TradingCore.Side side =
-                e15.bullish ? TradingCore.Side.LONG :
-                        e15.bearish ? TradingCore.Side.SHORT : null;
+                ltf.bullish ? TradingCore.Side.LONG :
+                        ltf.bearish ? TradingCore.Side.SHORT : null;
 
-        if (side == null) return;
-        if (cooldowned(s, side.name(), now)) return;
+        if (side == null) return null;
 
-        build(out, s, side, c, atr, base, type);
-        mark(s, side.name(), now);
+        String key = s + side;
+        if (cooldown.containsKey(key) && now - cooldown.get(key) < 60_000)
+            return null;
+
+        cooldown.put(key, now);
+
+        return build(s, c, side, atr, score, type);
     }
 
     /* ======================= BUILD ======================= */
-    private void build(List<TradeIdea> out,
-                       String s,
-                       TradingCore.Side side,
-                       List<TradingCore.Candle> c,
-                       double atr,
-                       double p,
-                       String type) {
 
-        SignalGrade g = p >= 0.63 ? SignalGrade.A : SignalGrade.B;
+    private TradeIdea build(
+            String s,
+            List<TradingCore.Candle> c,
+            TradingCore.Side side,
+            double atr,
+            double score,
+            String type
+    ) {
 
-        double price = last(c).close;
-        double risk = Math.max(atr * STOP_ATR, price * HARD_MIN_STOP);
+        SignalGrade grade = score >= 0.65 ? SignalGrade.A : SignalGrade.B;
 
-        double entry = price;
-        double stop = side == TradingCore.Side.LONG ? entry - risk : entry + risk;
+        double entry = last(c).close;
+        double risk = atr * STOP_ATR;
+
+        double stop = side == TradingCore.Side.LONG
+                ? entry - risk
+                : entry + risk;
+
         double take = side == TradingCore.Side.LONG
-                ? entry + risk * (g == SignalGrade.A ? RR_A : RR_B)
-                : entry - risk * (g == SignalGrade.A ? RR_A : RR_B);
+                ? entry + risk * (grade == SignalGrade.A ? RR_A : RR_B)
+                : entry - risk * (grade == SignalGrade.A ? RR_A : RR_B);
 
-        out.add(new TradeIdea(
-                s, side, entry, stop, take,
-                clamp(p, 0.55, 0.78),
-                atr, g, SignalAuthority.FINAL,
-                "15M FUTURES " + g + " CONF",
+        return new TradeIdea(
+                s,
+                side,
+                entry,
+                stop,
+                take,
+                clamp(score, 0.55, 0.85),
+                atr,
+                grade,
+                "15M FUTURES CONF " + grade,
                 type
-        ));
+        );
     }
 
-    /* ======================= SCORING ======================= */
-    private double trendScore(EMA ltf, EMA htf) {
-        double s = 0;
-        if (ltf.bullish) s += 0.04;
-        if (ltf.bearish) s += 0.04;
-        if (ltf.bullish && htf.bullish) s += 0.04;
-        if (ltf.bearish && htf.bearish) s += 0.04;
-        return s;
+    /* ======================= INDICATORS ======================= */
+
+    private boolean impulse(List<TradingCore.Candle> c) {
+        var k = last(c);
+        double body = Math.abs(k.close - k.open);
+        double range = k.high - k.low;
+        return range > 0 && body / range > 0.6;
     }
 
-    private double momentumScore(List<TradingCore.Candle> c) {
-        double body = Math.abs(last(c).close - last(c).open);
-        double range = last(c).high - last(c).low;
-        return body / range > 0.55 ? 0.05 : 0.0;
-    }
-
-    private double volumeScore(List<TradingCore.Candle> c) {
-        return last(c).volume > avgVol(c, 20) ? 0.04 : 0.0;
-    }
-
-    private double structureScore(List<TradingCore.Candle> c) {
-        return rangeExpansion(c) ? 0.04 : 0.0;
+    private EMA emaContext(List<TradingCore.Candle> c) {
+        double e9 = ema(c, 9);
+        double e21 = ema(c, 21);
+        double e50 = ema(c, 50);
+        return new EMA(e9, e21, e50,
+                e9 > e21 && e21 > e50,
+                e9 < e21 && e21 < e50);
     }
 
     /* ======================= UTILS ======================= */
-    private boolean cooldowned(String s, String k, long n) {
-        return cooldown.containsKey(s + k) && n - cooldown.get(s + k) < 90_000;
-    }
-
-    private void mark(String s, String k, long n) {
-        cooldown.put(s + k, n);
-    }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
         return c.get(c.size() - 1);
@@ -212,29 +231,11 @@ public final class DecisionEngineMerged {
         return s / n;
     }
 
-    private boolean rangeExpansion(List<TradingCore.Candle> c) {
-        return (last(c).high - last(c).low) > avgRange(c, 20) * 1.2;
-    }
-
-    private double avgRange(List<TradingCore.Candle> c, int n) {
-        double s = 0;
-        for (int i = c.size() - n; i < c.size(); i++)
-            s += c.get(i).high - c.get(i).low;
-        return s / n;
-    }
-
     private double avgVol(List<TradingCore.Candle> c, int n) {
         double s = 0;
         for (int i = c.size() - n; i < c.size(); i++)
             s += c.get(i).volume;
         return s / n;
-    }
-
-    private EMA emaContext(List<TradingCore.Candle> c) {
-        double e9 = ema(c, 9), e21 = ema(c, 21), e50 = ema(c, 50);
-        return new EMA(e9, e21, e50,
-                e9 > e21 && e21 > e50,
-                e9 < e21 && e21 < e50);
     }
 
     private double ema(List<TradingCore.Candle> c, int p) {
@@ -250,12 +251,8 @@ public final class DecisionEngineMerged {
     }
 
     private static final class EMA {
-        final double ema9, ema21, ema50;
         final boolean bullish, bearish;
         EMA(double e9, double e21, double e50, boolean b, boolean s) {
-            this.ema9 = e9;
-            this.ema21 = e21;
-            this.ema50 = e50;
             this.bullish = b;
             this.bearish = s;
         }

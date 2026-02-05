@@ -9,23 +9,28 @@ public final class Elite5MinAnalyzer {
     private final DecisionEngineMerged engine;
     private final AdaptiveBrain brain = new AdaptiveBrain();
 
+    // cooldown теперь по SYMBOL + SIDE
     private final Map<String, Long> lastSignal = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
     private static final int MAX_COINS = 80;
+    private double MIN_CONF; // стало не static, чтобы задавать через конструктор
 
+    /* ======================= CONSTRUCTORS ======================= */
     public Elite5MinAnalyzer(DecisionEngineMerged engine) {
+        this(engine, 0.48); // default значение
+    }
+
+    public Elite5MinAnalyzer(DecisionEngineMerged engine, double minConf) {
         this.engine = engine;
+        this.MIN_CONF = minConf;
 
         cleaner.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
-            lastSignal.entrySet().removeIf(e -> now - e.getValue() > 30 * 60_000);
+            lastSignal.entrySet().removeIf(e -> now - e.getValue() > 20 * 60_000);
         }, 10, 10, TimeUnit.MINUTES);
     }
-    public Elite5MinAnalyzer(DecisionEngineMerged engine, double someThreshold) {
-        this(engine); // вызов существующего конструктора
-        // можно использовать someThreshold где-то в классе
-    }
+
     /* ======================= OUTPUT MODEL ======================= */
     public static final class TradeSignal {
         public final String symbol;
@@ -70,7 +75,7 @@ public final class Elite5MinAnalyzer {
 
             var m15 = c15.get(s);
             var h1  = c1h.get(s);
-            if (!valid(m15, 60) || !valid(h1, 40)) continue;
+            if (!valid(m15, 50) || !valid(h1, 30)) continue;
 
             String type = coinTypes.getOrDefault(s, "ALT");
 
@@ -84,12 +89,20 @@ public final class Elite5MinAnalyzer {
 
             for (var i : ideas) {
 
+                String key = s + "_" + i.side;
                 long cd = cooldown(type, i.grade);
-                if (lastSignal.containsKey(s) && now - lastSignal.get(s) < cd)
+
+                if (lastSignal.containsKey(key) && now - lastSignal.get(key) < cd)
                     continue;
 
-                double conf = brain.adjust(s, i.probability, type);
-                if (conf < 0.52) continue; // 🔥 единый мягкий порог
+                // ИСПРАВЛЕНО ЗДЕСЬ
+                double conf = brain.adjust(s, i.confidence, type);
+
+                if (i.grade == DecisionEngineMerged.SignalGrade.A) conf += 0.03;
+                if (i.grade == DecisionEngineMerged.SignalGrade.B) conf -= 0.03;
+
+                conf = clamp(conf, 0.45, 0.95);
+                if (conf < MIN_CONF) continue;
 
                 out.add(new TradeSignal(
                         s,
@@ -102,11 +115,9 @@ public final class Elite5MinAnalyzer {
                         type
                 ));
 
-                lastSignal.put(s, now);
-                System.out.println("[SIGNAL] " + s + " " + i.side + " conf=" + conf);
+                lastSignal.put(key, now);
             }
         }
-
         out.sort((a, b) -> Double.compare(b.confidence, a.confidence));
         return out;
     }
@@ -119,24 +130,25 @@ public final class Elite5MinAnalyzer {
             int k = streak.getOrDefault(s, 0);
             double c = base;
 
-            if (k >= 2) c += 0.04;
-            if (k <= -2) c -= 0.04;
+            if (k >= 2) c += 0.03;
+            if (k <= -2) c -= 0.03;
 
             if ("TOP".equals(type)) c += 0.02;
-            if ("MEME".equals(type)) c -= 0.02;
+            if ("MEME".equals(type)) c -= 0.01;
 
             int h = LocalTime.now(ZoneOffset.UTC).getHour();
-            if (h >= 7 && h <= 18) c += 0.02;
+            if (h >= 6 && h <= 22) c += 0.02;
 
-            return clamp(c, 0.45, 0.90);
+            return c;
         }
     }
 
     /* ======================= COOLDOWN ======================= */
     private static long cooldown(String type, DecisionEngineMerged.SignalGrade g) {
-        long base = 90_000;
-        if (g == DecisionEngineMerged.SignalGrade.A) base *= 0.6;
-        if ("MEME".equals(type)) base *= 0.8;
+        long base = 60_000;
+        if (g == DecisionEngineMerged.SignalGrade.A) base *= 0.5;
+        if (g == DecisionEngineMerged.SignalGrade.B) base *= 0.8;
+        if ("MEME".equals(type)) base *= 0.6;
         if ("TOP".equals(type)) base *= 1.2;
         return base;
     }

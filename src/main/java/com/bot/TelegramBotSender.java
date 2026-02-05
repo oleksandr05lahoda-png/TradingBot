@@ -9,11 +9,12 @@ import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
-public class TelegramBotSender {
+public final class TelegramBotSender {
 
     private final String token;
     private final String chatId;
     private final HttpClient client;
+    private static final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     public TelegramBotSender(String token, String chatId) {
         this.token = token;
@@ -21,58 +22,59 @@ public class TelegramBotSender {
         this.client = HttpClient.newHttpClient();
     }
 
-    // Асинхронная отправка сообщения
+    // ----------------- ASYNC MESSAGE -----------------
     public void sendMessage(String message) {
         try {
             String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" +
                     chatId + "&text=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
+
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .GET()
                     .build();
 
             client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                    .thenAccept(resp -> System.out.println("[TG " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "] Ответ: " + resp.body()))
+                    .thenAccept(resp -> System.out.println("[TG " + LocalDateTime.now().format(dtf) + "] Ответ: " + resp.body()))
                     .exceptionally(e -> {
-                        System.out.println("[TG] Ошибка отправки: " + e.getMessage());
+                        System.err.println("[TG] Ошибка отправки: " + e.getMessage());
                         return null;
                     });
+
         } catch (Exception e) {
-            System.out.println("[TG] Ошибка создания запроса: " + e.getMessage());
+            System.err.println("[TG] Ошибка создания запроса: " + e.getMessage());
         }
     }
 
-    // Синхронная отправка сообщения
+    // ----------------- SYNC MESSAGE -----------------
     public boolean sendMessageSync(String message) {
         try {
             String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" +
                     chatId + "&text=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
+
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .GET()
                     .build();
 
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            System.out.println("[TG " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "] Ответ: " + response.body());
+            System.out.println("[TG " + LocalDateTime.now().format(dtf) + "] Ответ: " + response.body());
             return true;
         } catch (Exception e) {
-            System.out.println("[TG] Ошибка отправки: " + e.getMessage());
+            System.err.println("[TG] Ошибка отправки: " + e.getMessage());
             return false;
         }
     }
 
-    // Удобный метод для сигналов
+    // ----------------- SIGNAL MESSAGE -----------------
     public void sendSignal(String symbol, String direction, double confidence, double price, int rsi, String flags) {
-        String message = symbol + " → " + direction + "\n" +
-                "Confidence: " + String.format("%.2f", confidence) + "\n" +
-                "Price: " + price + "\n" +
-                "RSI: " + rsi + "\n" +
-                "Flags: " + flags + "\n" +
-                "Time: " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        String message = String.format(
+                "%s → %s\nConfidence: %.2f\nPrice: %.2f\nRSI: %d\nFlags: %s\nTime: %s",
+                symbol, direction, confidence, price, rsi, flags, LocalDateTime.now().format(dtf)
+        );
         sendMessage(message);
     }
 
-    // Перегрузка для простого сообщения без параметров
+    // ----------------- SIMPLE MESSAGE -----------------
     public void sendSignal(String message) {
         sendMessage(message);
     }

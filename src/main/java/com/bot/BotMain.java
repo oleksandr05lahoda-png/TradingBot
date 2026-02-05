@@ -6,30 +6,35 @@ import java.time.format.DateTimeFormatter;
 public class BotMain {
 
     public static void main(String[] args) {
-        String tgToken = "8395445212:AAF7X7oFBx72HgKGoRTcFpdFbuHcZOPfTig";  // вставь свой токен
-        String chatId = "953233853"; // вставь свой chat_id
-        TelegramBotSender telegram = new TelegramBotSender(tgToken, chatId);
 
-        // Создаём SignalSender
+        String tgToken = "8395445212:AAF7X7oFBx72HgKGoRTcFpdFbuHcZOPfTig";
+        String chatId = "953233853";
+
+        TelegramBotSender telegram = new TelegramBotSender(tgToken, chatId);
         SignalSender signalSender = new SignalSender(telegram);
 
-        // Получаем текущее локальное время в нужном часовом поясе
-        ZoneId zone = ZoneId.of("Europe/Warsaw"); // здесь можно поставить любой твой часовой пояс
+        ZoneId zone = ZoneId.of("Europe/Warsaw");
         LocalDateTime now = LocalDateTime.now(zone);
         DateTimeFormatter dtf = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-        // Отправляем стартовое сообщение синхронно
-        boolean sent = telegram.sendMessageSync("🚀 Бот запущен! Время: " + now.format(dtf));
+        telegram.sendMessageSync(
+                "🚀 Бот запущен\n" +
+                        "⏰ Время: " + now.format(dtf) + "\n" +
+                        "📡 Режим: FUTURES 15m"
+        );
 
-        if (sent) {
-            System.out.println("Стартовое сообщение отправлено в Telegram!");
-        } else {
-            System.out.println("Не удалось отправить стартовое сообщение.");
+        System.out.println("[" + now.format(dtf) + "] Bot started");
+
+        try {
+            signalSender.start();
+        } catch (Exception e) {
+            telegram.sendMessageSync("❌ Ошибка старта SignalSender: " + e.getMessage());
+            e.printStackTrace();
         }
 
-        // Запускаем SignalSender
-        signalSender.start();
-
-        System.out.println("[" + now.format(dtf) + "] Бот запущен и работает!");
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            telegram.sendMessageSync("🛑 Бот остановлен");
+            System.out.println("Bot stopped");
+        }));
     }
 }

@@ -585,6 +585,15 @@ public class SignalSender {
         boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
 
         boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
+        double microFactor = 1.0;
+        if (endOfTrend) {
+            microFactor = 0.7 + Math.min(0.3, Math.abs(micro.speed) * 100); // уменьшает penalti за конец тренда
+            s.confidence *= microFactor;
+        }
+
+        if (bos || liqSweep) {
+            s.confidence = Math.max(MIN_CONF, s.confidence); // не даём упасть ниже порога
+        }
 
         // Блокировка микро-тренда только для конца тренда
         if (endOfTrend) {
@@ -679,8 +688,9 @@ public class SignalSender {
                 .getOrDefault(direction, 0L);
         Double lastConf = lastSentConfidence.getOrDefault(pair + ":" + direction, 0.0);
         if ((now - last) < COOLDOWN_MS) {
-            if (lastConf > 0.7) return true;  // блокируем сильные сигналы
-            return false;                     // разрешаем слабые сигналы
+            // dynamic cooldown: чем выше confidence, тем дольше блокировка
+            long dynamicCooldown = (long)(COOLDOWN_MS * lastConf);
+            return (now - last) < dynamicCooldown;
         }
         return false;
     }
@@ -910,10 +920,8 @@ public class SignalSender {
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
-                if (mtfConfirm == 0 ||
-                        (side == TradingCore.Side.LONG && mtfConfirm < 0) ||
-                        (side == TradingCore.Side.SHORT && mtfConfirm > 0)) continue;
-
+                if (Math.abs(mtfConfirm) > 0 && ((side == TradingCore.Side.LONG && mtfConfirm < 0) ||
+                        (side == TradingCore.Side.SHORT && mtfConfirm > 0))) continue;
                 // ================= RAW SCORE =================
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
                         strategyRSINorm(closes15) * 0.25 +
