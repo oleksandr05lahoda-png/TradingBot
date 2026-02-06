@@ -87,9 +87,6 @@ public class TradingCore {
             }
         }
 
-        /**
-         * Применяет риск-менеджмент к сигналу.
-         */
         public TradeSignal applyRisk(String symbol, Side side, double entry, double atr,
                                      double confidence, String reason, CoinType type) {
 

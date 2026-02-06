@@ -600,7 +600,7 @@ public class SignalSender {
 
         // Блокировка микро-тренда только для конца тренда
         if (endOfTrend) {
-            if (endOfTrend && !bos && !liqSweep) {
+            if (!bos && !liqSweep) {
                 s.confidence *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200); // динамическое снижение
             }
         }
@@ -622,8 +622,10 @@ public class SignalSender {
 
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
-        bot.sendMessage(s.toTelegramMessage());
-        signalsThisCycle++; // отправка
+        // ✅ Асинхронная отправка в Telegram через твой класс
+        bot.sendMessageAsync(s.toTelegramMessage());
+
+        signalsThisCycle++; // отметка что сигнал отправлен
         markSignalSent(pair, s.direction);
     }
     public static class Signal {
