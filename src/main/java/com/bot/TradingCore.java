@@ -9,12 +9,7 @@ public class TradingCore {
     public static class Candle {
         public final long openTime;
         public final long closeTime;
-        public final double open;
-        public final double high;
-        public final double low;
-        public final double close;
-        public final double volume;
-        public final double quoteAssetVolume;
+        public final double open, high, low, close, volume, quoteAssetVolume;
 
         public Candle(long openTime, double open, double high, double low,
                       double close, double volume, double quoteAssetVolume, long closeTime) {
@@ -36,17 +31,10 @@ public class TradingCore {
     }
 
     // ===================== SIDE =====================
-    public enum Side {
-        LONG,
-        SHORT
-    }
+    public enum Side { LONG, SHORT }
 
     // ===================== COIN TYPE =====================
-    public enum CoinType {
-        TOP,
-        ALT,
-        MEME
-    }
+    public enum CoinType { TOP, ALT, MEME }
 
     // ===================== RISK ENGINE =====================
     public static class RiskEngine {
@@ -60,9 +48,7 @@ public class TradingCore {
         public static class TradeSignal {
             public final String symbol;
             public final Side side;
-            public final double entry;
-            public final double stop;
-            public final double take;
+            public final double entry, stop, take;
             public final double confidence;
             public final String reason;
             public final CoinType type;
@@ -90,16 +76,17 @@ public class TradingCore {
         public TradeSignal applyRisk(String symbol, Side side, double entry, double atr,
                                      double confidence, String reason, CoinType type) {
 
+            // множители под 15-минутные фьючи
             double riskMultiplier = switch (type) {
                 case TOP -> 1.0;
-                case ALT -> 1.2;
+                case ALT -> 1.3;
                 case MEME -> 1.5;
             };
 
             double takeMultiplier = switch (type) {
-                case TOP -> 2.5;
-                case ALT -> 3.0;
-                case MEME -> 4.0;
+                case TOP -> 2.0;
+                case ALT -> 2.5;
+                case MEME -> 3.5;
             };
 
             double risk = Math.max(atr * riskMultiplier, entry * minRiskPct);
@@ -117,25 +104,25 @@ public class TradingCore {
         private final Map<String, Integer> streaks = new ConcurrentHashMap<>();
 
         /**
-         * Корректирует уверенность сигнала с учетом стратегии, монеты, объема и текущих сессий.
+         * Корректирует уверенность сигнала под стратегию, монету и волатильность
          */
         public double applyAllAdjustments(String strategy, String symbol, double baseConfidence,
                                           CoinType type, boolean highVol, boolean lowVol) {
             double conf = baseConfidence;
 
-            conf += adaptStrategy(strategy);
-            conf += symbolBias.getOrDefault(symbol, 0.0);
-            conf += sessionBoost();
-            conf += switch (type) {
+            conf += adaptStrategy(strategy);                // бонус по стратегии
+            conf += symbolBias.getOrDefault(symbol, 0.0);  // индивидуальный bias
+            conf += sessionBoost();                        // дневной/ночной бонус
+            conf += switch (type) {                         // тип монеты
                 case TOP -> 0.00;
                 case ALT -> 0.02;
                 case MEME -> 0.04;
             };
 
-            if (highVol) conf += 0.03;
-            if (lowVol) conf -= 0.02;
+            if (highVol) conf += 0.03;  // высокая активность → +3%
+            if (lowVol) conf -= 0.02;   // низкая активность → -2%
 
-            return clamp(conf, 0.0, 0.95);
+            return clamp(conf, 0.40, 0.95); // минимальная уверенность 0.4 для 15-минутных сигналов
         }
 
         private double adaptStrategy(String strategy) {

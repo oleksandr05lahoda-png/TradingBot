@@ -58,6 +58,7 @@ public class SignalSender {
     private final SignalOptimizer optimizer;
     private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
+    private final Map<String, Signal> activeSignals = new ConcurrentHashMap<>();
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
     private long dailyResetTs = System.currentTimeMillis();
     private ScheduledExecutorService scheduler;
@@ -604,7 +605,8 @@ public class SignalSender {
                 s.confidence *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200); // динамическое снижение
             }
         }
-
+        if (activeSignals.containsKey(pair)) return; // сигнал уже открыт
+        activeSignals.put(pair, s); // отметка что сигнал активен
         // Дальше обычные проверки
         if (isCooldown(pair, s.direction)) return;
         if (closes15m.size() < 4) return;
@@ -1016,8 +1018,7 @@ public class SignalSender {
 
                         double finalConf = ts != null ? Math.max(0.50, Math.min(0.88, ts.confidence)) : baseConf;
 
-                        // ================= SAFE STOP/TAKE =================
-                        double pct = Math.max(0.01, atr5 / last.close);
+                        double pct = Math.max(0.003, Math.min(0.015, atr5 / last.close)); // от 0.3% до 1.5%
                         double stop = sSide == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
                         double take = sSide == TradingCore.Side.LONG ? last.close * (1 + pct * 2) : last.close * (1 - pct * 2);
 

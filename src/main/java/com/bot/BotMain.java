@@ -25,26 +25,16 @@ public class BotMain {
             System.out.println("[" + now.format(TIME_FORMATTER) + "] Bot started");
 
             // ===== START SIGNALS =====
-            signalSender.start(); // запуск потоков анализатора
+            signalSender.start(); // запускаем все анализаторы
         } catch (Exception e) {
             telegram.sendMessageAsync("❌ Ошибка старта SignalSender: " + e.getMessage());
             e.printStackTrace();
         }
 
-        // ===== ADD SHUTDOWN HOOK =====
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                System.out.println("Shutdown hook triggered");
-                signalSender.stop();          // корректная остановка всех потоков анализа
-                telegram.sendMessageAsync("🛑 Бот остановлен");
-                telegram.shutdown();          // закрываем Telegram потоки
-            } catch (Exception ignored) {}
-        }));
-
         // ===== KEEP JVM ALIVE 24/7 =====
         while (true) {
             try {
-                Thread.sleep(60_000); // спим по 1 минуте, JVM живёт
+                Thread.sleep(60_000); // спим по 1 минуте
             } catch (InterruptedException ignored) {}
         }
     }
