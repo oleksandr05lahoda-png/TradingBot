@@ -605,9 +605,8 @@ public class SignalSender {
                 s.confidence *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200); // динамическое снижение
             }
         }
-        if (activeSignals.containsKey(pair)) return; // сигнал уже открыт
-        activeSignals.put(pair, s); // отметка что сигнал активен
-        // Дальше обычные проверки
+        if (activeSignals.get(pair) != null) return;
+        activeSignals.put(pair, s);
         if (isCooldown(pair, s.direction)) return;
         if (closes15m.size() < 4) return;
 
@@ -935,24 +934,26 @@ public class SignalSender {
 
                 List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
                 List<TradingCore.Candle> c1h = new ArrayList<>(f1h.join());
-
-                if (c15m.size() < 2) continue; // минимальный размер для RSI
+                if (c15m.size() < 20 || c1h.size() < 20) continue; // минимальный размер для индикаторов
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
-                double atr5 = SignalSender.atr(c15m, 14);
-                if (atr5 <= 0) continue;
+
+                // ================= ATR & VOLUME =================
+                double atr15 = SignalSender.atr(c15m, 14);
+                if (atr15 <= 0) continue;
+                double avgVol = c15m.stream().mapToDouble(c -> c.volume).average().orElse(0);
+                boolean volOk = last.volume >= avgVol * VOL_MULTIPLIER;
+                boolean atrOk = atr15 / last.close >= ATR_MIN_PCT;
 
                 // ================= IMPULSE DIRECTION =================
-                boolean impulseUp = last.close > last.open && (last.high - last.low) > atr5 * 0.8;
-                boolean impulseDown = last.close < last.open && (last.high - last.low) > atr5 * 0.8;
+                boolean impulseUp = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
+                boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
                 TradingCore.Side side = impulseUp ? TradingCore.Side.LONG :
                         impulseDown ? TradingCore.Side.SHORT : null;
                 if (side == null) continue;
 
-                List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
-                if (closes15.size() < 2) continue;
-
                 // ================= RSI FILTER =================
+                List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
                 double rsi14 = SignalSender.rsi(closes15, 14);
                 if ((side == TradingCore.Side.LONG && rsi14 > 80) ||
                         (side == TradingCore.Side.SHORT && rsi14 < 20)) continue;
@@ -961,95 +962,52 @@ public class SignalSender {
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
-                if (Math.abs(mtfConfirm) > 0 && ((side == TradingCore.Side.LONG && mtfConfirm < 0) ||
-                        (side == TradingCore.Side.SHORT && mtfConfirm > 0))) continue;
+                if ((side == TradingCore.Side.LONG && mtfConfirm < 0) ||
+                        (side == TradingCore.Side.SHORT && mtfConfirm > 0)) continue;
+
                 // ================= RAW SCORE =================
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
                         strategyRSINorm(closes15) * 0.25 +
                         strategyMomentumNorm(closes15) * 0.20 +
                         strategyMACDNorm(closes15) * 0.20;
 
-                // ================= VOLUME & ATR CHECK =================
-                double avgVol = c15m.stream().mapToDouble(c -> c.volume).average().orElse(0);
-                boolean volOk = last.close > avgVol * VOL_MULTIPLIER;
-                boolean atrOk = atr5 / last.close > ATR_MIN_PCT;
-
-                // ================= ADAPTIVE CONFIDENCE =================
+                // ================= CONFIDENCE =================
                 double conf = adaptiveBrain != null
                         ? rawScore * (volOk && atrOk ? 1.0 : 0.9)
                         : composeConfidence(rawScore, mtfConfirm, volOk, atrOk, true, true, true,
                         detectBOS(c15m), detectLiquiditySweep(c15m));
                 conf = Math.max(0.50, Math.min(0.88, conf));
 
-                // ================= END OF TREND CHECK =================
-                double lastHigh = lastSwingHigh(c15m);
-                double lastLow = lastSwingLow(c15m);
-                boolean nearSwingHigh = side == TradingCore.Side.LONG && last.close >= lastHigh * 0.995;
-                boolean nearSwingLow = side == TradingCore.Side.SHORT && last.close <= lastLow * 1.005;
+                // ================= STOP / TAKE =================
+                double pct = Math.max(0.003, Math.min(0.015, atr15 / last.close));
+                double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
+                double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 2) : last.close * (1 - pct * 2);
 
-                MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
-                boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
+                // ================= CREATE SIGNAL =================
+                Signal s = new Signal(
+                        pair,
+                        side.toString(),
+                        conf,
+                        last.close,
+                        rsi14,
+                        rawScore,
+                        mtfConfirm,
+                        volOk,
+                        atrOk,
+                        true,                   // strongTrigger
+                        side == TradingCore.Side.LONG,
+                        side == TradingCore.Side.SHORT,
+                        true,                   // impulse
+                        SignalSender.rsi(closes15, 7),
+                        SignalSender.rsi(closes15, 4)
+                );
+                s.stop = stop;
+                s.take = take;
+                s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
+                s.confidence = optimizer.adjustConfidence(s, s.confidence);
+                optimizer.adjustStopTake(s, atr15);
 
-                boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
-                List<TradingCore.Candle> recent = new ArrayList<>(c15m.subList(Math.max(0, c15m.size() - 30), c15m.size()));
-                boolean bos = detectBOS(recent);
-                boolean liqSweep = detectLiquiditySweep(recent);
-
-                if (endOfTrend && !bos && !liqSweep) conf *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200);
-                conf = Math.max(0.50, Math.min(0.88, conf));
-
-                // ================= ELITE5 SIGNALS =================
-                Map<String, TradingCore.CoinType> coinTypeMap = Map.of(pair, TradingCore.CoinType.ALT);
-                List<Elite5MinAnalyzer.TradeSignal> ideas = elite5MinAnalyzer != null
-                        ? elite5MinAnalyzer.analyze(List.of(pair), Map.of(pair, c15m), Map.of(pair, c1h), Map.of(pair, "ALT"))
-                        : null;
-
-                if (ideas != null) {
-                    for (Elite5MinAnalyzer.TradeSignal i : ideas) {
-                        TradingCore.Side sSide = i.side;
-                        if (sSide == null) continue;
-
-                        double baseConf = Math.max(0.50, Math.min(0.88, i.confidence));
-
-                        // ================= RISK ENGINE =================
-                        TradingCore.RiskEngine.TradeSignal ts = riskEngine != null
-                                ? riskEngine.applyRisk(pair, sSide, i.entry, atr5, baseConf, "ELITE5", coinTypeMap.get(pair))
-                                : null;
-
-                        double finalConf = ts != null ? Math.max(0.50, Math.min(0.88, ts.confidence)) : baseConf;
-
-                        double pct = Math.max(0.003, Math.min(0.015, atr5 / last.close)); // от 0.3% до 1.5%
-                        double stop = sSide == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
-                        double take = sSide == TradingCore.Side.LONG ? last.close * (1 + pct * 2) : last.close * (1 - pct * 2);
-
-                        // ================= CREATE SIGNAL =================
-                        Signal s = new Signal(
-                                pair,
-                                sSide.toString(),
-                                finalConf,
-                                i.entry,
-                                rsi14,
-                                rawScore,
-                                mtfConfirm,
-                                volOk,
-                                atrOk,
-                                true,                   // strongTrigger
-                                sSide == TradingCore.Side.LONG,
-                                sSide == TradingCore.Side.SHORT,
-                                true,                   // impulse
-                                SignalSender.rsi(closes15, 7),
-                                SignalSender.rsi(closes15, 4)
-                        );
-
-                        s.stop = stop;
-                        s.take = take;
-                        s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
-                        s.confidence = optimizer.adjustConfidence(s, s.confidence);
-                        optimizer.adjustStopTake(s, atr5);
-
-                        sendSignalIfAllowed(pair, s, c15m);
-                    }
-                }
+                sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
                 System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
