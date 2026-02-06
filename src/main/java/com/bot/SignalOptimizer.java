@@ -83,8 +83,6 @@ public final class SignalOptimizer {
             s.stop = s.price * (1 + volPct);
             s.take = s.price * (1 - volPct * rr);
         }
-
-        s.leverage = clamp(2.0 + (s.confidence - 0.5) * 8, 2.0, 6.5);
     }
 
     /* ======================= UTILS ======================= */
