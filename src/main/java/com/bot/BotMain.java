@@ -13,42 +13,39 @@ public class BotMain {
 
     public static void main(String[] args) {
 
+        // ===== INIT BOT =====
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
         SignalSender signalSender = new SignalSender(telegram);
 
+        // ===== START BOT =====
         try {
             LocalDateTime now = LocalDateTime.now(ZONE);
 
-            // Асинхронная отправка стартового сообщения
-            telegram.sendMessageAsync(
-                    "🚀 Бот запущен\n"
-            );
-
+            telegram.sendMessageAsync("🚀 Бот запущен");
             System.out.println("[" + now.format(TIME_FORMATTER) + "] Bot started");
 
-            // ===== START CORE =====
-            signalSender.start();
-
+            // ===== START SIGNALS =====
+            signalSender.start(); // запуск потоков анализатора
         } catch (Exception e) {
-            telegram.sendMessageAsync(
-                    "❌ Ошибка старта SignalSender: " + e.getMessage()
-            );
+            telegram.sendMessageAsync("❌ Ошибка старта SignalSender: " + e.getMessage());
             e.printStackTrace();
-            return;
         }
 
-        // ===== SHUTDOWN HOOK =====
+        // ===== ADD SHUTDOWN HOOK =====
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
-                signalSender.stop(); // корректная остановка SignalSender
+                System.out.println("Shutdown hook triggered");
+                signalSender.stop();          // корректная остановка всех потоков анализа
                 telegram.sendMessageAsync("🛑 Бот остановлен");
-                System.out.println("Bot stopped");
+                telegram.shutdown();          // закрываем Telegram потоки
             } catch (Exception ignored) {}
         }));
 
-        // ===== KEEP JVM ALIVE =====
-        try {
-            Thread.currentThread().join();
-        } catch (InterruptedException ignored) {}
+        // ===== KEEP JVM ALIVE 24/7 =====
+        while (true) {
+            try {
+                Thread.sleep(60_000); // спим по 1 минуте, JVM живёт
+            } catch (InterruptedException ignored) {}
+        }
     }
 }
