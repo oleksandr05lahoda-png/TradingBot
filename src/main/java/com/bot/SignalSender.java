@@ -937,7 +937,6 @@ public class SignalSender {
                 List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
                 List<TradingCore.Candle> c1h = new ArrayList<>(f1h.join());
 
-                // Проверка минимального объема данных
                 if (c15m.size() < 20 || c1h.size() < 20) continue;
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
@@ -992,8 +991,8 @@ public class SignalSender {
                     if (volOk) conf += 0.02;
                 }
 
-                // ================= STOP / TAKE =================
-                double pct = Math.max(0.003, Math.min(0.015, atr15 / last.close));
+                // ================= STOP / TAKE (на основе ATR, быстрые сделки) =================
+                double pct = Math.max(0.003, Math.min(0.01, atr15 / last.close)); // стоп 0.3–1%
                 double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
                 double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 2) : last.close * (1 - pct * 2);
 
@@ -1019,14 +1018,7 @@ public class SignalSender {
                 s.stop = stop;
                 s.take = take;
 
-                double baseLev = 2.0 + (conf - 0.5) * 8;
-                double atrFactor = Math.min(1.5, atr15 / last.close * 20);
-                s.leverage = Math.max(2.0, Math.min(7.0, baseLev + atrFactor));
-
-                s.confidence = optimizer.adjustConfidence(s, s.confidence);
-                optimizer.adjustStopTake(s, atr15);
-
-                // ================= SEND SIGNAL IF ALLOWED =================
+                // Сохраняем только confidence, stop/take, импульс, направление
                 sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
