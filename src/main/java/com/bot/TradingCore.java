@@ -16,14 +16,8 @@ public class TradingCore {
         public final double volume;
         public final double quoteAssetVolume;
 
-        public Candle(long openTime,
-                      double open,
-                      double high,
-                      double low,
-                      double close,
-                      double volume,
-                      double quoteAssetVolume,
-                      long closeTime) {
+        public Candle(long openTime, double open, double high, double low,
+                      double close, double volume, double quoteAssetVolume, long closeTime) {
             this.openTime = openTime;
             this.open = open;
             this.high = high;
@@ -32,6 +26,12 @@ public class TradingCore {
             this.volume = volume;
             this.quoteAssetVolume = quoteAssetVolume;
             this.closeTime = closeTime;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("Candle[%d - %d | O: %.4f H: %.4f L: %.4f C: %.4f V: %.4f]",
+                    openTime, closeTime, open, high, low, close, volume);
         }
     }
 
@@ -68,7 +68,8 @@ public class TradingCore {
             public final CoinType type;
 
             public TradeSignal(String symbol, Side side, double entry,
-                               double stop, double take, double confidence, String reason, CoinType type) {
+                               double stop, double take, double confidence,
+                               String reason, CoinType type) {
                 this.symbol = symbol;
                 this.side = side;
                 this.entry = entry;
@@ -81,23 +82,17 @@ public class TradingCore {
 
             @Override
             public String toString() {
-                return "TradeSignal{" +
-                        "symbol='" + symbol + '\'' +
-                        ", type=" + type +
-                        ", side=" + side +
-                        ", entry=" + entry +
-                        ", stop=" + stop +
-                        ", take=" + take +
-                        ", confidence=" + confidence +
-                        ", reason='" + reason + '\'' +
-                        '}';
+                return String.format("TradeSignal[%s | %s | %s | Entry: %.4f Stop: %.4f Take: %.4f Conf: %.2f Reason: %s]",
+                        symbol, type, side, entry, stop, take, confidence, reason);
             }
         }
 
+        /**
+         * Применяет риск-менеджмент к сигналу.
+         */
         public TradeSignal applyRisk(String symbol, Side side, double entry, double atr,
                                      double confidence, String reason, CoinType type) {
 
-            // ================== DYNAMIC STOP ==================
             double riskMultiplier = switch (type) {
                 case TOP -> 1.0;
                 case ALT -> 1.2;
@@ -124,26 +119,22 @@ public class TradingCore {
         private final Map<String, Double> symbolBias = new ConcurrentHashMap<>();
         private final Map<String, Integer> streaks = new ConcurrentHashMap<>();
 
-        public double applyAllAdjustments(String strategy, String symbol, double baseConfidence, CoinType type, boolean highVol, boolean lowVol) {
+        /**
+         * Корректирует уверенность сигнала с учетом стратегии, монеты, объема и текущих сессий.
+         */
+        public double applyAllAdjustments(String strategy, String symbol, double baseConfidence,
+                                          CoinType type, boolean highVol, boolean lowVol) {
             double conf = baseConfidence;
 
-            // ================= STRATEGY ADJUST =================
             conf += adaptStrategy(strategy);
-
-            // ================= SYMBOL BIAS =================
-            conf += getSymbolBias(symbol);
-
-            // ================= SESSION BOOST =================
+            conf += symbolBias.getOrDefault(symbol, 0.0);
             conf += sessionBoost();
-
-            // ================= COIN TYPE BOOST =================
             conf += switch (type) {
                 case TOP -> 0.00;
                 case ALT -> 0.02;
                 case MEME -> 0.04;
             };
 
-            // ================= VOLUME ADJUST =================
             if (highVol) conf += 0.03;
             if (lowVol) conf -= 0.02;
 
@@ -151,12 +142,7 @@ public class TradingCore {
         }
 
         private double adaptStrategy(String strategy) {
-            if ("ELITE5".equalsIgnoreCase(strategy)) return 0.02;
-            return 0.0;
-        }
-
-        private double getSymbolBias(String symbol) {
-            return symbolBias.getOrDefault(symbol, 0.0);
+            return "ELITE5".equalsIgnoreCase(strategy) ? 0.02 : 0.0;
         }
 
         private double sessionBoost() {

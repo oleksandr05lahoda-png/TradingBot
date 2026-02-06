@@ -622,7 +622,7 @@ public class SignalSender {
 
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
-        bot.sendSignal(s.toTelegramMessage());
+        bot.sendMessage(s.toTelegramMessage());
         signalsThisCycle++; // отправка
         markSignalSent(pair, s.direction);
     }
@@ -739,10 +739,9 @@ public class SignalSender {
                         }
 
                         @Override
-                        public CompletionStage<?> onError(java.net.http.WebSocket webSocket, Throwable error) {
+                        public void onError(java.net.http.WebSocket webSocket, Throwable error) {
                             System.out.println("[WS ERROR] " + pair + " " + error.getMessage());
                             reconnect(pair);
-                            return CompletableFuture.completedFuture(null);
                         }
 
                         @Override

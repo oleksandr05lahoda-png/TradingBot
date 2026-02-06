@@ -12,19 +12,20 @@ import java.time.format.DateTimeFormatter;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * Класс для безопасной отправки сообщений в Telegram.
+ * Асинхронная очередь + Heartbeat + Retry.
+ */
 public final class TelegramBotSender {
 
     private final String token;
     private final String chatId;
-
     private final HttpClient client;
     private final BlockingQueue<String> queue = new LinkedBlockingQueue<>(1000);
     private final ScheduledExecutorService sender;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    private static final DateTimeFormatter DTF =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-
+    private static final DateTimeFormatter DTF = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final int RATE_LIMIT_MS = 1200; // безопасно для TG
     private static final int MAX_RETRY = 3;
 
@@ -47,39 +48,36 @@ public final class TelegramBotSender {
     }
 
     // ======================= PUBLIC API =======================
-    public void sendMessageSync(String message) {
-        try {
 
-            HttpRequest req = buildRequest(message);
-
-            HttpResponse<String> resp =
-                    client.send(req, HttpResponse.BodyHandlers.ofString());
-
-            if (resp.statusCode() == 200) {
-                log("SYNC OK");
-            } else {
-                log("SYNC HTTP " + resp.statusCode());
-            }
-
-        } catch (Exception e) {
-            log("SYNC ERROR: " + e.getMessage());
-        }
-    }
-
-    public void send(String message) {
+    /** Асинхронная отправка сообщения через очередь */
+    public void sendMessageAsync(String message) {
         if (!running.get()) return;
         if (!queue.offer(message)) {
-            System.err.println("[TG] Очередь переполнена, сообщение отброшено");
+            log("[WARN] Очередь переполнена, сообщение отброшено");
         }
     }
 
+    /** Синхронная отправка сообщения (блокирующая) */
+    public void sendMessageSync(String message) {
+        sendWithRetry(message);
+    }
+
+    /** Корректная остановка */
     public void shutdown() {
         running.set(false);
         sender.shutdown();
+        try {
+            if (!sender.awaitTermination(5, TimeUnit.SECONDS)) {
+                sender.shutdownNow();
+            }
+        } catch (InterruptedException ignored) {
+            sender.shutdownNow();
+        }
     }
 
     // ======================= INTERNAL =======================
 
+    /** Поток обработки очереди сообщений */
     private void startWorker() {
         sender.scheduleWithFixedDelay(() -> {
             try {
@@ -89,33 +87,35 @@ public final class TelegramBotSender {
                     Thread.sleep(RATE_LIMIT_MS);
                 }
             } catch (Throwable t) {
-                System.err.println("[TG] Критическая ошибка sender: " + t.getMessage());
+                log("[ERROR] Sender thread: " + t.getMessage());
                 t.printStackTrace();
             }
         }, 0, 500, TimeUnit.MILLISECONDS);
     }
 
+    /** Отправка сообщения с повтором в случае ошибок */
     private void sendWithRetry(String message) {
         for (int i = 1; i <= MAX_RETRY; i++) {
             try {
                 HttpRequest req = buildRequest(message);
-                HttpResponse<String> resp =
-                        client.send(req, HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
 
                 if (resp.statusCode() == 200) {
-                    log("OK");
+                    log("[OK] Message sent");
                     return;
                 } else {
-                    log("HTTP " + resp.statusCode());
+                    log("[WARN] HTTP " + resp.statusCode());
                 }
 
             } catch (Exception e) {
-                log("Retry " + i + " failed: " + e.getMessage());
-                sleep(800L * i);
+                log("[Retry " + i + "] failed: " + e.getMessage());
+                sleep(800L * i); // экспоненциальная задержка
             }
         }
+        log("[ERROR] Failed to send message after " + MAX_RETRY + " attempts");
     }
 
+    /** Создание запроса к Telegram API */
     private HttpRequest buildRequest(String message) throws Exception {
         String url = "https://api.telegram.org/bot" + token + "/sendMessage"
                 + "?chat_id=" + chatId
@@ -130,9 +130,10 @@ public final class TelegramBotSender {
 
     // ======================= HEARTBEAT =======================
 
+    /** Периодическое сообщение, что бот жив */
     private void startHeartbeat() {
         sender.scheduleAtFixedRate(() -> {
-            send("🤖 Bot alive: " + LocalDateTime.now().format(DTF));
+            sendMessageAsync("🤖 Bot alive: " + LocalDateTime.now().format(DTF));
         }, 10, 30, TimeUnit.MINUTES);
     }
 

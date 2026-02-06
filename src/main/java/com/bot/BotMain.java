@@ -5,39 +5,34 @@ import java.time.format.DateTimeFormatter;
 
 public class BotMain {
 
+    // ===== CONFIG =====
+    private static final String TG_TOKEN = "8395445212:AAF7X7oFBx72HgKGoRTcFpdFbuHcZOPfTig";
+    private static final String CHAT_ID = "953233853";
+    private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
+    private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
+
     public static void main(String[] args) {
 
-        // ===== CONFIG =====
-        String tgToken = "PASTE_TOKEN_HERE";
-        String chatId = "PASTE_CHAT_ID";
-
-        TelegramBotSender telegram = new TelegramBotSender(tgToken, chatId);
+        TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
         SignalSender signalSender = new SignalSender(telegram);
 
-        ZoneId zone = ZoneId.of("Europe/Warsaw");
-        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("HH:mm:ss");
-
         try {
+            LocalDateTime now = LocalDateTime.now(ZONE);
 
-            LocalDateTime now = LocalDateTime.now(zone);
-
-            telegram.sendMessageSync(
-                    "🚀 Бот запущен\n" +
-                            "⏰ Время: " + now.format(dtf) + "\n" +
-                            "📡 Режим: FUTURES 15m"
+            // Асинхронная отправка стартового сообщения
+            telegram.sendMessageAsync(
+                    "🚀 Бот запущен\n"
             );
 
-            System.out.println("[" + now.format(dtf) + "] Bot started");
+            System.out.println("[" + now.format(TIME_FORMATTER) + "] Bot started");
 
             // ===== START CORE =====
             signalSender.start();
 
         } catch (Exception e) {
-
-            telegram.sendMessageSync(
-                    "❌ Критическая ошибка старта:\n" + e.getMessage()
+            telegram.sendMessageAsync(
+                    "❌ Ошибка старта SignalSender: " + e.getMessage()
             );
-
             e.printStackTrace();
             return;
         }
@@ -45,8 +40,8 @@ public class BotMain {
         // ===== SHUTDOWN HOOK =====
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
-                signalSender.stop();
-                telegram.sendMessageSync("🛑 Бот остановлен");
+                signalSender.stop(); // корректная остановка SignalSender
+                telegram.sendMessageAsync("🛑 Бот остановлен");
                 System.out.println("Bot stopped");
             } catch (Exception ignored) {}
         }));
