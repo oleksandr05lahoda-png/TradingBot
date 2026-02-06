@@ -677,7 +677,7 @@ public class SignalSender {
                     (impulse ? "IMPULSE " : "");
             String localTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
 
-            return String.format("*%s* → *%s*\n" + "Confidence: *%.2f*\n" + "Price: %.8f\n" + "Leverage: x%.1f\n" + "SL: %.8f\n" + "TP: %.8f\n" + "RSI(14): %.2f\n" + "_flags_: %s\n" + "_raw: %.3f mtf:%d vol:%b atr:%b_\n" + "_time: %s_",
+            return String.format("*%s* → *%s*\n" + "Confidence: *%.2f*\n" + "Price: %.8f\n" + "SL: %.8f\n" + "TP: %.8f\n" + "RSI(14): %.2f\n" + "_flags_: %s\n" + "_raw: %.3f mtf:%d vol:%b atr:%b_\n" + "_time: %s_",
                     symbol, direction, confidence, price, stop != null ? stop : 0.0, take != null ? take : 0.0, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk,
                     localTime
             );
