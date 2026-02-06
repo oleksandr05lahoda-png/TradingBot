@@ -918,29 +918,34 @@ public class SignalSender {
         if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
             cachedPairs = getTopSymbolsSet(TOP_N);
             lastBinancePairsRefresh = now;
-            System.out.println("[Pairs] refreshed top symbols: " + cachedPairs.size());
+            System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
         }
 
+        // Фильтруем только поддерживаемые пары
         Set<String> symbols = cachedPairs.stream()
                 .filter(BINANCE_PAIRS::contains)
                 .collect(Collectors.toSet());
 
+        // ================= PROCESS EACH SYMBOL =================
         for (String pair : symbols) {
             try {
-                // ================= FETCH CANDLES =================
+                // ================= FETCH CANDLES ASYNC =================
                 CompletableFuture<List<TradingCore.Candle>> f15 = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
                 CompletableFuture<List<TradingCore.Candle>> f1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
                 CompletableFuture.allOf(f15, f1h).join();
 
                 List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
                 List<TradingCore.Candle> c1h = new ArrayList<>(f1h.join());
-                if (c15m.size() < 20 || c1h.size() < 20) continue; // минимальный размер для индикаторов
+
+                // Проверка минимального объема данных
+                if (c15m.size() < 20 || c1h.size() < 20) continue;
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
 
-                // ================= ATR & VOLUME =================
+                // ================= ATR & VOLUME FILTER =================
                 double atr15 = SignalSender.atr(c15m, 14);
                 if (atr15 <= 0) continue;
+
                 double avgVol = c15m.stream().mapToDouble(c -> c.volume).average().orElse(0);
                 boolean volOk = last.volume >= avgVol * VOL_MULTIPLIER;
                 boolean atrOk = atr15 / last.close >= ATR_MIN_PCT;
@@ -965,30 +970,27 @@ public class SignalSender {
                 if ((side == TradingCore.Side.LONG && mtfConfirm < 0) ||
                         (side == TradingCore.Side.SHORT && mtfConfirm > 0)) continue;
 
-                // ================= RAW SCORE =================
+                // ================= RAW SIGNAL SCORE =================
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
                         strategyRSINorm(closes15) * 0.25 +
                         strategyMomentumNorm(closes15) * 0.20 +
                         strategyMACDNorm(closes15) * 0.20;
 
-                // ================= CONFIDENCE =================
-                double conf = adaptiveBrain != null
-                        ? rawScore * (volOk && atrOk ? 1.0 : 0.9)
-                        : composeConfidence(rawScore, mtfConfirm, volOk, atrOk, true, true, true,
-                        detectBOS(c15m), detectLiquiditySweep(c15m));
-                conf = Math.max(0.50, Math.min(0.88, conf));
-                // --- адаптация confidence по силе сигнала и случайной поправке ---
+                // ================= CONFIDENCE COMPOSITION =================
+                double conf = composeConfidence(
+                        rawScore, mtfConfirm, volOk, atrOk,
+                        impulseUp || impulseDown,
+                        true,  // vwapAligned
+                        true,  // structureAligned
+                        detectBOS(c15m),
+                        detectLiquiditySweep(c15m)
+                );
+
                 if (conf > 0.5) {
-                    // небольшая поправка по ATR (волатильность)
                     conf += Math.min(0.05, atr15 / last.close * 10);
-                    // mtfConfirm добавляет силу
                     if (mtfConfirm != 0) conf += 0.03;
-                    // объём выше среднего усиливает сигнал
                     if (volOk) conf += 0.02;
-                    // случайная мелкая поправка, чтобы не было одинаковых
-                    conf += (Math.random() - 0.5) * 0.03;
                 }
-                conf = Math.max(0.50, Math.min(0.88, conf));
 
                 // ================= STOP / TAKE =================
                 double pct = Math.max(0.003, Math.min(0.015, atr15 / last.close));
@@ -1013,22 +1015,26 @@ public class SignalSender {
                         SignalSender.rsi(closes15, 7),
                         SignalSender.rsi(closes15, 4)
                 );
+
                 s.stop = stop;
                 s.take = take;
-                double baseLev = 2.0 + (conf - 0.5) * 8;                 // основной вклад от силы сигнала
-                double atrFactor = Math.min(1.5, atr15 / last.close * 20); // небольшое увеличение плеча для волатильности
+
+                double baseLev = 2.0 + (conf - 0.5) * 8;
+                double atrFactor = Math.min(1.5, atr15 / last.close * 20);
                 s.leverage = Math.max(2.0, Math.min(7.0, baseLev + atrFactor));
+
                 s.confidence = optimizer.adjustConfidence(s, s.confidence);
                 optimizer.adjustStopTake(s, atr15);
 
+                // ================= SEND SIGNAL IF ALLOWED =================
                 sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
-                System.out.println("[Scheduler] error for " + pair + ": " + e.getMessage());
+                System.out.println("[Scheduler] Error for " + pair + ": " + e.getMessage());
                 e.printStackTrace();
             }
         }
 
-        System.out.println("[Cycle] signals sent: " + signalsThisCycle);
+        System.out.println("[Cycle] Signals sent: " + signalsThisCycle);
     }
 }
