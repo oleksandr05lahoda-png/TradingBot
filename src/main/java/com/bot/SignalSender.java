@@ -615,7 +615,7 @@ public class SignalSender {
                 .getOrDefault(pair, new ConcurrentHashMap<>())
                 .getOrDefault(s.direction, 0L);
 
-        if (Math.abs(candleTs - lastTs) < 5 * 60_000) return;
+        if (Math.abs(candleTs - lastTs) < 15 * 60_000) return;
 
         lastSignalCandleTs.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
                 .put(s.direction, candleTs);

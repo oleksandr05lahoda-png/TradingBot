@@ -44,7 +44,6 @@ public final class TelegramBotSender {
         });
 
         startWorker();
-        startHeartbeat();
     }
 
     // ======================= PUBLIC API =======================
@@ -128,16 +127,6 @@ public final class TelegramBotSender {
                 .build();
     }
 
-    // ======================= HEARTBEAT =======================
-
-    /** Периодическое сообщение, что бот жив */
-    private void startHeartbeat() {
-        sender.scheduleAtFixedRate(() -> {
-            sendMessageAsync("🤖 Bot alive: " + LocalDateTime.now().format(DTF));
-        }, 10, 30, TimeUnit.MINUTES);
-    }
-
-    // ======================= UTILS =======================
 
     private void log(String msg) {
         System.out.println("[TG " + LocalDateTime.now().format(DTF) + "] " + msg);

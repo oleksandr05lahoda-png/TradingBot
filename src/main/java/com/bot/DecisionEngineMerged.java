@@ -5,8 +5,6 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class DecisionEngineMerged {
 
-    /* ======================= MODEL ======================= */
-
     public enum SignalGrade { A, B }
 
     public static final class TradeIdea {
@@ -36,40 +34,27 @@ public final class DecisionEngineMerged {
 
         @Override
         public String toString() {
-            return String.format("TradeIdea[%s | %s | %s | Entry: %.4f Stop: %.4f Take: %.4f Conf: %.2f ATR: %.4f Reason: %s]",
+            return String.format("[SIGNAL] %s | %s | %s | Entry: %.4f Stop: %.4f Take: %.4f Conf: %.2f ATR: %.4f Reason: %s",
                     symbol, coinType, side, entry, stop, take, confidence, atr, reason);
         }
     }
 
-    /* ======================= FUTURES FILTER ======================= */
-
     private static final Set<String> FUTURES = ConcurrentHashMap.newKeySet();
-
     public static void loadFuturesSymbols(Collection<String> symbols) {
         FUTURES.clear();
         FUTURES.addAll(symbols);
         System.out.println("[INIT] Futures loaded: " + FUTURES.size());
     }
-
     private static boolean isFutures(String s) {
         return FUTURES.isEmpty() || FUTURES.contains(s);
     }
 
-    /* ======================= CONFIG ======================= */
-
-    private static final int MAX_COINS = 70;
-
-    private static final double MIN_ATR_TOP  = 0.0012;
-    private static final double MIN_ATR_ALT  = 0.0010;
-    private static final double MIN_ATR_MEME = 0.0008;
-
-    private static final double STOP_ATR = 0.6;
+    private static final int MAX_COINS = 120;      // максимум монет для сканирования
+    private static final double STOP_ATR = 0.45;   // чуть меньше, чтобы чаще были сигналы
     private static final double RR_A = 2.0;
-    private static final double RR_B = 1.5;
+    private static final double RR_B = 1.4;
 
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
-
-    /* ======================= MAIN ======================= */
 
     public List<TradeIdea> evaluate(List<String> symbols,
                                     Map<String, List<TradingCore.Candle>> m15,
@@ -87,19 +72,11 @@ public final class DecisionEngineMerged {
             var c15 = m15.get(s);
             var c1h = h1.get(s);
 
-            if (!valid(c15, 60) || !valid(c1h, 40)) continue;
+            if (!valid(c15, 15) || !valid(c1h, 15)) continue; // минимальный объем данных
 
             String type = coinTypes.getOrDefault(s, "ALT");
             double price = last(c15).close;
             double atr = atr(c15, 14);
-
-            double minAtr = switch (type) {
-                case "TOP"  -> MIN_ATR_TOP;
-                case "MEME" -> MIN_ATR_MEME;
-                default     -> MIN_ATR_ALT;
-            };
-
-            if (atr / price < minAtr) continue;
 
             EMA ltf = emaContext(c15);
             EMA htf = emaContext(c1h);
@@ -108,49 +85,49 @@ public final class DecisionEngineMerged {
             if (idea != null) out.add(idea);
         }
 
-        // Сортировка по уверенности и ATR
+        // сортировка по уверенности, выше confidence → раньше в списке
         out.sort(Comparator.comparingDouble((TradeIdea t) -> t.confidence)
-                .thenComparingDouble(t -> t.atr)
                 .reversed());
 
         return out;
     }
-
-    /* ======================= CORE LOGIC ======================= */
 
     private TradeIdea scan(String s, List<TradingCore.Candle> c, double atr,
                            EMA ltf, EMA htf, String type, long now) {
 
         double score = 0.50;
 
-        // Тренд
-        if (ltf.bullish && htf.bullish) score += 0.10;
-        if (ltf.bearish && htf.bearish) score += 0.10;
+        // Трендовые оценки
+        if (ltf.bullish) score += 0.08;
+        if (ltf.bearish) score += 0.08;
+        if (htf.bullish) score += 0.06;
+        if (htf.bearish) score += 0.06;
 
-        // Импульсная свеча
-        if (impulse(c)) score += 0.06;
-
-        // Объем
+        // Импульсная свеча и объем
+        if (impulse(c)) score += 0.07;
         if (last(c).volume > avgVol(c, 20)) score += 0.05;
 
-        if (score < 0.55) return null;
+        // Вес MEME/TOP/ALT
+        switch (type) {
+            case "TOP" -> score += 0.03;
+            case "MEME" -> score -= 0.01;
+        }
 
-        TradingCore.Side side = ltf.bullish ? TradingCore.Side.LONG :
-                ltf.bearish ? TradingCore.Side.SHORT : null;
+        score = clamp(score, 0.45, 0.90); // максимум 0.90
 
-        if (side == null) return null;
+        // Генерация стороны LONG/SHORT
+        TradingCore.Side side;
+        if (ltf.bullish && htf.bullish) side = TradingCore.Side.LONG;
+        else if (ltf.bearish && htf.bearish) side = TradingCore.Side.SHORT;
+        else return null; // пропускаем непонятные сигналы
 
         String key = s + side;
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < 60_000) return null;
-
+        long cd = 15 * 60_000; // cooldown 15 минут
+        if (cooldown.containsKey(key) && now - cooldown.get(key) < cd) return null;
         cooldown.put(key, now);
 
-        TradeIdea idea = build(s, c, side, atr, score, type);
-        System.out.println("[SIGNAL] " + idea);
-        return idea;
+        return build(s, c, side, atr, score, type);
     }
-
-    /* ======================= BUILD ======================= */
 
     private TradeIdea build(String s, List<TradingCore.Candle> c, TradingCore.Side side,
                             double atr, double score, String type) {
@@ -166,27 +143,23 @@ public final class DecisionEngineMerged {
                 : entry - risk * (grade == SignalGrade.A ? RR_A : RR_B);
 
         return new TradeIdea(s, side, entry, stop, take,
-                clamp(score, 0.55, 0.85), atr, grade,
-                "15M FUTURES CONF " + grade, type);
+                score, atr, grade,
+                "PROF FUTURES " + grade, type);
     }
-
-    /* ======================= INDICATORS ======================= */
 
     private boolean impulse(List<TradingCore.Candle> c) {
         var k = last(c);
         double body = Math.abs(k.close - k.open);
         double range = k.high - k.low;
-        return range > 0 && body / range > 0.6;
+        return range > 0 && body / range > 0.5;
     }
 
     private EMA emaContext(List<TradingCore.Candle> c) {
         double e9 = ema(c, 9);
         double e21 = ema(c, 21);
         double e50 = ema(c, 50);
-        return new EMA(e9, e21, e50, e9 > e21 && e21 > e50, e9 < e21 && e21 < e50);
+        return new EMA(e9, e21, e50, e9 >= e21 && e21 >= e50, e9 <= e21 && e21 <= e50);
     }
-
-    /* ======================= UTILS ======================= */
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
         return c != null && !c.isEmpty() ? c.get(c.size() - 1) : null;
@@ -222,19 +195,8 @@ public final class DecisionEngineMerged {
     private static final class EMA {
         final double e9, e21, e50;
         final boolean bullish, bearish;
-
         EMA(double e9, double e21, double e50, boolean bullish, boolean bearish) {
-            this.e9 = e9;
-            this.e21 = e21;
-            this.e50 = e50;
-            this.bullish = bullish;
-            this.bearish = bearish;
-        }
-
-        @Override
-        public String toString() {
-            return String.format("EMA[e9=%.4f, e21=%.4f, e50=%.4f, bullish=%b, bearish=%b]",
-                    e9, e21, e50, bullish, bearish);
+            this.e9 = e9; this.e21 = e21; this.e50 = e50; this.bullish = bullish; this.bearish = bearish;
         }
     }
 }

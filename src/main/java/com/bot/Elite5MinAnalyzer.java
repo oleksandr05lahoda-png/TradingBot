@@ -11,23 +11,23 @@ public final class Elite5MinAnalyzer {
     private final Map<String, Long> lastSignal = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    private static final int MAX_COINS = 80;
-    private final double MIN_CONF; // минимальная уверенность сигнала
+    private static final int MAX_COINS = 120; // больше монет для сканирования
+    private final double MIN_CONF;
 
     /* ======================= CONSTRUCTORS ======================= */
     public Elite5MinAnalyzer(DecisionEngineMerged engine) {
-        this(engine, 0.48);
+        this(engine, 0.45); // чуть ниже минимальная уверенность
     }
 
     public Elite5MinAnalyzer(DecisionEngineMerged engine, double minConf) {
         this.engine = engine;
         this.MIN_CONF = minConf;
 
-        // Очистка старых сигналов каждые 10 минут
+        // Очистка старых сигналов каждые 5 минут
         scheduler.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
-            lastSignal.entrySet().removeIf(e -> now - e.getValue() > 20 * 60_000);
-        }, 10, 10, TimeUnit.MINUTES);
+            lastSignal.entrySet().removeIf(e -> now - e.getValue() > 15 * 60_000); // 15 минут
+        }, 5, 5, TimeUnit.MINUTES);
     }
 
     /* ======================= OUTPUT MODEL ======================= */
@@ -74,7 +74,7 @@ public final class Elite5MinAnalyzer {
 
             var m15 = c15.get(s);
             var h1 = c1h.get(s);
-            if (!valid(m15, 50) || !valid(h1, 30)) continue;
+            if (!valid(m15, 30) || !valid(h1, 20)) continue; // чуть меньше свечей для MEME/ALT
 
             String type = coinTypes.getOrDefault(s, "ALT");
 
@@ -90,8 +90,8 @@ public final class Elite5MinAnalyzer {
                 double conf = brain.adjust(s, idea.confidence, type);
 
                 // усиление/ослабление по grade
-                conf += idea.grade == DecisionEngineMerged.SignalGrade.A ? 0.03 : -0.02;
-                conf = clamp(conf, 0.45, 0.95);
+                conf += idea.grade == DecisionEngineMerged.SignalGrade.A ? 0.03 : 0.0; // B grade не занижаем
+                conf = clamp(conf, 0.40, 0.99); // можно чуть ниже для слабых сигналов
 
                 if (conf < MIN_CONF) continue;
 
@@ -108,7 +108,7 @@ public final class Elite5MinAnalyzer {
 
                 out.add(signal);
                 lastSignal.put(key, now);
-                System.out.println("[SIGNAL GENERATED] " + signal);
+                System.out.println("[SIGNAL GENERATED] " + signal); // чисто сигналы
             }
         }
 
@@ -125,13 +125,13 @@ public final class Elite5MinAnalyzer {
             double conf = baseConf;
 
             if (k >= 2) conf += 0.03;
-            if (k <= -2) conf -= 0.03;
+            if (k <= -2) conf -= 0.02; // ослабление только небольшое
 
             if ("TOP".equals(type)) conf += 0.02;
-            if ("MEME".equals(type)) conf -= 0.01;
+            if ("MEME".equals(type)) conf += 0.01; // MEME теперь не теряет уверенность
 
             int hour = LocalTime.now(ZoneOffset.UTC).getHour();
-            if (hour >= 6 && hour <= 22) conf += 0.02;
+            if (hour >= 6 && hour <= 22) conf += 0.02; // дневное время + бонус
 
             return clamp(conf, 0.0, 0.99);
         }
@@ -143,11 +143,12 @@ public final class Elite5MinAnalyzer {
 
     /* ======================= COOLDOWN ======================= */
     private static long cooldown(String type, DecisionEngineMerged.SignalGrade grade) {
-        long base = 5 * 60_000; // 5 минут
-        if (grade == DecisionEngineMerged.SignalGrade.A) base *= 0.5;  // 2.5 мин
-        if (grade == DecisionEngineMerged.SignalGrade.B) base *= 0.8;  // 4 мин
-        if ("MEME".equals(type)) base *= 0.6;
-        if ("TOP".equals(type)) base *= 1.2;
+        long base = 4 * 60_000; // 4 минуты базово
+        if (grade == DecisionEngineMerged.SignalGrade.A) base *= 0.5;  // 2 мин
+        if (grade == DecisionEngineMerged.SignalGrade.B) base *= 0.8;  // 3.2 мин
+        if ("MEME".equals(type)) base *= 0.5; // мемы чаще
+        if ("TOP".equals(type)) base *= 1.0;  // топы стандарт
+        if ("ALT".equals(type)) base *= 0.6;  // альты чаще
         return base;
     }
 
