@@ -16,6 +16,7 @@ public class SignalSender {
     private final com.bot.TelegramBotSender bot;
     private final HttpClient http;
     MarketContext ctx = null; // инициализируем позже в evaluate
+    private final Object wsLock = new Object(); // для безопасного добавления тиков из WebSocket
 
     private final int TOP_N;
     private final double MIN_CONF;            // 0..1
@@ -715,8 +716,11 @@ public class SignalSender {
                                 double qty = json.has("q") ? Double.parseDouble(json.getString("q")) : 0.0;
                                 long ts = json.has("T") ? json.getLong("T") : System.currentTimeMillis();
 
-                                // сохраняем тики
-                                tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>()).addLast(price);
+                                synchronized(wsLock) {
+                                    Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>());
+                                    dq.addLast(price);
+                                    while (dq.size() > TICK_HISTORY) dq.removeFirst();
+                                }
                                 Deque<Double> dq = tickPriceDeque.get(pair);
                                 while (dq.size() > TICK_HISTORY) dq.removeFirst();
 
@@ -738,6 +742,10 @@ public class SignalSender {
 
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         if (dq == null || dq.size() < 5) return new MicroTrendResult(0, 0, 0);
+        Deque<Double> safeDq;
+        synchronized(wsLock) {
+            safeDq = new ArrayDeque<>(dq);
+        }
         List<Double> arr = new ArrayList<>(dq);
         int n = Math.min(arr.size(), 10);
 
