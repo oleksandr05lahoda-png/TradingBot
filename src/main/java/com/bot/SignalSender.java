@@ -977,6 +977,18 @@ public class SignalSender {
                         : composeConfidence(rawScore, mtfConfirm, volOk, atrOk, true, true, true,
                         detectBOS(c15m), detectLiquiditySweep(c15m));
                 conf = Math.max(0.50, Math.min(0.88, conf));
+                // --- адаптация confidence по силе сигнала и случайной поправке ---
+                if (conf > 0.5) {
+                    // небольшая поправка по ATR (волатильность)
+                    conf += Math.min(0.05, atr15 / last.close * 10);
+                    // mtfConfirm добавляет силу
+                    if (mtfConfirm != 0) conf += 0.03;
+                    // объём выше среднего усиливает сигнал
+                    if (volOk) conf += 0.02;
+                    // случайная мелкая поправка, чтобы не было одинаковых
+                    conf += (Math.random() - 0.5) * 0.03;
+                }
+                conf = Math.max(0.50, Math.min(0.88, conf));
 
                 // ================= STOP / TAKE =================
                 double pct = Math.max(0.003, Math.min(0.015, atr15 / last.close));
@@ -1003,7 +1015,9 @@ public class SignalSender {
                 );
                 s.stop = stop;
                 s.take = take;
-                s.leverage = Math.max(2.0, Math.min(7.0, 2.0 + (s.confidence - 0.5) * 10));
+                double baseLev = 2.0 + (conf - 0.5) * 8;                 // основной вклад от силы сигнала
+                double atrFactor = Math.min(1.5, atr15 / last.close * 20); // небольшое увеличение плеча для волатильности
+                s.leverage = Math.max(2.0, Math.min(7.0, baseLev + atrFactor));
                 s.confidence = optimizer.adjustConfidence(s, s.confidence);
                 optimizer.adjustStopTake(s, atr15);
 
