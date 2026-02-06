@@ -44,6 +44,8 @@ public class SignalSender {
     private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
     private final Map<String, Deque<Double>> tickPriceDeque = new ConcurrentHashMap<>();
     private final Map<String, Double> lastTickPrice = new ConcurrentHashMap<>();
+    private final Map<String, java.net.http.WebSocket> wsMap = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService wsWatcher = Executors.newSingleThreadScheduledExecutor();
     private final Map<String, Long> lastTickTime = new ConcurrentHashMap<>();
     private final Map<String, MicroCandleBuilder> microBuilders = new ConcurrentHashMap<>();
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
@@ -702,50 +704,69 @@ public class SignalSender {
     }
 
     public void connectTickWebSocket(String pair) {
+        wsWatcher.execute(() -> connectWsInternal(pair));
+    }
+
+    private void connectWsInternal(String pair) {
         try {
             final String symbol = pair.toLowerCase();
-            String aggUrl = String.format("wss://fstream.binance.com/ws/%s@aggTrade", symbol);
-            System.out.println("[WS] Connecting to " + aggUrl);
-            java.net.http.WebSocket ws = java.net.http.HttpClient.newHttpClient()
+            String url = "wss://fstream.binance.com/ws/" + symbol + "@aggTrade";
+
+            System.out.println("[WS] Connecting " + pair);
+
+            java.net.http.WebSocket ws = HttpClient.newHttpClient()
                     .newWebSocketBuilder()
-                    .buildAsync(URI.create(aggUrl), new java.net.http.WebSocket.Listener() {
+                    .buildAsync(URI.create(url), new java.net.http.WebSocket.Listener() {
+
+                        @Override
                         public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
                             try {
                                 JSONObject json = new JSONObject(data.toString());
-                                double price = json.has("p") ? Double.parseDouble(json.getString("p")) : 0.0;
-                                double qty = json.has("q") ? Double.parseDouble(json.getString("q")) : 0.0;
-                                long ts = json.has("T") ? json.getLong("T") : System.currentTimeMillis();
+                                double price = Double.parseDouble(json.getString("p"));
+                                long ts = json.getLong("T");
 
-                                synchronized(wsLock) {
+                                synchronized (wsLock) {
                                     Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>());
                                     dq.addLast(price);
                                     while (dq.size() > TICK_HISTORY) dq.removeFirst();
                                 }
-                                Deque<Double> dq = tickPriceDeque.get(pair);
-                                while (dq.size() > TICK_HISTORY) dq.removeFirst();
 
                                 lastTickPrice.put(pair, price);
                                 lastTickTime.put(pair, ts);
 
-                            } catch (Exception ex) {
-                                System.out.println("[WS tick parse] " + ex.getMessage());
-                            }
-                            return java.net.http.WebSocket.Listener.super.onText(webSocket, data, last);
+                            } catch (Exception ignored) {}
+                            return CompletableFuture.completedFuture(null);
+                        }
+
+                        @Override
+                        public CompletionStage<?> onError(java.net.http.WebSocket webSocket, Throwable error) {
+                            System.out.println("[WS ERROR] " + pair + " " + error.getMessage());
+                            reconnect(pair);
+                            return CompletableFuture.completedFuture(null);
+                        }
+
+                        @Override
+                        public CompletionStage<?> onClose(java.net.http.WebSocket webSocket, int statusCode, String reason) {
+                            System.out.println("[WS CLOSED] " + pair + " code=" + statusCode);
+                            reconnect(pair);
+                            return CompletableFuture.completedFuture(null);
                         }
                     }).join();
 
-            System.out.println("[WS-TICK] connected aggTrade for " + pair);
+            wsMap.put(pair, ws);
+            System.out.println("[WS] Connected " + pair);
+
         } catch (Exception e) {
-            System.out.println("[WS connect] error for " + pair + " : " + e.getMessage());
+            System.out.println("[WS] Failed connect " + pair + " retry in 5s");
+            reconnect(pair);
         }
     }
 
+    private void reconnect(String pair) {
+        wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
+    }
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         if (dq == null || dq.size() < 5) return new MicroTrendResult(0, 0, 0);
-        Deque<Double> safeDq;
-        synchronized(wsLock) {
-            safeDq = new ArrayDeque<>(dq);
-        }
         List<Double> arr = new ArrayList<>(dq);
         int n = Math.min(arr.size(), 10);
 
@@ -773,9 +794,11 @@ public class SignalSender {
     }
 
     public void stop() {
-        if (scheduler != null) scheduler.shutdownNow();
-        System.out.println("[SignalSender] stopped");
+        System.out.println("[SignalSender] stopping...");
+        if (scheduler != null) scheduler.shutdown();
+        wsWatcher.shutdown();
     }
+
 
     // ========================= Helper: top symbols via CoinGecko =========================
     public List<String> getTopSymbols(int limit) {
@@ -824,15 +847,22 @@ public class SignalSender {
                     .collect(Collectors.toSet());
 
             System.out.println("[INIT] Loaded pairs: " + BINANCE_PAIRS.size());
+            for (String pair : BINANCE_PAIRS) {
+                connectTickWebSocket(pair);
+            }
         }
 
-        scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(() -> {
+        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "signal-scheduler");
+            t.setDaemon(false);
+            return t;
+        });
+        scheduler.scheduleWithFixedDelay(() -> {
             try {
                 runSchedulerCycle();
-            } catch (Exception e) {
-                System.out.println("[Scheduler] error: " + e.getMessage());
-                e.printStackTrace();
+            } catch (Throwable t) {
+                System.out.println("[Scheduler-FATAL] cycle crashed: " + t.getMessage());
+                t.printStackTrace();
             }
         }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }

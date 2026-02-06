@@ -7,34 +7,53 @@ public class BotMain {
 
     public static void main(String[] args) {
 
-        String tgToken = "8395445212:AAF7X7oFBx72HgKGoRTcFpdFbuHcZOPfTig";
-        String chatId = "953233853";
+        // ===== CONFIG =====
+        String tgToken = "PASTE_TOKEN_HERE";
+        String chatId = "PASTE_CHAT_ID";
 
         TelegramBotSender telegram = new TelegramBotSender(tgToken, chatId);
         SignalSender signalSender = new SignalSender(telegram);
 
         ZoneId zone = ZoneId.of("Europe/Warsaw");
-        LocalDateTime now = LocalDateTime.now(zone);
         DateTimeFormatter dtf = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-        telegram.sendMessageSync(
-                "🚀 Бот запущен\n" +
-                        "⏰ Время: " + now.format(dtf) + "\n" +
-                        "📡 Режим: FUTURES 15m"
-        );
-
-        System.out.println("[" + now.format(dtf) + "] Bot started");
-
         try {
+
+            LocalDateTime now = LocalDateTime.now(zone);
+
+            telegram.sendMessageSync(
+                    "🚀 Бот запущен\n" +
+                            "⏰ Время: " + now.format(dtf) + "\n" +
+                            "📡 Режим: FUTURES 15m"
+            );
+
+            System.out.println("[" + now.format(dtf) + "] Bot started");
+
+            // ===== START CORE =====
             signalSender.start();
+
         } catch (Exception e) {
-            telegram.sendMessageSync("❌ Ошибка старта SignalSender: " + e.getMessage());
+
+            telegram.sendMessageSync(
+                    "❌ Критическая ошибка старта:\n" + e.getMessage()
+            );
+
             e.printStackTrace();
+            return;
         }
 
+        // ===== SHUTDOWN HOOK =====
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            telegram.sendMessageSync("🛑 Бот остановлен");
-            System.out.println("Bot stopped");
+            try {
+                signalSender.stop();
+                telegram.sendMessageSync("🛑 Бот остановлен");
+                System.out.println("Bot stopped");
+            } catch (Exception ignored) {}
         }));
+
+        // ===== KEEP JVM ALIVE =====
+        try {
+            Thread.currentThread().join();
+        } catch (InterruptedException ignored) {}
     }
 }

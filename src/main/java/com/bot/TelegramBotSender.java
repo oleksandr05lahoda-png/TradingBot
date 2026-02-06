@@ -6,76 +6,145 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class TelegramBotSender {
 
     private final String token;
     private final String chatId;
+
     private final HttpClient client;
-    private static final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private final BlockingQueue<String> queue = new LinkedBlockingQueue<>(1000);
+    private final ScheduledExecutorService sender;
+    private final AtomicBoolean running = new AtomicBoolean(true);
+
+    private static final DateTimeFormatter DTF =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    private static final int RATE_LIMIT_MS = 1200; // безопасно для TG
+    private static final int MAX_RETRY = 3;
 
     public TelegramBotSender(String token, String chatId) {
         this.token = token;
         this.chatId = chatId;
-        this.client = HttpClient.newHttpClient();
+
+        this.client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+
+        this.sender = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "tg-sender");
+            t.setDaemon(true);
+            return t;
+        });
+
+        startWorker();
+        startHeartbeat();
     }
 
-    // ----------------- ASYNC MESSAGE -----------------
-    public void sendMessage(String message) {
+    // ======================= PUBLIC API =======================
+    public void sendMessageSync(String message) {
         try {
-            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" +
-                    chatId + "&text=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .GET()
-                    .build();
+            HttpRequest req = buildRequest(message);
 
-            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                    .thenAccept(resp -> System.out.println("[TG " + LocalDateTime.now().format(dtf) + "] Ответ: " + resp.body()))
-                    .exceptionally(e -> {
-                        System.err.println("[TG] Ошибка отправки: " + e.getMessage());
-                        return null;
-                    });
+            HttpResponse<String> resp =
+                    client.send(req, HttpResponse.BodyHandlers.ofString());
+
+            if (resp.statusCode() == 200) {
+                log("SYNC OK");
+            } else {
+                log("SYNC HTTP " + resp.statusCode());
+            }
 
         } catch (Exception e) {
-            System.err.println("[TG] Ошибка создания запроса: " + e.getMessage());
+            log("SYNC ERROR: " + e.getMessage());
         }
     }
 
-    // ----------------- SYNC MESSAGE -----------------
-    public boolean sendMessageSync(String message) {
-        try {
-            String url = "https://api.telegram.org/bot" + token + "/sendMessage?chat_id=" +
-                    chatId + "&text=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .GET()
-                    .build();
-
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            System.out.println("[TG " + LocalDateTime.now().format(dtf) + "] Ответ: " + response.body());
-            return true;
-        } catch (Exception e) {
-            System.err.println("[TG] Ошибка отправки: " + e.getMessage());
-            return false;
+    public void send(String message) {
+        if (!running.get()) return;
+        if (!queue.offer(message)) {
+            System.err.println("[TG] Очередь переполнена, сообщение отброшено");
         }
     }
 
-    // ----------------- SIGNAL MESSAGE -----------------
-    public void sendSignal(String symbol, String direction, double confidence, double price, int rsi, String flags) {
-        String message = String.format(
-                "%s → %s\nConfidence: %.2f\nPrice: %.2f\nRSI: %d\nFlags: %s\nTime: %s",
-                symbol, direction, confidence, price, rsi, flags, LocalDateTime.now().format(dtf)
-        );
-        sendMessage(message);
+    public void shutdown() {
+        running.set(false);
+        sender.shutdown();
     }
 
-    // ----------------- SIMPLE MESSAGE -----------------
-    public void sendSignal(String message) {
-        sendMessage(message);
+    // ======================= INTERNAL =======================
+
+    private void startWorker() {
+        sender.scheduleWithFixedDelay(() -> {
+            try {
+                String msg = queue.poll(2, TimeUnit.SECONDS);
+                if (msg != null) {
+                    sendWithRetry(msg);
+                    Thread.sleep(RATE_LIMIT_MS);
+                }
+            } catch (Throwable t) {
+                System.err.println("[TG] Критическая ошибка sender: " + t.getMessage());
+                t.printStackTrace();
+            }
+        }, 0, 500, TimeUnit.MILLISECONDS);
+    }
+
+    private void sendWithRetry(String message) {
+        for (int i = 1; i <= MAX_RETRY; i++) {
+            try {
+                HttpRequest req = buildRequest(message);
+                HttpResponse<String> resp =
+                        client.send(req, HttpResponse.BodyHandlers.ofString());
+
+                if (resp.statusCode() == 200) {
+                    log("OK");
+                    return;
+                } else {
+                    log("HTTP " + resp.statusCode());
+                }
+
+            } catch (Exception e) {
+                log("Retry " + i + " failed: " + e.getMessage());
+                sleep(800L * i);
+            }
+        }
+    }
+
+    private HttpRequest buildRequest(String message) throws Exception {
+        String url = "https://api.telegram.org/bot" + token + "/sendMessage"
+                + "?chat_id=" + chatId
+                + "&text=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
+
+        return HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .build();
+    }
+
+    // ======================= HEARTBEAT =======================
+
+    private void startHeartbeat() {
+        sender.scheduleAtFixedRate(() -> {
+            send("🤖 Bot alive: " + LocalDateTime.now().format(DTF));
+        }, 10, 30, TimeUnit.MINUTES);
+    }
+
+    // ======================= UTILS =======================
+
+    private void log(String msg) {
+        System.out.println("[TG " + LocalDateTime.now().format(DTF) + "] " + msg);
+    }
+
+    private void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ignored) {}
     }
 }
