@@ -647,7 +647,6 @@ public class SignalSender {
         public final boolean impulse;
         public Double stop;
         public Double take;
-        public Double leverage;
         public final Instant created = Instant.now();
 
         public Signal(String symbol, String direction, double confidence, double price, double rsi,
@@ -679,7 +678,7 @@ public class SignalSender {
             String localTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
 
             return String.format("*%s* → *%s*\n" + "Confidence: *%.2f*\n" + "Price: %.8f\n" + "Leverage: x%.1f\n" + "SL: %.8f\n" + "TP: %.8f\n" + "RSI(14): %.2f\n" + "_flags_: %s\n" + "_raw: %.3f mtf:%d vol:%b atr:%b_\n" + "_time: %s_",
-                    symbol, direction, confidence, price, leverage != null ? leverage : 1.0, stop != null ? stop : 0.0, take != null ? take : 0.0, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk,
+                    symbol, direction, confidence, price, stop != null ? stop : 0.0, take != null ? take : 0.0, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk,
                     localTime
             );
         }
