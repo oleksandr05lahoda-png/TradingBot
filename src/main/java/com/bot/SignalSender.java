@@ -542,7 +542,7 @@ public class SignalSender {
         if (mtfConfirm != 0) conf += 0.10;
         if (volOk) conf += 0.08;
         if (atrOk) conf += 0.08;
-        if (impulse) conf += 0.06;
+        if (impulse && Math.abs(rawScore) > 0.25) conf += 0.04;
         if (vwapAligned) conf += 0.05;
         if (structureAligned) conf += 0.06;
         if (bos) conf += 0.05;
@@ -550,7 +550,7 @@ public class SignalSender {
         if (liquiditySweep) conf -= 0.12;
 
         // расширяем диапазон
-        conf = Math.max(0.30, Math.min(0.95, conf));
+        conf = Math.max(0.20, Math.min(0.90, conf));
         return conf;
     }
 
@@ -596,7 +596,9 @@ public class SignalSender {
         }
 
         if (bos || liqSweep) {
-            s.confidence = Math.max(MIN_CONF, s.confidence); // не даём упасть ниже порога
+            if (endOfTrend) {
+                s.confidence *= 0.75; // BOS на экстремуме = подозрительно
+            }
         }
 
         // Блокировка микро-тренда только для конца тренда
@@ -951,8 +953,11 @@ public class SignalSender {
                 // ================= IMPULSE DIRECTION =================
                 boolean impulseUp = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
                 boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
-                TradingCore.Side side = impulseUp ? TradingCore.Side.LONG :
-                        impulseDown ? TradingCore.Side.SHORT : null;
+                int trend15 = marketStructure(c15m);
+                if (trend15 == 0) continue;
+
+                TradingCore.Side side =
+                        trend15 > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
                 if (side == null) continue;
 
                 // ================= RSI FILTER =================
@@ -965,8 +970,11 @@ public class SignalSender {
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
-                if ((side == TradingCore.Side.LONG && mtfConfirm < 0) ||
-                        (side == TradingCore.Side.SHORT && mtfConfirm > 0)) continue;
+                if (mtfConfirm != 0) {
+                    if (side == TradingCore.Side.LONG && dir1h < 0) continue;
+                    if (side == TradingCore.Side.SHORT && dir1h > 0) continue;
+                }
+
 
                 // ================= RAW SIGNAL SCORE =================
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
@@ -977,7 +985,8 @@ public class SignalSender {
                 // ================= CONFIDENCE COMPOSITION =================
                 double conf = composeConfidence(
                         rawScore, mtfConfirm, volOk, atrOk,
-                        impulseUp || impulseDown,
+                        (side == TradingCore.Side.LONG && impulseUp) ||
+                                (side == TradingCore.Side.SHORT && impulseDown),
                         true,  // vwapAligned
                         true,  // structureAligned
                         detectBOS(c15m),
@@ -993,7 +1002,9 @@ public class SignalSender {
                 // ================= STOP / TAKE (на основе ATR, быстрые сделки) =================
                 double pct = Math.max(0.003, Math.min(0.01, atr15 / last.close)); // стоп 0.3–1%
                 double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
-                double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 2) : last.close * (1 - pct * 2);
+                double take = side == TradingCore.Side.LONG
+                        ? last.close * (1 + pct * 1.4)
+                        : last.close * (1 - pct * 1.4);
 
                 // ================= CREATE SIGNAL =================
                 Signal s = new Signal(
