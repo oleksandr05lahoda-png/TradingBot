@@ -154,6 +154,11 @@ public class SignalSender {
             return Set.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
         }
     }
+    enum MarketPhase {
+        TREND_CONTINUATION,
+        TREND_EXHAUSTION,
+        NO_TRADE
+    }
 
     public class MarketContext {
         public final double vwapDev;
@@ -418,7 +423,49 @@ public class SignalSender {
         if (ll && lh) return -1;
         return 0;
     }
+    private MarketPhase detectMarketPhase(
+            List<TradingCore.Candle> c15m,
+            MicroTrendResult micro
+    ) {
+        int structure = marketStructure(c15m);
+        if (structure == 0) {
+            return MarketPhase.NO_TRADE; // флэт = не торгуем
+        }
 
+        List<Double> closes = c15m.stream().map(c -> c.close).toList();
+
+        double atr = atr(c15m, 14);
+        if (atr <= 0) return MarketPhase.NO_TRADE;
+
+        double ema20 = ema(closes, 20);
+        double ema50 = ema(closes, 50);
+
+        double trendStrength = Math.abs(ema20 - ema50) / atr;
+
+        // ---- 1. СЕРЕДИНА ТРЕНДА ----
+        if (trendStrength > 0.6 && trendStrength < 1.2) {
+            if (Math.abs(micro.accel) < 0.0003) {
+                return MarketPhase.TREND_CONTINUATION;
+            }
+        }
+
+        // ---- 2. КОНЕЦ ТРЕНДА (EXHAUSTION) ----
+        if (trendStrength >= 1.2) {
+            boolean momentumFading =
+                    Math.abs(micro.speed) < 0.0006 &&
+                            micro.accel < 0;
+
+            boolean structureExtreme =
+                    detectLiquiditySweep(c15m) ||
+                            detectBOS(c15m);
+
+            if (momentumFading && structureExtreme) {
+                return MarketPhase.TREND_EXHAUSTION;
+            }
+        }
+
+        return MarketPhase.NO_TRADE;
+    }
     public static boolean detectBOS(List<TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 10) return false;
         List<Integer> highs = detectSwingHighs(candles, 3);
@@ -547,7 +594,11 @@ public class SignalSender {
         if (structureAligned) conf += 0.06;
         if (bos) conf += 0.05;
 
-        if (liquiditySweep) conf -= 0.12;
+        if (liquiditySweep && rawScore * mtfConfirm < 0) {
+            conf += 0.10; // sweep ПРОТИВ тренда = хорошо для разворота
+        } else if (liquiditySweep) {
+            conf -= 0.10;
+        }
 
         // расширяем диапазон
         conf = Math.max(0.20, Math.min(0.90, conf));
@@ -607,9 +658,7 @@ public class SignalSender {
                 s.confidence *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200); // динамическое снижение
             }
         }
-        if (activeSignals.get(pair) != null) return;
-        activeSignals.put(pair, s);
-        if (isCooldown(pair, s.direction)) return;
+        if (isCooldown(pair, s)) return;
         if (closes15m.size() < 4) return;
 
         long candleTs = closes15m.get(closes15m.size() - 1).openTime;
@@ -688,19 +737,30 @@ public class SignalSender {
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
 
-    private boolean isCooldown(String pair, String direction) {
+    private boolean isCooldown(String pair, Signal s) {
         long now = System.currentTimeMillis();
-        long last = lastSignalTimeDir
-                .getOrDefault(pair, new ConcurrentHashMap<>())
-                .getOrDefault(direction, 0L);
-        Double lastConf = lastSentConfidence.getOrDefault(pair + ":" + direction, 0.0);
-        if ((now - last) < COOLDOWN_MS) {
-            // dynamic cooldown: чем выше confidence, тем дольше блокировка
-            long dynamicCooldown = (long)(COOLDOWN_MS * lastConf);
-            return (now - last) < dynamicCooldown;
+
+        Map<String, Long> dirMap =
+                lastSignalTimeDir.getOrDefault(pair, new ConcurrentHashMap<>());
+
+        Long lastTimeSameDir = dirMap.get(s.direction);
+        Long lastTimeOppDir = dirMap.get(
+                s.direction.equals("LONG") ? "SHORT" : "LONG"
+        );
+
+        // ⛔ Блок если тот же direction был < 45 минут назад
+        if (lastTimeSameDir != null && now - lastTimeSameDir < 45 * 60_000) {
+            return true;
         }
+
+        // ✅ Разрешаем противоположный сигнал через 30 минут
+        if (lastTimeOppDir != null && now - lastTimeOppDir > 30 * 60_000) {
+            return false;
+        }
+
         return false;
     }
+
 
     private void markSignalSent(String pair, String direction) {
         lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
@@ -941,6 +1001,15 @@ public class SignalSender {
                 if (c15m.size() < 20 || c1h.size() < 20) continue;
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
+                MicroTrendResult micro =
+                        computeMicroTrend(pair, tickPriceDeque.get(pair));
+
+                MarketPhase phase =
+                        detectMarketPhase(c15m, micro);
+
+                if (phase == MarketPhase.NO_TRADE) {
+                    continue;
+                }
 
                 // ================= ATR & VOLUME FILTER =================
                 double atr15 = SignalSender.atr(c15m, 14);
@@ -958,6 +1027,18 @@ public class SignalSender {
 
                 TradingCore.Side side =
                         trend15 > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
+
+                if (phase == MarketPhase.TREND_CONTINUATION) {
+                    if (side == TradingCore.Side.LONG && trend15 < 0) continue;
+                    if (side == TradingCore.Side.SHORT && trend15 > 0) continue;
+                }
+
+                if (phase == MarketPhase.TREND_EXHAUSTION) {
+                    // разворот ТОЛЬКО против предыдущего тренда
+                    side = trend15 > 0
+                            ? TradingCore.Side.SHORT
+                            : TradingCore.Side.LONG;
+                }
                 if (side == null) continue;
 
                 // ================= RSI FILTER =================
@@ -982,6 +1063,9 @@ public class SignalSender {
                         strategyMomentumNorm(closes15) * 0.20 +
                         strategyMACDNorm(closes15) * 0.20;
 
+                if (side == TradingCore.Side.LONG && rawScore < -0.1) continue;
+                if (side == TradingCore.Side.SHORT && rawScore > 0.1) continue;
+
                 // ================= CONFIDENCE COMPOSITION =================
                 double conf = composeConfidence(
                         rawScore, mtfConfirm, volOk, atrOk,
@@ -992,6 +1076,12 @@ public class SignalSender {
                         detectBOS(c15m),
                         detectLiquiditySweep(c15m)
                 );
+                if (side == TradingCore.Side.LONG && rsi14 > 60) {
+                    conf -= 0.08;
+                }
+                if (side == TradingCore.Side.SHORT && rsi14 < 40) {
+                    conf -= 0.08;
+                }
 
                 if (conf > 0.5) {
                     conf += Math.min(0.05, atr15 / last.close * 10);
@@ -1027,8 +1117,10 @@ public class SignalSender {
 
                 s.stop = stop;
                 s.take = take;
+                if (conf < 0.55) {
+                    continue; // слишком слабый сигнал
+                }
 
-                // Сохраняем только confidence, stop/take, импульс, направление
                 sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
