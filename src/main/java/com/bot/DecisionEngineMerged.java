@@ -3,7 +3,16 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * PROFESSIONAL FUTURES DECISION ENGINE
+ * - No prediction
+ * - No flip signals
+ * - HTF controls regime
+ * - LTF only entry timing
+ */
 public final class DecisionEngineMerged {
+
+    /* ===================== MODELS ===================== */
 
     public enum SignalGrade { A, B }
 
@@ -17,9 +26,17 @@ public final class DecisionEngineMerged {
         public final String reason;
         public final String coinType;
 
-        public TradeIdea(String symbol, TradingCore.Side side, double entry,
-                         double stop, double take, double confidence, double atr,
-                         SignalGrade grade, String reason, String coinType) {
+        public TradeIdea(String symbol,
+                         TradingCore.Side side,
+                         double entry,
+                         double stop,
+                         double take,
+                         double confidence,
+                         double atr,
+                         SignalGrade grade,
+                         String reason,
+                         String coinType) {
+
             this.symbol = symbol;
             this.side = side;
             this.entry = entry;
@@ -31,172 +48,194 @@ public final class DecisionEngineMerged {
             this.reason = reason;
             this.coinType = coinType;
         }
-
-        @Override
-        public String toString() {
-            return String.format("[SIGNAL] %s | %s | %s | Entry: %.4f Stop: %.4f Take: %.4f Conf: %.2f ATR: %.4f Reason: %s",
-                    symbol, coinType, side, entry, stop, take, confidence, atr, reason);
-        }
     }
 
-    private static final Set<String> FUTURES = ConcurrentHashMap.newKeySet();
-    public static void loadFuturesSymbols(Collection<String> symbols) {
-        FUTURES.clear();
-        FUTURES.addAll(symbols);
-        System.out.println("[INIT] Futures loaded: " + FUTURES.size());
-    }
-    private static boolean isFutures(String s) {
-        return FUTURES.isEmpty() || FUTURES.contains(s);
-    }
+    /* ===================== CONFIG ===================== */
 
-    private static final int MAX_COINS = 120;      // максимум монет для сканирования
-    private static final double STOP_ATR = 0.45;   // чуть меньше, чтобы чаще были сигналы
-    private static final double RR_A = 2.0;
-    private static final double RR_B = 1.4;
+    private static final int MAX_COINS = 120;
 
+    private static final double STOP_ATR = 0.55;
+    private static final double RR_A = 2.2;
+    private static final double RR_B = 1.6;
+
+    private static final long COOLDOWN_MS = 20 * 60_000; // 20 мин
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
+
+    /* ===================== ENTRY ===================== */
 
     public List<TradeIdea> evaluate(List<String> symbols,
                                     Map<String, List<TradingCore.Candle>> m15,
                                     Map<String, List<TradingCore.Candle>> h1,
                                     Map<String, String> coinTypes) {
 
-        List<TradeIdea> out = new ArrayList<>();
+        List<TradeIdea> result = new ArrayList<>();
         long now = System.currentTimeMillis();
         int scanned = 0;
 
-        for (String s : symbols) {
+        for (String symbol : symbols) {
             if (scanned++ >= MAX_COINS) break;
-            if (!isFutures(s)) continue;
 
-            var c15 = m15.get(s);
-            var c1h = h1.get(s);
+            List<TradingCore.Candle> c15 = m15.get(symbol);
+            List<TradingCore.Candle> c1h = h1.get(symbol);
 
-            if (!valid(c15, 15) || !valid(c1h, 15)) continue; // минимальный объем данных
+            if (!valid(c15, 50) || !valid(c1h, 50)) continue;
 
-            String type = coinTypes.getOrDefault(s, "ALT");
-            double price = last(c15).close;
-            double atr = atr(c15, 14);
+            MarketRegime regime = detectRegime(c1h);
+            if (regime == MarketRegime.RANGE) continue;
 
-            EMA ltf = emaContext(c15);
-            EMA htf = emaContext(c1h);
+            TradeIdea idea = scan(symbol, c15, c1h, regime,
+                    coinTypes.getOrDefault(symbol, "ALT"), now);
 
-            TradeIdea idea = scan(s, c15, atr, ltf, htf, type, now);
-            if (idea != null) out.add(idea);
+            if (idea != null) result.add(idea);
         }
 
-        // сортировка по уверенности, выше confidence → раньше в списке
-        out.sort(Comparator.comparingDouble((TradeIdea t) -> t.confidence)
-                .reversed());
-
-        return out;
+        result.sort(Comparator.comparingDouble((TradeIdea t) -> t.confidence).reversed());
+        return result;
     }
 
-    private TradeIdea scan(String s, List<TradingCore.Candle> c, double atr,
-                           EMA ltf, EMA htf, String type, long now) {
+    /* ===================== CORE LOGIC ===================== */
 
-        double score = 0.50;
+    private TradeIdea scan(String s,
+                           List<TradingCore.Candle> m15,
+                           List<TradingCore.Candle> h1,
+                           MarketRegime regime,
+                           String type,
+                           long now) {
 
-        // Трендовые оценки
-        if (ltf.bullish) score += 0.08;
-        if (ltf.bearish) score += 0.08;
-        if (htf.bullish) score += 0.06;
-        if (htf.bearish) score += 0.06;
+        TradingCore.Side side =
+                regime == MarketRegime.BULL ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
-        // Импульсная свеча и объем
-        if (impulse(c)) score += 0.07;
-        if (last(c).volume > avgVol(c, 20)) score += 0.05;
+        String key = s + "_" + side;
+        if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS) return null;
 
-        // Вес MEME/TOP/ALT
-        switch (type) {
-            case "TOP" -> score += 0.03;
-            case "MEME" -> score -= 0.01;
-        }
+        if (!structureConfirmed(m15, side)) return null;
+        if (isExhaustion(m15)) return null;
 
-        score = clamp(score, 0.45, 0.90); // максимум 0.90
-
-        // Генерация стороны LONG/SHORT
-        TradingCore.Side side;
-        if (ltf.bullish && htf.bullish) side = TradingCore.Side.LONG;
-        else if (ltf.bearish && htf.bearish) side = TradingCore.Side.SHORT;
-        else return null; // пропускаем непонятные сигналы
-
-        String key = s + side;
-        long cd = 15 * 60_000; // cooldown 15 минут
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < cd) return null;
-        cooldown.put(key, now);
-
-        return build(s, c, side, atr, score, type);
-    }
-
-    private TradeIdea build(String s, List<TradingCore.Candle> c, TradingCore.Side side,
-                            double atr, double score, String type) {
-
-        SignalGrade grade = score >= 0.65 ? SignalGrade.A : SignalGrade.B;
-
-        double entry = last(c).close;
+        double atr = atr(m15, 14);
+        double entry = last(m15).close;
         double risk = atr * STOP_ATR;
 
         double stop = side == TradingCore.Side.LONG ? entry - risk : entry + risk;
         double take = side == TradingCore.Side.LONG
-                ? entry + risk * (grade == SignalGrade.A ? RR_A : RR_B)
-                : entry - risk * (grade == SignalGrade.A ? RR_A : RR_B);
+                ? entry + risk * RR_A
+                : entry - risk * RR_A;
 
-        return new TradeIdea(s, side, entry, stop, take,
-                score, atr, grade,
-                "PROF FUTURES " + grade, type);
+        double confidence = computeConfidence(m15, h1, regime, type);
+
+        SignalGrade grade = confidence >= 0.68 ? SignalGrade.A : SignalGrade.B;
+        if (grade == SignalGrade.B) {
+            take = side == TradingCore.Side.LONG
+                    ? entry + risk * RR_B
+                    : entry - risk * RR_B;
+        }
+
+        cooldown.put(key, now);
+
+        return new TradeIdea(
+                s,
+                side,
+                entry,
+                stop,
+                take,
+                confidence,
+                atr,
+                grade,
+                "HTF " + regime + " | STRUCTURE ENTRY",
+                type
+        );
     }
 
-    private boolean impulse(List<TradingCore.Candle> c) {
-        var k = last(c);
+    /* ===================== MARKET REGIME ===================== */
+
+    private enum MarketRegime { BULL, BEAR, RANGE }
+
+    private MarketRegime detectRegime(List<TradingCore.Candle> h1) {
+        double e50 = ema(h1, 50);
+        double e200 = ema(h1, 200);
+        double price = last(h1).close;
+
+        if (price > e50 && e50 > e200) return MarketRegime.BULL;
+        if (price < e50 && e50 < e200) return MarketRegime.BEAR;
+        return MarketRegime.RANGE;
+    }
+
+    /* ===================== FILTERS ===================== */
+
+    private boolean structureConfirmed(List<TradingCore.Candle> c, TradingCore.Side side) {
+        TradingCore.Candle a = c.get(c.size() - 3);
+        TradingCore.Candle b = c.get(c.size() - 2);
+        TradingCore.Candle d = c.get(c.size() - 1);
+
+        if (side == TradingCore.Side.LONG)
+            return d.close > b.high && b.low > a.low;
+        else
+            return d.close < b.low && b.high < a.high;
+    }
+
+    private boolean isExhaustion(List<TradingCore.Candle> c) {
+        TradingCore.Candle k = last(c);
+        double atr = atr(c, 14);
+        double range = k.high - k.low;
+        return range > atr * 1.8;
+    }
+
+    /* ===================== CONFIDENCE ===================== */
+
+    private double computeConfidence(List<TradingCore.Candle> m15,
+                                     List<TradingCore.Candle> h1,
+                                     MarketRegime regime,
+                                     String type) {
+
+        double conf = 0.50;
+
+        conf += structureStrength(m15) * 0.15;
+        conf += trendStrength(h1) * 0.20;
+
+        if ("TOP".equals(type)) conf += 0.03;
+        if ("MEME".equals(type)) conf -= 0.03;
+
+        return clamp(conf, 0.45, 0.85);
+    }
+
+    private double structureStrength(List<TradingCore.Candle> c) {
+        TradingCore.Candle k = last(c);
         double body = Math.abs(k.close - k.open);
         double range = k.high - k.low;
-        return range > 0 && body / range > 0.5;
+        return range == 0 ? 0 : body / range;
     }
 
-    private EMA emaContext(List<TradingCore.Candle> c) {
-        double e9 = ema(c, 9);
-        double e21 = ema(c, 21);
+    private double trendStrength(List<TradingCore.Candle> c) {
         double e50 = ema(c, 50);
-        return new EMA(e9, e21, e50, e9 >= e21 && e21 >= e50, e9 <= e21 && e21 <= e50);
+        double e200 = ema(c, 200);
+        return Math.min(1.0, Math.abs(e50 - e200) / e200 * 5);
     }
+
+    /* ===================== MATH ===================== */
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
-        return c != null && !c.isEmpty() ? c.get(c.size() - 1) : null;
+        return c.get(c.size() - 1);
     }
 
-    private boolean valid(List<?> l, int n) {
-        return l != null && l.size() >= n;
+    private boolean valid(List<?> c, int n) {
+        return c != null && c.size() >= n;
     }
 
     private double atr(List<TradingCore.Candle> c, int n) {
         double s = 0;
-        for (int i = c.size() - n; i < c.size(); i++) s += c.get(i).high - c.get(i).low;
-        return s / n;
-    }
-
-    private double avgVol(List<TradingCore.Candle> c, int n) {
-        double s = 0;
-        for (int i = c.size() - n; i < c.size(); i++) s += c.get(i).volume;
+        for (int i = c.size() - n; i < c.size(); i++)
+            s += c.get(i).high - c.get(i).low;
         return s / n;
     }
 
     private double ema(List<TradingCore.Candle> c, int p) {
         double k = 2.0 / (p + 1);
         double e = c.get(c.size() - p).close;
-        for (int i = c.size() - p + 1; i < c.size(); i++) e = c.get(i).close * k + e * (1 - k);
+        for (int i = c.size() - p + 1; i < c.size(); i++)
+            e = c.get(i).close * k + e * (1 - k);
         return e;
     }
 
     private double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
-    }
-
-    private static final class EMA {
-        final double e9, e21, e50;
-        final boolean bullish, bearish;
-        EMA(double e9, double e21, double e50, boolean bullish, boolean bearish) {
-            this.e9 = e9; this.e21 = e21; this.e50 = e50; this.bullish = bullish; this.bearish = bearish;
-        }
     }
 }
