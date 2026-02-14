@@ -6,8 +6,8 @@ import java.time.format.DateTimeFormatter;
 public class BotMain {
 
     // ===== CONFIG =====
-    private static final String TG_TOKEN = System.getenv("TG_BOT_TOKEN");
-    private static final String CHAT_ID = System.getenv("TG_CHAT_ID");
+    private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
+    private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
 
