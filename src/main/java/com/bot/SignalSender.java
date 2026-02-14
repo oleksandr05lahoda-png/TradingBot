@@ -1011,9 +1011,16 @@ public class SignalSender {
                     continue;
                 }
 
-                // ================= ATR & VOLUME FILTER =================
-                double atr15 = SignalSender.atr(c15m, 14);
-                if (atr15 <= 0) continue;
+                double atr15 = atr(c15m, 14);
+                double atrPrev = atr(c15m.subList(0, c15m.size()-1), 14);
+
+                double atrPercent = atr15 / last.close;
+                double atrGrowth = atr15 / atrPrev;
+
+                if (atrPercent < ATR_MIN_PCT) continue;
+
+                boolean atrExpanding = atrGrowth > 1.05;
+
 
                 double avgVol = c15m.stream().mapToDouble(c -> c.volume).average().orElse(0);
                 boolean volOk = last.volume >= avgVol * VOL_MULTIPLIER;
