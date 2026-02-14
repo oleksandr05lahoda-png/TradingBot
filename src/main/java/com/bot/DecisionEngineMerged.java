@@ -3,13 +3,6 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * PROFESSIONAL FUTURES DECISION ENGINE
- * - No prediction
- * - No flip signals
- * - HTF controls regime
- * - LTF only entry timing
- */
 public final class DecisionEngineMerged {
 
     /* ===================== MODELS ===================== */

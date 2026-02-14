@@ -583,7 +583,7 @@ public class SignalSender {
             boolean bos,
             boolean liquiditySweep
     ) {
-        double conf = 0.35;
+        double conf = 0.5;
 
         conf += Math.abs(rawScore) * 0.55; // увеличили вклад
         if (mtfConfirm != 0) conf += 0.10;
@@ -1117,7 +1117,7 @@ public class SignalSender {
 
                 s.stop = stop;
                 s.take = take;
-                if (conf < 0.55) {
+                if (conf < 0.6) {
                     continue; // слишком слабый сигнал
                 }
 
