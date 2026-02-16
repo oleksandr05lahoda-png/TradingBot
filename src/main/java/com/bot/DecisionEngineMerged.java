@@ -29,7 +29,6 @@ public final class DecisionEngineMerged {
                          SignalGrade grade,
                          String reason,
                          String coinType) {
-
             this.symbol = symbol;
             this.side = side;
             this.entry = entry;
@@ -45,12 +44,11 @@ public final class DecisionEngineMerged {
 
     /* ===================== CONFIG ===================== */
 
-    private static final int MIN_BARS = 220;
+    private static final int MIN_BARS = 180; // чуть меньше, чтобы ловились новые монеты
+    private static final double RR_A = 2.2;
+    private static final double RR_B = 1.5;
 
-    private static final double RR_A = 2.4;
-    private static final double RR_B = 1.7;
-
-    private static final long COOLDOWN_MS = 20 * 60_000;
+    private static final long COOLDOWN_MS = 15 * 60_000; // более частые сигналы
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
     /* ===================== ENTRY ===================== */
@@ -72,9 +70,7 @@ public final class DecisionEngineMerged {
                 continue;
 
             MarketRegime regime = detectRegime(c1h);
-            if (regime == MarketRegime.RANGE)
-                continue;
-
+            // Убрали жесткую фильтрацию RANGE, теперь генерируем и в боковиках
             TradeIdea idea = scan(symbol, c15, c1h,
                     regime,
                     coinTypes.getOrDefault(symbol, "ALT"),
@@ -98,17 +94,13 @@ public final class DecisionEngineMerged {
                            long now) {
 
         TradingCore.Side side =
-                regime == MarketRegime.BULL ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
+                (regime == MarketRegime.BEAR) ? TradingCore.Side.SHORT : TradingCore.Side.LONG;
 
         String key = s + "_" + side;
-        if (cooldown.containsKey(key)
-                && now - cooldown.get(key) < COOLDOWN_MS)
+        if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS)
             return null;
 
         if (!structureConfirmed(m15, side))
-            return null;
-
-        if (isClimacticMove(m15))
             return null;
 
         double atr = trueATR(m15, 14);
@@ -116,25 +108,18 @@ public final class DecisionEngineMerged {
 
         double entry = last(m15).close;
 
-        // 🔥 динамический стоп
-        double stopATR = adx > 25 ? 0.7 : 0.55;
-        double risk = atr * stopATR;
+        // 🔥 динамический стоп и риск
+        double riskMultiplier = (adx > 20) ? 0.65 : 0.50;
+        double risk = atr * riskMultiplier;
 
-        double stop = side == TradingCore.Side.LONG
-                ? entry - risk
-                : entry + risk;
+        double stop = (side == TradingCore.Side.LONG) ? entry - risk : entry + risk;
 
         double confidence = computeConfidence(m15, h1, regime, type, adx);
 
-        SignalGrade grade = confidence >= 0.70
-                ? SignalGrade.A
-                : SignalGrade.B;
+        SignalGrade grade = confidence >= 0.68 ? SignalGrade.A : SignalGrade.B;
 
-        double rr = grade == SignalGrade.A ? RR_A : RR_B;
-
-        double take = side == TradingCore.Side.LONG
-                ? entry + risk * rr
-                : entry - risk * rr;
+        double rr = (grade == SignalGrade.A) ? RR_A : RR_B;
+        double take = (side == TradingCore.Side.LONG) ? entry + risk * rr : entry - risk * rr;
 
         cooldown.put(key, now);
 
@@ -147,7 +132,7 @@ public final class DecisionEngineMerged {
                 confidence,
                 atr,
                 grade,
-                "HTF " + regime + " | PRO TREND ENTRY",
+                "REGIME " + regime + " | TREND ENTRY",
                 type
         );
     }
@@ -157,37 +142,26 @@ public final class DecisionEngineMerged {
     private enum MarketRegime { BULL, BEAR, RANGE }
 
     private MarketRegime detectRegime(List<TradingCore.Candle> h1) {
-
         double e50 = ema(h1, 50);
         double e200 = ema(h1, 200);
         double price = last(h1).close;
-
         double adx = adx(h1, 14);
 
-        if (adx < 16) return MarketRegime.RANGE;
-
-        if (price > e50 && e50 > e200)
-            return MarketRegime.BULL;
-
-        if (price < e50 && e50 < e200)
-            return MarketRegime.BEAR;
+        if (price > e50 && e50 > e200) return MarketRegime.BULL;
+        if (price < e50 && e50 < e200) return MarketRegime.BEAR;
 
         return MarketRegime.RANGE;
     }
-    private double structureStrength(List<TradingCore.Candle> c) {
 
-        TradingCore.Candle last = c.get(c.size() - 1);
+    private double structureStrength(List<TradingCore.Candle> c) {
+        TradingCore.Candle last = last(c);
         TradingCore.Candle prev = c.get(c.size() - 2);
 
         double body = Math.abs(last.close - last.open);
         double range = last.high - last.low;
-
         if (range == 0) return 0;
 
-        // сила тела
         double bodyPower = body / range;
-
-        // импульс относительно предыдущей свечи
         double momentum = Math.abs(last.close - prev.close) / range;
 
         return clamp((bodyPower * 0.6 + momentum * 0.4), 0.0, 1.0);
@@ -200,25 +174,20 @@ public final class DecisionEngineMerged {
                                      MarketRegime regime,
                                      String type,
                                      double adx) {
-
         double conf = 0.50;
-
         conf += structureStrength(m15) * 0.15;
         conf += trendAcceleration(h1) * 0.20;
-
         conf += Math.min(0.10, adx / 100.0);
 
         if ("TOP".equals(type)) conf += 0.03;
         if ("MEME".equals(type)) conf -= 0.04;
 
-        return clamp(conf, 0.45, 0.90);
+        return clamp(conf, 0.45, 0.92);
     }
 
     /* ===================== FILTERS ===================== */
 
-    private boolean structureConfirmed(List<TradingCore.Candle> c,
-                                       TradingCore.Side side) {
-
+    private boolean structureConfirmed(List<TradingCore.Candle> c, TradingCore.Side side) {
         TradingCore.Candle a = c.get(c.size() - 3);
         TradingCore.Candle b = c.get(c.size() - 2);
         TradingCore.Candle d = c.get(c.size() - 1);
@@ -229,44 +198,24 @@ public final class DecisionEngineMerged {
         return d.close < b.low && b.high < a.high;
     }
 
-    private boolean isClimacticMove(List<TradingCore.Candle> c) {
-        TradingCore.Candle k = last(c);
-        double atr = trueATR(c, 14);
-        return (k.high - k.low) > atr * 2.2;
-    }
-
     /* ===================== INDICATORS ===================== */
 
     private double trueATR(List<TradingCore.Candle> c, int n) {
-
         double sum = 0;
-
         for (int i = c.size() - n; i < c.size(); i++) {
-
             TradingCore.Candle cur = c.get(i);
             TradingCore.Candle prev = c.get(i - 1);
-
-            double tr = Math.max(
-                    cur.high - cur.low,
-                    Math.max(
-                            Math.abs(cur.high - prev.close),
-                            Math.abs(cur.low - prev.close)
-                    )
-            );
-
+            double tr = Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close)));
             sum += tr;
         }
-
         return sum / n;
     }
 
     private double adx(List<TradingCore.Candle> c, int n) {
-
         double move = 0;
-
         for (int i = c.size() - n; i < c.size() - 1; i++)
             move += Math.abs(c.get(i + 1).close - c.get(i).close);
-
         return (move / n) / trueATR(c, n) * 25.0;
     }
 
@@ -287,13 +236,10 @@ public final class DecisionEngineMerged {
     }
 
     private double ema(List<TradingCore.Candle> c, int p) {
-
         double k = 2.0 / (p + 1);
         double e = c.get(c.size() - p).close;
-
         for (int i = c.size() - p + 1; i < c.size(); i++)
             e = c.get(i).close * k + e * (1 - k);
-
         return e;
     }
 

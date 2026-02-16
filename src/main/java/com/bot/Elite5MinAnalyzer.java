@@ -14,17 +14,17 @@ public final class Elite5MinAnalyzer {
 
     /* ================= CONFIG ================= */
 
-    private static final int MAX_COINS = 120;
+    private static final int MAX_COINS = 70; // топ 70 монет
 
     private static final int MIN_M15 = 50;
     private static final int MIN_H1  = 40;
 
-    private static final double MIN_CONF = 0.60;
+    private static final double MIN_CONF = 0.55; // чуть мягче
 
-    // Market filters
-    private static final double MIN_BODY_RATIO = 0.55;
-    private static final double MIN_ATR_PERCENT = 0.0035; // 0.35%
-    private static final double MIN_ADX = 18.0;
+    // Market filters (смягчены для большего количества сигналов)
+    private static final double MIN_BODY_RATIO = 0.50;
+    private static final double MIN_ATR_PERCENT = 0.0025; // 0.25%
+    private static final double MIN_ADX = 12.0;
 
     /* ================= CONSTRUCTOR ================= */
 
@@ -105,8 +105,8 @@ public final class Elite5MinAnalyzer {
 
             for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
-                if (counterTrendHTF(tf1h, idea.side))
-                    continue;
+                // Убрали жесткий фильтр против H1
+                // if (counterTrendHTF(tf1h, idea.side)) continue;
 
                 String key = symbol + "_" + idea.side;
                 long cd = cooldown(type, idea.grade);
@@ -119,11 +119,10 @@ public final class Elite5MinAnalyzer {
                 if (conf < MIN_CONF) continue;
 
                 double atr = atr(tf15, 14);
-                double riskPercent =
-                        Math.abs(idea.entry - idea.stop) / idea.entry;
+                double riskPercent = Math.abs(idea.entry - idea.stop) / idea.entry;
 
-                if (riskPercent > atr * 1.8)
-                    continue; // риск слишком большой
+                if (riskPercent > atr * 2.5) // смягчение проверки риска
+                    continue;
 
                 result.add(new TradeSignal(
                         symbol,
@@ -200,17 +199,6 @@ public final class Elite5MinAnalyzer {
         return true;
     }
 
-    private boolean counterTrendHTF(List<TradingCore.Candle> h1,
-                                    TradingCore.Side side) {
-        TradingCore.Candle last = h1.get(h1.size() - 1);
-        boolean up = last.close > last.open;
-
-        if (side == TradingCore.Side.LONG && !up) return true;
-        if (side == TradingCore.Side.SHORT && up) return true;
-
-        return false;
-    }
-
     /* ================= INDICATORS ================= */
 
     private double atr(List<TradingCore.Candle> c, int period) {
@@ -250,10 +238,10 @@ public final class Elite5MinAnalyzer {
             int k = streak.getOrDefault(symbol, 0);
             double conf = base;
 
-            if (k >= 2) conf += 0.05;
-            if (k <= -2) conf -= 0.05;
+            if (k >= 2) conf += 0.03;
+            if (k <= -2) conf -= 0.02;
 
-            if ("TOP".equals(type)) conf += 0.02;
+            if ("TOP".equals(type)) conf += 0.03;
 
             return conf;
         }
@@ -264,7 +252,7 @@ public final class Elite5MinAnalyzer {
     private static long cooldown(String type,
                                  DecisionEngineMerged.SignalGrade grade) {
 
-        long base = 12 * 60_000;
+        long base = 8 * 60_000; // смягчено
 
         if (grade == DecisionEngineMerged.SignalGrade.A)
             base *= 0.7;
