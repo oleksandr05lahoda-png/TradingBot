@@ -1,6 +1,5 @@
 package com.bot;
 
-import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -13,26 +12,24 @@ public final class Elite5MinAnalyzer {
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor();
 
+    /* ================= CONFIG ================= */
+
     private static final int MAX_COINS = 120;
 
-    // ФИЛЬТРЫ ДЛЯ ФЬЮЧЕЙ
-    private static final int MIN_M15 = 40;
-    private static final int MIN_H1  = 30;
+    private static final int MIN_M15 = 50;
+    private static final int MIN_H1  = 40;
 
-    private static final double MIN_BODY_RATIO = 0.55; // защита от 1–2 свечей
-    private static final int MIN_TREND_CANDLES = 3;    // структура
+    private static final double MIN_CONF = 0.60;
 
-    private final double MIN_CONF;
+    // Market filters
+    private static final double MIN_BODY_RATIO = 0.55;
+    private static final double MIN_ATR_PERCENT = 0.0035; // 0.35%
+    private static final double MIN_ADX = 18.0;
 
-    /* ======================= CONSTRUCTORS ======================= */
+    /* ================= CONSTRUCTOR ================= */
 
     public Elite5MinAnalyzer(DecisionEngineMerged engine) {
-        this(engine, 0.55); // ❗ ниже для фьючей нельзя
-    }
-
-    public Elite5MinAnalyzer(DecisionEngineMerged engine, double minConf) {
         this.engine = engine;
-        this.MIN_CONF = minConf;
 
         scheduler.scheduleAtFixedRate(() -> {
             long now = System.currentTimeMillis();
@@ -41,7 +38,7 @@ public final class Elite5MinAnalyzer {
         }, 5, 5, TimeUnit.MINUTES);
     }
 
-    /* ======================= OUTPUT MODEL ======================= */
+    /* ================= OUTPUT ================= */
 
     public static final class TradeSignal {
         public final String symbol;
@@ -70,11 +67,11 @@ public final class Elite5MinAnalyzer {
         }
     }
 
-    /* ======================= MAIN ANALYSIS ======================= */
+    /* ================= MAIN ================= */
 
     public List<TradeSignal> analyze(List<String> symbols,
-                                     Map<String, List<TradingCore.Candle>> c15,
-                                     Map<String, List<TradingCore.Candle>> c1h,
+                                     Map<String, List<TradingCore.Candle>> m15,
+                                     Map<String, List<TradingCore.Candle>> h1,
                                      Map<String, String> coinTypes) {
 
         List<TradeSignal> result = new ArrayList<>();
@@ -84,40 +81,49 @@ public final class Elite5MinAnalyzer {
         for (String symbol : symbols) {
             if (scanned++ >= MAX_COINS) break;
 
-            List<TradingCore.Candle> m15 = c15.get(symbol);
-            List<TradingCore.Candle> h1  = c1h.get(symbol);
+            List<TradingCore.Candle> tf15 = m15.get(symbol);
+            List<TradingCore.Candle> tf1h = h1.get(symbol);
 
-            if (!valid(m15, MIN_M15) || !valid(h1, MIN_H1)) continue;
+            if (!valid(tf15, MIN_M15) || !valid(tf1h, MIN_H1))
+                continue;
 
-            // 🔥 КЛЮЧЕВО: отсекаем флэт сразу
-            if (isFlatMarket(m15)) continue;
+            if (isFlat(tf15)) continue;
+            if (!hasVolatility(tf15)) continue;
+            if (!hasTrendStrength(tf15)) continue;
+            if (!hasVolumeExpansion(tf15)) continue;
+            if (!structureConfirmed(tf15)) continue;
 
             String type = coinTypes.getOrDefault(symbol, "ALT");
 
             List<DecisionEngineMerged.TradeIdea> ideas =
                     engine.evaluate(
                             List.of(symbol),
-                            Map.of(symbol, m15),
-                            Map.of(symbol, h1),
+                            Map.of(symbol, tf15),
+                            Map.of(symbol, tf1h),
                             Map.of(symbol, type)
                     );
 
             for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
-                // ❗ защита от ранних входов
-                if (!trendStructureConfirmed(m15)) continue;
-
-                // ❗ защита от ложных разворотов
-                if (isFakeReversal(m15, h1, idea.side)) continue;
+                if (counterTrendHTF(tf1h, idea.side))
+                    continue;
 
                 String key = symbol + "_" + idea.side;
                 long cd = cooldown(type, idea.grade);
 
                 if (lastSignal.containsKey(key)
-                        && now - lastSignal.get(key) < cd) continue;
+                        && now - lastSignal.get(key) < cd)
+                    continue;
 
                 double conf = brain.adjust(symbol, idea.confidence, type);
                 if (conf < MIN_CONF) continue;
+
+                double atr = atr(tf15, 14);
+                double riskPercent =
+                        Math.abs(idea.entry - idea.stop) / idea.entry;
+
+                if (riskPercent > atr * 1.8)
+                    continue; // риск слишком большой
 
                 result.add(new TradeSignal(
                         symbol,
@@ -142,70 +148,110 @@ public final class Elite5MinAnalyzer {
         return result;
     }
 
-    /* ======================= MARKET FILTERS ======================= */
+    /* ================= MARKET FILTERS ================= */
 
-    // ФЛЭТ = нет нормальных тел свечей
-    private boolean isFlatMarket(List<TradingCore.Candle> c) {
+    private boolean isFlat(List<TradingCore.Candle> c) {
         int n = c.size();
-        double sum = 0;
+        double bodySum = 0;
 
         for (int i = n - 6; i < n - 1; i++) {
             TradingCore.Candle k = c.get(i);
             double body = Math.abs(k.close - k.open);
             double range = k.high - k.low + 1e-6;
-            sum += body / range;
+            bodySum += body / range;
         }
-        return (sum / 5.0) < MIN_BODY_RATIO;
+
+        return (bodySum / 5.0) < MIN_BODY_RATIO;
     }
 
-    // СТРУКТУРА: минимум 3 свечи в одну сторону
-    private boolean trendStructureConfirmed(List<TradingCore.Candle> c) {
+    private boolean hasVolatility(List<TradingCore.Candle> c) {
+        double atr = atr(c, 14);
+        double price = c.get(c.size() - 1).close;
+        return (atr / price) > MIN_ATR_PERCENT;
+    }
+
+    private boolean hasTrendStrength(List<TradingCore.Candle> c) {
+        return adx(c, 14) > MIN_ADX;
+    }
+
+    private boolean hasVolumeExpansion(List<TradingCore.Candle> c) {
+        int n = c.size();
+        double avg = 0;
+
+        for (int i = n - 15; i < n - 1; i++)
+            avg += c.get(i).volume;
+
+        avg /= 14.0;
+
+        return c.get(n - 1).volume > avg * 1.2;
+    }
+
+    private boolean structureConfirmed(List<TradingCore.Candle> c) {
         int n = c.size();
         int dir = 0;
 
         for (int i = n - 4; i < n - 1; i++) {
-            double a = c.get(i).close;
-            double b = c.get(i + 1).close;
-            int d = Double.compare(b, a);
-
+            int d = Double.compare(c.get(i + 1).close, c.get(i).close);
             if (d == 0) return false;
             if (dir == 0) dir = d;
             else if (d != dir) return false;
         }
+
         return true;
     }
 
-    // ЛОЖНЫЙ РАЗВОРОТ
-    private boolean isFakeReversal(List<TradingCore.Candle> m15,
-                                   List<TradingCore.Candle> h1,
-                                   TradingCore.Side side) {
+    private boolean counterTrendHTF(List<TradingCore.Candle> h1,
+                                    TradingCore.Side side) {
+        TradingCore.Candle last = h1.get(h1.size() - 1);
+        boolean up = last.close > last.open;
 
-        TradingCore.Candle last15 = m15.get(m15.size() - 1);
-        TradingCore.Candle prev15 = m15.get(m15.size() - 2);
-        TradingCore.Candle lastH1 = h1.get(h1.size() - 1);
-
-        boolean htfUp = lastH1.close > lastH1.open;
-        boolean impulse =
-                Math.abs(last15.close - prev15.close) >
-                        Math.abs(prev15.close - m15.get(m15.size() - 3).close);
-
-        if (side == TradingCore.Side.LONG && !htfUp && !impulse) return true;
-        if (side == TradingCore.Side.SHORT && htfUp && !impulse) return true;
+        if (side == TradingCore.Side.LONG && !up) return true;
+        if (side == TradingCore.Side.SHORT && up) return true;
 
         return false;
     }
 
-    /* ======================= ADAPTIVE BRAIN ======================= */
+    /* ================= INDICATORS ================= */
+
+    private double atr(List<TradingCore.Candle> c, int period) {
+        int n = c.size();
+        double sum = 0;
+
+        for (int i = n - period; i < n; i++) {
+            TradingCore.Candle k = c.get(i);
+            double tr = k.high - k.low;
+            sum += tr;
+        }
+
+        return sum / period;
+    }
+
+    private double adx(List<TradingCore.Candle> c, int period) {
+        int n = c.size();
+        double move = 0;
+
+        for (int i = n - period; i < n - 1; i++)
+            move += Math.abs(c.get(i + 1).close - c.get(i).close);
+
+        double atr = atr(c, period);
+        return (move / period) / atr * 25.0;
+    }
+
+    /* ================= BRAIN ================= */
 
     static final class AdaptiveBrain {
-        private final Map<String, Integer> streak = new ConcurrentHashMap<>();
+        private final Map<String, Integer> streak =
+                new ConcurrentHashMap<>();
 
-        double adjust(String symbol, double baseConf, String type) {
+        double adjust(String symbol,
+                      double base,
+                      String type) {
+
             int k = streak.getOrDefault(symbol, 0);
-            double conf = baseConf;
+            double conf = base;
 
-            if (k >= 2) conf += 0.04;
-            if (k <= -2) conf -= 0.04;
+            if (k >= 2) conf += 0.05;
+            if (k <= -2) conf -= 0.05;
 
             if ("TOP".equals(type)) conf += 0.02;
 
@@ -213,26 +259,31 @@ public final class Elite5MinAnalyzer {
         }
     }
 
-    /* ======================= COOLDOWN ======================= */
+    /* ================= COOLDOWN ================= */
 
     private static long cooldown(String type,
                                  DecisionEngineMerged.SignalGrade grade) {
 
-        long base = 12 * 60_000; // ⬆️ чтобы не переобувался
+        long base = 12 * 60_000;
 
-        if (grade == DecisionEngineMerged.SignalGrade.A) base *= 0.7;
-        if ("MEME".equals(type)) base *= 0.6;
+        if (grade == DecisionEngineMerged.SignalGrade.A)
+            base *= 0.7;
+
+        if ("MEME".equals(type))
+            base *= 0.6;
 
         return base;
     }
 
-    /* ======================= UTILS ======================= */
+    /* ================= UTILS ================= */
 
-    private static boolean valid(List<?> list, int min) {
-        return list != null && list.size() >= min;
+    private static boolean valid(List<?> l, int min) {
+        return l != null && l.size() >= min;
     }
 
-    private static double clamp(double v, double min, double max) {
+    private static double clamp(double v,
+                                double min,
+                                double max) {
         return Math.max(min, Math.min(max, v));
     }
 

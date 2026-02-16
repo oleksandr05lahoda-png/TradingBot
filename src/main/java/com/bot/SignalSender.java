@@ -90,7 +90,7 @@ public class SignalSender {
         this.STABLE = Set.of("USDT", "USDC", "BUSD");
         this.decisionEngine = new DecisionEngineMerged();
         this.adaptiveBrain = new TradingCore.AdaptiveBrain();
-        this.elite5MinAnalyzer = new Elite5MinAnalyzer(decisionEngine, 0.001);
+        this.elite5MinAnalyzer = new Elite5MinAnalyzer(decisionEngine);
         this.optimizer = new SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
     }

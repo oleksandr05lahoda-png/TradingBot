@@ -45,13 +45,12 @@ public final class DecisionEngineMerged {
 
     /* ===================== CONFIG ===================== */
 
-    private static final int MAX_COINS = 120;
+    private static final int MIN_BARS = 220;
 
-    private static final double STOP_ATR = 0.55;
-    private static final double RR_A = 2.2;
-    private static final double RR_B = 1.6;
+    private static final double RR_A = 2.4;
+    private static final double RR_B = 1.7;
 
-    private static final long COOLDOWN_MS = 20 * 60_000; // 20 мин
+    private static final long COOLDOWN_MS = 20 * 60_000;
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
     /* ===================== ENTRY ===================== */
@@ -63,30 +62,33 @@ public final class DecisionEngineMerged {
 
         List<TradeIdea> result = new ArrayList<>();
         long now = System.currentTimeMillis();
-        int scanned = 0;
 
         for (String symbol : symbols) {
-            if (scanned++ >= MAX_COINS) break;
 
             List<TradingCore.Candle> c15 = m15.get(symbol);
             List<TradingCore.Candle> c1h = h1.get(symbol);
 
-            if (!valid(c15, 50) || !valid(c1h, 50)) continue;
+            if (!valid(c15, MIN_BARS) || !valid(c1h, MIN_BARS))
+                continue;
 
             MarketRegime regime = detectRegime(c1h);
-            if (regime == MarketRegime.RANGE) continue;
+            if (regime == MarketRegime.RANGE)
+                continue;
 
-            TradeIdea idea = scan(symbol, c15, c1h, regime,
-                    coinTypes.getOrDefault(symbol, "ALT"), now);
+            TradeIdea idea = scan(symbol, c15, c1h,
+                    regime,
+                    coinTypes.getOrDefault(symbol, "ALT"),
+                    now);
 
-            if (idea != null) result.add(idea);
+            if (idea != null)
+                result.add(idea);
         }
 
         result.sort(Comparator.comparingDouble((TradeIdea t) -> t.confidence).reversed());
         return result;
     }
 
-    /* ===================== CORE LOGIC ===================== */
+    /* ===================== CORE ===================== */
 
     private TradeIdea scan(String s,
                            List<TradingCore.Candle> m15,
@@ -99,28 +101,40 @@ public final class DecisionEngineMerged {
                 regime == MarketRegime.BULL ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
         String key = s + "_" + side;
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS) return null;
+        if (cooldown.containsKey(key)
+                && now - cooldown.get(key) < COOLDOWN_MS)
+            return null;
 
-        if (!structureConfirmed(m15, side)) return null;
-        if (isExhaustion(m15)) return null;
+        if (!structureConfirmed(m15, side))
+            return null;
 
-        double atr = atr(m15, 14);
+        if (isClimacticMove(m15))
+            return null;
+
+        double atr = trueATR(m15, 14);
+        double adx = adx(m15, 14);
+
         double entry = last(m15).close;
-        double risk = atr * STOP_ATR;
 
-        double stop = side == TradingCore.Side.LONG ? entry - risk : entry + risk;
+        // 🔥 динамический стоп
+        double stopATR = adx > 25 ? 0.7 : 0.55;
+        double risk = atr * stopATR;
+
+        double stop = side == TradingCore.Side.LONG
+                ? entry - risk
+                : entry + risk;
+
+        double confidence = computeConfidence(m15, h1, regime, type, adx);
+
+        SignalGrade grade = confidence >= 0.70
+                ? SignalGrade.A
+                : SignalGrade.B;
+
+        double rr = grade == SignalGrade.A ? RR_A : RR_B;
+
         double take = side == TradingCore.Side.LONG
-                ? entry + risk * RR_A
-                : entry - risk * RR_A;
-
-        double confidence = computeConfidence(m15, h1, regime, type);
-
-        SignalGrade grade = confidence >= 0.68 ? SignalGrade.A : SignalGrade.B;
-        if (grade == SignalGrade.B) {
-            take = side == TradingCore.Side.LONG
-                    ? entry + risk * RR_B
-                    : entry - risk * RR_B;
-        }
+                ? entry + risk * rr
+                : entry - risk * rr;
 
         cooldown.put(key, now);
 
@@ -133,43 +147,50 @@ public final class DecisionEngineMerged {
                 confidence,
                 atr,
                 grade,
-                "HTF " + regime + " | STRUCTURE ENTRY",
+                "HTF " + regime + " | PRO TREND ENTRY",
                 type
         );
     }
 
-    /* ===================== MARKET REGIME ===================== */
+    /* ===================== REGIME ===================== */
 
     private enum MarketRegime { BULL, BEAR, RANGE }
 
     private MarketRegime detectRegime(List<TradingCore.Candle> h1) {
+
         double e50 = ema(h1, 50);
         double e200 = ema(h1, 200);
         double price = last(h1).close;
 
-        if (price > e50 && e50 > e200) return MarketRegime.BULL;
-        if (price < e50 && e50 < e200) return MarketRegime.BEAR;
+        double adx = adx(h1, 14);
+
+        if (adx < 16) return MarketRegime.RANGE;
+
+        if (price > e50 && e50 > e200)
+            return MarketRegime.BULL;
+
+        if (price < e50 && e50 < e200)
+            return MarketRegime.BEAR;
+
         return MarketRegime.RANGE;
     }
+    private double structureStrength(List<TradingCore.Candle> c) {
 
-    /* ===================== FILTERS ===================== */
+        TradingCore.Candle last = c.get(c.size() - 1);
+        TradingCore.Candle prev = c.get(c.size() - 2);
 
-    private boolean structureConfirmed(List<TradingCore.Candle> c, TradingCore.Side side) {
-        TradingCore.Candle a = c.get(c.size() - 3);
-        TradingCore.Candle b = c.get(c.size() - 2);
-        TradingCore.Candle d = c.get(c.size() - 1);
+        double body = Math.abs(last.close - last.open);
+        double range = last.high - last.low;
 
-        if (side == TradingCore.Side.LONG)
-            return d.close > b.high && b.low > a.low;
-        else
-            return d.close < b.low && b.high < a.high;
-    }
+        if (range == 0) return 0;
 
-    private boolean isExhaustion(List<TradingCore.Candle> c) {
-        TradingCore.Candle k = last(c);
-        double atr = atr(c, 14);
-        double range = k.high - k.low;
-        return range > atr * 1.8;
+        // сила тела
+        double bodyPower = body / range;
+
+        // импульс относительно предыдущей свечи
+        double momentum = Math.abs(last.close - prev.close) / range;
+
+        return clamp((bodyPower * 0.6 + momentum * 0.4), 0.0, 1.0);
     }
 
     /* ===================== CONFIDENCE ===================== */
@@ -177,30 +198,82 @@ public final class DecisionEngineMerged {
     private double computeConfidence(List<TradingCore.Candle> m15,
                                      List<TradingCore.Candle> h1,
                                      MarketRegime regime,
-                                     String type) {
+                                     String type,
+                                     double adx) {
 
         double conf = 0.50;
 
         conf += structureStrength(m15) * 0.15;
-        conf += trendStrength(h1) * 0.20;
+        conf += trendAcceleration(h1) * 0.20;
+
+        conf += Math.min(0.10, adx / 100.0);
 
         if ("TOP".equals(type)) conf += 0.03;
-        if ("MEME".equals(type)) conf -= 0.03;
+        if ("MEME".equals(type)) conf -= 0.04;
 
-        return clamp(conf, 0.45, 0.85);
+        return clamp(conf, 0.45, 0.90);
     }
 
-    private double structureStrength(List<TradingCore.Candle> c) {
+    /* ===================== FILTERS ===================== */
+
+    private boolean structureConfirmed(List<TradingCore.Candle> c,
+                                       TradingCore.Side side) {
+
+        TradingCore.Candle a = c.get(c.size() - 3);
+        TradingCore.Candle b = c.get(c.size() - 2);
+        TradingCore.Candle d = c.get(c.size() - 1);
+
+        if (side == TradingCore.Side.LONG)
+            return d.close > b.high && b.low > a.low;
+
+        return d.close < b.low && b.high < a.high;
+    }
+
+    private boolean isClimacticMove(List<TradingCore.Candle> c) {
         TradingCore.Candle k = last(c);
-        double body = Math.abs(k.close - k.open);
-        double range = k.high - k.low;
-        return range == 0 ? 0 : body / range;
+        double atr = trueATR(c, 14);
+        return (k.high - k.low) > atr * 2.2;
     }
 
-    private double trendStrength(List<TradingCore.Candle> c) {
+    /* ===================== INDICATORS ===================== */
+
+    private double trueATR(List<TradingCore.Candle> c, int n) {
+
+        double sum = 0;
+
+        for (int i = c.size() - n; i < c.size(); i++) {
+
+            TradingCore.Candle cur = c.get(i);
+            TradingCore.Candle prev = c.get(i - 1);
+
+            double tr = Math.max(
+                    cur.high - cur.low,
+                    Math.max(
+                            Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)
+                    )
+            );
+
+            sum += tr;
+        }
+
+        return sum / n;
+    }
+
+    private double adx(List<TradingCore.Candle> c, int n) {
+
+        double move = 0;
+
+        for (int i = c.size() - n; i < c.size() - 1; i++)
+            move += Math.abs(c.get(i + 1).close - c.get(i).close);
+
+        return (move / n) / trueATR(c, n) * 25.0;
+    }
+
+    private double trendAcceleration(List<TradingCore.Candle> c) {
+        double e21 = ema(c, 21);
         double e50 = ema(c, 50);
-        double e200 = ema(c, 200);
-        return Math.min(1.0, Math.abs(e50 - e200) / e200 * 5);
+        return Math.min(1.0, Math.abs(e21 - e50) / e50 * 6);
     }
 
     /* ===================== MATH ===================== */
@@ -213,18 +286,14 @@ public final class DecisionEngineMerged {
         return c != null && c.size() >= n;
     }
 
-    private double atr(List<TradingCore.Candle> c, int n) {
-        double s = 0;
-        for (int i = c.size() - n; i < c.size(); i++)
-            s += c.get(i).high - c.get(i).low;
-        return s / n;
-    }
-
     private double ema(List<TradingCore.Candle> c, int p) {
+
         double k = 2.0 / (p + 1);
         double e = c.get(c.size() - p).close;
+
         for (int i = c.size() - p + 1; i < c.size(); i++)
             e = c.get(i).close * k + e * (1 - k);
+
         return e;
     }
 
