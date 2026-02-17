@@ -14,17 +14,15 @@ public final class Elite5MinAnalyzer {
 
     /* ================= CONFIG ================= */
 
-    private static final int MAX_COINS = 70; // топ 70 монет
+    private static final int MAX_COINS = 70;
 
-    private static final int MIN_M15 = 50;
-    private static final int MIN_H1  = 40;
+    private static final int MIN_M15 = 60;
+    private static final int MIN_H1  = 60;
 
-    private static final double MIN_CONF = 0.55; // чуть мягче
+    private static final double MIN_CONF = 0.56;
 
-    // Market filters (смягчены для большего количества сигналов)
-    private static final double MIN_BODY_RATIO = 0.50;
-    private static final double MIN_ATR_PERCENT = 0.0025; // 0.25%
-    private static final double MIN_ADX = 12.0;
+    private static final double MIN_ATR_PERCENT = 0.0023;
+    private static final double MIN_ADX = 14.0;
 
     /* ================= CONSTRUCTOR ================= */
 
@@ -87,11 +85,13 @@ public final class Elite5MinAnalyzer {
             if (!valid(tf15, MIN_M15) || !valid(tf1h, MIN_H1))
                 continue;
 
-            if (isFlat(tf15)) continue;
             if (!hasVolatility(tf15)) continue;
             if (!hasTrendStrength(tf15)) continue;
-            if (!hasVolumeExpansion(tf15)) continue;
-            if (!structureConfirmed(tf15)) continue;
+
+            TradingCore.Side htfBias = detectHTFBias(tf1h);
+            if (htfBias == null) continue;
+
+            if (!pullbackReady(tf15, htfBias)) continue;
 
             String type = coinTypes.getOrDefault(symbol, "ALT");
 
@@ -105,8 +105,8 @@ public final class Elite5MinAnalyzer {
 
             for (DecisionEngineMerged.TradeIdea idea : ideas) {
 
-                // Убрали жесткий фильтр против H1
-                // if (counterTrendHTF(tf1h, idea.side)) continue;
+                if (idea.side != htfBias)
+                    continue;
 
                 String key = symbol + "_" + idea.side;
                 long cd = cooldown(type, idea.grade);
@@ -115,14 +115,14 @@ public final class Elite5MinAnalyzer {
                         && now - lastSignal.get(key) < cd)
                     continue;
 
-                double conf = brain.adjust(symbol, idea.confidence, type);
+                double conf = buildProfessionalConfidence(tf15, tf1h,
+                        idea.confidence,
+                        htfBias,
+                        type);
+
+                conf = brain.adjust(symbol, conf, type);
+
                 if (conf < MIN_CONF) continue;
-
-                double atr = atr(tf15, 14);
-                double riskPercent = Math.abs(idea.entry - idea.stop) / idea.entry;
-
-                if (riskPercent > atr * 2.5) // смягчение проверки риска
-                    continue;
 
                 result.add(new TradeSignal(
                         symbol,
@@ -131,7 +131,7 @@ public final class Elite5MinAnalyzer {
                         idea.stop,
                         idea.take,
                         clamp(conf, 0.0, 0.99),
-                        idea.reason,
+                        idea.reason + " | HTF aligned",
                         type
                 ));
 
@@ -147,20 +147,97 @@ public final class Elite5MinAnalyzer {
         return result;
     }
 
-    /* ================= MARKET FILTERS ================= */
+    /* ================= PROFESSIONAL LOGIC ================= */
 
-    private boolean isFlat(List<TradingCore.Candle> c) {
+    private TradingCore.Side detectHTFBias(List<TradingCore.Candle> c) {
+        double ema50 = ema(c, 50);
+        double ema200 = ema(c, 200);
+        double price = c.get(c.size() - 1).close;
+
+        if (price > ema50 && ema50 > ema200)
+            return TradingCore.Side.LONG;
+
+        if (price < ema50 && ema50 < ema200)
+            return TradingCore.Side.SHORT;
+
+        return null;
+    }
+
+    private boolean pullbackReady(List<TradingCore.Candle> c,
+                                  TradingCore.Side bias) {
+
+        double ema20 = ema(c, 20);
+        double lastClose = c.get(c.size() - 1).close;
+
+        if (bias == TradingCore.Side.LONG)
+            return lastClose > ema20;
+
+        return lastClose < ema20;
+    }
+
+    private double buildProfessionalConfidence(List<TradingCore.Candle> m15,
+                                               List<TradingCore.Candle> h1,
+                                               double base,
+                                               TradingCore.Side side,
+                                               String type) {
+
+        double trendScore = trendScore(h1);
+        double momentumScore = momentumScore(m15);
+        double volatilityScore = volatilityScore(m15);
+        double structureScore = structureScore(m15);
+
+        double conf =
+                base * 0.35 +
+                        trendScore * 0.25 +
+                        momentumScore * 0.20 +
+                        volatilityScore * 0.10 +
+                        structureScore * 0.10;
+
+        if ("TOP".equals(type)) conf += 0.02;
+        if ("MEME".equals(type)) conf -= 0.03;
+
+        return clamp(conf, 0.45, 0.93);
+    }
+
+    /* ================= SCORES ================= */
+
+    private double trendScore(List<TradingCore.Candle> c) {
+        double ema21 = ema(c, 21);
+        double ema50 = ema(c, 50);
+        return clamp(Math.abs(ema21 - ema50) / ema50 * 8, 0, 1);
+    }
+
+    private double momentumScore(List<TradingCore.Candle> c) {
         int n = c.size();
-        double bodySum = 0;
+        double move = 0;
+        for (int i = n - 6; i < n - 1; i++)
+            move += Math.abs(c.get(i + 1).close - c.get(i).close);
+        return clamp(move / 6.0 / atr(c, 14), 0, 1);
+    }
 
-        for (int i = n - 6; i < n - 1; i++) {
-            TradingCore.Candle k = c.get(i);
-            double body = Math.abs(k.close - k.open);
-            double range = k.high - k.low + 1e-6;
-            bodySum += body / range;
-        }
+    private double volatilityScore(List<TradingCore.Candle> c) {
+        double atr = atr(c, 14);
+        double price = c.get(c.size() - 1).close;
+        return clamp((atr / price) * 40, 0, 1);
+    }
 
-        return (bodySum / 5.0) < MIN_BODY_RATIO;
+    private double structureScore(List<TradingCore.Candle> c) {
+        int n = c.size();
+        int up = 0;
+        for (int i = n - 5; i < n - 1; i++)
+            if (c.get(i + 1).close > c.get(i).close)
+                up++;
+        return up / 4.0;
+    }
+
+    /* ================= INDICATORS ================= */
+
+    private double atr(List<TradingCore.Candle> c, int period) {
+        int n = c.size();
+        double sum = 0;
+        for (int i = n - period; i < n; i++)
+            sum += c.get(i).high - c.get(i).low;
+        return sum / period;
     }
 
     private boolean hasVolatility(List<TradingCore.Candle> c) {
@@ -173,86 +250,55 @@ public final class Elite5MinAnalyzer {
         return adx(c, 14) > MIN_ADX;
     }
 
-    private boolean hasVolumeExpansion(List<TradingCore.Candle> c) {
-        int n = c.size();
-        double avg = 0;
-
-        for (int i = n - 15; i < n - 1; i++)
-            avg += c.get(i).volume;
-
-        avg /= 14.0;
-
-        return c.get(n - 1).volume > avg * 1.2;
-    }
-
-    private boolean structureConfirmed(List<TradingCore.Candle> c) {
-        int n = c.size();
-        int dir = 0;
-
-        for (int i = n - 4; i < n - 1; i++) {
-            int d = Double.compare(c.get(i + 1).close, c.get(i).close);
-            if (d == 0) return false;
-            if (dir == 0) dir = d;
-            else if (d != dir) return false;
-        }
-
-        return true;
-    }
-
-    /* ================= INDICATORS ================= */
-
-    private double atr(List<TradingCore.Candle> c, int period) {
-        int n = c.size();
-        double sum = 0;
-
-        for (int i = n - period; i < n; i++) {
-            TradingCore.Candle k = c.get(i);
-            double tr = k.high - k.low;
-            sum += tr;
-        }
-
-        return sum / period;
-    }
-
     private double adx(List<TradingCore.Candle> c, int period) {
         int n = c.size();
         double move = 0;
-
         for (int i = n - period; i < n - 1; i++)
             move += Math.abs(c.get(i + 1).close - c.get(i).close);
-
-        double atr = atr(c, period);
-        return (move / period) / atr * 25.0;
+        return (move / period) / atr(c, period) * 25.0;
     }
 
-    /* ================= BRAIN ================= */
+    private double ema(List<TradingCore.Candle> c, int p) {
+        double k = 2.0 / (p + 1);
+        double e = c.get(c.size() - p).close;
+        for (int i = c.size() - p + 1; i < c.size(); i++)
+            e = c.get(i).close * k + e * (1 - k);
+        return e;
+    }
+
+    private static boolean valid(List<?> l, int min) {
+        return l != null && l.size() >= min;
+    }
+
+    private static double clamp(double v, double min, double max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+    public void shutdown() {
+        scheduler.shutdown();
+    }
+
+    /* ================= ADAPTIVE ================= */
 
     static final class AdaptiveBrain {
         private final Map<String, Integer> streak =
                 new ConcurrentHashMap<>();
 
-        double adjust(String symbol,
-                      double base,
-                      String type) {
-
+        double adjust(String symbol, double base, String type) {
             int k = streak.getOrDefault(symbol, 0);
             double conf = base;
 
-            if (k >= 2) conf += 0.03;
+            if (k >= 2) conf += 0.02;
             if (k <= -2) conf -= 0.02;
-
-            if ("TOP".equals(type)) conf += 0.03;
 
             return conf;
         }
     }
 
-    /* ================= COOLDOWN ================= */
-
     private static long cooldown(String type,
                                  DecisionEngineMerged.SignalGrade grade) {
 
-        long base = 8 * 60_000; // смягчено
+        long base = 8 * 60_000;
 
         if (grade == DecisionEngineMerged.SignalGrade.A)
             base *= 0.7;
@@ -261,21 +307,5 @@ public final class Elite5MinAnalyzer {
             base *= 0.6;
 
         return base;
-    }
-
-    /* ================= UTILS ================= */
-
-    private static boolean valid(List<?> l, int min) {
-        return l != null && l.size() >= min;
-    }
-
-    private static double clamp(double v,
-                                double min,
-                                double max) {
-        return Math.max(min, Math.min(max, v));
-    }
-
-    public void shutdown() {
-        scheduler.shutdown();
     }
 }
