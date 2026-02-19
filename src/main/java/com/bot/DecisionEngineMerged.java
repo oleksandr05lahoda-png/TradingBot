@@ -3,18 +3,19 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Профессиональная версия DecisionEngineMerged.
- * Улучшена надежность прогнозов, более точный расчёт confidence, фильтры трендов и паттернов.
- */
 public final class DecisionEngineMerged {
 
+    /* ================= ENUMS ================= */
     public enum SignalGrade { A, B }
-
     private enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, CLIMAX }
-
     private enum HTFBias { BULL, BEAR, NONE }
 
+    /* ================= CONFIG ================= */
+    private static final int MIN_BARS = 200;
+    private static final long COOLDOWN_MS = 12 * 60_000; // не душим частоту
+    private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
+
+    /* ================= OUTPUT ================= */
     public static final class TradeIdea {
         public final String symbol;
         public final TradingCore.Side side;
@@ -42,13 +43,7 @@ public final class DecisionEngineMerged {
         }
     }
 
-    private static final int MIN_BARS = 200;
-    private static final long COOLDOWN_MS = 45 * 60_000;
-    private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
-
-    /**
-     * Основной метод: оценивает все символы и генерирует торговые идеи.
-     */
+    /* ================= MAIN EVALUATION ================= */
     public List<TradeIdea> evaluate(List<String> symbols,
                                     Map<String, List<TradingCore.Candle>> m15,
                                     Map<String, List<TradingCore.Candle>> h1) {
@@ -73,9 +68,7 @@ public final class DecisionEngineMerged {
         return ideas;
     }
 
-    /**
-     * Генерация одной торговой идеи на основе анализа свечей, тренда и паттернов.
-     */
+    /* ================= SIGNAL LOGIC ================= */
     private TradeIdea generateTradeIdea(String symbol,
                                         List<TradingCore.Candle> c,
                                         MarketState state,
@@ -91,123 +84,91 @@ public final class DecisionEngineMerged {
         String reason = null;
 
         switch (state) {
+
+            // 🔥 Early Trend Impulse
             case STRONG_TREND -> {
-                if (isBullTrend(c) && bias == HTFBias.BULL) {
+                if (bias == HTFBias.BULL && ema(c, 21) > ema(c, 50) && rsi > 38 && rsi < 65) {
                     side = TradingCore.Side.LONG;
-                    reason = "Strong trend continuation (bullish)";
+                    reason = "Early Trend Impulse (Bullish)";
                 }
-                if (isBearTrend(c) && bias == HTFBias.BEAR) {
+                if (bias == HTFBias.BEAR && ema(c, 21) < ema(c, 50) && rsi < 62 && rsi > 35) {
                     side = TradingCore.Side.SHORT;
-                    reason = "Strong trend continuation (bearish)";
+                    reason = "Early Trend Impulse (Bearish)";
                 }
             }
 
+            // ⚡ Weak Trend Continuation
             case WEAK_TREND -> {
-                if (pullbackLong(c, rsi) && bias == HTFBias.BULL) {
+                if (bias == HTFBias.BULL && ema(c, 21) > ema(c, 50) && rsi < 55) {
                     side = TradingCore.Side.LONG;
-                    reason = "Pullback entry (bullish)";
+                    reason = "Weak Trend Early Continuation";
                 }
-                if (pullbackShort(c, rsi) && bias == HTFBias.BEAR) {
+                if (bias == HTFBias.BEAR && ema(c, 21) < ema(c, 50) && rsi > 45) {
                     side = TradingCore.Side.SHORT;
-                    reason = "Pullback entry (bearish)";
+                    reason = "Weak Trend Early Continuation";
                 }
             }
 
+            // 📦 Range Bounce
+            case RANGE -> {
+                double high = highest(c, 15);
+                double low = lowest(c, 15);
+
+                if (price <= low * 1.002) {
+                    side = TradingCore.Side.LONG;
+                    reason = "Range Early Support";
+                }
+                if (price >= high * 0.998) {
+                    side = TradingCore.Side.SHORT;
+                    reason = "Range Early Resistance";
+                }
+            }
+
+            // 💥 Climax Reversal
             case CLIMAX -> {
-                if (reversalSignal(c, rsi, TradingCore.Side.LONG)) {
+                if (rsi < 30) {
                     side = TradingCore.Side.LONG;
-                    reason = "Exhaustion reversal (bullish)";
+                    reason = "Early Exhaustion Reversal";
                 }
-                if (reversalSignal(c, rsi, TradingCore.Side.SHORT)) {
+                if (rsi > 70) {
                     side = TradingCore.Side.SHORT;
-                    reason = "Exhaustion reversal (bearish)";
+                    reason = "Early Exhaustion Reversal";
                 }
             }
-
-            default -> {}
         }
 
         if (side == null) return null;
 
-        // Проверка cooldown для одной стороны
+        // cooldown
         String key = symbol + "_" + side;
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS) return null;
+        if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS)
+            return null;
 
-        // Надежность прогноза
-        double confidence = computeConfidence(c, state, adx, rsi);
+        // confidence
+        double confidence = computeConfidence(c, state, adx);
 
-        // Расчет стопа и тейка
-        double risk = atr * 1.2;
-        double rr = confidence > 0.75 ? 2.8 : 2.0;
+        double risk = atr * 1.0;
+        double rr = confidence > 0.72 ? 2.8 : 2.2;
 
         double stop = side == TradingCore.Side.LONG ? price - risk : price + risk;
         double take = side == TradingCore.Side.LONG ? price + risk * rr : price - risk * rr;
 
         cooldown.put(key, now);
 
-        return new TradeIdea(symbol, side, price, stop, take, confidence,
-                confidence > 0.75 ? SignalGrade.A : SignalGrade.B, reason);
+        return new TradeIdea(symbol, side, price, stop, take,
+                confidence,
+                confidence > 0.72 ? SignalGrade.A : SignalGrade.B,
+                reason);
     }
 
-    /* ===================== ЛОГИКА РЫНКА ===================== */
-
+    /* ================= MARKET STATE ================= */
     private MarketState detectMarketState(List<TradingCore.Candle> c) {
         double adx = adx(c, 14);
-        double vol = relativeVolume(c);
-
-        if (adx > 28) return MarketState.STRONG_TREND;
-        if (adx > 18) return MarketState.WEAK_TREND;
-        if (vol > 1.8) return MarketState.CLIMAX;
+        if (adx > 22) return MarketState.STRONG_TREND;
+        if (adx > 15) return MarketState.WEAK_TREND;
+        if (relativeVolume(c) > 1.8) return MarketState.CLIMAX;
         return MarketState.RANGE;
     }
-
-    private boolean isBullTrend(List<TradingCore.Candle> c) {
-        return ema(c, 21) > ema(c, 50) && last(c).close > ema(c, 21) && higherHighs(c);
-    }
-
-    private boolean isBearTrend(List<TradingCore.Candle> c) {
-        return ema(c, 21) < ema(c, 50) && last(c).close < ema(c, 21) && lowerLows(c);
-    }
-
-    private boolean pullbackLong(List<TradingCore.Candle> c, double rsi) {
-        return ema(c, 21) > ema(c, 50) && rsi < 45 && last(c).close > ema(c, 50);
-    }
-
-    private boolean pullbackShort(List<TradingCore.Candle> c, double rsi) {
-        return ema(c, 21) < ema(c, 50) && rsi > 55 && last(c).close < ema(c, 50);
-    }
-
-    private boolean reversalSignal(List<TradingCore.Candle> c, double rsi, TradingCore.Side side) {
-        TradingCore.Candle last = last(c);
-        double body = Math.abs(last.close - last.open);
-        double range = last.high - last.low;
-        if (range == 0) return false;
-
-        boolean exhaustion = body / range < 0.3;
-        return (side == TradingCore.Side.LONG && rsi < 30 && exhaustion) ||
-                (side == TradingCore.Side.SHORT && rsi > 70 && exhaustion);
-    }
-
-    /* ===================== CONFIDENCE ===================== */
-
-    private double computeConfidence(List<TradingCore.Candle> c, MarketState state, double adx, double rsi) {
-        double structure = Math.abs(ema(c, 21) - ema(c, 50)) / ema(c, 50) * 10;
-        double vol = relativeVolume(c);
-
-        double base = switch (state) {
-            case STRONG_TREND -> 0.74;
-            case WEAK_TREND -> 0.66;
-            case CLIMAX -> 0.60;
-            default -> 0.55;
-        };
-
-        double conf = base + structure * 0.05 + (adx / 50.0) * 0.1 + (vol - 1) * 0.05;
-
-        // Более строгий диапазон для достоверности
-        return clamp(conf, 0.52, 0.90);
-    }
-
-    /* ===================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ===================== */
 
     private HTFBias detectHTFBias(List<TradingCore.Candle> c) {
         if (ema(c, 50) > ema(c, 200)) return HTFBias.BULL;
@@ -215,28 +176,30 @@ public final class DecisionEngineMerged {
         return HTFBias.NONE;
     }
 
-    private boolean higherHighs(List<TradingCore.Candle> c) {
-        int n = c.size();
-        return c.get(n - 1).high > c.get(n - 2).high && c.get(n - 2).high > c.get(n - 3).high;
+    /* ================= CONFIDENCE ================= */
+    private double computeConfidence(List<TradingCore.Candle> c,
+                                     MarketState state,
+                                     double adx) {
+        double structure = Math.abs(ema(c, 21) - ema(c, 50)) / ema(c, 50) * 10;
+        double base = switch (state) {
+            case STRONG_TREND -> 0.72;
+            case WEAK_TREND -> 0.66;
+            case RANGE -> 0.60;
+            case CLIMAX -> 0.63;
+        };
+        double momentumBoost = (adx / 50.0) * 0.1;
+        return clamp(base + structure * 0.05 + momentumBoost, 0.55, 0.90);
     }
 
-    private boolean lowerLows(List<TradingCore.Candle> c) {
-        int n = c.size();
-        return c.get(n - 1).low < c.get(n - 2).low && c.get(n - 2).low < c.get(n - 3).low;
-    }
-
-    private double relativeVolume(List<TradingCore.Candle> c) {
-        int n = c.size();
-        double avg = c.subList(n - 20, n - 1).stream().mapToDouble(cd -> cd.volume).average().orElse(0);
-        return last(c).volume / avg;
-    }
-
+    /* ================= INDICATORS ================= */
     private double atr(List<TradingCore.Candle> c, int n) {
         double sum = 0;
         for (int i = c.size() - n; i < c.size(); i++) {
             TradingCore.Candle cur = c.get(i);
             TradingCore.Candle prev = c.get(i - 1);
-            double tr = Math.max(cur.high - cur.low, Math.max(Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close)));
+            double tr = Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)));
             sum += tr;
         }
         return sum / n;
@@ -244,7 +207,8 @@ public final class DecisionEngineMerged {
 
     private double adx(List<TradingCore.Candle> c, int n) {
         double move = 0;
-        for (int i = c.size() - n; i < c.size() - 1; i++) move += Math.abs(c.get(i + 1).close - c.get(i).close);
+        for (int i = c.size() - n; i < c.size() - 1; i++)
+            move += Math.abs(c.get(i + 1).close - c.get(i).close);
         return move / n / atr(c, n) * 25;
     }
 
@@ -252,19 +216,32 @@ public final class DecisionEngineMerged {
         double gain = 0, loss = 0;
         for (int i = c.size() - n; i < c.size() - 1; i++) {
             double diff = c.get(i + 1).close - c.get(i).close;
-            if (diff > 0) gain += diff;
-            else loss -= diff;
+            if (diff > 0) gain += diff; else loss -= diff;
         }
         if (loss == 0) return 100;
-        double rs = gain / loss;
-        return 100 - (100 / (1 + rs));
+        return 100 - (100 / (1 + gain / loss));
     }
 
     private double ema(List<TradingCore.Candle> c, int p) {
         double k = 2.0 / (p + 1);
         double e = c.get(c.size() - p).close;
-        for (int i = c.size() - p + 1; i < c.size(); i++) e = c.get(i).close * k + e * (1 - k);
+        for (int i = c.size() - p + 1; i < c.size(); i++)
+            e = c.get(i).close * k + e * (1 - k);
         return e;
+    }
+
+    private double highest(List<TradingCore.Candle> c, int n) {
+        return c.subList(c.size() - n, c.size()).stream().mapToDouble(cd -> cd.high).max().orElse(0);
+    }
+
+    private double lowest(List<TradingCore.Candle> c, int n) {
+        return c.subList(c.size() - n, c.size()).stream().mapToDouble(cd -> cd.low).min().orElse(0);
+    }
+
+    private double relativeVolume(List<TradingCore.Candle> c) {
+        int n = c.size();
+        double avg = c.subList(n - 20, n - 1).stream().mapToDouble(cd -> cd.volume).average().orElse(1);
+        return last(c).volume / avg;
     }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {

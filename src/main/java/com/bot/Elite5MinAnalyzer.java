@@ -6,23 +6,17 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class Elite5MinAnalyzer {
 
     /* ================= CONFIG ================= */
-
     private static final int MIN_M15 = 200;
     private static final int MIN_H1  = 200;
+    private static final int MAX_SYMBOLS = 70;
 
-    private static final int MAX_SYMBOLS = 70;  // увеличено для большего покрытия
-
-    private static final double MIN_CONFIDENCE = 0.62;
-    private static final double MIN_ATR_PCT    = 0.0020;  // чуть мягче, чтобы не терять сигналы
-    private static final double MIN_ADX        = 18.0;
-
-    private static final long BASE_COOLDOWN = 12 * 60_000;
+    private static final double MIN_CONFIDENCE = 0.60;
+    private static final double MIN_ATR_PCT    = 0.0018;
+    private static final long BASE_COOLDOWN = 8 * 60_000;
 
     private final Map<String, Long> cooldown = new ConcurrentHashMap<>();
-    private final AdaptiveBrain brain = new AdaptiveBrain();
 
     /* ================= OUTPUT ================= */
-
     public static final class TradeSignal {
         public final String symbol;
         public final TradingCore.Side side;
@@ -47,8 +41,7 @@ public final class Elite5MinAnalyzer {
         }
     }
 
-    /* ================= MAIN ================= */
-
+    /* ================= MAIN ANALYSIS ================= */
     public List<TradeSignal> analyze(List<String> symbols,
                                      Map<String, List<TradingCore.Candle>> m15,
                                      Map<String, List<TradingCore.Candle>> h1) {
@@ -69,9 +62,7 @@ public final class Elite5MinAnalyzer {
             TradingCore.Side bias = detectHTFBias(tf1h);
             if (bias == null) continue;
 
-            MarketState state = detectMarketState(tf15);
-
-            TradeSignal signal = buildSignal(symbol, tf15, tf1h, bias, state, now);
+            TradeSignal signal = buildSignal(symbol, tf15, bias, now);
             if (signal != null) result.add(signal);
         }
 
@@ -79,13 +70,10 @@ public final class Elite5MinAnalyzer {
         return result;
     }
 
-    /* ================= CORE LOGIC ================= */
-
+    /* ================= SIGNAL BUILDING ================= */
     private TradeSignal buildSignal(String symbol,
                                     List<TradingCore.Candle> m15,
-                                    List<TradingCore.Candle> h1,
                                     TradingCore.Side bias,
-                                    MarketState state,
                                     long now) {
 
         double price = last(m15).close;
@@ -93,223 +81,193 @@ public final class Elite5MinAnalyzer {
         double adx = adx(m15, 14);
         double rsi = rsi(m15, 14);
 
-        if (adx < MIN_ADX) return null;
-
         TradingCore.Side side = null;
         String reason = null;
 
-        /* ===== TREND CONTINUATION ===== */
-        if (state == MarketState.STRONG_TREND) {
-            if (bias == TradingCore.Side.LONG && structureBullish(m15) && pullbackZone(m15, TradingCore.Side.LONG)) {
+        // 1️⃣ Early Breakout — ловим импульс сразу
+        if (earlyBreakout(m15, bias) && adx > 14 && !overextendedMove(m15)) {
+            side = bias;
+            reason = "Early Breakout";
+        }
+
+        // 2️⃣ Pullback Entry — тренд с коррекцией
+        if (side == null && adx > 18 && pullbackZone(m15, bias) && !overextendedMove(m15)) {
+            side = bias;
+            reason = "Trend Pullback";
+        }
+
+        // 3️⃣ Reversal/Divergence — ранний разворот
+        if (side == null) {
+            if (bullishDivergence(m15) && rsi < 35) {
                 side = TradingCore.Side.LONG;
-                reason = "Strong Trend Pullback";
+                reason = "Bullish Divergence";
             }
-            if (bias == TradingCore.Side.SHORT && structureBearish(m15) && pullbackZone(m15, TradingCore.Side.SHORT)) {
+            if (bearishDivergence(m15) && rsi > 65) {
                 side = TradingCore.Side.SHORT;
-                reason = "Strong Trend Pullback";
+                reason = "Bearish Divergence";
             }
         }
 
-        /* ===== CONTROLLED REVERSAL ===== */
-        if (state == MarketState.CLIMAX) {
-            if (bias == TradingCore.Side.LONG && rsi < 30 && exhaustionCandle(m15)) {
-                side = TradingCore.Side.LONG;
-                reason = "Climax Reversal Long";
-            }
-            if (bias == TradingCore.Side.SHORT && rsi > 70 && exhaustionCandle(m15)) {
-                side = TradingCore.Side.SHORT;
-                reason = "Climax Reversal Short";
-            }
-        }
-
+        // Нет сигнала
         if (side == null) return null;
 
+        // Cooldown
         String key = symbol + "_" + side;
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < dynamicCooldown(adx)) return null;
+        if (cooldown.containsKey(key) && now - cooldown.get(key) < BASE_COOLDOWN) return null;
 
-        double confidence = calculateConfidence(m15, h1, adx, rsi, state);
-        confidence = brain.adjust(symbol, confidence);
+        // Confidence
+        double confidence = calculateConfidence(m15, adx, rsi);
         if (confidence < MIN_CONFIDENCE) return null;
 
-        double risk = atr * 1.2;  // чуть меньше, более агрессивная цель
-        double rr = confidence > 0.78 ? 3.0 : 2.4;
+        // Risk/Reward
+        double risk = atr * 1.1;
+        double rr = confidence > 0.75 ? 3.0 : 2.2;
 
         double stop = side == TradingCore.Side.LONG ? price - risk : price + risk;
         double take = side == TradingCore.Side.LONG ? price + risk * rr : price - risk * rr;
 
         cooldown.put(key, now);
 
-        return new TradeSignal(symbol, side, price, stop, take, clamp(confidence, 0.52, 0.95), reason);
+        return new TradeSignal(symbol, side, price, stop, take,
+                clamp(confidence, 0.55, 0.93), reason);
     }
 
-    /* ================= MARKET STATE ================= */
-
-    private enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, CLIMAX }
-
-    private MarketState detectMarketState(List<TradingCore.Candle> c) {
-        double adx = adx(c, 14);
-        double vol = relativeVolume(c);
-        if (vol > 2.2) return MarketState.CLIMAX;
-        if (adx > 28)  return MarketState.STRONG_TREND;
-        if (adx > 17)  return MarketState.WEAK_TREND;
-        return MarketState.RANGE;
-    }
-
-    /* ================= STRUCTURE ================= */
-
-    private boolean structureBullish(List<TradingCore.Candle> c) {
-        return ema(c,21) > ema(c,50) && higherHighs(c) && last(c).close > ema(c,21);
-    }
-
-    private boolean structureBearish(List<TradingCore.Candle> c) {
-        return ema(c,21) < ema(c,50) && lowerLows(c) && last(c).close < ema(c,21);
-    }
-
-    private boolean higherHighs(List<TradingCore.Candle> c) {
+    /* ================= SIGNAL MODELS ================= */
+    private boolean earlyBreakout(List<TradingCore.Candle> c, TradingCore.Side side) {
         int n = c.size();
-        return c.get(n-1).high > c.get(n-2).high && c.get(n-2).high > c.get(n-3).high;
+        TradingCore.Candle last = c.get(n - 1);
+        TradingCore.Candle prev = c.get(n - 2);
+
+        return side == TradingCore.Side.LONG
+                ? last.close > prev.high
+                : last.close < prev.low;
     }
 
-    private boolean lowerLows(List<TradingCore.Candle> c) {
+    private boolean overextendedMove(List<TradingCore.Candle> c) {
         int n = c.size();
-        return c.get(n-1).low < c.get(n-2).low && c.get(n-2).low < c.get(n-3).low;
+        int strong = 0;
+        for (int i = n - 4; i < n - 1; i++) {
+            double body = Math.abs(c.get(i).close - c.get(i).open);
+            double range = c.get(i).high - c.get(i).low;
+            if (range > 0 && body / range > 0.7) strong++;
+        }
+        return strong >= 3;
     }
 
     private boolean pullbackZone(List<TradingCore.Candle> c, TradingCore.Side side) {
-        double ema21 = ema(c,21);
+        double ema21 = ema(c, 21);
         double price = last(c).close;
-        return side == TradingCore.Side.LONG ? price <= ema21 * 1.008 : price >= ema21 * 0.992;
+        return side == TradingCore.Side.LONG
+                ? price <= ema21 * 1.006
+                : price >= ema21 * 0.994;
     }
 
-    private boolean exhaustionCandle(List<TradingCore.Candle> c) {
-        TradingCore.Candle last = last(c);
-        double body = Math.abs(last.close - last.open);
-        double range = last.high - last.low;
-        return range > 0 && body / range < 0.22;
+    private boolean bullishDivergence(List<TradingCore.Candle> c) {
+        int n = c.size();
+        if (n < 20) return false;
+        double low1 = c.get(n - 3).low;
+        double low2 = c.get(n - 1).low;
+        double rsi1 = rsi(c.subList(0, n - 2), 14);
+        double rsi2 = rsi(c, 14);
+        return low2 < low1 && rsi2 > rsi1;
+    }
+
+    private boolean bearishDivergence(List<TradingCore.Candle> c) {
+        int n = c.size();
+        if (n < 20) return false;
+        double high1 = c.get(n - 3).high;
+        double high2 = c.get(n - 1).high;
+        double rsi1 = rsi(c.subList(0, n - 2), 14);
+        double rsi2 = rsi(c, 14);
+        return high2 > high1 && rsi2 < rsi1;
     }
 
     /* ================= CONFIDENCE ================= */
-
     private double calculateConfidence(List<TradingCore.Candle> m15,
-                                       List<TradingCore.Candle> h1,
                                        double adx,
-                                       double rsi,
-                                       MarketState state) {
-
-        double trendH1 = trendStrength(h1);
+                                       double rsi) {
+        double trend = trendStrength(m15);
         double momentum = momentumScore(m15);
-        double structure = structureScore(m15);
         double vol = relativeVolume(m15);
-
-        double base = switch (state) {
-            case STRONG_TREND -> 0.74;
-            case WEAK_TREND   -> 0.66;
-            case CLIMAX       -> 0.62;
-            default           -> 0.55;
-        };
-
-        double conf = base
-                + trendH1 * 0.15
-                + momentum * 0.12
-                + structure * 0.10
-                + (adx / 50.0) * 0.10
-                + (vol - 1) * 0.05;
-
-        return clamp(conf, 0.52, 0.95);
+        return clamp(0.58 + trend * 0.18 + momentum * 0.15 + (adx / 40.0) * 0.12 + (vol - 1) * 0.05, 0.55, 0.93);
     }
 
     /* ================= INDICATORS ================= */
-
-    private double atr(List<TradingCore.Candle> c,int p){
-        double sum=0;
-        for(int i=c.size()-p;i<c.size();i++)
-            sum+=c.get(i).high-c.get(i).low;
-        return sum/p;
+    private double atr(List<TradingCore.Candle> c, int p) {
+        double sum = 0;
+        for (int i = c.size() - p; i < c.size(); i++)
+            sum += c.get(i).high - c.get(i).low;
+        return sum / p;
     }
 
-    private double adx(List<TradingCore.Candle> c,int p){
-        double move=0;
-        for(int i=c.size()-p;i<c.size()-1;i++)
-            move+=Math.abs(c.get(i+1).close-c.get(i).close);
-        return (move/p)/atr(c,p)*25.0;
+    private double adx(List<TradingCore.Candle> c, int p) {
+        double move = 0;
+        for (int i = c.size() - p; i < c.size() - 1; i++)
+            move += Math.abs(c.get(i + 1).close - c.get(i).close);
+        return (move / p) / atr(c, p) * 25.0;
     }
 
-    private double rsi(List<TradingCore.Candle> c,int p){
-        double gain=0,loss=0;
-        for(int i=c.size()-p;i<c.size()-1;i++){
-            double diff=c.get(i+1).close-c.get(i).close;
-            if(diff>0) gain+=diff; else loss-=diff;
+    private double rsi(List<TradingCore.Candle> c, int p) {
+        double gain = 0, loss = 0;
+        for (int i = c.size() - p; i < c.size() - 1; i++) {
+            double diff = c.get(i + 1).close - c.get(i).close;
+            if (diff > 0) gain += diff; else loss -= diff;
         }
-        if(loss==0) return 100;
-        return 100-(100/(1+gain/loss));
+        if (loss == 0) return 100;
+        return 100 - (100 / (1 + gain / loss));
     }
 
-    private double ema(List<TradingCore.Candle> c,int p){
-        double k=2.0/(p+1);
-        double e=c.get(c.size()-p).close;
-        for(int i=c.size()-p+1;i<c.size();i++)
-            e=c.get(i).close*k+e*(1-k);
+    private double ema(List<TradingCore.Candle> c, int p) {
+        double k = 2.0 / (p + 1);
+        double e = c.get(c.size() - p).close;
+        for (int i = c.size() - p + 1; i < c.size(); i++)
+            e = c.get(i).close * k + e * (1 - k);
         return e;
     }
 
-    private double trendStrength(List<TradingCore.Candle> c){
-        double e21=ema(c,21), e50=ema(c,50);
-        return clamp(Math.abs(e21-e50)/e50*8,0,1);
+    private double trendStrength(List<TradingCore.Candle> c) {
+        double e21 = ema(c, 21);
+        double e50 = ema(c, 50);
+        return clamp(Math.abs(e21 - e50) / e50 * 6, 0, 1);
     }
 
-    private double momentumScore(List<TradingCore.Candle> c){
-        double move=0;
-        for(int i=c.size()-6;i<c.size()-1;i++)
-            move+=Math.abs(c.get(i+1).close-c.get(i).close);
-        return clamp(move/6.0/atr(c,14),0,1);
+    private double momentumScore(List<TradingCore.Candle> c) {
+        double move = 0;
+        for (int i = c.size() - 6; i < c.size() - 1; i++)
+            move += Math.abs(c.get(i + 1).close - c.get(i).close);
+        return clamp(move / 6.0 / atr(c, 14), 0, 1);
     }
 
-    private double structureScore(List<TradingCore.Candle> c){
-        int up=0;
-        for(int i=c.size()-5;i<c.size()-1;i++)
-            if(c.get(i+1).close>c.get(i).close) up++;
-        return up/4.0;
+    private double relativeVolume(List<TradingCore.Candle> c) {
+        int n = c.size();
+        double avg = c.subList(n - 20, n - 1).stream().mapToDouble(cd -> cd.volume).average().orElse(0);
+        return avg == 0 ? 1 : last(c).volume / avg;
     }
 
-    private double relativeVolume(List<TradingCore.Candle> c){
-        int n=c.size();
-        double avg=c.subList(n-20,n-1).stream().mapToDouble(cd->cd.volume).average().orElse(0);
-        return avg==0?1:last(c).volume/avg;
+    private boolean volatilityOk(List<TradingCore.Candle> c) {
+        double a = atr(c, 14);
+        double price = last(c).close;
+        return (a / price) > MIN_ATR_PCT;
     }
 
-    private boolean volatilityOk(List<TradingCore.Candle> c){
-        double a=atr(c,14), price=last(c).close;
-        return (a/price)>MIN_ATR_PCT;
-    }
-
-    private TradingCore.Side detectHTFBias(List<TradingCore.Candle> c){
-        double e50=ema(c,50), e200=ema(c,200), price=last(c).close;
-        if(price>e50 && e50>e200) return TradingCore.Side.LONG;
-        if(price<e50 && e50<e200) return TradingCore.Side.SHORT;
+    private TradingCore.Side detectHTFBias(List<TradingCore.Candle> c) {
+        double e50 = ema(c, 50);
+        double e200 = ema(c, 200);
+        double price = last(c).close;
+        if (price > e50 && e50 > e200) return TradingCore.Side.LONG;
+        if (price < e50 && e50 < e200) return TradingCore.Side.SHORT;
         return null;
     }
 
-    private static boolean valid(List<?> l,int min){ return l!=null && l.size()>=min; }
-
-    private TradingCore.Candle last(List<TradingCore.Candle> c){ return c.get(c.size()-1); }
-
-    private double clamp(double v,double min,double max){ return Math.max(min,Math.min(max,v)); }
-
-    private long dynamicCooldown(double adx){
-        if(adx>32) return BASE_COOLDOWN/2;
-        if(adx<15) return BASE_COOLDOWN*2;
-        return BASE_COOLDOWN;
+    private static boolean valid(List<?> l, int min) {
+        return l != null && l.size() >= min;
     }
 
-    /* ================= ADAPTIVE ================= */
+    private TradingCore.Candle last(List<TradingCore.Candle> c) {
+        return c.get(c.size() - 1);
+    }
 
-    static final class AdaptiveBrain {
-        private final Map<String,Integer> memory = new ConcurrentHashMap<>();
-        double adjust(String symbol,double base){
-            int s=memory.getOrDefault(symbol,0);
-            if(s>=2) base+=0.02;
-            if(s<=-2) base-=0.02;
-            return base;
-        }
+    private double clamp(double v, double min, double max) {
+        return Math.max(min, Math.min(max, v));
     }
 }
