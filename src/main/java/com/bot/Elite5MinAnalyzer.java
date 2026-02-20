@@ -12,7 +12,7 @@ public final class Elite5MinAnalyzer {
 
     private static final double MIN_CONFIDENCE = 0.62;
     private static final double MIN_ATR_PCT    = 0.0020;
-    private static final long BASE_COOLDOWN = 8 * 60_000;
+    private static final long BASE_COOLDOWN = 15 * 60_000;
 
     private final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 

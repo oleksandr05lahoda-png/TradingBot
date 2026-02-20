@@ -12,7 +12,7 @@ public final class DecisionEngineMerged {
 
     /* ================= CONFIG ================= */
     private static final int MIN_BARS = 200;
-    private static final long COOLDOWN_MS = 5 * 60_000; // 5 минут минимальный интервал сигнала
+    private static final long COOLDOWN_MS = 15 * 60_000; // 5 минут минимальный интервал сигнала
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
     /* ================= OUTPUT ================= */
