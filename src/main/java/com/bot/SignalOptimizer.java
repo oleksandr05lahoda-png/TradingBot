@@ -4,13 +4,13 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * SignalOptimizer Ultimate для интеграции с Elite5MinAnalyzer и DecisionEngineMerged.
+ * SignalOptimizer Ultimate для интеграции с EliteM15Analyzer и DecisionEngineMerged.
  * Поддерживает микро-тренды, импульсы, направление сигнала и согласование с HTF.
  */
 public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */
-    private static final int MAX_TICKS = 60;           // количество последних тиков для анализа микротренда
+    private static final int MAX_TICKS = 60;           // последние тики для анализа микро-тренда
     private static final double ALPHA = 0.35;          // сглаживание скорости и ускорения
     private static final double IMPULSE_DEAD = 0.0003;
     private static final double IMPULSE_STRONG = 0.0015;
@@ -25,7 +25,7 @@ public final class SignalOptimizer {
         this.adaptiveBrain = adaptiveBrain;
     }
 
-    /* ===================== MICRO TREND ===================== */
+    /* ================= MICRO TREND ================= */
     public static final class MicroTrendResult {
         public final double speed;
         public final double accel;
@@ -54,34 +54,34 @@ public final class SignalOptimizer {
             accel = ALPHA * (speed - prevSpeed) + (1 - ALPHA) * accel;
         }
 
-        double avg = prices.subList(size - n, size).stream().mapToDouble(d -> d).average().orElse(prices.get(size - 1));
+        double avg = prices.subList(size - n, size).stream().mapToDouble(d -> d).average()
+                .orElse(prices.get(size - 1));
         MicroTrendResult result = new MicroTrendResult(speed, accel, avg);
         microTrendCache.put(symbol, result);
         return result;
     }
 
-    /* ===================== ADJUST CONFIDENCE ===================== */
+    /* ================= CONFIDENCE ================= */
     public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s, double baseConfidence) {
         double conf = baseConfidence;
-
         MicroTrendResult mt = microTrendCache.get(s.symbol);
+
         if (mt != null) {
             double impulse = Math.abs(mt.speed) + Math.abs(mt.accel);
 
-            if (impulse < IMPULSE_DEAD) conf *= 0.78;       // рынок мёртв
+            if (impulse < IMPULSE_DEAD) conf *= 0.78;        // рынок мёртв
             else if (impulse > IMPULSE_STRONG) conf += 0.06; // сильный импульс
 
-            // направление против микротренда → штраф
             if ((mt.speed > 0 && s.side == TradingCore.Side.SHORT) ||
                     (mt.speed < 0 && s.side == TradingCore.Side.LONG)) {
-                conf *= 0.85;
+                conf *= 0.85; // против микро-тренда → штраф
             }
         }
 
         // согласование с AdaptiveBrain
         if (adaptiveBrain != null) {
             conf = adaptiveBrain.applyAllAdjustments(
-                    "ELITE5", s.symbol, conf,
+                    "ELITE15", s.symbol, conf,
                     TradingCore.CoinType.TOP, true, false
             );
         }
@@ -89,7 +89,7 @@ public final class SignalOptimizer {
         return clamp(conf, 0.50, 0.97);
     }
 
-    /* ===================== ADJUST STOP/TAKE ===================== */
+    /* ================= STOP / TAKE ================= */
     public Elite5MinAnalyzer.TradeSignal withAdjustedStopTake(Elite5MinAnalyzer.TradeSignal s, double atr) {
         double volPct = clamp(atr / s.entry, 0.008, 0.04);
         double rr = s.confidence > 0.75 ? 2.5 : s.confidence > 0.65 ? 2.0 : 1.6;
@@ -103,7 +103,6 @@ public final class SignalOptimizer {
             take = s.entry * (1 - volPct * rr);
         }
 
-        // создаём новый объект с обновлёнными stop/take
         return new Elite5MinAnalyzer.TradeSignal(
                 s.symbol,
                 s.side,
@@ -111,20 +110,20 @@ public final class SignalOptimizer {
                 stop,
                 take,
                 s.confidence,
-                s.reason
+                s.reason,
+                s.grade
         );
     }
 
-    /* ===================== HTF ALIGNMENT ===================== */
+    /* ================= HTF ALIGNMENT ================= */
     public boolean alignsWithDecisionEngine(DecisionEngineMerged.TradeIdea idea, List<TradingCore.Candle> h1) {
         if (h1 == null || h1.size() < 200) return true;
         double ema50 = ema(h1, 50);
         double ema200 = ema(h1, 200);
-        if (idea.side == TradingCore.Side.LONG) return ema50 > ema200;
-        else return ema50 < ema200;
+        return idea.side == TradingCore.Side.LONG ? ema50 > ema200 : ema50 < ema200;
     }
 
-    /* ===================== UTILS ===================== */
+    /* ================= UTIL ================= */
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }
