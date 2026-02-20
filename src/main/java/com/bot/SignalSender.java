@@ -91,7 +91,8 @@ public class SignalSender {
         this.decisionEngine = new DecisionEngineMerged();
         this.adaptiveBrain = new TradingCore.AdaptiveBrain();
         this.elite5MinAnalyzer = new Elite5MinAnalyzer();
-        this.optimizer = new SignalOptimizer(this.tickPriceDeque);
+        TradingCore.AdaptiveBrain brain = new TradingCore.AdaptiveBrain();
+        this.optimizer = new SignalOptimizer(this.tickPriceDeque, brain);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
     }
 

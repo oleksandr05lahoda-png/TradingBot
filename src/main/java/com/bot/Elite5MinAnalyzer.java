@@ -10,8 +10,8 @@ public final class Elite5MinAnalyzer {
     private static final int MIN_H1  = 200;
     private static final int MAX_SYMBOLS = 70;
 
-    private static final double MIN_CONFIDENCE = 0.60;
-    private static final double MIN_ATR_PCT    = 0.0018;
+    private static final double MIN_CONFIDENCE = 0.62;
+    private static final double MIN_ATR_PCT    = 0.0020;
     private static final long BASE_COOLDOWN = 8 * 60_000;
 
     private final Map<String, Long> cooldown = new ConcurrentHashMap<>();
@@ -62,7 +62,7 @@ public final class Elite5MinAnalyzer {
             TradingCore.Side bias = detectHTFBias(tf1h);
             if (bias == null) continue;
 
-            TradeSignal signal = buildSignal(symbol, tf15, bias, now);
+            TradeSignal signal = buildSignal(symbol, tf15, bias, tf1h, now);
             if (signal != null) result.add(signal);
         }
 
@@ -74,81 +74,86 @@ public final class Elite5MinAnalyzer {
     private TradeSignal buildSignal(String symbol,
                                     List<TradingCore.Candle> m15,
                                     TradingCore.Side bias,
+                                    List<TradingCore.Candle> h1,
                                     long now) {
 
         double price = last(m15).close;
         double atr = atr(m15, 14);
         double adx = adx(m15, 14);
         double rsi = rsi(m15, 14);
+        double vol = relativeVolume(m15);
 
         TradingCore.Side side = null;
         String reason = null;
 
-        // 1️⃣ Early Breakout — ловим импульс сразу
-        if (earlyBreakout(m15, bias) && adx > 14 && !overextendedMove(m15)) {
-            side = bias;
-            reason = "Early Breakout";
+        // ================= STRATEGIES =================
+        // 1️⃣ Early Breakout
+        if (earlyBreakout(m15, bias) && adx > 16 && !overextendedMove(m15)) {
+            side = bias; reason = "Early Breakout";
         }
 
-        // 2️⃣ Pullback Entry — тренд с коррекцией
+        // 2️⃣ Pullback Entry
         if (side == null && adx > 18 && pullbackZone(m15, bias) && !overextendedMove(m15)) {
-            side = bias;
-            reason = "Trend Pullback";
+            side = bias; reason = "Trend Pullback";
         }
 
-        // 3️⃣ Reversal/Divergence — ранний разворот
+        // 3️⃣ Reversal/Divergence
         if (side == null) {
-            if (bullishDivergence(m15) && rsi < 35) {
-                side = TradingCore.Side.LONG;
-                reason = "Bullish Divergence";
+            if (bullishDivergence(m15) && rsi < 38 && bias == TradingCore.Side.LONG) {
+                side = TradingCore.Side.LONG; reason = "Bullish Divergence";
             }
-            if (bearishDivergence(m15) && rsi > 65) {
-                side = TradingCore.Side.SHORT;
-                reason = "Bearish Divergence";
+            if (bearishDivergence(m15) && rsi > 62 && bias == TradingCore.Side.SHORT) {
+                side = TradingCore.Side.SHORT; reason = "Bearish Divergence";
             }
         }
 
-        // Нет сигнала
         if (side == null) return null;
 
-        // Cooldown
+        // ================= COOLDOWN =================
         String key = symbol + "_" + side;
         if (cooldown.containsKey(key) && now - cooldown.get(key) < BASE_COOLDOWN) return null;
 
-        // Confidence
-        double confidence = calculateConfidence(m15, adx, rsi);
+        // ================= ALIGNMENT CHECK =================
+        if (!isAlignedWithHTF(side, h1)) return null;
+
+        // ================= CONFIDENCE =================
+        double confidence = calculateConfidence(m15, adx, rsi, vol, bias);
         if (confidence < MIN_CONFIDENCE) return null;
 
-        // Risk/Reward
+        // ================= RISK/REWARD =================
         double risk = atr * 1.1;
         double rr = confidence > 0.75 ? 3.0 : 2.2;
-
         double stop = side == TradingCore.Side.LONG ? price - risk : price + risk;
         double take = side == TradingCore.Side.LONG ? price + risk * rr : price - risk * rr;
 
         cooldown.put(key, now);
 
         return new TradeSignal(symbol, side, price, stop, take,
-                clamp(confidence, 0.55, 0.93), reason);
+                clamp(confidence, 0.55, 0.95), reason);
     }
 
-    /* ================= SIGNAL MODELS ================= */
+    /* ================= ALIGNMENT ================= */
+    private boolean isAlignedWithHTF(TradingCore.Side side, List<TradingCore.Candle> h1) {
+        if (!valid(h1, MIN_H1)) return true;
+        double ema50 = ema(h1, 50);
+        double ema200 = ema(h1, 200);
+        return side == TradingCore.Side.LONG ? ema50 > ema200 : ema50 < ema200;
+    }
+
+    /* ================= STRATEGIES ================= */
     private boolean earlyBreakout(List<TradingCore.Candle> c, TradingCore.Side side) {
         int n = c.size();
-        TradingCore.Candle last = c.get(n - 1);
+        TradingCore.Candle last = last(c);
         TradingCore.Candle prev = c.get(n - 2);
-
-        return side == TradingCore.Side.LONG
-                ? last.close > prev.high
-                : last.close < prev.low;
+        return side == TradingCore.Side.LONG ? last.close > prev.high : last.close < prev.low;
     }
 
     private boolean overextendedMove(List<TradingCore.Candle> c) {
         int n = c.size();
         int strong = 0;
         for (int i = n - 4; i < n - 1; i++) {
-            double body = Math.abs(c.get(i).close - c.get(i).open);
-            double range = c.get(i).high - c.get(i).low;
+            double body = Math.abs(c.get(i + 1).close - c.get(i + 1).open);
+            double range = c.get(i + 1).high - c.get(i + 1).low;
             if (range > 0 && body / range > 0.7) strong++;
         }
         return strong >= 3;
@@ -157,14 +162,11 @@ public final class Elite5MinAnalyzer {
     private boolean pullbackZone(List<TradingCore.Candle> c, TradingCore.Side side) {
         double ema21 = ema(c, 21);
         double price = last(c).close;
-        return side == TradingCore.Side.LONG
-                ? price <= ema21 * 1.006
-                : price >= ema21 * 0.994;
+        return side == TradingCore.Side.LONG ? price <= ema21 * 1.006 : price >= ema21 * 0.994;
     }
 
     private boolean bullishDivergence(List<TradingCore.Candle> c) {
-        int n = c.size();
-        if (n < 20) return false;
+        int n = c.size(); if (n < 20) return false;
         double low1 = c.get(n - 3).low;
         double low2 = c.get(n - 1).low;
         double rsi1 = rsi(c.subList(0, n - 2), 14);
@@ -173,8 +175,7 @@ public final class Elite5MinAnalyzer {
     }
 
     private boolean bearishDivergence(List<TradingCore.Candle> c) {
-        int n = c.size();
-        if (n < 20) return false;
+        int n = c.size(); if (n < 20) return false;
         double high1 = c.get(n - 3).high;
         double high2 = c.get(n - 1).high;
         double rsi1 = rsi(c.subList(0, n - 2), 14);
@@ -185,11 +186,15 @@ public final class Elite5MinAnalyzer {
     /* ================= CONFIDENCE ================= */
     private double calculateConfidence(List<TradingCore.Candle> m15,
                                        double adx,
-                                       double rsi) {
+                                       double rsi,
+                                       double vol,
+                                       TradingCore.Side bias) {
         double trend = trendStrength(m15);
         double momentum = momentumScore(m15);
-        double vol = relativeVolume(m15);
-        return clamp(0.58 + trend * 0.18 + momentum * 0.15 + (adx / 40.0) * 0.12 + (vol - 1) * 0.05, 0.55, 0.93);
+        double conf = 0.58 + trend * 0.2 + momentum * 0.15 + (adx / 40.0) * 0.12 + (vol - 1) * 0.05;
+        if (bias == TradingCore.Side.LONG && trend > 0.6) conf += 0.05;
+        if (bias == TradingCore.Side.SHORT && trend > 0.6) conf += 0.05;
+        return clamp(conf, 0.55, 0.95);
     }
 
     /* ================= INDICATORS ================= */
