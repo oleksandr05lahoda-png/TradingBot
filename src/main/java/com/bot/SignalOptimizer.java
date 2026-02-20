@@ -4,14 +4,14 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Адаптированный SignalOptimizer для работы с TradeSignal наших шедевров.
- * Обрабатывает микротренды, импульсы, направление сигнала.
+ * SignalOptimizer Ultimate для интеграции с Elite5MinAnalyzer и DecisionEngineMerged.
+ * Поддерживает микро-тренды, импульсы, направление сигнала и согласование с HTF.
  */
 public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */
-    private static final int MAX_TICKS = 50;          // количество последних тиков для анализа микротренда
-    private static final double ALPHA = 0.35;         // сглаживание скорости и ускорения
+    private static final int MAX_TICKS = 60;           // количество последних тиков для анализа микротренда
+    private static final double ALPHA = 0.35;          // сглаживание скорости и ускорения
     private static final double IMPULSE_DEAD = 0.0003;
     private static final double IMPULSE_STRONG = 0.0015;
 
@@ -78,10 +78,12 @@ public final class SignalOptimizer {
             }
         }
 
-        // дополнительная корректировка через AdaptiveBrain
+        // согласование с AdaptiveBrain
         if (adaptiveBrain != null) {
-            conf = adaptiveBrain.applyAllAdjustments("ELITE5", s.symbol, conf,
-                    TradingCore.CoinType.TOP, true, false);
+            conf = adaptiveBrain.applyAllAdjustments(
+                    "ELITE5", s.symbol, conf,
+                    TradingCore.CoinType.TOP, true, false
+            );
         }
 
         return clamp(conf, 0.50, 0.97);
@@ -113,8 +115,25 @@ public final class SignalOptimizer {
         );
     }
 
+    /* ===================== HTF ALIGNMENT ===================== */
+    public boolean alignsWithDecisionEngine(DecisionEngineMerged.TradeIdea idea, List<TradingCore.Candle> h1) {
+        if (h1 == null || h1.size() < 200) return true;
+        double ema50 = ema(h1, 50);
+        double ema200 = ema(h1, 200);
+        if (idea.side == TradingCore.Side.LONG) return ema50 > ema200;
+        else return ema50 < ema200;
+    }
+
     /* ===================== UTILS ===================== */
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
+    }
+
+    private double ema(List<TradingCore.Candle> c, int p) {
+        double k = 2.0 / (p + 1);
+        double e = c.get(c.size() - p).close;
+        for (int i = c.size() - p + 1; i < c.size(); i++)
+            e = c.get(i).close * k + e * (1 - k);
+        return e;
     }
 }

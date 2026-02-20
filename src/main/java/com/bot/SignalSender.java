@@ -627,58 +627,64 @@ public class SignalSender {
                                      List<TradingCore.Candle> closes15m) {
 
         if (s.confidence < MIN_CONF) return;
-
-        List<TradingCore.Candle> recent = new ArrayList<>(closes15m);
-        boolean bos = detectBOS(recent);
-        boolean liqSweep = detectLiquiditySweep(recent);
-        MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
-
-        // Пересчитываем конец тренда прямо здесь
-        double lastHigh = lastSwingHigh(recent);
-        double lastLow = lastSwingLow(recent);
-        boolean nearSwingHigh = s.direction.equals("LONG") && recent.get(recent.size() - 1).close >= lastHigh * 0.995;
-        boolean nearSwingLow = s.direction.equals("SHORT") && recent.get(recent.size() - 1).close <= lastLow * 1.005;
-        boolean trendSlowing = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
-
-        boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
-        double microFactor = 1.0;
-        if (endOfTrend) {
-            microFactor = 0.7 + Math.min(0.3, Math.abs(micro.speed) * 100); // уменьшает penalti за конец тренда
-            s.confidence *= microFactor;
-        }
-
-        if (bos || liqSweep) {
-            if (endOfTrend) {
-                s.confidence *= 0.75; // BOS на экстремуме = подозрительно
-            }
-        }
-
-        // Блокировка микро-тренда только для конца тренда
-        if (endOfTrend) {
-            if (!bos && !liqSweep) {
-                s.confidence *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200); // динамическое снижение
-            }
-        }
-        if (isCooldown(pair, s)) return;
         if (closes15m.size() < 4) return;
 
-        long candleTs = closes15m.get(closes15m.size() - 1).openTime;
+        List<TradingCore.Candle> recent = new ArrayList<>(closes15m);
 
+        // ===== Проверка BOS и Liquidity Sweep =====
+        boolean bos = detectBOS(recent);
+        boolean liqSweep = detectLiquiditySweep(recent);
+
+        // ===== Микротренд =====
+        MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
+
+        // ===== Определяем конец тренда =====
+        double lastHigh = lastSwingHigh(recent);
+        double lastLow = lastSwingLow(recent);
+
+        boolean nearSwingHigh = s.direction.equals("LONG") && recent.get(recent.size() - 1).close >= lastHigh * 0.995;
+        boolean nearSwingLow  = s.direction.equals("SHORT") && recent.get(recent.size() - 1).close <= lastLow * 1.005;
+        boolean trendSlowing  = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
+
+        boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
+
+        // ===== Корректируем confidence по микротренду =====
+        if (endOfTrend) {
+            double microFactor = 0.7 + Math.min(0.3, Math.abs(micro.speed) * 100);
+            s.confidence *= microFactor;
+
+            if (!bos && !liqSweep) {
+                // динамическое снижение, если нет BOS/liqSweep
+                s.confidence *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200);
+            }
+        }
+
+        // ===== Дополнительное снижение confidence для BOS/LiquiditySweep на экстремуме =====
+        if ((bos || liqSweep) && endOfTrend) {
+            s.confidence *= 0.75;
+        }
+
+        // ===== Проверка cooldown =====
+        if (isCooldown(pair, s)) return;
+
+        long candleTs = closes15m.get(closes15m.size() - 1).openTime;
         Long lastTs = lastSignalCandleTs
                 .getOrDefault(pair, new ConcurrentHashMap<>())
                 .getOrDefault(s.direction, 0L);
 
-        if (Math.abs(candleTs - lastTs) < 15 * 60_000) return;
+        if (Math.abs(candleTs - lastTs) < 15 * 60_000) return; // 15 минут между сигналами
 
         lastSignalCandleTs.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
                 .put(s.direction, candleTs);
 
+        // ===== Добавляем в историю сигналов =====
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
-        // ✅ Асинхронная отправка в Telegram через твой класс
+        // ===== Асинхронная отправка в Telegram =====
         bot.sendMessageAsync(s.toTelegramMessage());
 
-        signalsThisCycle++; // отметка что сигнал отправлен
+        // ===== Отмечаем, что сигнал отправлен =====
+        signalsThisCycle++;
         markSignalSent(pair, s.direction);
     }
     public static class Signal {

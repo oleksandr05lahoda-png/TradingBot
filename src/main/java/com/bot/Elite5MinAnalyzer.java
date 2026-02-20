@@ -87,7 +87,7 @@ public final class Elite5MinAnalyzer {
         String reason = null;
 
         // ================= STRATEGIES =================
-        // 1️⃣ Early Breakout
+        // 1️⃣ Early Breakout / Impulse
         if (earlyBreakout(m15, bias) && adx > 16 && !overextendedMove(m15)) {
             side = bias; reason = "Early Breakout";
         }
@@ -105,6 +105,14 @@ public final class Elite5MinAnalyzer {
             if (bearishDivergence(m15) && rsi > 62 && bias == TradingCore.Side.SHORT) {
                 side = TradingCore.Side.SHORT; reason = "Bearish Divergence";
             }
+        }
+
+        // 4️⃣ Range / Exhaustion
+        if (side == null) {
+            double high = highest(m15, 15);
+            double low = lowest(m15, 15);
+            if (bias == TradingCore.Side.LONG && price <= low * 1.002) { side = TradingCore.Side.LONG; reason="Range Support"; }
+            if (bias == TradingCore.Side.SHORT && price >= high * 0.998) { side = TradingCore.Side.SHORT; reason="Range Resistance"; }
         }
 
         if (side == null) return null;
@@ -189,12 +197,9 @@ public final class Elite5MinAnalyzer {
                                        double rsi,
                                        double vol,
                                        TradingCore.Side bias) {
-        double trend = trendStrength(m15);
-        double momentum = momentumScore(m15);
-        double conf = 0.58 + trend * 0.2 + momentum * 0.15 + (adx / 40.0) * 0.12 + (vol - 1) * 0.05;
-        if (bias == TradingCore.Side.LONG && trend > 0.6) conf += 0.05;
-        if (bias == TradingCore.Side.SHORT && trend > 0.6) conf += 0.05;
-        return clamp(conf, 0.55, 0.95);
+        double structure = Math.abs(ema(m15,21)-ema(m15,50))/ema(m15,50);
+        double base = 0.6 + structure*0.15 + (adx/50.0)*0.1 + Math.min((vol-1)*0.05,0.08);
+        return clamp(base, 0.55, 0.95);
     }
 
     /* ================= INDICATORS ================= */
@@ -230,23 +235,18 @@ public final class Elite5MinAnalyzer {
         return e;
     }
 
-    private double trendStrength(List<TradingCore.Candle> c) {
-        double e21 = ema(c, 21);
-        double e50 = ema(c, 50);
-        return clamp(Math.abs(e21 - e50) / e50 * 6, 0, 1);
+    private double highest(List<TradingCore.Candle> c, int n){
+        return c.subList(c.size()-n,c.size()).stream().mapToDouble(cd->cd.high).max().orElse(0);
     }
 
-    private double momentumScore(List<TradingCore.Candle> c) {
-        double move = 0;
-        for (int i = c.size() - 6; i < c.size() - 1; i++)
-            move += Math.abs(c.get(i + 1).close - c.get(i).close);
-        return clamp(move / 6.0 / atr(c, 14), 0, 1);
+    private double lowest(List<TradingCore.Candle> c, int n){
+        return c.subList(c.size()-n,c.size()).stream().mapToDouble(cd->cd.low).min().orElse(0);
     }
 
     private double relativeVolume(List<TradingCore.Candle> c) {
         int n = c.size();
-        double avg = c.subList(n - 20, n - 1).stream().mapToDouble(cd -> cd.volume).average().orElse(0);
-        return avg == 0 ? 1 : last(c).volume / avg;
+        double avg = c.subList(n - 20, n - 1).stream().mapToDouble(cd -> cd.volume).average().orElse(1);
+        return last(c).volume / avg;
     }
 
     private boolean volatilityOk(List<TradingCore.Candle> c) {
@@ -264,15 +264,7 @@ public final class Elite5MinAnalyzer {
         return null;
     }
 
-    private static boolean valid(List<?> l, int min) {
-        return l != null && l.size() >= min;
-    }
-
-    private TradingCore.Candle last(List<TradingCore.Candle> c) {
-        return c.get(c.size() - 1);
-    }
-
-    private double clamp(double v, double min, double max) {
-        return Math.max(min, Math.min(max, v));
-    }
+    private static boolean valid(List<?> l, int min) { return l != null && l.size() >= min; }
+    private TradingCore.Candle last(List<TradingCore.Candle> c) { return c.get(c.size() - 1); }
+    private double clamp(double v, double min, double max) { return Math.max(min, Math.min(max, v)); }
 }
