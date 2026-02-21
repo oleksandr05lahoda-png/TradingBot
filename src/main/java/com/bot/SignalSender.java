@@ -1019,9 +1019,8 @@ public class SignalSender {
                 MarketPhase phase =
                         detectMarketPhase(c15m, micro);
 
-                if (phase == MarketPhase.NO_TRADE ||
-                        phase == MarketPhase.TREND_EXHAUSTION) {
-                    continue; // НЕ ТОРГУЕМ В ИСТОЩЕНИИ
+                if (phase == MarketPhase.NO_TRADE) {
+                    continue;
                 }
 
                 // ================= ATR =================
@@ -1123,7 +1122,7 @@ public class SignalSender {
                 if (side == TradingCore.Side.SHORT)
                     conf -= 0.03;
 
-                if (conf < 0.60) continue;
+                if (conf < 0.50) continue;
 
                 // ================= STOP / TAKE =================
                 double pct = Math.max(0.003,
