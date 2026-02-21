@@ -979,6 +979,7 @@ public class SignalSender {
         return res;
     }
     private void runSchedulerCycle() {
+
         signalsThisCycle = 0;
         long now = System.currentTimeMillis();
 
@@ -989,7 +990,6 @@ public class SignalSender {
             System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
         }
 
-        // Фильтруем только поддерживаемые пары
         Set<String> symbols = cachedPairs.stream()
                 .filter(BINANCE_PAIRS::contains)
                 .collect(Collectors.toSet());
@@ -997,115 +997,142 @@ public class SignalSender {
         // ================= PROCESS EACH SYMBOL =================
         for (String pair : symbols) {
             try {
-                // ================= FETCH CANDLES ASYNC =================
-                CompletableFuture<List<TradingCore.Candle>> f15 = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
-                CompletableFuture<List<TradingCore.Candle>> f1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
+
+                CompletableFuture<List<TradingCore.Candle>> f15 =
+                        fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
+
+                CompletableFuture<List<TradingCore.Candle>> f1h =
+                        fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
+
                 CompletableFuture.allOf(f15, f1h).join();
 
                 List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
-                List<TradingCore.Candle> c1h = new ArrayList<>(f1h.join());
+                List<TradingCore.Candle> c1h  = new ArrayList<>(f1h.join());
 
-                if (c15m.size() < 20 || c1h.size() < 20) continue;
+                if (c15m.size() < 30 || c1h.size() < 30) continue;
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
+
                 MicroTrendResult micro =
                         computeMicroTrend(pair, tickPriceDeque.get(pair));
 
                 MarketPhase phase =
                         detectMarketPhase(c15m, micro);
 
-                if (phase == MarketPhase.NO_TRADE) {
-                    continue;
+                if (phase == MarketPhase.NO_TRADE ||
+                        phase == MarketPhase.TREND_EXHAUSTION) {
+                    continue; // НЕ ТОРГУЕМ В ИСТОЩЕНИИ
                 }
 
+                // ================= ATR =================
                 double atr15 = atr(c15m, 14);
-                double atrPrev = atr(c15m.subList(0, c15m.size()-1), 14);
+                if (atr15 <= 0) continue;
 
                 double atrPercent = atr15 / last.close;
-                double atrGrowth = atr15 / atrPrev;
-
                 if (atrPercent < ATR_MIN_PCT) continue;
 
-                boolean atrExpanding = atrGrowth > 1.05;
+                // ================= VOLUME =================
+                double avgVol = c15m.stream()
+                        .mapToDouble(c -> c.volume)
+                        .average().orElse(0);
 
-
-                double avgVol = c15m.stream().mapToDouble(c -> c.volume).average().orElse(0);
                 boolean volOk = last.volume >= avgVol * VOL_MULTIPLIER;
-                boolean atrOk = atr15 / last.close >= ATR_MIN_PCT;
 
-                // ================= IMPULSE DIRECTION =================
-                boolean impulseUp = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
-                boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
-                int trend15 = marketStructure(c15m);
-                if (trend15 == 0) continue;
+                // ================= RSI =================
+                List<Double> closes15 = c15m.stream()
+                        .map(c -> c.close).toList();
 
-                TradingCore.Side side =
-                        trend15 > 0 ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
-
-                if (phase == MarketPhase.TREND_CONTINUATION) {
-                    if (side == TradingCore.Side.LONG && trend15 < 0) continue;
-                    if (side == TradingCore.Side.SHORT && trend15 > 0) continue;
-                }
-
-                if (phase == MarketPhase.TREND_EXHAUSTION) {
-                    // разворот ТОЛЬКО против предыдущего тренда
-                    side = trend15 > 0
-                            ? TradingCore.Side.SHORT
-                            : TradingCore.Side.LONG;
-                }
-                if (side == null) continue;
-
-                // ================= RSI FILTER =================
-                List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
                 double rsi14 = SignalSender.rsi(closes15, 14);
-                if ((side == TradingCore.Side.LONG && rsi14 > 80) ||
-                        (side == TradingCore.Side.SHORT && rsi14 < 20)) continue;
 
-                // ================= MARKET STRUCTURE =================
+                // ================= STRUCTURE =================
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
+
+                if (dir15 == 0) continue;
+
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
-                if (mtfConfirm != 0) {
-                    if (side == TradingCore.Side.LONG && dir1h < 0) continue;
-                    if (side == TradingCore.Side.SHORT && dir1h > 0) continue;
+
+                // ================= IMPULSE =================
+                boolean impulseUp =
+                        last.close > last.open &&
+                                (last.high - last.low) > atr15 * 0.8;
+
+                boolean impulseDown =
+                        last.close < last.open &&
+                                (last.high - last.low) > atr15 * 0.8;
+
+                // =====================================================
+                // 🔥 НОВЫЙ БЛОК ВЫБОРА НАПРАВЛЕНИЯ (ИСПРАВЛЕННЫЙ)
+                // =====================================================
+
+                TradingCore.Side side = null;
+
+                // ===== LONG =====
+                if (dir15 > 0 &&
+                        rsi14 > 45 && rsi14 < 72 &&
+                        micro.speed >= 0 &&
+                        (mtfConfirm >= 0)) {
+
+                    side = TradingCore.Side.LONG;
                 }
 
+                // ===== SHORT (БОЛЕЕ СТРОГИЙ) =====
+                if (dir15 < 0 &&
+                        rsi14 < 55 && rsi14 > 28 &&
+                        micro.speed <= 0 &&
+                        (mtfConfirm <= 0)) {
 
-                // ================= RAW SIGNAL SCORE =================
-                double rawScore = strategyEMANorm(closes15) * 0.35 +
-                        strategyRSINorm(closes15) * 0.25 +
-                        strategyMomentumNorm(closes15) * 0.20 +
-                        strategyMACDNorm(closes15) * 0.20;
+                    // Защита от зелёного разворота
+                    boolean bullishPressure =
+                            last.close > last.open &&
+                                    rsi14 > 38 &&
+                                    micro.speed > -0.05;
+
+                    if (!bullishPressure) {
+                        side = TradingCore.Side.SHORT;
+                    }
+                }
+
+                if (side == null) continue;
+
+                // ================= RAW SCORE =================
+                double rawScore =
+                        strategyEMANorm(closes15) * 0.35 +
+                                strategyRSINorm(closes15) * 0.25 +
+                                strategyMomentumNorm(closes15) * 0.20 +
+                                strategyMACDNorm(closes15) * 0.20;
 
                 if (side == TradingCore.Side.LONG && rawScore < -0.1) continue;
-                if (side == TradingCore.Side.SHORT && rawScore > 0.1) continue;
+                if (side == TradingCore.Side.SHORT && rawScore >  0.1) continue;
 
-                // ================= CONFIDENCE COMPOSITION =================
+                // ================= CONFIDENCE =================
                 double conf = composeConfidence(
-                        rawScore, mtfConfirm, volOk, atrOk,
+                        rawScore,
+                        mtfConfirm,
+                        volOk,
+                        true,
                         (side == TradingCore.Side.LONG && impulseUp) ||
                                 (side == TradingCore.Side.SHORT && impulseDown),
-                        true,  // vwapAligned
-                        true,  // structureAligned
+                        true,
+                        true,
                         detectBOS(c15m),
                         detectLiquiditySweep(c15m)
                 );
-                if (side == TradingCore.Side.LONG && rsi14 > 60) {
-                    conf -= 0.08;
-                }
-                if (side == TradingCore.Side.SHORT && rsi14 < 40) {
-                    conf -= 0.08;
-                }
 
-                if (conf > 0.5) {
-                    conf += Math.min(0.05, atr15 / last.close * 10);
-                    if (mtfConfirm != 0) conf += 0.03;
-                    if (volOk) conf += 0.02;
-                }
+                // SHORT немного строже
+                if (side == TradingCore.Side.SHORT)
+                    conf -= 0.03;
 
-                // ================= STOP / TAKE (на основе ATR, быстрые сделки) =================
-                double pct = Math.max(0.003, Math.min(0.01, atr15 / last.close)); // стоп 0.3–1%
-                double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
+                if (conf < 0.60) continue;
+
+                // ================= STOP / TAKE =================
+                double pct = Math.max(0.003,
+                        Math.min(0.01, atrPercent));
+
+                double stop = side == TradingCore.Side.LONG
+                        ? last.close * (1 - pct)
+                        : last.close * (1 + pct);
+
                 double take = side == TradingCore.Side.LONG
                         ? last.close * (1 + pct * 1.4)
                         : last.close * (1 - pct * 1.4);
@@ -1120,29 +1147,27 @@ public class SignalSender {
                         rawScore,
                         mtfConfirm,
                         volOk,
-                        atrOk,
-                        true,                   // strongTrigger
+                        true,
+                        true,
                         side == TradingCore.Side.LONG,
                         side == TradingCore.Side.SHORT,
-                        true,                   // impulse
+                        true,
                         SignalSender.rsi(closes15, 7),
                         SignalSender.rsi(closes15, 4)
                 );
 
                 s.stop = stop;
                 s.take = take;
-                if (conf < 0.6) {
-                    continue; // слишком слабый сигнал
-                }
 
                 sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
-                System.out.println("[Scheduler] Error for " + pair + ": " + e.getMessage());
-                e.printStackTrace();
+                System.out.println("[Scheduler] Error for "
+                        + pair + ": " + e.getMessage());
             }
         }
 
-        System.out.println("[Cycle] Signals sent: " + signalsThisCycle);
+        System.out.println("[Cycle] Signals sent: "
+                + signalsThisCycle);
     }
 }
