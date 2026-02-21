@@ -630,63 +630,46 @@ public class SignalSender {
             System.out.println("[DEBUG] Skipped " + pair + " due to low confidence: " + s.confidence);
             return;
         }
-
-        if (closes15m == null || closes15m.size() < 4) return;
+        if (closes15m.size() < 4) return;
 
         List<TradingCore.Candle> recent = new ArrayList<>(closes15m);
 
-        // ===== Проверка BOS и Liquidity Sweep =====
         boolean bos = detectBOS(recent);
         boolean liqSweep = detectLiquiditySweep(recent);
 
-        // ===== Микротренд =====
-        Deque<Double> tickDeque = tickPriceDeque.getOrDefault(s.symbol, new ArrayDeque<>());
-        MicroTrendResult micro = computeMicroTrend(s.symbol, tickDeque);
+        MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
 
-        // ===== Определяем экстремумы и конец тренда =====
         double lastHigh = lastSwingHigh(recent);
-        double lastLow  = lastSwingLow(recent);
+        double lastLow = lastSwingLow(recent);
 
         boolean nearSwingHigh = s.direction.equals("LONG") && recent.get(recent.size() - 1).close >= lastHigh * 0.995;
         boolean nearSwingLow  = s.direction.equals("SHORT") && recent.get(recent.size() - 1).close <= lastLow * 1.005;
-        boolean endOfTrend    = nearSwingHigh || nearSwingLow;
 
-        // ===== Корректировка confidence =====
-        if (endOfTrend) {
-            double microFactor = 0.85 + Math.min(0.15, Math.abs(micro.speed) * 100);
-            s.confidence *= microFactor;
+        boolean endOfTrend = nearSwingHigh || nearSwingLow;
 
-            if (!bos && !liqSweep) {
-                s.confidence *= Math.max(0.75, 1.0 - Math.abs(micro.speed) * 100);
-            }
-        }
+        // ==== Для теста временно отключаем резкое снижение confidence ====
+        //if (endOfTrend) {
+        //    double microFactor = 0.85 + Math.min(0.15, Math.abs(micro.speed) * 100);
+        //    s.confidence *= microFactor;
+        //    if (!bos && !liqSweep) {
+        //        s.confidence *= Math.max(0.75, 1.0 - Math.abs(micro.speed) * 100);
+        //    }
+        //}
+        //if ((bos || liqSweep) && endOfTrend) {
+        //    s.confidence *= 0.85;
+        //}
 
-        // Дополнительное снижение confidence, если BOS или Liquidity Sweep на экстремуме
-        if ((bos || liqSweep) && endOfTrend) {
-            s.confidence *= 0.85;
-        }
-
-        // ===== Проверка cooldown =====
         if (isCooldown(pair, s)) {
             System.out.println("[DEBUG] Skipped " + pair + " due to cooldown");
             return;
         }
-
-        // ===== Отмечаем сигнал как отправленный =====
         markSignalSent(pair, s.direction);
 
-        // ===== Добавляем в историю сигналов =====
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
-        // ===== Асинхронная отправка в Telegram =====
-        try {
-            System.out.println("[DEBUG] Sending signal: " + s.toTelegramMessage());
-            bot.sendMessageAsync(s.toTelegramMessage());
-        } catch (Exception e) {
-            System.out.println("[ERROR] Telegram send failed for " + pair + ": " + e.getMessage());
-        }
+        System.out.println("[DEBUG] Sending signal: " + s.toTelegramMessage());
+        bot.sendMessageAsync(s.toTelegramMessage());
 
-        // ===== Увеличиваем счетчик сигналов за цикл =====
         signalsThisCycle++;
     }
     public static class Signal {
@@ -1023,107 +1006,89 @@ public class SignalSender {
 
         for (String pair : symbols) {
             try {
-                // ===== FETCH KLINES ASYNC =====
-                CompletableFuture<List<TradingCore.Candle>> f15 = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
-                CompletableFuture<List<TradingCore.Candle>> f1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
+                CompletableFuture<List<TradingCore.Candle>> f15 =
+                        fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
+                CompletableFuture<List<TradingCore.Candle>> f1h =
+                        fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
+                CompletableFuture.allOf(f15, f1h).join();
 
-                // Обрабатываем асинхронно, без join()
-                f15.thenCombine(f1h, (c15mRaw, c1hRaw) -> {
-                    List<TradingCore.Candle> c15m = new ArrayList<>(c15mRaw);
-                    List<TradingCore.Candle> c1h  = new ArrayList<>(c1hRaw);
+                List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
+                List<TradingCore.Candle> c1h  = new ArrayList<>(f1h.join());
+                if (c15m.size() < 30 || c1h.size() < 30) continue;
 
-                    if (c15m.size() < 30 || c1h.size() < 30) return null;
+                TradingCore.Candle last = c15m.get(c15m.size() - 1);
+                MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.getOrDefault(pair, new ArrayDeque<>()));
+                MarketPhase phase = detectMarketPhase(c15m, micro);
+                if (phase == MarketPhase.NO_TRADE) continue;
 
-                    TradingCore.Candle last = c15m.get(c15m.size() - 1);
+                double atr15 = atr(c15m, 14);
+                if (atr15 <= 0) continue;
+                double atrPercent = atr15 / last.close;
+                if (atrPercent < 0.002) continue; // ослаблено для теста
 
-                    // ===== MICRO TREND =====
-                    MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.getOrDefault(pair, new ArrayDeque<>()));
+                boolean volOk = true; // для теста игнорируем
 
-                    MarketPhase phase = detectMarketPhase(c15m, micro);
-                    if (phase == MarketPhase.NO_TRADE) return null;
+                List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
+                double rsi14 = SignalSender.rsi(closes15, 14);
 
-                    double atr15 = atr(c15m, 14);
-                    if (atr15 <= 0) return null;
+                int dir15 = marketStructure(c15m);
+                int dir1h = marketStructure(c1h);
+                //if (dir15 == 0) continue; // временно отключаем фильтр
+                int mtfConfirm = multiTFConfirm(dir1h, dir15);
 
-                    double atrPercent = atr15 / last.close;
-                    if (atrPercent < ATR_MIN_PCT) return null;
+                boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.5; // порог снижен
+                boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.5;
 
-                    boolean volOk = true; // пока игнорируем
+                TradingCore.Side side = null;
+                if (dir15 >= 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
+                else if (dir15 <= 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
+                if (side == null) continue;
 
-                    List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
-                    double rsi14 = SignalSender.rsi(closes15, 14);
+                double rawScore = strategyEMANorm(closes15) * 0.35 +
+                        strategyRSINorm(closes15) * 0.25 +
+                        strategyMomentumNorm(closes15) * 0.20 +
+                        strategyMACDNorm(closes15) * 0.20;
 
-                    int dir15 = marketStructure(c15m);
-                    int dir1h = marketStructure(c1h);
-                    if (dir15 == 0) return null;
+                double conf = composeConfidence(
+                        rawScore,
+                        mtfConfirm,
+                        volOk,
+                        true,
+                        (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
+                        true,
+                        true,
+                        detectBOS(c15m),
+                        detectLiquiditySweep(c15m)
+                );
+                if (side == TradingCore.Side.SHORT) conf -= 0.03;
 
-                    int mtfConfirm = multiTFConfirm(dir1h, dir15);
+                double pct = Math.max(0.003, Math.min(0.01, atrPercent));
+                double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
+                double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
 
-                    boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
-                    boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
+                Signal s = new Signal(
+                        pair,
+                        side.toString(),
+                        conf,
+                        last.close,
+                        rsi14,
+                        rawScore,
+                        mtfConfirm,
+                        volOk,
+                        true,
+                        true,
+                        side == TradingCore.Side.LONG,
+                        side == TradingCore.Side.SHORT,
+                        true,
+                        SignalSender.rsi(closes15, 7),
+                        SignalSender.rsi(closes15, 4)
+                );
+                s.stop = stop;
+                s.take = take;
 
-                    TradingCore.Side side = null;
-                    if (dir15 > 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
-                    else if (dir15 < 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
-                    if (side == null) return null;
+                if (conf < MIN_CONF) continue;
 
-                    // ===== CONFIDENCE =====
-                    double rawScore = strategyEMANorm(closes15) * 0.35 +
-                            strategyRSINorm(closes15) * 0.25 +
-                            strategyMomentumNorm(closes15) * 0.20 +
-                            strategyMACDNorm(closes15) * 0.20;
-
-                    double conf = composeConfidence(
-                            rawScore,
-                            mtfConfirm,
-                            volOk,
-                            true,
-                            (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
-                            true,
-                            true,
-                            detectBOS(c15m),
-                            detectLiquiditySweep(c15m)
-                    );
-
-                    if (side == TradingCore.Side.SHORT) conf -= 0.03;
-                    if (Double.isNaN(conf)) conf = 0.5;
-
-                    if (conf < MIN_CONF) return null;
-
-                    // ===== STOP / TAKE =====
-                    double pct = Math.max(0.003, Math.min(0.01, atrPercent));
-                    double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
-                    double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
-
-                    // ===== CREATE SIGNAL =====
-                    Signal s = new Signal(
-                            pair,
-                            side.toString(),
-                            conf,
-                            last.close,
-                            rsi14,
-                            rawScore,
-                            mtfConfirm,
-                            volOk,
-                            true,
-                            true,
-                            side == TradingCore.Side.LONG,
-                            side == TradingCore.Side.SHORT,
-                            true,
-                            SignalSender.rsi(closes15, 7),
-                            SignalSender.rsi(closes15, 4)
-                    );
-                    s.stop = stop;
-                    s.take = take;
-
-                    // ===== SEND SIGNAL =====
-                    sendSignalIfAllowed(pair, s, c15m);
-
-                    return null;
-                }).exceptionally(ex -> {
-                    System.out.println("[Scheduler] Error async for " + pair + ": " + ex.getMessage());
-                    return null;
-                });
+                sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
                 System.out.println("[Scheduler] Error for " + pair + ": " + e.getMessage());
