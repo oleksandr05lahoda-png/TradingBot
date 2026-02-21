@@ -746,29 +746,15 @@ public class SignalSender {
 
     private boolean isCooldown(String pair, Signal s) {
         long now = System.currentTimeMillis();
-
-        Map<String, Long> dirMap =
-                lastSignalTimeDir.getOrDefault(pair, new ConcurrentHashMap<>());
-
+        Map<String, Long> dirMap = lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>());
         Long lastTimeSameDir = dirMap.get(s.direction);
-        Long lastTimeOppDir = dirMap.get(
-                s.direction.equals("LONG") ? "SHORT" : "LONG"
-        );
 
-        // ⛔ Блок если тот же direction был < 45 минут назад
-        if (lastTimeSameDir != null && now - lastTimeSameDir < 45 * 60_000) {
-            return true;
+        if (lastTimeSameDir != null && now - lastTimeSameDir < 15 * 60_000) {
+            return true; // 15 минут cooldown вместо 45
         }
 
-        // ✅ Разрешаем противоположный сигнал через 30 минут
-        if (lastTimeOppDir != null && now - lastTimeOppDir > 30 * 60_000) {
-            return false;
-        }
-
-        return false;
+        return false; // все остальное разрешено
     }
-
-
     private void markSignalSent(String pair, String direction) {
         lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
                 .put(direction, System.currentTimeMillis());
