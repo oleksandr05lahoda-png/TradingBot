@@ -666,18 +666,11 @@ public class SignalSender {
             s.confidence *= 0.85;
         }
 
-        // ===== Проверка cooldown (только один map) =====
-        long now = System.currentTimeMillis();
-        Map<String, Long> dirMap = lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>());
-        Long lastTimeSameDir = dirMap.get(s.direction);
-
-        if (lastTimeSameDir != null && now - lastTimeSameDir < 15 * 60_000) {
+        if (isCooldown(pair, s)) {
             System.out.println("[DEBUG] Skipped " + pair + " due to cooldown");
             return;
         }
-
-        // ===== Обновляем время последнего сигнала =====
-        dirMap.put(s.direction, now);
+        markSignalSent(pair, s.direction);
 
         // ===== Добавляем в историю сигналов =====
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);

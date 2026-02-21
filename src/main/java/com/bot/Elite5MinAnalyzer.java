@@ -60,13 +60,19 @@ public final class Elite5MinAnalyzer {
             List<TradingCore.Candle> tf1h = h1.get(symbol);
 
             if (!valid(tf15, MIN_M15) || !valid(tf1h, MIN_H1)) continue;
-            if (!volatilityOk(tf15)) continue;
+            if (!volatilityOk(tf15)) {
+                System.out.println("[Volatility] " + symbol + " skipped due to low ATR");
+                // не полностью режем, можно дебажить
+            }
 
             TradingCore.Side bias = detectHTFBias(tf1h);
 
             TradeSignal signal = buildSignal(symbol, tf15, bias, tf1h, now);
-            if (signal != null)
+            if (signal != null) {
                 result.add(signal);
+                System.out.println("[SignalGenerated] " + signal.symbol + " " + signal.side +
+                        " conf=" + signal.confidence + " reason=" + signal.reason);
+            }
         }
 
         result.sort(Comparator.comparingDouble((TradeSignal s) -> s.confidence).reversed());
@@ -93,21 +99,17 @@ public final class Elite5MinAnalyzer {
         boolean trendDown = ema(m15,21) < ema(m15,50);
 
         /* ========== TREND ENTRY ========== */
-
         if (bias == TradingCore.Side.LONG && trendUp && adx > 13) {
             side = TradingCore.Side.LONG;
             reason = "Trend continuation";
         }
-
         if (bias == TradingCore.Side.SHORT && trendDown && adx > 13) {
             side = TradingCore.Side.SHORT;
             reason = "Trend continuation";
         }
 
         /* ========== PULLBACK ENTRY ========== */
-
         double ema21 = ema(m15,21);
-
         if (side == null && bias != null) {
             if (bias == TradingCore.Side.LONG && price <= ema21*1.01) {
                 side = TradingCore.Side.LONG;
@@ -120,7 +122,6 @@ public final class Elite5MinAnalyzer {
         }
 
         /* ========== BREAKOUT ENTRY ========== */
-
         if (side == null) {
             double high = highest(m15,10);
             double low  = lowest(m15,10);
@@ -129,7 +130,6 @@ public final class Elite5MinAnalyzer {
                 side = TradingCore.Side.LONG;
                 reason = "Breakout";
             }
-
             if (price < low*1.001 && adx>11) {
                 side = TradingCore.Side.SHORT;
                 reason = "Breakdown";
@@ -137,54 +137,47 @@ public final class Elite5MinAnalyzer {
         }
 
         /* ========== REVERSAL ENTRY ========== */
-
         if (side == null) {
             if (bullishDivergence(m15) && rsi < 48) {
                 side = TradingCore.Side.LONG;
                 reason = "Bullish Divergence";
             }
-
             if (bearishDivergence(m15) && rsi > 52) {
                 side = TradingCore.Side.SHORT;
                 reason = "Bearish Divergence";
             }
         }
 
-        if (side == null)
-            return null;
+        if (side == null) return null;
 
-        /* ========== COOLDOWN ========== */
-
+        /* ========== COOLDOWN ================= */
         String key = symbol + "_" + side;
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < BASE_COOLDOWN)
-            return null;
+        if (cooldown.containsKey(key)) {
+            long delta = now - cooldown.get(key);
+            if (delta < BASE_COOLDOWN) {
+                System.out.println("[Cooldown] " + symbol + " blocked for " + (BASE_COOLDOWN - delta)/1000 + "s");
+                return null;
+            }
+        }
 
-        /* ========== CONFIDENCE ========== */
-
+        /* ========== CONFIDENCE ================= */
         double structure = Math.abs(ema(m15,21) - ema(m15,50)) / ema(m15,50);
-
         double confidence =
-                0.58
-                        + structure * 0.18
-                        + (adx/40.0)*0.12
-                        + Math.min((vol-1)*0.07,0.12);
+                0.58 + structure*0.18 + (adx/40.0)*0.12 + Math.min((vol-1)*0.07,0.12);
 
         confidence = clamp(confidence, MIN_CONFIDENCE, 0.95);
 
-        String grade =
-                confidence > 0.78 ? "A" :
-                        confidence > 0.64 ? "B" : "C";
+        String grade = confidence > 0.78 ? "A" : confidence > 0.64 ? "B" : "C";
 
-        /* ========== RISK ========== */
-
-        double rr =
-                confidence>0.80 ? 2.8 :
-                        confidence>0.70 ? 2.3 : 1.9;
-
+        /* ========== RISK ================= */
+        double rr = confidence>0.80 ? 2.8 : confidence>0.70 ? 2.3 : 1.9;
         double stop = side==TradingCore.Side.LONG ? price-atr : price+atr;
         double take = side==TradingCore.Side.LONG ? price+atr*rr : price-atr*rr;
 
         cooldown.put(key, now);
+
+        System.out.println("[BuildSignal] " + symbol + " " + side +
+                " conf=" + confidence + " stop=" + stop + " take=" + take + " reason=" + reason);
 
         return new TradeSignal(symbol, side, price, stop, take, confidence, reason, grade);
     }
@@ -199,7 +192,6 @@ public final class Elite5MinAnalyzer {
     }
 
     /* ================= INDICATORS ================= */
-
     private double atr(List<TradingCore.Candle> c,int n){
         double sum=0;
         for(int i=c.size()-n;i<c.size();i++)
@@ -265,7 +257,9 @@ public final class Elite5MinAnalyzer {
     private boolean volatilityOk(List<TradingCore.Candle> c){
         double atr=atr(c,14);
         double price=last(c).close;
-        return atr/price>MIN_ATR_PCT;
+        boolean ok = atr/price>MIN_ATR_PCT;
+        if(!ok) System.out.println("[VolatilityCheck] ATR too low for price " + price);
+        return ok;
     }
 
     private static boolean valid(List<?> l,int min){

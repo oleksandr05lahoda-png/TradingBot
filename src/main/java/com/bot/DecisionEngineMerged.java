@@ -72,7 +72,11 @@ public final class DecisionEngineMerged {
             MarketState state = detectMarketState(c15);
 
             TradeIdea idea = buildSignal(symbol, c15, htf, bias, state, now);
-            if (idea != null) list.add(idea);
+            if (idea != null) {
+                list.add(idea);
+                System.out.println("[TradeIdea] " + symbol + " " + idea.side +
+                        " conf=" + idea.confidence + " reason=" + idea.reason);
+            }
         }
 
         list.sort(Comparator.comparingDouble((TradeIdea t) -> t.confidence).reversed());
@@ -105,28 +109,21 @@ public final class DecisionEngineMerged {
         boolean trendDown = ema21 < ema50;
 
         /* ========= TREND ========= */
-
-        if (bias == HTFBias.BULL && trendUp && rsi > 45)
-        {
+        if (bias == HTFBias.BULL && trendUp && rsi > 45) {
             side = TradingCore.Side.LONG;
             reason = "Trend continuation";
         }
-
-        if (bias == HTFBias.BEAR && trendDown && rsi < 55)
-        {
+        if (bias == HTFBias.BEAR && trendDown && rsi < 55) {
             side = TradingCore.Side.SHORT;
             reason = "Trend continuation";
         }
 
         /* ========= PULLBACK ========= */
-
         if (side == null && bias != HTFBias.NONE) {
-
             if (bias == HTFBias.BULL && price <= ema21*1.01 && rsi>42) {
                 side = TradingCore.Side.LONG;
                 reason = "Pullback";
             }
-
             if (bias == HTFBias.BEAR && price >= ema21*0.99 && rsi<58) {
                 side = TradingCore.Side.SHORT;
                 reason = "Pullback";
@@ -134,17 +131,14 @@ public final class DecisionEngineMerged {
         }
 
         /* ========= BREAKOUT ========= */
-
         double high = highest(m15,12);
         double low = lowest(m15,12);
 
         if (side == null && state != MarketState.RANGE) {
-
             if (price > high*0.998 && adx>14 && rsi>48) {
                 side = TradingCore.Side.LONG;
                 reason = "Breakout";
             }
-
             if (price < low*1.002 && adx>14 && rsi<52) {
                 side = TradingCore.Side.SHORT;
                 reason = "Breakdown";
@@ -152,14 +146,11 @@ public final class DecisionEngineMerged {
         }
 
         /* ========= REVERSAL ========= */
-
         if (side == null) {
-
             if (bullishDivergence(m15) && rsi<45) {
                 side = TradingCore.Side.LONG;
                 reason = "Bullish Divergence";
             }
-
             if (bearishDivergence(m15) && rsi>55 && bias!=HTFBias.BULL) {
                 side = TradingCore.Side.SHORT;
                 reason = "Bearish Divergence";
@@ -169,44 +160,41 @@ public final class DecisionEngineMerged {
         if (side == null) return null;
 
         /* ========= COOLDOWN ========= */
-
         String key = symbol+"_"+side;
-        if (cooldown.containsKey(key) && now-cooldown.get(key)<COOLDOWN_MS)
-            return null;
+        if (cooldown.containsKey(key)) {
+            long delta = now - cooldown.get(key);
+            if (delta < COOLDOWN_MS) {
+                System.out.println("[Cooldown] " + symbol + " blocked for " + (COOLDOWN_MS-delta)/1000 + "s");
+                return null;
+            }
+        }
 
         /* ========= CONFIDENCE ========= */
-
         double confidence = baseConfidence(state);
         confidence += Math.min(adx/50.0,0.18);
         confidence += Math.min((vol-1)*0.06,0.10);
 
-        if (side == TradingCore.Side.SHORT && bias==HTFBias.NONE)
-            confidence -= 0.05;
+        if (side == TradingCore.Side.SHORT && bias==HTFBias.NONE) confidence -= 0.05;
 
         confidence = clamp(confidence,0.54,0.95);
 
-        SignalGrade grade =
-                confidence>0.76 ? SignalGrade.A :
-                        confidence>0.63 ? SignalGrade.B :
-                                SignalGrade.C;
+        SignalGrade grade = confidence>0.76 ? SignalGrade.A :
+                confidence>0.63 ? SignalGrade.B : SignalGrade.C;
 
         /* ========= RISK ========= */
-
-        double rr =
-                confidence>0.80 ? 2.7 :
-                        confidence>0.70 ? 2.2 :
-                                1.8;
-
+        double rr = confidence>0.80 ? 2.7 : confidence>0.70 ? 2.2 : 1.8;
         double stop = side==TradingCore.Side.LONG ? price-atr : price+atr;
         double take = side==TradingCore.Side.LONG ? price+atr*rr : price-atr*rr;
 
         cooldown.put(key, now);
 
+        System.out.println("[BuildTradeIdea] " + symbol + " " + side +
+                " conf=" + confidence + " stop=" + stop + " take=" + take + " reason=" + reason);
+
         return new TradeIdea(symbol, side, price, stop, take, confidence, grade, reason);
     }
 
     /* ================= STATE ================= */
-
     private MarketState detectMarketState(List<TradingCore.Candle> c){
         double adx = adx(c,14);
         double vol = relativeVolume(c);
@@ -237,7 +225,6 @@ public final class DecisionEngineMerged {
     }
 
     /* ================= INDICATORS ================= */
-
     private double atr(List<TradingCore.Candle> c,int n){
         double sum=0;
         for(int i=c.size()-n;i<c.size();i++){

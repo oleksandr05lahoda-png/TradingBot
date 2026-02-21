@@ -4,11 +4,12 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * FINAL SignalOptimizer — сбалансированная версия
+ * SignalOptimizer — сбалансированная версия с дебагом
  * ✔ не душит сигналы
  * ✔ корректно обрабатывает шорты и лонги
  * ✔ мягкая фильтрация микро-движений
  * ✔ стабильный confidence
+ * ✔ выводит логи для дебага сигналов
  */
 public final class SignalOptimizer {
 
@@ -70,6 +71,7 @@ public final class SignalOptimizer {
         MicroTrendResult result = new MicroTrendResult(speed, accel, avg);
         microTrendCache.put(symbol, result);
 
+        System.out.println("[MicroTrend] " + symbol + " speed=" + speed + " accel=" + accel);
         return result;
     }
 
@@ -82,20 +84,24 @@ public final class SignalOptimizer {
 
         if (mt != null) {
             double impulse = Math.abs(mt.speed) + Math.abs(mt.accel);
+            System.out.println("[AdjustConfidence] " + s.symbol + " base=" + baseConfidence +
+                    " impulse=" + impulse + " side=" + s.side);
 
-            // рынок спит — мягкий штраф
-            if (impulse < IMPULSE_DEAD)
-                conf *= 0.88;
-
-                // сильный импульс — небольшой буст
-            else if (impulse > IMPULSE_STRONG)
+            // Дебаг: временно убираем агрессивные штрафы
+            if (impulse < IMPULSE_DEAD) {
+                System.out.println("[AdjustConfidence] small impulse, soft penalty skipped");
+                // conf *= 0.88; // закомментировано
+            } else if (impulse > IMPULSE_STRONG) {
                 conf += 0.05;
-
-            // сигнал против микро-движения — небольшой штраф
-            if ((mt.speed > 0 && s.side == TradingCore.Side.SHORT) ||
-                    (mt.speed < 0 && s.side == TradingCore.Side.LONG)) {
-                conf *= 0.92;
+                System.out.println("[AdjustConfidence] strong impulse, +0.05 boost");
             }
+
+            // сигнал против микро-движения — временно закомментировано
+            // if ((mt.speed > 0 && s.side == TradingCore.Side.SHORT) ||
+            //     (mt.speed < 0 && s.side == TradingCore.Side.LONG)) {
+            //     conf *= 0.92;
+            //     System.out.println("[AdjustConfidence] against micro, -8%");
+            // }
         }
 
         // ===== adaptive brain =====
@@ -110,7 +116,9 @@ public final class SignalOptimizer {
             );
         }
 
-        return clamp(conf, 0.50, 0.97);
+        conf = clamp(conf, 0.50, 0.97);
+        System.out.println("[AdjustConfidence] final conf=" + conf);
+        return conf;
     }
 
     /* ================= STOP / TAKE ================= */
@@ -137,6 +145,7 @@ public final class SignalOptimizer {
             take = s.entry * (1 - volPct * rr);
         }
 
+        System.out.println("[StopTake] " + s.symbol + " stop=" + stop + " take=" + take);
         return new Elite5MinAnalyzer.TradeSignal(
                 s.symbol,
                 s.side,
@@ -160,9 +169,12 @@ public final class SignalOptimizer {
         double ema50 = ema(h1, 50);
         double ema200 = ema(h1, 200);
 
-        return idea.side == TradingCore.Side.LONG
+        boolean aligns = idea.side == TradingCore.Side.LONG
                 ? ema50 > ema200
                 : ema50 < ema200;
+
+        System.out.println("[HTFAlignment] " + idea.symbol + " aligns=" + aligns);
+        return aligns;
     }
 
     /* ================= UTILS ================= */
