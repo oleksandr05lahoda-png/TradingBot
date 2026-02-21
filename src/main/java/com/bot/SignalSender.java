@@ -1061,21 +1061,10 @@ public class SignalSender {
                     side = TradingCore.Side.LONG;
                 }
 
-                // ===== SHORT (БОЛЕЕ СТРОГИЙ) =====
                 if (dir15 < 0 &&
                         rsi14 < 55 && rsi14 > 28 &&
-                        micro.speed <= 0 &&
-                        (mtfConfirm <= 0)) {
-
-                    // Защита от зелёного разворота
-                    boolean bullishPressure =
-                            last.close > last.open &&
-                                    rsi14 > 38 &&
-                                    micro.speed > -0.05;
-
-                    if (!bullishPressure) {
-                        side = TradingCore.Side.SHORT;
-                    }
+                        (mtfConfirm <= 0)) { // убрали micro.speed
+                    side = TradingCore.Side.SHORT;
                 }
 
                 if (side == null) continue;
