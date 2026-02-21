@@ -630,7 +630,8 @@ public class SignalSender {
             System.out.println("[DEBUG] Skipped " + pair + " due to low confidence: " + s.confidence);
             return;
         }
-        if (closes15m.size() < 4) return;
+
+        if (closes15m == null || closes15m.size() < 4) return;
 
         List<TradingCore.Candle> recent = new ArrayList<>(closes15m);
 
@@ -639,19 +640,18 @@ public class SignalSender {
         boolean liqSweep = detectLiquiditySweep(recent);
 
         // ===== Микротренд =====
-        MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
+        Deque<Double> tickDeque = tickPriceDeque.getOrDefault(s.symbol, new ArrayDeque<>());
+        MicroTrendResult micro = computeMicroTrend(s.symbol, tickDeque);
 
-        // ===== Определяем конец тренда =====
+        // ===== Определяем экстремумы и конец тренда =====
         double lastHigh = lastSwingHigh(recent);
-        double lastLow = lastSwingLow(recent);
+        double lastLow  = lastSwingLow(recent);
 
         boolean nearSwingHigh = s.direction.equals("LONG") && recent.get(recent.size() - 1).close >= lastHigh * 0.995;
         boolean nearSwingLow  = s.direction.equals("SHORT") && recent.get(recent.size() - 1).close <= lastLow * 1.005;
-        boolean trendSlowing  = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
+        boolean endOfTrend    = nearSwingHigh || nearSwingLow;
 
-        boolean endOfTrend = nearSwingHigh || nearSwingLow; // Убираем trendSlowing, чтобы не режать confidence сильно
-
-        // ===== Корректируем confidence по микротренду =====
+        // ===== Корректировка confidence =====
         if (endOfTrend) {
             double microFactor = 0.85 + Math.min(0.15, Math.abs(micro.speed) * 100);
             s.confidence *= microFactor;
@@ -661,25 +661,32 @@ public class SignalSender {
             }
         }
 
-        // ===== Дополнительное снижение confidence для BOS/LiquiditySweep на экстремуме =====
+        // Дополнительное снижение confidence, если BOS или Liquidity Sweep на экстремуме
         if ((bos || liqSweep) && endOfTrend) {
             s.confidence *= 0.85;
         }
 
+        // ===== Проверка cooldown =====
         if (isCooldown(pair, s)) {
             System.out.println("[DEBUG] Skipped " + pair + " due to cooldown");
             return;
         }
+
+        // ===== Отмечаем сигнал как отправленный =====
         markSignalSent(pair, s.direction);
 
         // ===== Добавляем в историю сигналов =====
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
         // ===== Асинхронная отправка в Telegram =====
-        System.out.println("[DEBUG] Sending signal: " + s.toTelegramMessage());
-        bot.sendMessageAsync(s.toTelegramMessage());
+        try {
+            System.out.println("[DEBUG] Sending signal: " + s.toTelegramMessage());
+            bot.sendMessageAsync(s.toTelegramMessage());
+        } catch (Exception e) {
+            System.out.println("[ERROR] Telegram send failed for " + pair + ": " + e.getMessage());
+        }
 
-        // ===== Отмечаем, что сигнал отправлен =====
+        // ===== Увеличиваем счетчик сигналов за цикл =====
         signalsThisCycle++;
     }
     public static class Signal {
@@ -765,7 +772,47 @@ public class SignalSender {
             String url = "wss://fstream.binance.com/ws/" + symbol + "@aggTrade";
 
             System.out.println("[WS] Connecting " + pair);
+            HttpClient client = HttpClient.newHttpClient();
+            client.newWebSocketBuilder()
+                    .buildAsync(URI.create(url), new java.net.http.WebSocket.Listener() {
+                        @Override
+                        public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
+                            try {
+                                JSONObject json = new JSONObject(data.toString());
+                                double price = Double.parseDouble(json.getString("p"));
+                                long ts = json.getLong("T");
 
+                                synchronized (wsLock) {
+                                    Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>());
+                                    dq.addLast(price);
+                                    while (dq.size() > TICK_HISTORY) dq.removeFirst();
+                                }
+
+                                lastTickPrice.put(pair, price);
+                                lastTickTime.put(pair, ts);
+                            } catch (Exception ignored) {}
+                            return CompletableFuture.completedFuture(null);
+                        }
+
+                        @Override
+                        public void onError(java.net.http.WebSocket webSocket, Throwable error) {
+                            System.out.println("[WS ERROR] " + pair + " " + error.getMessage());
+                            wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
+                        }
+
+                        @Override
+                        public CompletionStage<?> onClose(java.net.http.WebSocket webSocket, int statusCode, String reason) {
+                            System.out.println("[WS CLOSED] " + pair + " code=" + statusCode);
+                            wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
+                            return CompletableFuture.completedFuture(null);
+                        }
+                    })
+                    .thenAccept(ws -> wsMap.put(pair, ws))
+                    .exceptionally(ex -> {
+                        System.out.println("[WS] Failed connect " + pair + " retry in 5s: " + ex.getMessage());
+                        wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
+                        return null;
+                    });
             java.net.http.WebSocket ws = HttpClient.newHttpClient()
                     .newWebSocketBuilder()
                     .buildAsync(URI.create(url), new java.net.http.WebSocket.Listener() {
@@ -976,89 +1023,107 @@ public class SignalSender {
 
         for (String pair : symbols) {
             try {
-                CompletableFuture<List<TradingCore.Candle>> f15 =
-                        fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
-                CompletableFuture<List<TradingCore.Candle>> f1h =
-                        fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
-                CompletableFuture.allOf(f15, f1h).join();
+                // ===== FETCH KLINES ASYNC =====
+                CompletableFuture<List<TradingCore.Candle>> f15 = fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
+                CompletableFuture<List<TradingCore.Candle>> f1h = fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
 
-                List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
-                List<TradingCore.Candle> c1h  = new ArrayList<>(f1h.join());
-                if (c15m.size() < 30 || c1h.size() < 30) continue;
+                // Обрабатываем асинхронно, без join()
+                f15.thenCombine(f1h, (c15mRaw, c1hRaw) -> {
+                    List<TradingCore.Candle> c15m = new ArrayList<>(c15mRaw);
+                    List<TradingCore.Candle> c1h  = new ArrayList<>(c1hRaw);
 
-                TradingCore.Candle last = c15m.get(c15m.size() - 1);
-                MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
-                MarketPhase phase = detectMarketPhase(c15m, micro);
-                if (phase == MarketPhase.NO_TRADE) continue;
+                    if (c15m.size() < 30 || c1h.size() < 30) return null;
 
-                double atr15 = atr(c15m, 14);
-                if (atr15 <= 0) continue;
-                double atrPercent = atr15 / last.close;
-                if (atrPercent < ATR_MIN_PCT) continue;
+                    TradingCore.Candle last = c15m.get(c15m.size() - 1);
 
-                boolean volOk = true; // для теста игнорируем
+                    // ===== MICRO TREND =====
+                    MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.getOrDefault(pair, new ArrayDeque<>()));
 
-                List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
-                double rsi14 = SignalSender.rsi(closes15, 14);
+                    MarketPhase phase = detectMarketPhase(c15m, micro);
+                    if (phase == MarketPhase.NO_TRADE) return null;
 
-                int dir15 = marketStructure(c15m);
-                int dir1h = marketStructure(c1h);
-                if (dir15 == 0) continue;
-                int mtfConfirm = multiTFConfirm(dir1h, dir15);
+                    double atr15 = atr(c15m, 14);
+                    if (atr15 <= 0) return null;
 
-                boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
-                boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
+                    double atrPercent = atr15 / last.close;
+                    if (atrPercent < ATR_MIN_PCT) return null;
 
-                TradingCore.Side side = null;
-                if (dir15 > 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
-                else if (dir15 < 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
-                if (side == null) continue;
+                    boolean volOk = true; // пока игнорируем
 
-                double rawScore = strategyEMANorm(closes15) * 0.35 +
-                        strategyRSINorm(closes15) * 0.25 +
-                        strategyMomentumNorm(closes15) * 0.20 +
-                        strategyMACDNorm(closes15) * 0.20;
+                    List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
+                    double rsi14 = SignalSender.rsi(closes15, 14);
 
-                double conf = composeConfidence(
-                        rawScore,
-                        mtfConfirm,
-                        volOk,
-                        true,
-                        (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
-                        true,
-                        true,
-                        detectBOS(c15m),
-                        detectLiquiditySweep(c15m)
-                );
-                if (side == TradingCore.Side.SHORT) conf -= 0.03;
+                    int dir15 = marketStructure(c15m);
+                    int dir1h = marketStructure(c1h);
+                    if (dir15 == 0) return null;
 
-                double pct = Math.max(0.003, Math.min(0.01, atrPercent));
-                double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
-                double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
+                    int mtfConfirm = multiTFConfirm(dir1h, dir15);
 
-                Signal s = new Signal(
-                        pair,
-                        side.toString(),
-                        conf,
-                        last.close,
-                        rsi14,
-                        rawScore,
-                        mtfConfirm,
-                        volOk,
-                        true,
-                        true,
-                        side == TradingCore.Side.LONG,
-                        side == TradingCore.Side.SHORT,
-                        true,
-                        SignalSender.rsi(closes15, 7),
-                        SignalSender.rsi(closes15, 4)
-                );
-                s.stop = stop;
-                s.take = take;
+                    boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
+                    boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
 
-                if (conf < MIN_CONF) continue;
+                    TradingCore.Side side = null;
+                    if (dir15 > 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
+                    else if (dir15 < 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
+                    if (side == null) return null;
 
-                sendSignalIfAllowed(pair, s, c15m);
+                    // ===== CONFIDENCE =====
+                    double rawScore = strategyEMANorm(closes15) * 0.35 +
+                            strategyRSINorm(closes15) * 0.25 +
+                            strategyMomentumNorm(closes15) * 0.20 +
+                            strategyMACDNorm(closes15) * 0.20;
+
+                    double conf = composeConfidence(
+                            rawScore,
+                            mtfConfirm,
+                            volOk,
+                            true,
+                            (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
+                            true,
+                            true,
+                            detectBOS(c15m),
+                            detectLiquiditySweep(c15m)
+                    );
+
+                    if (side == TradingCore.Side.SHORT) conf -= 0.03;
+                    if (Double.isNaN(conf)) conf = 0.5;
+
+                    if (conf < MIN_CONF) return null;
+
+                    // ===== STOP / TAKE =====
+                    double pct = Math.max(0.003, Math.min(0.01, atrPercent));
+                    double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
+                    double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
+
+                    // ===== CREATE SIGNAL =====
+                    Signal s = new Signal(
+                            pair,
+                            side.toString(),
+                            conf,
+                            last.close,
+                            rsi14,
+                            rawScore,
+                            mtfConfirm,
+                            volOk,
+                            true,
+                            true,
+                            side == TradingCore.Side.LONG,
+                            side == TradingCore.Side.SHORT,
+                            true,
+                            SignalSender.rsi(closes15, 7),
+                            SignalSender.rsi(closes15, 4)
+                    );
+                    s.stop = stop;
+                    s.take = take;
+
+                    // ===== SEND SIGNAL =====
+                    sendSignalIfAllowed(pair, s, c15m);
+
+                    return null;
+                }).exceptionally(ex -> {
+                    System.out.println("[Scheduler] Error async for " + pair + ": " + ex.getMessage());
+                    return null;
+                });
 
             } catch (Exception e) {
                 System.out.println("[Scheduler] Error for " + pair + ": " + e.getMessage());
