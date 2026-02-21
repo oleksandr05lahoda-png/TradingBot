@@ -191,7 +191,10 @@ public class SignalSender {
 
     public CompletableFuture<List<TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
-            String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", symbol, interval, limit);
+            String url = String.format(
+                    "https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
+                    symbol, interval, limit
+            );
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(10))
@@ -201,10 +204,7 @@ public class SignalSender {
             return http.sendAsync(req, HttpResponse.BodyHandlers.ofString())
                     .thenApply(resp -> {
                         String body = resp.body();
-                        if (body == null || body.isEmpty() || !body.startsWith("[")) {
-                            System.out.println("[Binance] Invalid klines response for " + symbol + " " + interval + ": " + body);
-                            return Collections.emptyList();
-                        }
+                        // ...
                         JSONArray arr = new JSONArray(body);
                         List<TradingCore.Candle> list = new ArrayList<>();
                         for (int i = 0; i < arr.length(); i++) {
@@ -220,9 +220,13 @@ public class SignalSender {
                             list.add(new TradingCore.Candle(openTime, open, high, low, close, vol, qvol, closeTime));
                         }
                         return list;
+                    })
+                    .exceptionally(e -> {
+                        System.out.println("[Binance] Error fetching klines for " + symbol + ": " + e.getMessage());
+                        return Collections.emptyList();
                     });
         } catch (Exception e) {
-            System.out.println("[Binance] Error preparing klines request for " + symbol + " : " + e.getMessage());
+            System.out.println("[Binance] Error preparing klines request for " + symbol + ": " + e.getMessage());
             return CompletableFuture.completedFuture(Collections.emptyList());
         }
     }
