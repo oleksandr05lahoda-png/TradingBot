@@ -888,25 +888,43 @@ public class SignalSender {
     // ========================= Helper: top symbols via CoinGecko =========================
     public List<String> getTopSymbols(int limit) {
         try {
-            String url = String.format("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=%d&page=1", limit);
-            HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
+            String url = String.format(
+                    "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=%d&page=1",
+                    limit
+            );
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             JSONArray arr = new JSONArray(resp.body());
+
             List<String> list = new ArrayList<>();
+
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject c = arr.getJSONObject(i);
                 String sym = c.getString("symbol").toUpperCase();
+
                 if (STABLE.contains(sym)) continue;
-                list.add(sym + "USDT");
+
+                String pair = sym + "USDT";
+
+                // ФИЛЬТР — ВОТ ГЛАВНОЕ
+                if (BINANCE_PAIRS.contains(pair)) {
+                    list.add(pair);
+                }
             }
+
             return list;
+
         } catch (Exception e) {
             System.out.println("[CoinGecko] Error: " + e.getMessage());
-            return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT");
+            return List.of("BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","ADAUSDT");
         }
     }
-
-
     public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
             List<TradingCore.Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
