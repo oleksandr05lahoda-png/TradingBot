@@ -960,11 +960,10 @@ public class SignalSender {
         return res;
     }
     private void runSchedulerCycle() {
-
         signalsThisCycle = 0;
         long now = System.currentTimeMillis();
 
-        // ================= REFRESH SYMBOLS =================
+        // ===== REFRESH SYMBOLS =====
         if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
             cachedPairs = getTopSymbolsSet(TOP_N);
             lastBinancePairsRefresh = now;
@@ -975,98 +974,68 @@ public class SignalSender {
                 .filter(BINANCE_PAIRS::contains)
                 .collect(Collectors.toSet());
 
-        // ================= PROCESS EACH SYMBOL =================
         for (String pair : symbols) {
             try {
-
                 CompletableFuture<List<TradingCore.Candle>> f15 =
                         fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
-
                 CompletableFuture<List<TradingCore.Candle>> f1h =
                         fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
-
                 CompletableFuture.allOf(f15, f1h).join();
 
                 List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
                 List<TradingCore.Candle> c1h  = new ArrayList<>(f1h.join());
-
                 if (c15m.size() < 30 || c1h.size() < 30) continue;
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
-
                 MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
-
                 MarketPhase phase = detectMarketPhase(c15m, micro);
                 if (phase == MarketPhase.NO_TRADE) continue;
 
-                // ================= ATR =================
                 double atr15 = atr(c15m, 14);
                 if (atr15 <= 0) continue;
-
                 double atrPercent = atr15 / last.close;
                 if (atrPercent < ATR_MIN_PCT) continue;
 
-                // ================= VOLUME =================
-                boolean volOk = true; // временно игнорируем объём для теста
+                boolean volOk = true; // для теста игнорируем
 
-                // ================= RSI =================
                 List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
                 double rsi14 = SignalSender.rsi(closes15, 14);
 
-                // ================= STRUCTURE =================
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
                 if (dir15 == 0) continue;
-
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
 
-                // ================= IMPULSE =================
                 boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
                 boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
 
-                // ================= CHOOSE DIRECTION =================
                 TradingCore.Side side = null;
-
-                if (dir15 > 0 && rsi14 > 45 && rsi14 < 72 && micro.speed >= 0 && mtfConfirm >= 0) {
-                    side = TradingCore.Side.LONG;
-                } else if (dir15 < 0 && rsi14 < 55 && rsi14 > 28 && mtfConfirm <= 0) {
-                    side = TradingCore.Side.SHORT;
-                }
-
+                if (dir15 > 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
+                else if (dir15 < 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
                 if (side == null) continue;
 
-                // ================= RAW SCORE =================
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
                         strategyRSINorm(closes15) * 0.25 +
                         strategyMomentumNorm(closes15) * 0.20 +
                         strategyMACDNorm(closes15) * 0.20;
 
-                if ((side == TradingCore.Side.LONG && rawScore < -0.1) ||
-                        (side == TradingCore.Side.SHORT && rawScore > 0.1)) continue;
-
-                // ================= CONFIDENCE =================
                 double conf = composeConfidence(
                         rawScore,
                         mtfConfirm,
                         volOk,
                         true,
-                        (side == TradingCore.Side.LONG && impulseUp) ||
-                                (side == TradingCore.Side.SHORT && impulseDown),
+                        (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
                         true,
                         true,
                         detectBOS(c15m),
                         detectLiquiditySweep(c15m)
                 );
-
                 if (side == TradingCore.Side.SHORT) conf -= 0.03;
-                if (conf < 0.50) continue;
 
-                // ================= STOP / TAKE =================
                 double pct = Math.max(0.003, Math.min(0.01, atrPercent));
                 double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
                 double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
 
-                // ================= CREATE SIGNAL =================
                 Signal s = new Signal(
                         pair,
                         side.toString(),
@@ -1086,6 +1055,8 @@ public class SignalSender {
                 );
                 s.stop = stop;
                 s.take = take;
+
+                if (conf < MIN_CONF) continue;
 
                 sendSignalIfAllowed(pair, s, c15m);
 
