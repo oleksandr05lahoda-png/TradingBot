@@ -888,7 +888,7 @@ public class SignalSender {
     // ========================= Helper: top symbols via CoinGecko =========================
     private List<String> getTopSymbols(int limit) {
         try {
-            String url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
+            String url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
 
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -896,32 +896,47 @@ public class SignalSender {
                     .GET()
                     .build();
 
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            JSONObject json = new JSONObject(resp.body());
-            JSONArray arr = json.getJSONArray("symbols");
+            HttpResponse<String> resp =
+                    http.send(req, HttpResponse.BodyHandlers.ofString());
 
-            List<String> list = new ArrayList<>();
+            JSONArray arr = new JSONArray(resp.body());
+
+            List<JSONObject> filtered = new ArrayList<>();
 
             for (int i = 0; i < arr.length(); i++) {
-                JSONObject s = arr.getJSONObject(i);
+                JSONObject o = arr.getJSONObject(i);
 
-                if ("TRADING".equalsIgnoreCase(s.optString("status"))
-                        && "USDT".equalsIgnoreCase(s.optString("quoteAsset"))
-                        && "PERPETUAL".equalsIgnoreCase(s.optString("contractType"))) {
+                String symbol = o.getString("symbol");
 
-                    list.add(s.getString("symbol"));
-                }
+                if (!symbol.endsWith("USDT"))
+                    continue;
+
+                double volume = o.optDouble("quoteVolume", 0);
+
+                if (volume < 1_000_000)
+                    continue;
+
+                filtered.add(o);
             }
 
-            Collections.shuffle(list); // чтобы брать случайные топы
-            if (list.size() > limit)
-                list = list.subList(0, limit);
+            filtered.sort((a,b) ->
+                    Double.compare(
+                            b.getDouble("quoteVolume"),
+                            a.getDouble("quoteVolume")
+                    )
+            );
 
-            System.out.println("[BINANCE] Loaded symbols: " + list.size());
-            return list;
+            List<String> result = new ArrayList<>();
+
+            for (int i = 0; i < Math.min(limit, filtered.size()); i++)
+                result.add(filtered.get(i).getString("symbol"));
+
+            System.out.println("[PAIRS] Loaded TOP " + result.size() + " symbols");
+
+            return result;
 
         } catch (Exception e) {
-            System.out.println("[BINANCE] getTopSymbols error: " + e.getMessage());
+            System.out.println("[PAIRS] ERROR: " + e.getMessage());
             return List.of("BTCUSDT","ETHUSDT","SOLUSDT");
         }
     }
