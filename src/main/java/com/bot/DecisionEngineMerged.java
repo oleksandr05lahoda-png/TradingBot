@@ -5,8 +5,6 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class DecisionEngineMerged {
 
-    /* ================= ENUMS ================= */
-
     public enum SignalGrade { A, B, C }
 
     private enum MarketState {
@@ -19,14 +17,10 @@ public final class DecisionEngineMerged {
 
     private enum HTFBias { BULL, BEAR, NONE }
 
-    /* ================= CONFIG ================= */
-
     private static final int MIN_BARS = 200;
-    private static final long COOLDOWN_MS = 8 * 60_000; // уменьшено для частых сигналов
+    private static final long COOLDOWN_MS = 8 * 60_000;
 
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
-
-    /* ================= OUTPUT ================= */
 
     public static final class TradeIdea {
         public final String symbol;
@@ -69,7 +63,6 @@ public final class DecisionEngineMerged {
         long now = System.currentTimeMillis();
 
         for (String symbol : symbols) {
-            List<TradingCore.Candle> c1 = m1.get(symbol);
             List<TradingCore.Candle> c15 = m15.get(symbol);
             List<TradingCore.Candle> htf = h1.get(symbol);
 
@@ -78,7 +71,7 @@ public final class DecisionEngineMerged {
             HTFBias bias = detectHTFBias(htf);
             MarketState state = detectMarketState(c15);
 
-            TradeIdea idea = buildSignal(symbol, c1, c15, htf, bias, state, now);
+            TradeIdea idea = buildSignal(symbol, c15, htf, bias, state, now);
             if (idea != null) list.add(idea);
         }
 
@@ -86,11 +79,10 @@ public final class DecisionEngineMerged {
         return list;
     }
 
-    /* ================= CORE LOGIC ================= */
+    /* ================= CORE ================= */
 
     private TradeIdea buildSignal(
             String symbol,
-            List<TradingCore.Candle> m1,
             List<TradingCore.Candle> m15,
             List<TradingCore.Candle> h1,
             HTFBias bias,
@@ -106,31 +98,36 @@ public final class DecisionEngineMerged {
         TradingCore.Side side = null;
         String reason = null;
 
-        /* ========= TREND IMPULSE ========= */
+        double ema21 = ema(m15,21);
+        double ema50 = ema(m15,50);
 
-        boolean trendUp = ema(m15,21) > ema(m15,50);
-        boolean trendDown = ema(m15,21) < ema(m15,50);
+        boolean trendUp = ema21 > ema50;
+        boolean trendDown = ema21 < ema50;
 
-        if (bias == HTFBias.BULL && trendUp) {
+        /* ========= TREND ========= */
+
+        if (bias == HTFBias.BULL && trendUp && rsi > 45)
+        {
             side = TradingCore.Side.LONG;
             reason = "Trend continuation";
         }
 
-        if (bias == HTFBias.BEAR && trendDown) {
+        if (bias == HTFBias.BEAR && trendDown && rsi < 55)
+        {
             side = TradingCore.Side.SHORT;
             reason = "Trend continuation";
         }
 
-        /* ========= PULLBACK ENTRY ========= */
-
-        double ema21 = ema(m15,21);
+        /* ========= PULLBACK ========= */
 
         if (side == null && bias != HTFBias.NONE) {
-            if (bias == HTFBias.BULL && price <= ema21*1.015) {
+
+            if (bias == HTFBias.BULL && price <= ema21*1.01 && rsi>42) {
                 side = TradingCore.Side.LONG;
                 reason = "Pullback";
             }
-            if (bias == HTFBias.BEAR && price >= ema21*0.985) {
+
+            if (bias == HTFBias.BEAR && price >= ema21*0.99 && rsi<58) {
                 side = TradingCore.Side.SHORT;
                 reason = "Pullback";
             }
@@ -142,11 +139,13 @@ public final class DecisionEngineMerged {
         double low = lowest(m15,12);
 
         if (side == null && state != MarketState.RANGE) {
-            if (price > high*0.998 && adx>12) {
+
+            if (price > high*0.998 && adx>14 && rsi>48) {
                 side = TradingCore.Side.LONG;
                 reason = "Breakout";
             }
-            if (price < low*1.002 && adx>12) {
+
+            if (price < low*1.002 && adx>14 && rsi<52) {
                 side = TradingCore.Side.SHORT;
                 reason = "Breakdown";
             }
@@ -155,29 +154,24 @@ public final class DecisionEngineMerged {
         /* ========= REVERSAL ========= */
 
         if (side == null) {
-            if (bullishDivergence(m15) && rsi < 50) {
+
+            if (bullishDivergence(m15) && rsi<45) {
                 side = TradingCore.Side.LONG;
                 reason = "Bullish Divergence";
             }
-            if (bearishDivergence(m15) && rsi > 50) {
+
+            if (bearishDivergence(m15) && rsi>55 && bias!=HTFBias.BULL) {
                 side = TradingCore.Side.SHORT;
                 reason = "Bearish Divergence";
             }
-        }
-
-        /* ========= DEFAULT LONG FOR NEUTRAL HTF ========= */
-
-        if (side == null && bias == HTFBias.NONE) {
-            side = TradingCore.Side.LONG;
-            reason = "Neutral HTF default LONG";
         }
 
         if (side == null) return null;
 
         /* ========= COOLDOWN ========= */
 
-        String key = symbol + "_" + side;
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS)
+        String key = symbol+"_"+side;
+        if (cooldown.containsKey(key) && now-cooldown.get(key)<COOLDOWN_MS)
             return null;
 
         /* ========= CONFIDENCE ========= */
@@ -185,19 +179,23 @@ public final class DecisionEngineMerged {
         double confidence = baseConfidence(state);
         confidence += Math.min(adx/50.0,0.18);
         confidence += Math.min((vol-1)*0.06,0.10);
-        if (bias != HTFBias.NONE) confidence += 0.04;
 
-        confidence = clamp(confidence,0.53,0.95); // нижняя граница чуть меньше
+        if (side == TradingCore.Side.SHORT && bias==HTFBias.NONE)
+            confidence -= 0.05;
+
+        confidence = clamp(confidence,0.54,0.95);
 
         SignalGrade grade =
-                confidence > 0.76 ? SignalGrade.A :
-                        confidence > 0.63 ? SignalGrade.B :
+                confidence>0.76 ? SignalGrade.A :
+                        confidence>0.63 ? SignalGrade.B :
                                 SignalGrade.C;
 
         /* ========= RISK ========= */
 
-        double rr = confidence>0.80 ? 2.7 :
-                confidence>0.70 ? 2.2 : 1.8;
+        double rr =
+                confidence>0.80 ? 2.7 :
+                        confidence>0.70 ? 2.2 :
+                                1.8;
 
         double stop = side==TradingCore.Side.LONG ? price-atr : price+atr;
         double take = side==TradingCore.Side.LONG ? price+atr*rr : price-atr*rr;
@@ -207,7 +205,7 @@ public final class DecisionEngineMerged {
         return new TradeIdea(symbol, side, price, stop, take, confidence, grade, reason);
     }
 
-    /* ================= MARKET STATE ================= */
+    /* ================= STATE ================= */
 
     private MarketState detectMarketState(List<TradingCore.Candle> c){
         double adx = adx(c,14);

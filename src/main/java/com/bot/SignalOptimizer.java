@@ -6,14 +6,13 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * FINAL SignalOptimizer — сбалансированная версия
  * ✔ не душит сигналы
- * ✔ не ломает шорты
+ * ✔ корректно обрабатывает шорты и лонги
  * ✔ мягкая фильтрация микро-движений
  * ✔ стабильный confidence
  */
 public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */
-
     private static final int MAX_TICKS = 60;
     private static final double ALPHA = 0.35;
 
@@ -31,7 +30,6 @@ public final class SignalOptimizer {
     }
 
     /* ================= MICRO TREND ================= */
-
     public static final class MicroTrendResult {
         public final double speed;
         public final double accel;
@@ -45,7 +43,6 @@ public final class SignalOptimizer {
     }
 
     public MicroTrendResult computeMicroTrend(String symbol) {
-
         Deque<Double> dq = tickPriceDeque.get(symbol);
         if (dq == null || dq.size() < 6)
             return new MicroTrendResult(0, 0, 0);
@@ -58,9 +55,7 @@ public final class SignalOptimizer {
         double accel = 0;
 
         for (int i = size - n + 1; i < size; i++) {
-
             double diff = prices.get(i) - prices.get(i - 1);
-
             double prevSpeed = speed;
             speed = ALPHA * diff + (1 - ALPHA) * speed;
             accel = ALPHA * (speed - prevSpeed) + (1 - ALPHA) * accel;
@@ -79,16 +74,13 @@ public final class SignalOptimizer {
     }
 
     /* ================= CONFIDENCE ================= */
-
     public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s,
                                    double baseConfidence) {
 
         double conf = baseConfidence;
-
         MicroTrendResult mt = microTrendCache.get(s.symbol);
 
         if (mt != null) {
-
             double impulse = Math.abs(mt.speed) + Math.abs(mt.accel);
 
             // рынок спит — мягкий штраф
@@ -102,15 +94,12 @@ public final class SignalOptimizer {
             // сигнал против микро-движения — небольшой штраф
             if ((mt.speed > 0 && s.side == TradingCore.Side.SHORT) ||
                     (mt.speed < 0 && s.side == TradingCore.Side.LONG)) {
-
                 conf *= 0.92;
             }
         }
 
-        /* ===== adaptive brain ===== */
-
+        // ===== adaptive brain =====
         if (adaptiveBrain != null) {
-
             conf = adaptiveBrain.applyAllAdjustments(
                     "ELITE15",
                     s.symbol,
@@ -125,7 +114,6 @@ public final class SignalOptimizer {
     }
 
     /* ================= STOP / TAKE ================= */
-
     public Elite5MinAnalyzer.TradeSignal withAdjustedStopTake(
             Elite5MinAnalyzer.TradeSignal s,
             double atr) {
@@ -144,8 +132,7 @@ public final class SignalOptimizer {
         if (s.side == TradingCore.Side.LONG) {
             stop = s.entry * (1 - volPct);
             take = s.entry * (1 + volPct * rr);
-        }
-        else {
+        } else {
             stop = s.entry * (1 + volPct);
             take = s.entry * (1 - volPct * rr);
         }
@@ -163,7 +150,6 @@ public final class SignalOptimizer {
     }
 
     /* ================= HTF ALIGNMENT ================= */
-
     public boolean alignsWithDecisionEngine(
             DecisionEngineMerged.TradeIdea idea,
             List<TradingCore.Candle> h1) {
@@ -180,13 +166,11 @@ public final class SignalOptimizer {
     }
 
     /* ================= UTILS ================= */
-
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }
 
     private double ema(List<TradingCore.Candle> c, int p) {
-
         if (c.size() < p)
             return c.get(c.size() - 1).close;
 
