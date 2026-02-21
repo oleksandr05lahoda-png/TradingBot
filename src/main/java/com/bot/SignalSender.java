@@ -888,7 +888,7 @@ public class SignalSender {
     // ========================= Helper: top symbols via CoinGecko =========================
     private List<String> getTopSymbols(int limit) {
         try {
-            String url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
+            String url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -899,44 +899,42 @@ public class SignalSender {
             HttpResponse<String> resp =
                     http.send(req, HttpResponse.BodyHandlers.ofString());
 
-            JSONArray arr = new JSONArray(resp.body());
+            JSONObject obj = new JSONObject(resp.body());
+            JSONArray arr = obj.getJSONArray("symbols");
 
-            List<JSONObject> filtered = new ArrayList<>();
+            List<String> list = new ArrayList<>();
 
             for (int i = 0; i < arr.length(); i++) {
-                JSONObject o = arr.getJSONObject(i);
+                JSONObject s = arr.getJSONObject(i);
 
-                String symbol = o.getString("symbol");
-
-                if (!symbol.endsWith("USDT"))
+                if (!s.getString("contractType").equals("PERPETUAL"))
                     continue;
 
-                double volume = o.optDouble("quoteVolume", 0);
-
-                if (volume < 1_000_000)
+                if (!s.getString("quoteAsset").equals("USDT"))
                     continue;
 
-                filtered.add(o);
+                if (!s.getString("status").equals("TRADING"))
+                    continue;
+
+                String symbol = s.getString("symbol");
+
+                if (symbol.contains("_"))
+                    continue;
+
+                list.add(symbol);
             }
 
-            filtered.sort((a,b) ->
-                    Double.compare(
-                            b.getDouble("quoteVolume"),
-                            a.getDouble("quoteVolume")
-                    )
-            );
+            Collections.sort(list);
 
-            List<String> result = new ArrayList<>();
+            if (list.size() > limit)
+                list = list.subList(0, limit);
 
-            for (int i = 0; i < Math.min(limit, filtered.size()); i++)
-                result.add(filtered.get(i).getString("symbol"));
+            System.out.println("[PAIRS] Loaded TOP " + list.size() + " major pairs");
 
-            System.out.println("[PAIRS] Loaded TOP " + result.size() + " symbols");
-
-            return result;
+            return list;
 
         } catch (Exception e) {
-            System.out.println("[PAIRS] ERROR: " + e.getMessage());
+            System.out.println("[PAIRS] ERROR " + e.getMessage());
             return List.of("BTCUSDT","ETHUSDT","SOLUSDT");
         }
     }
