@@ -886,43 +886,43 @@ public class SignalSender {
 
 
     // ========================= Helper: top symbols via CoinGecko =========================
-    public List<String> getTopSymbols(int limit) {
+    private List<String> getTopSymbols(int limit) {
         try {
-            String url = String.format(
-                    "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=%d&page=1",
-                    limit
-            );
+            String url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(10))
+                    .timeout(Duration.ofSeconds(15))
                     .GET()
                     .build();
 
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            JSONArray arr = new JSONArray(resp.body());
+            JSONObject json = new JSONObject(resp.body());
+            JSONArray arr = json.getJSONArray("symbols");
 
             List<String> list = new ArrayList<>();
 
             for (int i = 0; i < arr.length(); i++) {
-                JSONObject c = arr.getJSONObject(i);
-                String sym = c.getString("symbol").toUpperCase();
+                JSONObject s = arr.getJSONObject(i);
 
-                if (STABLE.contains(sym)) continue;
+                if ("TRADING".equalsIgnoreCase(s.optString("status"))
+                        && "USDT".equalsIgnoreCase(s.optString("quoteAsset"))
+                        && "PERPETUAL".equalsIgnoreCase(s.optString("contractType"))) {
 
-                String pair = sym + "USDT";
-
-                // ФИЛЬТР — ВОТ ГЛАВНОЕ
-                if (BINANCE_PAIRS.contains(pair)) {
-                    list.add(pair);
+                    list.add(s.getString("symbol"));
                 }
             }
 
+            Collections.shuffle(list); // чтобы брать случайные топы
+            if (list.size() > limit)
+                list = list.subList(0, limit);
+
+            System.out.println("[BINANCE] Loaded symbols: " + list.size());
             return list;
 
         } catch (Exception e) {
-            System.out.println("[CoinGecko] Error: " + e.getMessage());
-            return List.of("BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","ADAUSDT");
+            System.out.println("[BINANCE] getTopSymbols error: " + e.getMessage());
+            return List.of("BTCUSDT","ETHUSDT","SOLUSDT");
         }
     }
     public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
