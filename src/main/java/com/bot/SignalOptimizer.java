@@ -3,14 +3,6 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * SignalOptimizer — сбалансированная версия с дебагом
- * ✔ не душит сигналы
- * ✔ корректно обрабатывает шорты и лонги
- * ✔ мягкая фильтрация микро-движений
- * ✔ стабильный confidence
- * ✔ выводит логи для дебага сигналов
- */
 public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */
@@ -76,9 +68,7 @@ public final class SignalOptimizer {
     }
 
     /* ================= CONFIDENCE ================= */
-    public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s,
-                                   double baseConfidence) {
-
+    public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s, double baseConfidence) {
         double conf = baseConfidence;
         MicroTrendResult mt = microTrendCache.get(s.symbol);
 
@@ -87,24 +77,12 @@ public final class SignalOptimizer {
             System.out.println("[AdjustConfidence] " + s.symbol + " base=" + baseConfidence +
                     " impulse=" + impulse + " side=" + s.side);
 
-            // Дебаг: временно убираем агрессивные штрафы
-            if (impulse < IMPULSE_DEAD) {
-                System.out.println("[AdjustConfidence] small impulse, soft penalty skipped");
-                // conf *= 0.88; // закомментировано
-            } else if (impulse > IMPULSE_STRONG) {
+            if (impulse > IMPULSE_STRONG) {
                 conf += 0.05;
                 System.out.println("[AdjustConfidence] strong impulse, +0.05 boost");
             }
-
-            // сигнал против микро-движения — временно закомментировано
-            // if ((mt.speed > 0 && s.side == TradingCore.Side.SHORT) ||
-            //     (mt.speed < 0 && s.side == TradingCore.Side.LONG)) {
-            //     conf *= 0.92;
-            //     System.out.println("[AdjustConfidence] against micro, -8%");
-            // }
         }
 
-        // ===== adaptive brain =====
         if (adaptiveBrain != null) {
             conf = adaptiveBrain.applyAllAdjustments(
                     "ELITE15",
@@ -128,11 +106,9 @@ public final class SignalOptimizer {
 
         double volPct = clamp(atr / s.entry, 0.007, 0.045);
 
-        double rr =
-                s.confidence > 0.80 ? 2.8 :
-                        s.confidence > 0.70 ? 2.3 :
-                                s.confidence > 0.60 ? 1.9 :
-                                        1.6;
+        double rr = s.confidence > 0.80 ? 2.8 :
+                s.confidence > 0.70 ? 2.3 :
+                        s.confidence > 0.60 ? 1.9 : 1.6;
 
         double stop;
         double take;
@@ -147,32 +123,19 @@ public final class SignalOptimizer {
 
         System.out.println("[StopTake] " + s.symbol + " stop=" + stop + " take=" + take);
         return new Elite5MinAnalyzer.TradeSignal(
-                s.symbol,
-                s.side,
-                s.entry,
-                stop,
-                take,
-                s.confidence,
-                s.reason,
-                s.grade
+                s.symbol, s.side, s.entry, stop, take, s.confidence, s.reason, s.grade
         );
     }
 
     /* ================= HTF ALIGNMENT ================= */
-    public boolean alignsWithDecisionEngine(
-            DecisionEngineMerged.TradeIdea idea,
-            List<TradingCore.Candle> h1) {
-
+    public boolean alignsWithDecisionEngine(DecisionEngineMerged.TradeIdea idea, List<TradingCore.Candle> h1) {
         if (h1 == null || h1.size() < 200)
             return true;
 
         double ema50 = ema(h1, 50);
         double ema200 = ema(h1, 200);
 
-        boolean aligns = idea.side == TradingCore.Side.LONG
-                ? ema50 > ema200
-                : ema50 < ema200;
-
+        boolean aligns = idea.side == TradingCore.Side.LONG ? ema50 > ema200 : ema50 < ema200;
         System.out.println("[HTFAlignment] " + idea.symbol + " aligns=" + aligns);
         return aligns;
     }
