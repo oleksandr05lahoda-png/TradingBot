@@ -626,7 +626,10 @@ public class SignalSender {
                                      Signal s,
                                      List<TradingCore.Candle> closes15m) {
 
-        if (s.confidence < MIN_CONF) return;
+        if (s.confidence < MIN_CONF) {
+            System.out.println("[DEBUG] Skipped " + pair + " due to low confidence: " + s.confidence);
+            return;
+        }
         if (closes15m.size() < 4) return;
 
         List<TradingCore.Candle> recent = new ArrayList<>(closes15m);
@@ -646,46 +649,45 @@ public class SignalSender {
         boolean nearSwingLow  = s.direction.equals("SHORT") && recent.get(recent.size() - 1).close <= lastLow * 1.005;
         boolean trendSlowing  = Math.abs(micro.speed) < 0.0005 && Math.abs(micro.accel) < 0.0002;
 
-        boolean endOfTrend = nearSwingHigh || nearSwingLow || trendSlowing;
+        boolean endOfTrend = nearSwingHigh || nearSwingLow; // Убираем trendSlowing, чтобы не режать confidence сильно
 
         // ===== Корректируем confidence по микротренду =====
         if (endOfTrend) {
-            double microFactor = 0.7 + Math.min(0.3, Math.abs(micro.speed) * 100);
+            double microFactor = 0.85 + Math.min(0.15, Math.abs(micro.speed) * 100);
             s.confidence *= microFactor;
 
             if (!bos && !liqSweep) {
-                // динамическое снижение, если нет BOS/liqSweep
-                s.confidence *= Math.max(0.6, 1.0 - Math.abs(micro.speed) * 200);
+                s.confidence *= Math.max(0.75, 1.0 - Math.abs(micro.speed) * 100);
             }
         }
 
         // ===== Дополнительное снижение confidence для BOS/LiquiditySweep на экстремуме =====
         if ((bos || liqSweep) && endOfTrend) {
-            s.confidence *= 0.75;
+            s.confidence *= 0.85;
         }
 
-        // ===== Проверка cooldown =====
-        if (isCooldown(pair, s)) return;
+        // ===== Проверка cooldown (только один map) =====
+        long now = System.currentTimeMillis();
+        Map<String, Long> dirMap = lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>());
+        Long lastTimeSameDir = dirMap.get(s.direction);
 
-        long candleTs = closes15m.get(closes15m.size() - 1).openTime;
-        Long lastTs = lastSignalCandleTs
-                .getOrDefault(pair, new ConcurrentHashMap<>())
-                .getOrDefault(s.direction, 0L);
+        if (lastTimeSameDir != null && now - lastTimeSameDir < 15 * 60_000) {
+            System.out.println("[DEBUG] Skipped " + pair + " due to cooldown");
+            return;
+        }
 
-        if (Math.abs(candleTs - lastTs) < 15 * 60_000) return; // 15 минут между сигналами
-
-        lastSignalCandleTs.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
-                .put(s.direction, candleTs);
+        // ===== Обновляем время последнего сигнала =====
+        dirMap.put(s.direction, now);
 
         // ===== Добавляем в историю сигналов =====
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
         // ===== Асинхронная отправка в Telegram =====
+        System.out.println("[DEBUG] Sending signal: " + s.toTelegramMessage());
         bot.sendMessageAsync(s.toTelegramMessage());
 
         // ===== Отмечаем, что сигнал отправлен =====
         signalsThisCycle++;
-        markSignalSent(pair, s.direction);
     }
     public static class Signal {
         public final String symbol;
@@ -999,15 +1001,10 @@ public class SignalSender {
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
 
-                MicroTrendResult micro =
-                        computeMicroTrend(pair, tickPriceDeque.get(pair));
+                MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
 
-                MarketPhase phase =
-                        detectMarketPhase(c15m, micro);
-
-                if (phase == MarketPhase.NO_TRADE) {
-                    continue;
-                }
+                MarketPhase phase = detectMarketPhase(c15m, micro);
+                if (phase == MarketPhase.NO_TRADE) continue;
 
                 // ================= ATR =================
                 double atr15 = atr(c15m, 14);
@@ -1017,67 +1014,42 @@ public class SignalSender {
                 if (atrPercent < ATR_MIN_PCT) continue;
 
                 // ================= VOLUME =================
-                double avgVol = c15m.stream()
-                        .mapToDouble(c -> c.volume)
-                        .average().orElse(0);
-
-                boolean volOk = last.volume >= avgVol * VOL_MULTIPLIER;
+                boolean volOk = true; // временно игнорируем объём для теста
 
                 // ================= RSI =================
-                List<Double> closes15 = c15m.stream()
-                        .map(c -> c.close).toList();
-
+                List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
                 double rsi14 = SignalSender.rsi(closes15, 14);
 
                 // ================= STRUCTURE =================
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
-
                 if (dir15 == 0) continue;
 
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
 
                 // ================= IMPULSE =================
-                boolean impulseUp =
-                        last.close > last.open &&
-                                (last.high - last.low) > atr15 * 0.8;
+                boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.8;
+                boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.8;
 
-                boolean impulseDown =
-                        last.close < last.open &&
-                                (last.high - last.low) > atr15 * 0.8;
-
-                // =====================================================
-                // 🔥 НОВЫЙ БЛОК ВЫБОРА НАПРАВЛЕНИЯ (ИСПРАВЛЕННЫЙ)
-                // =====================================================
-
+                // ================= CHOOSE DIRECTION =================
                 TradingCore.Side side = null;
 
-                // ===== LONG =====
-                if (dir15 > 0 &&
-                        rsi14 > 45 && rsi14 < 72 &&
-                        micro.speed >= 0 &&
-                        (mtfConfirm >= 0)) {
-
+                if (dir15 > 0 && rsi14 > 45 && rsi14 < 72 && micro.speed >= 0 && mtfConfirm >= 0) {
                     side = TradingCore.Side.LONG;
-                }
-
-                if (dir15 < 0 &&
-                        rsi14 < 55 && rsi14 > 28 &&
-                        (mtfConfirm <= 0)) { // убрали micro.speed
+                } else if (dir15 < 0 && rsi14 < 55 && rsi14 > 28 && mtfConfirm <= 0) {
                     side = TradingCore.Side.SHORT;
                 }
 
                 if (side == null) continue;
 
                 // ================= RAW SCORE =================
-                double rawScore =
-                        strategyEMANorm(closes15) * 0.35 +
-                                strategyRSINorm(closes15) * 0.25 +
-                                strategyMomentumNorm(closes15) * 0.20 +
-                                strategyMACDNorm(closes15) * 0.20;
+                double rawScore = strategyEMANorm(closes15) * 0.35 +
+                        strategyRSINorm(closes15) * 0.25 +
+                        strategyMomentumNorm(closes15) * 0.20 +
+                        strategyMACDNorm(closes15) * 0.20;
 
-                if (side == TradingCore.Side.LONG && rawScore < -0.1) continue;
-                if (side == TradingCore.Side.SHORT && rawScore >  0.1) continue;
+                if ((side == TradingCore.Side.LONG && rawScore < -0.1) ||
+                        (side == TradingCore.Side.SHORT && rawScore > 0.1)) continue;
 
                 // ================= CONFIDENCE =================
                 double conf = composeConfidence(
@@ -1093,23 +1065,13 @@ public class SignalSender {
                         detectLiquiditySweep(c15m)
                 );
 
-                // SHORT немного строже
-                if (side == TradingCore.Side.SHORT)
-                    conf -= 0.03;
-
+                if (side == TradingCore.Side.SHORT) conf -= 0.03;
                 if (conf < 0.50) continue;
 
                 // ================= STOP / TAKE =================
-                double pct = Math.max(0.003,
-                        Math.min(0.01, atrPercent));
-
-                double stop = side == TradingCore.Side.LONG
-                        ? last.close * (1 - pct)
-                        : last.close * (1 + pct);
-
-                double take = side == TradingCore.Side.LONG
-                        ? last.close * (1 + pct * 1.4)
-                        : last.close * (1 - pct * 1.4);
+                double pct = Math.max(0.003, Math.min(0.01, atrPercent));
+                double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
+                double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
 
                 // ================= CREATE SIGNAL =================
                 Signal s = new Signal(
@@ -1129,19 +1091,17 @@ public class SignalSender {
                         SignalSender.rsi(closes15, 7),
                         SignalSender.rsi(closes15, 4)
                 );
-
                 s.stop = stop;
                 s.take = take;
 
                 sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
-                System.out.println("[Scheduler] Error for "
-                        + pair + ": " + e.getMessage());
+                System.out.println("[Scheduler] Error for " + pair + ": " + e.getMessage());
+                e.printStackTrace();
             }
         }
 
-        System.out.println("[Cycle] Signals sent: "
-                + signalsThisCycle);
+        System.out.println("[Cycle] Signals sent: " + signalsThisCycle);
     }
 }
