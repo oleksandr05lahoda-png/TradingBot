@@ -769,7 +769,34 @@ public class SignalSender {
     public void connectTickWebSocket(String pair) {
         wsWatcher.execute(() -> connectWsInternal(pair));
     }
+    private Signal analyzePair(String pair, List<TradingCore.Candle> c15m, List<TradingCore.Candle> c1h) {
+        // Простейший пример: берём последнюю свечу и делаем LONG если close > open
+        TradingCore.Candle last = c15m.get(c15m.size() - 1);
+        String dir = last.close > last.open ? "LONG" : "SHORT";
 
+        double confidence = 0.5; // базовое значение
+
+        Signal s = new Signal(
+                pair,
+                dir,
+                confidence,
+                last.close,
+                rsi(c15m.stream().map(c -> c.close).collect(Collectors.toList()), 14),
+                0.0, // rawScore
+                0,   // mtfConfirm
+                true, // volOk
+                true, // atrOk
+                false, // strongTrigger
+                false, // atrBreakLong
+                false, // atrBreakShort
+                false, // impulse
+                0.0, // rsi7
+                0.0  // rsi4
+        );
+
+        // stop/take можно добавить здесь при желании
+        return s;
+    }
     private void connectWsInternal(String pair) {
         try {
             final String symbol = pair.toLowerCase();
@@ -899,6 +926,12 @@ public class SignalSender {
 
                 histM15.put(pair, new ArrayList<>(c15m));
                 histH1.put(pair, new ArrayList<>(c1h));
+
+                // ----- Новый блок: анализируем исторические свечи -----
+                if (!c15m.isEmpty() && !c1h.isEmpty()) {
+                    Signal s = analyzePair(pair, c15m, c1h);
+                    if (s != null) sendSignalIfAllowed(pair, s, c15m);
+                }
 
                 connectTickWebSocket(pair);
             }
@@ -1048,132 +1081,127 @@ public class SignalSender {
         return structure == dir;
     }
     private void runSchedulerCycle() {
-        signalsThisCycle = 0;
-        long now = System.currentTimeMillis();
+        try {
 
-        // =================== Обновление топ-пар ===================
-        if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
-            Set<String> availablePairs = getBinanceSymbolsFutures(); // реально торгуемые пары
-            cachedPairs = getTopSymbolsSet(TOP_N).stream()
-                    .filter(availablePairs::contains)
-                    .collect(Collectors.toSet());
-            lastBinancePairsRefresh = now;
-            System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
-        }
+            if (cachedPairs == null || cachedPairs.isEmpty())
+                return;
 
-        // =================== Основной цикл по каждой паре ===================
-        for (String pair : cachedPairs) {
-            try {
-                // ===== Получаем исторические свечи =====
-                List<TradingCore.Candle> c15m = histM15.getOrDefault(pair, new ArrayList<>());
-                List<TradingCore.Candle> c1h = histH1.getOrDefault(pair, new ArrayList<>());
-                if (c15m.size() < 30 || c1h.size() < 30) {
-                    System.out.println("[Scheduler] Skipping " + pair + " - not enough candles");
+            List<Signal> candidates = new ArrayList<>();
+
+            for (String pair : cachedPairs) {
+
+                List<TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
+                List<TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
+
+                if (m15.size() < 60 || h1.size() < 60)
                     continue;
-                }
-                TradingCore.Candle last = c15m.get(c15m.size() - 1);
 
-                // ===== Микротренд (tick-based) =====
-                MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.getOrDefault(pair, new ArrayDeque<>()));
-                MarketPhase phase = detectMarketPhase(c15m, micro);
-                if (phase == MarketPhase.NO_TRADE) continue;
-                if (phase == MarketPhase.TREND_EXHAUSTION) continue;
+                histM15.put(pair,m15);
+                histH1.put(pair,h1);
 
-                // ===== ATR и волатильность =====
-                double atr15 = atr(c15m, 14);
-                if (atr15 <= 0 || atr15 / last.close < 0.002) continue;
-                boolean atrOk = atr15 / last.close > 0.003;
+                TradingCore.Candle last = m15.get(m15.size()-2);
 
-                // ===== RSI =====
-                List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
-                double rsi14 = SignalSender.rsi(closes15, 14);
+                // не отправлять сигнал повторно на ту же свечу
+                Map<String, Long> map =
+                        lastSignalCandleTs.computeIfAbsent(pair,k->new ConcurrentHashMap<>());
 
-                // ===== Многотаймфреймовая структура =====
-                int dir15 = marketStructure(c15m);
-                int dir1h = marketStructure(c1h);
-                int mtfConfirm = multiTFConfirm(dir1h, dir15);
-
-                boolean impulseUp = last.close > last.open && (last.high - last.low) > atr15 * 0.5;
-                boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.5;
-                boolean impulse = (dir15 > 0 && impulseUp) || (dir15 < 0 && impulseDown);
-
-                TradingCore.Side side = null;
-
-                if (dir15 == 0) continue;
-
-                if (dir15 == 1 && dir1h == 1) {
-                    side = TradingCore.Side.LONG;
-                }
-                else if (dir15 == -1 && dir1h == -1) {
-                    side = TradingCore.Side.SHORT;
-                }
-                else {
+                Long lastSent = map.get("15m");
+                if (lastSent != null && lastSent.longValue() == last.closeTime)
                     continue;
-                }
 
-                if (side == TradingCore.Side.LONG && (rsi14 < 45 || rsi14 > 72)) continue;
-                if (side == TradingCore.Side.SHORT && (rsi14 > 55 || rsi14 < 28)) continue;
-                // ===== Расчёт стратегии =====
-                double rawScore = strategyEMANorm(closes15) * 0.35 +
-                        strategyRSINorm(closes15) * 0.25 +
-                        strategyMomentumNorm(closes15) * 0.20 +
-                        strategyMACDNorm(closes15) * 0.20;
+                // закрытия
+                List<Double> closes15 = m15.stream().map(c->c.close).toList();
 
-                // ===== Динамичные флаги для composeConfidence =====
-                boolean volOk = computeVolatilityOk(c15m, atr15); // реальная проверка волатильности
-                boolean vwapAligned = checkVWAPAlignment(pair, last.close); // VWAP соответствие
-                boolean structureAligned = checkStructureAlignment(c15m, dir15); // структура рынка
-                boolean bos = detectBOS(c15m);
-                boolean liquiditySweep = detectLiquiditySweep(c15m);
+                // микро тренд
+                MicroTrendResult micro =
+                        computeMicroTrend(pair,tickPriceDeque.get(pair));
+                MarketPhase phase = detectMarketPhase(m15,micro);
+                if(phase == MarketPhase.NO_TRADE)
+                    continue;
+                // score
+                double emaScore  = strategyEMANorm(closes15);
+                double rsiScore  = strategyRSINorm(closes15);
+                double momScore  = strategyMomentumNorm(closes15);
+                double macdScore = strategyMACDNorm(closes15);
 
-                // ===== Композиция confidence =====
-                double conf = composeConfidence(
-                        rawScore,
-                        mtfConfirm,
-                        volOk,
-                        atrOk,
-                        impulse,
-                        vwapAligned,
-                        structureAligned,
-                        bos,
-                        liquiditySweep
-                );
-                if (side == TradingCore.Side.SHORT) conf -= 0.03;
-                if (conf < MIN_CONF) continue; // фильтр по минимальной уверенности
+                double microBias = Math.tanh(micro.speed * 500);
 
-                // ===== Stop Loss / Take Profit =====
-                double pct = Math.max(0.003, Math.min(0.01, atr15 / last.close));
-                double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
-                double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
+                double rawScore =
+                        emaScore*0.25 +
+                                rsiScore*0.15 +
+                                momScore*0.20 +
+                                macdScore*0.15 +
+                                microBias*0.25;
 
-                // ===== Формируем объект сигнала =====
+                double confidence = Math.pow(Math.abs(rawScore),0.7);
+
+                if(confidence < MIN_CONF)
+                    continue;
+
+                String dir = rawScore>=0 ? "LONG":"SHORT";
+
+                // ATR риск
+                double atr = atr(m15,14);
+                if(atr<=0)
+                    continue;
+
+                double entry = last.close;
+                double risk  = atr*1.2;
+
+                double stop = dir.equals("LONG")
+                        ? entry-risk
+                        : entry+risk;
+
+                double take = dir.equals("LONG")
+                        ? entry+risk*2.4
+                        : entry-risk*2.4;
+
                 Signal s = new Signal(
                         pair,
-                        side.toString(),
-                        conf,
-                        last.close,
-                        rsi14,
+                        dir,
+                        confidence,
+                        entry,
+                        rsi(closes15,14),
                         rawScore,
-                        mtfConfirm,
-                        volOk, atrOk, impulse,
-                        side == TradingCore.Side.LONG,
-                        side == TradingCore.Side.SHORT,
-                        vwapAligned,
-                        SignalSender.rsi(closes15, 7),
-                        SignalSender.rsi(closes15, 4)
+                        0,
+                        true,
+                        true,
+                        Math.abs(rawScore)>0.6,
+                        false,
+                        false,
+                        Math.abs(micro.speed)>0.0005,
+                        rsi(closes15,7),
+                        rsi(closes15,4)
                 );
+
                 s.stop = stop;
                 s.take = take;
 
-                // ===== Отправка сигнала с учётом cooldown =====
-                sendSignalIfAllowed(pair, s, c15m);
-
-            } catch (Exception e) {
-                System.out.println("[Scheduler] Error for " + pair + ": " + e.getMessage());
-                e.printStackTrace();
+                candidates.add(s);
             }
-        }
 
-        System.out.println("[Cycle] Signals sent: " + signalsThisCycle);
+            // сортировка
+            candidates.sort((a,b)->Double.compare(b.confidence,a.confidence));
+
+            int limit = Math.min(5,candidates.size());
+
+            for(int i=0;i<limit;i++){
+                Signal s = candidates.get(i);
+
+                sendSignalIfAllowed(s.symbol,s,histM15.get(s.symbol));
+
+                lastSignalCandleTs
+                        .computeIfAbsent(s.symbol,k->new ConcurrentHashMap<>())
+                        .put("15m",
+                                histM15.get(s.symbol)
+                                        .get(histM15.get(s.symbol).size()-2)
+                                        .closeTime
+                        );
+            }
+
+        } catch (Exception e) {
+            System.out.println("[Scheduler ERROR] "+e.getMessage());
+            e.printStackTrace();
+        }
     }
 }
