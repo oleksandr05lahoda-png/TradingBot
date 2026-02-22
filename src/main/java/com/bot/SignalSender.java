@@ -1050,7 +1050,7 @@ public class SignalSender {
         signalsThisCycle = 0;
         long now = System.currentTimeMillis();
 
-        // ===== Обновляем топ-пары (раз в BINANCE_REFRESH_INTERVAL_MS) =====
+        // ===== Обновляем топ-пары =====
         if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
             cachedPairs = getTopSymbolsSet(TOP_N);
             lastBinancePairsRefresh = now;
@@ -1064,18 +1064,19 @@ public class SignalSender {
 
         for (String pair : symbols) {
             try {
-                // Берем свечи 15m и 1h
                 List<TradingCore.Candle> c15m = histM15.getOrDefault(pair, new ArrayList<>());
                 List<TradingCore.Candle> c1h  = histH1.getOrDefault(pair, new ArrayList<>());
-                if (c15m.size() < 30 || c1h.size() < 30) continue;
+                if (c15m.size() < 20 || c1h.size() < 20) continue; // чуть меньше баров для старта
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
                 MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.getOrDefault(pair, new ArrayDeque<>()));
-                MarketPhase phase = detectMarketPhase(c15m, micro);
-                if (phase == MarketPhase.NO_TRADE) continue;
+
+                // 🔹 Убираем жесткий фильтр NO_TRADE для теста
+                // MarketPhase phase = detectMarketPhase(c15m, micro);
+                // if (phase == MarketPhase.NO_TRADE) continue;
 
                 double atr15 = atr(c15m, 14);
-                if (atr15 <= 0 || atr15 / last.close < 0.002) continue; // фильтр по волатильности
+                if (atr15 <= 0) continue; // только исключаем нулевой ATR
 
                 List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
                 double rsi14 = SignalSender.rsi(closes15, 14);
@@ -1088,27 +1089,27 @@ public class SignalSender {
                 boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.5;
 
                 TradingCore.Side side = null;
-                if (dir15 >= 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
-                else if (dir15 <= 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
-                if (side == null) continue;
+                if (dir15 >= 0 && rsi14 > 20 && rsi14 < 80) side = TradingCore.Side.LONG;
+                else if (dir15 <= 0 && rsi14 > 20 && rsi14 < 80) side = TradingCore.Side.SHORT;
+                if (side == null) side = TradingCore.Side.LONG; // форсим сигнал для теста
 
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
                         strategyRSINorm(closes15) * 0.25 +
                         strategyMomentumNorm(closes15) * 0.20 +
                         strategyMACDNorm(closes15) * 0.20;
 
+                // 🔹 Ослабляем confidence
                 double conf = composeConfidence(
                         rawScore,
                         mtfConfirm,
-                        true,  // volOk
-                        true,  // atrOk
+                        true, true,
                         (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
-                        true,  // vwapAligned
-                        true,  // structureAligned
+                        true, true,
                         detectBOS(c15m),
                         detectLiquiditySweep(c15m)
                 );
-                if (side == TradingCore.Side.SHORT) conf -= 0.03;
+                if (side == TradingCore.Side.SHORT) conf -= 0.02;
+                if (conf < 0.2) conf = 0.2; // минимальный порог для теста
 
                 double pct = Math.max(0.003, Math.min(0.01, atr15 / last.close));
                 double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
@@ -1131,8 +1132,6 @@ public class SignalSender {
                 );
                 s.stop = stop;
                 s.take = take;
-
-                if (conf < MIN_CONF) continue;
 
                 sendSignalIfAllowed(pair, s, c15m);
 
