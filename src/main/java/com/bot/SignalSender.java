@@ -1123,15 +1123,7 @@ public class SignalSender {
                 histM15.put(pair,m15);
                 histH1.put(pair,h1);
 
-                TradingCore.Candle last = m15.get(m15.size()-2);
-
-                // не отправлять сигнал повторно на ту же свечу
-                Map<String, Long> map =
-                        lastSignalCandleTs.computeIfAbsent(pair,k->new ConcurrentHashMap<>());
-
-                Long lastSent = map.get("15m");
-                if (lastSent != null && lastSent.longValue() == last.closeTime)
-                    continue;
+                TradingCore.Candle last = m15.get(m15.size()-1);
 
                 // закрытия
                 List<Double> closes15 = m15.stream().map(c->c.close).toList();
@@ -1153,7 +1145,17 @@ public class SignalSender {
                 double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.20 + macdScore*0.15 + microBias*0.25;
                 rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
 
-                double confidence = Math.pow(Math.abs(rawScore),0.7);
+                double confidence = composeConfidence(
+                        rawScore,
+                        multiTFConfirm(emaDirection(h1,20,50), emaDirection(m15,20,50)),
+                        computeVolatilityOk(m15, atr(m15,14)),
+                        atr(m15,14)/last.close > ATR_MIN_PCT,
+                        Math.abs(micro.speed)>0.0005,
+                        checkVWAPAlignment(pair,last.close),
+                        checkStructureAlignment(m15, rawScore>=0?1:-1),
+                        detectBOS(m15),
+                        detectLiquiditySweep(m15)
+                );
 
                 if(confidence < MIN_CONF)
                     continue;
@@ -1210,13 +1212,6 @@ public class SignalSender {
 
                 sendSignalIfAllowed(s.symbol,s,histM15.get(s.symbol));
 
-                lastSignalCandleTs
-                        .computeIfAbsent(s.symbol,k->new ConcurrentHashMap<>())
-                        .put("15m",
-                                histM15.get(s.symbol)
-                                        .get(histM15.get(s.symbol).size()-2)
-                                        .closeTime
-                        );
             }
 
         } catch (Exception e) {
