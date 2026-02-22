@@ -2,6 +2,7 @@ package com.bot;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 public final class DecisionEngineMerged {
 
@@ -13,8 +14,9 @@ public final class DecisionEngineMerged {
 
     /* ================= CONFIG ================= */
     private static final int MIN_BARS = 200;
-    private static final long COOLDOWN_MS = 10 * 60_000;
+    private static final long COOLDOWN_MS = 10 * 60_000; // 10 минут
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
+    private static final int MAX_TOP_COINS = 70;
 
     /* ================= OUTPUT ================= */
     public static final class TradeIdea {
@@ -57,14 +59,20 @@ public final class DecisionEngineMerged {
         List<TradeIdea> ideas = new ArrayList<>();
         long now = System.currentTimeMillis();
 
-        for (String symbol : symbols) {
+        // Фильтруем валидные монеты
+        List<String> validSymbols = symbols.stream()
+                .filter(s -> isValid(m15.get(s)) && isValid(h1.get(s)))
+                .collect(Collectors.toList());
+
+        // Ограничиваем топ-70
+        validSymbols = validSymbols.stream().limit(MAX_TOP_COINS).collect(Collectors.toList());
+
+        for (String symbol : validSymbols) {
             List<TradingCore.Candle> c1 = m1.get(symbol);
             List<TradingCore.Candle> c5List = m5.get(symbol);
             List<TradingCore.Candle> c15List = m15.get(symbol);
             List<TradingCore.Candle> c1hList = h1.get(symbol);
             CoinCategory cat = categories.getOrDefault(symbol, CoinCategory.TOP);
-
-            if (!isValid(c15List) || !isValid(c1hList)) continue;
 
             HTFBias bias = detectHTFBias(c1hList);
             MarketState state = detectMarketState(c15List);
@@ -75,8 +83,18 @@ public final class DecisionEngineMerged {
             if (idea != null) ideas.add(idea);
         }
 
-        ideas.sort(Comparator.<TradeIdea>comparingDouble(t -> t.confidence).reversed());
-        return ideas;
+        // Убираем дубликаты по монете и стороне, оставляем только самый высокий confidence
+        Map<String, TradeIdea> uniqueMap = new LinkedHashMap<>();
+        for (TradeIdea t : ideas) {
+            String key = t.symbol + "_" + t.side;
+            if (!uniqueMap.containsKey(key) || uniqueMap.get(key).confidence < t.confidence) {
+                uniqueMap.put(key, t);
+            }
+        }
+
+        List<TradeIdea> finalIdeas = new ArrayList<>(uniqueMap.values());
+        finalIdeas.sort(Comparator.<TradeIdea>comparingDouble(t -> t.confidence).reversed());
+        return finalIdeas;
     }
 
     /* ================= SIGNAL LOGIC ================= */
@@ -103,7 +121,6 @@ public final class DecisionEngineMerged {
         String reason = null;
 
         // ================= STRATEGIES =================
-        // 1️⃣ Trend Following w/ category adjustment
         if ((state == MarketState.STRONG_TREND || state == MarketState.WEAK_TREND) && bias != HTFBias.NONE) {
             double emaShort = ema(c15, 21);
             double emaLong = ema(c15, 50);
@@ -119,13 +136,11 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // 2️⃣ Divergence / Reversal
         if (side == null) {
             if (bullishDivergence(c15)) { side = TradingCore.Side.LONG; reason = "Bullish Divergence"; }
             else if (bearishDivergence(c15)) { side = TradingCore.Side.SHORT; reason = "Bearish Divergence"; }
         }
 
-        // 3️⃣ Range / Exhaustion
         if (side == null) {
             double high = highest(c15, 15);
             double low = lowest(c15, 15);
@@ -133,7 +148,6 @@ public final class DecisionEngineMerged {
             else if (price >= high * 0.995) { side = TradingCore.Side.SHORT; reason = "Range Resistance"; }
         }
 
-        // 4️⃣ Climax Reversal
         if (side == null && state == MarketState.CLIMAX) {
             if (rsi < 45) { side = TradingCore.Side.LONG; reason = "Exhaustion Reversal"; }
             else if (rsi > 55) { side = TradingCore.Side.SHORT; reason = "Exhaustion Reversal"; }
@@ -145,16 +159,13 @@ public final class DecisionEngineMerged {
         String key = symbol + "_" + side;
         if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS) return null;
 
-        // ================= CONFIDENCE =================
         double confidence = computeConfidence(c15, state, adx, vol, microVol, microImpulse, volumeSpike, cat);
-
         if (!passesLocalCheck(c15, side)) confidence *= 0.9;
 
         SignalGrade grade = confidence > 0.75 ? SignalGrade.A :
                 confidence > 0.62 ? SignalGrade.B : SignalGrade.C;
-        if (grade == SignalGrade.C && confidence < 0.52) return null; // чуть выше минимальной точности
+        if (grade == SignalGrade.C && confidence < 0.52) return null;
 
-        // ================= RISK/REWARD =================
         double risk = atr * (cat == CoinCategory.MEME ? 1.2 : 1.0);
         double rr = confidence > 0.72 ? 2.8 : 2.2;
         double stop = side == TradingCore.Side.LONG ? price - risk : price + risk;
