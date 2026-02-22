@@ -13,10 +13,13 @@ public final class DecisionEngineMerged {
     private enum HTFBias { BULL, BEAR, NONE }
 
     /* ================= CONFIG ================= */
-    private static final int MIN_BARS = 200;
-    private static final long COOLDOWN_MS = 10 * 60_000; // 10 минут
-    private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
+    private static final int MIN_BARS = 150;                // минимальное количество свечей
+    private static final long COOLDOWN_MS = 10 * 60_000;   // 10 минут cooldown
     private static final int MAX_TOP_COINS = 70;
+
+    /* ================= COOLDOWN ================= */
+    private final Map<String, Long> cooldown = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastCandleTime = new ConcurrentHashMap<>();
 
     /* ================= OUTPUT ================= */
     public static final class TradeIdea {
@@ -50,8 +53,6 @@ public final class DecisionEngineMerged {
 
     /* ================= MAIN EVALUATION ================= */
     public List<TradeIdea> evaluate(List<String> symbols,
-                                    Map<String, List<TradingCore.Candle>> m1,
-                                    Map<String, List<TradingCore.Candle>> m5,
                                     Map<String, List<TradingCore.Candle>> m15,
                                     Map<String, List<TradingCore.Candle>> h1,
                                     Map<String, CoinCategory> categories) {
@@ -68,22 +69,26 @@ public final class DecisionEngineMerged {
         validSymbols = validSymbols.stream().limit(MAX_TOP_COINS).collect(Collectors.toList());
 
         for (String symbol : validSymbols) {
-            List<TradingCore.Candle> c1 = m1.get(symbol);
-            List<TradingCore.Candle> c5List = m5.get(symbol);
-            List<TradingCore.Candle> c15List = m15.get(symbol);
-            List<TradingCore.Candle> c1hList = h1.get(symbol);
+            List<TradingCore.Candle> c15 = m15.get(symbol);
+            List<TradingCore.Candle> c1h = h1.get(symbol);
             CoinCategory cat = categories.getOrDefault(symbol, CoinCategory.TOP);
 
-            HTFBias bias = detectHTFBias(c1hList);
-            MarketState state = detectMarketState(c15List);
-            boolean microImpulse = detectMicroImpulse(c1);
-            boolean volumeSpike = detectVolumeSpike(c1, cat);
+            MarketState state = detectMarketState(c15);
+            HTFBias bias = detectHTFBias(c1h);
+            boolean microImpulse = detectMicroImpulse(c15);
+            boolean volumeSpike = detectVolumeSpike(c15, cat);
 
-            TradeIdea idea = generateTradeIdea(symbol, c1, c5List, c15List, c1hList, state, bias, microImpulse, volumeSpike, cat, now);
+            // Проверяем, что это новая свеча
+            long candleTime = last(c15).closeTime;
+            String key = symbol + "_" + candleTime;
+            if (lastCandleTime.getOrDefault(symbol, 0L) >= candleTime) continue;
+            lastCandleTime.put(symbol, candleTime);
+
+            TradeIdea idea = generateTradeIdea(symbol, c15, c1h, state, bias, microImpulse, volumeSpike, cat, now);
             if (idea != null) ideas.add(idea);
         }
 
-        // Убираем дубликаты по монете и стороне, оставляем только самый высокий confidence
+        // Убираем дубликаты по монете и стороне, оставляем максимальный confidence
         Map<String, TradeIdea> uniqueMap = new LinkedHashMap<>();
         for (TradeIdea t : ideas) {
             String key = t.symbol + "_" + t.side;
@@ -99,8 +104,6 @@ public final class DecisionEngineMerged {
 
     /* ================= SIGNAL LOGIC ================= */
     private TradeIdea generateTradeIdea(String symbol,
-                                        List<TradingCore.Candle> c1,
-                                        List<TradingCore.Candle> c5,
                                         List<TradingCore.Candle> c15,
                                         List<TradingCore.Candle> c1h,
                                         MarketState state,
@@ -111,11 +114,10 @@ public final class DecisionEngineMerged {
                                         long now) {
 
         double price = last(c15).close;
-        double atr = atr(c15, 14);
+        double atr = Math.max(atr(c15, 14), price * 0.002); // fallback, чтобы stop/tp != 0
         double adx = adx(c15, 14);
         double rsi = rsi(c15, 14);
         double vol = relativeVolume(c15);
-        double microVol = relativeVolume(c1);
 
         TradingCore.Side side = null;
         String reason = null;
@@ -137,8 +139,8 @@ public final class DecisionEngineMerged {
         }
 
         if (side == null) {
-            if (bullishDivergence(c15)) { side = TradingCore.Side.LONG; reason = "Bullish Divergence"; }
-            else if (bearishDivergence(c15)) { side = TradingCore.Side.SHORT; reason = "Bearish Divergence"; }
+            if (bullishDivergence(c15) && bias != HTFBias.BEAR) { side = TradingCore.Side.LONG; reason = "Bullish Divergence"; }
+            else if (bearishDivergence(c15) && bias != HTFBias.BULL) { side = TradingCore.Side.SHORT; reason = "Bearish Divergence"; }
         }
 
         if (side == null) {
@@ -156,22 +158,22 @@ public final class DecisionEngineMerged {
         if (side == null) return null;
 
         // ================= COOLDOWN =================
-        String key = symbol + "_" + side;
-        if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS) return null;
+        String cooldownKey = symbol + "_" + side;
+        if (cooldown.containsKey(cooldownKey) && now - cooldown.get(cooldownKey) < COOLDOWN_MS) return null;
 
-        double confidence = computeConfidence(c15, state, adx, vol, microVol, microImpulse, volumeSpike, cat);
-        if (!passesLocalCheck(c15, side)) confidence *= 0.9;
-
+        // ================= CONFIDENCE =================
+        double confidence = computeConfidence(c15, state, adx, vol, microImpulse, volumeSpike, cat);
         SignalGrade grade = confidence > 0.75 ? SignalGrade.A :
                 confidence > 0.62 ? SignalGrade.B : SignalGrade.C;
         if (grade == SignalGrade.C && confidence < 0.52) return null;
 
-        double risk = atr * (cat == CoinCategory.MEME ? 1.2 : 1.0);
+        // ================= RISK/REWARD =================
+        double riskMultiplier = cat == CoinCategory.MEME ? 1.2 : 1.0;
         double rr = confidence > 0.72 ? 2.8 : 2.2;
-        double stop = side == TradingCore.Side.LONG ? price - risk : price + risk;
-        double take = side == TradingCore.Side.LONG ? price + risk * rr : price - risk * rr;
+        double stop = side == TradingCore.Side.LONG ? price - atr * riskMultiplier : price + atr * riskMultiplier;
+        double take = side == TradingCore.Side.LONG ? price + atr * riskMultiplier * rr : price - atr * riskMultiplier * rr;
 
-        cooldown.put(key, now);
+        cooldown.put(cooldownKey, now);
         return new TradeIdea(symbol, side, price, stop, take, confidence, grade, reason);
     }
 
@@ -187,42 +189,42 @@ public final class DecisionEngineMerged {
     }
 
     private HTFBias detectHTFBias(List<TradingCore.Candle> c){
-        if (c.size()<200) return HTFBias.NONE;
+        if (c.size() < 200) return HTFBias.NONE;
         if (ema(c,50) > ema(c,200)) return HTFBias.BULL;
         if (ema(c,50) < ema(c,200)) return HTFBias.BEAR;
         return HTFBias.NONE;
     }
 
-    /* ================= MICRO TREND / VOLUME ================= */
+    /* ================= MICRO / VOLUME ================= */
     private boolean detectMicroImpulse(List<TradingCore.Candle> c){
-        if (c.size()<5) return false;
+        if (c.size() < 5) return false;
         double delta = last(c).close - c.get(c.size()-5).close;
         double vol = relativeVolume(c);
-        return Math.abs(delta)>0.0003 && vol>1.02;
+        return Math.abs(delta) > 0.0003 && vol > 1.02;
     }
 
     private boolean detectVolumeSpike(List<TradingCore.Candle> c, CoinCategory cat){
-        if (c.size()<10) return false;
-        double avgVol = c.subList(Math.max(0,c.size()-10),c.size()-1).stream().mapToDouble(cd->cd.volume).average().orElse(1);
+        if (c.size() < 10) return false;
+        double avgVol = c.subList(Math.max(0, c.size()-10), c.size()-1).stream().mapToDouble(cd -> cd.volume).average().orElse(1);
         double lastVol = last(c).volume;
         double threshold = switch(cat){
             case MEME -> 1.3;
             case ALT -> 1.2;
             default -> 1.1;
         };
-        return lastVol/avgVol > threshold;
+        return lastVol / avgVol > threshold;
     }
 
     private boolean pricePullback(List<TradingCore.Candle> c, boolean bullish){
-        double ema21 = ema(c,21);
+        double ema21 = ema(c, 21);
         double price = last(c).close;
-        return bullish ? price <= ema21*1.012 : price >= ema21*0.988;
+        return bullish ? price <= ema21 * 1.012 : price >= ema21 * 0.988;
     }
 
     /* ================= CONFIDENCE ================= */
-    private double computeConfidence(List<TradingCore.Candle> c, MarketState state, double adx, double vol, double microVol,
+    private double computeConfidence(List<TradingCore.Candle> c, MarketState state, double adx, double vol,
                                      boolean microImpulse, boolean volSpike, CoinCategory cat){
-        double structure = Math.abs(ema(c,21)-ema(c,50))/ema(c,50)*10;
+        double structure = Math.abs(ema(c,21) - ema(c,50)) / ema(c,50) * 10;
         double base = switch(state){
             case STRONG_TREND -> 0.72;
             case WEAK_TREND -> 0.66;
@@ -232,22 +234,14 @@ public final class DecisionEngineMerged {
         };
         double momentumBoost = (adx/50.0)*0.1;
         double volBoost = Math.min((vol-1)*0.05,0.08);
-        double microBoost = microImpulse ? Math.min((microVol-1)*0.08,0.1) : 0;
+        double microBoost = microImpulse ? Math.min((vol-1)*0.08,0.1) : 0;
         double spikeBoost = volSpike ? 0.05 : 0;
         double catBoost = switch(cat){
             case MEME -> 0.05;
             case ALT -> 0.03;
             default -> 0;
         };
-        return clamp(base + structure*0.05 + momentumBoost + volBoost + microBoost + spikeBoost + catBoost,0.50,0.95);
-    }
-
-    /* ================= LOCAL CHECK ================= */
-    private boolean passesLocalCheck(List<TradingCore.Candle> c, TradingCore.Side side){
-        int n=c.size();
-        TradingCore.Candle last=last(c);
-        TradingCore.Candle prev=c.get(n-2);
-        return side==TradingCore.Side.LONG ? last.close>=prev.low : last.close<=prev.high;
+        return clamp(base + structure*0.05 + momentumBoost + volBoost + microBoost + spikeBoost + catBoost, 0.50, 0.95);
     }
 
     /* ================= INDICATORS ================= */
@@ -264,7 +258,7 @@ public final class DecisionEngineMerged {
 
     private double adx(List<TradingCore.Candle> c,int n){
         double move=0;
-        for(int i=c.size()-n;i<c.size()-1;i++) move+=Math.abs(c.get(i+1).close-c.get(i).close);
+        for(int i=c.size()-n;i<c.size()-1;i++) move+=Math.abs(c.get(i+1).close - c.get(i).close);
         return move/n/atr(c,n)*25;
     }
 
@@ -290,7 +284,7 @@ public final class DecisionEngineMerged {
     private double lowest(List<TradingCore.Candle> c,int n){ return c.subList(Math.max(0,c.size()-n),c.size()).stream().mapToDouble(cd->cd.low).min().orElse(0); }
     private double relativeVolume(List<TradingCore.Candle> c){ int n=c.size(); double avg=c.subList(Math.max(0,n-20),n-1).stream().mapToDouble(cd->cd.volume).average().orElse(1); return last(c).volume/avg; }
     private TradingCore.Candle last(List<TradingCore.Candle> c){ return c.get(c.size()-1); }
-    private boolean isValid(List<?> c){ return c!=null && c.size()>=MIN_BARS; }
+    private boolean isValid(List<?> c){ return c != null && c.size()>=MIN_BARS; }
     private double clamp(double v,double min,double max){ return Math.max(min,Math.min(max,v)); }
 
     /* ================= DIVERGENCE ================= */
