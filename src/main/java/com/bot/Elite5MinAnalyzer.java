@@ -17,7 +17,6 @@ public final class Elite5MinAnalyzer {
     private static final int MIN_H1 = 150;
     private static final double MIN_CONFIDENCE = 0.52;
     private static final long BASE_COOLDOWN = 7 * 60_000; // 7 минут
-    private static final int MAX_SYMBOLS = 100;
     private static final int MAX_TOP_COINS = 70;
 
     /* ===== WEIGHTS ===== */
@@ -27,9 +26,10 @@ public final class Elite5MinAnalyzer {
     private static final double W_PULLBACK = 1.5;
     private static final double W_RANGE = 1.2;
     private static final double W_VOLUME = 1.5;
+    private static final double W_DIVERGENCE = 1.4;
 
     /* ================= STATE ================= */
-    private final Map<String, Long> cooldown = new ConcurrentHashMap<>();
+    private final Map<String, Deque<Long>> cooldownHistory = new ConcurrentHashMap<>();
     private final Map<String, Double> adaptiveTrendWeights = new ConcurrentHashMap<>();
 
     /* ================= OUTPUT ================= */
@@ -82,7 +82,7 @@ public final class Elite5MinAnalyzer {
             if (signal != null) candidates.add(signal);
         }
 
-        // ===== Сортировка и Top-N rotation =====
+        // ===== Top-N по категориям =====
         Map<CoinType, List<TradeSignal>> byType = candidates.stream()
                 .collect(Collectors.groupingBy(s -> s.type));
 
@@ -110,24 +110,23 @@ public final class Elite5MinAnalyzer {
 
         HTFBias bias = detectHTFBias(c1h);
         MarketState state = detectMarketState(c15);
-
         double microTrend = computeMicroTrend(c1);
 
-        double scoreLong = 0;
-        double scoreShort = 0;
+        double scoreLong = 0, scoreShort = 0;
 
         // ===== HTF TREND =====
         double trendWeight = adaptiveTrendWeights.getOrDefault(symbol, W_HTF);
         if (bias == HTFBias.BULL) scoreLong += trendWeight;
         if (bias == HTFBias.BEAR) scoreShort += trendWeight;
 
-        // ===== MICRO IMPULSE (1m) =====
-        if (detectMicroImpulse(c1)) {
+        // ===== MICRO IMPULSE =====
+        boolean impulse = detectMicroImpulse(c1);
+        if (impulse) {
             if (last(c1).close > c1.get(c1.size() - 5).close) scoreLong += W_MICRO_IMPULSE * microTrend;
             else scoreShort += W_MICRO_IMPULSE * microTrend;
         }
 
-        // ===== MICRO BREAKOUT (5m) =====
+        // ===== MICRO BREAKOUT =====
         if (detectMicroBreakout(c5, true)) scoreLong += W_MICRO_BREAK;
         if (detectMicroBreakout(c5, false)) scoreShort += W_MICRO_BREAK;
 
@@ -137,8 +136,7 @@ public final class Elite5MinAnalyzer {
 
         // ===== RANGE REACTION =====
         if (state == MarketState.RANGE) {
-            double high = highest(c15, 15);
-            double low = lowest(c15, 15);
+            double high = highest(c15, 15), low = lowest(c15, 15);
             if (price <= low * 1.004) scoreLong += W_RANGE;
             if (price >= high * 0.996) scoreShort += W_RANGE;
         }
@@ -150,15 +148,21 @@ public final class Elite5MinAnalyzer {
             scoreShort += W_VOLUME * 0.5;
         }
 
+        // ===== DIVERGENCE =====
+        if (bullishDivergence(c15)) scoreLong += W_DIVERGENCE;
+        if (bearishDivergence(c15)) scoreShort += W_DIVERGENCE;
+
         if (scoreLong < 2.5 && scoreShort < 2.5) return null;
 
         TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
-        // ===== Adaptive cooldown =====
+        // ===== COOL DOWN HISTORY =====
         String key = symbol + "_" + side;
-        Long lastTime = cooldown.get(key);
-        if (lastTime != null && now - lastTime < BASE_COOLDOWN) return null;
-        cooldown.put(key, now);
+        Deque<Long> history = cooldownHistory.computeIfAbsent(key, k -> new ArrayDeque<>());
+        long cutoff = now - BASE_COOLDOWN;
+        history.removeIf(t -> t < cutoff);
+        if (!history.isEmpty()) return null;
+        history.addLast(now);
 
         double raw = Math.max(scoreLong, scoreShort);
         double confidence = computeConfidence(raw, state, type, atr, price, microTrend);
@@ -173,14 +177,14 @@ public final class Elite5MinAnalyzer {
         double stop = side == TradingCore.Side.LONG ? price - atr * riskMult : price + atr * riskMult;
         double take = side == TradingCore.Side.LONG ? price + atr * riskMult * rr : price - atr * riskMult * rr;
 
-        // ===== Adaptive trend weight update =====
+        // ===== ADAPTIVE TREND UPDATE =====
         updateAdaptiveWeight(symbol, side, confidence);
 
         return new TradeSignal(symbol, side, price, stop, take, confidence, grade,
-                "MicroScore=" + raw + " State=" + state + " Vol=" + String.format("%.2f", relVol), type);
+                "Score=" + String.format("%.2f", raw) + " State=" + state + " Vol=" + String.format("%.2f", relVol), type);
     }
 
-    /* ================= HELPER METHODS ================= */
+    /* ================= HELPERS ================= */
     private void updateAdaptiveWeight(String symbol, TradingCore.Side side, double confidence) {
         double current = adaptiveTrendWeights.getOrDefault(symbol, W_HTF);
         if (confidence > 0.75) current += 0.05;
@@ -273,6 +277,28 @@ public final class Elite5MinAnalyzer {
         for (int i = Math.max(0, c.size() - p) + 1; i < c.size(); i++)
             e = c.get(i).close * k + e * (1 - k);
         return e;
+    }
+
+    private boolean bullishDivergence(List<TradingCore.Candle> c) {
+        if (c.size() < 20) return false;
+        return c.get(c.size() - 1).low < c.get(c.size() - 4).low &&
+                rsi(c, 14) > rsi(c.subList(0, c.size() - 2), 14);
+    }
+
+    private boolean bearishDivergence(List<TradingCore.Candle> c) {
+        if (c.size() < 20) return false;
+        return c.get(c.size() - 1).high > c.get(c.size() - 4).high &&
+                rsi(c, 14) < rsi(c.subList(0, c.size() - 2), 14);
+    }
+
+    private double rsi(List<TradingCore.Candle> c, int n) {
+        double g = 0, l = 0;
+        for (int i = Math.max(0, c.size() - n); i < c.size() - 1; i++) {
+            double d = c.get(i + 1).close - c.get(i).close;
+            if (d > 0) g += d; else l += Math.abs(d);
+        }
+        if (l == 0) return 100;
+        return 100 - (100 / (1 + g / l));
     }
 
     private double highest(List<TradingCore.Candle> c, int n) {

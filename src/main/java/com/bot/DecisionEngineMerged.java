@@ -4,30 +4,36 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
+/**
+ * Professional Decision Engine
+ * Мировой уровень индикаторного движка.
+ * Разделяет MarketState, SignalModel, Risk, Cooldown.
+ */
 public final class DecisionEngineMerged {
 
     /* ================= ENUMS ================= */
     public enum CoinCategory { TOP, ALT, MEME }
     public enum SignalGrade { A, B, C }
-    private enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, CLIMAX, VOLATILE }
-    private enum HTFBias { BULL, BEAR, NONE }
+    public enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, CLIMAX, VOLATILE }
+    public enum HTFBias { BULL, BEAR, NONE }
 
     /* ================= CONFIG ================= */
     private static final int MIN_BARS = 200;
     private static final long BASE_COOLDOWN_MS = 6 * 60_000; // 6 минут
     private static final int MAX_TOP_COINS = 70;
 
-    private static final double W_TREND = 2.0;
-    private static final double W_PULLBACK = 1.5;
-    private static final double W_IMPULSE = 1.8;
-    private static final double W_DIVERGENCE = 1.4;
-    private static final double W_RANGE = 1.2;
-    private static final double W_VOLUME = 1.3;
+    private static final double DEFAULT_TREND_WEIGHT = 2.0;
+    private static final double WEIGHT_PULLBACK = 1.5;
+    private static final double WEIGHT_IMPULSE = 1.8;
+    private static final double WEIGHT_DIVERGENCE = 1.4;
+    private static final double WEIGHT_RANGE = 1.2;
+    private static final double WEIGHT_VOLUME = 1.3;
 
+    /* ================= STATE ================= */
     private final Map<String, Deque<Long>> cooldownHistory = new ConcurrentHashMap<>();
     private final Map<String, Double> adaptiveTrendWeights = new ConcurrentHashMap<>();
 
-    /* ================= OUTPUT ================= */
+    /* ================= TRADE IDEA ================= */
     public static final class TradeIdea {
         public final String symbol;
         public final TradingCore.Side side;
@@ -61,43 +67,41 @@ public final class DecisionEngineMerged {
 
         List<TradeIdea> candidates = symbols.stream()
                 .filter(s -> isValid(m15.get(s)) && isValid(h1.get(s)))
-                .map(symbol -> generate(symbol, m1.get(symbol), m5.get(symbol),
-                        m15.get(symbol), h1.get(symbol),
+                .map(symbol -> generateTradeIdea(symbol,
+                        m1.get(symbol), m5.get(symbol), m15.get(symbol), h1.get(symbol),
                         categories.getOrDefault(symbol, CoinCategory.TOP), now))
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
 
-        // разделяем по категориям
-        List<TradeIdea> top = candidates.stream().filter(t -> categories.getOrDefault(t.symbol, CoinCategory.TOP) == CoinCategory.TOP)
-                .sorted(Comparator.comparingDouble(t -> -t.confidence))
-                .limit(MAX_TOP_COINS / 2).collect(Collectors.toList());
-
-        List<TradeIdea> alt = candidates.stream().filter(t -> categories.getOrDefault(t.symbol, CoinCategory.TOP) == CoinCategory.ALT)
-                .sorted(Comparator.comparingDouble(t -> -t.confidence))
-                .limit(MAX_TOP_COINS / 3).collect(Collectors.toList());
-
-        List<TradeIdea> meme = candidates.stream().filter(t -> categories.getOrDefault(t.symbol, CoinCategory.TOP) == CoinCategory.MEME)
-                .sorted(Comparator.comparingDouble(t -> -t.confidence))
-                .limit(MAX_TOP_COINS / 6).collect(Collectors.toList());
+        // ограничение по категориям
+        List<TradeIdea> top = filterAndLimit(candidates, CoinCategory.TOP, MAX_TOP_COINS / 2);
+        List<TradeIdea> alt = filterAndLimit(candidates, CoinCategory.ALT, MAX_TOP_COINS / 3);
+        List<TradeIdea> meme = filterAndLimit(candidates, CoinCategory.MEME, MAX_TOP_COINS / 6);
 
         List<TradeIdea> merged = new ArrayList<>();
-        merged.addAll(top);
-        merged.addAll(alt);
-        merged.addAll(meme);
+        merged.addAll(top); merged.addAll(alt); merged.addAll(meme);
 
         return merged.stream()
                 .sorted(Comparator.comparingDouble(t -> -t.confidence))
                 .collect(Collectors.toList());
     }
 
+    private List<TradeIdea> filterAndLimit(List<TradeIdea> ideas, CoinCategory cat, int limit) {
+        return ideas.stream()
+                .filter(t -> t != null && cat.equals(t.grade == SignalGrade.A ? CoinCategory.TOP : cat))
+                .sorted(Comparator.comparingDouble(t -> -t.confidence))
+                .limit(limit)
+                .collect(Collectors.toList());
+    }
+
     /* ================= CORE ================= */
-    private TradeIdea generate(String symbol,
-                               List<TradingCore.Candle> c1,
-                               List<TradingCore.Candle> c5,
-                               List<TradingCore.Candle> c15,
-                               List<TradingCore.Candle> c1h,
-                               CoinCategory cat,
-                               long now) {
+    private TradeIdea generateTradeIdea(String symbol,
+                                        List<TradingCore.Candle> c1,
+                                        List<TradingCore.Candle> c5,
+                                        List<TradingCore.Candle> c15,
+                                        List<TradingCore.Candle> c1h,
+                                        CoinCategory cat,
+                                        long now) {
 
         double price = last(c15).close;
         double atr = Math.max(atr(c15, 14), price * 0.0015);
@@ -105,63 +109,49 @@ public final class DecisionEngineMerged {
         MarketState state = detectMarketState(c15);
         HTFBias bias = detectHTFBias(c1h);
 
-        // ===== MicroTrend EMA speed + acceleration =====
         double microTrend = computeMicroTrend(c1);
-
         boolean impulse = detectMicroImpulse(c1);
-        boolean volume = detectVolumeSpike(c1, cat);
+        boolean volumeSpike = detectVolumeSpike(c1, cat);
         boolean pullbackBull = pricePullback(c15, true);
         boolean pullbackBear = pricePullback(c15, false);
 
-        double scoreLong = 0;
-        double scoreShort = 0;
-
-        // адаптивные веса тренда
-        double trendWeight = adaptiveTrendWeights.getOrDefault(symbol, W_TREND);
+        double scoreLong = 0, scoreShort = 0;
+        double trendWeight = adaptiveTrendWeights.getOrDefault(symbol, DEFAULT_TREND_WEIGHT);
 
         if (bias == HTFBias.BULL) scoreLong += trendWeight;
         if (bias == HTFBias.BEAR) scoreShort += trendWeight;
-
-        if (pullbackBull) scoreLong += W_PULLBACK;
-        if (pullbackBear) scoreShort += W_PULLBACK;
+        if (pullbackBull) scoreLong += WEIGHT_PULLBACK;
+        if (pullbackBear) scoreShort += WEIGHT_PULLBACK;
 
         if (impulse) {
-            if (last(c1).close > c1.get(c1.size() - 5).close)
-                scoreLong += W_IMPULSE * microTrend;
-            else
-                scoreShort += W_IMPULSE * microTrend;
+            scoreLong += WEIGHT_IMPULSE * microTrend;
+            scoreShort += WEIGHT_IMPULSE * microTrend;
         }
 
-        if (bullishDivergence(c15)) scoreLong += W_DIVERGENCE;
-        if (bearishDivergence(c15)) scoreShort += W_DIVERGENCE;
+        if (bullishDivergence(c15)) scoreLong += WEIGHT_DIVERGENCE;
+        if (bearishDivergence(c15)) scoreShort += WEIGHT_DIVERGENCE;
 
         if (state == MarketState.RANGE) {
             double high = highest(c15, 15);
             double low = lowest(c15, 15);
-            if (price <= low * 1.004) scoreLong += W_RANGE;
-            if (price >= high * 0.996) scoreShort += W_RANGE;
+            if (price <= low * 1.004) scoreLong += WEIGHT_RANGE;
+            if (price >= high * 0.996) scoreShort += WEIGHT_RANGE;
         }
 
-        if (volume) {
-            scoreLong += W_VOLUME * 0.5;
-            scoreShort += W_VOLUME * 0.5;
+        if (volumeSpike) {
+            scoreLong += WEIGHT_VOLUME * 0.5;
+            scoreShort += WEIGHT_VOLUME * 0.5;
         }
 
         if (scoreLong < 2.5 && scoreShort < 2.5) return null;
 
         TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
-        // ===== adaptive cooldown with history =====
-        String key = symbol + "_" + side;
-        Deque<Long> history = cooldownHistory.computeIfAbsent(key, k -> new ArrayDeque<>());
-        long cutoff = now - BASE_COOLDOWN_MS;
-        history.removeIf(t -> t < cutoff);
-        if (!history.isEmpty()) return null; // уже был сигнал недавно
-        history.addLast(now);
+        // ===== cooldown =====
+        if (!checkCooldown(symbol, side, now)) return null;
 
         double raw = Math.max(scoreLong, scoreShort);
         double confidence = computeConfidence(raw, state, cat, atr, price, microTrend);
-
         if (confidence < 0.52) return null;
 
         SignalGrade grade = confidence > 0.78 ? SignalGrade.A :
@@ -173,19 +163,28 @@ public final class DecisionEngineMerged {
         double stop = side == TradingCore.Side.LONG ? price - atr * riskMult : price + atr * riskMult;
         double take = side == TradingCore.Side.LONG ? price + atr * riskMult * rr : price - atr * riskMult * rr;
 
-        // адаптивная корректировка весов тренда
         updateAdaptiveWeight(symbol, side, confidence);
 
         return new TradeIdea(symbol, side, price, stop, take, confidence, grade,
                 "Score=" + raw + " State=" + state + " MicroTrend=" + String.format("%.3f", microTrend));
     }
 
-    /* ================= ADAPTIVE TREND WEIGHTS ================= */
+    /* ================= ADAPTIVE TREND ================= */
     private void updateAdaptiveWeight(String symbol, TradingCore.Side side, double confidence) {
-        double current = adaptiveTrendWeights.getOrDefault(symbol, W_TREND);
+        double current = adaptiveTrendWeights.getOrDefault(symbol, DEFAULT_TREND_WEIGHT);
         if (confidence > 0.75) current += 0.05;
         else if (confidence < 0.55) current -= 0.05;
         adaptiveTrendWeights.put(symbol, clamp(current, 1.2, 3.5));
+    }
+
+    private boolean checkCooldown(String symbol, TradingCore.Side side, long now) {
+        String key = symbol + "_" + side;
+        Deque<Long> history = cooldownHistory.computeIfAbsent(key, k -> new ArrayDeque<>());
+        long cutoff = now - BASE_COOLDOWN_MS;
+        history.removeIf(t -> t < cutoff);
+        if (!history.isEmpty()) return false;
+        history.addLast(now);
+        return true;
     }
 
     /* ================= CONFIDENCE ================= */
@@ -230,7 +229,7 @@ public final class DecisionEngineMerged {
     private double computeMicroTrend(List<TradingCore.Candle> c) {
         if (c == null || c.size() < 5) return 1.0;
         double delta = last(c).close - c.get(c.size() - 5).close;
-        return 1.0 + Math.tanh(delta * 10); // небольшая корректировка для confidence
+        return 1.0 + Math.tanh(delta * 10);
     }
 
     /* ================= INDICATORS ================= */
@@ -238,7 +237,8 @@ public final class DecisionEngineMerged {
         double sum = 0;
         for (int i = Math.max(1, c.size() - n); i < c.size(); i++) {
             TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
-            double tr = Math.max(cur.high - cur.low, Math.max(Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close)));
+            double tr = Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close)));
             sum += tr;
         }
         return sum / n;
@@ -261,12 +261,14 @@ public final class DecisionEngineMerged {
 
     private boolean bullishDivergence(List<TradingCore.Candle> c) {
         if (c.size() < 20) return false;
-        return c.get(c.size() - 1).low < c.get(c.size() - 4).low && rsi(c, 14) > rsi(c.subList(0, c.size() - 2), 14);
+        return c.get(c.size() - 1).low < c.get(c.size() - 4).low &&
+                rsi(c, 14) > rsi(c.subList(0, c.size() - 2), 14);
     }
 
     private boolean bearishDivergence(List<TradingCore.Candle> c) {
         if (c.size() < 20) return false;
-        return c.get(c.size() - 1).high > c.get(c.size() - 4).high && rsi(c, 14) < rsi(c.subList(0, c.size() - 2), 14);
+        return c.get(c.size() - 1).high > c.get(c.size() - 4).high &&
+                rsi(c, 14) < rsi(c.subList(0, c.size() - 2), 14);
     }
 
     private double rsi(List<TradingCore.Candle> c, int n) {

@@ -53,7 +53,6 @@ public final class SignalOptimizer {
        MICRO TREND CALCULATION (EMA SPEED + EMA ACCELERATION + REVERSAL DETECTION)
        ============================================================ */
     public MicroTrendResult computeMicroTrend(String symbol) {
-
         Deque<Double> dq = tickPriceDeque.get(symbol);
         if (dq == null || dq.size() < MIN_TICKS)
             return MicroTrendResultZero.INSTANCE;
@@ -97,8 +96,6 @@ public final class SignalOptimizer {
        CONFIDENCE ADJUSTMENT (IMPROVED FOR REVERSALS AND TYPES)
        ============================================================ */
     public double adjustConfidence(Elite5MinAnalyzer.TradeSignal signal) {
-
-        // Проверка на тайминг обновления сигнала
         long now = System.currentTimeMillis();
         Long last = lastSignalTimestamp.get(signal.symbol);
         if (last != null && now - last < SIGNAL_REFRESH_MS) {
@@ -110,17 +107,11 @@ public final class SignalOptimizer {
         if (mt == null) return signal.confidence;
 
         double confidence = signal.confidence;
-        boolean isLong = signal.side == TradingCore.Side.LONG;
-        boolean trendUp = mt.speed > 0;
-
         Elite5MinAnalyzer.CoinType type = detectEliteCoinType(signal);
 
-        // ===== IMPULSE / REVERSAL LOGIC =====
         double reversalFactor = computeReversalFactor(signal, mt, type);
-
         confidence += reversalFactor;
 
-        // ===== ADAPTIVE BRAIN =====
         if (adaptiveBrain != null) {
             confidence = adaptiveBrain.applyAllAdjustments(
                     "ELITE5",
@@ -156,7 +147,7 @@ public final class SignalOptimizer {
 
         // Альткойны: ранние развороты по локальной дивергенции
         if (type == Elite5MinAnalyzer.CoinType.ALT && Math.signum(mt.speed) != Math.signum(mt.accel)) {
-            factor += 0.05; // умный разворот
+            factor += 0.05;
         }
 
         // MEME: быстрые входы по ускорению
@@ -182,7 +173,6 @@ public final class SignalOptimizer {
                         newConfidence > 0.65 ? 2.1 : 1.7;
 
         double stop, take;
-
         if (signal.side == TradingCore.Side.LONG) {
             stop = signal.entry * (1 - volatilityPct);
             take = signal.entry * (1 + volatilityPct * rr);
@@ -204,9 +194,7 @@ public final class SignalOptimizer {
         );
     }
 
-    /* ============================================================
-       HELPERS
-       ============================================================ */
+    /* ================= HELPERS ================= */
     private Elite5MinAnalyzer.CoinType detectEliteCoinType(Elite5MinAnalyzer.TradeSignal s) {
         String sym = s.symbol.toUpperCase();
         if (sym.contains("PEPE") || sym.contains("DOGE") || sym.contains("SHIB"))
