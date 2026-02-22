@@ -2,7 +2,6 @@ package com.bot;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
 
 public final class Elite5MinAnalyzer {
 
@@ -96,7 +95,7 @@ public final class Elite5MinAnalyzer {
                                  long now) {
 
         double price = last(c15).close;
-        double atr = Math.max(atr(c15,14), price*0.002);
+        double atr = Math.max(atr(c15, 14), price * 0.002);
 
         HTFBias bias = detectHTFBias(c1h);
         MarketState state = detectMarketState(c15);
@@ -104,16 +103,14 @@ public final class Elite5MinAnalyzer {
         double scoreLong = 0;
         double scoreShort = 0;
 
-        // ===== HTF TREND ALIGNMENT =====
+        // ===== HTF TREND =====
         if (bias == HTFBias.BULL) scoreLong += W_HTF;
         if (bias == HTFBias.BEAR) scoreShort += W_HTF;
 
         // ===== MICRO IMPULSE (1m) =====
         if (detectMicroImpulse(c1)) {
-            if (last(c1).close > c1.get(c1.size()-5).close)
-                scoreLong += W_MICRO_IMPULSE;
-            else
-                scoreShort += W_MICRO_IMPULSE;
+            if (last(c1).close > c1.get(c1.size()-5).close) scoreLong += W_MICRO_IMPULSE;
+            else scoreShort += W_MICRO_IMPULSE;
         }
 
         // ===== MICRO BREAKOUT (5m) =====
@@ -133,9 +130,10 @@ public final class Elite5MinAnalyzer {
         }
 
         // ===== VOLUME CONFIRM =====
-        if (relativeVolume(c1) > 1.1) {
-            scoreLong += W_VOLUME*0.5;
-            scoreShort += W_VOLUME*0.5;
+        double relVol = relativeVolume(c1);
+        if (relVol > 1.1) {
+            scoreLong += W_VOLUME * 0.5;
+            scoreShort += W_VOLUME * 0.5;
         }
 
         if (scoreLong < 2.5 && scoreShort < 2.5) return null;
@@ -147,22 +145,23 @@ public final class Elite5MinAnalyzer {
             return null;
 
         double raw = Math.max(scoreLong, scoreShort);
-        double confidence = computeConfidence(raw,state,type,atr,price);
+        double confidence = computeConfidence(raw, state, type, atr, price);
 
         if (confidence < MIN_CONFIDENCE) return null;
 
-        SignalGrade grade = confidence>0.80?SignalGrade.A:
-                confidence>0.65?SignalGrade.B:SignalGrade.C;
+        SignalGrade grade = confidence>0.80? SignalGrade.A :
+                confidence>0.65? SignalGrade.B : SignalGrade.C;
 
-        double riskMult = type==CoinType.MEME?1.3:type==CoinType.ALT?1.0:0.85;
-        double rr = confidence>0.75?2.8:2.2;
+        double riskMult = type==CoinType.MEME?1.3 : type==CoinType.ALT?1.0 : 0.85;
+        double rr = confidence>0.75?2.8 : 2.2;
 
-        double stop = side==TradingCore.Side.LONG?price-atr*riskMult:price+atr*riskMult;
-        double take = side==TradingCore.Side.LONG?price+atr*riskMult*rr:price-atr*riskMult*rr;
+        double stop = side==TradingCore.Side.LONG ? price - atr*riskMult : price + atr*riskMult;
+        double take = side==TradingCore.Side.LONG ? price + atr*riskMult*rr : price - atr*riskMult*rr;
 
-        cooldown.put(key,now);
+        cooldown.put(key, now);
 
-        return new TradeSignal(symbol, side, price, stop, take, confidence, grade, "MicroScore="+raw+" State="+state, type);
+        return new TradeSignal(symbol, side, price, stop, take, confidence, grade,
+                "MicroScore="+raw+" State="+state+" Vol="+String.format("%.2f", relVol), type);
     }
 
     /* ================= CONFIDENCE ================= */
@@ -178,25 +177,24 @@ public final class Elite5MinAnalyzer {
         };
 
         double volatility = Math.min(atr/price*40,0.1);
+        double typeBoost = type==CoinType.MEME?0.06 : type==CoinType.ALT?0.04 : 0.02;
 
-        double typeBoost = type==CoinType.MEME?0.06:type==CoinType.ALT?0.04:0.02;
-
-        return clamp(0.50+base+stateBoost+volatility+typeBoost,0.50,0.95);
+        return clamp(0.50 + base + stateBoost + volatility + typeBoost, 0.50, 0.95);
     }
 
     /* ================= MICRO EXTRA ================= */
     private boolean detectMicroBreakout(List<TradingCore.Candle> c, boolean bullish){
-        if(c==null||c.size()<6) return false;
-        double high=highest(c,5);
-        double low=lowest(c,5);
-        double price=last(c).close;
-        return bullish?price>high*1.001:price<low*0.999;
+        if (c==null || c.size()<6) return false;
+        double high = highest(c,5);
+        double low = lowest(c,5);
+        double price = last(c).close;
+        return bullish ? price>high*1.001 : price<low*0.999;
     }
 
     private boolean detectMicroImpulse(List<TradingCore.Candle> c){
-        if(c==null||c.size()<5) return false;
+        if (c==null || c.size()<5) return false;
         double delta = last(c).close - c.get(c.size()-5).close;
-        return Math.abs(delta)>0.0002 && relativeVolume(c)>1.05;
+        return Math.abs(delta) > 0.0002 && relativeVolume(c) > 1.05;
     }
 
     private boolean pricePullback(List<TradingCore.Candle> c, boolean bull){
@@ -209,47 +207,47 @@ public final class Elite5MinAnalyzer {
     private MarketState detectMarketState(List<TradingCore.Candle> c){
         double adx = adx(c,14);
         double vol = relativeVolume(c);
-        if(adx>25) return MarketState.STRONG_TREND;
-        if(adx>18) return MarketState.WEAK_TREND;
-        if(vol>1.8) return MarketState.CLIMAX;
-        if(vol>1.3) return MarketState.VOLATILE;
+        if (adx>25) return MarketState.STRONG_TREND;
+        if (adx>18) return MarketState.WEAK_TREND;
+        if (vol>1.8) return MarketState.CLIMAX;
+        if (vol>1.3) return MarketState.VOLATILE;
         return MarketState.RANGE;
     }
 
     private HTFBias detectHTFBias(List<TradingCore.Candle> c){
-        if(c.size()<200) return HTFBias.NONE;
-        double ema50=ema(c,50);
-        double ema200=ema(c,200);
-        if(ema50>ema200*1.002) return HTFBias.BULL;
-        if(ema50<ema200*0.998) return HTFBias.BEAR;
+        if (c.size()<200) return HTFBias.NONE;
+        double ema50 = ema(c,50);
+        double ema200 = ema(c,200);
+        if (ema50 > ema200*1.002) return HTFBias.BULL;
+        if (ema50 < ema200*0.998) return HTFBias.BEAR;
         return HTFBias.NONE;
     }
 
     /* ================= INDICATORS ================= */
     private double atr(List<TradingCore.Candle> c,int n){
-        double sum=0;
+        double sum = 0;
         for(int i=Math.max(1,c.size()-n);i<c.size();i++){
-            TradingCore.Candle cur=c.get(i),prev=c.get(i-1);
+            TradingCore.Candle cur=c.get(i), prev=c.get(i-1);
             double tr=Math.max(cur.high-cur.low,
                     Math.max(Math.abs(cur.high-prev.close),
                             Math.abs(cur.low-prev.close)));
-            sum+=tr;
+            sum += tr;
         }
         return sum/n;
     }
 
     private double adx(List<TradingCore.Candle> c,int n){
-        double move=0;
+        double move = 0;
         for(int i=Math.max(0,c.size()-n);i<c.size()-1;i++)
-            move+=Math.abs(c.get(i+1).close-c.get(i).close);
+            move += Math.abs(c.get(i+1).close - c.get(i).close);
         return move/n/atr(c,n)*25;
     }
 
     private double ema(List<TradingCore.Candle> c,int p){
-        double k=2.0/(p+1);
-        double e=c.get(Math.max(0,c.size()-p)).close;
+        double k = 2.0/(p+1);
+        double e = c.get(Math.max(0,c.size()-p)).close;
         for(int i=Math.max(0,c.size()-p)+1;i<c.size();i++)
-            e=c.get(i).close*k+e*(1-k);
+            e = c.get(i).close*k + e*(1-k);
         return e;
     }
 
@@ -267,17 +265,15 @@ public final class Elite5MinAnalyzer {
         return last(c).volume/avg;
     }
 
-    private TradingCore.Candle last(List<TradingCore.Candle> c){
-        return c.get(c.size()-1);
-    }
+    private TradingCore.Candle last(List<TradingCore.Candle> c){ return c.get(c.size()-1); }
 
-    private boolean valid(List<?> c,int min){return c!=null&&c.size()>=min;}
+    private boolean valid(List<?> c,int min){ return c!=null && c.size()>=min; }
 
-    private double clamp(double v,double min,double max){return Math.max(min,Math.min(max,v));}
+    private double clamp(double v,double min,double max){ return Math.max(min,Math.min(max,v)); }
 
     private boolean volatilityOk(List<TradingCore.Candle> c,CoinType type){
         double a=atr(c,14), price=last(c).close;
-        double multiplier = type==CoinType.MEME?0.0008:type==CoinType.ALT?0.0015:0.001;
+        double multiplier = type==CoinType.MEME?0.0008 : type==CoinType.ALT?0.0015 : 0.001;
         return a/price > multiplier;
     }
 }
