@@ -945,6 +945,7 @@ public class SignalSender {
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
 
+        // ===== Инициализация пар =====
         if (BINANCE_PAIRS == null || BINANCE_PAIRS.isEmpty()) {
             BINANCE_PAIRS = getTopSymbolsSet(TOP_N)
                     .stream()
@@ -952,17 +953,20 @@ public class SignalSender {
                     .collect(Collectors.toSet());
 
             System.out.println("[INIT] Loaded pairs: " + BINANCE_PAIRS.size());
+
+            // Подключаем WS к каждой паре
             for (String pair : BINANCE_PAIRS) {
                 connectTickWebSocket(pair);
             }
-
         }
 
+        // ===== Scheduler =====
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "signal-scheduler");
             t.setDaemon(false);
             return t;
         });
+
         scheduler.scheduleWithFixedDelay(() -> {
             try {
                 runSchedulerCycle();
@@ -974,8 +978,36 @@ public class SignalSender {
     }
 
     public Set<String> getTopSymbolsSet(int limit) {
-        List<String> list = getTopSymbols(limit); // используем существующий метод List<String>
-        return new HashSet<>(list); // конвертируем в Set
+        try {
+            // Берём топ монет с CoinGecko
+            String url = "https://api.coingecko.com/api/v3/coins/markets" +
+                    "?vs_currency=usd&order=market_cap_desc&per_page=" + limit + "&page=1";
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(15))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            JSONArray arr = new JSONArray(resp.body());
+
+            Set<String> topPairs = new HashSet<>();
+            for (int i = 0; i < arr.length(); i++) {
+                String sym = arr.getJSONObject(i).getString("symbol").toUpperCase();
+                // исключаем стабильные монеты
+                if (Set.of("USDT", "USDC", "BUSD").contains(sym)) continue;
+                topPairs.add(sym + "USDT"); // формируем Binance-пару
+                if (topPairs.size() >= limit) break; // реально ограничиваем 70
+            }
+
+            System.out.println("[PAIRS] Loaded TOP " + topPairs.size() + " USDT pairs");
+            return topPairs;
+
+        } catch (Exception e) {
+            System.out.println("[PAIRS] ERROR fetching top symbols: " + e.getMessage());
+            return Set.of("BTCUSDT", "ETHUSDT"); // fallback
+        }
     }
 
     // ========================= AGGREGATE candles =========================
@@ -1018,24 +1050,21 @@ public class SignalSender {
         signalsThisCycle = 0;
         long now = System.currentTimeMillis();
 
-        // ===== REFRESH SYMBOLS =====
+        // ===== Обновляем топ-пары (раз в BINANCE_REFRESH_INTERVAL_MS) =====
         if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
             cachedPairs = getTopSymbolsSet(TOP_N);
             lastBinancePairsRefresh = now;
             System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
         }
 
+        // ===== Фильтруем по доступным парам Binance =====
         Set<String> symbols = cachedPairs.stream()
                 .filter(BINANCE_PAIRS::contains)
                 .collect(Collectors.toSet());
 
         for (String pair : symbols) {
             try {
-                CompletableFuture<List<TradingCore.Candle>> f15 =
-                        fetchKlinesAsync(pair, "15m", KLINES_LIMIT);  // берём все свечи
-                CompletableFuture<List<TradingCore.Candle>> f1h =
-                        fetchKlinesAsync(pair, "1h", 50);             // берём небольшую выборку часовых
-
+                // Берем свечи 15m и 1h
                 List<TradingCore.Candle> c15m = histM15.getOrDefault(pair, new ArrayList<>());
                 List<TradingCore.Candle> c1h  = histH1.getOrDefault(pair, new ArrayList<>());
                 if (c15m.size() < 30 || c1h.size() < 30) continue;
@@ -1046,21 +1075,16 @@ public class SignalSender {
                 if (phase == MarketPhase.NO_TRADE) continue;
 
                 double atr15 = atr(c15m, 14);
-                if (atr15 <= 0) continue;
-                double atrPercent = atr15 / last.close;
-                if (atrPercent < 0.002) continue; // ослаблено для теста
-
-                boolean volOk = true; // для теста игнорируем
+                if (atr15 <= 0 || atr15 / last.close < 0.002) continue; // фильтр по волатильности
 
                 List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
                 double rsi14 = SignalSender.rsi(closes15, 14);
 
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
-                //if (dir15 == 0) continue; // временно отключаем фильтр
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
 
-                boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.5; // порог снижен
+                boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.5;
                 boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.5;
 
                 TradingCore.Side side = null;
@@ -1076,17 +1100,17 @@ public class SignalSender {
                 double conf = composeConfidence(
                         rawScore,
                         mtfConfirm,
-                        volOk,
-                        true,
+                        true,  // volOk
+                        true,  // atrOk
                         (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
-                        true,
-                        true,
+                        true,  // vwapAligned
+                        true,  // structureAligned
                         detectBOS(c15m),
                         detectLiquiditySweep(c15m)
                 );
                 if (side == TradingCore.Side.SHORT) conf -= 0.03;
 
-                double pct = Math.max(0.003, Math.min(0.01, atrPercent));
+                double pct = Math.max(0.003, Math.min(0.01, atr15 / last.close));
                 double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
                 double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
 
@@ -1098,9 +1122,7 @@ public class SignalSender {
                         rsi14,
                         rawScore,
                         mtfConfirm,
-                        volOk,
-                        true,
-                        true,
+                        true, true, true,
                         side == TradingCore.Side.LONG,
                         side == TradingCore.Side.SHORT,
                         true,
