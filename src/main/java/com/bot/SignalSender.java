@@ -792,17 +792,20 @@ public class SignalSender {
                         @Override
                         public void onError(java.net.http.WebSocket webSocket, Throwable error) {
                             System.out.println("[WS ERROR] " + pair + " " + error.getMessage());
-                            wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
+                            reconnect(pair);
                         }
 
                         @Override
                         public CompletionStage<?> onClose(java.net.http.WebSocket webSocket, int statusCode, String reason) {
                             System.out.println("[WS CLOSED] " + pair + " code=" + statusCode);
-                            wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
+                            reconnect(pair);
                             return CompletableFuture.completedFuture(null);
                         }
                     })
-                    .thenAccept(ws -> wsMap.put(pair, ws))
+                    .thenAccept(ws -> {
+                        wsMap.put(pair, ws);
+                        System.out.println("[WS] Connected " + pair);
+                    })
                     .exceptionally(ex -> {
                         System.out.println("[WS] Failed connect " + pair + " retry in 5s: " + ex.getMessage());
                         wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
@@ -892,41 +895,6 @@ public class SignalSender {
         wsWatcher.shutdown();
     }
 
-
-    // ========================= Helper: top symbols via CoinGecko =========================
-    private List<String> getTopSymbols(int limit) {
-        try {
-            // CoinGecko API: топ монет по капитализации
-            String url = "https://api.coingecko.com/api/v3/coins/markets" +
-                    "?vs_currency=usd&order=market_cap_desc&per_page=" + limit + "&page=1";
-
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(15))
-                    .GET()
-                    .build();
-
-            HttpResponse<String> resp =
-                    http.send(req, HttpResponse.BodyHandlers.ofString());
-
-            JSONArray arr = new JSONArray(resp.body());
-            List<String> topSymbols = new ArrayList<>();
-
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject coin = arr.getJSONObject(i);
-                String symbol = coin.getString("symbol").toUpperCase(); // например, BTC, ETH
-                topSymbols.add(symbol + "USDT"); // формируем Binance-пары
-            }
-
-            System.out.println("[PAIRS] Loaded TOP " + topSymbols.size() + " market coins");
-
-            return topSymbols;
-
-        } catch (Exception e) {
-            System.out.println("[PAIRS] ERROR " + e.getMessage());
-            return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT"); // fallback
-        }
-    }
     public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
             List<TradingCore.Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
@@ -979,6 +947,9 @@ public class SignalSender {
 
     public Set<String> getTopSymbolsSet(int limit) {
         try {
+            // Получаем реально торгуемые пары на Binance USDT
+            Set<String> binancePairs = getBinanceSymbolsFutures();
+
             // Берём топ монет с CoinGecko
             String url = "https://api.coingecko.com/api/v3/coins/markets" +
                     "?vs_currency=usd&order=market_cap_desc&per_page=" + limit + "&page=1";
@@ -995,13 +966,16 @@ public class SignalSender {
             Set<String> topPairs = new HashSet<>();
             for (int i = 0; i < arr.length(); i++) {
                 String sym = arr.getJSONObject(i).getString("symbol").toUpperCase();
-                // исключаем стабильные монеты
                 if (Set.of("USDT", "USDC", "BUSD").contains(sym)) continue;
-                topPairs.add(sym + "USDT"); // формируем Binance-пару
-                if (topPairs.size() >= limit) break; // реально ограничиваем 70
+                String pair = sym + "USDT";
+                // фильтруем только реально существующие на Binance
+                if (binancePairs.contains(pair)) {
+                    topPairs.add(pair);
+                }
+                if (topPairs.size() >= limit) break;
             }
 
-            System.out.println("[PAIRS] Loaded TOP " + topPairs.size() + " USDT pairs");
+            System.out.println("[PAIRS] Loaded TOP " + topPairs.size() + " USDT pairs (real pairs only)");
             return topPairs;
 
         } catch (Exception e) {
@@ -1009,7 +983,6 @@ public class SignalSender {
             return Set.of("BTCUSDT", "ETHUSDT"); // fallback
         }
     }
-
     // ========================= AGGREGATE candles =========================
     private List<TradingCore.Candle> aggregate(List<TradingCore.Candle> base, int factor) {
         List<TradingCore.Candle> res = new ArrayList<>();
@@ -1050,15 +1023,17 @@ public class SignalSender {
         signalsThisCycle = 0;
         long now = System.currentTimeMillis();
 
-        // ===== Получаем только реальные топ-пары USDT с биржи =====
         if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
-            // Берём топ N, но только реально существующие пары Binance
-            Set<String> availablePairs = BINANCE_PAIRS; // предположим, что это Set всех реально торгуемых USDT пар
+            // Берём реально существующие пары Binance
+            Set<String> availablePairs = getBinanceSymbolsFutures();
+
+            // Берём топ CoinGecko, фильтруем по реальным парам
             cachedPairs = getTopSymbolsSet(TOP_N).stream()
-                    .filter(availablePairs::contains) // убираем вымышленные
+                    .filter(availablePairs::contains)
                     .collect(Collectors.toSet());
+
             lastBinancePairsRefresh = now;
-            System.out.println("[Pairs] Refreshed top symbols (real pairs only): " + cachedPairs.size());
+            System.out.println("[Pairs] Refreshed top symbols (real Binance USDT pairs only): " + cachedPairs.size());
         }
 
         for (String pair : cachedPairs) {
