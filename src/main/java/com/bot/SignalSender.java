@@ -1052,11 +1052,13 @@ public class SignalSender {
 
         // ===== Получаем только реальные топ-пары USDT с биржи =====
         if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
+            // Берём топ N, но только реально существующие пары Binance
+            Set<String> availablePairs = BINANCE_PAIRS; // предположим, что это Set всех реально торгуемых USDT пар
             cachedPairs = getTopSymbolsSet(TOP_N).stream()
-                    .filter(BINANCE_PAIRS::contains) // только существующие на Binance
+                    .filter(availablePairs::contains) // убираем вымышленные
                     .collect(Collectors.toSet());
             lastBinancePairsRefresh = now;
-            System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
+            System.out.println("[Pairs] Refreshed top symbols (real pairs only): " + cachedPairs.size());
         }
 
         for (String pair : cachedPairs) {
