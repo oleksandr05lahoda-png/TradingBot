@@ -2,18 +2,21 @@ package com.bot;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 public final class Elite5MinAnalyzer {
 
+    /* ================= ENUMS ================= */
     public enum SignalGrade { A, B, C }
     public enum CoinType { TOP, ALT, MEME }
     private enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, CLIMAX, VOLATILE }
     private enum HTFBias { BULL, BEAR, NONE }
 
+    /* ================= CONFIG ================= */
     private static final int MIN_M15 = 150;
     private static final int MIN_H1 = 150;
     private static final double MIN_CONFIDENCE = 0.52;
-    private static final long BASE_COOLDOWN = 7 * 60_000;
+    private static final long BASE_COOLDOWN = 7 * 60_000; // 7 минут
     private static final int MAX_SYMBOLS = 100;
 
     /* ===== WEIGHTS ===== */
@@ -27,7 +30,6 @@ public final class Elite5MinAnalyzer {
     private final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
     /* ================= OUTPUT ================= */
-
     public static final class TradeSignal {
         public final String symbol;
         public final TradingCore.Side side;
@@ -52,7 +54,6 @@ public final class Elite5MinAnalyzer {
     }
 
     /* ================= MAIN ================= */
-
     public List<TradeSignal> analyze(List<String> symbols,
                                      Map<String, List<TradingCore.Candle>> m1,
                                      Map<String, List<TradingCore.Candle>> m5,
@@ -60,13 +61,11 @@ public final class Elite5MinAnalyzer {
                                      Map<String, List<TradingCore.Candle>> h1,
                                      Map<String, CoinType> types) {
 
-        List<TradeSignal> result = new ArrayList<>();
         long now = System.currentTimeMillis();
-
+        List<TradeSignal> result = new ArrayList<>();
         int scanned = 0;
 
         for (String symbol : symbols) {
-
             if (scanned++ >= MAX_SYMBOLS) break;
 
             List<TradingCore.Candle> c1 = m1.get(symbol);
@@ -88,7 +87,6 @@ public final class Elite5MinAnalyzer {
     }
 
     /* ================= CORE ================= */
-
     private TradeSignal generate(String symbol,
                                  List<TradingCore.Candle> c1,
                                  List<TradingCore.Candle> c5,
@@ -106,11 +104,11 @@ public final class Elite5MinAnalyzer {
         double scoreLong = 0;
         double scoreShort = 0;
 
-        /* ===== HTF TREND ALIGNMENT ===== */
+        // ===== HTF TREND ALIGNMENT =====
         if (bias == HTFBias.BULL) scoreLong += W_HTF;
         if (bias == HTFBias.BEAR) scoreShort += W_HTF;
 
-        /* ===== MICRO IMPULSE (1m) ===== */
+        // ===== MICRO IMPULSE (1m) =====
         if (detectMicroImpulse(c1)) {
             if (last(c1).close > c1.get(c1.size()-5).close)
                 scoreLong += W_MICRO_IMPULSE;
@@ -118,15 +116,15 @@ public final class Elite5MinAnalyzer {
                 scoreShort += W_MICRO_IMPULSE;
         }
 
-        /* ===== MICRO BREAKOUT (5m) ===== */
-        if (detectMicroBreakout(c5, true)) scoreLong += W_MICRO_BREAK;
-        if (detectMicroBreakout(c5, false)) scoreShort += W_MICRO_BREAK;
+        // ===== MICRO BREAKOUT (5m) =====
+        if (detectMicroBreakout(c5,true)) scoreLong += W_MICRO_BREAK;
+        if (detectMicroBreakout(c5,false)) scoreShort += W_MICRO_BREAK;
 
-        /* ===== PULLBACK ENTRY ===== */
-        if (pricePullback(c15, true)) scoreLong += W_PULLBACK;
-        if (pricePullback(c15, false)) scoreShort += W_PULLBACK;
+        // ===== PULLBACK ENTRY =====
+        if (pricePullback(c15,true)) scoreLong += W_PULLBACK;
+        if (pricePullback(c15,false)) scoreShort += W_PULLBACK;
 
-        /* ===== RANGE REACTION ===== */
+        // ===== RANGE REACTION =====
         if (state == MarketState.RANGE) {
             double high = highest(c15,15);
             double low = lowest(c15,15);
@@ -134,74 +132,41 @@ public final class Elite5MinAnalyzer {
             if (price >= high*0.996) scoreShort += W_RANGE;
         }
 
-        /* ===== VOLUME CONFIRM ===== */
+        // ===== VOLUME CONFIRM =====
         if (relativeVolume(c1) > 1.1) {
-            scoreLong += W_VOLUME * 0.5;
-            scoreShort += W_VOLUME * 0.5;
+            scoreLong += W_VOLUME*0.5;
+            scoreShort += W_VOLUME*0.5;
         }
 
         if (scoreLong < 2.5 && scoreShort < 2.5) return null;
 
-        TradingCore.Side side =
-                scoreLong > scoreShort ?
-                        TradingCore.Side.LONG :
-                        TradingCore.Side.SHORT;
+        TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
         String key = symbol + "_" + side;
-        if (cooldown.containsKey(key) &&
-                now - cooldown.get(key) < BASE_COOLDOWN)
+        if (cooldown.containsKey(key) && now - cooldown.get(key) < BASE_COOLDOWN)
             return null;
 
         double raw = Math.max(scoreLong, scoreShort);
-
-        double confidence = computeConfidence(raw, state, type, atr, price);
+        double confidence = computeConfidence(raw,state,type,atr,price);
 
         if (confidence < MIN_CONFIDENCE) return null;
 
-        SignalGrade grade =
-                confidence > 0.80 ? SignalGrade.A :
-                        confidence > 0.65 ? SignalGrade.B :
-                                SignalGrade.C;
+        SignalGrade grade = confidence>0.80?SignalGrade.A:
+                confidence>0.65?SignalGrade.B:SignalGrade.C;
 
-        double riskMult =
-                type==CoinType.MEME?1.3:
-                        type==CoinType.ALT?1.0:0.85;
-
+        double riskMult = type==CoinType.MEME?1.3:type==CoinType.ALT?1.0:0.85;
         double rr = confidence>0.75?2.8:2.2;
 
-        double stop =
-                side==TradingCore.Side.LONG?
-                        price-atr*riskMult:
-                        price+atr*riskMult;
+        double stop = side==TradingCore.Side.LONG?price-atr*riskMult:price+atr*riskMult;
+        double take = side==TradingCore.Side.LONG?price+atr*riskMult*rr:price-atr*riskMult*rr;
 
-        double take =
-                side==TradingCore.Side.LONG?
-                        price+atr*riskMult*rr:
-                        price-atr*riskMult*rr;
+        cooldown.put(key,now);
 
-        cooldown.put(key, now);
-
-        return new TradeSignal(
-                symbol,
-                side,
-                price,
-                stop,
-                take,
-                confidence,
-                grade,
-                "MicroScore="+raw+" State="+state,
-                type
-        );
+        return new TradeSignal(symbol, side, price, stop, take, confidence, grade, "MicroScore="+raw+" State="+state, type);
     }
 
     /* ================= CONFIDENCE ================= */
-
-    private double computeConfidence(double raw,
-                                     MarketState state,
-                                     CoinType type,
-                                     double atr,
-                                     double price){
-
+    private double computeConfidence(double raw, MarketState state, CoinType type, double atr, double price) {
         double base = raw/6.5;
 
         double stateBoost = switch(state){
@@ -214,31 +179,36 @@ public final class Elite5MinAnalyzer {
 
         double volatility = Math.min(atr/price*40,0.1);
 
-        double typeBoost =
-                type==CoinType.MEME?0.06:
-                        type==CoinType.ALT?0.04:0.02;
+        double typeBoost = type==CoinType.MEME?0.06:type==CoinType.ALT?0.04:0.02;
 
-        return clamp(
-                0.50 + base + stateBoost + volatility + typeBoost,
-                0.50, 0.95
-        );
+        return clamp(0.50+base+stateBoost+volatility+typeBoost,0.50,0.95);
     }
 
     /* ================= MICRO EXTRA ================= */
-
     private boolean detectMicroBreakout(List<TradingCore.Candle> c, boolean bullish){
-        if(c==null || c.size()<6) return false;
+        if(c==null||c.size()<6) return false;
         double high=highest(c,5);
         double low=lowest(c,5);
         double price=last(c).close;
-        return bullish ? price>high*1.001 : price<low*0.999;
+        return bullish?price>high*1.001:price<low*0.999;
+    }
+
+    private boolean detectMicroImpulse(List<TradingCore.Candle> c){
+        if(c==null||c.size()<5) return false;
+        double delta = last(c).close - c.get(c.size()-5).close;
+        return Math.abs(delta)>0.0002 && relativeVolume(c)>1.05;
+    }
+
+    private boolean pricePullback(List<TradingCore.Candle> c, boolean bull){
+        double ema21 = ema(c,21);
+        double price = last(c).close;
+        return bull ? price <= ema21*1.01 : price >= ema21*0.99;
     }
 
     /* ================= MARKET ================= */
-
     private MarketState detectMarketState(List<TradingCore.Candle> c){
-        double adx=adx(c,14);
-        double vol=relativeVolume(c);
+        double adx = adx(c,14);
+        double vol = relativeVolume(c);
         if(adx>25) return MarketState.STRONG_TREND;
         if(adx>18) return MarketState.WEAK_TREND;
         if(vol>1.8) return MarketState.CLIMAX;
@@ -256,19 +226,6 @@ public final class Elite5MinAnalyzer {
     }
 
     /* ================= INDICATORS ================= */
-
-    private boolean detectMicroImpulse(List<TradingCore.Candle> c){
-        if(c==null||c.size()<5) return false;
-        double delta=last(c).close-c.get(c.size()-5).close;
-        return Math.abs(delta)>0.0002 && relativeVolume(c)>1.05;
-    }
-
-    private boolean pricePullback(List<TradingCore.Candle> c,boolean bull){
-        double ema21=ema(c,21);
-        double price=last(c).close;
-        return bull?price<=ema21*1.01:price>=ema21*0.99;
-    }
-
     private double atr(List<TradingCore.Candle> c,int n){
         double sum=0;
         for(int i=Math.max(1,c.size()-n);i<c.size();i++){
@@ -297,19 +254,16 @@ public final class Elite5MinAnalyzer {
     }
 
     private double highest(List<TradingCore.Candle> c,int n){
-        return c.subList(Math.max(0,c.size()-n),c.size())
-                .stream().mapToDouble(cd->cd.high).max().orElse(0);
+        return c.subList(Math.max(0,c.size()-n),c.size()).stream().mapToDouble(cd->cd.high).max().orElse(0);
     }
 
     private double lowest(List<TradingCore.Candle> c,int n){
-        return c.subList(Math.max(0,c.size()-n),c.size())
-                .stream().mapToDouble(cd->cd.low).min().orElse(0);
+        return c.subList(Math.max(0,c.size()-n),c.size()).stream().mapToDouble(cd->cd.low).min().orElse(0);
     }
 
     private double relativeVolume(List<TradingCore.Candle> c){
         int n=c.size();
-        double avg=c.subList(Math.max(0,n-20),n-1)
-                .stream().mapToDouble(cd->cd.volume).average().orElse(1);
+        double avg=c.subList(Math.max(0,n-20),n-1).stream().mapToDouble(cd->cd.volume).average().orElse(1);
         return last(c).volume/avg;
     }
 
@@ -317,18 +271,13 @@ public final class Elite5MinAnalyzer {
         return c.get(c.size()-1);
     }
 
-    private boolean valid(List<?> c,int min){
-        return c!=null&&c.size()>=min;
-    }
+    private boolean valid(List<?> c,int min){return c!=null&&c.size()>=min;}
 
-    private double clamp(double v,double min,double max){
-        return Math.max(min,Math.min(max,v));
-    }
+    private double clamp(double v,double min,double max){return Math.max(min,Math.min(max,v));}
 
-    private boolean volatilityOk(List<TradingCore.Candle> c, CoinType type){
+    private boolean volatilityOk(List<TradingCore.Candle> c,CoinType type){
         double a=atr(c,14), price=last(c).close;
-        double multiplier=type==CoinType.MEME?0.0008:
-                type==CoinType.ALT?0.0015:0.001;
-        return (a/price)>multiplier;
+        double multiplier = type==CoinType.MEME?0.0008:type==CoinType.ALT?0.0015:0.001;
+        return a/price > multiplier;
     }
 }
