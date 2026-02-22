@@ -3,10 +3,13 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * SignalOptimizer — улучшенный класс для оценки сигналов Elite5MinAnalyzer
+ * с микротрендом, EMA скорости/ускорения, импульсами и адаптивной корректировкой confidence.
+ */
 public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */
-
     private static final int MAX_TICKS = 80;
     private static final int MIN_TICKS = 8;
 
@@ -18,7 +21,6 @@ public final class SignalOptimizer {
     private static final double MIN_CONF = 0.40;
 
     /* ================= STATE ================= */
-
     private final Map<String, Deque<Double>> tickPriceDeque;
     private final Map<String, MicroTrendResult> microTrendCache = new ConcurrentHashMap<>();
     private final TradingCore.AdaptiveBrain adaptiveBrain;
@@ -30,12 +32,11 @@ public final class SignalOptimizer {
     }
 
     /* ================= DATA CLASS ================= */
-
     public static final class MicroTrendResult {
-        public final double speed;
-        public final double accel;
-        public final double avg;
-        public final double impulse;
+        public final double speed;      // EMA скорости изменения цены
+        public final double accel;      // EMA ускорения (изменение скорости)
+        public final double avg;        // Среднее по буферу
+        public final double impulse;    // Сумма абсолютных значений speed и accel
 
         public MicroTrendResult(double speed, double accel, double avg) {
             this.speed = speed;
@@ -45,10 +46,14 @@ public final class SignalOptimizer {
         }
     }
 
+    private static final class MicroTrendResultZero {
+        private static final MicroTrendResult INSTANCE =
+                new MicroTrendResult(0, 0, 0);
+    }
+
     /* ============================================================
        MICRO TREND CALCULATION (EMA SPEED + EMA ACCELERATION)
        ============================================================ */
-
     public MicroTrendResult computeMicroTrend(String symbol) {
 
         Deque<Double> dq = tickPriceDeque.get(symbol);
@@ -57,18 +62,16 @@ public final class SignalOptimizer {
 
         double speed = 0.0;
         double accel = 0.0;
-
-        int processed = 0;
         double prevPrice = 0.0;
         double sum = 0.0;
+        int processed = 0;
 
+        // собираем последние MAX_TICKS цены
         Iterator<Double> it = dq.descendingIterator();
-
         List<Double> buffer = new ArrayList<>(MAX_TICKS);
         while (it.hasNext() && buffer.size() < MAX_TICKS) {
             buffer.add(it.next());
         }
-
         Collections.reverse(buffer);
 
         for (double price : buffer) {
@@ -80,8 +83,8 @@ public final class SignalOptimizer {
             }
 
             double diff = price - prevPrice;
-
             double prevSpeed = speed;
+
             speed = EMA_ALPHA * diff + (1 - EMA_ALPHA) * speed;
             accel = EMA_ALPHA * (speed - prevSpeed) + (1 - EMA_ALPHA) * accel;
 
@@ -101,7 +104,6 @@ public final class SignalOptimizer {
     /* ============================================================
        CONFIDENCE ADJUSTMENT
        ============================================================ */
-
     public double adjustConfidence(Elite5MinAnalyzer.TradeSignal signal) {
 
         MicroTrendResult mt = microTrendCache.get(signal.symbol);
@@ -112,27 +114,16 @@ public final class SignalOptimizer {
         boolean isLong = signal.side == TradingCore.Side.LONG;
         boolean trendUp = mt.speed > 0;
 
-        /* ===== IMPULSE LOGIC ===== */
-
+        // ===== IMPULSE LOGIC =====
         if (mt.impulse > STRONG_IMPULSE) {
-
-            if ((isLong && trendUp) || (!isLong && !trendUp)) {
-                confidence += 0.07; // сильное подтверждение
-            } else {
-                confidence -= 0.06; // сильное противоречие
-            }
-
+            if ((isLong && trendUp) || (!isLong && !trendUp)) confidence += 0.07;
+            else confidence -= 0.06;
         } else if (mt.impulse > WEAK_IMPULSE) {
-
-            if ((isLong && trendUp) || (!isLong && !trendUp)) {
-                confidence += 0.03;
-            } else {
-                confidence -= 0.03;
-            }
+            if ((isLong && trendUp) || (!isLong && !trendUp)) confidence += 0.03;
+            else confidence -= 0.03;
         }
 
-        /* ===== ADAPTIVE BRAIN ===== */
-
+        // ===== ADAPTIVE BRAIN =====
         if (adaptiveBrain != null) {
             confidence = adaptiveBrain.applyAllAdjustments(
                     "ELITE5",
@@ -150,7 +141,6 @@ public final class SignalOptimizer {
     /* ============================================================
        STOP / TAKE OPTIMIZATION (ATR ADAPTIVE)
        ============================================================ */
-
     public Elite5MinAnalyzer.TradeSignal withAdjustedStopTake(
             Elite5MinAnalyzer.TradeSignal signal,
             double atr) {
@@ -159,14 +149,11 @@ public final class SignalOptimizer {
 
         double volatilityPct = clamp(atr / signal.entry, 0.006, 0.035);
 
-        double rr =
-                newConfidence > 0.85 ? 3.2 :
-                        newConfidence > 0.75 ? 2.6 :
-                                newConfidence > 0.65 ? 2.1 :
-                                        1.7;
+        double rr = newConfidence > 0.85 ? 3.2 :
+                newConfidence > 0.75 ? 2.6 :
+                        newConfidence > 0.65 ? 2.1 : 1.7;
 
-        double stop;
-        double take;
+        double stop, take;
 
         if (signal.side == TradingCore.Side.LONG) {
             stop = signal.entry * (1 - volatilityPct);
@@ -192,7 +179,6 @@ public final class SignalOptimizer {
     /* ============================================================
        HELPERS
        ============================================================ */
-
     private Elite5MinAnalyzer.CoinType convertToEliteCoinType(TradingCore.CoinType type) {
         return switch (type) {
             case TOP  -> Elite5MinAnalyzer.CoinType.TOP;
@@ -217,10 +203,5 @@ public final class SignalOptimizer {
 
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
-    }
-
-    private static final class MicroTrendResultZero {
-        private static final MicroTrendResult INSTANCE =
-                new MicroTrendResult(0, 0, 0);
     }
 }
