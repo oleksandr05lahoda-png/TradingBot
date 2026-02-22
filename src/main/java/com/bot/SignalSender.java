@@ -888,7 +888,7 @@ public class SignalSender {
     // ========================= Helper: top symbols via CoinGecko =========================
     private List<String> getTopSymbols(int limit) {
         try {
-            String url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
+            String url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
 
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -899,39 +899,40 @@ public class SignalSender {
             HttpResponse<String> resp =
                     http.send(req, HttpResponse.BodyHandlers.ofString());
 
-            JSONObject obj = new JSONObject(resp.body());
-            JSONArray arr = obj.getJSONArray("symbols");
+            JSONArray arr = new JSONArray(resp.body());
 
-            List<String> list = new ArrayList<>();
+            List<JSONObject> filtered = new ArrayList<>();
 
+            // Фильтруем только USDT вечные контракты
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject s = arr.getJSONObject(i);
-
-                if (!s.getString("contractType").equals("PERPETUAL"))
-                    continue;
-
-                if (!s.getString("quoteAsset").equals("USDT"))
-                    continue;
-
-                if (!s.getString("status").equals("TRADING"))
-                    continue;
-
                 String symbol = s.getString("symbol");
+                String contractType = s.optString("contractType", "PERPETUAL"); // можно уточнить, если API поддерживает
+
+                if (!symbol.endsWith("USDT"))
+                    continue;
 
                 if (symbol.contains("_"))
                     continue;
 
-                list.add(symbol);
+                filtered.add(s);
             }
 
-            Collections.sort(list);
+            // Сортируем по объему торгов за 24 часа, по убыванию
+            filtered.sort((a, b) -> {
+                double volA = a.getDouble("quoteVolume");
+                double volB = b.getDouble("quoteVolume");
+                return Double.compare(volB, volA); // от большего к меньшему
+            });
 
-            if (list.size() > limit)
-                list = list.subList(0, limit);
+            List<String> topSymbols = new ArrayList<>();
+            for (int i = 0; i < Math.min(limit, filtered.size()); i++) {
+                topSymbols.add(filtered.get(i).getString("symbol"));
+            }
 
-            System.out.println("[PAIRS] Loaded TOP " + list.size() + " major pairs");
+            System.out.println("[PAIRS] Loaded TOP " + topSymbols.size() + " major pairs by volume");
 
-            return list;
+            return topSymbols;
 
         } catch (Exception e) {
             System.out.println("[PAIRS] ERROR " + e.getMessage());
