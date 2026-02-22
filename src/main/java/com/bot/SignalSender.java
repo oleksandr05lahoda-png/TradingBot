@@ -886,7 +886,7 @@ public class SignalSender {
 
 
     // ========================= Helper: top symbols via CoinGecko =========================
-    private List<String> getTopMarketCoins(int limit) {
+    private List<String> getTopSymbols(int limit) {
         try {
             // CoinGecko API: топ монет по капитализации
             String url = "https://api.coingecko.com/api/v3/coins/markets" +
