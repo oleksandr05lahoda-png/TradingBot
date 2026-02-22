@@ -11,8 +11,8 @@ public final class DecisionEngineMerged {
     private enum HTFBias { BULL, BEAR, NONE }
 
     /* ================= CONFIG ================= */
-    private static final int MIN_BARS = 200;
-    private static final long COOLDOWN_MS = 10 * 60_000; // 10 минут минимальный интервал сигнала
+    private static final int MIN_BARS = 200;                 // минимальные свечи для анализа
+    private static final long COOLDOWN_MS = 10 * 60_000;    // кулдаун сигналов
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
     /* ================= OUTPUT ================= */
@@ -43,6 +43,7 @@ public final class DecisionEngineMerged {
                                     Map<String, List<TradingCore.Candle>> m5,
                                     Map<String, List<TradingCore.Candle>> m15,
                                     Map<String, List<TradingCore.Candle>> h1) {
+
         List<TradeIdea> ideas = new ArrayList<>();
         long now = System.currentTimeMillis();
 
@@ -88,7 +89,7 @@ public final class DecisionEngineMerged {
         String reason = null;
 
         // ================= STRATEGIES =================
-        // 1️⃣ Trend Following (улучшено для Мех4)
+        // 1️⃣ Trend Following
         if ((state == MarketState.STRONG_TREND || state == MarketState.WEAK_TREND) && bias != HTFBias.NONE) {
             if (bias == HTFBias.BULL && ema(c15, 21) > ema(c15, 50)) {
                 if (microImpulse || pricePullback(c15, true)) {

@@ -54,6 +54,9 @@ public class SignalSender {
     private Set<String> cachedPairs = new HashSet<>();
     private final DecisionEngineMerged decisionEngine;
     private final Elite5MinAnalyzer elite5MinAnalyzer;
+    // ========================= HISTORICAL CANDLES =========================
+    private final Map<String, List<TradingCore.Candle>> histM15 = new ConcurrentHashMap<>();
+    private final Map<String, List<TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
     private final TradingCore.AdaptiveBrain adaptiveBrain;
     private final SignalOptimizer optimizer;
     private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
@@ -947,6 +950,7 @@ public class SignalSender {
             for (String pair : BINANCE_PAIRS) {
                 connectTickWebSocket(pair);
             }
+
         }
 
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -1023,13 +1027,12 @@ public class SignalSender {
         for (String pair : symbols) {
             try {
                 CompletableFuture<List<TradingCore.Candle>> f15 =
-                        fetchKlinesAsync(pair, "15m", KLINES_LIMIT / 3);
+                        fetchKlinesAsync(pair, "15m", KLINES_LIMIT);  // берём все свечи
                 CompletableFuture<List<TradingCore.Candle>> f1h =
-                        fetchKlinesAsync(pair, "1h", KLINES_LIMIT / 12);
-                CompletableFuture.allOf(f15, f1h).join();
+                        fetchKlinesAsync(pair, "1h", 50);             // берём небольшую выборку часовых
 
-                List<TradingCore.Candle> c15m = new ArrayList<>(f15.join());
-                List<TradingCore.Candle> c1h  = new ArrayList<>(f1h.join());
+                List<TradingCore.Candle> c15m = histM15.getOrDefault(pair, new ArrayList<>());
+                List<TradingCore.Candle> c1h  = histH1.getOrDefault(pair, new ArrayList<>());
                 if (c15m.size() < 30 || c1h.size() < 30) continue;
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
