@@ -6,20 +6,16 @@ import java.util.stream.Collectors;
 
 public final class Elite5MinAnalyzer {
 
-    /* ================= ENUMS ================= */
     public enum SignalGrade { A, B, C }
     public enum CoinType { TOP, ALT, MEME }
     private enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, CLIMAX, VOLATILE }
     private enum HTFBias { BULL, BEAR, NONE }
 
-    /* ================= CONFIG ================= */
     private static final int MIN_M15 = 150;
     private static final int MIN_H1 = 150;
     private static final double MIN_CONFIDENCE = 0.52;
-    private static final long BASE_COOLDOWN = 7 * 60_000; // 7 минут
-    private static final int MAX_TOP_COINS = 70;
+    private static final long BASE_COOLDOWN = 7 * 60_000;
 
-    /* ===== WEIGHTS ===== */
     private static final double W_HTF = 2.0;
     private static final double W_MICRO_IMPULSE = 2.2;
     private static final double W_MICRO_BREAK = 1.8;
@@ -27,12 +23,11 @@ public final class Elite5MinAnalyzer {
     private static final double W_RANGE = 1.2;
     private static final double W_VOLUME = 1.5;
     private static final double W_DIVERGENCE = 1.4;
+    private static final double W_REVERSAL = 3.0; // вес для раннего разворота
 
-    /* ================= STATE ================= */
     private final Map<String, Deque<Long>> cooldownHistory = new ConcurrentHashMap<>();
     private final Map<String, Double> adaptiveTrendWeights = new ConcurrentHashMap<>();
 
-    /* ================= OUTPUT ================= */
     public static final class TradeSignal {
         public final String symbol;
         public final TradingCore.Side side;
@@ -56,7 +51,6 @@ public final class Elite5MinAnalyzer {
         }
     }
 
-    /* ================= MAIN ================= */
     public List<TradeSignal> analyze(List<String> symbols,
                                      Map<String, List<TradingCore.Candle>> m1,
                                      Map<String, List<TradingCore.Candle>> m5,
@@ -82,21 +76,12 @@ public final class Elite5MinAnalyzer {
             if (signal != null) candidates.add(signal);
         }
 
-        // ===== Top-N по категориям =====
-        Map<CoinType, List<TradeSignal>> byType = candidates.stream()
-                .collect(Collectors.groupingBy(s -> s.type));
-
-        List<TradeSignal> merged = new ArrayList<>();
-        merged.addAll(topN(byType.getOrDefault(CoinType.TOP, Collections.emptyList()), MAX_TOP_COINS / 2));
-        merged.addAll(topN(byType.getOrDefault(CoinType.ALT, Collections.emptyList()), MAX_TOP_COINS / 3));
-        merged.addAll(topN(byType.getOrDefault(CoinType.MEME, Collections.emptyList()), MAX_TOP_COINS / 6));
-
-        return merged.stream()
+        // Сортируем все сигналы по уверенности без ограничения Top-N
+        return candidates.stream()
                 .sorted(Comparator.comparingDouble(s -> -s.confidence))
                 .collect(Collectors.toList());
     }
 
-    /* ================= CORE ================= */
     private TradeSignal generate(String symbol,
                                  List<TradingCore.Candle> c1,
                                  List<TradingCore.Candle> c5,
@@ -152,16 +137,19 @@ public final class Elite5MinAnalyzer {
         if (bullishDivergence(c15)) scoreLong += W_DIVERGENCE;
         if (bearishDivergence(c15)) scoreShort += W_DIVERGENCE;
 
+        // ===== EARLY REVERSAL LOGIC =====
+        if (earlyReversalLong(c15)) scoreLong += W_REVERSAL;
+        if (earlyReversalShort(c15)) scoreShort += W_REVERSAL;
+
         if (scoreLong < 2.5 && scoreShort < 2.5) return null;
 
         TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
-        // ===== COOL DOWN HISTORY =====
+        // ===== COOL DOWN HISTORY (по каждому сигналу отдельно) =====
         String key = symbol + "_" + side;
         Deque<Long> history = cooldownHistory.computeIfAbsent(key, k -> new ArrayDeque<>());
         long cutoff = now - BASE_COOLDOWN;
         history.removeIf(t -> t < cutoff);
-        if (!history.isEmpty()) return null;
         history.addLast(now);
 
         double raw = Math.max(scoreLong, scoreShort);
@@ -177,26 +165,29 @@ public final class Elite5MinAnalyzer {
         double stop = side == TradingCore.Side.LONG ? price - atr * riskMult : price + atr * riskMult;
         double take = side == TradingCore.Side.LONG ? price + atr * riskMult * rr : price - atr * riskMult * rr;
 
-        // ===== ADAPTIVE TREND UPDATE =====
         updateAdaptiveWeight(symbol, side, confidence);
 
         return new TradeSignal(symbol, side, price, stop, take, confidence, grade,
                 "Score=" + String.format("%.2f", raw) + " State=" + state + " Vol=" + String.format("%.2f", relVol), type);
     }
 
-    /* ================= HELPERS ================= */
+    // ===================== EARLY REVERSALS =====================
+    private boolean earlyReversalLong(List<TradingCore.Candle> c) {
+        if (c.size() < 10) return false;
+        return last(c).low < lowest(c, 5) && rsi(c, 14) < 30 && rsi(c.subList(c.size() - 5, c.size()), 5) > 35;
+    }
+
+    private boolean earlyReversalShort(List<TradingCore.Candle> c) {
+        if (c.size() < 10) return false;
+        return last(c).high > highest(c, 5) && rsi(c, 14) > 70 && rsi(c.subList(c.size() - 5, c.size()), 5) < 65;
+    }
+
+    // ===================== HELPERS =====================
     private void updateAdaptiveWeight(String symbol, TradingCore.Side side, double confidence) {
         double current = adaptiveTrendWeights.getOrDefault(symbol, W_HTF);
         if (confidence > 0.75) current += 0.05;
         else if (confidence < 0.55) current -= 0.05;
         adaptiveTrendWeights.put(symbol, clamp(current, 1.2, 3.5));
-    }
-
-    private List<TradeSignal> topN(List<TradeSignal> signals, int n) {
-        return signals.stream()
-                .sorted(Comparator.comparingDouble(s -> -s.confidence))
-                .limit(n)
-                .collect(Collectors.toList());
     }
 
     private double computeConfidence(double raw, MarketState state, CoinType type, double atr, double price, double microTrend) {
