@@ -102,7 +102,7 @@ public final class Elite5MinAnalyzer {
                                        CoinType type) {
 
         double price = last(c15).close;
-        double atr = Math.max(atr(c15,14), price*0.002); // безопасный fallback
+        double atr = Math.max(atr(c15,14), price*0.002);
         double adx = adx(c15, 14);
         double rsi = rsi(c15, 14);
         double vol = relativeVolume(c15);
@@ -111,7 +111,7 @@ public final class Elite5MinAnalyzer {
         TradingCore.Side side = null;
         String reason = null;
 
-        // ================= TREND STRATEGY =================
+        // TREND STRATEGY
         if ((state == MarketState.STRONG_TREND || state == MarketState.WEAK_TREND) && bias != HTFBias.NONE) {
             if (bias == HTFBias.BULL && ema(c15, 21) > ema(c15, 50) && (microImpulse || pricePullback(c15,true))) {
                 side = TradingCore.Side.LONG; reason="Trend Bull + MicroImpulse/Pullback";
@@ -120,13 +120,13 @@ public final class Elite5MinAnalyzer {
             }
         }
 
-        // ================= DIVERGENCE / REVERSAL =================
+        // DIVERGENCE / REVERSAL
         if (side==null) {
             if (bullishDivergence(c15) && bias!=HTFBias.BEAR) { side=TradingCore.Side.LONG; reason="Bullish Divergence"; }
             else if (bearishDivergence(c15) && bias!=HTFBias.BULL) { side=TradingCore.Side.SHORT; reason="Bearish Divergence"; }
         }
 
-        // ================= RANGE / CLIMAX =================
+        // RANGE / CLIMAX
         if (side==null) {
             double high=highest(c15,15), low=lowest(c15,15);
             if (price<=low*1.005) { side=TradingCore.Side.LONG; reason="Range Support"; }
@@ -140,16 +140,16 @@ public final class Elite5MinAnalyzer {
 
         if (side==null) return null;
 
-        // ================= COOLDOWN =================
+        // COOLDOWN
         String key = symbol+"_"+side;
         if (cooldown.containsKey(key) && now - cooldown.get(key)<BASE_COOLDOWN) return null;
 
-        // ================= CONFIDENCE =================
+        // CONFIDENCE
         double confidence = computeConfidence(c15, state, adx, vol, microVol, microImpulse, type, bias);
         SignalGrade grade = confidence>0.75?SignalGrade.A:confidence>0.62?SignalGrade.B:SignalGrade.C;
         if (grade==SignalGrade.C && confidence<MIN_CONFIDENCE) return null;
 
-        // ================= RISK / REWARD =================
+        // RISK / REWARD
         double riskMultiplier = type==CoinType.MEME?1.25:type==CoinType.ALT?1.0:0.85;
         double rr = confidence>0.72?2.8:2.2;
         double stop = side==TradingCore.Side.LONG? price-atr*riskMultiplier : price+atr*riskMultiplier;
