@@ -886,9 +886,11 @@ public class SignalSender {
 
 
     // ========================= Helper: top symbols via CoinGecko =========================
-    private List<String> getTopSymbols(int limit) {
+    private List<String> getTopMarketCoins(int limit) {
         try {
-            String url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
+            // CoinGecko API: топ монет по капитализации
+            String url = "https://api.coingecko.com/api/v3/coins/markets" +
+                    "?vs_currency=usd&order=market_cap_desc&per_page=" + limit + "&page=1";
 
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -900,43 +902,21 @@ public class SignalSender {
                     http.send(req, HttpResponse.BodyHandlers.ofString());
 
             JSONArray arr = new JSONArray(resp.body());
-
-            List<JSONObject> filtered = new ArrayList<>();
-
-            // Фильтруем только USDT вечные контракты
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject s = arr.getJSONObject(i);
-                String symbol = s.getString("symbol");
-                String contractType = s.optString("contractType", "PERPETUAL"); // можно уточнить, если API поддерживает
-
-                if (!symbol.endsWith("USDT"))
-                    continue;
-
-                if (symbol.contains("_"))
-                    continue;
-
-                filtered.add(s);
-            }
-
-            // Сортируем по объему торгов за 24 часа, по убыванию
-            filtered.sort((a, b) -> {
-                double volA = a.getDouble("quoteVolume");
-                double volB = b.getDouble("quoteVolume");
-                return Double.compare(volB, volA); // от большего к меньшему
-            });
-
             List<String> topSymbols = new ArrayList<>();
-            for (int i = 0; i < Math.min(limit, filtered.size()); i++) {
-                topSymbols.add(filtered.get(i).getString("symbol"));
+
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject coin = arr.getJSONObject(i);
+                String symbol = coin.getString("symbol").toUpperCase(); // например, BTC, ETH
+                topSymbols.add(symbol + "USDT"); // формируем Binance-пары
             }
 
-            System.out.println("[PAIRS] Loaded TOP " + topSymbols.size() + " major pairs by volume");
+            System.out.println("[PAIRS] Loaded TOP " + topSymbols.size() + " market coins");
 
             return topSymbols;
 
         } catch (Exception e) {
             System.out.println("[PAIRS] ERROR " + e.getMessage());
-            return List.of("BTCUSDT","ETHUSDT","SOLUSDT");
+            return List.of("BTCUSDT", "ETHUSDT", "SOLUSDT"); // fallback
         }
     }
     public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
