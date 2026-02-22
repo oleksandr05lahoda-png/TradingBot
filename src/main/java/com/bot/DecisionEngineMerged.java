@@ -36,6 +36,14 @@ public final class DecisionEngineMerged {
             this.grade = grade;
             this.reason = reason;
         }
+
+        @Override
+        public String toString() {
+            return String.format(
+                    "TradeIdea[%s | %s | Entry: %.4f Stop: %.4f Take: %.4f Conf: %.2f Grade: %s Reason: %s]",
+                    symbol, side, entry, stop, take, confidence, grade, reason
+            );
+        }
     }
 
     /* ================= MAIN EVALUATION ================= */
@@ -144,7 +152,7 @@ public final class DecisionEngineMerged {
 
         SignalGrade grade = confidence > 0.75 ? SignalGrade.A :
                 confidence > 0.62 ? SignalGrade.B : SignalGrade.C;
-        if (grade == SignalGrade.C && confidence < 0.50) return null;
+        if (grade == SignalGrade.C && confidence < 0.52) return null; // чуть выше минимальной точности
 
         // ================= RISK/REWARD =================
         double risk = atr * (cat == CoinCategory.MEME ? 1.2 : 1.0);
@@ -168,6 +176,7 @@ public final class DecisionEngineMerged {
     }
 
     private HTFBias detectHTFBias(List<TradingCore.Candle> c){
+        if (c.size()<200) return HTFBias.NONE;
         if (ema(c,50) > ema(c,200)) return HTFBias.BULL;
         if (ema(c,50) < ema(c,200)) return HTFBias.BEAR;
         return HTFBias.NONE;
@@ -234,6 +243,7 @@ public final class DecisionEngineMerged {
     private double atr(List<TradingCore.Candle> c,int n){
         double sum=0;
         for(int i=c.size()-n;i<c.size();i++){
+            if(i-1<0) continue;
             TradingCore.Candle cur=c.get(i), prev=c.get(i-1);
             double tr=Math.max(cur.high-cur.low,Math.max(Math.abs(cur.high-prev.close),Math.abs(cur.low-prev.close)));
             sum+=tr;
@@ -258,14 +268,15 @@ public final class DecisionEngineMerged {
     }
 
     private double ema(List<TradingCore.Candle> c,int p){
+        if(c.size()<p) return last(c).close;
         double k=2.0/(p+1);
         double e=c.get(c.size()-p).close;
         for(int i=c.size()-p+1;i<c.size();i++) e=c.get(i).close*k + e*(1-k);
         return e;
     }
 
-    private double highest(List<TradingCore.Candle> c,int n){ return c.subList(c.size()-n,c.size()).stream().mapToDouble(cd->cd.high).max().orElse(0); }
-    private double lowest(List<TradingCore.Candle> c,int n){ return c.subList(c.size()-n,c.size()).stream().mapToDouble(cd->cd.low).min().orElse(0); }
+    private double highest(List<TradingCore.Candle> c,int n){ return c.subList(Math.max(0,c.size()-n),c.size()).stream().mapToDouble(cd->cd.high).max().orElse(0); }
+    private double lowest(List<TradingCore.Candle> c,int n){ return c.subList(Math.max(0,c.size()-n),c.size()).stream().mapToDouble(cd->cd.low).min().orElse(0); }
     private double relativeVolume(List<TradingCore.Candle> c){ int n=c.size(); double avg=c.subList(Math.max(0,n-20),n-1).stream().mapToDouble(cd->cd.volume).average().orElse(1); return last(c).volume/avg; }
     private TradingCore.Candle last(List<TradingCore.Candle> c){ return c.get(c.size()-1); }
     private boolean isValid(List<?> c){ return c!=null && c.size()>=MIN_BARS; }

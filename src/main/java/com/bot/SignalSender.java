@@ -623,13 +623,6 @@ public class SignalSender {
         if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.10; // sweep против тренда = возможный разворот
         else if (liquiditySweep) conf -= 0.05;
 
-        // шум для различия между парами
-        conf += (Math.random() - 0.5) * 0.02;
-
-        // корректировка для SHORT
-        // conf -= 0.03; можно делать отдельно в цикле
-
-        // лимитируем диапазон, чтобы не было нереально высоких/низких значений
         conf = Math.max(0.20, Math.min(0.90, conf));
 
         return conf;
@@ -1043,14 +1036,17 @@ public class SignalSender {
     }
 
     private boolean checkVWAPAlignment(String pair, double price) {
-        double vwap = histM15.getOrDefault(pair, new ArrayList<>()).stream()
-                .mapToDouble(c -> c.close)
-                .average().orElse(price);
-        return price > vwap; // пример: выше VWAP = aligned
+        List<TradingCore.Candle> candles = histM15.getOrDefault(pair, new ArrayList<>());
+        if (candles.isEmpty()) return true;
+
+        double vwap = vwap(candles); // используем твой настоящий метод vwap()
+
+        return price > vwap;
     }
 
     private boolean checkStructureAlignment(List<TradingCore.Candle> candles, int dir) {
-        return dir != 0; // если тренд есть, структура согласована
+        int structure = marketStructure(candles);
+        return structure == dir;
     }
     private void runSchedulerCycle() {
         signalsThisCycle = 0;
@@ -1082,6 +1078,7 @@ public class SignalSender {
                 MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.getOrDefault(pair, new ArrayDeque<>()));
                 MarketPhase phase = detectMarketPhase(c15m, micro);
                 if (phase == MarketPhase.NO_TRADE) continue;
+                if (phase == MarketPhase.TREND_EXHAUSTION) continue;
 
                 // ===== ATR и волатильность =====
                 double atr15 = atr(c15m, 14);
@@ -1101,12 +1098,22 @@ public class SignalSender {
                 boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.5;
                 boolean impulse = (dir15 > 0 && impulseUp) || (dir15 < 0 && impulseDown);
 
-                // ===== Определяем направление сделки =====
                 TradingCore.Side side = null;
-                if (dir15 >= 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
-                else if (dir15 <= 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
-                if (side == null) continue;
 
+                if (dir15 == 0) continue;
+
+                if (dir15 == 1 && dir1h == 1) {
+                    side = TradingCore.Side.LONG;
+                }
+                else if (dir15 == -1 && dir1h == -1) {
+                    side = TradingCore.Side.SHORT;
+                }
+                else {
+                    continue;
+                }
+
+                if (side == TradingCore.Side.LONG && (rsi14 < 45 || rsi14 > 72)) continue;
+                if (side == TradingCore.Side.SHORT && (rsi14 > 55 || rsi14 < 28)) continue;
                 // ===== Расчёт стратегии =====
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
                         strategyRSINorm(closes15) * 0.25 +

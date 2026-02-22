@@ -27,8 +27,14 @@ public final class SignalOptimizer {
             this.accel = accel;
             this.avg = avg;
         }
+
+        @Override
+        public String toString() {
+            return String.format("MicroTrend[speed=%.6f, accel=%.6f, avg=%.6f]", speed, accel, avg);
+        }
     }
 
+    /** Вычисляет микротренд на основании последних MAX_TICKS тиков */
     public MicroTrendResult computeMicroTrend(String symbol) {
         Deque<Double> dq = tickPriceDeque.get(symbol);
         if (dq == null || dq.size() < 6) return new MicroTrendResult(0, 0, 0);
@@ -53,12 +59,13 @@ public final class SignalOptimizer {
         return result;
     }
 
+    /** Корректировка confidence с учетом микротренда и адаптивного мозга */
     public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s) {
         double conf = s.confidence;
         MicroTrendResult mt = microTrendCache.get(s.symbol);
         if (mt != null) {
             double impulse = Math.abs(mt.speed) + Math.abs(mt.accel);
-            if (impulse > IMPULSE_STRONG) conf += 0.05;
+            if (impulse > IMPULSE_STRONG) conf += 0.05; // бонус за сильный микротренд
         }
 
         if (adaptiveBrain != null) {
@@ -75,10 +82,11 @@ public final class SignalOptimizer {
         return clamp(conf, 0.40, 0.97);
     }
 
+    /** Пересчитывает stop и take под ATR и confidence */
     public Elite5MinAnalyzer.TradeSignal withAdjustedStopTake(
             Elite5MinAnalyzer.TradeSignal s, double atr) {
 
-        double volPct = clamp(atr / s.entry, 0.007, 0.045);
+        double volPct = clamp(atr / s.entry, 0.007, 0.045); // корректировка под волатильность
         double rr = s.confidence > 0.80 ? 2.8 :
                 s.confidence > 0.70 ? 2.3 :
                         s.confidence > 0.60 ? 1.9 : 1.6;
@@ -110,11 +118,13 @@ public final class SignalOptimizer {
     }
 
     private TradingCore.CoinType detectTradingCoreCoinType(Elite5MinAnalyzer.TradeSignal s) {
-        if (s.symbol.toUpperCase().contains("MEME")) return TradingCore.CoinType.MEME;
-        if (s.symbol.toUpperCase().contains("ALT")) return TradingCore.CoinType.ALT;
+        String sym = s.symbol.toUpperCase();
+        if (sym.contains("MEME")) return TradingCore.CoinType.MEME;
+        if (sym.contains("ALT")) return TradingCore.CoinType.ALT;
         return TradingCore.CoinType.TOP;
     }
 
+    /** Безопасный clamp */
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }

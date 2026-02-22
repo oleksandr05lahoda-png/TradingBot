@@ -14,8 +14,7 @@ public final class Elite5MinAnalyzer {
     /* ================= CONFIG ================= */
     private static final int MIN_M15 = 150;
     private static final int MIN_H1 = 150;
-    private static final double MIN_CONFIDENCE = 0.50;
-    private static final double MIN_ATR_PCT = 0.0015;
+    private static final double MIN_CONFIDENCE = 0.52; // чуть выше, чтобы повысить точность
     private static final long BASE_COOLDOWN = 10 * 60_000;
     private static final int MAX_SYMBOLS = 100;
 
@@ -46,8 +45,10 @@ public final class Elite5MinAnalyzer {
 
         @Override
         public String toString() {
-            return String.format("TradeSignal[%s | %s | Entry: %.4f Stop: %.4f Take: %.4f Conf: %.2f Grade: %s Reason: %s Type: %s]",
-                    symbol, side, entry, stop, take, confidence, grade, reason, type);
+            return String.format(
+                    "TradeSignal[%s | %s | Entry: %.4f Stop: %.4f Take: %.4f Conf: %.2f Grade: %s Reason: %s Type: %s]",
+                    symbol, side, entry, stop, take, confidence, grade, reason, type
+            );
         }
     }
 
@@ -77,7 +78,6 @@ public final class Elite5MinAnalyzer {
 
             HTFBias bias = detectHTFBias(tf1h);
             MarketState state = detectMarketState(tf15);
-
             boolean microImpulse = detectMicroImpulse(tf1);
 
             TradeSignal signal = generateSignal(symbol, tf1, tf5, tf15, tf1h, state, bias, microImpulse, now, type);
@@ -111,15 +111,14 @@ public final class Elite5MinAnalyzer {
         String reason = null;
 
         // ================= STRATEGIES =================
-        // Trend Following
+        // Trend Following with bias check
         if ((state == MarketState.STRONG_TREND || state == MarketState.WEAK_TREND) && bias != HTFBias.NONE) {
             if (bias == HTFBias.BULL && ema(c15, 21) > ema(c15, 50)) {
                 if (microImpulse || pricePullback(c15, true)) {
                     side = TradingCore.Side.LONG;
                     reason = "Trend Bull + MicroImpulse/Pullback";
                 }
-            }
-            if (bias == HTFBias.BEAR && ema(c15, 21) < ema(c15, 50)) {
+            } else if (bias == HTFBias.BEAR && ema(c15, 21) < ema(c15, 50)) {
                 if (microImpulse || pricePullback(c15, false)) {
                     side = TradingCore.Side.SHORT;
                     reason = "Trend Bear + MicroImpulse/Pullback";
@@ -129,10 +128,10 @@ public final class Elite5MinAnalyzer {
 
         // Divergence / Reversal
         if (side == null) {
-            if (bullishDivergence(c15)) {
+            if (bullishDivergence(c15) && bias != HTFBias.BEAR) {
                 side = TradingCore.Side.LONG;
                 reason = "Bullish Divergence";
-            } else if (bearishDivergence(c15)) {
+            } else if (bearishDivergence(c15) && bias != HTFBias.BULL) {
                 side = TradingCore.Side.SHORT;
                 reason = "Bearish Divergence";
             }
@@ -142,7 +141,6 @@ public final class Elite5MinAnalyzer {
         if (side == null) {
             double high = highest(c15, 15);
             double low = lowest(c15, 15);
-
             if (price <= low * 1.005) {
                 side = TradingCore.Side.LONG;
                 reason = "Range Support";
@@ -152,10 +150,10 @@ public final class Elite5MinAnalyzer {
             }
 
             if (state == MarketState.CLIMAX) {
-                if (rsi < 45) {
+                if (rsi < 45 && bias != HTFBias.BEAR) {
                     side = TradingCore.Side.LONG;
                     reason = "Exhaustion Reversal";
-                } else if (rsi > 55) {
+                } else if (rsi > 55 && bias != HTFBias.BULL) {
                     side = TradingCore.Side.SHORT;
                     reason = "Exhaustion Reversal";
                 }
@@ -169,13 +167,13 @@ public final class Elite5MinAnalyzer {
         if (cooldown.containsKey(key) && now - cooldown.get(key) < BASE_COOLDOWN) return null;
 
         // ================= CONFIDENCE =================
-        double confidence = computeConfidence(c15, state, adx, vol, microVol, microImpulse, type);
+        double confidence = computeConfidence(c15, state, adx, vol, microVol, microImpulse, type, bias);
         SignalGrade grade = confidence > 0.75 ? SignalGrade.A :
                 confidence > 0.62 ? SignalGrade.B : SignalGrade.C;
         if (grade == SignalGrade.C && confidence < MIN_CONFIDENCE) return null;
 
         // ================= RISK/REWARD =================
-        double riskMultiplier = type == CoinType.MEME ? 1.3 : type == CoinType.ALT ? 1.0 : 0.85;
+        double riskMultiplier = type == CoinType.MEME ? 1.25 : type == CoinType.ALT ? 1.0 : 0.85;
         double rr = confidence > 0.72 ? 2.8 : 2.2;
         double stop = side == TradingCore.Side.LONG ? price - atr * riskMultiplier : price + atr * riskMultiplier;
         double take = side == TradingCore.Side.LONG ? price + atr * riskMultiplier * rr : price - atr * riskMultiplier * rr;
@@ -196,6 +194,7 @@ public final class Elite5MinAnalyzer {
     }
 
     private HTFBias detectHTFBias(List<TradingCore.Candle> c){
+        if (c.size()<200) return HTFBias.NONE;
         if (ema(c, 50) > ema(c, 200)) return HTFBias.BULL;
         if (ema(c, 50) < ema(c, 200)) return HTFBias.BEAR;
         return HTFBias.NONE;
@@ -217,7 +216,7 @@ public final class Elite5MinAnalyzer {
 
     /* ================= CONFIDENCE ================= */
     private double computeConfidence(List<TradingCore.Candle> c, MarketState state, double adx,
-                                     double vol, double microVol, boolean microImpulse, CoinType type) {
+                                     double vol, double microVol, boolean microImpulse, CoinType type, HTFBias bias) {
 
         double structure = Math.abs(ema(c,21)-ema(c,50))/ema(c,50)*10;
         double base = switch(state){
@@ -227,14 +226,13 @@ public final class Elite5MinAnalyzer {
             case CLIMAX -> 0.63;
             case VOLATILE -> 0.58;
         };
-
         double momentumBoost = (adx/50.0)*0.1;
         double volBoost = Math.min((vol-1)*0.05, 0.08);
         double microBoost = microImpulse ? Math.min((microVol-1)*0.08,0.1) : 0;
-
         double typeBoost = type == CoinType.MEME ? 0.05 : type == CoinType.ALT ? 0.02 : 0;
+        double trendBoost = (bias != HTFBias.NONE) ? 0.03 : 0;
 
-        return clamp(base + structure*0.05 + momentumBoost + volBoost + microBoost + typeBoost, 0.50, 0.95);
+        return clamp(base + structure*0.05 + momentumBoost + volBoost + microBoost + typeBoost + trendBoost, 0.50, 0.95);
     }
 
     /* ================= DIVERGENCE ================= */
@@ -295,5 +293,10 @@ public final class Elite5MinAnalyzer {
     private TradingCore.Candle last(List<TradingCore.Candle> c){ return c.get(c.size()-1); }
     private boolean valid(List<?> c,int min){ return c!=null && c.size()>=min; }
     private double clamp(double v,double min,double max){ return Math.max(min,Math.min(max,v)); }
-    private boolean volatilityOk(List<TradingCore.Candle> c, CoinType type){ double a=atr(c,14); double price=last(c).close; double multiplier=type==CoinType.MEME?0.0008:type==CoinType.ALT?0.0015:0.001; return (a/price)>multiplier; }
+    private boolean volatilityOk(List<TradingCore.Candle> c, CoinType type){
+        double a=atr(c,14);
+        double price=last(c).close;
+        double multiplier=type==CoinType.MEME?0.0008:type==CoinType.ALT?0.0015:0.001;
+        return (a/price)>multiplier;
+    }
 }
