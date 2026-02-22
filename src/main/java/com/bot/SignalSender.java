@@ -598,26 +598,42 @@ public class SignalSender {
     ) {
         double conf = 0.5;
 
-        conf += Math.abs(rawScore) * 0.55; // увеличили вклад
-        if (mtfConfirm != 0) conf += 0.10;
-        if (volOk) conf += 0.08;
-        if (atrOk) conf += 0.08;
+        // основной вклад стратегии
+        conf += Math.abs(rawScore) * 0.55;
+
+        // многотаймфреймное подтверждение
+        conf += mtfConfirm * 0.05; // +0.05 за каждый уровень подтверждения
+
+        // волатильность и ATR
+        conf += volOk ? 0.08 : -0.05;
+        conf += atrOk ? 0.08 : -0.05;
+
+        // импульс свечи
         if (impulse && Math.abs(rawScore) > 0.25) conf += 0.04;
-        if (vwapAligned) conf += 0.05;
-        if (structureAligned) conf += 0.06;
-        if (bos) conf += 0.05;
+        else if (!impulse) conf -= 0.02;
 
-        if (liquiditySweep && rawScore * mtfConfirm < 0) {
-            conf += 0.10; // sweep ПРОТИВ тренда = хорошо для разворота
-        } else if (liquiditySweep) {
-            conf -= 0.10;
-        }
+        // VWAP и структура
+        conf += vwapAligned ? 0.05 : -0.02;
+        conf += structureAligned ? 0.06 : -0.03;
 
-        // расширяем диапазон
+        // Break of structure
+        conf += bos ? 0.05 : 0;
+
+        // Liquidity sweep
+        if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.10; // sweep против тренда = возможный разворот
+        else if (liquiditySweep) conf -= 0.05;
+
+        // шум для различия между парами
+        conf += (Math.random() - 0.5) * 0.02;
+
+        // корректировка для SHORT
+        // conf -= 0.03; можно делать отдельно в цикле
+
+        // лимитируем диапазон, чтобы не было нереально высоких/низких значений
         conf = Math.max(0.20, Math.min(0.90, conf));
+
         return conf;
     }
-
     private double lastSwingLow(List<TradingCore.Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double low = Double.POSITIVE_INFINITY;
@@ -764,12 +780,14 @@ public class SignalSender {
     private void connectWsInternal(String pair) {
         try {
             final String symbol = pair.toLowerCase();
-            String url = "wss://fstream.binance.com/ws/" + symbol + "@aggTrade";
+            final String url = "wss://fstream.binance.com/ws/" + symbol + "@aggTrade";
 
             System.out.println("[WS] Connecting " + pair);
+
             HttpClient client = HttpClient.newHttpClient();
             client.newWebSocketBuilder()
                     .buildAsync(URI.create(url), new java.net.http.WebSocket.Listener() {
+
                         @Override
                         public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
                             try {
@@ -785,6 +803,7 @@ public class SignalSender {
 
                                 lastTickPrice.put(pair, price);
                                 lastTickTime.put(pair, ts);
+
                             } catch (Exception ignored) {}
                             return CompletableFuture.completedFuture(null);
                         }
@@ -801,6 +820,7 @@ public class SignalSender {
                             reconnect(pair);
                             return CompletableFuture.completedFuture(null);
                         }
+
                     })
                     .thenAccept(ws -> {
                         wsMap.put(pair, ws);
@@ -811,53 +831,12 @@ public class SignalSender {
                         wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
                         return null;
                     });
-            java.net.http.WebSocket ws = HttpClient.newHttpClient()
-                    .newWebSocketBuilder()
-                    .buildAsync(URI.create(url), new java.net.http.WebSocket.Listener() {
-
-                        @Override
-                        public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
-                            try {
-                                JSONObject json = new JSONObject(data.toString());
-                                double price = Double.parseDouble(json.getString("p"));
-                                long ts = json.getLong("T");
-
-                                synchronized (wsLock) {
-                                    Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>());
-                                    dq.addLast(price);
-                                    while (dq.size() > TICK_HISTORY) dq.removeFirst();
-                                }
-
-                                lastTickPrice.put(pair, price);
-                                lastTickTime.put(pair, ts);
-
-                            } catch (Exception ignored) {}
-                            return CompletableFuture.completedFuture(null);
-                        }
-
-                        @Override
-                        public void onError(java.net.http.WebSocket webSocket, Throwable error) {
-                            System.out.println("[WS ERROR] " + pair + " " + error.getMessage());
-                            reconnect(pair);
-                        }
-
-                        @Override
-                        public CompletionStage<?> onClose(java.net.http.WebSocket webSocket, int statusCode, String reason) {
-                            System.out.println("[WS CLOSED] " + pair + " code=" + statusCode);
-                            reconnect(pair);
-                            return CompletableFuture.completedFuture(null);
-                        }
-                    }).join();
-
-            wsMap.put(pair, ws);
-            System.out.println("[WS] Connected " + pair);
 
         } catch (Exception e) {
-            System.out.println("[WS] Failed connect " + pair + " retry in 5s");
+            System.out.println("[WS] Failed connect " + pair + " retry in 5s: " + e.getMessage());
             reconnect(pair);
         }
     }
-
     private void reconnect(String pair) {
         wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
     }
@@ -913,27 +892,24 @@ public class SignalSender {
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
 
-        // ===== Инициализация пар =====
-        if (BINANCE_PAIRS == null || BINANCE_PAIRS.isEmpty()) {
-            BINANCE_PAIRS = getTopSymbolsSet(TOP_N)
-                    .stream()
-                    .filter(p -> p.endsWith("USDT"))
-                    .collect(Collectors.toSet());
+        // ===== Инициализация топ-пар =====
+        if (cachedPairs.isEmpty()) {
+            cachedPairs = getTopSymbolsSet(TOP_N);
+            lastBinancePairsRefresh = System.currentTimeMillis();
 
-            System.out.println("[INIT] Loaded pairs: " + BINANCE_PAIRS.size());
+            System.out.println("[INIT] Loaded initial top pairs: " + cachedPairs.size());
 
-            for (String pair : BINANCE_PAIRS) {
+            // ===== Загрузка исторических свечей и подключение WS =====
+            for (String pair : cachedPairs) {
                 List<TradingCore.Candle> c15m = fetchKlines(pair, "15m", KLINES_LIMIT);
                 List<TradingCore.Candle> c1h  = fetchKlines(pair, "1h", KLINES_LIMIT);
 
                 histM15.put(pair, new ArrayList<>(c15m));
                 histH1.put(pair, new ArrayList<>(c1h));
-            }
-            System.out.println("[INIT] Loaded historical candles for all pairs");
-            // Подключаем WS к каждой паре
-            for (String pair : BINANCE_PAIRS) {
+
                 connectTickWebSocket(pair);
             }
+            System.out.println("[INIT] Historical candles loaded and WS connected for all initial pairs");
         }
 
         // ===== Scheduler =====
@@ -945,14 +921,44 @@ public class SignalSender {
 
         scheduler.scheduleWithFixedDelay(() -> {
             try {
+                long now = System.currentTimeMillis();
+
+                // ===== Обновление топ-пар каждые BINANCE_REFRESH_INTERVAL_MS =====
+                if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
+                    Set<String> availablePairs = getBinanceSymbolsFutures(); // реально торгуемые пары
+                    Set<String> updatedTop = getTopSymbolsSet(TOP_N).stream()
+                            .filter(availablePairs::contains)
+                            .collect(Collectors.toSet());
+
+                    // Определяем новые пары для подключения WS
+                    Set<String> newPairs = new HashSet<>(updatedTop);
+                    newPairs.removeAll(cachedPairs);
+
+                    cachedPairs = updatedTop;
+                    lastBinancePairsRefresh = now;
+                    System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
+
+                    // Подключаем WS к новым парам
+                    for (String pair : newPairs) {
+                        connectTickWebSocket(pair);
+
+                        // Загружаем исторические свечи для новых пар
+                        List<TradingCore.Candle> c15m = fetchKlines(pair, "15m", KLINES_LIMIT);
+                        List<TradingCore.Candle> c1h  = fetchKlines(pair, "1h", KLINES_LIMIT);
+                        histM15.put(pair, new ArrayList<>(c15m));
+                        histH1.put(pair, new ArrayList<>(c1h));
+                    }
+                }
+
+                // ===== Основной цикл анализа и отправки сигналов =====
                 runSchedulerCycle();
+
             } catch (Throwable t) {
                 System.out.println("[Scheduler-FATAL] cycle crashed: " + t.getMessage());
                 t.printStackTrace();
             }
         }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
-
     public Set<String> getTopSymbolsSet(int limit) {
         try {
             // Получаем реально торгуемые пары на Binance USDT
@@ -1027,6 +1033,20 @@ public class SignalSender {
         }
         return res;
     }
+    private boolean computeVolatilityOk(List<TradingCore.Candle> candles, double atr) {
+        return atr / candles.get(candles.size() - 1).close > 0.003;
+    }
+
+    private boolean checkVWAPAlignment(String pair, double price) {
+        double vwap = histM15.getOrDefault(pair, new ArrayList<>()).stream()
+                .mapToDouble(c -> c.close)
+                .average().orElse(price);
+        return price > vwap; // пример: выше VWAP = aligned
+    }
+
+    private boolean checkStructureAlignment(List<TradingCore.Candle> candles, int dir) {
+        return dir != 0; // если тренд есть, структура согласована
+    }
     private void runSchedulerCycle() {
         signalsThisCycle = 0;
         long now = System.currentTimeMillis();
@@ -1061,6 +1081,7 @@ public class SignalSender {
                 // ===== ATR и волатильность =====
                 double atr15 = atr(c15m, 14);
                 if (atr15 <= 0 || atr15 / last.close < 0.002) continue;
+                boolean atrOk = atr15 / last.close > 0.003;
 
                 // ===== RSI =====
                 List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
@@ -1073,6 +1094,7 @@ public class SignalSender {
 
                 boolean impulseUp = last.close > last.open && (last.high - last.low) > atr15 * 0.5;
                 boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.5;
+                boolean impulse = (dir15 > 0 && impulseUp) || (dir15 < 0 && impulseDown);
 
                 // ===== Определяем направление сделки =====
                 TradingCore.Side side = null;
@@ -1086,17 +1108,24 @@ public class SignalSender {
                         strategyMomentumNorm(closes15) * 0.20 +
                         strategyMACDNorm(closes15) * 0.20;
 
+                // ===== Динамичные флаги для composeConfidence =====
+                boolean volOk = computeVolatilityOk(c15m, atr15); // реальная проверка волатильности
+                boolean vwapAligned = checkVWAPAlignment(pair, last.close); // VWAP соответствие
+                boolean structureAligned = checkStructureAlignment(c15m, dir15); // структура рынка
+                boolean bos = detectBOS(c15m);
+                boolean liquiditySweep = detectLiquiditySweep(c15m);
+
                 // ===== Композиция confidence =====
                 double conf = composeConfidence(
                         rawScore,
                         mtfConfirm,
-                        true,  // volOk
-                        true,  // atrOk
-                        (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
-                        true,  // vwapAligned
-                        true,  // structureAligned
-                        detectBOS(c15m),
-                        detectLiquiditySweep(c15m)
+                        volOk,
+                        atrOk,
+                        impulse,
+                        vwapAligned,
+                        structureAligned,
+                        bos,
+                        liquiditySweep
                 );
                 if (side == TradingCore.Side.SHORT) conf -= 0.03;
                 if (conf < MIN_CONF) continue; // фильтр по минимальной уверенности
@@ -1115,10 +1144,10 @@ public class SignalSender {
                         rsi14,
                         rawScore,
                         mtfConfirm,
-                        true, true, true,
+                        volOk, atrOk, impulse,
                         side == TradingCore.Side.LONG,
                         side == TradingCore.Side.SHORT,
-                        true,
+                        vwapAligned,
                         SignalSender.rsi(closes15, 7),
                         SignalSender.rsi(closes15, 4)
                 );
