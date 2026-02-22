@@ -598,8 +598,7 @@ public class SignalSender {
     ) {
         double conf = 0.5;
 
-        // основной вклад стратегии
-        conf += Math.abs(rawScore) * 0.55;
+        conf += rawScore * 0.55;
 
         // многотаймфреймное подтверждение
         conf += mtfConfirm * 0.05; // +0.05 за каждый уровень подтверждения
@@ -648,7 +647,7 @@ public class SignalSender {
                                      List<TradingCore.Candle> closes15m) {
 
         if (s.confidence < MIN_CONF) {
-            System.out.println("[DEBUG] Skipped " + pair + " due to low confidence: " + s.confidence);
+            System.out.println("[SignalSender] Skipped " + pair + " due to low confidence: " + String.format("%.2f", s.confidence));
             return;
         }
         if (closes15m.size() < 4) return;
@@ -770,29 +769,62 @@ public class SignalSender {
         wsWatcher.execute(() -> connectWsInternal(pair));
     }
     private Signal analyzePair(String pair, List<TradingCore.Candle> c15m, List<TradingCore.Candle> c1h) {
-        TradingCore.Candle last = c15m.get(c15m.size() - 1);
-        String dir = last.close > last.open ? "LONG" : "SHORT";
+        if(c15m.size()<60 || c1h.size()<60) return null;
 
-        double confidence = 0.5; // базовое значение
+        TradingCore.Candle last = c15m.get(c15m.size() - 1);
+        List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
+        List<Double> closes1h = c1h.stream().map(c -> c.close).toList();
+
+        // --- Расчет rawScore ---
+        MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
+        double emaScore  = strategyEMANorm(closes15);
+        double rsiScore  = strategyRSINorm(closes15);
+        double momScore  = strategyMomentumNorm(closes15);
+        double macdScore = strategyMACDNorm(closes15);
+        double microBias = Math.tanh(micro.speed * 500);
+
+        double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.20 + macdScore*0.15 + microBias*0.25;
+// добавлено округление и нормализация в [-1,1]
+        rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
+        // --- Confidence ---
+        int mtfConfirm = multiTFConfirm(emaDirection(c1h,20,50), emaDirection(c15m,20,50));
+        boolean volOk = computeVolatilityOk(c15m, atr(c15m,14));
+        boolean atrOk = atr(c15m,14)/last.close > ATR_MIN_PCT;
+        boolean impulse = Math.abs(micro.speed) > 0.0005;
+        boolean vwapAligned = checkVWAPAlignment(pair,last.close);
+        boolean structureAligned = checkStructureAlignment(c15m, rawScore>=0 ? 1 : -1);
+        boolean bos = detectBOS(c15m);
+        boolean sweep = detectLiquiditySweep(c15m);
+
+        double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, impulse, vwapAligned, structureAligned, bos, sweep);
+
+        // --- Стоп и тейк ---
+        double atrValue = atr(c15m,14);
+        double entry = last.close;
+        double risk = atrValue*1.2;
+        double stop = rawScore>=0 ? entry-risk : entry+risk;
+        double take = rawScore>=0 ? entry+risk*2.4 : entry-risk*2.4;
 
         Signal s = new Signal(
                 pair,
-                dir,
+                rawScore>=0 ? "LONG" : "SHORT",
                 confidence,
-                last.close,
-                rsi(c15m.stream().map(c -> c.close).collect(Collectors.toList()), 14),
-                0.0, // rawScore
-                0,   // mtfConfirm
-                true, // volOk
-                true, // atrOk
-                false, // strongTrigger
-                false, // atrBreakLong
-                false, // atrBreakShort
-                false, // impulse
-                0.0, // rsi7
-                0.0  // rsi4
+                entry,
+                rsi(closes15,14),
+                rawScore,
+                mtfConfirm,
+                volOk,
+                atrOk,
+                Math.abs(rawScore)>0.6,
+                rawScore>=0 && entry>stop, // atrBreakLong
+                rawScore<0 && entry<stop,  // atrBreakShort
+                impulse,
+                rsi(closes15,7),
+                rsi(closes15,4)
         );
 
+        s.stop = stop;
+        s.take = take;
         return s;
     }
     private void connectWsInternal(String pair) {
@@ -859,24 +891,23 @@ public class SignalSender {
         wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
     }
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
-        if (dq == null || dq.size() < 5) return new MicroTrendResult(0, 0, 0);
+        if(dq==null || dq.size()<5) return new MicroTrendResult(0,0,0);
         List<Double> arr = new ArrayList<>(dq);
         int n = Math.min(arr.size(), 10);
-
-        double alpha = 0.5;
-        double speed = 0;
-        for (int i = arr.size() - n + 1; i < arr.size(); i++) {
-            double diff = arr.get(i) - arr.get(i - 1);
-            speed = alpha * diff + (1 - alpha) * speed;
+        double alpha=0.5;
+        double speed=0;
+        for(int i=arr.size()-n+1;i<arr.size();i++){
+            double diff=arr.get(i)-arr.get(i-1);
+            speed=alpha*diff + (1-alpha)*speed;
         }
-        double accel = 0;
-        if (arr.size() >= 3) {
-            double lastDiff = arr.get(arr.size() - 1) - arr.get(arr.size() - 2);
-            double prevDiff = arr.get(arr.size() - 2) - arr.get(arr.size() - 3);
-            accel = alpha * (lastDiff - prevDiff) + (1 - alpha) * accel;
+        double accel=0;
+        if(arr.size()>=3){
+            double lastDiff = arr.get(arr.size()-1)-arr.get(arr.size()-2);
+            double prevDiff = arr.get(arr.size()-2)-arr.get(arr.size()-3);
+            accel = alpha*(lastDiff-prevDiff)+(1-alpha)*accel;
         }
-        double avg = arr.stream().mapToDouble(Double::doubleValue).average().orElse(arr.get(arr.size() - 1));
-        return new MicroTrendResult(speed, accel, avg);
+        double avg = arr.stream().mapToDouble(Double::doubleValue).average().orElse(arr.get(arr.size()-1));
+        return new MicroTrendResult(speed,accel,avg);
     }
     private boolean isVolumeStrong(String pair, double lastPrice) {
         OrderbookSnapshot obs = orderbookMap.get(pair);
@@ -919,18 +950,24 @@ public class SignalSender {
 
             // ===== Загрузка исторических свечей и подключение WS =====
             for (String pair : cachedPairs) {
-                List<TradingCore.Candle> c15m = fetchKlines(pair, "15m", KLINES_LIMIT);
-                List<TradingCore.Candle> c1h  = fetchKlines(pair, "1h", KLINES_LIMIT);
+                List<TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
+                List<TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
 
-                histM15.put(pair, new ArrayList<>(c15m));
-                histH1.put(pair, new ArrayList<>(c1h));
+                if(m15.size()<60 || h1.size()<60) continue;
 
-                if (!c15m.isEmpty() && !c1h.isEmpty()) {
-                    Signal s = analyzePair(pair, c15m, c1h); // вместо computeSignal
-                    if (s != null) sendSignalIfAllowed(pair, s, c15m);
+                histM15.put(pair,m15);
+                histH1.put(pair,h1);
+
+                Map<String, Long> map = lastSignalCandleTs.computeIfAbsent(pair,k->new ConcurrentHashMap<>());
+                Long lastSent = map.get("15m");
+                TradingCore.Candle last = m15.get(m15.size()-2);
+                if(lastSent != null && lastSent == last.closeTime) continue;
+
+                Signal s = analyzePair(pair,m15,h1);
+                if(s != null) {
+                    sendSignalIfAllowed(pair,s,m15);
+                    map.put("15m",last.closeTime);
                 }
-
-                connectTickWebSocket(pair);
             }
             System.out.println("[INIT] Historical candles loaded and WS connected for all initial pairs");
         }
@@ -1061,7 +1098,7 @@ public class SignalSender {
 
         double vwap = vwap(candles); // используем твой настоящий метод vwap()
 
-        return price > vwap;
+        return price > vwap * 0.998 && price < vwap * 1.002;
     }
     private boolean checkStructureAlignment(List<TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
@@ -1113,12 +1150,8 @@ public class SignalSender {
 
                 double microBias = Math.tanh(micro.speed * 500);
 
-                double rawScore =
-                        emaScore*0.25 +
-                                rsiScore*0.15 +
-                                momScore*0.20 +
-                                macdScore*0.15 +
-                                microBias*0.25;
+                double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.20 + macdScore*0.15 + microBias*0.25;
+                rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
 
                 double confidence = Math.pow(Math.abs(rawScore),0.7);
 
@@ -1168,8 +1201,8 @@ public class SignalSender {
             }
 
             // сортировка
-            candidates.sort((a,b)->Double.compare(b.confidence,a.confidence));
-
+            candidates.sort(Comparator.comparingDouble((Signal s) -> s.confidence).reversed()
+                    .thenComparing(s -> s.symbol));
             int limit = Math.min(5,candidates.size());
 
             for(int i=0;i<limit;i++){
