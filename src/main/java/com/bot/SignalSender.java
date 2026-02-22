@@ -961,13 +961,12 @@ public class SignalSender {
     }
     public Set<String> getTopSymbolsSet(int limit) {
         try {
-            // Получаем реально торгуемые пары на Binance USDT
+            // Все реально торгуемые пары на Binance
             Set<String> binancePairs = getBinanceSymbolsFutures();
 
-            // Берём топ монет с CoinGecko
+            // Берём топ монет с CoinGecko (market cap)
             String url = "https://api.coingecko.com/api/v3/coins/markets" +
-                    "?vs_currency=usd&order=market_cap_desc&per_page=" + limit + "&page=1";
-
+                    "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"; // <- больше, чтобы компенсировать фильтр
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(15))
@@ -977,16 +976,23 @@ public class SignalSender {
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             JSONArray arr = new JSONArray(resp.body());
 
-            Set<String> topPairs = new HashSet<>();
+            Set<String> topPairs = new LinkedHashSet<>(); // сохраняем порядок
             for (int i = 0; i < arr.length(); i++) {
                 String sym = arr.getJSONObject(i).getString("symbol").toUpperCase();
                 if (Set.of("USDT", "USDC", "BUSD").contains(sym)) continue;
                 String pair = sym + "USDT";
-                // фильтруем только реально существующие на Binance
                 if (binancePairs.contains(pair)) {
                     topPairs.add(pair);
                 }
                 if (topPairs.size() >= limit) break;
+            }
+
+            // Если меньше limit, добиваем просто реальными парами с Binance
+            if (topPairs.size() < limit) {
+                for (String p : binancePairs) {
+                    if (topPairs.size() >= limit) break;
+                    topPairs.add(p);
+                }
             }
 
             System.out.println("[PAIRS] Loaded TOP " + topPairs.size() + " USDT pairs (real pairs only)");
