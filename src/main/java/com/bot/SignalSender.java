@@ -1043,7 +1043,6 @@ public class SignalSender {
 
         return price > vwap;
     }
-
     private boolean checkStructureAlignment(List<TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
         return structure == dir;
