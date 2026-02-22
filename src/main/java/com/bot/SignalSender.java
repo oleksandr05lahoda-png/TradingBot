@@ -1007,7 +1007,6 @@ public class SignalSender {
     private List<TradingCore.Candle> aggregate(List<TradingCore.Candle> base, int factor) {
         List<TradingCore.Candle> res = new ArrayList<>();
         if (base == null || base.size() < factor) return res;
-
         for (int i = 0; i + factor <= base.size(); i += factor) {
             long openTime = base.get(i).openTime;
             double open = base.get(i).open;
