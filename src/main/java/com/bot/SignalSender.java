@@ -205,9 +205,12 @@ public class SignalSender {
                     .build();
 
             return http.sendAsync(req, HttpResponse.BodyHandlers.ofString())
-                    .thenApply(resp -> {
+                    .thenApply((HttpResponse<String> resp) -> {  // явный тип
                         String body = resp.body();
-                        // ...
+                        if (!body.trim().startsWith("[")) {
+                            System.out.println("[Binance] Unexpected response for " + symbol + ": " + body);
+                            return Collections.<TradingCore.Candle>emptyList(); // явный тип
+                        }
                         JSONArray arr = new JSONArray(body);
                         List<TradingCore.Candle> list = new ArrayList<>();
                         for (int i = 0; i < arr.length(); i++) {
@@ -220,17 +223,19 @@ public class SignalSender {
                             double vol = Double.parseDouble(k.getString(5));
                             double qvol = Double.parseDouble(k.getString(7));
                             long closeTime = k.getLong(6);
+
                             list.add(new TradingCore.Candle(openTime, open, high, low, close, vol, qvol, closeTime));
                         }
                         return list;
                     })
                     .exceptionally(e -> {
                         System.out.println("[Binance] Error fetching klines for " + symbol + ": " + e.getMessage());
-                        return Collections.emptyList();
+                        return Collections.<TradingCore.Candle>emptyList(); // явный тип
                     });
+
         } catch (Exception e) {
             System.out.println("[Binance] Error preparing klines request for " + symbol + ": " + e.getMessage());
-            return CompletableFuture.completedFuture(Collections.emptyList());
+            return CompletableFuture.completedFuture(Collections.<TradingCore.Candle>emptyList()); // явный тип
         }
     }
 
