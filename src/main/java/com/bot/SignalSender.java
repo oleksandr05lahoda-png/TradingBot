@@ -1050,37 +1050,42 @@ public class SignalSender {
         signalsThisCycle = 0;
         long now = System.currentTimeMillis();
 
-        // ===== Обновляем топ-пары =====
+        // ===== Получаем только реальные топ-пары USDT с биржи =====
         if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
-            cachedPairs = getTopSymbolsSet(TOP_N);
+            cachedPairs = getTopSymbolsSet(TOP_N).stream()
+                    .filter(BINANCE_PAIRS::contains) // только существующие на Binance
+                    .collect(Collectors.toSet());
             lastBinancePairsRefresh = now;
             System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
         }
 
-        // ===== Фильтруем по доступным парам Binance =====
-        Set<String> symbols = cachedPairs.stream()
-                .filter(BINANCE_PAIRS::contains)
-                .collect(Collectors.toSet());
-
-        for (String pair : symbols) {
+        for (String pair : cachedPairs) {
             try {
+                // ===== Берём свечи =====
                 List<TradingCore.Candle> c15m = histM15.getOrDefault(pair, new ArrayList<>());
                 List<TradingCore.Candle> c1h  = histH1.getOrDefault(pair, new ArrayList<>());
-                if (c15m.size() < 20 || c1h.size() < 20) continue; // чуть меньше баров для старта
+
+                if (c15m.size() < 30 || c1h.size() < 30) {
+                    System.out.println("[Scheduler] Skipping " + pair + " - not enough candles");
+                    continue; // нужно минимум 30 свечей
+                }
 
                 TradingCore.Candle last = c15m.get(c15m.size() - 1);
+
+                // ===== Микротренд =====
                 MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.getOrDefault(pair, new ArrayDeque<>()));
+                MarketPhase phase = detectMarketPhase(c15m, micro);
+                if (phase == MarketPhase.NO_TRADE) continue;
 
-                // 🔹 Убираем жесткий фильтр NO_TRADE для теста
-                // MarketPhase phase = detectMarketPhase(c15m, micro);
-                // if (phase == MarketPhase.NO_TRADE) continue;
-
+                // ===== ATR и волатильность =====
                 double atr15 = atr(c15m, 14);
-                if (atr15 <= 0) continue; // только исключаем нулевой ATR
+                if (atr15 <= 0 || atr15 / last.close < 0.002) continue;
 
+                // ===== RSI =====
                 List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
                 double rsi14 = SignalSender.rsi(closes15, 14);
 
+                // ===== Многотаймфреймовая структура =====
                 int dir15 = marketStructure(c15m);
                 int dir1h = marketStructure(c1h);
                 int mtfConfirm = multiTFConfirm(dir1h, dir15);
@@ -1088,33 +1093,39 @@ public class SignalSender {
                 boolean impulseUp   = last.close > last.open && (last.high - last.low) > atr15 * 0.5;
                 boolean impulseDown = last.close < last.open && (last.high - last.low) > atr15 * 0.5;
 
+                // ===== Определяем сторону =====
                 TradingCore.Side side = null;
-                if (dir15 >= 0 && rsi14 > 20 && rsi14 < 80) side = TradingCore.Side.LONG;
-                else if (dir15 <= 0 && rsi14 > 20 && rsi14 < 80) side = TradingCore.Side.SHORT;
-                if (side == null) side = TradingCore.Side.LONG; // форсим сигнал для теста
+                if (dir15 >= 0 && rsi14 > 30 && rsi14 < 80) side = TradingCore.Side.LONG;
+                else if (dir15 <= 0 && rsi14 > 20 && rsi14 < 70) side = TradingCore.Side.SHORT;
+                if (side == null) continue;
 
+                // ===== Стратегии =====
                 double rawScore = strategyEMANorm(closes15) * 0.35 +
                         strategyRSINorm(closes15) * 0.25 +
                         strategyMomentumNorm(closes15) * 0.20 +
                         strategyMACDNorm(closes15) * 0.20;
 
-                // 🔹 Ослабляем confidence
                 double conf = composeConfidence(
                         rawScore,
                         mtfConfirm,
-                        true, true,
+                        true,  // volOk
+                        true,  // atrOk
                         (side == TradingCore.Side.LONG && impulseUp) || (side == TradingCore.Side.SHORT && impulseDown),
-                        true, true,
+                        true,  // vwapAligned
+                        true,  // structureAligned
                         detectBOS(c15m),
                         detectLiquiditySweep(c15m)
                 );
-                if (side == TradingCore.Side.SHORT) conf -= 0.02;
-                if (conf < 0.2) conf = 0.2; // минимальный порог для теста
+                if (side == TradingCore.Side.SHORT) conf -= 0.03;
 
+                if (conf < MIN_CONF) continue; // фильтр по уверенности
+
+                // ===== Стоп и тейк =====
                 double pct = Math.max(0.003, Math.min(0.01, atr15 / last.close));
                 double stop = side == TradingCore.Side.LONG ? last.close * (1 - pct) : last.close * (1 + pct);
                 double take = side == TradingCore.Side.LONG ? last.close * (1 + pct * 1.4) : last.close * (1 - pct * 1.4);
 
+                // ===== Создаём сигнал =====
                 Signal s = new Signal(
                         pair,
                         side.toString(),
@@ -1133,6 +1144,7 @@ public class SignalSender {
                 s.stop = stop;
                 s.take = take;
 
+                // ===== Отправка сигнала =====
                 sendSignalIfAllowed(pair, s, c15m);
 
             } catch (Exception e) {
