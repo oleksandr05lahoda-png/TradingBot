@@ -6,13 +6,14 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class DecisionEngineMerged {
 
     /* ================= ENUMS ================= */
+    public enum CoinCategory { TOP, ALT, MEME }
     public enum SignalGrade { A, B, C }
     private enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, CLIMAX, VOLATILE }
     private enum HTFBias { BULL, BEAR, NONE }
 
     /* ================= CONFIG ================= */
-    private static final int MIN_BARS = 200;                 // минимальные свечи для анализа
-    private static final long COOLDOWN_MS = 10 * 60_000;    // кулдаун сигналов
+    private static final int MIN_BARS = 200;
+    private static final long COOLDOWN_MS = 10 * 60_000;
     private static final Map<String, Long> cooldown = new ConcurrentHashMap<>();
 
     /* ================= OUTPUT ================= */
@@ -42,7 +43,8 @@ public final class DecisionEngineMerged {
                                     Map<String, List<TradingCore.Candle>> m1,
                                     Map<String, List<TradingCore.Candle>> m5,
                                     Map<String, List<TradingCore.Candle>> m15,
-                                    Map<String, List<TradingCore.Candle>> h1) {
+                                    Map<String, List<TradingCore.Candle>> h1,
+                                    Map<String, CoinCategory> categories) {
 
         List<TradeIdea> ideas = new ArrayList<>();
         long now = System.currentTimeMillis();
@@ -52,14 +54,16 @@ public final class DecisionEngineMerged {
             List<TradingCore.Candle> c5List = m5.get(symbol);
             List<TradingCore.Candle> c15List = m15.get(symbol);
             List<TradingCore.Candle> c1hList = h1.get(symbol);
+            CoinCategory cat = categories.getOrDefault(symbol, CoinCategory.TOP);
 
             if (!isValid(c15List) || !isValid(c1hList)) continue;
 
             HTFBias bias = detectHTFBias(c1hList);
             MarketState state = detectMarketState(c15List);
             boolean microImpulse = detectMicroImpulse(c1);
+            boolean volumeSpike = detectVolumeSpike(c1, cat);
 
-            TradeIdea idea = generateTradeIdea(symbol, c1, c5List, c15List, c1hList, state, bias, microImpulse, now);
+            TradeIdea idea = generateTradeIdea(symbol, c1, c5List, c15List, c1hList, state, bias, microImpulse, volumeSpike, cat, now);
             if (idea != null) ideas.add(idea);
         }
 
@@ -76,6 +80,8 @@ public final class DecisionEngineMerged {
                                         MarketState state,
                                         HTFBias bias,
                                         boolean microImpulse,
+                                        boolean volumeSpike,
+                                        CoinCategory cat,
                                         long now) {
 
         double price = last(c15).close;
@@ -89,56 +95,40 @@ public final class DecisionEngineMerged {
         String reason = null;
 
         // ================= STRATEGIES =================
-        // 1️⃣ Trend Following
+        // 1️⃣ Trend Following w/ category adjustment
         if ((state == MarketState.STRONG_TREND || state == MarketState.WEAK_TREND) && bias != HTFBias.NONE) {
-            if (bias == HTFBias.BULL && ema(c15, 21) > ema(c15, 50)) {
-                if (microImpulse || pricePullback(c15, true)) {
-                    side = TradingCore.Side.LONG;
-                    reason = "Trend Bull + MicroImpulse/Pullback";
-                }
-            }
-            if (bias == HTFBias.BEAR && ema(c15, 21) < ema(c15, 50)) {
-                if (microImpulse || pricePullback(c15, false)) {
-                    side = TradingCore.Side.SHORT;
-                    reason = "Trend Bear + MicroImpulse/Pullback";
-                }
+            double emaShort = ema(c15, 21);
+            double emaLong = ema(c15, 50);
+            boolean trendBull = bias == HTFBias.BULL && emaShort > emaLong;
+            boolean trendBear = bias == HTFBias.BEAR && emaShort < emaLong;
+
+            if (trendBull && (microImpulse || pricePullback(c15,true))) {
+                side = TradingCore.Side.LONG;
+                reason = "Trend Bull + MicroImpulse/Pullback";
+            } else if (trendBear && (microImpulse || pricePullback(c15,false))) {
+                side = TradingCore.Side.SHORT;
+                reason = "Trend Bear + MicroImpulse/Pullback";
             }
         }
 
         // 2️⃣ Divergence / Reversal
         if (side == null) {
-            if (bullishDivergence(c15)) {
-                side = TradingCore.Side.LONG;
-                reason = "Bullish Divergence";
-            } else if (bearishDivergence(c15)) {
-                side = TradingCore.Side.SHORT;
-                reason = "Bearish Divergence";
-            }
+            if (bullishDivergence(c15)) { side = TradingCore.Side.LONG; reason = "Bullish Divergence"; }
+            else if (bearishDivergence(c15)) { side = TradingCore.Side.SHORT; reason = "Bearish Divergence"; }
         }
 
         // 3️⃣ Range / Exhaustion
         if (side == null) {
             double high = highest(c15, 15);
             double low = lowest(c15, 15);
-
-            if (price <= low * 1.005) {
-                side = TradingCore.Side.LONG;
-                reason = "Range Support";
-            } else if (price >= high * 0.995) {
-                side = TradingCore.Side.SHORT;
-                reason = "Range Resistance";
-            }
+            if (price <= low * 1.005) { side = TradingCore.Side.LONG; reason = "Range Support"; }
+            else if (price >= high * 0.995) { side = TradingCore.Side.SHORT; reason = "Range Resistance"; }
         }
 
         // 4️⃣ Climax Reversal
         if (side == null && state == MarketState.CLIMAX) {
-            if (rsi < 45) {
-                side = TradingCore.Side.LONG;
-                reason = "Exhaustion Reversal";
-            } else if (rsi > 55) {
-                side = TradingCore.Side.SHORT;
-                reason = "Exhaustion Reversal";
-            }
+            if (rsi < 45) { side = TradingCore.Side.LONG; reason = "Exhaustion Reversal"; }
+            else if (rsi > 55) { side = TradingCore.Side.SHORT; reason = "Exhaustion Reversal"; }
         }
 
         if (side == null) return null;
@@ -148,7 +138,7 @@ public final class DecisionEngineMerged {
         if (cooldown.containsKey(key) && now - cooldown.get(key) < COOLDOWN_MS) return null;
 
         // ================= CONFIDENCE =================
-        double confidence = computeConfidence(c15, state, adx, vol, microVol, microImpulse);
+        double confidence = computeConfidence(c15, state, adx, vol, microVol, microImpulse, volumeSpike, cat);
 
         if (!passesLocalCheck(c15, side)) confidence *= 0.9;
 
@@ -157,7 +147,7 @@ public final class DecisionEngineMerged {
         if (grade == SignalGrade.C && confidence < 0.50) return null;
 
         // ================= RISK/REWARD =================
-        double risk = atr * 1.0;
+        double risk = atr * (cat == CoinCategory.MEME ? 1.2 : 1.0);
         double rr = confidence > 0.72 ? 2.8 : 2.2;
         double stop = side == TradingCore.Side.LONG ? price - risk : price + risk;
         double take = side == TradingCore.Side.LONG ? price + risk * rr : price - risk * rr;
@@ -178,27 +168,40 @@ public final class DecisionEngineMerged {
     }
 
     private HTFBias detectHTFBias(List<TradingCore.Candle> c){
-        if (ema(c, 50) > ema(c, 200)) return HTFBias.BULL;
-        if (ema(c, 50) < ema(c, 200)) return HTFBias.BEAR;
+        if (ema(c,50) > ema(c,200)) return HTFBias.BULL;
+        if (ema(c,50) < ema(c,200)) return HTFBias.BEAR;
         return HTFBias.NONE;
     }
 
-    /* ================= MICRO TREND DETECTION ================= */
+    /* ================= MICRO TREND / VOLUME ================= */
     private boolean detectMicroImpulse(List<TradingCore.Candle> c){
-        if (c.size() < 5) return false;
+        if (c.size()<5) return false;
         double delta = last(c).close - c.get(c.size()-5).close;
         double vol = relativeVolume(c);
-        return Math.abs(delta) > 0.0003 && vol > 1.02;
+        return Math.abs(delta)>0.0003 && vol>1.02;
+    }
+
+    private boolean detectVolumeSpike(List<TradingCore.Candle> c, CoinCategory cat){
+        if (c.size()<10) return false;
+        double avgVol = c.subList(Math.max(0,c.size()-10),c.size()-1).stream().mapToDouble(cd->cd.volume).average().orElse(1);
+        double lastVol = last(c).volume;
+        double threshold = switch(cat){
+            case MEME -> 1.3;
+            case ALT -> 1.2;
+            default -> 1.1;
+        };
+        return lastVol/avgVol > threshold;
     }
 
     private boolean pricePullback(List<TradingCore.Candle> c, boolean bullish){
-        double ema21 = ema(c, 21);
+        double ema21 = ema(c,21);
         double price = last(c).close;
         return bullish ? price <= ema21*1.012 : price >= ema21*0.988;
     }
 
     /* ================= CONFIDENCE ================= */
-    private double computeConfidence(List<TradingCore.Candle> c, MarketState state, double adx, double vol, double microVol, boolean microImpulse){
+    private double computeConfidence(List<TradingCore.Candle> c, MarketState state, double adx, double vol, double microVol,
+                                     boolean microImpulse, boolean volSpike, CoinCategory cat){
         double structure = Math.abs(ema(c,21)-ema(c,50))/ema(c,50)*10;
         double base = switch(state){
             case STRONG_TREND -> 0.72;
@@ -208,9 +211,15 @@ public final class DecisionEngineMerged {
             case VOLATILE -> 0.58;
         };
         double momentumBoost = (adx/50.0)*0.1;
-        double volBoost = Math.min((vol-1)*0.05, 0.08);
+        double volBoost = Math.min((vol-1)*0.05,0.08);
         double microBoost = microImpulse ? Math.min((microVol-1)*0.08,0.1) : 0;
-        return clamp(base + structure*0.05 + momentumBoost + volBoost + microBoost, 0.50, 0.95);
+        double spikeBoost = volSpike ? 0.05 : 0;
+        double catBoost = switch(cat){
+            case MEME -> 0.05;
+            case ALT -> 0.03;
+            default -> 0;
+        };
+        return clamp(base + structure*0.05 + momentumBoost + volBoost + microBoost + spikeBoost + catBoost,0.50,0.95);
     }
 
     /* ================= LOCAL CHECK ================= */
@@ -218,7 +227,7 @@ public final class DecisionEngineMerged {
         int n=c.size();
         TradingCore.Candle last=last(c);
         TradingCore.Candle prev=c.get(n-2);
-        return side == TradingCore.Side.LONG ? last.close>=prev.low : last.close<=prev.high;
+        return side==TradingCore.Side.LONG ? last.close>=prev.low : last.close<=prev.high;
     }
 
     /* ================= INDICATORS ================= */
@@ -262,7 +271,7 @@ public final class DecisionEngineMerged {
     private boolean isValid(List<?> c){ return c!=null && c.size()>=MIN_BARS; }
     private double clamp(double v,double min,double max){ return Math.max(min,Math.min(max,v)); }
 
-    /* ================= ADDITIONAL STRATEGIES ================= */
+    /* ================= DIVERGENCE ================= */
     private boolean bullishDivergence(List<TradingCore.Candle> c){
         int n=c.size(); if(n<20) return false;
         double low1=c.get(n-3).low, low2=c.get(n-1).low;

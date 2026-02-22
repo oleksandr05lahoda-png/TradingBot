@@ -5,11 +5,8 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class SignalOptimizer {
 
-    /* ================= CONFIG ================= */
     private static final int MAX_TICKS = 60;
     private static final double ALPHA = 0.35;
-
-    private static final double IMPULSE_DEAD = 0.00025;
     private static final double IMPULSE_STRONG = 0.0014;
 
     private final Map<String, Deque<Double>> tickPriceDeque;
@@ -22,11 +19,8 @@ public final class SignalOptimizer {
         this.adaptiveBrain = adaptiveBrain;
     }
 
-    /* ================= MICRO TREND ================= */
     public static final class MicroTrendResult {
-        public final double speed;
-        public final double accel;
-        public final double avg;
+        public final double speed, accel, avg;
 
         public MicroTrendResult(double speed, double accel, double avg) {
             this.speed = speed;
@@ -37,16 +31,13 @@ public final class SignalOptimizer {
 
     public MicroTrendResult computeMicroTrend(String symbol) {
         Deque<Double> dq = tickPriceDeque.get(symbol);
-        if (dq == null || dq.size() < 6)
-            return new MicroTrendResult(0, 0, 0);
+        if (dq == null || dq.size() < 6) return new MicroTrendResult(0, 0, 0);
 
         List<Double> prices = new ArrayList<>(dq);
         int size = prices.size();
         int n = Math.min(size, MAX_TICKS);
 
-        double speed = 0;
-        double accel = 0;
-
+        double speed = 0, accel = 0;
         for (int i = size - n + 1; i < size; i++) {
             double diff = prices.get(i) - prices.get(i - 1);
             double prevSpeed = speed;
@@ -54,107 +45,77 @@ public final class SignalOptimizer {
             accel = ALPHA * (speed - prevSpeed) + (1 - ALPHA) * accel;
         }
 
-        double avg = prices.subList(size - n, size)
-                .stream()
-                .mapToDouble(d -> d)
-                .average()
+        double avg = prices.subList(size - n, size).stream().mapToDouble(d -> d).average()
                 .orElse(prices.get(size - 1));
 
         MicroTrendResult result = new MicroTrendResult(speed, accel, avg);
         microTrendCache.put(symbol, result);
-
-        System.out.println("[MicroTrend] " + symbol + " speed=" + speed + " accel=" + accel);
         return result;
     }
 
-    /* ================= CONFIDENCE ================= */
-    public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s, double baseConfidence) {
-        double conf = baseConfidence;
+    public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s) {
+        double conf = s.confidence;
         MicroTrendResult mt = microTrendCache.get(s.symbol);
-
         if (mt != null) {
             double impulse = Math.abs(mt.speed) + Math.abs(mt.accel);
-            System.out.println("[AdjustConfidence] " + s.symbol + " base=" + baseConfidence +
-                    " impulse=" + impulse + " side=" + s.side);
-
-            if (impulse > IMPULSE_STRONG) {
-                conf += 0.05;
-                System.out.println("[AdjustConfidence] strong impulse, +0.05 boost");
-            }
+            if (impulse > IMPULSE_STRONG) conf += 0.05;
         }
 
         if (adaptiveBrain != null) {
             conf = adaptiveBrain.applyAllAdjustments(
-                    "ELITE15",
+                    "ELITE5",
                     s.symbol,
                     conf,
-                    TradingCore.CoinType.TOP,
+                    detectTradingCoreCoinType(s),
                     true,
                     false
             );
         }
 
-        conf = clamp(conf, 0.50, 0.97);
-        System.out.println("[AdjustConfidence] final conf=" + conf);
-        return conf;
+        return clamp(conf, 0.40, 0.97);
     }
 
-    /* ================= STOP / TAKE ================= */
     public Elite5MinAnalyzer.TradeSignal withAdjustedStopTake(
-            Elite5MinAnalyzer.TradeSignal s,
-            double atr) {
+            Elite5MinAnalyzer.TradeSignal s, double atr) {
 
         double volPct = clamp(atr / s.entry, 0.007, 0.045);
-
         double rr = s.confidence > 0.80 ? 2.8 :
                 s.confidence > 0.70 ? 2.3 :
                         s.confidence > 0.60 ? 1.9 : 1.6;
 
-        double stop;
-        double take;
+        double stop = s.side == TradingCore.Side.LONG ? s.entry * (1 - volPct)
+                : s.entry * (1 + volPct);
+        double take = s.side == TradingCore.Side.LONG ? s.entry * (1 + volPct * rr)
+                : s.entry * (1 - volPct * rr);
 
-        if (s.side == TradingCore.Side.LONG) {
-            stop = s.entry * (1 - volPct);
-            take = s.entry * (1 + volPct * rr);
-        } else {
-            stop = s.entry * (1 + volPct);
-            take = s.entry * (1 - volPct * rr);
-        }
-
-        System.out.println("[StopTake] " + s.symbol + " stop=" + stop + " take=" + take);
         return new Elite5MinAnalyzer.TradeSignal(
-                s.symbol, s.side, s.entry, stop, take, s.confidence, s.reason, s.grade
+                s.symbol,
+                s.side,
+                s.entry,
+                stop,
+                take,
+                adjustConfidence(s),
+                s.grade,
+                s.reason,
+                convertToEliteCoinType(detectTradingCoreCoinType(s))
         );
     }
 
-    /* ================= HTF ALIGNMENT ================= */
-    public boolean alignsWithDecisionEngine(DecisionEngineMerged.TradeIdea idea, List<TradingCore.Candle> h1) {
-        if (h1 == null || h1.size() < 200)
-            return true;
-
-        double ema50 = ema(h1, 50);
-        double ema200 = ema(h1, 200);
-
-        boolean aligns = idea.side == TradingCore.Side.LONG ? ema50 > ema200 : ema50 < ema200;
-        System.out.println("[HTFAlignment] " + idea.symbol + " aligns=" + aligns);
-        return aligns;
+    private Elite5MinAnalyzer.CoinType convertToEliteCoinType(TradingCore.CoinType type) {
+        return switch (type) {
+            case TOP -> Elite5MinAnalyzer.CoinType.TOP;
+            case ALT -> Elite5MinAnalyzer.CoinType.ALT;
+            case MEME -> Elite5MinAnalyzer.CoinType.MEME;
+        };
     }
 
-    /* ================= UTILS ================= */
+    private TradingCore.CoinType detectTradingCoreCoinType(Elite5MinAnalyzer.TradeSignal s) {
+        if (s.symbol.toUpperCase().contains("MEME")) return TradingCore.CoinType.MEME;
+        if (s.symbol.toUpperCase().contains("ALT")) return TradingCore.CoinType.ALT;
+        return TradingCore.CoinType.TOP;
+    }
+
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
-    }
-
-    private double ema(List<TradingCore.Candle> c, int p) {
-        if (c.size() < p)
-            return c.get(c.size() - 1).close;
-
-        double k = 2.0 / (p + 1);
-        double e = c.get(c.size() - p).close;
-
-        for (int i = c.size() - p + 1; i < c.size(); i++)
-            e = c.get(i).close * k + e * (1 - k);
-
-        return e;
     }
 }
