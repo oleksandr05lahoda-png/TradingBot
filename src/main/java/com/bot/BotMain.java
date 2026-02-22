@@ -8,7 +8,9 @@ public class BotMain {
     // ===== CONFIG =====
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
-    private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
+
+    // Используем локальный часовой пояс устройства
+    private static final ZoneId ZONE = ZoneId.systemDefault();
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     public static void main(String[] args) {
@@ -21,7 +23,7 @@ public class BotMain {
         try {
             LocalDateTime now = LocalDateTime.now(ZONE);
 
-            telegram.sendMessageAsync("🚀 Бот запущен");
+            telegram.sendMessageAsync("🚀 Бот запущен в локальном времени: " + now.format(TIME_FORMATTER));
             System.out.println("[" + now.format(TIME_FORMATTER) + "] Bot started");
 
             // ===== START SIGNALS =====
@@ -37,5 +39,15 @@ public class BotMain {
                 Thread.sleep(60_000); // спим по 1 минуте
             } catch (InterruptedException ignored) {}
         }
+    }
+
+    /**
+     * Метод для конвертации времени от биржи (UTC timestamp) в локальное
+     * Используй при выводе сигналов/свечей
+     */
+    public static String formatLocalTime(long utcMillis) {
+        Instant instant = Instant.ofEpochMilli(utcMillis);
+        ZonedDateTime local = instant.atZone(ZONE);
+        return local.format(DateTimeFormatter.ofPattern("HH:mm"));
     }
 }

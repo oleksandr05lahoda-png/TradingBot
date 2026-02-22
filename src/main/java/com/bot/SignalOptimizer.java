@@ -5,9 +5,19 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class SignalOptimizer {
 
-    private static final int MAX_TICKS = 60;
-    private static final double ALPHA = 0.35;
-    private static final double IMPULSE_STRONG = 0.0014;
+    /* ================= CONFIG ================= */
+
+    private static final int MAX_TICKS = 80;
+    private static final int MIN_TICKS = 8;
+
+    private static final double EMA_ALPHA = 0.32;
+    private static final double STRONG_IMPULSE = 0.0015;
+    private static final double WEAK_IMPULSE   = 0.0006;
+
+    private static final double MAX_CONF = 0.97;
+    private static final double MIN_CONF = 0.40;
+
+    /* ================= STATE ================= */
 
     private final Map<String, Deque<Double>> tickPriceDeque;
     private final Map<String, MicroTrendResult> microTrendCache = new ConcurrentHashMap<>();
@@ -19,113 +29,198 @@ public final class SignalOptimizer {
         this.adaptiveBrain = adaptiveBrain;
     }
 
+    /* ================= DATA CLASS ================= */
+
     public static final class MicroTrendResult {
-        public final double speed, accel, avg;
+        public final double speed;
+        public final double accel;
+        public final double avg;
+        public final double impulse;
 
         public MicroTrendResult(double speed, double accel, double avg) {
             this.speed = speed;
             this.accel = accel;
             this.avg = avg;
-        }
-
-        @Override
-        public String toString() {
-            return String.format("MicroTrend[speed=%.6f, accel=%.6f, avg=%.6f]", speed, accel, avg);
+            this.impulse = Math.abs(speed) + Math.abs(accel);
         }
     }
 
-    /** Вычисляет микротренд на основании последних MAX_TICKS тиков */
+    /* ============================================================
+       MICRO TREND CALCULATION (EMA SPEED + EMA ACCELERATION)
+       ============================================================ */
+
     public MicroTrendResult computeMicroTrend(String symbol) {
+
         Deque<Double> dq = tickPriceDeque.get(symbol);
-        if (dq == null || dq.size() < 6) return new MicroTrendResult(0, 0, 0);
+        if (dq == null || dq.size() < MIN_TICKS)
+            return MicroTrendResultZero.INSTANCE;
 
-        List<Double> prices = new ArrayList<>(dq);
-        int size = prices.size();
-        int n = Math.min(size, MAX_TICKS);
+        double speed = 0.0;
+        double accel = 0.0;
 
-        double speed = 0, accel = 0;
-        for (int i = size - n + 1; i < size; i++) {
-            double diff = prices.get(i) - prices.get(i - 1);
-            double prevSpeed = speed;
-            speed = ALPHA * diff + (1 - ALPHA) * speed;
-            accel = ALPHA * (speed - prevSpeed) + (1 - ALPHA) * accel;
+        int processed = 0;
+        double prevPrice = 0.0;
+        double sum = 0.0;
+
+        Iterator<Double> it = dq.descendingIterator();
+
+        List<Double> buffer = new ArrayList<>(MAX_TICKS);
+        while (it.hasNext() && buffer.size() < MAX_TICKS) {
+            buffer.add(it.next());
         }
 
-        double avg = prices.subList(size - n, size).stream().mapToDouble(d -> d).average()
-                .orElse(prices.get(size - 1));
+        Collections.reverse(buffer);
+
+        for (double price : buffer) {
+            if (processed == 0) {
+                prevPrice = price;
+                sum += price;
+                processed++;
+                continue;
+            }
+
+            double diff = price - prevPrice;
+
+            double prevSpeed = speed;
+            speed = EMA_ALPHA * diff + (1 - EMA_ALPHA) * speed;
+            accel = EMA_ALPHA * (speed - prevSpeed) + (1 - EMA_ALPHA) * accel;
+
+            prevPrice = price;
+            sum += price;
+            processed++;
+        }
+
+        double avg = sum / processed;
 
         MicroTrendResult result = new MicroTrendResult(speed, accel, avg);
         microTrendCache.put(symbol, result);
+
         return result;
     }
 
-    /** Корректировка confidence с учетом микротренда и адаптивного мозга */
-    public double adjustConfidence(Elite5MinAnalyzer.TradeSignal s) {
-        double conf = s.confidence;
-        MicroTrendResult mt = microTrendCache.get(s.symbol);
-        if (mt != null) {
-            double impulse = Math.abs(mt.speed) + Math.abs(mt.accel);
-            if (impulse > IMPULSE_STRONG) conf += 0.05; // бонус за сильный микротренд
+    /* ============================================================
+       CONFIDENCE ADJUSTMENT
+       ============================================================ */
+
+    public double adjustConfidence(Elite5MinAnalyzer.TradeSignal signal) {
+
+        MicroTrendResult mt = microTrendCache.get(signal.symbol);
+        if (mt == null) return signal.confidence;
+
+        double confidence = signal.confidence;
+
+        boolean isLong = signal.side == TradingCore.Side.LONG;
+        boolean trendUp = mt.speed > 0;
+
+        /* ===== IMPULSE LOGIC ===== */
+
+        if (mt.impulse > STRONG_IMPULSE) {
+
+            if ((isLong && trendUp) || (!isLong && !trendUp)) {
+                confidence += 0.07; // сильное подтверждение
+            } else {
+                confidence -= 0.06; // сильное противоречие
+            }
+
+        } else if (mt.impulse > WEAK_IMPULSE) {
+
+            if ((isLong && trendUp) || (!isLong && !trendUp)) {
+                confidence += 0.03;
+            } else {
+                confidence -= 0.03;
+            }
         }
 
+        /* ===== ADAPTIVE BRAIN ===== */
+
         if (adaptiveBrain != null) {
-            conf = adaptiveBrain.applyAllAdjustments(
+            confidence = adaptiveBrain.applyAllAdjustments(
                     "ELITE5",
-                    s.symbol,
-                    conf,
-                    detectTradingCoreCoinType(s),
+                    signal.symbol,
+                    confidence,
+                    detectTradingCoreCoinType(signal),
                     true,
                     false
             );
         }
 
-        return clamp(conf, 0.40, 0.97);
+        return clamp(confidence, MIN_CONF, MAX_CONF);
     }
 
-    /** Пересчитывает stop и take под ATR и confidence */
+    /* ============================================================
+       STOP / TAKE OPTIMIZATION (ATR ADAPTIVE)
+       ============================================================ */
+
     public Elite5MinAnalyzer.TradeSignal withAdjustedStopTake(
-            Elite5MinAnalyzer.TradeSignal s, double atr) {
+            Elite5MinAnalyzer.TradeSignal signal,
+            double atr) {
 
-        double volPct = clamp(atr / s.entry, 0.007, 0.045); // корректировка под волатильность
-        double rr = s.confidence > 0.80 ? 2.8 :
-                s.confidence > 0.70 ? 2.3 :
-                        s.confidence > 0.60 ? 1.9 : 1.6;
+        double newConfidence = adjustConfidence(signal);
 
-        double stop = s.side == TradingCore.Side.LONG ? s.entry * (1 - volPct)
-                : s.entry * (1 + volPct);
-        double take = s.side == TradingCore.Side.LONG ? s.entry * (1 + volPct * rr)
-                : s.entry * (1 - volPct * rr);
+        double volatilityPct = clamp(atr / signal.entry, 0.006, 0.035);
+
+        double rr =
+                newConfidence > 0.85 ? 3.2 :
+                        newConfidence > 0.75 ? 2.6 :
+                                newConfidence > 0.65 ? 2.1 :
+                                        1.7;
+
+        double stop;
+        double take;
+
+        if (signal.side == TradingCore.Side.LONG) {
+            stop = signal.entry * (1 - volatilityPct);
+            take = signal.entry * (1 + volatilityPct * rr);
+        } else {
+            stop = signal.entry * (1 + volatilityPct);
+            take = signal.entry * (1 - volatilityPct * rr);
+        }
 
         return new Elite5MinAnalyzer.TradeSignal(
-                s.symbol,
-                s.side,
-                s.entry,
+                signal.symbol,
+                signal.side,
+                signal.entry,
                 stop,
                 take,
-                adjustConfidence(s),
-                s.grade,
-                s.reason,
-                convertToEliteCoinType(detectTradingCoreCoinType(s))
+                newConfidence,
+                signal.grade,
+                signal.reason,
+                convertToEliteCoinType(detectTradingCoreCoinType(signal))
         );
     }
 
+    /* ============================================================
+       HELPERS
+       ============================================================ */
+
     private Elite5MinAnalyzer.CoinType convertToEliteCoinType(TradingCore.CoinType type) {
         return switch (type) {
-            case TOP -> Elite5MinAnalyzer.CoinType.TOP;
-            case ALT -> Elite5MinAnalyzer.CoinType.ALT;
+            case TOP  -> Elite5MinAnalyzer.CoinType.TOP;
+            case ALT  -> Elite5MinAnalyzer.CoinType.ALT;
             case MEME -> Elite5MinAnalyzer.CoinType.MEME;
         };
     }
 
-    private TradingCore.CoinType detectTradingCoreCoinType(Elite5MinAnalyzer.TradeSignal s) {
+    private TradingCore.CoinType detectTradingCoreCoinType(
+            Elite5MinAnalyzer.TradeSignal s) {
+
         String sym = s.symbol.toUpperCase();
-        if (sym.contains("MEME")) return TradingCore.CoinType.MEME;
-        if (sym.contains("ALT")) return TradingCore.CoinType.ALT;
-        return TradingCore.CoinType.TOP;
+
+        if (sym.contains("PEPE") || sym.contains("DOGE") || sym.contains("SHIB"))
+            return TradingCore.CoinType.MEME;
+
+        if (sym.contains("BTC") || sym.contains("ETH"))
+            return TradingCore.CoinType.TOP;
+
+        return TradingCore.CoinType.ALT;
     }
 
-    /** Безопасный clamp */
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
+    }
+
+    private static final class MicroTrendResultZero {
+        private static final MicroTrendResult INSTANCE =
+                new MicroTrendResult(0, 0, 0);
     }
 }

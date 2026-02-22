@@ -59,7 +59,7 @@ public class SignalSender {
     private final Map<String, List<TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
     private final TradingCore.AdaptiveBrain adaptiveBrain;
     private final SignalOptimizer optimizer;
-    private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01);
+    private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01, 0.05, 1.0);
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     private final Map<String, Signal> activeSignals = new ConcurrentHashMap<>();
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
@@ -216,12 +216,12 @@ public class SignalSender {
                         for (int i = 0; i < arr.length(); i++) {
                             JSONArray k = arr.getJSONArray(i);
                             long openTime = k.getLong(0);
-                            double open = Double.parseDouble(k.getString(1));
-                            double high = Double.parseDouble(k.getString(2));
-                            double low = Double.parseDouble(k.getString(3));
+                            double open  = Double.parseDouble(k.getString(1));
+                            double high  = Double.parseDouble(k.getString(2));
+                            double low   = Double.parseDouble(k.getString(3));
                             double close = Double.parseDouble(k.getString(4));
-                            double vol = Double.parseDouble(k.getString(5));
-                            double qvol = Double.parseDouble(k.getString(7));
+                            double vol   = Double.parseDouble(k.getString(5));
+                            double qvol  = k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0; // <-- исправлено
                             long closeTime = k.getLong(6);
 
                             list.add(new TradingCore.Candle(openTime, open, high, low, close, vol, qvol, closeTime));
@@ -770,7 +770,6 @@ public class SignalSender {
         wsWatcher.execute(() -> connectWsInternal(pair));
     }
     private Signal analyzePair(String pair, List<TradingCore.Candle> c15m, List<TradingCore.Candle> c1h) {
-        // Простейший пример: берём последнюю свечу и делаем LONG если close > open
         TradingCore.Candle last = c15m.get(c15m.size() - 1);
         String dir = last.close > last.open ? "LONG" : "SHORT";
 
@@ -794,7 +793,6 @@ public class SignalSender {
                 0.0  // rsi4
         );
 
-        // stop/take можно добавить здесь при желании
         return s;
     }
     private void connectWsInternal(String pair) {
@@ -927,9 +925,8 @@ public class SignalSender {
                 histM15.put(pair, new ArrayList<>(c15m));
                 histH1.put(pair, new ArrayList<>(c1h));
 
-                // ----- Новый блок: анализируем исторические свечи -----
                 if (!c15m.isEmpty() && !c1h.isEmpty()) {
-                    Signal s = analyzePair(pair, c15m, c1h);
+                    Signal s = analyzePair(pair, c15m, c1h); // вместо computeSignal
                     if (s != null) sendSignalIfAllowed(pair, s, c15m);
                 }
 
@@ -1029,7 +1026,6 @@ public class SignalSender {
             return Set.of("BTCUSDT", "ETHUSDT"); // fallback
         }
     }
-    // ========================= AGGREGATE candles =========================
     private List<TradingCore.Candle> aggregate(List<TradingCore.Candle> base, int factor) {
         List<TradingCore.Candle> res = new ArrayList<>();
         if (base == null || base.size() < factor) return res;
@@ -1048,19 +1044,10 @@ public class SignalSender {
                 high = Math.max(high, c.high);
                 low = Math.min(low, c.low);
                 volume += c.volume;
-                qvol += c.quoteAssetVolume;
+                qvol += c.qvol;
             }
 
-            res.add(new TradingCore.Candle(
-                    openTime,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    qvol,
-                    closeTime
-            ));
+            res.add(new TradingCore.Candle(openTime, open, high, low, close, volume, qvol, closeTime));
         }
         return res;
     }
