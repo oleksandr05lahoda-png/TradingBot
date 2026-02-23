@@ -1266,17 +1266,20 @@ public class SignalSender {
             for (int i = 0; i < limit; i++) {
                 Signal s = candidates.get(i);
 
-                sendSignalIfAllowed(s.symbol, s,
-                        fetchKlines(s.symbol,"15m",KLINES_LIMIT));
+                List<com.bot.TradingCore.Candle> m15 =
+                        fetchKlines(s.symbol, "15m", KLINES_LIMIT);
+
+                if (m15.size() < 2) continue;
+
+                com.bot.TradingCore.Candle lastClosed =
+                        m15.get(m15.size() - 2);
+
+                sendSignalIfAllowed(s.symbol, s, m15);
 
                 lastSignalCandleTs
                         .computeIfAbsent(s.symbol, k -> new ConcurrentHashMap<>())
-                        .put("15m",
-                                fetchKlines(s.symbol,"15m",KLINES_LIMIT)
-                                        .get(KLINES_LIMIT - 2).closeTime
-                        );
+                        .put("15m", lastClosed.closeTime);
             }
-
         } catch (Exception e) {
             e.printStackTrace();
         }
