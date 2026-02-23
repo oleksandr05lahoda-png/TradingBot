@@ -52,14 +52,13 @@ public class SignalSender {
     private final Map<String, Map<String, Long>> lastSignalCandleTs = new ConcurrentHashMap<>();
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private Set<String> cachedPairs = new HashSet<>();
-    private final DecisionEngineMerged decisionEngine;
-    private final Elite5MinAnalyzer elite5MinAnalyzer;
+    private final com.bot.DecisionEngineMerged decisionEngine;
     // ========================= HISTORICAL CANDLES =========================
-    private final Map<String, List<TradingCore.Candle>> histM15 = new ConcurrentHashMap<>();
-    private final Map<String, List<TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
-    private final TradingCore.AdaptiveBrain adaptiveBrain;
+    private final Map<String, List<com.bot.TradingCore.Candle>> histM15 = new ConcurrentHashMap<>();
+    private final Map<String, List<com.bot.TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
+    private final com.bot.TradingCore.AdaptiveBrain adaptiveBrain;
     private final SignalOptimizer optimizer;
-    private final TradingCore.RiskEngine riskEngine = new TradingCore.RiskEngine(0.01, 0.05, 1.0);
+    private final com.bot.TradingCore.RiskEngine riskEngine = new com.bot.TradingCore.RiskEngine(0.01, 0.05, 1.0);
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     private final Map<String, Signal> activeSignals = new ConcurrentHashMap<>();
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
@@ -91,11 +90,10 @@ public class SignalSender {
         this.VOLUME_SPIKE_MULT = envDouble("VOL_SPIKE_MULT", 1.4);
 
         this.STABLE = Set.of("USDT", "USDC", "BUSD");
-        this.decisionEngine = new DecisionEngineMerged();
-        this.adaptiveBrain = new TradingCore.AdaptiveBrain();
-        this.elite5MinAnalyzer = new Elite5MinAnalyzer();
-        TradingCore.AdaptiveBrain brain = new TradingCore.AdaptiveBrain();
-        this.optimizer = new SignalOptimizer(this.tickPriceDeque, brain);
+        this.decisionEngine = new com.bot.DecisionEngineMerged();
+        this.adaptiveBrain = new com.bot.TradingCore.AdaptiveBrain();
+        com.bot.TradingCore.AdaptiveBrain brain = new com.bot.TradingCore.AdaptiveBrain();
+        this.optimizer = new SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
     }
 
@@ -192,7 +190,7 @@ public class SignalSender {
         }
     }
 
-    public CompletableFuture<List<TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
+    public CompletableFuture<List<com.bot.TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
             String url = String.format(
                     "https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
@@ -209,10 +207,10 @@ public class SignalSender {
                         String body = resp.body();
                         if (!body.trim().startsWith("[")) {
                             System.out.println("[Binance] Unexpected response for " + symbol + ": " + body);
-                            return Collections.<TradingCore.Candle>emptyList(); // явный тип
+                            return Collections.<com.bot.TradingCore.Candle>emptyList(); // явный тип
                         }
                         JSONArray arr = new JSONArray(body);
-                        List<TradingCore.Candle> list = new ArrayList<>();
+                        List<com.bot.TradingCore.Candle> list = new ArrayList<>();
                         for (int i = 0; i < arr.length(); i++) {
                             JSONArray k = arr.getJSONArray(i);
                             long openTime = k.getLong(0);
@@ -224,18 +222,18 @@ public class SignalSender {
                             double qvol  = k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0; // <-- исправлено
                             long closeTime = k.getLong(6);
 
-                            list.add(new TradingCore.Candle(openTime, open, high, low, close, vol, qvol, closeTime));
+                            list.add(new com.bot.TradingCore.Candle(openTime, open, high, low, close, vol, qvol, closeTime));
                         }
                         return list;
                     })
                     .exceptionally(e -> {
                         System.out.println("[Binance] Error fetching klines for " + symbol + ": " + e.getMessage());
-                        return Collections.<TradingCore.Candle>emptyList(); // явный тип
+                        return Collections.<com.bot.TradingCore.Candle>emptyList(); // явный тип
                     });
 
         } catch (Exception e) {
             System.out.println("[Binance] Error preparing klines request for " + symbol + ": " + e.getMessage());
-            return CompletableFuture.completedFuture(Collections.<TradingCore.Candle>emptyList()); // явный тип
+            return CompletableFuture.completedFuture(Collections.<com.bot.TradingCore.Candle>emptyList()); // явный тип
         }
     }
 
@@ -251,7 +249,7 @@ public class SignalSender {
             this.intervalMs = intervalMs;
         }
 
-        public Optional<TradingCore.Candle> addTick(long tsMillis, double price, double qty) {
+        public Optional<com.bot.TradingCore.Candle> addTick(long tsMillis, double price, double qty) {
             long bucket = (tsMillis / intervalMs) * intervalMs;
             if (currentBucketStart == -1) {
                 currentBucketStart = bucket;
@@ -270,7 +268,7 @@ public class SignalSender {
                 volume += qty;
                 return Optional.empty();
             } else {
-                TradingCore.Candle c = new TradingCore.Candle(currentBucketStart, open, high, low, close, volume, volume, closeTime);
+                com.bot.TradingCore.Candle c = new com.bot.TradingCore.Candle(currentBucketStart, open, high, low, close, volume, volume, closeTime);
                 currentBucketStart = bucket;
                 open = price;
                 high = price;
@@ -344,12 +342,12 @@ public class SignalSender {
 
 
     // ATR
-    public static double atr(List<TradingCore.Candle> candles, int period) {
+    public static double atr(List<com.bot.TradingCore.Candle> candles, int period) {
         if (candles == null || candles.size() <= period) return 0.0;
         List<Double> trs = new ArrayList<>();
         for (int i = 1; i < candles.size(); i++) {
-            TradingCore.Candle prev = candles.get(i - 1);
-            TradingCore.Candle cur = candles.get(i);
+            com.bot.TradingCore.Candle prev = candles.get(i - 1);
+            com.bot.TradingCore.Candle cur = candles.get(i);
             double highLow = cur.high - cur.low;
             double highClose = Math.abs(cur.high - prev.close);
             double lowClose = Math.abs(cur.low - prev.close);
@@ -370,10 +368,10 @@ public class SignalSender {
         return (last - prev) / (prev + 1e-12);
     }
 
-    public static double vwap(List<TradingCore.Candle> candles) {
+    public static double vwap(List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.isEmpty()) return 0.0;
         double pv = 0.0, vol = 0.0;
-        for (TradingCore.Candle c : candles) {
+        for (com.bot.TradingCore.Candle c : candles) {
             double tp = (c.high + c.low + c.close) / 3.0;
             pv += tp * c.volume;
             vol += c.volume;
@@ -383,7 +381,7 @@ public class SignalSender {
     }
 
     // ========================= Price Action helpers =========================
-    public static List<Integer> detectSwingHighs(List<TradingCore.Candle> candles, int leftRight) {
+    public static List<Integer> detectSwingHighs(List<com.bot.TradingCore.Candle> candles, int leftRight) {
         List<Integer> res = new ArrayList<>();
         for (int i = leftRight; i < candles.size() - leftRight; i++) {
             double v = candles.get(i).high;
@@ -399,7 +397,7 @@ public class SignalSender {
         return res;
     }
 
-    public static List<Integer> detectSwingLows(List<TradingCore.Candle> candles, int leftRight) {
+    public static List<Integer> detectSwingLows(List<com.bot.TradingCore.Candle> candles, int leftRight) {
         List<Integer> res = new ArrayList<>();
         for (int i = leftRight; i < candles.size() - leftRight; i++) {
             double v = candles.get(i).low;
@@ -415,7 +413,7 @@ public class SignalSender {
         return res;
     }
 
-    public static int marketStructure(List<TradingCore.Candle> candles) {
+    public static int marketStructure(List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 20) return 0;
         List<Integer> highs = detectSwingHighs(candles, 5);
         List<Integer> lows = detectSwingLows(candles, 5);
@@ -437,7 +435,7 @@ public class SignalSender {
         return 0;
     }
     private MarketPhase detectMarketPhase(
-            List<TradingCore.Candle> c15m,
+            List<com.bot.TradingCore.Candle> c15m,
             MicroTrendResult micro
     ) {
         int structure = marketStructure(c15m);
@@ -479,12 +477,12 @@ public class SignalSender {
 
         return MarketPhase.NO_TRADE;
     }
-    public static boolean detectBOS(List<TradingCore.Candle> candles) {
+    public static boolean detectBOS(List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 10) return false;
         List<Integer> highs = detectSwingHighs(candles, 3);
         List<Integer> lows = detectSwingLows(candles, 3);
         if (highs.size() < 2 && lows.size() < 2) return false;
-        TradingCore.Candle last = candles.get(candles.size() - 1);
+        com.bot.TradingCore.Candle last = candles.get(candles.size() - 1);
         if (highs.size() >= 2) {
             double lastSwingHigh = candles.get(highs.get(highs.size() - 1)).high;
             if (last.close > lastSwingHigh * 1.0006) return true;
@@ -496,11 +494,11 @@ public class SignalSender {
         return false;
     }
 
-    public static boolean detectLiquiditySweep(List<TradingCore.Candle> candles) {
+    public static boolean detectLiquiditySweep(List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 6) return false;
         int n = candles.size();
-        TradingCore.Candle last = candles.get(n - 1);
-        TradingCore.Candle prev = candles.get(n - 2);
+        com.bot.TradingCore.Candle last = candles.get(n - 1);
+        com.bot.TradingCore.Candle prev = candles.get(n - 2);
         double upperWick = last.high - Math.max(last.open, last.close);
         double lowerWick = Math.min(last.open, last.close) - last.low;
         double body = Math.abs(last.close - last.open);
@@ -509,7 +507,7 @@ public class SignalSender {
         return false;
     }
 
-    private int emaDirection(List<TradingCore.Candle> candles, int fast, int slow) {
+    private int emaDirection(List<com.bot.TradingCore.Candle> candles, int fast, int slow) {
         if (candles == null || candles.size() < Math.max(slow + 5, 60)) return 0;
 
         List<Double> closes = candles.subList(candles.size() - 60, candles.size())
@@ -541,7 +539,7 @@ public class SignalSender {
     }
 
     private double holdProbability5Bars(
-            List<TradingCore.Candle> c15m,
+            List<com.bot.TradingCore.Candle> c15m,
             String direction
     ) {
         if (c15m.size() < 30) return 0.5;
@@ -626,7 +624,7 @@ public class SignalSender {
 
         return conf;
     }
-    private double lastSwingLow(List<TradingCore.Candle> candles) {
+    private double lastSwingLow(List<com.bot.TradingCore.Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double low = Double.POSITIVE_INFINITY;
         for (int i = candles.size() - lookback; i < candles.size(); i++)
@@ -634,7 +632,7 @@ public class SignalSender {
         return low;
     }
 
-    private double lastSwingHigh(List<TradingCore.Candle> candles) {
+    private double lastSwingHigh(List<com.bot.TradingCore.Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double high = Double.NEGATIVE_INFINITY;
         for (int i = candles.size() - lookback; i < candles.size(); i++)
@@ -644,7 +642,7 @@ public class SignalSender {
 
     private void sendSignalIfAllowed(String pair,
                                      Signal s,
-                                     List<TradingCore.Candle> closes15m) {
+                                     List<com.bot.TradingCore.Candle> closes15m) {
 
         if (s.confidence < MIN_CONF) {
             System.out.println("[SignalSender] Skipped " + pair + " due to low confidence: " + String.format("%.2f", s.confidence));
@@ -652,7 +650,7 @@ public class SignalSender {
         }
         if (closes15m.size() < 4) return;
 
-        List<TradingCore.Candle> recent = new ArrayList<>(closes15m);
+        List<com.bot.TradingCore.Candle> recent = new ArrayList<>(closes15m);
 
         boolean bos = detectBOS(recent);
         boolean liqSweep = detectLiquiditySweep(recent);
@@ -768,10 +766,10 @@ public class SignalSender {
     public void connectTickWebSocket(String pair) {
         wsWatcher.execute(() -> connectWsInternal(pair));
     }
-    private Signal analyzePair(String pair, List<TradingCore.Candle> c15m, List<TradingCore.Candle> c1h) {
+    private Signal analyzePair(String pair, List<com.bot.TradingCore.Candle> c15m, List<com.bot.TradingCore.Candle> c1h) {
         if(c15m.size()<60 || c1h.size()<60) return null;
 
-        TradingCore.Candle last = c15m.get(c15m.size() - 1);
+        com.bot.TradingCore.Candle last = c15m.get(c15m.size() - 1);
         List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
         List<Double> closes1h = c1h.stream().map(c -> c.close).toList();
 
@@ -923,9 +921,9 @@ public class SignalSender {
         wsWatcher.shutdown();
     }
 
-    public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
+    public List<com.bot.TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
-            List<TradingCore.Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
+            List<com.bot.TradingCore.Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
             if (candles.isEmpty()) {
                 System.out.println("[KLİNES] Пустой ответ для " + symbol + " интервал " + interval);
             } else {
@@ -950,8 +948,8 @@ public class SignalSender {
 
             // ===== Загрузка исторических свечей и подключение WS =====
             for (String pair : cachedPairs) {
-                List<TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
-                List<TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
 
                 if(m15.size()<60 || h1.size()<60) continue;
 
@@ -960,7 +958,7 @@ public class SignalSender {
 
                 Map<String, Long> map = lastSignalCandleTs.computeIfAbsent(pair,k->new ConcurrentHashMap<>());
                 Long lastSent = map.get("15m");
-                TradingCore.Candle last = m15.get(m15.size()-2);
+                com.bot.TradingCore.Candle last = m15.get(m15.size()-2);
                 if(lastSent != null && lastSent == last.closeTime) continue;
 
                 Signal s = analyzePair(pair,m15,h1);
@@ -1003,8 +1001,8 @@ public class SignalSender {
                         connectTickWebSocket(pair);
 
                         // Загружаем исторические свечи для новых пар
-                        List<TradingCore.Candle> c15m = fetchKlines(pair, "15m", KLINES_LIMIT);
-                        List<TradingCore.Candle> c1h  = fetchKlines(pair, "1h", KLINES_LIMIT);
+                        List<com.bot.TradingCore.Candle> c15m = fetchKlines(pair, "15m", KLINES_LIMIT);
+                        List<com.bot.TradingCore.Candle> c1h  = fetchKlines(pair, "1h", KLINES_LIMIT);
                         histM15.put(pair, new ArrayList<>(c15m));
                         histH1.put(pair, new ArrayList<>(c1h));
                     }
@@ -1063,8 +1061,8 @@ public class SignalSender {
             return Set.of("BTCUSDT", "ETHUSDT"); // fallback
         }
     }
-    private List<TradingCore.Candle> aggregate(List<TradingCore.Candle> base, int factor) {
-        List<TradingCore.Candle> res = new ArrayList<>();
+    private List<com.bot.TradingCore.Candle> aggregate(List<com.bot.TradingCore.Candle> base, int factor) {
+        List<com.bot.TradingCore.Candle> res = new ArrayList<>();
         if (base == null || base.size() < factor) return res;
         for (int i = 0; i + factor <= base.size(); i += factor) {
             long openTime = base.get(i).openTime;
@@ -1077,30 +1075,30 @@ public class SignalSender {
             long closeTime = base.get(i + factor - 1).closeTime;
 
             for (int j = i; j < i + factor; j++) {
-                TradingCore.Candle c = base.get(j);
+                com.bot.TradingCore.Candle c = base.get(j);
                 high = Math.max(high, c.high);
                 low = Math.min(low, c.low);
                 volume += c.volume;
                 qvol += c.qvol;
             }
 
-            res.add(new TradingCore.Candle(openTime, open, high, low, close, volume, qvol, closeTime));
+            res.add(new com.bot.TradingCore.Candle(openTime, open, high, low, close, volume, qvol, closeTime));
         }
         return res;
     }
-    private boolean computeVolatilityOk(List<TradingCore.Candle> candles, double atr) {
+    private boolean computeVolatilityOk(List<com.bot.TradingCore.Candle> candles, double atr) {
         return atr / candles.get(candles.size() - 1).close > 0.003;
     }
 
     private boolean checkVWAPAlignment(String pair, double price) {
-        List<TradingCore.Candle> candles = histM15.getOrDefault(pair, new ArrayList<>());
+        List<com.bot.TradingCore.Candle> candles = histM15.getOrDefault(pair, new ArrayList<>());
         if (candles.isEmpty()) return true;
 
         double vwap = vwap(candles); // используем твой настоящий метод vwap()
 
         return price > vwap * 0.998 && price < vwap * 1.002;
     }
-    private boolean checkStructureAlignment(List<TradingCore.Candle> candles, int dir) {
+    private boolean checkStructureAlignment(List<com.bot.TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
         return structure == dir;
     }
@@ -1114,8 +1112,8 @@ public class SignalSender {
 
             for (String pair : cachedPairs) {
 
-                List<TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
-                List<TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
 
                 if (m15.size() < 60 || h1.size() < 60)
                     continue;
@@ -1123,7 +1121,7 @@ public class SignalSender {
                 histM15.put(pair,m15);
                 histH1.put(pair,h1);
 
-                TradingCore.Candle last = m15.get(m15.size()-1);
+                com.bot.TradingCore.Candle last = m15.get(m15.size()-1);
 
                 // закрытия
                 List<Double> closes15 = m15.stream().map(c->c.close).toList();

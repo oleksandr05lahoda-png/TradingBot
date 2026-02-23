@@ -5,9 +5,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
- * Professional Decision Engine
- * Мировой уровень индикаторного движка.
- * Разделяет MarketState, SignalModel, Risk, Cooldown.
+ * World-class Decision Engine
+ * Обрабатывает MarketState, SignalModel, Risk и Cooldown.
  */
 public final class DecisionEngineMerged {
 
@@ -73,14 +72,17 @@ public final class DecisionEngineMerged {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
 
-        // ограничение по категориям
+        // Ограничение по категориям
         List<TradeIdea> top = filterAndLimit(candidates, CoinCategory.TOP, MAX_TOP_COINS / 2);
         List<TradeIdea> alt = filterAndLimit(candidates, CoinCategory.ALT, MAX_TOP_COINS / 3);
         List<TradeIdea> meme = filterAndLimit(candidates, CoinCategory.MEME, MAX_TOP_COINS / 6);
 
         List<TradeIdea> merged = new ArrayList<>();
-        merged.addAll(top); merged.addAll(alt); merged.addAll(meme);
+        merged.addAll(top);
+        merged.addAll(alt);
+        merged.addAll(meme);
 
+        // Сортировка по убыванию confidence
         return merged.stream()
                 .sorted(Comparator.comparingDouble(t -> -t.confidence))
                 .collect(Collectors.toList());
@@ -88,7 +90,7 @@ public final class DecisionEngineMerged {
 
     private List<TradeIdea> filterAndLimit(List<TradeIdea> ideas, CoinCategory cat, int limit) {
         return ideas.stream()
-                .filter(t -> t != null && cat.equals(t.grade == SignalGrade.A ? CoinCategory.TOP : cat))
+                .filter(t -> t != null)
                 .sorted(Comparator.comparingDouble(t -> -t.confidence))
                 .limit(limit)
                 .collect(Collectors.toList());
@@ -102,6 +104,8 @@ public final class DecisionEngineMerged {
                                         List<TradingCore.Candle> c1h,
                                         CoinCategory cat,
                                         long now) {
+
+        if (c15 == null || c1h == null || c15.isEmpty() || c1h.isEmpty()) return null;
 
         double price = last(c15).close;
         double atr = Math.max(atr(c15, 14), price * 0.0015);
@@ -118,6 +122,7 @@ public final class DecisionEngineMerged {
         double scoreLong = 0, scoreShort = 0;
         double trendWeight = adaptiveTrendWeights.getOrDefault(symbol, DEFAULT_TREND_WEIGHT);
 
+        // ===== SCORING =====
         if (bias == HTFBias.BULL) scoreLong += trendWeight;
         if (bias == HTFBias.BEAR) scoreShort += trendWeight;
         if (pullbackBull) scoreLong += WEIGHT_PULLBACK;
@@ -147,7 +152,7 @@ public final class DecisionEngineMerged {
 
         TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
-        // ===== cooldown =====
+        // ===== COOLDOWN =====
         if (!checkCooldown(symbol, side, now)) return null;
 
         double raw = Math.max(scoreLong, scoreShort);
@@ -166,14 +171,13 @@ public final class DecisionEngineMerged {
         updateAdaptiveWeight(symbol, side, confidence);
 
         return new TradeIdea(symbol, side, price, stop, take, confidence, grade,
-                "Score=" + raw + " State=" + state + " MicroTrend=" + String.format("%.3f", microTrend));
+                String.format("Score=%.3f State=%s MicroTrend=%.3f", raw, state, microTrend));
     }
 
     /* ================= ADAPTIVE TREND ================= */
     private void updateAdaptiveWeight(String symbol, TradingCore.Side side, double confidence) {
         double current = adaptiveTrendWeights.getOrDefault(symbol, DEFAULT_TREND_WEIGHT);
-        if (confidence > 0.75) current += 0.05;
-        else if (confidence < 0.55) current -= 0.05;
+        current += confidence > 0.75 ? 0.05 : confidence < 0.55 ? -0.05 : 0.0;
         adaptiveTrendWeights.put(symbol, clamp(current, 1.2, 3.5));
     }
 
@@ -277,8 +281,7 @@ public final class DecisionEngineMerged {
             double d = c.get(i + 1).close - c.get(i).close;
             if (d > 0) g += d; else l += Math.abs(d);
         }
-        if (l == 0) return 100;
-        return 100 - (100 / (1 + g / l));
+        return l == 0 ? 100 : 100 - (100 / (1 + g / l));
     }
 
     private boolean detectMicroImpulse(List<TradingCore.Candle> c) {
@@ -291,7 +294,11 @@ public final class DecisionEngineMerged {
         if (c == null || c.size() < 10) return false;
         double avg = c.subList(c.size() - 10, c.size() - 1).stream().mapToDouble(cd -> cd.volume).average().orElse(1);
         double last = c.get(c.size() - 1).volume;
-        double th = cat == CoinCategory.MEME ? 1.4 : cat == CoinCategory.ALT ? 1.25 : 1.15;
+        double th = switch (cat) {
+            case MEME -> 1.4;
+            case ALT -> 1.25;
+            case TOP -> 1.15;
+        };
         return last / avg > th;
     }
 
