@@ -59,6 +59,15 @@ public class SignalSender {
     private final com.bot.TradingCore.AdaptiveBrain adaptiveBrain;
     private final SignalOptimizer optimizer;
     private final com.bot.TradingCore.RiskEngine riskEngine = new com.bot.TradingCore.RiskEngine(0.01, 0.05, 1.0);
+    private final InstitutionalSignalCore core =
+            new InstitutionalSignalCore(
+                    12,        // max signals per hour
+                    1,         // max same symbol
+                    0.25,      // portfolio risk
+                    6*60_000,  // signal lifetime
+                    0.58,      // min quality
+                    0.004      // min volatility
+            );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     private final Map<String, Signal> activeSignals = new ConcurrentHashMap<>();
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
@@ -644,10 +653,7 @@ public class SignalSender {
                                      Signal s,
                                      List<com.bot.TradingCore.Candle> closes15m) {
 
-        if (s.confidence < MIN_CONF) {
-            System.out.println("[SignalSender] Skipped " + pair + " due to low confidence: " + String.format("%.2f", s.confidence));
-            return;
-        }
+        // Не обрабатываем, если мало свечей
         if (closes15m.size() < 4) return;
 
         List<com.bot.TradingCore.Candle> recent = new ArrayList<>(closes15m);
@@ -665,22 +671,42 @@ public class SignalSender {
 
         boolean endOfTrend = nearSwingHigh || nearSwingLow;
 
-        // ==== Для теста временно отключаем резкое снижение confidence ====
-        //if (endOfTrend) {
-        //    double microFactor = 0.85 + Math.min(0.15, Math.abs(micro.speed) * 100);
-        //    s.confidence *= microFactor;
-        //    if (!bos && !liqSweep) {
-        //        s.confidence *= Math.max(0.75, 1.0 - Math.abs(micro.speed) * 100);
-        //    }
-        //}
-        //if ((bos || liqSweep) && endOfTrend) {
-        //    s.confidence *= 0.85;
-        //}
+        // ==== Формируем TradeIdea (8 аргументов) ====
+        double entry = s.price;
+        double stop = s.direction.equals("LONG") ? entry * 0.995 : entry * 1.005; // примерное значение
+        double take = s.direction.equals("LONG") ? entry * 1.01  : entry * 0.99;  // примерное значение
+        DecisionEngineMerged.SignalGrade grade = s.confidence > 0.78 ?
+                DecisionEngineMerged.SignalGrade.A :
+                s.confidence > 0.64 ?
+                        DecisionEngineMerged.SignalGrade.B :
+                        DecisionEngineMerged.SignalGrade.C;
+        String reason = String.format("MicroTrend=%.3f BOS=%b LIQ=%b", micro.speed, bos, liqSweep);
 
+        DecisionEngineMerged.TradeIdea idea = new DecisionEngineMerged.TradeIdea(
+                s.symbol,
+                s.direction.equals("LONG") ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
+                entry,
+                stop,
+                take,
+                s.confidence,
+                grade,
+                reason
+        );
+
+        // Проверяем через core
+        if (!core.allowSignal(idea)) {
+            System.out.println("[DEBUG] Skipped " + pair + " due to core restrictions");
+            return;
+        }
+
+        core.registerSignal(idea);
+
+        // Проверяем локальный кулдаун
         if (isCooldown(pair, s)) {
             System.out.println("[DEBUG] Skipped " + pair + " due to cooldown");
             return;
         }
+
         markSignalSent(pair, s.direction);
 
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
