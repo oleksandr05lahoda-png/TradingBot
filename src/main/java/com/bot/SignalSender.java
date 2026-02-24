@@ -784,8 +784,29 @@ public class SignalSender {
                     (impulse ? "IMPULSE " : "");
             String localTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
 
-            return String.format("*%s* → *%s*\n" + "Confidence: *%.2f*\n" + "Price: %.8f\n" + "SL: %.8f\n" + "TP: %.8f\n" + "RSI(14): %.2f\n" + "_flags_: %s\n" + "_raw: %.3f mtf:%d vol:%b atr:%b_\n" + "_time: %s_",
-                    symbol, direction, confidence, price, stop != null ? stop : 0.0, take != null ? take : 0.0, rsi, flags.trim(), rawScore, mtfConfirm, volOk, atrOk,
+            return String.format("*%s* → *%s*\n" +
+                            "Probability: *%.0f%%*\n" +
+                            "Price: %.8f\n" +
+                            "SL: %.8f\n" +
+                            "TP: %.8f\n" +
+                            "RSI(14): %.2f | RSI7: %.2f | RSI4: %.2f\n" +
+                            "_flags_: %s\n" +
+                            "_rawScore: %.3f mtf:%d vol:%b atr:%b_\n" +
+                            "_time: %s_",
+                    symbol,
+                    direction,
+                    confidence*100.0,   // выводим вероятность в процентах
+                    price,
+                    stop != null ? stop : 0.0,
+                    take != null ? take : 0.0,
+                    rsi,
+                    rsi7,
+                    rsi4,
+                    flags.trim(),
+                    rawScore,
+                    mtfConfirm,
+                    volOk,
+                    atrOk,
                     localTime
             );
         }
@@ -883,7 +904,7 @@ public class SignalSender {
                         public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
                             try {
                                 JSONObject json = new JSONObject(data.toString());
-                                double price = Double.parseDouble(json.getString("p"));
+                               double price = Double.parseDouble(json.getString("p"));
                                 long ts = json.getLong("T");
 
                                 synchronized (wsLock) {
