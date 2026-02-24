@@ -36,52 +36,34 @@ public final class DecisionEngineMerged {
 
     /* ================= TRADE IDEA ================= */
 
+    /* ================= TRADE IDEA ================= */
     public static final class TradeIdea {
         public final String symbol;          // Символ монеты
         public final TradingCore.Side side;  // LONG или SHORT
         public final double price;           // Цена закрытия последней свечи
-        public final double probability;     // Вероятность успешного прогноза (0.52 - 0.95)
+        public final double stop;            // Стоп-лосс
+        public final double take;            // Тейк-профит
+        public final double probability;     // Вероятность успешного прогноза
         public final String reason;          // Причины сигнала (2-3 главных фактора)
 
         public TradeIdea(String symbol,
                          TradingCore.Side side,
                          double price,
+                         double stop,
+                         double take,
                          double probability,
                          String reason) {
             this.symbol = symbol;
             this.side = side;
             this.price = price;
+            this.stop = stop;
+            this.take = take;
             this.probability = probability;
             this.reason = reason;
         }
     }
 
-    /* ================= MAIN ================= */
-
-    public List<TradeIdea> evaluate(List<String> symbols,
-                                    Map<String, List<TradingCore.Candle>> m1,
-                                    Map<String, List<TradingCore.Candle>> m5,
-                                    Map<String, List<TradingCore.Candle>> m15,
-                                    Map<String, List<TradingCore.Candle>> h1,
-                                    Map<String, CoinCategory> categories) {
-
-        long now = System.currentTimeMillis();
-
-        return symbols.stream()
-                .map(symbol -> generate(symbol,
-                        m1.get(symbol),
-                        m5.get(symbol),
-                        m15.get(symbol),
-                        h1.get(symbol),
-                        categories.getOrDefault(symbol, CoinCategory.TOP),
-                        now))
-                .filter(Objects::nonNull)
-                .sorted(Comparator.comparingDouble(t -> -t.probability)) // заменили confidence на probability
-                .collect(Collectors.toList());
-    }
-
     /* ================= CORE ================= */
-
     private TradeIdea generate(String symbol,
                                List<TradingCore.Candle> c1,
                                List<TradingCore.Candle> c5,
@@ -93,6 +75,7 @@ public final class DecisionEngineMerged {
         if (!valid(c15) || !valid(c1h)) return null;
 
         double price = last(c15).close;
+        double atr = Math.max(atr(c15, 14), price * 0.0012);
 
         MarketState state = detectState(c15);
         HTFBias bias = detectBias(c1h);
@@ -166,12 +149,29 @@ public final class DecisionEngineMerged {
         // Ограничиваем количество причин до 3
         String reasonStr = String.join(", ", reasons.subList(0, Math.min(3, reasons.size())));
 
+        // ===== Stop и Take =====
+        double riskMult =
+                cat == CoinCategory.MEME ? 1.3 :
+                        cat == CoinCategory.ALT ? 1.0 : 0.85;
+
+        double rr = probability > 0.75 ? 2.8 : 2.2;
+
+        double stop = side == TradingCore.Side.LONG ?
+                price - atr * riskMult :
+                price + atr * riskMult;
+
+        double take = side == TradingCore.Side.LONG ?
+                price + atr * riskMult * rr :
+                price - atr * riskMult * rr;
+
         registerSignal(symbol, side, now);
 
         return new TradeIdea(
                 symbol,
                 side,
                 price,
+                stop,
+                take,
                 probability,
                 reasonStr
         );

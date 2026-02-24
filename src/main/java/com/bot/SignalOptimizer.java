@@ -114,7 +114,7 @@ public final class SignalOptimizer {
         MicroTrendResult mt =
                 computeMicroTrend(signal.symbol);
 
-        double confidence = signal.confidence;
+        double confidence = signal.probability;
 
         if (mt == ZERO)
             return confidence;
@@ -152,7 +152,7 @@ public final class SignalOptimizer {
                 adjustConfidence(signal);
 
         double volatilityPct =
-                clamp(atr / signal.entry,
+                clamp(atr / signal.price,
                         0.006,
                         0.035);
 
@@ -167,29 +167,28 @@ public final class SignalOptimizer {
 
         if (signal.side == TradingCore.Side.LONG) {
 
-            stop = signal.entry *
+            stop = signal.price *
                     (1 - volatilityPct);
 
-            take = signal.entry *
+            take = signal.price *
                     (1 + volatilityPct * rr);
 
         } else {
 
-            stop = signal.entry *
+            stop = signal.price *
                     (1 + volatilityPct);
 
-            take = signal.entry *
+            take = signal.price *
                     (1 - volatilityPct * rr);
         }
 
         return new DecisionEngineMerged.TradeIdea(
                 signal.symbol,
                 signal.side,
-                signal.entry,
+                signal.price,
                 stop,
                 take,
                 newConfidence,
-                signal.grade,
                 signal.reason
         );
     }

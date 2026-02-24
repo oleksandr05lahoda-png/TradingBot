@@ -99,14 +99,11 @@ public class SignalSender {
             DecisionEngineMerged.TradeIdea idea =
                     new DecisionEngineMerged.TradeIdea(
                             s.symbol,
-                            s.direction.equals("LONG")
-                                    ? TradingCore.Side.LONG
-                                    : TradingCore.Side.SHORT,
+                            s.direction.equals("LONG") ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
                             s.price,
                             s.stop,
                             s.take,
-                            s.confidence,
-                            grade,
+                            s.confidence, // это probability
                             "auto-generated"
                     );
 
@@ -119,7 +116,7 @@ public class SignalSender {
         }
 
         result.sort(Comparator.comparingDouble(
-                (DecisionEngineMerged.TradeIdea i) -> i.confidence
+                (DecisionEngineMerged.TradeIdea i) -> i.probability // сортируем по probability
         ).reversed());
 
         return result;
@@ -1093,7 +1090,7 @@ public class SignalSender {
     private void runScheduleCycle() {
         try {
             signalsThisCycle = 0;  // сброс счетчика на цикл
-            if (System.currentTimeMillis() - dailyResetTs > 24*60*60_000L) {
+            if (System.currentTimeMillis() - dailyResetTs > 24 * 60 * 60_000L) {
                 dailyRequests.set(0);
                 dailyResetTs = System.currentTimeMillis();
             }
@@ -1129,7 +1126,6 @@ public class SignalSender {
                 markSignalSent(pair, s.direction, candleCloseTime);
                 signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
-                // Проверка DecisionEngine и core
                 DecisionEngineMerged.TradeIdea idea =
                         new DecisionEngineMerged.TradeIdea(
                                 s.symbol,
@@ -1137,10 +1133,7 @@ public class SignalSender {
                                 s.price,
                                 s.stop,
                                 s.take,
-                                s.confidence,
-                                s.confidence > 0.80 ? DecisionEngineMerged.SignalGrade.A :
-                                        s.confidence > 0.70 ? DecisionEngineMerged.SignalGrade.B :
-                                                DecisionEngineMerged.SignalGrade.C,
+                                s.confidence, // это теперь probability
                                 "auto-generated"
                         );
 

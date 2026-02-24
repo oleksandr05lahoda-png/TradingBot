@@ -50,18 +50,18 @@ public final class InstitutionalSignalCore {
         public final String symbol;
         public final TradingCore.Side side;
         public final double entry;
-        public final double confidence;
+        public final double probability;
         public final long timestamp;
 
         public ActiveSignal(String symbol,
                             TradingCore.Side side,
                             double entry,
-                            double confidence,
+                            double probability,
                             long timestamp) {
             this.symbol = symbol;
             this.side = side;
             this.entry = entry;
-            this.confidence = confidence;
+            this.probability = probability;
             this.timestamp = timestamp;
         }
     }
@@ -90,7 +90,7 @@ public final class InstitutionalSignalCore {
 
         if (signal == null) return false;
 
-        if (signal.confidence < minConfidence)
+        if (signal.probability < minConfidence)
             return false;
 
         if (getActiveSignalsCount() >= maxGlobalSignals)
@@ -114,11 +114,11 @@ public final class InstitutionalSignalCore {
             if (a.side != signal.side)
                 return false;
 
-            double diff = Math.abs(a.entry - signal.entry) / a.entry;
+            double diff = Math.abs(a.entry - signal.price) / a.entry;
             if (diff < minSignalDiff)
                 return false;
 
-            if (Math.abs(a.confidence - signal.confidence) < 0.015)
+            if (Math.abs(a.probability - signal.probability) < 0.015)
                 return false;
         }
 
@@ -140,8 +140,8 @@ public final class InstitutionalSignalCore {
         ActiveSignal active = new ActiveSignal(
                 signal.symbol,
                 signal.side,
-                signal.entry,
-                signal.confidence,
+                signal.price,
+                signal.probability,
                 now
         );
 
@@ -251,17 +251,17 @@ public final class InstitutionalSignalCore {
     private double estimateExposure(
             DecisionEngineMerged.TradeIdea s) {
 
-        if (s.confidence > 0.85) return 0.05;
-        if (s.confidence > 0.75) return 0.035;
-        if (s.confidence > 0.65) return 0.025;
+        if (s.probability > 0.85) return 0.05;
+        if (s.probability > 0.75) return 0.035;
+        if (s.probability > 0.65) return 0.025;
         return 0.02;
     }
 
     private double estimateExposure(ActiveSignal s) {
 
-        if (s.confidence > 0.85) return 0.05;
-        if (s.confidence > 0.75) return 0.035;
-        if (s.confidence > 0.65) return 0.025;
+        if (s.probability > 0.85) return 0.05;
+        if (s.probability > 0.75) return 0.035;
+        if (s.probability > 0.65) return 0.025;
         return 0.02;
     }
 
