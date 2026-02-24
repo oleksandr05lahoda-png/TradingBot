@@ -1151,6 +1151,7 @@ public class SignalSender {
         return structure == dir;
     }
     private void runSchedulerCycle() {
+        System.out.println("[CYCLE] " + LocalDateTime.now());
         try {
             if (cachedPairs == null || cachedPairs.isEmpty())
                 return;
@@ -1173,8 +1174,8 @@ public class SignalSender {
                         .getOrDefault(pair, new ConcurrentHashMap<>())
                         .getOrDefault("15m", 0L);
 
-                if (lastProcessed == lastClosed.closeTime) {
-                    continue; // эта свеча уже анализировалась
+                if (lastClosed.closeTime <= lastProcessed) {
+                    continue;
                 }
 
                 List<Double> closes15 = m15.stream().map(c -> c.close).toList();
