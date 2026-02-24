@@ -83,6 +83,7 @@ public final class DecisionEngineMerged {
         double scoreLong = 0;
         double scoreShort = 0;
 
+
         List<String> reasons = new ArrayList<>();
 
         // ===== Trend =====
