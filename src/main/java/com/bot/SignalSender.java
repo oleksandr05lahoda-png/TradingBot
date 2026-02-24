@@ -69,7 +69,73 @@ public class SignalSender {
                     0.004      // min volatility
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
-    private final Map<String, Signal> activeSignals = new ConcurrentHashMap<>();
+    // ========================= PUBLIC API =========================
+    public List<DecisionEngineMerged.TradeIdea> generateSignals() {
+
+        List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
+
+        if (cachedPairs == null || cachedPairs.isEmpty()) {
+            cachedPairs = getTopSymbolsSet(TOP_N);
+        }
+
+        for (String pair : cachedPairs) {
+
+            List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
+
+            if (m15.size() < 60 || h1.size() < 60)
+                continue;
+
+            Signal s = analyzePair(pair, m15, h1);
+
+            if (s == null || s.confidence < MIN_CONF)
+                continue;
+
+            DecisionEngineMerged.SignalGrade grade =
+                    s.confidence > 0.80 ? DecisionEngineMerged.SignalGrade.A :
+                            s.confidence > 0.70 ? DecisionEngineMerged.SignalGrade.B :
+                                    DecisionEngineMerged.SignalGrade.C;
+
+            DecisionEngineMerged.TradeIdea idea =
+                    new DecisionEngineMerged.TradeIdea(
+                            s.symbol,
+                            s.direction.equals("LONG")
+                                    ? TradingCore.Side.LONG
+                                    : TradingCore.Side.SHORT,
+                            s.price,
+                            s.stop,
+                            s.take,
+                            s.confidence,
+                            grade,
+                            "auto-generated"
+                    );
+
+            if (!core.allowSignal(idea))
+                continue;
+
+            core.registerSignal(idea);
+
+            result.add(idea);
+        }
+
+        result.sort(Comparator.comparingDouble(
+                (DecisionEngineMerged.TradeIdea i) -> i.confidence
+        ).reversed());
+
+        return result;
+    }
+    public SignalOptimizer getOptimizer() {
+        return optimizer;
+    }
+
+    public InstitutionalSignalCore getSignalCore() {
+        return core;
+    }
+
+    public double getAtr(String symbol) {
+        List<com.bot.TradingCore.Candle> candles = histM15.getOrDefault(symbol, Collections.emptyList());
+        return atr(candles, 14);
+    }
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
     private long dailyResetTs = System.currentTimeMillis();
     private ScheduledExecutorService scheduler;
@@ -670,105 +736,6 @@ public class SignalSender {
             high = Math.max(high, candles.get(i).high);
         return high;
     }
-
-    private void sendSignalIfAllowed(String pair, Signal s, List<com.bot.TradingCore.Candle> closes15m) {
-
-        // ===== проверка активного сигнала =====
-        Signal active = activeSignals.get(pair);
-        if (active != null) {
-
-            // если уже есть сигнал в ту же сторону — пропускаем
-            if (active.direction.equals(s.direction)) {
-                System.out.println("[SKIP] already active " + pair);
-                return;
-            }
-
-            // если противоположный сигнал слишком рано
-            if (System.currentTimeMillis() - active.created.toEpochMilli() < 10 * 60_000) {
-                System.out.println("[SKIP] opposite too soon " + pair);
-                return;
-            }
-        }
-
-        // ===== достаточно ли свечей =====
-        if (closes15m.size() < 20) {
-            System.out.println("[SKIP] Not enough candles for " + pair);
-            return;
-        }
-
-        // ===== время закрытия последней свечи =====
-        long candleCloseTime = closes15m.get(closes15m.size() - 1).closeTime;
-
-        // ===== проверка изменения confidence =====
-        Double lastConf = lastSentConfidence.get(pair);
-        if (lastConf != null && Math.abs(lastConf - s.confidence) < 0.03) {
-            System.out.println("[SKIP] confidence unchanged " + pair);
-            return;
-        }
-
-        // ===== cooldown =====
-        if (isCooldown(pair, s, candleCloseTime)) {
-            System.out.println("[SKIP] Cooldown active for " + pair + " " + s.direction);
-            return;
-        }
-
-        // ===== анти-дубликат направления =====
-        if (wasSameDirectionRecently(pair, s.direction, 1)) {
-            System.out.println("[SKIP] Same direction recently for " + pair + " " + s.direction);
-            return;
-        }
-
-        // ===== microtrend + price action =====
-        MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
-        boolean bos = detectBOS(closes15m);
-        boolean liq = detectLiquiditySweep(closes15m);
-
-        // ===== grade сигнала =====
-        DecisionEngineMerged.SignalGrade grade =
-                s.confidence > 0.80 ? DecisionEngineMerged.SignalGrade.A :
-                        s.confidence > 0.70 ? DecisionEngineMerged.SignalGrade.B :
-                                DecisionEngineMerged.SignalGrade.C;
-
-        String reason = String.format(
-                "Score=%.2f Micro=%.4f BOS=%b LIQ=%b",
-                s.rawScore, micro.speed, bos, liq
-        );
-
-        DecisionEngineMerged.TradeIdea idea = new DecisionEngineMerged.TradeIdea(
-                s.symbol,
-                s.direction.equals("LONG") ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
-                s.price,
-                s.stop,
-                s.take,
-                s.confidence,
-                grade,
-                reason
-        );
-
-        // ===== institutional core фильтр =====
-        if (!core.allowSignal(idea)) {
-            System.out.println("[SKIP] core disallowed signal for " + pair);
-            return;
-        }
-
-        core.registerSignal(idea);
-
-        // ===== регистрируем время сигнала =====
-        markSignalSent(pair, s.direction, candleCloseTime);
-
-        // ===== сохраняем историю =====
-        signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
-
-        // ===== отправка =====
-        bot.sendMessageAsync(s.toTelegramMessage());
-
-        // ===== обновляем состояния =====
-        activeSignals.put(pair, s);
-        lastSentConfidence.put(pair, s.confidence);
-        signalsThisCycle++;
-
-        System.out.println("[SENT] Signal for " + pair + " " + s.direction + " conf=" + s.confidence);
-    }
     public static class Signal {
         public final String symbol;
         public final String direction;
@@ -865,7 +832,7 @@ public class SignalSender {
         boolean volOk = computeVolatilityOk(c15m, atr(c15m,14));
         boolean atrOk = atr(c15m,14)/last.close > ATR_MIN_PCT;
         boolean impulse = Math.abs(micro.speed) > 0.0005;
-        boolean vwapAligned = checkVWAPAlignment(pair,last.close);
+        boolean vwapAligned = checkVWAPAlignment(c15m,last.close);
         boolean structureAligned = checkStructureAlignment(c15m, rawScore>=0 ? 1 : -1);
         boolean bos = detectBOS(c15m);
         boolean sweep = detectLiquiditySweep(c15m);
@@ -990,13 +957,6 @@ public class SignalSender {
         double obi = Math.abs(obs.obi());
         return obi > OBI_THRESHOLD;
     }
-
-    public void stop() {
-        System.out.println("[SignalSender] stopping...");
-        if (scheduler != null) scheduler.shutdown();
-        wsWatcher.shutdown();
-    }
-
     public List<com.bot.TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
             List<com.bot.TradingCore.Candle> candles =
@@ -1017,86 +977,6 @@ public class SignalSender {
             System.out.println("[fetchKlines] error for " + symbol + " " + interval + ": " + e.getMessage());
             return Collections.emptyList();
         }
-    }
-    public void start() {
-        System.out.println("[SignalSender] Scheduler started");
-
-        // ===== Инициализация топ-пар =====
-        if (cachedPairs.isEmpty()) {
-            cachedPairs = getTopSymbolsSet(TOP_N);
-            lastBinancePairsRefresh = System.currentTimeMillis();
-
-            System.out.println("[INIT] Loaded initial top pairs: " + cachedPairs.size());
-
-            List<CompletableFuture<Signal>> futures = new ArrayList<>();
-
-            for (String pair : cachedPairs) {
-
-                futures.add(CompletableFuture.supplyAsync(() -> {
-
-                    List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
-                    List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
-
-                    if (m15.size() < 60 || h1.size() < 60)
-                        return null;
-
-                    return analyzePair(pair, m15, h1);
-
-                }));
-            }
-            List<Signal> candidates = futures.stream()
-                    .map(CompletableFuture::join)
-                    .filter(Objects::nonNull)
-                    .collect(Collectors.toList());
-            System.out.println("[INIT] Historical candles loaded and WS connected for all initial pairs");
-        }
-
-        // ===== Scheduler =====
-        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "signal-scheduler");
-            t.setDaemon(false);
-            return t;
-        });
-
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                long now = System.currentTimeMillis();
-
-                // ===== Обновление топ-пар каждые BINANCE_REFRESH_INTERVAL_MS =====
-                if (cachedPairs.isEmpty() || now - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
-                    Set<String> availablePairs = getBinanceSymbolsFutures(); // реально торгуемые пары
-                    Set<String> updatedTop = getTopSymbolsSet(TOP_N).stream()
-                            .filter(availablePairs::contains)
-                            .collect(Collectors.toSet());
-
-                    // Определяем новые пары для подключения WS
-                    Set<String> newPairs = new HashSet<>(updatedTop);
-                    newPairs.removeAll(cachedPairs);
-
-                    cachedPairs = updatedTop;
-                    lastBinancePairsRefresh = now;
-                    System.out.println("[Pairs] Refreshed top symbols: " + cachedPairs.size());
-
-                    // Подключаем WS к новым парам
-                    for (String pair : newPairs) {
-                        connectTickWebSocket(pair);
-
-                        // Загружаем исторические свечи для новых пар
-                        List<com.bot.TradingCore.Candle> c15m = fetchKlines(pair, "15m", KLINES_LIMIT);
-                        List<com.bot.TradingCore.Candle> c1h  = fetchKlines(pair, "1h", KLINES_LIMIT);
-                        histM15.put(pair, new ArrayList<>(c15m));
-                        histH1.put(pair, new ArrayList<>(c1h));
-                    }
-                }
-
-                // ===== Основной цикл анализа и отправки сигналов =====
-                runSchedulerCycle();
-
-            } catch (Throwable t) {
-                System.out.println("[Scheduler-FATAL] cycle crashed: " + t.getMessage());
-                t.printStackTrace();
-            }
-        }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
     public Set<String> getTopSymbolsSet(int limit) {
         try {
@@ -1171,97 +1051,13 @@ public class SignalSender {
         return atr / candles.get(candles.size() - 1).close > 0.003;
     }
 
-    private boolean checkVWAPAlignment(String pair, double price) {
-        List<com.bot.TradingCore.Candle> candles = fetchKlines(pair,"15m",100);
-        if (candles.isEmpty()) return true;
-
-        double vwap = vwap(candles);
-        return price > vwap * 0.995 && price < vwap * 1.005;
+    private boolean checkVWAPAlignment(List<com.bot.TradingCore.Candle> candles, double price) {
+        if (candles == null || candles.isEmpty()) return true;
+        double v = vwap(candles);
+        return price > v * 0.995 && price < v * 1.005;
     }
     private boolean checkStructureAlignment(List<com.bot.TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
         return structure == dir;
-    }
-    private void runSchedulerCycle() {
-        System.out.println("[CYCLE] " + LocalDateTime.now());
-        long cycleStart = System.currentTimeMillis();
-
-        try {
-            if (cachedPairs == null || cachedPairs.isEmpty())
-                return;
-
-            signalsThisCycle = 0;
-            List<Signal> candidates = new ArrayList<>();
-
-            // ========= АНАЛИЗ ВСЕХ ПАР =========
-            for (String pair : cachedPairs) {
-
-                List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
-                List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
-
-                if (m15.size() < 60 || h1.size() < 60) {
-                    System.out.println("[SKIP] Not enough candles for " + pair);
-                    continue;
-                }
-
-                // 👉 ВЕСЬ анализ теперь централизован
-                Signal s = analyzePair(pair, m15, h1);
-
-                if (s == null)
-                    continue;
-
-                if (s.confidence < MIN_CONF)
-                    continue;
-
-                candidates.add(s);
-            }
-
-            if (candidates.isEmpty()) {
-                System.out.println("[CYCLE] no candidates");
-                return;
-            }
-
-            // ========= СОРТИРОВКА =========
-            candidates.sort(
-                    Comparator.comparingDouble((Signal s) -> s.confidence).reversed()
-            );
-
-            // ========= ОТПРАВКА ТОПОВ =========
-            int limit = candidates.size();
-
-            for (int i = 0; i < limit; i++) {
-
-                Signal s = candidates.get(i);
-
-                // берём уже готовые свечи (без нового HTTP)
-                List<com.bot.TradingCore.Candle> m15 =
-                        fetchKlines(s.symbol,"15m",KLINES_LIMIT);
-
-                sendSignalIfAllowed(s.symbol, s, m15);
-
-                lastSignalCandleTs
-                        .computeIfAbsent(s.symbol, k -> new ConcurrentHashMap<>())
-                        .put("15m", System.currentTimeMillis());
-            }
-
-            // ========= УДАЛЕНИЕ ПРОСРОЧЕННЫХ АКТИВНЫХ =========
-            activeSignals.entrySet().removeIf(e ->
-                    System.currentTimeMillis() -
-                            e.getValue().created.toEpochMilli() > 15 * 60_000
-            );
-
-            // ========= ОЧИСТКА ИСТОРИИ =========
-            signalHistory.values().forEach(list -> {
-                if (list.size() > 50)
-                    list.subList(0, list.size() - 50).clear();
-            });
-
-            System.out.println("[CYCLE DONE] duration ms = " +
-                    (System.currentTimeMillis() - cycleStart));
-
-        } catch (Throwable t) {
-            System.out.println("[Scheduler-FATAL] " + t.getMessage());
-            t.printStackTrace();
-        }
     }
 }

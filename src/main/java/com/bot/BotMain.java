@@ -2,52 +2,88 @@ package com.bot;
 
 import java.time.*;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.concurrent.*;
 
 public class BotMain {
 
     // ===== CONFIG =====
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
-
-    // Используем локальный часовой пояс устройства
     private static final ZoneId ZONE = ZoneId.systemDefault();
-    private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final int SIGNAL_INTERVAL_MIN = 15; // каждые 15 минут
 
     public static void main(String[] args) {
 
-        // ===== INIT BOT =====
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
         SignalSender signalSender = new SignalSender(telegram);
 
-        // ===== START BOT =====
-        try {
-            LocalDateTime now = LocalDateTime.now(ZONE);
+        telegram.sendMessageAsync("Бот запущен");
+        System.out.println("Bot started");
 
-            telegram.sendMessageAsync("🚀 Бот запущен в локальном времени: " + now.format(TIME_FORMATTER));
-            System.out.println("[" + now.format(TIME_FORMATTER) + "] Bot started");
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-            // ===== START SIGNALS =====
-            signalSender.start(); // запускаем все анализаторы
-        } catch (Exception e) {
-            telegram.sendMessageAsync("❌ Ошибка старта SignalSender: " + e.getMessage());
-            e.printStackTrace();
-        }
+        long initialDelay = computeInitialDelay();
 
-        // ===== KEEP JVM ALIVE 24/7 =====
-        while (true) {
+        scheduler.scheduleAtFixedRate(() -> {
             try {
-                Thread.sleep(60_000); // спим по 1 минуте
-            } catch (InterruptedException ignored) {}
-        }
+
+                System.out.println("Signal cycle: " + LocalDateTime.now());
+
+                // Получаем уже готовые, отфильтрованные сигналы
+                List<DecisionEngineMerged.TradeIdea> signals =
+                        signalSender.generateSignals();
+
+                for (DecisionEngineMerged.TradeIdea s : signals) {
+                    telegram.sendMessageAsync(formatSignal(s));
+                }
+
+            } catch (Exception ex) {
+                telegram.sendMessageAsync("Ошибка генерации сигналов: " + ex.getMessage());
+                ex.printStackTrace();
+            }
+
+        }, initialDelay, SIGNAL_INTERVAL_MIN, TimeUnit.MINUTES);
+
+        // KEEP JVM ALIVE
+        try {
+            Thread.currentThread().join();
+        } catch (InterruptedException ignored) {}
     }
 
     /**
-     * Метод для конвертации времени от биржи (UTC timestamp) в локальное
-     * Используй при выводе сигналов/свечей
+     * Синхронизация с закрытием M15 свечи
+     */
+    private static long computeInitialDelay() {
+        LocalDateTime now = LocalDateTime.now(ZONE);
+        int minute = now.getMinute();
+        int delay = SIGNAL_INTERVAL_MIN - (minute % SIGNAL_INTERVAL_MIN);
+        if (delay == SIGNAL_INTERVAL_MIN) delay = 0;
+        return delay;
+    }
+
+    /**
+     * Формат Telegram сообщения
+     */
+    private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
+        return String.format(
+                "%s %s\nEntry: %.4f\nStop: %.4f\nTake: %.4f\nConfidence: %.2f\nGrade: %s",
+                s.symbol,
+                s.side,
+                s.entry,
+                s.stop,
+                s.take,
+                s.confidence,
+                s.grade
+        );
+    }
+
+    /**
+     * UTC -> локальное время
      */
     public static String formatLocalTime(long utcMillis) {
-        Instant instant = Instant.ofEpochMilli(utcMillis);
-        ZonedDateTime local = instant.atZone(ZONE);
-        return local.format(DateTimeFormatter.ofPattern("HH:mm"));
+        return Instant.ofEpochMilli(utcMillis)
+                .atZone(ZONE)
+                .format(DateTimeFormatter.ofPattern("HH:mm"));
     }
 }
