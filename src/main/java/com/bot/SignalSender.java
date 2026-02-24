@@ -681,8 +681,11 @@ public class SignalSender {
             return;
         }
 
-        // Проверка cooldown
-        if (isCooldown(pair, s)) {
+        // Берём время закрытия последней свечи
+        long candleCloseTime = closes15m.get(closes15m.size() - 1).closeTime;
+
+        // Проверка cooldown на основе closeTime
+        if (isCooldown(pair, s, candleCloseTime)) {
             System.out.println("[SKIP] Cooldown active for " + pair + " " + s.direction);
             return;
         }
@@ -698,7 +701,7 @@ public class SignalSender {
         boolean bos = detectBOS(closes15m);
         boolean liq = detectLiquiditySweep(closes15m);
 
-        // Определяем grade
+        // Определяем grade сигнала
         DecisionEngineMerged.SignalGrade grade =
                 s.confidence > 0.80 ? DecisionEngineMerged.SignalGrade.A :
                         s.confidence > 0.70 ? DecisionEngineMerged.SignalGrade.B :
@@ -721,6 +724,7 @@ public class SignalSender {
                 reason
         );
 
+        // Проверка core
         if (!core.allowSignal(idea)) {
             System.out.println("[SKIP] core disallowed signal for " + pair);
             return;
@@ -728,9 +732,11 @@ public class SignalSender {
 
         // Регистрация сигнала
         core.registerSignal(idea);
-        markSignalSent(pair, s.direction);
 
-        // История
+        // Отмечаем сигнал с правильным временем закрытия свечи
+        markSignalSent(pair, s.direction, candleCloseTime);
+
+        // Сохраняем в историю
         signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
         // Отправка в Telegram
@@ -796,20 +802,14 @@ public class SignalSender {
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
     private final Map<String, String> lastDirection = new ConcurrentHashMap<>();
-    private boolean isCooldown(String pair, Signal s) {
-        long now = System.currentTimeMillis();
+    private boolean isCooldown(String pair, Signal s, long candleCloseTime) {
         Map<String, Long> dirMap = lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>());
-        Long lastTimeSameDir = dirMap.get(s.direction);
-
-        if (lastTimeSameDir != null && now - lastTimeSameDir < 15 * 60_000) {
-            return true; // 15 минут cooldown вместо 45
-        }
-
-        return false; // все остальное разрешено
+        Long lastCloseTime = dirMap.get(s.direction);
+        return lastCloseTime != null && candleCloseTime - lastCloseTime < 15 * 60_000;
     }
-    private void markSignalSent(String pair, String direction) {
+    private void markSignalSent(String pair, String direction, long candleCloseTime) {
         lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
-                .put(direction, System.currentTimeMillis());
+                .put(direction, candleCloseTime);
     }
 
     public void connectTickWebSocket(String pair) {
