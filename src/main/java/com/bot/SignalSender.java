@@ -675,68 +675,69 @@ public class SignalSender {
         return high;
     }
 
-    private void sendSignalIfAllowed(String pair,
-                                     Signal s,
-                                     List<com.bot.TradingCore.Candle> closes15m) {
-
-        if (closes15m.size() < 20)
-            return;
-
-        // ✅ запрет дублирования направления
-        if (wasSameDirectionRecently(pair, s.direction, 1)) {
+    private void sendSignalIfAllowed(String pair, Signal s, List<com.bot.TradingCore.Candle> closes15m) {
+        if (closes15m.size() < 20) {
+            System.out.println("[SKIP] Not enough candles for " + pair);
             return;
         }
 
-        MicroTrendResult micro =
-                computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
+        // Проверка cooldown
+        if (isCooldown(pair, s)) {
+            System.out.println("[SKIP] Cooldown active for " + pair + " " + s.direction);
+            return;
+        }
 
+        // Проверка дублирования направления
+        if (wasSameDirectionRecently(pair, s.direction, 1)) {
+            System.out.println("[SKIP] Same direction recently for " + pair + " " + s.direction);
+            return;
+        }
+
+        // MicroTrend
+        MicroTrendResult micro = computeMicroTrend(s.symbol, tickPriceDeque.get(s.symbol));
         boolean bos = detectBOS(closes15m);
         boolean liq = detectLiquiditySweep(closes15m);
 
-        double entry = s.price;
-        double stop  = s.stop;
-        double take  = s.take;
-
+        // Определяем grade
         DecisionEngineMerged.SignalGrade grade =
-                s.confidence > 0.80 ?
-                        DecisionEngineMerged.SignalGrade.A :
-                        s.confidence > 0.70 ?
-                                DecisionEngineMerged.SignalGrade.B :
+                s.confidence > 0.80 ? DecisionEngineMerged.SignalGrade.A :
+                        s.confidence > 0.70 ? DecisionEngineMerged.SignalGrade.B :
                                 DecisionEngineMerged.SignalGrade.C;
 
+        // Причина для логов
         String reason = String.format(
                 "Score=%.2f Micro=%.4f BOS=%b LIQ=%b",
                 s.rawScore, micro.speed, bos, liq
         );
 
-        DecisionEngineMerged.TradeIdea idea =
-                new DecisionEngineMerged.TradeIdea(
-                        s.symbol,
-                        s.direction.equals("LONG") ?
-                                TradingCore.Side.LONG :
-                                TradingCore.Side.SHORT,
-                        entry,
-                        stop,
-                        take,
-                        s.confidence,
-                        grade,
-                        reason
-                );
+        DecisionEngineMerged.TradeIdea idea = new DecisionEngineMerged.TradeIdea(
+                s.symbol,
+                s.direction.equals("LONG") ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
+                s.price,
+                s.stop,
+                s.take,
+                s.confidence,
+                grade,
+                reason
+        );
 
-        if (!core.allowSignal(idea))
+        if (!core.allowSignal(idea)) {
+            System.out.println("[SKIP] core disallowed signal for " + pair);
             return;
+        }
 
+        // Регистрация сигнала
         core.registerSignal(idea);
-
         markSignalSent(pair, s.direction);
 
-        signalHistory
-                .computeIfAbsent(pair, k -> new ArrayList<>())
-                .add(s);
+        // История
+        signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
 
+        // Отправка в Telegram
         bot.sendMessageAsync(s.toTelegramMessage());
 
         signalsThisCycle++;
+        System.out.println("[SENT] Signal for " + pair + " " + s.direction + " conf=" + s.confidence);
     }
     public static class Signal {
         public final String symbol;
@@ -1152,11 +1153,12 @@ public class SignalSender {
     }
     private void runSchedulerCycle() {
         System.out.println("[CYCLE] " + LocalDateTime.now());
+
         try {
             if (cachedPairs == null || cachedPairs.isEmpty())
                 return;
 
-            signalsThisCycle = 0; // чистим счетчик на новый цикл
+            signalsThisCycle = 0;
             List<Signal> candidates = new ArrayList<>();
 
             for (String pair : cachedPairs) {
@@ -1164,62 +1166,48 @@ public class SignalSender {
                 List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
                 List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
 
-                if (m15.size() < 60 || h1.size() < 60)
+                if (m15.size() < 60 || h1.size() < 60) {
+                    System.out.println("[SKIP] Not enough candles for " + pair);
                     continue;
+                }
 
-                com.bot.TradingCore.Candle lastClosed = m15.get(m15.size()-2);
+                com.bot.TradingCore.Candle lastClosed = m15.get(m15.size()-1);
 
-                // ✅ проверяем новая ли свеча
                 long lastProcessed = lastSignalCandleTs
                         .getOrDefault(pair, new ConcurrentHashMap<>())
                         .getOrDefault("15m", 0L);
 
                 if (lastClosed.closeTime <= lastProcessed) {
+                    System.out.println("[SKIP] Already processed candle for " + pair);
                     continue;
                 }
 
+                // --- расчёт основных индикаторов ---
                 List<Double> closes15 = m15.stream().map(c -> c.close).toList();
-
-                MicroTrendResult micro =
-                        computeMicroTrend(pair, tickPriceDeque.get(pair));
-
-                MarketPhase phase = detectMarketPhase(m15, micro);
-                if (phase == MarketPhase.NO_TRADE)
-                    continue;
+                MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
 
                 double emaScore  = strategyEMANorm(closes15);
                 double rsiScore  = strategyRSINorm(closes15);
                 double momScore  = strategyMomentumNorm(closes15);
                 double macdScore = strategyMACDNorm(closes15);
-
                 double microBias = Math.tanh(micro.speed * 500);
 
-                double rawScore = emaScore*0.30 +
-                        rsiScore*0.15 +
-                        momScore*0.20 +
-                        macdScore*0.15 +
-                        microBias*0.20;
-
+                double rawScore = emaScore*0.30 + rsiScore*0.15 + momScore*0.20 + macdScore*0.15 + microBias*0.20;
                 rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
 
                 String dir = rawScore >= 0 ? "LONG" : "SHORT";
-
                 double atr = atr(m15, 14);
-                if (atr <= 0)
-                    continue;
+                if (atr <= 0) continue;
 
                 double entry = lastClosed.close;
                 double risk  = atr * 1.3;
-
                 double stop = dir.equals("LONG") ? entry - risk : entry + risk;
                 double take = dir.equals("LONG") ? entry + risk*2.6 : entry - risk*2.6;
 
+                // Confidence
                 double confidence = composeConfidence(
                         rawScore,
-                        multiTFConfirm(
-                                emaDirection(h1,20,50),
-                                emaDirection(m15,20,50)
-                        ),
+                        multiTFConfirm(emaDirection(h1,20,50), emaDirection(m15,20,50)),
                         computeVolatilityOk(m15, atr),
                         atr/entry > ATR_MIN_PCT,
                         Math.abs(micro.speed) > 0.0006,
@@ -1229,8 +1217,10 @@ public class SignalSender {
                         detectLiquiditySweep(m15)
                 );
 
-                if(confidence < MIN_CONF)
+                if (confidence < 0.50) { // снижен порог для теста
+                    System.out.println("[SKIP] Low confidence " + pair + " conf=" + confidence);
                     continue;
+                }
 
                 Signal s = new Signal(
                         pair,
@@ -1252,31 +1242,23 @@ public class SignalSender {
 
                 s.stop = stop;
                 s.take = take;
-
                 candidates.add(s);
             }
 
-            // сортировка по силе сигнала
+            // Сортировка кандидатов по силе сигнала
             candidates.sort(Comparator.comparingDouble((Signal s) -> s.confidence).reversed());
 
             int limit = Math.min(5, candidates.size());
             for (int i = 0; i < limit; i++) {
                 Signal s = candidates.get(i);
+                sendSignalIfAllowed(s.symbol, s, histM15.getOrDefault(s.symbol, new ArrayList<>()));
 
-                List<com.bot.TradingCore.Candle> m15 =
-                        fetchKlines(s.symbol, "15m", KLINES_LIMIT);
-
-                if (m15.size() < 2) continue;
-
-                com.bot.TradingCore.Candle lastClosed =
-                        m15.get(m15.size() - 2);
-
-                sendSignalIfAllowed(s.symbol, s, m15);
-
-                lastSignalCandleTs
-                        .computeIfAbsent(s.symbol, k -> new ConcurrentHashMap<>())
+                // Обновляем lastSignalCandleTs
+                com.bot.TradingCore.Candle lastClosed = histM15.get(s.symbol).get(histM15.get(s.symbol).size()-1);
+                lastSignalCandleTs.computeIfAbsent(s.symbol, k -> new ConcurrentHashMap<>())
                         .put("15m", lastClosed.closeTime);
             }
+
         } catch (Exception e) {
             e.printStackTrace();
         }
