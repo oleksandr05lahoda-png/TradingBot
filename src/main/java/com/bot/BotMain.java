@@ -69,25 +69,22 @@ public class BotMain {
     }
 
     /**
-     * Telegram формат (пока базовый, потом сделаем расширенный)
+     * Telegram формат (базовый)
      */
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
-
         return String.format(
                 "*%s* → *%s*\n" +
                         "Entry: %.6f\n" +
                         "Stop: %.6f\n" +
                         "Take: %.6f\n" +
-                        "Confidence: *%.2f*\n" +
-                        "Grade: %s\n" +
+                        "Probability: *%.2f*\n" +
                         "_time: %s_",
                 s.symbol,
                 s.side,
-                s.entry,
+                s.price,
                 s.stop,
                 s.take,
-                s.confidence,
-                s.grade,
+                s.probability, // probability вместо confidence
                 LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }
