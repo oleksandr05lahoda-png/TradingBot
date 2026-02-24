@@ -37,30 +37,21 @@ public final class DecisionEngineMerged {
     /* ================= TRADE IDEA ================= */
 
     public static final class TradeIdea {
-        public final String symbol;
-        public final TradingCore.Side side;
-        public final double entry;
-        public final double stop;
-        public final double take;
-        public final double confidence;
-        public final SignalGrade grade;
-        public final String reason;
+        public final String symbol;          // Символ монеты
+        public final TradingCore.Side side;  // LONG или SHORT
+        public final double price;           // Цена закрытия последней свечи
+        public final double probability;     // Вероятность успешного прогноза (0.52 - 0.95)
+        public final String reason;          // Причины сигнала (2-3 главных фактора)
 
         public TradeIdea(String symbol,
                          TradingCore.Side side,
-                         double entry,
-                         double stop,
-                         double take,
-                         double confidence,
-                         SignalGrade grade,
+                         double price,
+                         double probability,
                          String reason) {
             this.symbol = symbol;
             this.side = side;
-            this.entry = entry;
-            this.stop = stop;
-            this.take = take;
-            this.confidence = confidence;
-            this.grade = grade;
+            this.price = price;
+            this.probability = probability;
             this.reason = reason;
         }
     }
@@ -85,7 +76,7 @@ public final class DecisionEngineMerged {
                         categories.getOrDefault(symbol, CoinCategory.TOP),
                         now))
                 .filter(Objects::nonNull)
-                .sorted(Comparator.comparingDouble(t -> -t.confidence))
+                .sorted(Comparator.comparingDouble(t -> -t.probability)) // заменили confidence на probability
                 .collect(Collectors.toList());
     }
 
@@ -102,7 +93,6 @@ public final class DecisionEngineMerged {
         if (!valid(c15) || !valid(c1h)) return null;
 
         double price = last(c15).close;
-        double atr = Math.max(atr(c15, 14), price * 0.0012);
 
         MarketState state = detectState(c15);
         HTFBias bias = detectBias(c1h);
@@ -110,39 +100,56 @@ public final class DecisionEngineMerged {
         double scoreLong = 0;
         double scoreShort = 0;
 
+        List<String> reasons = new ArrayList<>();
+
         // ===== Trend =====
-        if (bias == HTFBias.BULL) scoreLong += 2.0;
-        if (bias == HTFBias.BEAR) scoreShort += 2.0;
+        if (bias == HTFBias.BULL) {
+            scoreLong += 2.0;
+            reasons.add("BULL trend");
+        }
+        if (bias == HTFBias.BEAR) {
+            scoreShort += 2.0;
+            reasons.add("BEAR trend");
+        }
 
         // ===== Pullback =====
-        if (pullback(c15, true)) scoreLong += 1.4;
-        if (pullback(c15, false)) scoreShort += 1.4;
+        if (pullback(c15, true)) {
+            scoreLong += 1.4;
+            reasons.add("Pullback bullish");
+        }
+        if (pullback(c15, false)) {
+            scoreShort += 1.4;
+            reasons.add("Pullback bearish");
+        }
 
         // ===== Micro impulse =====
         if (impulse(c1)) {
             scoreLong += 0.8;
             scoreShort += 0.8;
+            reasons.add("Impulse detected");
         }
 
         // ===== Divergence =====
-        if (bullDiv(c15)) scoreLong += 1.2;
-        if (bearDiv(c15)) scoreShort += 1.2;
+        if (bullDiv(c15)) {
+            scoreLong += 1.2;
+            reasons.add("Bullish divergence");
+        }
+        if (bearDiv(c15)) {
+            scoreShort += 1.2;
+            reasons.add("Bearish divergence");
+        }
 
         // ===== Volume =====
         if (volumeSpike(c15, cat)) {
             scoreLong += 0.5;
             scoreShort += 0.5;
+            reasons.add("Volume spike");
         }
 
-        if (scoreLong < MIN_SCORE_THRESHOLD &&
-                scoreShort < MIN_SCORE_THRESHOLD)
+        if (scoreLong < MIN_SCORE_THRESHOLD && scoreShort < MIN_SCORE_THRESHOLD)
             return null;
 
-        TradingCore.Side side =
-                scoreLong > scoreShort ?
-                        TradingCore.Side.LONG :
-                        TradingCore.Side.SHORT;
-
+        TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
         double rawScore = Math.max(scoreLong, scoreShort);
 
         if (!cooldownAllowed(symbol, side, cat, now))
@@ -151,31 +158,13 @@ public final class DecisionEngineMerged {
         if (!flipAllowed(symbol, side))
             return null;
 
-        double confidence = computeConfidence(rawScore, state, cat);
+        double probability = computeConfidence(rawScore, state, cat);
 
-        if (confidence < MIN_CONFIDENCE)
+        if (probability < MIN_CONFIDENCE)
             return null;
 
-        SignalGrade grade =
-                confidence > 0.78 ? SignalGrade.A :
-                        confidence > 0.65 ? SignalGrade.B :
-                                SignalGrade.C;
-
-        double riskMult =
-                cat == CoinCategory.MEME ? 1.3 :
-                        cat == CoinCategory.ALT ? 1.0 : 0.85;
-
-        double rr = confidence > 0.75 ? 2.8 : 2.2;
-
-        double stop =
-                side == TradingCore.Side.LONG ?
-                        price - atr * riskMult :
-                        price + atr * riskMult;
-
-        double take =
-                side == TradingCore.Side.LONG ?
-                        price + atr * riskMult * rr :
-                        price - atr * riskMult * rr;
+        // Ограничиваем количество причин до 3
+        String reasonStr = String.join(", ", reasons.subList(0, Math.min(3, reasons.size())));
 
         registerSignal(symbol, side, now);
 
@@ -183,11 +172,8 @@ public final class DecisionEngineMerged {
                 symbol,
                 side,
                 price,
-                stop,
-                take,
-                confidence,
-                grade,
-                "Score=" + rawScore + " State=" + state
+                probability,
+                reasonStr
         );
     }
 
