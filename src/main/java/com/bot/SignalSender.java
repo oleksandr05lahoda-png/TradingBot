@@ -61,12 +61,11 @@ public class SignalSender {
     private final com.bot.TradingCore.RiskEngine riskEngine = new com.bot.TradingCore.RiskEngine(0.01, 0.05, 1.0);
     private final InstitutionalSignalCore core =
             new InstitutionalSignalCore(
-                    12,        // max signals per hour
-                    1,         // max same symbol
-                    0.25,      // portfolio risk
-                    6*60_000,  // signal lifetime
-                    0.58,      // min quality
-                    0.004      // min volatility
+                    12,       // max global signals
+                    1,        // max signals per symbol
+                    0.25,     // portfolio risk / exposure
+                    0.58,     // min confidence
+                    0.004     // min signal diff
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     // ========================= PUBLIC API =========================
@@ -1059,5 +1058,90 @@ public class SignalSender {
     private boolean checkStructureAlignment(List<com.bot.TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
         return structure == dir;
+    }
+    public void startScheduler() {
+        if (scheduler != null && !scheduler.isShutdown()) return; // уже запущен
+
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(
+                this::runScheduleCycle,       // метод который вызывается
+                0,                             // первый запуск сразу
+                INTERVAL_MIN,                  // период в минутах
+                TimeUnit.MINUTES
+        );
+
+        System.out.println("[Scheduler] Scheduler started, interval " + INTERVAL_MIN + " min");
+    }
+    private void runScheduleCycle() {
+        try {
+            signalsThisCycle = 0;  // сброс счетчика на цикл
+            if (System.currentTimeMillis() - dailyResetTs > 24*60*60_000L) {
+                dailyRequests.set(0);
+                dailyResetTs = System.currentTimeMillis();
+            }
+
+            // Обновляем топовые пары
+            if (cachedPairs == null || cachedPairs.isEmpty()) {
+                cachedPairs = getTopSymbolsSet(TOP_N);
+            }
+
+            for (String pair : cachedPairs) {
+                // Получаем свечи
+                List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair, "15m", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
+
+                if (m15.size() < 60 || h1.size() < 60) continue;
+
+                // Анализ пары
+                Signal s = analyzePair(pair, m15, h1);
+                if (s == null || s.confidence < MIN_CONF) continue;
+
+                long candleCloseTime = m15.get(m15.size() - 1).closeTime;
+
+                // Проверка cooldown для направления
+                if (isCooldown(pair, s, candleCloseTime)) continue;
+
+                // Проверка дневного лимита
+                if (dailyRequests.incrementAndGet() > 5000) {
+                    System.out.println("[Scheduler] Daily request limit reached, skipping " + pair);
+                    continue;
+                }
+
+                // Регистрация сигнала
+                markSignalSent(pair, s.direction, candleCloseTime);
+                signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
+
+                // Проверка DecisionEngine и core
+                DecisionEngineMerged.TradeIdea idea =
+                        new DecisionEngineMerged.TradeIdea(
+                                s.symbol,
+                                s.direction.equals("LONG") ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
+                                s.price,
+                                s.stop,
+                                s.take,
+                                s.confidence,
+                                s.confidence > 0.80 ? DecisionEngineMerged.SignalGrade.A :
+                                        s.confidence > 0.70 ? DecisionEngineMerged.SignalGrade.B :
+                                                DecisionEngineMerged.SignalGrade.C,
+                                "auto-generated"
+                        );
+
+                if (!core.allowSignal(idea)) continue; // core фильтр
+                core.registerSignal(idea);
+
+                // Отправка в Telegram
+                bot.sendMessageAsync(s.toTelegramMessage());
+                signalsThisCycle++;
+
+                // Ограничение сигналов на один цикл
+                if (signalsThisCycle >= TOP_N) break;
+            }
+
+            System.out.println("[Scheduler] Cycle completed: signals sent " + signalsThisCycle);
+
+        } catch (Exception e) {
+            System.out.println("[Scheduler] Exception in runScheduleCycle: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 }

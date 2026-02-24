@@ -98,7 +98,6 @@ public final class SignalOptimizer {
 
         double confidence = signal.confidence;
 
-        // Коррекция в зависимости от микро-тренда
         boolean isLong = signal.side == TradingCore.Side.LONG;
         boolean trendUp = mt.speed > 0;
 
@@ -108,9 +107,7 @@ public final class SignalOptimizer {
             confidence += ((isLong && trendUp) || (!isLong && !trendUp)) ? 0.03 : -0.03;
         }
 
-        // Дополнительные мелкие корректировки
-        confidence = clamp(confidence, MIN_CONF, MAX_CONF);
-        return confidence;
+        return clamp(confidence, MIN_CONF, MAX_CONF);
     }
 
     /* ================= STOP / TAKE ADJUSTMENT ================= */
@@ -148,4 +145,5 @@ public final class SignalOptimizer {
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }
+
 }
