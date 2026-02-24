@@ -782,7 +782,8 @@ public class SignalSender {
                     (atrBreakLong ? "ATR↑ " : "") +
                     (atrBreakShort ? "ATR↓ " : "") +
                     (impulse ? "IMPULSE " : "");
-            String localTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+
+            String timeStr = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
 
             return String.format("*%s* → *%s*\n" +
                             "Probability: *%.0f%%*\n" +
@@ -791,11 +792,10 @@ public class SignalSender {
                             "TP: %.8f\n" +
                             "RSI(14): %.2f | RSI7: %.2f | RSI4: %.2f\n" +
                             "_flags_: %s\n" +
-                            "_rawScore: %.3f mtf:%d vol:%b atr:%b_\n" +
                             "_time: %s_",
                     symbol,
                     direction,
-                    confidence*100.0,   // выводим вероятность в процентах
+                    confidence * 100.0,
                     price,
                     stop != null ? stop : 0.0,
                     take != null ? take : 0.0,
@@ -803,11 +803,7 @@ public class SignalSender {
                     rsi7,
                     rsi4,
                     flags.trim(),
-                    rawScore,
-                    mtfConfirm,
-                    volOk,
-                    atrOk,
-                    localTime
+                    timeStr
             );
         }
     }
