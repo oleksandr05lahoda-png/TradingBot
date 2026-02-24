@@ -147,10 +147,19 @@ public final class DecisionEngineMerged {
         if (probability < MIN_CONFIDENCE)
             return null;
 
-        // Ограничиваем количество причин до 3
-        String reasonStr = String.join(", ", reasons.subList(0, Math.min(3, reasons.size())));
+// ===== Дополнительные флаги и RSI для Reason =====
+        List<String> flags = new ArrayList<>();
+        if (atr(c15, 14) > price * 0.001) flags.add("ATR↑");
+        if (volumeSpike(c15, cat)) flags.add("vol:true");
+        if (impulse(c1)) flags.add("impulse:true");
 
-        // ===== Stop и Take =====
+        double rsi14 = rsi(c15, 14); // метод RSI добавляем ниже
+
+        String reasonStr = String.join(", ", reasons.subList(0, Math.min(3, reasons.size())))
+                + " | _flags_: " + String.join(", ", flags)
+                + " | _raw_: " + String.format("%.3f mtf:0 vol:%b atr:%b", Math.max(scoreLong, scoreShort), volumeSpike(c15, cat), atr(c15, 14) > price * 0.001)
+                + " | RSI(14): " + String.format("%.2f", rsi14);
+
         double riskMult =
                 cat == CoinCategory.MEME ? 1.3 :
                         cat == CoinCategory.ALT ? 1.0 : 0.85;
@@ -376,5 +385,16 @@ public final class DecisionEngineMerged {
                          double min,
                          double max) {
         return Math.max(min, Math.min(max, v));
+    }
+    private double rsi(List<TradingCore.Candle> c, int period) {
+        if (c.size() < period + 1) return 50.0;
+        double gain = 0, loss = 0;
+        for (int i = c.size() - period; i < c.size(); i++) {
+            double change = c.get(i).close - c.get(i - 1).close;
+            if (change > 0) gain += change;
+            else loss -= change;
+        }
+        double rs = loss == 0 ? 100 : gain / loss;
+        return 100 - (100 / (1 + rs));
     }
 }
