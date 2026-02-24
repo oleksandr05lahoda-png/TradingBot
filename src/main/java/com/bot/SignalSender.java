@@ -1171,17 +1171,6 @@ public class SignalSender {
                     continue;
                 }
 
-                com.bot.TradingCore.Candle lastClosed = m15.get(m15.size()-1);
-
-                long lastProcessed = lastSignalCandleTs
-                        .getOrDefault(pair, new ConcurrentHashMap<>())
-                        .getOrDefault("15m", 0L);
-
-                if (lastClosed.closeTime <= lastProcessed) {
-                    System.out.println("[SKIP] Already processed candle for " + pair);
-                    continue;
-                }
-
                 // --- расчёт основных индикаторов ---
                 List<Double> closes15 = m15.stream().map(c -> c.close).toList();
                 MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
@@ -1198,8 +1187,13 @@ public class SignalSender {
                 String dir = rawScore >= 0 ? "LONG" : "SHORT";
                 double atr = atr(m15, 14);
                 if (atr <= 0) continue;
-
-                double entry = lastClosed.close;
+                double entry;
+                Deque<Double> dq = tickPriceDeque.getOrDefault(pair, new ArrayDeque<>());
+                if (!dq.isEmpty()) {
+                    entry = dq.getLast(); // берем последнюю цену из WebSocket
+                } else {
+                    entry = m15.get(m15.size()-1).close; // fallback
+                }
                 double risk  = atr * 1.3;
                 double stop = dir.equals("LONG") ? entry - risk : entry + risk;
                 double take = dir.equals("LONG") ? entry + risk*2.6 : entry - risk*2.6;
@@ -1253,10 +1247,8 @@ public class SignalSender {
                 Signal s = candidates.get(i);
                 sendSignalIfAllowed(s.symbol, s, histM15.getOrDefault(s.symbol, new ArrayList<>()));
 
-                // Обновляем lastSignalCandleTs
-                com.bot.TradingCore.Candle lastClosed = histM15.get(s.symbol).get(histM15.get(s.symbol).size()-1);
                 lastSignalCandleTs.computeIfAbsent(s.symbol, k -> new ConcurrentHashMap<>())
-                        .put("15m", lastClosed.closeTime);
+                        .put("15m", System.currentTimeMillis());
             }
 
         } catch (Exception e) {
