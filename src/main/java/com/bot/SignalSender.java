@@ -636,17 +636,13 @@ public class SignalSender {
         // многотаймфреймное подтверждение
         conf += mtfConfirm * 0.05; // +0.05 за каждый уровень подтверждения
 
-        // волатильность и ATR
-        conf += volOk ? 0.08 : -0.05;
-        conf += atrOk ? 0.08 : -0.05;
-
+        conf += volOk ? 0.05 : -0.02;
+        conf += atrOk ? 0.05 : -0.02;
+        conf += vwapAligned ? 0.03 : 0;
+        conf += structureAligned ? 0.04 : -0.01;
         // импульс свечи
         if (impulse && Math.abs(rawScore) > 0.25) conf += 0.04;
         else if (!impulse) conf -= 0.02;
-
-        // VWAP и структура
-        conf += vwapAligned ? 0.05 : -0.02;
-        conf += structureAligned ? 0.06 : -0.03;
 
         // Break of structure
         conf += bos ? 0.05 : 0;
@@ -676,12 +672,6 @@ public class SignalSender {
     }
 
     private void sendSignalIfAllowed(String pair, Signal s, List<com.bot.TradingCore.Candle> closes15m) {
-
-        // ===== лимит сигналов за цикл =====
-        if (signalsThisCycle >= 5) {
-            System.out.println("[LIMIT] signals per cycle reached");
-            return;
-        }
 
         // ===== проверка активного сигнала =====
         Signal active = activeSignals.get(pair);
@@ -1177,7 +1167,7 @@ public class SignalSender {
         if (candles.isEmpty()) return true;
 
         double vwap = vwap(candles);
-        return price > vwap * 0.998 && price < vwap * 1.002;
+        return price > vwap * 0.995 && price < vwap * 1.005;
     }
     private boolean checkStructureAlignment(List<com.bot.TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
@@ -1228,7 +1218,7 @@ public class SignalSender {
             );
 
             // ========= ОТПРАВКА ТОПОВ =========
-            int limit = Math.min(5, candidates.size());
+            int limit = candidates.size();
 
             for (int i = 0; i < limit; i++) {
 
