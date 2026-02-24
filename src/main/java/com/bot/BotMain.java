@@ -11,75 +11,109 @@ public class BotMain {
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.systemDefault();
-    private static final int SIGNAL_INTERVAL_MIN = 15; // каждые 15 минут
+    private static final int SIGNAL_INTERVAL_MIN = 15;
 
     public static void main(String[] args) {
+
+        if (TG_TOKEN == null || TG_TOKEN.isBlank()) {
+            System.err.println("TELEGRAM_TOKEN not set!");
+            return;
+        }
 
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
         SignalSender signalSender = new SignalSender(telegram);
 
-        telegram.sendMessageAsync("Бот запущен");
-        System.out.println("Bot started");
+        telegram.sendMessageAsync("🚀 Trading Bot запущен");
+        System.out.println("Bot started at " + LocalDateTime.now());
 
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        ScheduledExecutorService scheduler =
+                Executors.newScheduledThreadPool(2, new BotThreadFactory());
 
-        long initialDelay = computeInitialDelay();
-
-        scheduler.scheduleAtFixedRate(() -> {
+        Runnable signalTask = () -> {
             try {
 
-                System.out.println("Signal cycle: " + LocalDateTime.now());
+                System.out.println("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                // Получаем уже готовые, отфильтрованные сигналы
                 List<DecisionEngineMerged.TradeIdea> signals =
                         signalSender.generateSignals();
+
+                if (signals == null || signals.isEmpty()) {
+                    System.out.println("No valid signals this cycle.");
+                    return;
+                }
 
                 for (DecisionEngineMerged.TradeIdea s : signals) {
                     telegram.sendMessageAsync(formatSignal(s));
                 }
 
-            } catch (Exception ex) {
-                telegram.sendMessageAsync("Ошибка генерации сигналов: " + ex.getMessage());
-                ex.printStackTrace();
+            } catch (Throwable t) {
+                System.err.println("CRITICAL ERROR in signal cycle:");
+                t.printStackTrace();
+                telegram.sendMessageAsync("⚠ Ошибка цикла: " + t.getMessage());
             }
+        };
 
-        }, initialDelay, SIGNAL_INTERVAL_MIN, TimeUnit.MINUTES);
+        // Запуск сразу + каждые 15 минут
+        scheduler.scheduleAtFixedRate(
+                signalTask,
+                0,
+                SIGNAL_INTERVAL_MIN,
+                TimeUnit.MINUTES
+        );
 
-        // KEEP JVM ALIVE
-        try {
-            Thread.currentThread().join();
-        } catch (InterruptedException ignored) {}
+        // Graceful shutdown
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutting down bot...");
+            scheduler.shutdown();
+        }));
     }
 
     /**
-     * Синхронизация с закрытием M15 свечи
-     */
-    private static long computeInitialDelay() {
-        LocalDateTime now = LocalDateTime.now(ZONE);
-        int minute = now.getMinute();
-        int delay = SIGNAL_INTERVAL_MIN - (minute % SIGNAL_INTERVAL_MIN);
-        if (delay == SIGNAL_INTERVAL_MIN) delay = 0;
-        return delay;
-    }
-
-    /**
-     * Формат Telegram сообщения
+     * Telegram формат (пока базовый, потом сделаем расширенный)
      */
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
+
         return String.format(
-                "%s %s\nEntry: %.4f\nStop: %.4f\nTake: %.4f\nConfidence: %.2f\nGrade: %s",
+                "*%s* → *%s*\n" +
+                        "Entry: %.6f\n" +
+                        "Stop: %.6f\n" +
+                        "Take: %.6f\n" +
+                        "Confidence: *%.2f*\n" +
+                        "Grade: %s\n" +
+                        "_time: %s_",
                 s.symbol,
                 s.side,
                 s.entry,
                 s.stop,
                 s.take,
                 s.confidence,
-                s.grade
+                s.grade,
+                LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }
 
     /**
-     * UTC -> локальное время
+     * Кастомный ThreadFactory с защитой от смерти потока
+     */
+    static class BotThreadFactory implements ThreadFactory {
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r);
+            t.setName("SignalSchedulerThread");
+            t.setDaemon(false);
+
+            t.setUncaughtExceptionHandler((thread, ex) -> {
+                System.err.println("UNCAUGHT ERROR in " + thread.getName());
+                ex.printStackTrace();
+            });
+
+            return t;
+        }
+    }
+
+    /**
+     * UTC → локальное
      */
     public static String formatLocalTime(long utcMillis) {
         return Instant.ofEpochMilli(utcMillis)

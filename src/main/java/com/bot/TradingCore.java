@@ -9,18 +9,26 @@ public final class TradingCore {
        CANDLE
        ============================================================ */
 
-    public static class Candle {
+    public static final class Candle {
+
         public final long openTime;
         public final double open;
         public final double high;
         public final double low;
         public final double close;
         public final double volume;
-        public final double qvol; // <-- добавляем сюда
+        public final double qvol;
         public final long closeTime;
 
-        public Candle(long openTime, double open, double high, double low, double close,
-                      double volume, double qvol, long closeTime) {
+        public Candle(long openTime,
+                      double open,
+                      double high,
+                      double low,
+                      double close,
+                      double volume,
+                      double qvol,
+                      long closeTime) {
+
             this.openTime = openTime;
             this.open = open;
             this.high = high;
@@ -41,7 +49,7 @@ public final class TradingCore {
     public enum CoinType { TOP, ALT, MEME }
 
     /* ============================================================
-       RISK ENGINE (PRO LEVEL)
+       RISK ENGINE (STABLE)
        ============================================================ */
 
     public static final class RiskEngine {
@@ -60,6 +68,7 @@ public final class TradingCore {
         }
 
         public static final class TradeSignal {
+
             public final String symbol;
             public final Side side;
             public final double entry;
@@ -100,23 +109,23 @@ public final class TradingCore {
                                      String reason,
                                      CoinType type) {
 
-            /* ==== VOLATILITY ADJUSTMENT ==== */
+            if (entry <= 0 || atr <= 0)
+                return null;
 
             double atrPct = atr / entry;
-
             atrPct = clamp(atrPct, minRiskPct, maxRiskPct);
 
-            double typeRiskMultiplier = switch (type) {
+            double typeMultiplier = switch (type) {
                 case TOP -> 1.0;
-                case ALT -> 1.25;
-                case MEME -> 1.6;
+                case ALT -> 1.2;
+                case MEME -> 1.4; // снижено с 1.6
             };
 
-            double riskPct = atrPct * typeRiskMultiplier;
-
-            riskPct = clamp(riskPct, minRiskPct, maxRiskPct);
-
-            /* ==== RR BASED ON CONFIDENCE ==== */
+            double riskPct = clamp(
+                    atrPct * typeMultiplier,
+                    minRiskPct,
+                    maxRiskPct
+            );
 
             double rr =
                     confidence > 0.85 ? 3.2 :
@@ -126,9 +135,8 @@ public final class TradingCore {
 
             rr = Math.max(rr, minRR);
 
-            /* ==== STOP / TAKE ==== */
-
-            double stop, take;
+            double stop;
+            double take;
 
             if (side == Side.LONG) {
                 stop = entry * (1 - riskPct);
@@ -151,22 +159,28 @@ public final class TradingCore {
             );
         }
 
-        private double clamp(double v, double min, double max) {
+        private double clamp(double v,
+                             double min,
+                             double max) {
             return Math.max(min, Math.min(max, v));
         }
     }
 
     /* ============================================================
-       ADAPTIVE BRAIN (SAFE VERSION)
+       ADAPTIVE BRAIN (PRO SAFE)
        ============================================================ */
 
     public static final class AdaptiveBrain {
 
         private static final double MAX_BIAS = 0.08;
-        private static final double DECAY = 0.98;
+        private static final double DECAY = 0.985;
+        private static final int MAX_STREAK = 5;
 
-        private final Map<String, Double> symbolBias = new ConcurrentHashMap<>();
-        private final Map<String, Integer> streaks = new ConcurrentHashMap<>();
+        private final Map<String, Double> symbolBias =
+                new ConcurrentHashMap<>();
+
+        private final Map<String, Integer> streaks =
+                new ConcurrentHashMap<>();
 
         public double applyAllAdjustments(String strategy,
                                           String symbol,
@@ -188,46 +202,70 @@ public final class TradingCore {
         }
 
         private double strategyBoost(String strategy) {
-            if ("ELITE5".equalsIgnoreCase(strategy))
-                return 0.02;
-            return 0.0;
+            return "ELITE5".equalsIgnoreCase(strategy)
+                    ? 0.02
+                    : 0.0;
         }
 
         private double typeBoost(CoinType type) {
             return switch (type) {
                 case TOP -> 0.00;
-                case ALT -> 0.015;
-                case MEME -> 0.03;
+                case ALT -> 0.012;
+                case MEME -> 0.02;
             };
         }
 
-        public void registerResult(String symbol, boolean win) {
+        public void registerResult(String symbol,
+                                   boolean win) {
 
-            /* ==== STREAK CONTROL ==== */
+            /* ==== STREAK ==== */
 
-            streaks.merge(symbol, win ? 1 : -1, Integer::sum);
+            streaks.merge(symbol,
+                    win ? 1 : -1,
+                    Integer::sum);
 
             streaks.compute(symbol, (s, val) -> {
                 if (val == null) return 0;
-                if (val > 5) return 5;
-                if (val < -5) return -5;
+                if (val > MAX_STREAK) return MAX_STREAK;
+                if (val < -MAX_STREAK) return -MAX_STREAK;
                 return val;
             });
 
-            /* ==== BIAS CONTROL ==== */
+            /* ==== BIAS ==== */
 
             symbolBias.merge(symbol,
                     win ? 0.01 : -0.01,
                     Double::sum);
 
             symbolBias.compute(symbol, (s, val) -> {
-                if (val == null) return 0.0;
-                val *= DECAY; // плавное затухание
-                return clamp(val, -MAX_BIAS, MAX_BIAS);
+
+                if (val == null)
+                    return 0.0;
+
+                val *= DECAY;
+
+                val = clamp(val, -MAX_BIAS, MAX_BIAS);
+
+                if (Math.abs(val) < 0.0005)
+                    return 0.0; // очистка шума
+
+                return val;
             });
         }
 
-        private double clamp(double v, double min, double max) {
+        public void clearSymbol(String symbol) {
+            symbolBias.remove(symbol);
+            streaks.remove(symbol);
+        }
+
+        public void clearAll() {
+            symbolBias.clear();
+            streaks.clear();
+        }
+
+        private double clamp(double v,
+                             double min,
+                             double max) {
             return Math.max(min, Math.min(max, v));
         }
     }

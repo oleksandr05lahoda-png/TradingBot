@@ -65,7 +65,8 @@ public class SignalSender {
                     1,        // max signals per symbol
                     0.25,     // portfolio risk / exposure
                     0.58,     // min confidence
-                    0.004     // min signal diff
+                    0.004,    // min signal diff
+                    15000     // cooldown в миллисекундах (пример: 15 секунд)
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     // ========================= PUBLIC API =========================
