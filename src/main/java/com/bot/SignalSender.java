@@ -683,7 +683,7 @@ public class SignalSender {
             return;
 
         // ✅ запрет дублирования направления
-        if (wasSameDirectionRecently(pair, s.direction, 2)) {
+        if (wasSameDirectionRecently(pair, s.direction, 1)) {
             return;
         }
 
@@ -1202,10 +1202,6 @@ public class SignalSender {
                 rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
 
                 String dir = rawScore >= 0 ? "LONG" : "SHORT";
-
-                // ✅ запрет переворота в течение 2 последних сигналов
-                if (isRecentOppositeSignal(pair, dir, 2))
-                    continue;
 
                 double atr = atr(m15, 14);
                 if (atr <= 0)
