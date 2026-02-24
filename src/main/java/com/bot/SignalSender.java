@@ -837,8 +837,11 @@ public class SignalSender {
     }
 
     public void connectTickWebSocket(String pair) {
-        wsWatcher.execute(() -> connectWsInternal(pair));
-    }
+        wsWatcher.scheduleAtFixedRate(() -> {
+            if (!wsMap.containsKey(pair) || wsMap.get(pair).isInputClosed()) {
+                connectWsInternal(pair);
+            }
+        }, 0, 5, TimeUnit.SECONDS);    }
     private Signal analyzePair(String pair, List<com.bot.TradingCore.Candle> c15m, List<com.bot.TradingCore.Candle> c1h) {
         if(c15m.size()<60 || c1h.size()<60) return null;
 
@@ -996,19 +999,25 @@ public class SignalSender {
 
     public List<com.bot.TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
-            List<com.bot.TradingCore.Candle> candles = fetchKlinesAsync(symbol, interval, limit).get();
+            List<com.bot.TradingCore.Candle> candles =
+                    fetchKlinesAsync(symbol, interval, limit)
+                            .get(12, TimeUnit.SECONDS);
+
             if (candles.isEmpty()) {
-                System.out.println("[KLİNES] Пустой ответ для " + symbol + " интервал " + interval);
-            } else {
-                System.out.println("[KLİNES] Получено " + candles.size() + " свечей для " + symbol + " интервал " + interval);
+                System.out.println("[KLINES] empty " + symbol + " " + interval);
             }
+
             return candles;
+
+        } catch (TimeoutException e) {
+            System.out.println("[TIMEOUT] " + symbol + " " + interval);
+            return Collections.emptyList();
+
         } catch (Exception e) {
             System.out.println("[fetchKlines] error for " + symbol + " " + interval + ": " + e.getMessage());
             return Collections.emptyList();
         }
     }
-
     public void start() {
         System.out.println("[SignalSender] Scheduler started");
 
