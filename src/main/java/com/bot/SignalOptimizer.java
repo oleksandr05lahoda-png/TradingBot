@@ -144,55 +144,21 @@ public final class SignalOptimizer {
 
     /* ================= STOP / TAKE ================= */
 
-    public DecisionEngineMerged.TradeIdea withAdjustedStopTake(
-            DecisionEngineMerged.TradeIdea signal,
-            double atr) {
+    public DecisionEngineMerged.TradeIdea withAdjustedConfidence(
+            DecisionEngineMerged.TradeIdea signal) {
 
-        double newConfidence =
-                adjustConfidence(signal);
-
-        double volatilityPct =
-                clamp(atr / signal.price,
-                        0.006,
-                        0.035);
-
-        double rr =
-                newConfidence > 0.85 ? 3.2 :
-                        newConfidence > 0.75 ? 2.6 :
-                                newConfidence > 0.65 ? 2.1 :
-                                        1.7;
-
-        double stop;
-        double take;
-
-        if (signal.side == TradingCore.Side.LONG) {
-
-            stop = signal.price *
-                    (1 - volatilityPct);
-
-            take = signal.price *
-                    (1 + volatilityPct * rr);
-
-        } else {
-
-            stop = signal.price *
-                    (1 + volatilityPct);
-
-            take = signal.price *
-                    (1 - volatilityPct * rr);
-        }
+        double newConfidence = adjustConfidence(signal);
 
         return new DecisionEngineMerged.TradeIdea(
                 signal.symbol,
                 signal.side,
                 signal.price,
-                stop,
-                take,
+                signal.stop,     // НЕ трогаем стоп
+                signal.take,     // НЕ трогаем тейк
                 newConfidence,
                 signal.flags
         );
     }
-
     /* ================= CLEANUP ================= */
 
     public void clearCacheForSymbol(String symbol) {
@@ -203,7 +169,6 @@ public final class SignalOptimizer {
         microTrendCache.clear();
     }
 
-    /* ================= UTIL ================= */
 
     private static double clamp(double v,
                                 double min,
