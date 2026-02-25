@@ -78,8 +78,8 @@ public class BotMain {
         return String.format(
                 "*%s* → *%s*\n" +
                         "Price: %.6f\n" +
+                        "Probability: %.0f%%\n" +
                         "Stop-Take: %.6f - %.6f\n" +
-                        "Probability: *%.2f*\n" +
                         "Flags: %s\n" +
                         "_time: %s_",
                 s.symbol,
