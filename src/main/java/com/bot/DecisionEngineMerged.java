@@ -95,17 +95,20 @@ public final class DecisionEngineMerged {
 
         // ===== Pullback =====
         if (pullback(c15, true)) {
-            scoreLong += 1.4;
+            scoreLong += 1.0;
             reasonWeightsLong.put("Pullback bullish", 2.0);
         }
         if (pullback(c15, false)) {
-            scoreShort += 1.4;
+            scoreShort += 1.0;
             reasonWeightsShort.put("Pullback bullish", 2.0);
         }
 
         if (impulse(c1)) {
-            scoreLong += 0.4;
-            scoreShort += 0.4;
+            if (last(c1).close > c1.get(c1.size() - 5).close) {
+                scoreLong += 0.4;
+            } else {
+                scoreShort += 0.4;
+            }
 
             reasonWeightsLong.put("Impulse", 0.4);
             reasonWeightsShort.put("Impulse", 0.4);
@@ -135,7 +138,21 @@ public final class DecisionEngineMerged {
 
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
             return null;
-        TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
+        // === Честный выбор направления без перекоса ===
+        TradingCore.Side side;
+
+        double scoreDiff = Math.abs(scoreLong - scoreShort);
+
+        if (scoreDiff < 0.25) {
+            return null;
+        }
+
+        if (scoreLong > scoreShort) {
+            side = TradingCore.Side.LONG;
+        } else {
+            side = TradingCore.Side.SHORT;
+        }
+
         double rawScore = Math.max(scoreLong, scoreShort);
 
         if (!cooldownAllowed(symbol, side, cat, now))
