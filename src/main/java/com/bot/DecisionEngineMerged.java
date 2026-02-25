@@ -129,9 +129,13 @@ public final class DecisionEngineMerged {
             reasonWeightsLong.put("Volume", 0.5);
             reasonWeightsShort.put("Volume", 0.5);
         }
-        if (scoreLong < MIN_SCORE_THRESHOLD && scoreShort < MIN_SCORE_THRESHOLD)
-            return null;
+        double dynamicThreshold =
+                state == MarketState.STRONG_TREND ? 3.0 :
+                        state == MarketState.RANGE ? 3.6 :
+                                3.2;
 
+        if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
+            return null;
         TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
         double rawScore = Math.max(scoreLong, scoreShort);
 
@@ -175,7 +179,10 @@ public final class DecisionEngineMerged {
                 cat == CoinCategory.MEME ? 1.3 :
                         cat == CoinCategory.ALT ? 1.0 : 0.85;
 
-        double rr = probability > 0.75 ? 2.8 : 2.2;
+        double rr =
+                probability > 0.80 ? 3.0 :
+                        probability > 0.70 ? 2.6 :
+                                2.2;
 
         double stop = side == TradingCore.Side.LONG ?
                 price - atr * riskMult :
@@ -233,7 +240,7 @@ public final class DecisionEngineMerged {
         if (!history.isEmpty()) {
             String last = history.peekLast();
             if (!last.equals(newSide.name()))
-                return false;
+                return true;
         }
 
         return true;
@@ -257,28 +264,28 @@ public final class DecisionEngineMerged {
             history.removeFirst();
     }
 
-    /* ================= CONFIDENCE ================= */
-
     private double computeConfidence(double raw,
                                      MarketState state,
                                      CoinCategory cat) {
 
-        double norm = raw / 5.0; // нормализация реального скоринга
+        // Сигмоид вместо линейной формулы
+        double x = raw - 3.0;
+        double sigmoid = 1.0 / (1.0 + Math.exp(-1.3 * x));
 
-        double stateBoost =
-                state == MarketState.STRONG_TREND ? 0.08 :
-                        state == MarketState.WEAK_TREND   ? 0.05 :
-                                state == MarketState.RANGE        ? 0.02 :
-                                        0.01;
+        double regimeBoost =
+                state == MarketState.STRONG_TREND ? 0.06 :
+                        state == MarketState.WEAK_TREND   ? 0.03 :
+                                state == MarketState.RANGE        ? -0.02 :
+                                        0.0;
 
-        double catPenalty =
-                cat == CoinCategory.MEME ? 0.08 :
-                        cat == CoinCategory.ALT  ? 0.04 :
+        double categoryPenalty =
+                cat == CoinCategory.MEME ? -0.07 :
+                        cat == CoinCategory.ALT  ? -0.03 :
                                 0.0;
 
-        double prob = 0.48 + norm * 0.35 + stateBoost - catPenalty;
+        double prob = 0.48 + sigmoid * 0.42 + regimeBoost + categoryPenalty;
 
-        return clamp(prob, 0.48, 0.91);
+        return clamp(prob, 0.48, 0.89);
     }
     /* ================= MARKET ================= */
 
@@ -314,10 +321,40 @@ public final class DecisionEngineMerged {
     }
 
     private double adx(List<TradingCore.Candle> c, int n) {
-        double move = 0;
-        for (int i = c.size() - n; i < c.size() - 1; i++)
-            move += Math.abs(c.get(i + 1).close - c.get(i).close);
-        return move / n;
+        if (c.size() < n + 1) return 15;
+
+        double trSum = 0;
+        double plusDM = 0;
+        double minusDM = 0;
+
+        for (int i = c.size() - n; i < c.size(); i++) {
+            TradingCore.Candle cur = c.get(i);
+            TradingCore.Candle prev = c.get(i - 1);
+
+            double highDiff = cur.high - prev.high;
+            double lowDiff = prev.low - cur.low;
+
+            double tr = Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)));
+
+            trSum += tr;
+
+            if (highDiff > lowDiff && highDiff > 0)
+                plusDM += highDiff;
+
+            if (lowDiff > highDiff && lowDiff > 0)
+                minusDM += lowDiff;
+        }
+
+        double atr = trSum / n;
+        double plusDI = 100 * (plusDM / n) / atr;
+        double minusDI = 100 * (minusDM / n) / atr;
+
+        double dx = 100 * Math.abs(plusDI - minusDI) /
+                Math.max(plusDI + minusDI, 1);
+
+        return dx;
     }
 
     private double ema(List<TradingCore.Candle> c, int p) {
@@ -329,15 +366,33 @@ public final class DecisionEngineMerged {
     }
 
     private boolean bullDiv(List<TradingCore.Candle> c) {
-        if (c.size() < 20) return false;
-        return c.get(c.size() - 1).low <
-                c.get(c.size() - 4).low;
+        if (c.size() < 25) return false;
+
+        int i1 = c.size() - 5;
+        int i2 = c.size() - 1;
+
+        double low1 = c.get(i1).low;
+        double low2 = c.get(i2).low;
+
+        double rsi1 = rsi(c.subList(0, i1 + 1), 14);
+        double rsi2 = rsi(c, 14);
+
+        return low2 < low1 && rsi2 > rsi1;
     }
 
     private boolean bearDiv(List<TradingCore.Candle> c) {
-        if (c.size() < 20) return false;
-        return c.get(c.size() - 1).high >
-                c.get(c.size() - 4).high;
+        if (c.size() < 25) return false;
+
+        int i1 = c.size() - 5;
+        int i2 = c.size() - 1;
+
+        double high1 = c.get(i1).high;
+        double high2 = c.get(i2).high;
+
+        double rsi1 = rsi(c.subList(0, i1 + 1), 14);
+        double rsi2 = rsi(c, 14);
+
+        return high2 > high1 && rsi2 < rsi1;
     }
 
     public boolean impulse(List<TradingCore.Candle> c) {
