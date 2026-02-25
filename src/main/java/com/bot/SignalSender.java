@@ -78,34 +78,30 @@ public class SignalSender {
             cachedPairs = getTopSymbolsSet(TOP_N);
         }
 
+        DecisionEngineMerged engine = new DecisionEngineMerged();
+
         for (String pair : cachedPairs) {
 
+            List<com.bot.TradingCore.Candle> m1  = fetchKlines(pair,"1m",KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> m5  = fetchKlines(pair,"5m",KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
 
-            if (m15.size() < 60 || h1.size() < 60)
+            if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60)
                 continue;
-
-            Signal s = analyzePair(pair, m15, h1);
-
-            if (s == null || s.confidence < MIN_CONF)
-                continue;
-
-            DecisionEngineMerged.SignalGrade grade =
-                    s.confidence > 0.80 ? DecisionEngineMerged.SignalGrade.A :
-                            s.confidence > 0.70 ? DecisionEngineMerged.SignalGrade.B :
-                                    DecisionEngineMerged.SignalGrade.C;
 
             DecisionEngineMerged.TradeIdea idea =
-                    new DecisionEngineMerged.TradeIdea(
-                            s.symbol,
-                            s.direction.equals("LONG") ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
-                            s.price,
-                            s.stop,
-                            s.take,
-                            s.confidence, // это probability
-                            "auto-generated"
+                    engine.analyze(
+                            pair,
+                            m1,
+                            m5,
+                            m15,
+                            h1,
+                            DecisionEngineMerged.CoinCategory.TOP
                     );
+
+            if (idea == null || idea.probability < MIN_CONF)
+                continue;
 
             if (!core.allowSignal(idea))
                 continue;
@@ -116,7 +112,7 @@ public class SignalSender {
         }
 
         result.sort(Comparator.comparingDouble(
-                (DecisionEngineMerged.TradeIdea i) -> i.probability // сортируем по probability
+                (DecisionEngineMerged.TradeIdea i) -> i.probability
         ).reversed());
 
         return result;
