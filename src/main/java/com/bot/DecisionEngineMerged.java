@@ -161,8 +161,7 @@ public final class DecisionEngineMerged {
         if (!flipAllowed(symbol, side))
             return null;
 
-        double probability = computeConfidence(rawScore, state, cat);
-
+        double probability = computeConfidence(rawScore, state, cat, atr, price);
         if (probability < MIN_CONFIDENCE)
             return null;
 
@@ -277,26 +276,46 @@ public final class DecisionEngineMerged {
             history.removeFirst();
     }
 
-    private double computeConfidence(double raw,
+    private double computeConfidence(double rawScore,
                                      MarketState state,
-                                     CoinCategory cat) {
+                                     CoinCategory cat,
+                                     double atr,      // добавим ATR для контроля волатильности
+                                     double price) {  // цена для нормализации ATR
 
-        double sigmoid = 1.0 / (1.0 + Math.exp(-1.3 * (raw - 3.0)));
+        // --- базовая сигмоида по rawScore ---
+        // rawScore ~ 3..5+, чем выше — тем выше вероятность
+        double x = rawScore - 2.5;  // смещаем центр к 2.5
+        double sigmoid = 1.0 / (1.0 + Math.exp(-1.0 * x)); // мягкая кривая
+        // теперь sigmoid ~0.08..0.92 для нормальных rawScore
 
-        double regimeBoost =
-                state == MarketState.STRONG_TREND ? 0.08 :
-                        state == MarketState.WEAK_TREND   ? 0.04 :
-                                state == MarketState.RANGE        ? -0.01 :
-                                        0.0;
+        // --- учёт рыночного режима ---
+        double regimeBoost = switch (state) {
+            case STRONG_TREND -> 0.12;
+            case WEAK_TREND -> 0.06;
+            case RANGE -> -0.03;
+            case VOLATILE, CLIMAX -> -0.05;
+        };
 
-        double categoryPenalty =
-                cat == CoinCategory.MEME ? -0.04 :
-                        cat == CoinCategory.ALT  ? -0.02 :
-                                0.0;
+        // --- учёт категории монеты ---
+        double categoryPenalty = switch (cat) {
+            case MEME -> -0.08;
+            case ALT  -> -0.03;
+            default -> 0.0;
+        };
 
-        double prob = 0.48 + sigmoid * 0.45 + regimeBoost + categoryPenalty;
+        // --- учёт ATR (чем ниже ATR относительно цены, тем сигнал чище) ---
+        double atrFactor = 0.0;
+        double atrRatio = atr / price; // маленький = низкая волатильность
+        if (atrRatio < 0.003) atrFactor = 0.05;
+        else if (atrRatio > 0.01) atrFactor = -0.05;
 
-        return clamp(prob, 0.48, 0.89);
+        // --- комбинируем ---
+        double prob = sigmoid + regimeBoost + categoryPenalty + atrFactor;
+
+        // --- clamp, но расширенный для правдивой вероятности ---
+        prob = Math.max(0.05, Math.min(prob, 0.95)); // 5%..95%
+
+        return prob;
     }
     /* ================= MARKET ================= */
 
