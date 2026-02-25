@@ -33,8 +33,7 @@ public class BotMain {
             try {
                 System.out.println("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                List<DecisionEngineMerged.TradeIdea> signals =
-                        signalSender.generateSignals();
+                List<DecisionEngineMerged.TradeIdea> signals = signalSender.generateSignals();
 
                 if (signals == null || signals.isEmpty()) {
                     System.out.println("No valid signals this cycle.");
@@ -68,24 +67,28 @@ public class BotMain {
     }
 
     /**
-     * Telegram формат с price, probability и reason
+     * Формат сигнала для Telegram
+     * Убираем reason/RSI, оставляем только flags
      */
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
+        String flags = s.flags != null && !s.flags.isEmpty()
+                ? String.join(", ", s.flags)
+                : "—";
+
         return String.format(
                 "*%s* → *%s*\n" +
                         "Price: %.6f\n" +
-                        "Stop: %.6f\n" +
-                        "Take: %.6f\n" +
+                        "Stop-Take: %.6f - %.6f\n" +
                         "Probability: *%.2f*\n" +
-                        "Reason: %s\n" +
+                        "Flags: %s\n" +
                         "_time: %s_",
                 s.symbol,
                 s.side,
                 s.price,
                 s.stop,
                 s.take,
-                s.probability,      // probability вместо confidence
-                s.reason,           // добавляем reason
+                s.probability,
+                flags,
                 LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }

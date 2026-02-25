@@ -189,7 +189,7 @@ public final class SignalOptimizer {
                 stop,
                 take,
                 newConfidence,
-                signal.reason
+                signal.flags
         );
     }
 

@@ -1155,7 +1155,7 @@ public class SignalSender {
                         idea.stop,
                         idea.take,
                         idea.probability,
-                        idea.reason, // уже из движка максимум 2–3 причины
+                        idea.flags, // уже из движка максимум 2–3 причины
                         LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
                 );
 

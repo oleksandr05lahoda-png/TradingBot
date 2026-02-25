@@ -44,22 +44,21 @@ public final class DecisionEngineMerged {
         public final double stop;            // Стоп-лосс
         public final double take;            // Тейк-профит
         public final double probability;     // Вероятность успешного прогноза
-        public final String reason;          // Причины сигнала (2-3 главных фактора)
-
+        public final List<String> flags;     // Флаги сигнала (ATR, volume, impulse и т.д.)
         public TradeIdea(String symbol,
                          TradingCore.Side side,
                          double price,
                          double stop,
                          double take,
                          double probability,
-                         String reason) {
+                         List<String> flags) {
             this.symbol = symbol;
             this.side = side;
             this.price = price;
             this.stop = stop;
             this.take = take;
             this.probability = probability;
-            this.reason = reason;
+            this.flags = flags != null ? flags : List.of();
         }
     }
 
@@ -171,10 +170,6 @@ public final class DecisionEngineMerged {
                         .map(Map.Entry::getKey)
                         .collect(Collectors.joining(", "));
 
-        String reasonStr =
-                mainReasons +
-                        " | raw:" + String.format("%.2f", rawScore) +
-                        " | RSI:" + String.format("%.1f", rsi14);
         double riskMult =
                 cat == CoinCategory.MEME ? 1.3 :
                         cat == CoinCategory.ALT ? 1.0 : 0.85;
@@ -194,6 +189,7 @@ public final class DecisionEngineMerged {
 
         registerSignal(symbol, side, now);
 
+
         return new TradeIdea(
                 symbol,
                 side,
@@ -201,7 +197,7 @@ public final class DecisionEngineMerged {
                 stop,
                 take,
                 probability,
-                reasonStr
+                flags
         );
     }
 
