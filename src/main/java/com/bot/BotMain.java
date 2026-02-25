@@ -71,6 +71,7 @@ public class BotMain {
      * Убираем reason/RSI, оставляем только flags
      */
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
+
         String flags = s.flags != null && !s.flags.isEmpty()
                 ? String.join(", ", s.flags)
                 : "—";
@@ -85,14 +86,13 @@ public class BotMain {
                 s.symbol,
                 s.side,
                 s.price,
+                s.probability * 100.0,   // ← ВОТ ТУТ
                 s.stop,
                 s.take,
-                s.probability,
                 flags,
                 LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }
-
     /**
      * Кастомный ThreadFactory с защитой от смерти потока
      */

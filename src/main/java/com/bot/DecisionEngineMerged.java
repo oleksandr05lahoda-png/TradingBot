@@ -281,22 +281,20 @@ public final class DecisionEngineMerged {
                                      MarketState state,
                                      CoinCategory cat) {
 
-        // Сигмоид вместо линейной формулы
-        double x = raw - 3.0;
-        double sigmoid = 1.0 / (1.0 + Math.exp(-1.3 * x));
+        double sigmoid = 1.0 / (1.0 + Math.exp(-1.3 * (raw - 3.0)));
 
         double regimeBoost =
-                state == MarketState.STRONG_TREND ? 0.06 :
-                        state == MarketState.WEAK_TREND   ? 0.03 :
-                                state == MarketState.RANGE        ? -0.02 :
+                state == MarketState.STRONG_TREND ? 0.08 :
+                        state == MarketState.WEAK_TREND   ? 0.04 :
+                                state == MarketState.RANGE        ? -0.01 :
                                         0.0;
 
         double categoryPenalty =
-                cat == CoinCategory.MEME ? -0.07 :
-                        cat == CoinCategory.ALT  ? -0.03 :
+                cat == CoinCategory.MEME ? -0.04 :
+                        cat == CoinCategory.ALT  ? -0.02 :
                                 0.0;
 
-        double prob = 0.48 + sigmoid * 0.42 + regimeBoost + categoryPenalty;
+        double prob = 0.48 + sigmoid * 0.45 + regimeBoost + categoryPenalty;
 
         return clamp(prob, 0.48, 0.89);
     }
