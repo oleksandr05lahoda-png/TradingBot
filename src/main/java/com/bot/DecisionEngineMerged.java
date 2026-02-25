@@ -288,21 +288,16 @@ public final class DecisionEngineMerged {
         double sigmoid = 1.0 / (1.0 + Math.exp(-1.0 * x)); // мягкая кривая
         // теперь sigmoid ~0.08..0.92 для нормальных rawScore
 
-        // --- учёт рыночного режима ---
-        double regimeBoost = switch (state) {
-            case STRONG_TREND -> 0.12;
-            case WEAK_TREND -> 0.06;
-            case RANGE -> -0.03;
-            case VOLATILE, CLIMAX -> -0.05;
-        };
+        double regimeBoost = 0.0;
+        if (state == MarketState.STRONG_TREND) regimeBoost = 0.12;
+        else if (state == MarketState.WEAK_TREND) regimeBoost = 0.06;
+        else if (state == MarketState.RANGE) regimeBoost = -0.03;
+        else if (state == MarketState.VOLATILE || state == MarketState.CLIMAX) regimeBoost = -0.05;
 
-        // --- учёт категории монеты ---
-        double categoryPenalty = switch (cat) {
-            case MEME -> -0.08;
-            case ALT  -> -0.03;
-            default -> 0.0;
-        };
-
+        double categoryPenalty = 0.0;
+        if (cat == CoinCategory.MEME) categoryPenalty = -0.08;
+        else if (cat == CoinCategory.ALT) categoryPenalty = -0.03;
+        else categoryPenalty = 0.0;
         // --- учёт ATR (чем ниже ATR относительно цены, тем сигнал чище) ---
         double atrFactor = 0.0;
         double atrRatio = atr / price; // маленький = низкая волатильность
