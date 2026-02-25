@@ -100,18 +100,17 @@ public final class DecisionEngineMerged {
         }
         if (pullback(c15, false)) {
             scoreShort += 1.0;
-            reasonWeightsShort.put("Pullback bullish", 2.0);
+            reasonWeightsShort.put("Pullback bearish", 2.0); // <- исправлено
         }
 
         if (impulse(c1)) {
-            if (last(c1).close > c1.get(c1.size() - 5).close) {
+            if (bias == HTFBias.BULL && last(c1).close > c1.get(c1.size() - 5).close) {
                 scoreLong += 0.4;
-            } else {
+                reasonWeightsLong.put("Impulse", 0.4);
+            } else if (bias == HTFBias.BEAR && last(c1).close < c1.get(c1.size() - 5).close) {
                 scoreShort += 0.4;
+                reasonWeightsShort.put("Impulse", 0.4);
             }
-
-            reasonWeightsLong.put("Impulse", 0.4);
-            reasonWeightsShort.put("Impulse", 0.4);
         }
 
         // ===== Divergence =====
