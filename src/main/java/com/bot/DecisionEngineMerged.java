@@ -25,7 +25,7 @@ public final class DecisionEngineMerged {
     private static final long COOLDOWN_ALT = 6 * 60_000;
     private static final long COOLDOWN_MEME = 8 * 60_000;
 
-    private static final double MIN_SCORE_THRESHOLD = 2.4;
+    private static final double MIN_SCORE_THRESHOLD = 3.2;
     private static final double MIN_CONFIDENCE = 0.52;
 
     /* ================= STATE ================= */
@@ -88,10 +88,10 @@ public final class DecisionEngineMerged {
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
         // ===== Trend =====
         if (bias == HTFBias.BULL) {
-            scoreLong += 2.0;
+            scoreLong += 1.2;
             reasonWeightsLong.put("Trend", 2.0);        }
         if (bias == HTFBias.BEAR) {
-            scoreShort += 2.0;
+            scoreShort += 1.2;
             reasonWeightsShort.put("Trend", 2.0);        }
 
         // ===== Pullback =====
@@ -114,11 +114,11 @@ public final class DecisionEngineMerged {
 
         // ===== Divergence =====
         if (bullDiv(c15)) {
-            scoreLong += 1.2;
+            scoreLong += 0.6;
             reasonWeightsLong.put("Bullish divergence", 2.0);
         }
         if (bearDiv(c15)) {
-            scoreShort += 1.2;
+            scoreShort += 0.6;
             reasonWeightsShort.put("Bearish divergence", 2.0);
         }
 
@@ -153,7 +153,8 @@ public final class DecisionEngineMerged {
         if (impulse(c1)) flags.add("impulse:true");
 
         double rsi14 = rsi(c15, 14);
-
+        if (rsi14 > 75) scoreLong -= 0.7;
+        if (rsi14 < 25) scoreShort -= 0.7;
         Map<String, Double> chosen =
                 scoreLong > scoreShort
                         ? reasonWeightsLong
@@ -262,22 +263,22 @@ public final class DecisionEngineMerged {
                                      MarketState state,
                                      CoinCategory cat) {
 
-        double base = raw / 10.0; // было 6 — слишком агрессивно
+        double norm = raw / 5.0; // нормализация реального скоринга
 
         double stateBoost =
-                state == MarketState.STRONG_TREND ? 0.10 :
-                        state == MarketState.WEAK_TREND   ? 0.06 :
-                                state == MarketState.RANGE        ? 0.03 :
-                                        0.02;
+                state == MarketState.STRONG_TREND ? 0.08 :
+                        state == MarketState.WEAK_TREND   ? 0.05 :
+                                state == MarketState.RANGE        ? 0.02 :
+                                        0.01;
 
-        double catBoost =
-                cat == CoinCategory.TOP ? 0.00 :
-                        cat == CoinCategory.ALT ? -0.03 :
-                                -0.06;
+        double catPenalty =
+                cat == CoinCategory.MEME ? 0.08 :
+                        cat == CoinCategory.ALT  ? 0.04 :
+                                0.0;
 
-        return clamp(0.45 + base + stateBoost + catBoost,
-                0.45,
-                0.92);
+        double prob = 0.48 + norm * 0.35 + stateBoost - catPenalty;
+
+        return clamp(prob, 0.48, 0.91);
     }
     /* ================= MARKET ================= */
 
@@ -378,8 +379,8 @@ public final class DecisionEngineMerged {
         double price = last(c).close;
 
         return bull ?
-                price <= ema21 * 1.01 :
-                price >= ema21 * 0.99;
+                price <= ema21 * 0.99 :
+                price >= ema21 * 1.01;
     }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
