@@ -84,52 +84,51 @@ public final class DecisionEngineMerged {
         double scoreShort = 0;
 
 
-        List<String> reasons = new ArrayList<>();
-
+        Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
+        Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
         // ===== Trend =====
         if (bias == HTFBias.BULL) {
             scoreLong += 2.0;
-            reasons.add("BULL trend");
-        }
+            reasonWeightsLong.put("Trend", 2.0);        }
         if (bias == HTFBias.BEAR) {
             scoreShort += 2.0;
-            reasons.add("BEAR trend");
-        }
+            reasonWeightsShort.put("Trend", 2.0);        }
 
         // ===== Pullback =====
         if (pullback(c15, true)) {
             scoreLong += 1.4;
-            reasons.add("Pullback bullish");
+            reasonWeightsLong.put("Pullback bullish", 2.0);
         }
         if (pullback(c15, false)) {
             scoreShort += 1.4;
-            reasons.add("Pullback bearish");
+            reasonWeightsShort.put("Pullback bullish", 2.0);
         }
 
-        // ===== Micro impulse =====
         if (impulse(c1)) {
-            scoreLong += 0.8;
-            scoreShort += 0.8;
-            reasons.add("Impulse detected");
+            scoreLong += 0.4;
+            scoreShort += 0.4;
+
+            reasonWeightsLong.put("Impulse", 0.4);
+            reasonWeightsShort.put("Impulse", 0.4);
         }
 
         // ===== Divergence =====
         if (bullDiv(c15)) {
             scoreLong += 1.2;
-            reasons.add("Bullish divergence");
+            reasonWeightsLong.put("Bullish divergence", 2.0);
         }
         if (bearDiv(c15)) {
             scoreShort += 1.2;
-            reasons.add("Bearish divergence");
+            reasonWeightsShort.put("Bearish divergence", 2.0);
         }
 
-        // ===== Volume =====
         if (volumeSpike(c15, cat)) {
             scoreLong += 0.5;
             scoreShort += 0.5;
-            reasons.add("Volume spike");
-        }
 
+            reasonWeightsLong.put("Volume", 0.5);
+            reasonWeightsShort.put("Volume", 0.5);
+        }
         if (scoreLong < MIN_SCORE_THRESHOLD && scoreShort < MIN_SCORE_THRESHOLD)
             return null;
 
@@ -153,13 +152,24 @@ public final class DecisionEngineMerged {
         if (volumeSpike(c15, cat)) flags.add("vol:true");
         if (impulse(c1)) flags.add("impulse:true");
 
-        double rsi14 = rsi(c15, 14); // метод RSI добавляем ниже
+        double rsi14 = rsi(c15, 14);
 
-        String reasonStr = String.join(", ", reasons.subList(0, Math.min(3, reasons.size())))
-                + " | _flags_: " + String.join(", ", flags)
-                + " | _raw_: " + String.format("%.3f mtf:0 vol:%b atr:%b", Math.max(scoreLong, scoreShort), volumeSpike(c15, cat), atr(c15, 14) > price * 0.001)
-                + " | RSI(14): " + String.format("%.2f", rsi14);
+        Map<String, Double> chosen =
+                scoreLong > scoreShort
+                        ? reasonWeightsLong
+                        : reasonWeightsShort;
 
+        String mainReasons =
+                chosen.entrySet().stream()
+                        .sorted((a,b)->Double.compare(b.getValue(),a.getValue()))
+                        .limit(3)
+                        .map(Map.Entry::getKey)
+                        .collect(Collectors.joining(", "));
+
+        String reasonStr =
+                mainReasons +
+                        " | raw:" + String.format("%.2f", rawScore) +
+                        " | RSI:" + String.format("%.1f", rsi14);
         double riskMult =
                 cat == CoinCategory.MEME ? 1.3 :
                         cat == CoinCategory.ALT ? 1.0 : 0.85;
@@ -252,24 +262,23 @@ public final class DecisionEngineMerged {
                                      MarketState state,
                                      CoinCategory cat) {
 
-        double base = raw / 6.0;
+        double base = raw / 10.0; // было 6 — слишком агрессивно
 
         double stateBoost =
-                state == MarketState.STRONG_TREND ? 0.12 :
-                        state == MarketState.WEAK_TREND ? 0.08 :
-                                state == MarketState.RANGE ? 0.05 :
-                                        0.04;
+                state == MarketState.STRONG_TREND ? 0.10 :
+                        state == MarketState.WEAK_TREND   ? 0.06 :
+                                state == MarketState.RANGE        ? 0.03 :
+                                        0.02;
 
         double catBoost =
-                cat == CoinCategory.TOP ? 0.02 :
-                        cat == CoinCategory.ALT ? 0.04 :
-                                0.06;
+                cat == CoinCategory.TOP ? 0.00 :
+                        cat == CoinCategory.ALT ? -0.03 :
+                                -0.06;
 
-        return clamp(0.52 + base + stateBoost + catBoost,
-                0.52,
-                0.95);
+        return clamp(0.45 + base + stateBoost + catBoost,
+                0.45,
+                0.92);
     }
-
     /* ================= MARKET ================= */
 
     private MarketState detectState(List<TradingCore.Candle> c) {
