@@ -1089,62 +1089,83 @@ public class SignalSender {
     }
     private void runScheduleCycle() {
         try {
-            signalsThisCycle = 0;  // сброс счетчика на цикл
+            signalsThisCycle = 0;
+
             if (System.currentTimeMillis() - dailyResetTs > 24 * 60 * 60_000L) {
                 dailyRequests.set(0);
                 dailyResetTs = System.currentTimeMillis();
             }
 
-            // Обновляем топовые пары
             if (cachedPairs == null || cachedPairs.isEmpty()) {
                 cachedPairs = getTopSymbolsSet(TOP_N);
             }
 
+            DecisionEngineMerged engine = new DecisionEngineMerged();
+
             for (String pair : cachedPairs) {
-                // Получаем свечи
-                List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair, "15m", KLINES_LIMIT);
-                List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
+                List<TradingCore.Candle> c1  = fetchKlines(pair, "1m", KLINES_LIMIT);
+                List<TradingCore.Candle> c5  = fetchKlines(pair, "5m", KLINES_LIMIT);
+                List<TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
+                List<TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
 
-                if (m15.size() < 60 || h1.size() < 60) continue;
+                if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
 
-                // Анализ пары
-                Signal s = analyzePair(pair, m15, h1);
-                if (s == null || s.confidence < MIN_CONF) continue;
+                // Получаем сигнал через движок
+                DecisionEngineMerged.TradeIdea idea = engine.analyze(pair, c1, c5, c15, h1, DecisionEngineMerged.CoinCategory.TOP);
+                if (idea == null || idea.probability < MIN_CONF) continue;
 
-                long candleCloseTime = m15.get(m15.size() - 1).closeTime;
+                long candleCloseTime = c15.get(c15.size() - 1).closeTime;
 
-                // Проверка cooldown для направления
-                if (isCooldown(pair, s, candleCloseTime)) continue;
+                // Собираем Signal, используя методы из движка
+                Signal tempSignal = new Signal(
+                        idea.symbol,                     // symbol
+                        idea.side.name(),                // direction
+                        idea.probability,                // confidence
+                        idea.price,                      // price
+                        engine.rsi(c15, 14),             // rsi
+                        Math.max(0.0, idea.probability), // rawScore (пример)
+                        1,                               // mtfConfirm
+                        engine.volumeSpike(c15, DecisionEngineMerged.CoinCategory.TOP), // volOk
+                        engine.atr(c15, 14) > idea.price * 0.001,                        // atrOk
+                        true,                            // strongTrigger
+                        false,                           // atrBreakLong
+                        false,                           // atrBreakShort
+                        engine.impulse(c1),              // impulse
+                        engine.rsi(c15, 7),              // rsi7
+                        engine.rsi(c15, 4)               // rsi4
+                );
 
-                // Проверка дневного лимита
-                if (dailyRequests.incrementAndGet() > 5000) {
-                    System.out.println("[Scheduler] Daily request limit reached, skipping " + pair);
-                    continue;
-                }
+                if (isCooldown(pair, tempSignal, candleCloseTime)) continue;
+                if (dailyRequests.incrementAndGet() > 5000) continue;
 
-                // Регистрация сигнала
-                markSignalSent(pair, s.direction, candleCloseTime);
-                signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(s);
+                markSignalSent(pair, idea.side.name(), candleCloseTime);
+                signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(tempSignal);
 
-                DecisionEngineMerged.TradeIdea idea =
-                        new DecisionEngineMerged.TradeIdea(
-                                s.symbol,
-                                s.direction.equals("LONG") ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
-                                s.price,
-                                s.stop,
-                                s.take,
-                                s.confidence, // это теперь probability
-                                "auto-generated"
-                        );
-
-                if (!core.allowSignal(idea)) continue; // core фильтр
+                if (!core.allowSignal(idea)) continue;
                 core.registerSignal(idea);
 
-                // Отправка в Telegram
-                bot.sendMessageAsync(s.toTelegramMessage());
+                // Telegram — показываем только 2–3 причины
+                String message = String.format(
+                        "*%s* → *%s*\n" +
+                                "Price: %.6f\n" +
+                                "Stop: %.6f\n" +
+                                "Take: %.6f\n" +
+                                "Probability: *%.2f*\n" +
+                                "Reason: %s\n" +
+                                "_time: %s_",
+                        idea.symbol,
+                        idea.side,
+                        idea.price,
+                        idea.stop,
+                        idea.take,
+                        idea.probability,
+                        idea.reason, // уже из движка максимум 2–3 причины
+                        LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+                );
+
+                bot.sendMessageAsync(message);
                 signalsThisCycle++;
 
-                // Ограничение сигналов на один цикл
                 if (signalsThisCycle >= TOP_N) break;
             }
 

@@ -290,7 +290,7 @@ public final class DecisionEngineMerged {
 
     /* ================= INDICATORS ================= */
 
-    private double atr(List<TradingCore.Candle> c, int n) {
+    public double atr(List<TradingCore.Candle> c, int n) {
         double sum = 0;
         for (int i = c.size() - n; i < c.size(); i++) {
             TradingCore.Candle cur = c.get(i);
@@ -330,7 +330,7 @@ public final class DecisionEngineMerged {
                 c.get(c.size() - 4).high;
     }
 
-    private boolean impulse(List<TradingCore.Candle> c) {
+    public boolean impulse(List<TradingCore.Candle> c) {
         if (c == null || c.size() < 5) return false;
         double delta =
                 last(c).close -
@@ -338,7 +338,7 @@ public final class DecisionEngineMerged {
         return Math.abs(delta) > 0.0002;
     }
 
-    private boolean volumeSpike(List<TradingCore.Candle> c,
+    public boolean volumeSpike(List<TradingCore.Candle> c,
                                 CoinCategory cat) {
 
         if (c.size() < 10) return false;
@@ -386,7 +386,7 @@ public final class DecisionEngineMerged {
                          double max) {
         return Math.max(min, Math.min(max, v));
     }
-    private double rsi(List<TradingCore.Candle> c, int period) {
+    public double rsi(List<TradingCore.Candle> c, int period) {
         if (c.size() < period + 1) return 50.0;
         double gain = 0, loss = 0;
         for (int i = c.size() - period; i < c.size(); i++) {
@@ -396,5 +396,28 @@ public final class DecisionEngineMerged {
         }
         double rs = loss == 0 ? 100 : gain / loss;
         return 100 - (100 / (1 + rs));
+    }
+    /**
+     * Публичный метод для внешнего вызова из SignalSender
+     * Возвращает TradeIdea с нормальным reason
+     */
+    public TradeIdea analyze(String symbol,
+                             List<TradingCore.Candle> c1,
+                             List<TradingCore.Candle> c5,
+                             List<TradingCore.Candle> c15,
+                             List<TradingCore.Candle> c1h,
+                             CoinCategory cat) {
+
+        long now = System.currentTimeMillis();
+
+        // Используем существующий private generate метод
+        TradeIdea idea = generate(symbol, c1, c5, c15, c1h, cat, now);
+
+        // Если generate вернул null, сигнал не подходит
+        if (idea == null) return null;
+
+        // Уже внутри generate reason собирается по тренду, импульсу, объему и RSI
+        // Поэтому здесь просто возвращаем TradeIdea с нормальным reason
+        return idea;
     }
 }
