@@ -85,15 +85,16 @@ public final class DecisionEngineMerged {
 
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
-        // ===== Trend =====
+        // ===== Soft HTF Bias (не блокирует противоположное направление) =====
         if (bias == HTFBias.BULL) {
-            scoreLong += 1.2;
-            reasonWeightsLong.put("Trend", 2.0);        }
-        if (bias == HTFBias.BEAR) {
-            scoreShort += 1.2;
-            reasonWeightsShort.put("Trend", 2.0);        }
+            scoreLong += 0.6;
+            scoreShort -= 0.2;   // лёгкое сопротивление шорту
+        }
+        else if (bias == HTFBias.BEAR) {
+            scoreShort += 0.6;
+            scoreLong -= 0.2;    // лёгкое сопротивление лонгу
+        }
 
-        // ===== Pullback =====
         if (pullback(c15, true)) {
             scoreLong += 1.0;
             reasonWeightsLong.put("Pullback bullish", 2.0);
@@ -122,7 +123,31 @@ public final class DecisionEngineMerged {
             scoreShort += 0.6;
             reasonWeightsShort.put("Bearish divergence", 2.0);
         }
+// ===== RSI sanity filter (до выбора направления!) =====
+        double rsi14 = rsi(c15, 14);
 
+        if (rsi14 > 75) {
+            scoreLong -= 0.8;
+            reasonWeightsLong.put("RSI overbought", 0.8);
+        }
+
+        if (rsi14 < 25) {
+            scoreShort -= 0.8;
+            reasonWeightsShort.put("RSI oversold", 0.8);
+        }
+        // ===== Anti-counter-trend filter (важно!) =====
+        double adxValue = adx(c15, 14);
+
+        if (adxValue > 28) { // если тренд реально сильный
+
+            if (bias == HTFBias.BULL && scoreShort > scoreLong) {
+                scoreShort -= 1.0;  // не даём шортить сильный бычий тренд
+            }
+
+            if (bias == HTFBias.BEAR && scoreLong > scoreShort) {
+                scoreLong -= 1.0;   // не даём лонговать сильный медвежий тренд
+            }
+        }
         if (volumeSpike(c15, cat)) {
             scoreLong += 0.5;
             scoreShort += 0.5;
@@ -170,9 +195,6 @@ public final class DecisionEngineMerged {
         if (volumeSpike(c15, cat)) flags.add("vol:true");
         if (impulse(c1)) flags.add("impulse:true");
 
-        double rsi14 = rsi(c15, 14);
-        if (rsi14 > 75) scoreLong -= 0.7;
-        if (rsi14 < 25) scoreShort -= 0.7;
         Map<String, Double> chosen =
                 scoreLong > scoreShort
                         ? reasonWeightsLong
@@ -461,16 +483,16 @@ public final class DecisionEngineMerged {
 
         return lastVol / avg > threshold;
     }
-
     private boolean pullback(List<TradingCore.Candle> c,
                              boolean bull) {
 
         double ema21 = ema(c, 21);
         double price = last(c).close;
 
+        // более глубокий откат
         return bull ?
-                price <= ema21 * 0.99 :
-                price >= ema21 * 1.01;
+                price <= ema21 * 0.985 :
+                price >= ema21 * 1.015;
     }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
