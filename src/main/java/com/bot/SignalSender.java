@@ -614,6 +614,17 @@ public class SignalSender {
         return Double.compare(emaFast, emaSlow);
     }
 
+    private int getBtcTrend() {
+        try {
+            List<com.bot.TradingCore.Candle> btcH1 = fetchKlines("BTCUSDT", "1h", 120);
+            if (btcH1.size() < 60) return 0;
+
+            return emaDirection(btcH1, 20, 50); // 1 = uptrend, -1 = downtrend
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     private double strategyEMANorm(List<Double> closes) {
         if (closes == null || closes.size() < 100) return 0.0;
         double e20 = ema(closes, 20);
@@ -1098,7 +1109,11 @@ public class SignalSender {
 
             DecisionEngineMerged engine = new DecisionEngineMerged();
 
+            // === Получаем глобальный тренд BTC ОДИН раз за цикл ===
+            int btcTrend = getBtcTrend();
+
             for (String pair : cachedPairs) {
+
                 List<TradingCore.Candle> c1  = fetchKlines(pair, "1m", KLINES_LIMIT);
                 List<TradingCore.Candle> c5  = fetchKlines(pair, "5m", KLINES_LIMIT);
                 List<TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
@@ -1107,28 +1122,34 @@ public class SignalSender {
                 if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
 
                 // Получаем сигнал через движок
-                DecisionEngineMerged.TradeIdea idea = engine.analyze(pair, c1, c5, c15, h1, DecisionEngineMerged.CoinCategory.TOP);
+                DecisionEngineMerged.TradeIdea idea =
+                        engine.analyze(pair, c1, c5, c15, h1, DecisionEngineMerged.CoinCategory.TOP);
+
                 if (idea == null || idea.probability < MIN_CONF) continue;
+
+                // === BTC GLOBAL TREND FILTER ===
+                if (btcTrend < 0 && idea.side.name().equals("LONG")) continue;
+                if (btcTrend > 0 && idea.side.name().equals("SHORT")) continue;
 
                 long candleCloseTime = c15.get(c15.size() - 1).closeTime;
 
-                // Собираем Signal, используя методы из движка
+                // Собираем Signal
                 Signal tempSignal = new Signal(
-                        idea.symbol,                     // symbol
-                        idea.side.name(),                // direction
-                        idea.probability,                // confidence
-                        idea.price,                      // price
-                        engine.rsi(c15, 14),             // rsi
-                        Math.max(0.0, idea.probability), // rawScore (пример)
-                        1,                               // mtfConfirm
-                        engine.volumeSpike(c15, DecisionEngineMerged.CoinCategory.TOP), // volOk
-                        engine.atr(c15, 14) > idea.price * 0.001,                        // atrOk
-                        true,                            // strongTrigger
-                        false,                           // atrBreakLong
-                        false,                           // atrBreakShort
-                        engine.impulse(c1),              // impulse
-                        engine.rsi(c15, 7),              // rsi7
-                        engine.rsi(c15, 4)               // rsi4
+                        idea.symbol,
+                        idea.side.name(),
+                        idea.probability,
+                        idea.price,
+                        engine.rsi(c15, 14),
+                        Math.max(0.0, idea.probability),
+                        1,
+                        engine.volumeSpike(c15, DecisionEngineMerged.CoinCategory.TOP),
+                        engine.atr(c15, 14) > idea.price * 0.001,
+                        true,
+                        false,
+                        false,
+                        engine.impulse(c1),
+                        engine.rsi(c15, 7),
+                        engine.rsi(c15, 4)
                 );
 
                 if (isCooldown(pair, tempSignal, candleCloseTime)) continue;
@@ -1140,7 +1161,6 @@ public class SignalSender {
                 if (!core.allowSignal(idea)) continue;
                 core.registerSignal(idea);
 
-                // Telegram — показываем только 2–3 причины
                 String message = String.format(
                         "*%s* → *%s*\n" +
                                 "Price: %.6f\n" +
@@ -1155,7 +1175,7 @@ public class SignalSender {
                         idea.stop,
                         idea.take,
                         idea.probability,
-                        idea.flags, // уже из движка максимум 2–3 причины
+                        idea.flags,
                         LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
                 );
 
