@@ -297,51 +297,58 @@ public final class DecisionEngineMerged {
     private double computeConfidence(double rawScore,
                                      MarketState state,
                                      CoinCategory cat,
-                                     double atr,      // добавим ATR для контроля волатильности
+                                     double atr,      // ATR для контроля волатильности
                                      double price) {  // цена для нормализации ATR
 
-        // --- базовая сигмоида по rawScore ---
-        // rawScore ~ 3..5+, чем выше — тем выше вероятность
-        double x = rawScore - 2.5;  // смещаем центр к 2.5
-        double sigmoid = 1.0 / (1.0 + Math.exp(-1.0 * x)); // мягкая кривая
-        // теперь sigmoid ~0.08..0.92 для нормальных rawScore
-// --- учитываем связь с биткоином для ALT-коинов ---
+        // --- базовая сигмоидная трансформация rawScore ---
+        // смещаем центр так, чтобы средний сигнал давал ~50–55%
+        double edge = rawScore - 3.0; // порог слабого сигнала
+        double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge)); // крутая сигмоида для реальной дифференциации
+        // sigmoid ~0.12..0.88 для типичных rawScore 3..5.5
+
+        // --- учёт корреляции с BTC для ALT ---
         if (cat == CoinCategory.ALT) {
-            Double btcCorr = adaptiveTrendWeight.get("BTC"); // адаптивный вес BTC
+            Double btcCorr = adaptiveTrendWeight.get("BTC");
             if (btcCorr != null) {
-                sigmoid += (btcCorr - 0.5) * 0.2; // прибавляем корреляцию к rawScore вероятности
+                sigmoid += (btcCorr - 0.5) * 0.15; // мягкий буст
             }
         }
-        // --- реальный буст по состоянию рынка, немного мягче ---
+
+        // --- буст/падение по состоянию рынка ---
         double regimeBoost = 0.0;
         switch(state) {
-            case STRONG_TREND: regimeBoost = 0.08; break;
-            case WEAK_TREND: regimeBoost = 0.04; break;
+            case STRONG_TREND: regimeBoost = 0.05; break; // тренд усиливает сигнал чуть-чуть
+            case WEAK_TREND: regimeBoost = 0.02; break;
             case RANGE: regimeBoost = -0.02; break;
             case VOLATILE:
             case CLIMAX: regimeBoost = -0.04; break;
         }
+
+        // --- штраф/бонус по категории монеты ---
         double categoryPenalty = 0.0;
         switch(cat) {
-            case MEME: categoryPenalty = -0.06; break;
-            case ALT: categoryPenalty = -0.02; break;
+            case MEME: categoryPenalty = -0.04; break;
+            case ALT: categoryPenalty = -0.015; break;
             case TOP: categoryPenalty = 0.0; break;
         }
-        // --- учёт ATR (чем ниже ATR относительно цены, тем сигнал чище) ---
-        double atrFactor = 0.0;
-        double atrRatio = atr / price; // маленький = низкая волатильность
-        if (atrRatio < 0.003) atrFactor = 0.05;
-        else if (atrRatio > 0.01) atrFactor = -0.05;
 
-        // --- комбинируем ---
+        // --- учёт ATR: чем ниже ATR относительно цены, тем сигнал чище ---
+        double atrFactor = 0.0;
+        double atrRatio = atr / price;
+        if (atrRatio < 0.003) atrFactor = 0.04;
+        else if (atrRatio > 0.01) atrFactor = -0.04;
+
+        // --- комбинируем всё в raw probability ---
         double prob = sigmoid + regimeBoost + categoryPenalty + atrFactor;
 
-        // --- clamp, но расширенный для правдивой вероятности ---
-        prob = Math.max(0.05, Math.min(prob, 0.95)); // 5%..95%
+        // --- нормируем в реалистичный диапазон 50%..85% ---
+        prob = 50 + prob * 35; // 50% базовое, максимум ~85%
+
+        // --- финальный clamp для безопасности ---
+        prob = Math.max(50.0, Math.min(prob, 85.0));
 
         return prob;
     }
-    /* ================= MARKET ================= */
 
     private MarketState detectState(List<TradingCore.Candle> c) {
         double adx = adx(c, 14);
