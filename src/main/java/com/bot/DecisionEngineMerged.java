@@ -85,14 +85,11 @@ public final class DecisionEngineMerged {
 
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
-        // ===== Soft HTF Bias (не блокирует противоположное направление) =====
         if (bias == HTFBias.BULL) {
-            scoreLong += 0.6;
-            scoreShort -= 0.2;   // лёгкое сопротивление шорту
+            scoreLong += 0.35;
         }
         else if (bias == HTFBias.BEAR) {
-            scoreShort += 0.6;
-            scoreLong -= 0.2;    // лёгкое сопротивление лонгу
+            scoreShort += 0.35;
         }
 
         if (pullback(c15, true)) {
@@ -137,15 +134,14 @@ public final class DecisionEngineMerged {
         }
         // ===== Anti-counter-trend filter (важно!) =====
         double adxValue = adx(c15, 14);
-
-        if (adxValue > 28) { // если тренд реально сильный
+        if (adxValue > 28) {
 
             if (bias == HTFBias.BULL && scoreShort > scoreLong) {
-                scoreShort -= 1.0;  // не даём шортить сильный бычий тренд
+                scoreShort -= 0.6;
             }
 
             if (bias == HTFBias.BEAR && scoreLong > scoreShort) {
-                scoreLong -= 1.0;   // не даём лонговать сильный медвежий тренд
+                scoreLong -= 0.6;
             }
         }
         if (volumeSpike(c15, cat)) {
@@ -156,19 +152,20 @@ public final class DecisionEngineMerged {
             reasonWeightsShort.put("Volume", 0.5);
         }
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 3.0 :
-                        state == MarketState.RANGE ? 3.6 :
-                                3.2;
-
+                state == MarketState.STRONG_TREND ? 2.8 :
+                        state == MarketState.RANGE ? 3.3 :
+                                3.0;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
             return null;
         // === Честный выбор направления без перекоса ===
         TradingCore.Side side;
-
         double scoreDiff = Math.abs(scoreLong - scoreShort);
 
-        if (scoreDiff < 0.25) {
-            return null;
+        if (scoreLong >= dynamicThreshold && scoreShort >= dynamicThreshold) {
+            // ничего не делаем — пусть выберется сильнейший
+        }
+        else if (scoreDiff < 0.12) {
+            return null; // фильтр оставляем, но мягче
         }
 
         if (scoreLong > scoreShort) {
