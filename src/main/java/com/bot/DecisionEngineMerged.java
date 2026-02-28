@@ -286,17 +286,28 @@ public final class DecisionEngineMerged {
         double x = rawScore - 2.5;  // смещаем центр к 2.5
         double sigmoid = 1.0 / (1.0 + Math.exp(-1.0 * x)); // мягкая кривая
         // теперь sigmoid ~0.08..0.92 для нормальных rawScore
-
+// --- учитываем связь с биткоином для ALT-коинов ---
+        if (cat == CoinCategory.ALT) {
+            Double btcCorr = adaptiveTrendWeight.get("BTC"); // адаптивный вес BTC
+            if (btcCorr != null) {
+                sigmoid += (btcCorr - 0.5) * 0.2; // прибавляем корреляцию к rawScore вероятности
+            }
+        }
+        // --- реальный буст по состоянию рынка, немного мягче ---
         double regimeBoost = 0.0;
-        if (state == MarketState.STRONG_TREND) regimeBoost = 0.12;
-        else if (state == MarketState.WEAK_TREND) regimeBoost = 0.06;
-        else if (state == MarketState.RANGE) regimeBoost = -0.03;
-        else if (state == MarketState.VOLATILE || state == MarketState.CLIMAX) regimeBoost = -0.05;
-
+        switch(state) {
+            case STRONG_TREND: regimeBoost = 0.08; break;
+            case WEAK_TREND: regimeBoost = 0.04; break;
+            case RANGE: regimeBoost = -0.02; break;
+            case VOLATILE:
+            case CLIMAX: regimeBoost = -0.04; break;
+        }
         double categoryPenalty = 0.0;
-        if (cat == CoinCategory.MEME) categoryPenalty = -0.08;
-        else if (cat == CoinCategory.ALT) categoryPenalty = -0.03;
-        else categoryPenalty = 0.0;
+        switch(cat) {
+            case MEME: categoryPenalty = -0.06; break;
+            case ALT: categoryPenalty = -0.02; break;
+            case TOP: categoryPenalty = 0.0; break;
+        }
         // --- учёт ATR (чем ниже ATR относительно цены, тем сигнал чище) ---
         double atrFactor = 0.0;
         double atrRatio = atr / price; // маленький = низкая волатильность
