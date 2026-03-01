@@ -86,7 +86,7 @@ public class BotMain {
                 s.symbol,
                 s.side,
                 s.price,
-                s.probability * 100.0,   // ← ВОТ ТУТ
+                s.probability,   // ← ВОТ ТУТ
                 s.stop,
                 s.take,
                 flags,
