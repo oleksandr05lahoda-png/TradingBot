@@ -297,34 +297,28 @@ public final class DecisionEngineMerged {
     private double computeConfidence(double rawScore,
                                      MarketState state,
                                      CoinCategory cat,
-                                     double atr,      // ATR для контроля волатильности
-                                     double price) {  // цена для нормализации ATR
+                                     double atr,
+                                     double price) {
 
         // --- базовая сигмоидная трансформация rawScore ---
-        // смещаем центр так, чтобы средний сигнал давал ~50–55%
-        double edge = rawScore - 3.0; // порог слабого сигнала
-        double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge)); // крутая сигмоида для реальной дифференциации
-        // sigmoid ~0.12..0.88 для типичных rawScore 3..5.5
+        double edge = rawScore - 3.0; // центр слабого сигнала
+        double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge)); // 0..1
 
-        // --- учёт корреляции с BTC для ALT ---
+        // --- бусты/штрафы ---
         if (cat == CoinCategory.ALT) {
             Double btcCorr = adaptiveTrendWeight.get("BTC");
-            if (btcCorr != null) {
-                sigmoid += (btcCorr - 0.5) * 0.15; // мягкий буст
-            }
+            if (btcCorr != null) sigmoid += (btcCorr - 0.5) * 0.15;
         }
 
-        // --- буст/падение по состоянию рынка ---
         double regimeBoost = 0.0;
         switch(state) {
-            case STRONG_TREND: regimeBoost = 0.05; break; // тренд усиливает сигнал чуть-чуть
+            case STRONG_TREND: regimeBoost = 0.05; break;
             case WEAK_TREND: regimeBoost = 0.02; break;
             case RANGE: regimeBoost = -0.02; break;
             case VOLATILE:
             case CLIMAX: regimeBoost = -0.04; break;
         }
 
-        // --- штраф/бонус по категории монеты ---
         double categoryPenalty = 0.0;
         switch(cat) {
             case MEME: categoryPenalty = -0.04; break;
@@ -332,20 +326,18 @@ public final class DecisionEngineMerged {
             case TOP: categoryPenalty = 0.0; break;
         }
 
-        // --- учёт ATR: чем ниже ATR относительно цены, тем сигнал чище ---
         double atrFactor = 0.0;
         double atrRatio = atr / price;
         if (atrRatio < 0.003) atrFactor = 0.04;
         else if (atrRatio > 0.01) atrFactor = -0.04;
 
-        // --- комбинируем всё в raw probability ---
-        double prob = sigmoid + regimeBoost + categoryPenalty + atrFactor;
+        double rawProb = sigmoid + regimeBoost + categoryPenalty + atrFactor;
 
-        // --- нормируем в реалистичный диапазон 50%..85% ---
-        prob = 50 + prob * 35; // 50% базовое, максимум ~85%
+        // --- Нормируем в диапазон 50–85% ---
+        double prob = 50 + clamp(rawProb, 0.0, 1.0) * 35;
 
-        // --- финальный clamp для безопасности ---
-        prob = Math.max(50.0, Math.min(prob, 85.0));
+        // --- Финальный clamp на всякий случай ---
+        prob = clamp(prob, 50.0, 85.0);
 
         return prob;
     }
