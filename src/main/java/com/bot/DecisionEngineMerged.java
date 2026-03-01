@@ -115,11 +115,11 @@ public final class DecisionEngineMerged {
         // --- RSI Filter
         double rsi14 = rsi(c15, 14);
         if (rsi14 > 80) {
-            scoreLong -= 0.5;
+            scoreLong -= 0.25;
             reasonWeightsLong.put("RSI overbought", 0.5);
         }
         if (rsi14 < 20) {
-            scoreShort -= 0.5;
+            scoreShort -= 0.25;
             reasonWeightsShort.put("RSI oversold", 0.5);
         }
 
@@ -132,7 +132,7 @@ public final class DecisionEngineMerged {
 
         // --- Dynamic Threshold
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 2.0 : 1.9;
+                state == MarketState.STRONG_TREND ? 1.75 : 1.55;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
 
         // --- Decide Side
@@ -180,11 +180,24 @@ public final class DecisionEngineMerged {
 
     /* ================= FLIP ================= */
     private boolean flipAllowed(String symbol, TradingCore.Side newSide) {
-        Deque<String> history = recentDirections.computeIfAbsent(symbol, k -> new ArrayDeque<>());
-        if (!history.isEmpty() && history.peekLast().equals(newSide.name())) return false;
+        Deque<String> history =
+                recentDirections.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+
+        // если последние 2 сигнала были в ту же сторону — блокируем
+        if (history.size() >= 2) {
+            boolean same = true;
+            for (String s : history) {
+                if (!s.equals(newSide.name())) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same)
+                return false;
+        }
+
         return true;
     }
-
     private void registerSignal(String symbol, TradingCore.Side side, long now) {
         String key = symbol + "_" + side;
         cooldownMap.put(key, now);
@@ -282,7 +295,8 @@ public final class DecisionEngineMerged {
 
     public boolean impulse(List<TradingCore.Candle> c) {
         if (c == null || c.size() < 5) return false;
-        return Math.abs(last(c).close - c.get(c.size() - 5).close) > 0.0002;
+        double atrVal = atr(c, 14);
+        return Math.abs(last(c).close - c.get(c.size() - 5).close) > atrVal * 0.12;
     }
 
     public boolean volumeSpike(List<TradingCore.Candle> c, CoinCategory cat) {
