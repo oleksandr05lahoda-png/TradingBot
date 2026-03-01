@@ -24,7 +24,7 @@ public final class DecisionEngineMerged {
     private static final long COOLDOWN_ALT = 3 * 60_000; // 3 минуты
     private static final long COOLDOWN_MEME = 4 * 60_000; // 4 минуты
     private static final double MIN_SCORE_THRESHOLD = 3.2;
-    private static final double MIN_CONFIDENCE = 0.52;
+    private static final double MIN_CONFIDENCE = 58.0;
 
     /* ================= STATE ================= */
 
@@ -121,13 +121,13 @@ public final class DecisionEngineMerged {
 // ===== RSI sanity filter (до выбора направления!) =====
         double rsi14 = rsi(c15, 14);
 
-        if (rsi14 > 75) {
-            scoreLong -= 0.8;
+        if (rsi14 > 80) {
+            scoreLong -= 0.5;
             reasonWeightsLong.put("RSI overbought", 0.8);
         }
 
-        if (rsi14 < 25) {
-            scoreShort -= 0.8;
+        if (rsi14 < 20) {
+            scoreShort -= 0.5;
             reasonWeightsShort.put("RSI oversold", 0.8);
         }
         // ===== Anti-counter-trend filter (важно!) =====
@@ -150,9 +150,9 @@ public final class DecisionEngineMerged {
             reasonWeightsShort.put("Volume", 0.5);
         }
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 2.3 :
-                        state == MarketState.RANGE ? 2.5 :
-                                2.1;
+                state == MarketState.STRONG_TREND ? 2.0 :
+                        state == MarketState.RANGE ? 2.2 :
+                                1.9;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
             return null;
         // === Честный выбор направления без перекоса ===
@@ -205,8 +205,8 @@ public final class DecisionEngineMerged {
                         cat == CoinCategory.ALT ? 1.0 : 0.85;
 
         double rr =
-                probability > 0.80 ? 3.0 :
-                        probability > 0.70 ? 2.6 :
+                probability > 80 ? 3.0 :
+                        probability > 70 ? 2.6 :
                                 2.2;
 
         double stop = side == TradingCore.Side.LONG ?
@@ -296,7 +296,7 @@ public final class DecisionEngineMerged {
                                      double price) {
 
         // --- базовая сигмоидная трансформация rawScore ---
-        double edge = rawScore - 3.0;
+        double edge = rawScore - 2.6;
         double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge)); // 0..1
 
         // --- бусты/штрафы ---
@@ -472,9 +472,9 @@ public final class DecisionEngineMerged {
                 last(c).volume;
 
         double threshold =
-                cat == CoinCategory.MEME ? 1.4 :
-                        cat == CoinCategory.ALT ? 1.25 :
-                                1.15;
+                cat == CoinCategory.MEME ? 1.25 :
+                        cat == CoinCategory.ALT ? 1.18 :
+                                1.10;
 
         return lastVol / avg > threshold;
     }
@@ -486,8 +486,8 @@ public final class DecisionEngineMerged {
 
         // более глубокий откат
         return bull ?
-                price <= ema21 * 0.985 :
-                price >= ema21 * 1.015;
+                price <= ema21 * 0.992 :
+                price >= ema21 * 1.008;
     }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
