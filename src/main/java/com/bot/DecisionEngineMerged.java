@@ -19,12 +19,10 @@ public final class DecisionEngineMerged {
 
     /* ================= CONFIG ================= */
 
-    private static final int MIN_BARS = 200;
-
-    private static final long COOLDOWN_TOP = 5 * 60_000;
-    private static final long COOLDOWN_ALT = 6 * 60_000;
-    private static final long COOLDOWN_MEME = 8 * 60_000;
-
+    private static final int MIN_BARS = 150;
+    private static final long COOLDOWN_TOP = 2 * 60_000; // 2 минуты
+    private static final long COOLDOWN_ALT = 3 * 60_000; // 3 минуты
+    private static final long COOLDOWN_MEME = 4 * 60_000; // 4 минуты
     private static final double MIN_SCORE_THRESHOLD = 3.2;
     private static final double MIN_CONFIDENCE = 0.52;
 
@@ -152,9 +150,9 @@ public final class DecisionEngineMerged {
             reasonWeightsShort.put("Volume", 0.5);
         }
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 2.8 :
-                        state == MarketState.RANGE ? 3.3 :
-                                3.0;
+                state == MarketState.STRONG_TREND ? 2.3 :
+                        state == MarketState.RANGE ? 2.5 :
+                                2.1;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
             return null;
         // === Честный выбор направления без перекоса ===
@@ -164,9 +162,7 @@ public final class DecisionEngineMerged {
         if (scoreLong >= dynamicThreshold && scoreShort >= dynamicThreshold) {
             // ничего не делаем — пусть выберется сильнейший
         }
-        else if (scoreDiff < 0.12) {
-            return null; // фильтр оставляем, но мягче
-        }
+        else if (scoreDiff < 0.05) return null;  // мягче, оставляем маленькие различия
 
         if (scoreLong > scoreShort) {
             side = TradingCore.Side.LONG;
@@ -328,8 +324,8 @@ public final class DecisionEngineMerged {
 
         double atrFactor = 0.0;
         double atrRatio = atr / price;
-        if (atrRatio < 0.003) atrFactor = 0.04;
-        else if (atrRatio > 0.01) atrFactor = -0.04;
+        if (atrRatio < 0.003) atrFactor = 0.05;
+        else if (atrRatio > 0.01) atrFactor = -0.03;
 
         double rawProb = sigmoid + regimeBoost + categoryPenalty + atrFactor;
 
