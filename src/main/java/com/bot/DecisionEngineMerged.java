@@ -289,7 +289,6 @@ public final class DecisionEngineMerged {
         if (history.size() > 3)
             history.removeFirst();
     }
-
     private double computeConfidence(double rawScore,
                                      MarketState state,
                                      CoinCategory cat,
@@ -297,7 +296,7 @@ public final class DecisionEngineMerged {
                                      double price) {
 
         // --- базовая сигмоидная трансформация rawScore ---
-        double edge = rawScore - 3.0; // центр слабого сигнала
+        double edge = rawScore - 3.0;
         double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge)); // 0..1
 
         // --- бусты/штрафы ---
@@ -327,15 +326,19 @@ public final class DecisionEngineMerged {
         if (atrRatio < 0.003) atrFactor = 0.05;
         else if (atrRatio > 0.01) atrFactor = -0.03;
 
+        // --- аккуратное суммирование ---
         double rawProb = sigmoid + regimeBoost + categoryPenalty + atrFactor;
 
-        // --- Нормируем в диапазон 50–85% ---
-        double prob = 50 + clamp(rawProb, 0.0, 1.0) * 35;
+        // --- Нормируем в диапазон 0..1 ---
+        rawProb = clamp(rawProb, 0.0, 1.0);
+
+        // --- Преобразуем в 50–85% ---
+        double probPercent = 50.0 + rawProb * 35.0;
 
         // --- Финальный clamp на всякий случай ---
-        prob = clamp(prob, 50.0, 85.0);
+        probPercent = clamp(probPercent, 50.0, 85.0);
 
-        return prob;
+        return probPercent;
     }
 
     private MarketState detectState(List<TradingCore.Candle> c) {
