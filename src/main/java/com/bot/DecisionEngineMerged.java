@@ -137,7 +137,7 @@ public final class DecisionEngineMerged {
             scoreShort += 0.25;
         // --- Dynamic Threshold
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 1.45 : 1.25;
+                state == MarketState.STRONG_TREND ? 1.30 : 1.15;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
 
         // --- Decide Side
@@ -185,22 +185,22 @@ public final class DecisionEngineMerged {
 
     /* ================= FLIP ================= */
     private boolean flipAllowed(String symbol, TradingCore.Side newSide) {
+
         Deque<String> history =
                 recentDirections.computeIfAbsent(symbol, k -> new ArrayDeque<>());
 
-        // если последние 2 сигнала были в ту же сторону — блокируем
-        if (history.size() >= 2) {
-            boolean same = true;
-            for (String s : history) {
-                if (!s.equals(newSide.name())) {
-                    same = false;
-                    break;
+        // Блокируем только резкий флип (LONG → SHORT → LONG)
+        if (!history.isEmpty()) {
+            String last = history.peekLast();
+            if (!last.equals(newSide.name())) {
+                // если смена стороны — проверяем, не было ли только что флипа
+                if (history.size() >= 2) {
+                    String prev = history.peekFirst();
+                    if (prev.equals(newSide.name()))
+                        return false;
                 }
             }
-            if (same)
-                return false;
         }
-
         return true;
     }
     private void registerSignal(String symbol, TradingCore.Side side, long now) {

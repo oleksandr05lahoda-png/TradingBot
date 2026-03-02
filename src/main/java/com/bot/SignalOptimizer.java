@@ -18,8 +18,8 @@ public final class SignalOptimizer {
     private static final double STRONG_IMPULSE = 0.0015;
     private static final double WEAK_IMPULSE = 0.0006;
 
-    private static final double MAX_CONF = 0.97;
-    private static final double MIN_CONF = 0.40;
+    private static final double MAX_CONF = 95.0;
+    private static final double MIN_CONF = 40.0;
 
     /* ================= STATE ================= */
 
