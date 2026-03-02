@@ -76,9 +76,8 @@ public final class DecisionEngineMerged {
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
 
-        // --- Bias
-        if (bias == HTFBias.BULL) scoreLong += 0.35;
-        else if (bias == HTFBias.BEAR) scoreShort += 0.35;
+        if (bias == HTFBias.BULL) scoreLong += 0.8;
+        else if (bias == HTFBias.BEAR) scoreShort += 0.8;
 
         // --- Pullback
         if (pullback(c15, true)) {
@@ -93,13 +92,10 @@ public final class DecisionEngineMerged {
         // --- Impulse
         if (impulse(c1)) {
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
-            if (delta > atr * 0.15 && bias == HTFBias.BULL) {
-                scoreLong += 0.4;
-                reasonWeightsLong.put("Impulse", 0.4);
-            } else if (delta < -atr * 0.15 && bias == HTFBias.BEAR) {
-                scoreShort += 0.4;
-                reasonWeightsShort.put("Impulse", 0.4);
-            }
+            if (delta > atr * 0.15)
+                scoreLong += 0.45;
+            else if (delta < -atr * 0.15)
+                scoreShort += 0.45;
         }
 
         // --- Divergence
@@ -116,23 +112,32 @@ public final class DecisionEngineMerged {
         double rsi14 = rsi(c15, 14);
         if (rsi14 > 80) {
             scoreLong -= 0.25;
-            reasonWeightsLong.put("RSI overbought", 0.5);
+            reasonWeightsLong.put("RSI overbought", 0.25);
         }
         if (rsi14 < 20) {
             scoreShort -= 0.25;
-            reasonWeightsShort.put("RSI oversold", 0.5);
+            reasonWeightsShort.put("RSI oversold", 0.25);
         }
 
         // --- ADX anti-counter-trend
         double adxValue = adx(c15, 14);
-        if (adxValue > 28) {
-            if (bias == HTFBias.BULL && scoreShort > scoreLong) scoreShort -= 0.6;
-            if (bias == HTFBias.BEAR && scoreLong > scoreShort) scoreLong -= 0.6;
-        }
 
+        if (adxValue > 28) {
+
+            if (bias == HTFBias.BULL && scoreShort > scoreLong)
+                scoreShort *= 0.6;
+
+            if (bias == HTFBias.BEAR && scoreLong > scoreShort)
+                scoreLong *= 0.6;
+        }
+        if (bias == HTFBias.BULL && scoreLong > scoreShort)
+            scoreLong += 0.25;
+
+        if (bias == HTFBias.BEAR && scoreShort > scoreLong)
+            scoreShort += 0.25;
         // --- Dynamic Threshold
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 1.75 : 1.55;
+                state == MarketState.STRONG_TREND ? 1.45 : 1.25;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
 
         // --- Decide Side
@@ -208,7 +213,7 @@ public final class DecisionEngineMerged {
 
     /* ================= CONFIDENCE ================= */
     private double computeConfidence(double rawScore, MarketState state, CoinCategory cat, double atr, double price) {
-        double edge = rawScore - 2.6;
+        double edge = rawScore - 1.8;
         double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge));
 
         double regimeBoost = state == MarketState.STRONG_TREND ? 0.05 : 0.0;
@@ -222,7 +227,7 @@ public final class DecisionEngineMerged {
     /* ================= STATE DETECT ================= */
     private MarketState detectState(List<TradingCore.Candle> c) {
         double adx = adx(c, 14);
-        if (adx > 25) return MarketState.STRONG_TREND;
+        if (adx > 26) return MarketState.STRONG_TREND;
         if (adx > 18) return MarketState.WEAK_TREND;
         return MarketState.RANGE;
     }
@@ -310,7 +315,7 @@ public final class DecisionEngineMerged {
     private boolean pullback(List<TradingCore.Candle> c, boolean bull) {
         double ema21 = ema(c, 21);
         double price = last(c).close;
-        return bull ? price <= ema21 * 0.992 : price >= ema21 * 1.008;
+        return bull ? price <= ema21 * 0.996 : price >= ema21 * 1.004;
     }
 
     private TradingCore.Candle last(List<TradingCore.Candle> c) {
