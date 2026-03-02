@@ -172,8 +172,8 @@ public final class TradingCore {
 
     public static final class AdaptiveBrain {
 
-        private static final double MAX_BIAS = 0.08;
-        private static final double DECAY = 0.985;
+        private static final double MAX_BIAS = 0.12;
+        private static final double DECAY = 0.992;
         private static final int MAX_STREAK = 5;
 
         private final Map<String, Double> symbolBias =
@@ -195,8 +195,8 @@ public final class TradingCore {
             conf += symbolBias.getOrDefault(symbol, 0.0);
             conf += typeBoost(type);
 
-            if (highVol) conf += 0.02;
-            if (lowVol) conf -= 0.02;
+            if (highVol) conf += 0.025;
+            if (lowVol) conf -= 0.03;
 
             return clamp(conf, 0.40, 0.95);
         }
@@ -234,9 +234,8 @@ public final class TradingCore {
             /* ==== BIAS ==== */
 
             symbolBias.merge(symbol,
-                    win ? 0.01 : -0.01,
+                    win ? 0.015 : -0.018,
                     Double::sum);
-
             symbolBias.compute(symbol, (s, val) -> {
 
                 if (val == null)

@@ -7,6 +7,7 @@
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -72,6 +73,9 @@
     &quot;accountId&quot;: &quot;bad814d6-1ceb-4128-8d07-2b8436b7181d&quot;
   }
 }</component>
+  <component name="ProblemsViewState">
+    <option name="selectedTabId" value="DEPENDENCY_CHECKER_PROBLEMS_TAB" />
+  </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 5
 }</component>
@@ -374,7 +378,10 @@
       <workItem from="1772287400590" duration="704000" />
       <workItem from="1772317517627" duration="5029000" />
       <workItem from="1772363440852" duration="5274000" />
-      <workItem from="1772376187878" duration="16795000" />
+      <workItem from="1772376187878" duration="18203000" />
+      <workItem from="1772418050036" duration="9000" />
+      <workItem from="1772475290115" duration="3223000" />
+      <workItem from="1772491671371" duration="1721000" />
     </task>
     <servers />
   </component>

@@ -76,8 +76,8 @@ public final class DecisionEngineMerged {
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
 
-        if (bias == HTFBias.BULL) scoreLong += 0.8;
-        else if (bias == HTFBias.BEAR) scoreShort += 0.8;
+        if (bias == HTFBias.BULL) scoreLong += 0.9;
+        else if (bias == HTFBias.BEAR) scoreShort += 0.9;
 
         // --- Pullback
         if (pullback(c15, true)) {
@@ -89,15 +89,15 @@ public final class DecisionEngineMerged {
             reasonWeightsShort.put("Pullback bearish", 1.0);
         }
 
-        // --- Impulse
         if (impulse(c1)) {
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
-            if (delta > atr * 0.15)
-                scoreLong += 0.45;
-            else if (delta < -atr * 0.15)
-                scoreShort += 0.45;
-        }
 
+            if (delta > atr * 0.15)
+                scoreLong += state == MarketState.STRONG_TREND ? 0.65 : 0.50;
+
+            else if (delta < -atr * 0.15)
+                scoreShort += state == MarketState.STRONG_TREND ? 0.65 : 0.50;
+        }
         // --- Divergence
         if (bullDiv(c15)) {
             scoreLong += 0.6;
@@ -108,17 +108,13 @@ public final class DecisionEngineMerged {
             reasonWeightsShort.put("Bearish divergence", 0.6);
         }
 
-        // --- RSI Filter
+        // --- RSI Soft Filter (не ломаем тренд)
         double rsi14 = rsi(c15, 14);
-        if (rsi14 > 80) {
-            scoreLong -= 0.25;
-            reasonWeightsLong.put("RSI overbought", 0.25);
-        }
-        if (rsi14 < 20) {
-            scoreShort -= 0.25;
-            reasonWeightsShort.put("RSI oversold", 0.25);
-        }
 
+        if (state != MarketState.STRONG_TREND) {
+            if (rsi14 > 82) scoreLong -= 0.15;
+            if (rsi14 < 18) scoreShort -= 0.15;
+        }
         // --- ADX anti-counter-trend
         double adxValue = adx(c15, 14);
 
@@ -139,7 +135,18 @@ public final class DecisionEngineMerged {
         double dynamicThreshold =
                 state == MarketState.STRONG_TREND ? 1.30 : 1.15;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
+// --- Momentum Regime Protection (anti stupid counter-trend)
+        double move4 = (last(c15).close - c15.get(c15.size() - 4).close) / price;
+        boolean strongMomentumUp = move4 > 0.018;   // ~1.8% за 4 свечи
+        boolean strongMomentumDown = move4 < -0.018;
 
+        if (strongMomentumUp && scoreShort > scoreLong) {
+            scoreShort *= 0.5; // сильно режем контртренд
+        }
+
+        if (strongMomentumDown && scoreLong > scoreShort) {
+            scoreLong *= 0.5;
+        }
         // --- Decide Side
         TradingCore.Side side;
         double scoreDiff = Math.abs(scoreLong - scoreShort);
@@ -213,7 +220,7 @@ public final class DecisionEngineMerged {
 
     /* ================= CONFIDENCE ================= */
     private double computeConfidence(double rawScore, MarketState state, CoinCategory cat, double atr, double price) {
-        double edge = rawScore - 1.8;
+        double edge = rawScore - 1.9;
         double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge));
 
         double regimeBoost = state == MarketState.STRONG_TREND ? 0.05 : 0.0;

@@ -90,9 +90,8 @@ public final class InstitutionalSignalCore {
 
         if (signal == null) return false;
 
-        if (signal.probability < minConfidence)
+        if (signal.probability < minConfidence + 2.0)
             return false;
-
         if (getActiveSignalsCount() >= maxGlobalSignals)
             return false;
 
@@ -234,9 +233,9 @@ public final class InstitutionalSignalCore {
                                    double pnl) {
 
         double delta =
-                pnl > 0 ? 0.025 :
-                        pnl < 0 ? -0.035 :
-                                -0.01;
+                pnl > 0 ? 0.02 :
+                        pnl < 0 ? -0.025 :
+                                -0.005;
 
         symbolScore.merge(symbol, delta, Double::sum);
 
@@ -248,23 +247,21 @@ public final class InstitutionalSignalCore {
        EXPOSURE MODEL
        ========================================================= */
 
-    private double estimateExposure(
-            DecisionEngineMerged.TradeIdea s) {
+    private double estimateExposure(DecisionEngineMerged.TradeIdea s) {
 
-        if (s.probability > 0.85) return 0.05;
-        if (s.probability > 0.75) return 0.035;
-        if (s.probability > 0.65) return 0.025;
+        if (s.probability >= 82) return 0.05;
+        if (s.probability >= 75) return 0.035;
+        if (s.probability >= 68) return 0.025;
         return 0.02;
     }
 
     private double estimateExposure(ActiveSignal s) {
 
-        if (s.probability > 0.85) return 0.05;
-        if (s.probability > 0.75) return 0.035;
-        if (s.probability > 0.65) return 0.025;
+        if (s.probability >= 82) return 0.05;
+        if (s.probability >= 75) return 0.035;
+        if (s.probability >= 68) return 0.025;
         return 0.02;
     }
-
     /* =========================================================
        STATS API
        ========================================================= */
