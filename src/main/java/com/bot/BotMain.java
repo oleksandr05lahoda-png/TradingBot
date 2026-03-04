@@ -105,31 +105,20 @@ public final class BotMain {
      * Для Telegram выводим в процентах.
      */
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
-
-        String flags = (s.flags != null && !s.flags.isEmpty())
-                ? String.join(", ", s.flags)
-                : "—";
-
+        String flags = (s.flags != null && !s.flags.isEmpty()) ? String.join(", ", s.flags) : "—";
         return String.format(
                 "*%s* → *%s*\n" +
                         "Price: %.6f\n" +
-                        "Probability: %.0f%%\n" +
+                        "Probability: %.0f%%\n" +  // просто выводим напрямую
                         "Stop-Take: %.6f - %.6f\n" +
                         "Flags: %s\n" +
                         "_time: %s_",
-                s.symbol,
-                s.side,
-                s.price,
-                s.probability * 100.0,   // ← важный фикс
-                s.stop,
-                s.take,
-                flags,
-                LocalTime.now().format(
-                        DateTimeFormatter.ofPattern("HH:mm:ss"))
+                s.symbol, s.side, s.price,
+                s.probability,  // ← убираем *100
+                s.stop, s.take, flags,
+                LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }
-
-    // ================= THREAD FACTORY =================
 
     static final class BotThreadFactory implements ThreadFactory {
 
