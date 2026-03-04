@@ -159,8 +159,7 @@ public final class DecisionEngineMerged {
         if (!cooldownAllowed(symbol, side, cat, now)) return null;
         if (!flipAllowed(symbol, side)) return null;
 
-        // --- Probability
-        double probability = computeConfidence(Math.max(scoreLong, scoreShort), state, cat, atr, price);
+        double probability = computeConfidence(scoreLong, scoreShort, state, cat, atr, price);
         if (probability < MIN_CONFIDENCE) return null;
 
         // --- Flags
@@ -219,17 +218,23 @@ public final class DecisionEngineMerged {
         if (history.size() > 3) history.removeFirst();
     }
 
-    /* ================= CONFIDENCE ================= */
-    private double computeConfidence(double rawScore, MarketState state, CoinCategory cat, double atr, double price) {
-        double edge = rawScore - 1.9;
-        double sigmoid = 1.0 / (1.0 + Math.exp(-2.0 * edge));
+    private double computeConfidence(double scoreLong, double scoreShort, MarketState state, CoinCategory cat, double atr, double price) {
+        // Разница между силами сигналов
+        double edge = Math.abs(scoreLong - scoreShort);
 
-        double regimeBoost = state == MarketState.STRONG_TREND ? 0.05 : 0.0;
-        double categoryPenalty = cat == CoinCategory.MEME ? -0.04 : cat == CoinCategory.ALT ? -0.015 : 0.0;
-        double atrFactor = atr / price < 0.003 ? 0.05 : atr / price > 0.01 ? -0.03 : 0.0;
+        // Сигмоид для плавной вероятности (чем сильнее edge, тем выше доверие)
+        double prob = 1.0 / (1.0 + Math.exp(-3.0 * (edge - 0.1)));
 
-        double rawProb = clamp(sigmoid + regimeBoost + categoryPenalty + atrFactor, 0.0, 1.0);
-        return clamp(50.0 + rawProb * 35.0, 50.0, 85.0);
+        // Подправим по тренду / категории / ATR
+        if (state == MarketState.STRONG_TREND) prob += 0.05;
+        if (cat == CoinCategory.MEME) prob -= 0.03;
+        if (atr / price > 0.01) prob -= 0.02;
+
+        // Ограничиваем 0..1
+        prob = clamp(prob, 0.0, 1.0);
+
+        // Возвращаем % вероятность для TradeIdea (50..100%)
+        return 50.0 + prob * 50.0;
     }
 
     /* ================= STATE DETECT ================= */
