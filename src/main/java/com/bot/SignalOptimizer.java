@@ -159,16 +159,6 @@ public final class SignalOptimizer {
                 signal.flags
         );
     }
-    /* ================= CLEANUP ================= */
-
-    public void clearCacheForSymbol(String symbol) {
-        microTrendCache.remove(symbol);
-    }
-
-    public void clearAllCache() {
-        microTrendCache.clear();
-    }
-
 
     private static double clamp(double v,
                                 double min,

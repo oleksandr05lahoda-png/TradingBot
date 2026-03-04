@@ -70,8 +70,8 @@ public class SignalSender {
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     // ========================= PUBLIC API =========================
-    public List<DecisionEngineMerged.TradeIdea> generateSignals() {
-
+    public List<DecisionEngineMerged.TradeIdea> generateSignals(
+            GlobalImpulseController.GlobalContext context){
         List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
 
         if (cachedPairs == null || cachedPairs.isEmpty()) {
@@ -97,7 +97,8 @@ public class SignalSender {
                             m5,
                             m15,
                             h1,
-                            DecisionEngineMerged.CoinCategory.TOP
+                            DecisionEngineMerged.CoinCategory.TOP,
+                            context
                     );
 
             if (idea == null || idea.probability < MIN_CONF)
@@ -614,17 +615,6 @@ public class SignalSender {
         return Double.compare(emaFast, emaSlow);
     }
 
-    private int getBtcTrend() {
-        try {
-            List<com.bot.TradingCore.Candle> btcH1 = fetchKlines("BTCUSDT", "1h", 120);
-            if (btcH1.size() < 60) return 0;
-
-            return emaDirection(btcH1, 20, 50); // 1 = uptrend, -1 = downtrend
-        } catch (Exception e) {
-            return 0;
-        }
-    }
-
     private double strategyEMANorm(List<Double> closes) {
         if (closes == null || closes.size() < 100) return 0.0;
         double e20 = ema(closes, 20);
@@ -1098,6 +1088,7 @@ public class SignalSender {
         try {
             signalsThisCycle = 0;
 
+            // === DAILY LIMIT RESET ===
             if (System.currentTimeMillis() - dailyResetTs > 24 * 60 * 60_000L) {
                 dailyRequests.set(0);
                 dailyResetTs = System.currentTimeMillis();
@@ -1107,10 +1098,24 @@ public class SignalSender {
                 cachedPairs = getTopSymbolsSet(TOP_N);
             }
 
-            DecisionEngineMerged engine = new DecisionEngineMerged();
+            // === BTC GLOBAL CONTEXT ===
+            List<TradingCore.Candle> btcC15 =
+                    fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
 
-            // === Получаем глобальный тренд BTC ОДИН раз за цикл ===
-            int btcTrend = getBtcTrend();
+            if (btcC15.size() < 60) {
+                System.out.println("[Scheduler] Not enough BTC data");
+                return;
+            }
+
+            GlobalImpulseController globalImpulse =
+                    new GlobalImpulseController();
+
+            globalImpulse.update(btcC15);
+
+            GlobalImpulseController.GlobalContext context =
+                    globalImpulse.getContext();
+
+            DecisionEngineMerged engine = new DecisionEngineMerged();
 
             for (String pair : cachedPairs) {
 
@@ -1119,21 +1124,26 @@ public class SignalSender {
                 List<TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
                 List<TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
 
-                if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
+                if (c1.size() < 60 || c5.size() < 60 ||
+                        c15.size() < 60 || h1.size() < 60) continue;
 
-                // Получаем сигнал через движок
+                // === ANALYZE WITH GLOBAL CONTEXT ===
                 DecisionEngineMerged.TradeIdea idea =
-                        engine.analyze(pair, c1, c5, c15, h1, DecisionEngineMerged.CoinCategory.TOP);
+                        engine.analyze(
+                                pair,
+                                c1,
+                                c5,
+                                c15,
+                                h1,
+                                DecisionEngineMerged.CoinCategory.TOP,
+                                context
+                        );
 
                 if (idea == null || idea.probability < MIN_CONF) continue;
 
-                // === BTC GLOBAL TREND FILTER ===
-                if (btcTrend < 0 && idea.side.name().equals("LONG")) continue;
-                if (btcTrend > 0 && idea.side.name().equals("SHORT")) continue;
-
                 long candleCloseTime = c15.get(c15.size() - 1).closeTime;
 
-                // Собираем Signal
+                // === BUILD TEMP SIGNAL ===
                 Signal tempSignal = new Signal(
                         idea.symbol,
                         idea.side.name(),

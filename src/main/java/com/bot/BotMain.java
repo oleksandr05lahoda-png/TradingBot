@@ -2,16 +2,19 @@ package com.bot;
 
 import java.time.*;
 import java.time.format.DateTimeFormatter;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.*;
 
-public class BotMain {
+public final class BotMain {
 
-    // ===== CONFIG =====
+    // ================= CONFIG =================
+
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.systemDefault();
     private static final int SIGNAL_INTERVAL_MIN = 15;
+
+    // ================= MAIN =================
 
     public static void main(String[] args) {
 
@@ -22,18 +25,29 @@ public class BotMain {
 
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
         SignalSender signalSender = new SignalSender(telegram);
+        GlobalImpulseController globalImpulse = new GlobalImpulseController();
 
         telegram.sendMessageAsync("🚀 Trading Bot запущен");
         System.out.println("Bot started at " + LocalDateTime.now());
 
         ScheduledExecutorService scheduler =
-                Executors.newScheduledThreadPool(2, new BotThreadFactory());
+                Executors.newSingleThreadScheduledExecutor(new BotThreadFactory());
 
         Runnable signalTask = () -> {
             try {
                 System.out.println("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                List<DecisionEngineMerged.TradeIdea> signals = signalSender.generateSignals();
+                // Получаем BTC 15m свечи
+                List<TradingCore.Candle> btcC15 = getBtcC15();
+
+                // Обновляем глобальный контекст
+                globalImpulse.update(btcC15);
+                GlobalImpulseController.GlobalContext context =
+                        globalImpulse.getContext();
+
+                // Генерируем сигналы
+                List<DecisionEngineMerged.TradeIdea> signals =
+                        signalSender.generateSignals(context);
 
                 if (signals == null || signals.isEmpty()) {
                     System.out.println("No valid signals this cycle.");
@@ -63,16 +77,36 @@ public class BotMain {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Shutting down bot...");
             scheduler.shutdown();
+            telegram.shutdown();
+            try {
+                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                    scheduler.shutdownNow();
+                }
+            } catch (InterruptedException ignored) {
+                scheduler.shutdownNow();
+            }
         }));
     }
 
+    // ================= MOCK BTC DATA =================
+
     /**
-     * Формат сигнала для Telegram
-     * Убираем reason/RSI, оставляем только flags
+     * Мок получения BTC 15m свечей.
+     * Здесь должен быть реальный API (Binance / Bybit и т.д.)
+     */
+    private static List<TradingCore.Candle> getBtcC15() {
+        return Collections.emptyList();
+    }
+
+    // ================= FORMAT SIGNAL =================
+
+    /**
+     * probability хранится в шкале 0.0 – 1.0
+     * Для Telegram выводим в процентах.
      */
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
 
-        String flags = s.flags != null && !s.flags.isEmpty()
+        String flags = (s.flags != null && !s.flags.isEmpty())
                 ? String.join(", ", s.flags)
                 : "—";
 
@@ -86,22 +120,22 @@ public class BotMain {
                 s.symbol,
                 s.side,
                 s.price,
-                s.probability,   // ← ВОТ ТУТ
+                s.probability * 100.0,   // ← важный фикс
                 s.stop,
                 s.take,
                 flags,
-                LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+                LocalTime.now().format(
+                        DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }
-    /**
-     * Кастомный ThreadFactory с защитой от смерти потока
-     */
-    static class BotThreadFactory implements ThreadFactory {
+
+    // ================= THREAD FACTORY =================
+
+    static final class BotThreadFactory implements ThreadFactory {
 
         @Override
         public Thread newThread(Runnable r) {
-            Thread t = new Thread(r);
-            t.setName("SignalSchedulerThread");
+            Thread t = new Thread(r, "SignalSchedulerThread");
             t.setDaemon(false);
 
             t.setUncaughtExceptionHandler((thread, ex) -> {
@@ -113,9 +147,8 @@ public class BotMain {
         }
     }
 
-    /**
-     * UTC → локальное
-     */
+    // ================= TIME UTIL =================
+
     public static String formatLocalTime(long utcMillis) {
         return Instant.ofEpochMilli(utcMillis)
                 .atZone(ZONE)

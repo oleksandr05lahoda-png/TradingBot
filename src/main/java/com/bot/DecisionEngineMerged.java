@@ -61,7 +61,8 @@ public final class DecisionEngineMerged {
                                List<TradingCore.Candle> c15,
                                List<TradingCore.Candle> c1h,
                                CoinCategory cat,
-                               long now) {
+                               long now,
+                               GlobalImpulseController.GlobalContext globalContext){
 
         if (!valid(c15) || !valid(c1h)) return null;
 
@@ -354,8 +355,9 @@ public final class DecisionEngineMerged {
                              List<TradingCore.Candle> c5,
                              List<TradingCore.Candle> c15,
                              List<TradingCore.Candle> c1h,
-                             CoinCategory cat) {
+                             CoinCategory cat,
+                             com.bot.GlobalImpulseController.GlobalContext globalContext) {
         long now = System.currentTimeMillis();
-        return generate(symbol, c1, c5, c15, c1h, cat, now);
+        return generate(symbol, c1, c5, c15, c1h, cat, now, globalContext);
     }
 }
