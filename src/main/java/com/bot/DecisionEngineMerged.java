@@ -26,7 +26,28 @@ public final class DecisionEngineMerged {
     private final Map<String, Deque<String>> recentDirections = new ConcurrentHashMap<>();
     private final Map<String, Double> lastSignalPrice = new ConcurrentHashMap<>();
     private final Set<String> currentCycleSignals = new HashSet<>();
+    /* ================= MICRO TREND ================= */
+    private static final class MicroTrendResult {
+        public final double speed;       // положительное = вверх, отрицательное = вниз
+        public final double impulse;     // сила движения
+        public final TradingCore.Side direction; // LONG / SHORT / null
 
+        public MicroTrendResult(double speed, double impulse, TradingCore.Side direction) {
+            this.speed = speed;
+            this.impulse = impulse;
+            this.direction = direction;
+        }
+    }
+
+    // вычисление микро-тренда
+    private MicroTrendResult computeMicroTrend(List<TradingCore.Candle> candles) {
+        if(candles == null || candles.size() < 10) return new MicroTrendResult(0,0,null);
+        double delta = last(candles).close - candles.get(candles.size()-5).close;
+        double atrVal = atr(candles, 14);
+        TradingCore.Side dir = delta > 0 ? TradingCore.Side.LONG : delta < 0 ? TradingCore.Side.SHORT : null;
+        double factor = Math.min(Math.abs(delta)/atrVal, 1.0); // нормализация скорости
+        return new MicroTrendResult(delta/atrVal, factor, dir);
+    }
     /* ================= TRADE IDEA ================= */
     public static final class TradeIdea {
         public final String symbol;
@@ -148,7 +169,14 @@ public final class DecisionEngineMerged {
         // дивергенции
         if (bullDiv(c15)) scoreLong += 0.6*btcInfluence;
         if (bearDiv(c15)) scoreShort += 0.6*btcInfluence;
+        MicroTrendResult mt = computeMicroTrend(c1);
+        if(mt.direction == TradingCore.Side.LONG) scoreLong += 0.3 * btcInfluence;
+        if(mt.direction == TradingCore.Side.SHORT) scoreShort += 0.3 * btcInfluence;
 
+        if((scoreLong > scoreShort && mt.direction == TradingCore.Side.SHORT) ||
+                (scoreShort > scoreLong && mt.direction == TradingCore.Side.LONG)) {
+            return null; // сигнал против микро-тренда – игнорируем
+        }
         // RSI фильтры
         double rsi14 = rsi(c15, 14);
         if (state != MarketState.STRONG_TREND) {
@@ -174,6 +202,8 @@ public final class DecisionEngineMerged {
         if (atr > price*0.001) flags.add("ATR↑");
         if (volumeSpike(c15, cat)) flags.add("vol:true");
         if (impulse(c1)) flags.add("impulse:true");
+        if(mt.direction == TradingCore.Side.LONG) flags.add("microTrend:UP");
+        if(mt.direction == TradingCore.Side.SHORT) flags.add("microTrend:DOWN");
 
         double riskMult = cat == CoinCategory.MEME ? 1.3 : cat == CoinCategory.ALT ? 1.0 : 0.85;
         double rr = probability > 80 ? 3.0 : probability > 70 ? 2.6 : 2.2;
@@ -207,14 +237,23 @@ public final class DecisionEngineMerged {
         history.addLast(side.name());
         if (history.size() > 3) history.removeFirst();
     }
-
     private double computeConfidence(double scoreLong, double scoreShort, MarketState state, CoinCategory cat, double atr, double price) {
         double edge = Math.abs(scoreLong - scoreShort);
-        double prob = 1.0 / (1.0 + Math.exp(-5*(edge-0.1))); // усиленный коэффициент для лучше разделения
-        double baseProb = 52 + prob*43;
-        return clamp(baseProb, 0, 100);
-    }
+        // базовая вероятность через логистическую функцию
+        double prob = 1.0 / (1.0 + Math.exp(-5*(edge-0.1)));
 
+        double baseProb = 50 + prob*45; // нормализуем 50..95%
+
+        // корректируем по состоянию рынка
+        if(state == MarketState.STRONG_TREND) baseProb += 5;
+        else if(state == MarketState.WEAK_TREND) baseProb += 2;
+
+        // корректируем по категории монеты
+        if(cat == CoinCategory.MEME) baseProb -= 5;
+        if(cat == CoinCategory.TOP) baseProb += 3;
+
+        return clamp(baseProb, 40, 95); // min/max, чтобы probability была правдоподобной
+    }
     /* ================= STATE DETECT ================= */
     private MarketState detectState(List<TradingCore.Candle> c) {
         double adx = adx(c,14);
