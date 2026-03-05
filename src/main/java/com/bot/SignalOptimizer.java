@@ -2,17 +2,18 @@ package com.bot;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
- * Professional Signal Optimizer (Enhanced)
- * Без блокировок, без залипаний, для бесконечного 15m цикла.
- * Улучшено: адаптивные пороги, контроль кэша, optional флаги для корректировки.
+ * Professional Signal Optimizer (Enhanced & Corrected)
+ * Поддержка микро-трендов, адаптивного confidence, безопасное кэширование,
+ * контроль импульсов и флагов для интеграции с DecisionEngineMerged.
  */
 public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */
     private static final int MIN_TICKS = 8;
-    private static final int MAX_TICKS = 120;
+    private static final int MAX_TICKS = 200; // увеличено для лучшего анализа
     private static final double EMA_ALPHA = 0.32;
 
     private static final double BASE_STRONG_IMPULSE = 0.0015;
@@ -21,7 +22,7 @@ public final class SignalOptimizer {
     private static final double MAX_CONF = 95.0;
     private static final double MIN_CONF = 40.0;
 
-    private static final int MICRO_CACHE_LIMIT = 200; // ограничение кэша микро-трендов
+    private static final int MICRO_CACHE_LIMIT = 500; // увеличен лимит кэша
 
     /* ================= STATE ================= */
     private final Map<String, Deque<Double>> tickPriceDeque;
@@ -44,6 +45,10 @@ public final class SignalOptimizer {
             this.avg = avg;
             this.impulse = Math.abs(speed) + Math.abs(accel);
         }
+
+        public boolean isZero() {
+            return speed == 0.0 && accel == 0.0 && avg == 0.0;
+        }
     }
 
     private static final MicroTrendResult ZERO = new MicroTrendResult(0, 0, 0);
@@ -58,8 +63,9 @@ public final class SignalOptimizer {
 
         synchronized (dq) {
             Iterator<Double> it = dq.descendingIterator();
-            while (it.hasNext() && buffer.size() < MAX_TICKS)
+            while (it.hasNext() && buffer.size() < MAX_TICKS) {
                 buffer.add(it.next());
+            }
         }
 
         if (buffer.size() < MIN_TICKS)
@@ -86,7 +92,7 @@ public final class SignalOptimizer {
 
         MicroTrendResult result = new MicroTrendResult(speed, accel, sum / buffer.size());
 
-        // --- Кэширование с лимитом
+        // --- кэширование с безопасным лимитом
         if (microTrendCache.size() > MICRO_CACHE_LIMIT) {
             Iterator<String> keys = microTrendCache.keySet().iterator();
             if (keys.hasNext()) microTrendCache.remove(keys.next());
@@ -97,13 +103,13 @@ public final class SignalOptimizer {
     }
 
     /* ================= ADAPTIVE IMPULSE ================= */
-    private double adaptiveStrongImpulse(String symbol, List<Double> buffer) {
+    private double adaptiveStrongImpulse(List<Double> buffer) {
         if (buffer == null || buffer.size() < 10) return BASE_STRONG_IMPULSE;
         double std = stdDev(buffer);
         return Math.max(BASE_STRONG_IMPULSE, std * 1.1);
     }
 
-    private double adaptiveWeakImpulse(String symbol, List<Double> buffer) {
+    private double adaptiveWeakImpulse(List<Double> buffer) {
         if (buffer == null || buffer.size() < 10) return BASE_WEAK_IMPULSE;
         double std = stdDev(buffer);
         return Math.max(BASE_WEAK_IMPULSE, std * 0.45);
@@ -117,30 +123,33 @@ public final class SignalOptimizer {
 
     /* ================= CONFIDENCE ================= */
     public double adjustConfidence(DecisionEngineMerged.TradeIdea signal) {
+        if (signal == null) return MIN_CONF;
+
         MicroTrendResult mt = computeMicroTrend(signal.symbol);
         double confidence = signal.probability;
 
-        if (mt == ZERO) return confidence;
+        if (mt.isZero()) return clamp(confidence, MIN_CONF, MAX_CONF);
 
         boolean isLong = signal.side == TradingCore.Side.LONG;
         boolean trendUp = mt.speed > 0;
 
         double adjustment = 0.0;
 
-        // Используем микро-тренд для адаптивного импульса
-        List<Double> buffer = new ArrayList<>(tickPriceDeque.getOrDefault(signal.symbol, new ArrayDeque<>()));
-        double strongImpulse = adaptiveStrongImpulse(signal.symbol, buffer);
-        double weakImpulse = adaptiveWeakImpulse(signal.symbol, buffer);
+        // Подготовка буфера для адаптивного импульса
+        List<Double> buffer = new ArrayList<>(tickPriceDeque.getOrDefault(signal.symbol, new ConcurrentLinkedDeque<>()));
+        double strongImpulse = adaptiveStrongImpulse(buffer);
+        double weakImpulse = adaptiveWeakImpulse(buffer);
 
+        // Основная адаптивная коррекция
         if (mt.impulse > strongImpulse) {
             adjustment = ((isLong && trendUp) || (!isLong && !trendUp)) ? 0.07 : -0.06;
         } else if (mt.impulse > weakImpulse) {
             adjustment = ((isLong && trendUp) || (!isLong && !trendUp)) ? 0.03 : -0.03;
         }
 
-        // Опционально можно учитывать флаги DecisionEngine
-        if (signal.flags.contains("impulse:true") && ((isLong && trendUp) || (!isLong && !trendUp))) {
-            adjustment += 0.015; // небольшое усиление
+        // Учитываем DecisionEngine флаги
+        if (signal.flags != null && signal.flags.contains("impulse:true")) {
+            adjustment += ((isLong && trendUp) || (!isLong && !trendUp)) ? 0.015 : -0.015;
         }
 
         confidence += adjustment;
@@ -150,18 +159,20 @@ public final class SignalOptimizer {
 
     /* ================= STOP / TAKE ================= */
     public DecisionEngineMerged.TradeIdea withAdjustedConfidence(DecisionEngineMerged.TradeIdea signal) {
+        if (signal == null) return null;
         double newConfidence = adjustConfidence(signal);
         return new DecisionEngineMerged.TradeIdea(
                 signal.symbol,
                 signal.side,
                 signal.price,
-                signal.stop,   // НЕ трогаем стоп
-                signal.take,   // НЕ трогаем тейк
+                signal.stop,
+                signal.take,
                 newConfidence,
                 signal.flags
         );
     }
 
+    /* ================= UTILS ================= */
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }

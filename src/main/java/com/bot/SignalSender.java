@@ -69,49 +69,63 @@ public class SignalSender {
                     15000     // cooldown в миллисекундах (пример: 15 секунд)
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
-    // ========================= PUBLIC API =========================
-    public List<DecisionEngineMerged.TradeIdea> generateSignals(
-            GlobalImpulseController.GlobalContext context){
+    public List<DecisionEngineMerged.TradeIdea> generateSignals() {
         List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
 
+        // 1. Получаем топовые символы, если ещё нет кеша
         if (cachedPairs == null || cachedPairs.isEmpty()) {
             cachedPairs = getTopSymbolsSet(TOP_N);
         }
 
+        // 2. Получаем BTC 15m свечи для глобального контекста
+        List<TradingCore.Candle> btcC15 = fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
+        if (btcC15.size() < 60) {
+            System.out.println("[generateSignals] Not enough BTC data for context");
+            return result; // возвращаем пустой список
+        }
+
+        // 3. Создаём глобальный контекст через GlobalImpulseController
+        GlobalImpulseController globalImpulse = new GlobalImpulseController();
+        globalImpulse.update(btcC15);
+        GlobalImpulseController.GlobalContext context = globalImpulse.getContext();
+
+        // 4. Создаём движок для анализа
         DecisionEngineMerged engine = new DecisionEngineMerged();
 
+        // 5. Проходим по всем парам
         for (String pair : cachedPairs) {
-
-            List<com.bot.TradingCore.Candle> m1  = fetchKlines(pair,"1m",KLINES_LIMIT);
-            List<com.bot.TradingCore.Candle> m5  = fetchKlines(pair,"5m",KLINES_LIMIT);
-            List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
-            List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
+            List<TradingCore.Candle> m1  = fetchKlines(pair, "1m", KLINES_LIMIT);
+            List<TradingCore.Candle> m5  = fetchKlines(pair, "5m", KLINES_LIMIT);
+            List<TradingCore.Candle> m15 = fetchKlines(pair, "15m", KLINES_LIMIT);
+            List<TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
 
             if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60)
                 continue;
 
-            DecisionEngineMerged.TradeIdea idea =
-                    engine.analyze(
-                            pair,
-                            m1,
-                            m5,
-                            m15,
-                            h1,
-                            DecisionEngineMerged.CoinCategory.TOP,
-                            context
-                    );
+            // Анализируем пару с глобальным контекстом
+            DecisionEngineMerged.TradeIdea idea = engine.analyze(
+                    pair,
+                    m1,
+                    m5,
+                    m15,
+                    h1,
+                    DecisionEngineMerged.CoinCategory.TOP,
+                    context
+            );
 
+            // Фильтруем слабые или запрещённые сигналы
             if (idea == null || idea.probability < MIN_CONF)
                 continue;
 
             if (!core.allowSignal(idea))
                 continue;
 
+            // Регистрируем сигнал и добавляем в результат
             core.registerSignal(idea);
-
             result.add(idea);
         }
 
+        // 6. Сортировка по вероятности (по убыванию)
         result.sort(Comparator.comparingDouble(
                 (DecisionEngineMerged.TradeIdea i) -> i.probability
         ).reversed());
