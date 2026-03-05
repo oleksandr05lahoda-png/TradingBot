@@ -1,11 +1,16 @@
 package com.bot;
 
+import java.text.DecimalFormat;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public final class BotMain {
+
+    private static final Logger LOGGER = Logger.getLogger(BotMain.class.getName());
 
     // ===== CONFIG =====
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
@@ -13,71 +18,67 @@ public final class BotMain {
     private static final ZoneId ZONE = ZoneId.systemDefault();
     private static final int SIGNAL_INTERVAL_MIN = 15;
 
+    private BotMain() { }
+
     public static void main(String[] args) {
 
         if (TG_TOKEN == null || TG_TOKEN.isBlank()) {
-            System.err.println("TELEGRAM_TOKEN not set!");
+            LOGGER.severe("TELEGRAM_TOKEN not set!");
             return;
         }
 
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
-        SignalSender signalSender = new SignalSender(telegram);
+        TradingCore tradingCore = new TradingCore();
+        DecisionEngineMerged decisionEngine = new DecisionEngineMerged();
         GlobalImpulseController globalImpulse = new GlobalImpulseController();
 
         telegram.sendMessageAsync("🚀 Trading Bot запущен");
-        System.out.println("Bot started at " + LocalDateTime.now());
+        LOGGER.info("Bot started at " + LocalDateTime.now());
 
-        ScheduledExecutorService scheduler =
-                Executors.newSingleThreadScheduledExecutor(new BotThreadFactory());
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(new BotThreadFactory());
 
         Runnable signalTask = () -> {
             try {
-                System.out.println("=== SIGNAL SCAN START === " + LocalDateTime.now());
+                LOGGER.info("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                // Получаем BTC 15m свечи
-                List<TradingCore.Candle> btcC15 = getBtcC15();
+                // === Получаем свечи с твоего источника (TradingCore) ===
+                // Твой код должен здесь подставить реальные списки свечей
+                List<TradingCore.Candle> candlesBTC = tradingCoreCandles("BTCUSDT"); // метод реализуй у себя
+                List<TradingCore.Candle> candlesSymbol = tradingCoreCandles("BTCUSDT"); // пример для анализа
 
-                if (btcC15 == null || btcC15.isEmpty()) {
-                    System.out.println("BTC candles not available. Skipping cycle.");
+                if (candlesBTC.isEmpty() || candlesSymbol.isEmpty()) {
+                    LOGGER.warning("Candles not available. Skipping cycle.");
                     return;
                 }
 
-                // Обновляем глобальный импульс
-                globalImpulse.update(btcC15);
-                GlobalImpulseController.GlobalContext context =
-                        globalImpulse.getContext();
+                // === Обновляем глобальный импульс BTC ===
+                globalImpulse.update(candlesBTC);
+                GlobalImpulseController.GlobalContext context = globalImpulse.getContext();
 
-                // Генерация сигналов
-                List<DecisionEngineMerged.TradeIdea> signals =
-                        signalSender.generateSignals(context);
+                // === Генерируем сигнал через DecisionEngineMerged ===
+                DecisionEngineMerged.TradeIdea signal = decisionEngine.analyze(
+                        "BTCUSDT",
+                        candlesSymbol, candlesSymbol, candlesSymbol, candlesBTC, // все свечи через твои списки
+                        DecisionEngineMerged.CoinCategory.TOP,
+                        context
+                );
 
-                if (signals == null || signals.isEmpty()) {
-                    System.out.println("No valid signals this cycle.");
-                    return;
-                }
-
-                for (DecisionEngineMerged.TradeIdea s : signals) {
-                    telegram.sendMessageAsync(formatSignal(s));
+                if (signal != null) {
+                    telegram.sendMessageAsync(formatSignal(signal));
+                } else {
+                    LOGGER.info("No valid signals this cycle.");
                 }
 
             } catch (Throwable t) {
-                System.err.println("CRITICAL ERROR in signal cycle:");
-                t.printStackTrace();
+                LOGGER.log(Level.SEVERE, "CRITICAL ERROR in signal cycle", t);
                 telegram.sendMessageAsync("⚠ Ошибка цикла: " + t.getMessage());
             }
         };
 
-        // Запуск сразу + каждые 15 минут
-        scheduler.scheduleAtFixedRate(
-                signalTask,
-                0,
-                SIGNAL_INTERVAL_MIN,
-                TimeUnit.MINUTES
-        );
+        scheduler.scheduleAtFixedRate(signalTask, 0, SIGNAL_INTERVAL_MIN, TimeUnit.MINUTES);
 
-        // Graceful shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down bot...");
+            LOGGER.info("Shutting down bot...");
             scheduler.shutdown();
             telegram.shutdown();
             try {
@@ -85,68 +86,58 @@ public final class BotMain {
                     scheduler.shutdownNow();
                 }
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 scheduler.shutdownNow();
             }
         }));
     }
 
-    /**
-     * Здесь должен быть реальный API-запрос к бирже.
-     * Пока оставляем заглушку.
-     */
-    private static List<TradingCore.Candle> getBtcC15() {
-        return Collections.emptyList();
-    }
+    private static String formatSignal(DecisionEngineMerged.TradeIdea signal) {
+        String flags = Optional.ofNullable(signal.flags)
+                .filter(f -> !f.isEmpty())
+                .map(f -> String.join(", ", f))
+                .orElse("—");
 
-    private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
-
-        String flags = (s.flags != null && !s.flags.isEmpty())
-                ? String.join(", ", s.flags)
-                : "—";
+        DecimalFormat df = new DecimalFormat("0.######");
 
         return String.format(
                 "*%s* → *%s*\n" +
-                        "Price: %.6f\n" +
+                        "Price: %s\n" +
                         "Probability: %.0f%%\n" +
-                        "Stop-Take: %.6f - %.6f\n" +
+                        "Stop-Take: %s - %s\n" +
                         "Flags: %s\n" +
                         "_time: %s_",
-                s.symbol,
-                s.side,
-                s.price,
-                s.probability,   // БЕЗ умножения на 100
-                s.stop,
-                s.take,
+                signal.symbol,
+                signal.side,
+                df.format(signal.price),
+                signal.probability,
+                df.format(signal.stop),
+                df.format(signal.take),
                 flags,
                 LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }
 
-    /**
-     * Поток с защитой от смерти
-     */
-    static final class BotThreadFactory implements ThreadFactory {
-
+    private static final class BotThreadFactory implements ThreadFactory {
         @Override
         public Thread newThread(Runnable r) {
             Thread t = new Thread(r, "SignalSchedulerThread");
             t.setDaemon(false);
-
-            t.setUncaughtExceptionHandler((thread, ex) -> {
-                System.err.println("UNCAUGHT ERROR in " + thread.getName());
-                ex.printStackTrace();
-            });
-
+            t.setUncaughtExceptionHandler((thread, ex) ->
+                    LOGGER.log(Level.SEVERE, "UNCAUGHT ERROR in " + thread.getName(), ex));
             return t;
         }
     }
 
-    /**
-     * UTC → локальное время
-     */
     public static String formatLocalTime(long utcMillis) {
         return Instant.ofEpochMilli(utcMillis)
                 .atZone(ZONE)
                 .format(DateTimeFormatter.ofPattern("HH:mm"));
+    }
+
+    // === ПРИМЕР МЕТОДА ДЛЯ ПОЛУЧЕНИЯ СВЕЧЕЙ ===
+    // Реализуй по своему источнику, здесь просто заглушка
+    private static List<TradingCore.Candle> tradingCoreCandles(String symbol) {
+        return new ArrayList<>(); // сюда твой реальный источник свечей
     }
 }
