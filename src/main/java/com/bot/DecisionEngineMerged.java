@@ -71,22 +71,18 @@ public final class DecisionEngineMerged {
         double atr = Math.max(rawAtr, price * 0.0015);
         MarketState state = detectState(c15);
         HTFBias bias = detectBias(c1h);
-
-// === GLOBAL BTC FILTER ===
-        // === GLOBAL BTC FILTER ===
-        if (globalContext != null) {
-
-            if (globalContext.onlyLong && bias == HTFBias.BEAR) {
-                return null;
-            }
-
-            if (globalContext.onlyShort && bias == HTFBias.BULL) {
-                return null;
-            }
-        }
-
         double scoreLong = 0;
         double scoreShort = 0;
+        // === GLOBAL BTC FILTER ===
+        if (globalContext != null) {
+            // не блокируем сигнал полностью, а уменьшаем силу контртренда
+            if (globalContext.onlyLong && bias == HTFBias.BEAR) {
+                scoreShort *= 0.6; // уменьшаем силу шорта, но не обнуляем
+            }
+            if (globalContext.onlyShort && bias == HTFBias.BULL) {
+                scoreLong *= 0.6; // уменьшаем силу лонга
+            }
+        }
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
 
