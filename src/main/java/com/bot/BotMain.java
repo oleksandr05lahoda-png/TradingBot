@@ -100,16 +100,50 @@ public class BotMain {
             }
         }));
     }
-
     /**
-     * Формат сигнала для Telegram
+     * Вычисляет вероятность правдивости сигнала на основе индикаторов (flags)
      */
+    private static double calculateProbability(DecisionEngineMerged.TradeIdea s) {
+        if (s.flags == null || s.flags.isEmpty())
+            return 50; // нейтральный сигнал
+
+        int strong = 0;
+        int medium = 0;
+        int weak = 0;
+
+        for (String flag : s.flags) {
+            switch(flag) {
+                case "ATR↑":
+                case "impulse:true":
+                case "EMA_strong":
+                    strong++;
+                    break;
+                case "Volume↑":
+                case "RSI_good":
+                    medium++;
+                    break;
+                default:
+                    weak++;
+            }
+        }
+
+        double prob = 50; // базовая вероятность
+        prob += (strong * 15);  // каждый сильный индикатор +15%
+        prob += (medium * 7);   // каждый средний +7%
+        prob += (weak * 3);     // каждый слабый +3%
+
+        // Ограничиваем максимум и минимум
+        if (prob > 80) prob = 80;
+        if (prob < 50) prob = 50;
+
+        return prob;
+    }
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
         String flags = s.flags != null && !s.flags.isEmpty()
                 ? String.join(", ", s.flags)
                 : "—";
 
-        double probabilityPercent = s.probability;
+        double probabilityPercent = calculateProbability(s);
 
         return String.format(
                 "*%s* → *%s*\n" +
