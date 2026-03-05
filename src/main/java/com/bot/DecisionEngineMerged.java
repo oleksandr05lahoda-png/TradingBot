@@ -190,24 +190,7 @@ public final class DecisionEngineMerged {
         return true;
     }
 
-    /* ================= FLIP ================= */
     private boolean flipAllowed(String symbol, TradingCore.Side newSide) {
-
-        Deque<String> history =
-                recentDirections.computeIfAbsent(symbol, k -> new ArrayDeque<>());
-
-        // Блокируем только резкий флип (LONG → SHORT → LONG)
-        if (!history.isEmpty()) {
-            String last = history.peekLast();
-            if (!last.equals(newSide.name())) {
-                // если смена стороны — проверяем, не было ли только что флипа
-                if (history.size() >= 2) {
-                    String prev = history.peekFirst();
-                    if (prev.equals(newSide.name()))
-                        return false;
-                }
-            }
-        }
         return true;
     }
     private void registerSignal(String symbol, TradingCore.Side side, long now) {
@@ -221,19 +204,8 @@ public final class DecisionEngineMerged {
     private double computeConfidence(double scoreLong, double scoreShort, MarketState state, CoinCategory cat, double atr, double price) {
         // Разница между силами сигналов
         double edge = Math.abs(scoreLong - scoreShort);
-
-        // Сигмоид для плавной вероятности (чем сильнее edge, тем выше доверие)
         double prob = 1.0 / (1.0 + Math.exp(-3.0 * (edge - 0.1)));
-
-        // Подправим по тренду / категории / ATR
-        if (state == MarketState.STRONG_TREND) prob += 0.05;
-        if (cat == CoinCategory.MEME) prob -= 0.03;
-        if (atr / price > 0.01) prob -= 0.02;
-
-        // Ограничиваем 0..1
         prob = clamp(prob, 0.0, 1.0);
-
-        // Возвращаем % вероятность для TradeIdea (50..100%)
         return 50.0 + prob * 50.0;
     }
 
