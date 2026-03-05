@@ -16,11 +16,13 @@ import org.json.JSONArray;
 public final class BotMain {
     private static final Logger LOGGER = Logger.getLogger(BotMain.class.getName());
 
-    // ===== CONFIG =====
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.systemDefault();
     private static final int SIGNAL_INTERVAL_MIN = 15;
+
+    // Список монет для сканирования
+    private static final List<String> SYMBOLS = List.of("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT");
 
     private BotMain() { }
 
@@ -44,12 +46,10 @@ public final class BotMain {
             try {
                 LOGGER.info("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                // ===== Получаем свечи с Binance =====
+                // ===== Получаем свечи BTC =====
                 List<TradingCore.Candle> candlesBTC = tradingCoreCandles("BTCUSDT");
-                List<TradingCore.Candle> candlesSymbol = tradingCoreCandles("BTCUSDT"); // пример
-
-                if (candlesBTC.isEmpty() || candlesSymbol.isEmpty()) {
-                    LOGGER.warning("Candles not available. Skipping cycle.");
+                if (candlesBTC.isEmpty()) {
+                    LOGGER.warning("BTC candles not available. Skipping cycle.");
                     return;
                 }
 
@@ -57,21 +57,29 @@ public final class BotMain {
                 globalImpulse.update(candlesBTC);
                 GlobalImpulseController.GlobalContext context = globalImpulse.getContext();
 
-                // ===== Генерируем сигнал через DecisionEngineMerged =====
-                DecisionEngineMerged.TradeIdea signal = decisionEngine.analyze(
-                        "BTCUSDT",
-                        candlesSymbol,
-                        candlesSymbol,
-                        candlesSymbol,
-                        candlesBTC,
-                        DecisionEngineMerged.CoinCategory.TOP,
-                        context
-                );
+                // ===== Проходимся по всем монетам =====
+                for (String symbol : SYMBOLS) {
+                    List<TradingCore.Candle> candles = tradingCoreCandles(symbol);
+                    if (candles.isEmpty()) continue;
 
-                if (signal != null) {
-                    telegram.sendMessageAsync(formatSignal(signal));
-                } else {
-                    LOGGER.info("No valid signals this cycle.");
+                    DecisionEngineMerged.CoinCategory cat = symbol.equals("BTCUSDT") ?
+                            DecisionEngineMerged.CoinCategory.TOP :
+                            DecisionEngineMerged.CoinCategory.ALT;
+
+                    DecisionEngineMerged.TradeIdea signal = decisionEngine.analyze(
+                            symbol,
+                            candles,
+                            candles,
+                            candles,
+                            candlesBTC, // Глобальный 1H для всех монет — BTC
+                            cat,
+                            context
+                    );
+
+                    if (signal != null) {
+                        telegram.sendMessageAsync(formatSignal(signal));
+                        LOGGER.info("Signal sent for " + symbol);
+                    }
                 }
 
             } catch (Throwable t) {
@@ -127,13 +135,6 @@ public final class BotMain {
         }
     }
 
-    public static String formatLocalTime(long utcMillis) {
-        return Instant.ofEpochMilli(utcMillis)
-                .atZone(ZONE)
-                .format(DateTimeFormatter.ofPattern("HH:mm"));
-    }
-
-    // ===== Binance API =====
     private static List<TradingCore.Candle> tradingCoreCandles(String symbol) {
         List<TradingCore.Candle> candles = new ArrayList<>();
         try {
