@@ -1,5 +1,9 @@
 package com.bot;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.text.DecimalFormat;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
@@ -7,9 +11,9 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.json.JSONArray;
 
 public final class BotMain {
-
     private static final Logger LOGGER = Logger.getLogger(BotMain.class.getName());
 
     // ===== CONFIG =====
@@ -21,7 +25,6 @@ public final class BotMain {
     private BotMain() { }
 
     public static void main(String[] args) {
-
         if (TG_TOKEN == null || TG_TOKEN.isBlank()) {
             LOGGER.severe("TELEGRAM_TOKEN not set!");
             return;
@@ -41,24 +44,26 @@ public final class BotMain {
             try {
                 LOGGER.info("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                // === Получаем свечи с твоего источника (TradingCore) ===
-                // Твой код должен здесь подставить реальные списки свечей
-                List<TradingCore.Candle> candlesBTC = tradingCoreCandles("BTCUSDT"); // метод реализуй у себя
-                List<TradingCore.Candle> candlesSymbol = tradingCoreCandles("BTCUSDT"); // пример для анализа
+                // ===== Получаем свечи с Binance =====
+                List<TradingCore.Candle> candlesBTC = tradingCoreCandles("BTCUSDT");
+                List<TradingCore.Candle> candlesSymbol = tradingCoreCandles("BTCUSDT"); // пример
 
                 if (candlesBTC.isEmpty() || candlesSymbol.isEmpty()) {
                     LOGGER.warning("Candles not available. Skipping cycle.");
                     return;
                 }
 
-                // === Обновляем глобальный импульс BTC ===
+                // ===== Обновляем глобальный импульс BTC =====
                 globalImpulse.update(candlesBTC);
                 GlobalImpulseController.GlobalContext context = globalImpulse.getContext();
 
-                // === Генерируем сигнал через DecisionEngineMerged ===
+                // ===== Генерируем сигнал через DecisionEngineMerged =====
                 DecisionEngineMerged.TradeIdea signal = decisionEngine.analyze(
                         "BTCUSDT",
-                        candlesSymbol, candlesSymbol, candlesSymbol, candlesBTC, // все свечи через твои списки
+                        candlesSymbol,
+                        candlesSymbol,
+                        candlesSymbol,
+                        candlesBTC,
                         DecisionEngineMerged.CoinCategory.TOP,
                         context
                 );
@@ -97,16 +102,9 @@ public final class BotMain {
                 .filter(f -> !f.isEmpty())
                 .map(f -> String.join(", ", f))
                 .orElse("—");
-
         DecimalFormat df = new DecimalFormat("0.######");
-
         return String.format(
-                "*%s* → *%s*\n" +
-                        "Price: %s\n" +
-                        "Probability: %.0f%%\n" +
-                        "Stop-Take: %s - %s\n" +
-                        "Flags: %s\n" +
-                        "_time: %s_",
+                "*%s* → *%s*\nPrice: %s\nProbability: %.0f%%\nStop-Take: %s - %s\nFlags: %s\n_time: %s_",
                 signal.symbol,
                 signal.side,
                 df.format(signal.price),
@@ -135,9 +133,42 @@ public final class BotMain {
                 .format(DateTimeFormatter.ofPattern("HH:mm"));
     }
 
-    // === ПРИМЕР МЕТОДА ДЛЯ ПОЛУЧЕНИЯ СВЕЧЕЙ ===
-    // Реализуй по своему источнику, здесь просто заглушка
+    // ===== Binance API =====
     private static List<TradingCore.Candle> tradingCoreCandles(String symbol) {
-        return new ArrayList<>(); // сюда твой реальный источник свечей
+        List<TradingCore.Candle> candles = new ArrayList<>();
+        try {
+            HttpClient client = HttpClient.newHttpClient();
+            String url = String.format(
+                    "https://api.binance.com/api/v3/klines?symbol=%s&interval=15m&limit=200",
+                    symbol
+            );
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                JSONArray arr = new JSONArray(response.body());
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONArray c = arr.getJSONArray(i);
+                    long openTime = c.getLong(0);
+                    double open = c.getDouble(1);
+                    double high = c.getDouble(2);
+                    double low = c.getDouble(3);
+                    double close = c.getDouble(4);
+                    double volume = c.getDouble(5);
+                    double quoteVolume = c.getDouble(7);
+                    long closeTime = c.getLong(6);
+                    candles.add(new TradingCore.Candle(openTime, open, high, low, close, volume, quoteVolume, closeTime));
+                }
+            } else {
+                LOGGER.warning("Binance API returned " + response.statusCode());
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error fetching candles: " + e.getMessage(), e);
+        }
+        return candles;
     }
 }
