@@ -67,10 +67,23 @@ public final class DecisionEngineMerged {
         if (!valid(c15) || !valid(c1h)) return null;
 
         double price = last(c15).close;
-        double atr = Math.max(atr(c15, 14), price * 0.0012);
-
+        double rawAtr = atr(c15, 14);
+        double atr = Math.max(rawAtr, price * 0.0015);
         MarketState state = detectState(c15);
         HTFBias bias = detectBias(c1h);
+
+// === GLOBAL BTC FILTER ===
+        // === GLOBAL BTC FILTER ===
+        if (globalContext != null) {
+
+            if (globalContext.onlyLong && bias == HTFBias.BEAR) {
+                return null;
+            }
+
+            if (globalContext.onlyShort && bias == HTFBias.BULL) {
+                return null;
+            }
+        }
 
         double scoreLong = 0;
         double scoreShort = 0;
@@ -132,8 +145,9 @@ public final class DecisionEngineMerged {
 
         if (bias == HTFBias.BEAR && scoreShort > scoreLong)
             scoreShort += 0.25;
-        // --- Dynamic Threshold
-        double dynamicThreshold =
+        if (atr < price * 0.0007) {
+            return null;
+        }        double dynamicThreshold =
                 state == MarketState.STRONG_TREND ? 1.30 : 1.15;
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
 // --- Momentum Regime Protection (anti stupid counter-trend)
@@ -180,17 +194,30 @@ public final class DecisionEngineMerged {
         return new TradeIdea(symbol, side, price, stop, take, probability, flags);
     }
 
-    /* ================= COOLDOWN ================= */
     private boolean cooldownAllowed(String symbol, TradingCore.Side side, CoinCategory cat, long now) {
         String key = symbol + "_" + side;
-        long base = cat == CoinCategory.TOP ? COOLDOWN_TOP : cat == CoinCategory.ALT ? COOLDOWN_ALT : COOLDOWN_MEME;
+        long base = cat == CoinCategory.TOP ? COOLDOWN_TOP :
+                cat == CoinCategory.ALT ? COOLDOWN_ALT :
+                        COOLDOWN_MEME;
+
         Long last = cooldownMap.get(key);
         if (last != null && now - last < base) return false;
-        cooldownMap.put(key, now);
+
         return true;
     }
-
     private boolean flipAllowed(String symbol, TradingCore.Side newSide) {
+
+        Deque<String> history = recentDirections.get(symbol);
+        if (history == null || history.isEmpty()) return true;
+
+        String lastSide = history.peekLast();
+        if (lastSide == null) return true;
+
+        // Запрещаем резкий переворот если последний сигнал был противоположным
+        if (!lastSide.equals(newSide.name())) {
+            return false;
+        }
+
         return true;
     }
     private void registerSignal(String symbol, TradingCore.Side side, long now) {
@@ -206,7 +233,7 @@ public final class DecisionEngineMerged {
         double edge = Math.abs(scoreLong - scoreShort);
         double prob = 1.0 / (1.0 + Math.exp(-3.0 * (edge - 0.1)));
         prob = clamp(prob, 0.0, 1.0);
-        return 50.0 + prob * 50.0;
+        return 52.0 + prob * 43.0;
     }
 
     /* ================= STATE DETECT ================= */
@@ -236,7 +263,7 @@ public final class DecisionEngineMerged {
             double tr = Math.max(cur.high - cur.low, Math.max(Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close)));
             sum += tr;
         }
-        return sum / n;
+        return n == 0 ? 0.0 : sum / n;
     }
 
     private double adx(List<TradingCore.Candle> c, int n) {
@@ -253,9 +280,15 @@ public final class DecisionEngineMerged {
             if (lowDiff > highDiff && lowDiff > 0) minusDM += lowDiff;
         }
         double atr = trSum / n;
+        if (atr == 0) return 15;
+
         double plusDI = 100 * (plusDM / n) / atr;
         double minusDI = 100 * (minusDM / n) / atr;
-        double dx = 100 * Math.abs(plusDI - minusDI) / Math.max(plusDI + minusDI, 1);
+
+        double denom = plusDI + minusDI;
+        if (denom == 0) return 15;
+
+        double dx = 100 * Math.abs(plusDI - minusDI) / denom;
         return dx;
     }
 

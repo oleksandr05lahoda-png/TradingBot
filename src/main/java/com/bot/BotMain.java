@@ -7,14 +7,11 @@ import java.util.concurrent.*;
 
 public final class BotMain {
 
-    // ================= CONFIG =================
-
+    // ===== CONFIG =====
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.systemDefault();
     private static final int SIGNAL_INTERVAL_MIN = 15;
-
-    // ================= MAIN =================
 
     public static void main(String[] args) {
 
@@ -40,12 +37,17 @@ public final class BotMain {
                 // Получаем BTC 15m свечи
                 List<TradingCore.Candle> btcC15 = getBtcC15();
 
-                // Обновляем глобальный контекст
+                if (btcC15 == null || btcC15.isEmpty()) {
+                    System.out.println("BTC candles not available. Skipping cycle.");
+                    return;
+                }
+
+                // Обновляем глобальный импульс
                 globalImpulse.update(btcC15);
                 GlobalImpulseController.GlobalContext context =
                         globalImpulse.getContext();
 
-                // Генерируем сигналы
+                // Генерация сигналов
                 List<DecisionEngineMerged.TradeIdea> signals =
                         signalSender.generateSignals(context);
 
@@ -82,44 +84,47 @@ public final class BotMain {
                 if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                     scheduler.shutdownNow();
                 }
-            } catch (InterruptedException ignored) {
+            } catch (InterruptedException e) {
                 scheduler.shutdownNow();
             }
         }));
     }
 
-    // ================= MOCK BTC DATA =================
-
     /**
-     * Мок получения BTC 15m свечей.
-     * Здесь должен быть реальный API (Binance / Bybit и т.д.)
+     * Здесь должен быть реальный API-запрос к бирже.
+     * Пока оставляем заглушку.
      */
     private static List<TradingCore.Candle> getBtcC15() {
         return Collections.emptyList();
     }
 
-    // ================= FORMAT SIGNAL =================
-
-    /**
-     * probability хранится в шкале 0.0 – 1.0
-     * Для Telegram выводим в процентах.
-     */
     private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
-        String flags = (s.flags != null && !s.flags.isEmpty()) ? String.join(", ", s.flags) : "—";
+
+        String flags = (s.flags != null && !s.flags.isEmpty())
+                ? String.join(", ", s.flags)
+                : "—";
+
         return String.format(
                 "*%s* → *%s*\n" +
                         "Price: %.6f\n" +
-                        "Probability: %.0f%%\n" +  // просто выводим напрямую
+                        "Probability: %.0f%%\n" +
                         "Stop-Take: %.6f - %.6f\n" +
                         "Flags: %s\n" +
                         "_time: %s_",
-                s.symbol, s.side, s.price,
-                s.probability,  // ← убираем *100
-                s.stop, s.take, flags,
+                s.symbol,
+                s.side,
+                s.price,
+                s.probability,   // БЕЗ умножения на 100
+                s.stop,
+                s.take,
+                flags,
                 LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
         );
     }
 
+    /**
+     * Поток с защитой от смерти
+     */
     static final class BotThreadFactory implements ThreadFactory {
 
         @Override
@@ -136,8 +141,9 @@ public final class BotMain {
         }
     }
 
-    // ================= TIME UTIL =================
-
+    /**
+     * UTC → локальное время
+     */
     public static String formatLocalTime(long utcMillis) {
         return Instant.ofEpochMilli(utcMillis)
                 .atZone(ZONE)

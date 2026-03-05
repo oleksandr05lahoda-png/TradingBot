@@ -12,10 +12,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Класс для безопасной отправки сообщений в Telegram.
- * Асинхронная очередь + Heartbeat + Retry.
- */
 public final class TelegramBotSender {
 
     private final String token;
