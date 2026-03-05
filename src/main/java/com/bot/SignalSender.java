@@ -61,74 +61,84 @@ public class SignalSender {
     private final com.bot.TradingCore.RiskEngine riskEngine = new com.bot.TradingCore.RiskEngine(0.01, 0.05, 1.0);
     private final InstitutionalSignalCore core =
             new InstitutionalSignalCore(
-                    12,       // max global signals
-                    1,        // max signals per symbol
-                    0.25,     // portfolio risk / exposure
-                    0.58,     // min confidence
-                    0.004,    // min signal diff
-                    15000     // cooldown в миллисекундах (пример: 15 секунд)
+                    12,        // max global signals
+                    1,         // max signals per symbol
+                    0.25,      // portfolio risk / exposure
+                    0.58,      // min confidence
+                    0.004,     // min signal diff
+                    15000,     // cooldown в миллисекундах
+                    -0.20      // scoreThreshold, минимальный score для разрешения сигнала
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     public List<DecisionEngineMerged.TradeIdea> generateSignals() {
+
         List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
 
-        // 1. Получаем топовые символы, если ещё нет кеша
+        // 1. Получаем топовые символы
         if (cachedPairs == null || cachedPairs.isEmpty()) {
             cachedPairs = getTopSymbolsSet(TOP_N);
         }
 
-        // 2. Получаем BTC 15m свечи для глобального контекста
+        // 2. BTC контекст
         List<TradingCore.Candle> btcC15 = fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
-        if (btcC15.size() < 60) {
-            System.out.println("[generateSignals] Not enough BTC data for context");
-            return result; // возвращаем пустой список
+
+        if (btcC15 == null || btcC15.size() < 60) {
+            System.out.println("[generateSignals] Not enough BTC data");
+            return result;
         }
 
-        // 3. Создаём глобальный контекст через GlobalImpulseController
+        // 3. Глобальный контекст
         GlobalImpulseController globalImpulse = new GlobalImpulseController();
         globalImpulse.update(btcC15);
         GlobalImpulseController.GlobalContext context = globalImpulse.getContext();
 
-        // 4. Создаём движок для анализа
+        // 4. Движок
         DecisionEngineMerged engine = new DecisionEngineMerged();
 
-        // 5. Проходим по всем парам
+        // 5. Анализируем пары
         for (String pair : cachedPairs) {
+
             List<TradingCore.Candle> m1  = fetchKlines(pair, "1m", KLINES_LIMIT);
             List<TradingCore.Candle> m5  = fetchKlines(pair, "5m", KLINES_LIMIT);
             List<TradingCore.Candle> m15 = fetchKlines(pair, "15m", KLINES_LIMIT);
             List<TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
 
+            if (m1 == null || m5 == null || m15 == null || h1 == null)
+                continue;
+
             if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60)
                 continue;
 
-            // Анализируем пару с глобальным контекстом
-            DecisionEngineMerged.TradeIdea idea = engine.analyze(
-                    pair,
-                    m1,
-                    m5,
-                    m15,
-                    h1,
-                    DecisionEngineMerged.CoinCategory.TOP,
-                    context
-            );
+            // Анализ
+            DecisionEngineMerged.TradeIdea idea =
+                    engine.analyze(pair, m1, m5, m15, h1,
+                            DecisionEngineMerged.CoinCategory.TOP,
+                            context);
 
-            // Фильтруем слабые или запрещённые сигналы
-            if (idea == null || idea.probability < MIN_CONF)
+            if (idea == null)
                 continue;
 
+            // вероятность
+            if (idea.probability < MIN_CONF)
+                continue;
+
+            // core фильтр
             if (!core.allowSignal(idea))
                 continue;
 
-            // Регистрируем сигнал и добавляем в результат
-            core.registerSignal(idea);
+            double atr = getAtr(idea.symbol);
+
+            core.registerSignal(idea, atr);
+
             result.add(idea);
         }
 
-        // 6. Сортировка по вероятности (по убыванию)
-        result.sort(Comparator.comparingDouble(
-                (DecisionEngineMerged.TradeIdea i) -> i.probability
-        ).reversed());
+        // 6. Сортировка
+        result.sort(
+                Comparator.comparingDouble(
+                        (DecisionEngineMerged.TradeIdea i) -> i.probability
+                ).reversed()
+        );
 
         return result;
     }
@@ -1143,16 +1153,9 @@ public class SignalSender {
 
                 // === ANALYZE WITH GLOBAL CONTEXT ===
                 DecisionEngineMerged.TradeIdea idea =
-                        engine.analyze(
-                                pair,
-                                c1,
-                                c5,
-                                c15,
-                                h1,
+                        engine.analyze(pair, c1, c5, c15, h1,
                                 DecisionEngineMerged.CoinCategory.TOP,
-                                context
-                        );
-
+                                context);
                 if (idea == null || idea.probability < MIN_CONF) continue;
 
                 long candleCloseTime = c15.get(c15.size() - 1).closeTime;
@@ -1183,7 +1186,8 @@ public class SignalSender {
                 signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(tempSignal);
 
                 if (!core.allowSignal(idea)) continue;
-                core.registerSignal(idea);
+                double atr = getAtr(idea.symbol); // Берём ATR для символа
+                core.registerSignal(idea, atr);
 
                 String message = String.format(
                         "*%s* → *%s*\n" +

@@ -330,7 +330,27 @@ public final class DecisionEngineMerged {
         double price=last(c).close;
         return bull?price<=ema21*0.996:price>=ema21*1.004;
     }
+    public TradeIdea analyze(String symbol,
+                             List<com.bot.TradingCore.Candle> c1,
+                             List<com.bot.TradingCore.Candle> c5,
+                             List<com.bot.TradingCore.Candle> c15,
+                             List<com.bot.TradingCore.Candle> c1h,
+                             CoinCategory cat,
+                             GlobalImpulseController.GlobalContext globalContext) {
 
+        long now = System.currentTimeMillis();
+
+        return generate(
+                symbol,
+                c1,
+                c5,
+                c15,
+                c1h,
+                cat,
+                now,
+                globalContext
+        );
+    }
     private TradingCore.Candle last(List<TradingCore.Candle> c){ return c.get(c.size()-1); }
     private boolean valid(List<?> c){ return c!=null && c.size()>=MIN_BARS; }
     private double clamp(double v,double min,double max){ return Math.max(min,Math.min(max,v)); }
