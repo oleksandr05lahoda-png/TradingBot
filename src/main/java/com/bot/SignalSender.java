@@ -21,7 +21,7 @@ public class SignalSender {
     private final int TOP_N;
     private final double MIN_CONF;            // 0..1
     private final int INTERVAL_MIN;           // scheduler interval minutes
-    private final int KLINES_LIMIT;           // number of candles fetched per TF
+    public final int KLINES_LIMIT;           // number of candles fetched per TF
     private final long REQUEST_DELAY_MS;      // delay between HTTP calls
 
     private final double IMPULSE_PCT;         // one-minute impulse threshold (relative)

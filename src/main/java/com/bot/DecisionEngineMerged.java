@@ -21,8 +21,6 @@ public final class DecisionEngineMerged {
     private static final long COOLDOWN_MEME = 4 * 60_000;
     private static final double MIN_CONFIDENCE = 58.0;
     private static final double UNIQUE_PRICE_DIST = 0.006; // 0.6%
-    private static final int MAX_SIGNALS_PER_CYCLE = 5; // увеличено для большего разнообразия
-
     /* ================= STATE ================= */
     private final Map<String, Long> cooldownMap = new ConcurrentHashMap<>();
     private final Map<String, Deque<String>> recentDirections = new ConcurrentHashMap<>();
@@ -84,11 +82,6 @@ public final class DecisionEngineMerged {
         for (String symbol : candles15m.keySet()) {
             CoinCategory cat = coinCategories.getOrDefault(symbol, CoinCategory.ALT);
 
-            // correlation filter: блокируем альты при лонге BTC
-            if (!symbol.equals("BTCUSDT") && btcSide != null && cat != CoinCategory.TOP) {
-                if (btcSide == TradingCore.Side.LONG) continue;
-            }
-
             TradeIdea idea = generate(symbol,
                     candles1m.getOrDefault(symbol, Collections.emptyList()),
                     candles5m.getOrDefault(symbol, Collections.emptyList()),
@@ -105,8 +98,6 @@ public final class DecisionEngineMerged {
                 results.add(idea);
                 lastSignalPrice.put(symbol, idea.price);
                 currentCycleSignals.add(symbol);
-
-                if (results.size() >= MAX_SIGNALS_PER_CYCLE) break;
             }
         }
 

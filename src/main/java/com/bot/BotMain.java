@@ -11,13 +11,11 @@ public class BotMain {
 
     // ===== CONFIG =====
     private static final Logger LOGGER = Logger.getLogger(BotMain.class.getName());
-
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
-
     private static final ZoneId ZONE = ZoneId.systemDefault();
     private static final int SIGNAL_INTERVAL_MIN = 15;
-
+    private static final int KLINES_LIMIT = 200; // например, 100 свечей
     public static void main(String[] args) {
 
         if (TG_TOKEN == null || TG_TOKEN.isBlank()) {
@@ -27,6 +25,7 @@ public class BotMain {
 
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
         SignalSender signalSender = new SignalSender(telegram);
+        GlobalImpulseController globalImpulse = new GlobalImpulseController();
 
         telegram.sendMessageAsync("🚀 Trading Bot запущен");
         LOGGER.info("Bot started at " + LocalDateTime.now());
@@ -38,18 +37,44 @@ public class BotMain {
             try {
                 LOGGER.info("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                List<DecisionEngineMerged.TradeIdea> signals = signalSender.generateSignals();
+                // 1️⃣ Получаем все сигналы
+                List<DecisionEngineMerged.TradeIdea> rawSignals = signalSender.generateSignals();
 
-                if (signals == null || signals.isEmpty()) {
+                if (rawSignals == null || rawSignals.isEmpty()) {
                     LOGGER.info("No valid signals this cycle.");
                     return;
                 }
 
-                for (DecisionEngineMerged.TradeIdea s : signals) {
+                // 2️⃣ Обновляем глобальный импульс для BTC
+                List<TradingCore.Candle> btcCandles = signalSender.fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
+                if (btcCandles != null && btcCandles.size() > 20) {
+                    globalImpulse.update(btcCandles);
+                }
+                GlobalImpulseController.GlobalContext ctx = globalImpulse.getContext();
+
+                // 3️⃣ Фильтруем сигналы через глобальный импульс
+                List<DecisionEngineMerged.TradeIdea> filteredSignals = rawSignals.stream()
+                        .filter(s -> {
+                            if (ctx.onlyLong && !s.symbol.equals("BTCUSDT"))
+                                return s.side.equals("LONG");
+
+                            if (ctx.onlyShort && !s.symbol.equals("BTCUSDT"))
+                                return s.side.equals("SHORT");
+                            return true; // NEUTRAL – все сигналы
+                        })
+                        .toList();
+
+                if (filteredSignals.isEmpty()) {
+                    LOGGER.info("No signals after applying global impulse filter.");
+                    return;
+                }
+
+                // 4️⃣ Отправляем в Telegram
+                for (DecisionEngineMerged.TradeIdea s : filteredSignals) {
                     telegram.sendMessageAsync(formatSignal(s));
                 }
 
-                LOGGER.info("Signals sent: " + signals.size());
+                LOGGER.info("Signals sent: " + filteredSignals.size());
 
             } catch (Throwable t) {
                 LOGGER.log(Level.SEVERE, "CRITICAL ERROR in signal cycle", t);
@@ -84,8 +109,7 @@ public class BotMain {
                 ? String.join(", ", s.flags)
                 : "—";
 
-        // Исправлено: probability как double, формат 0-100%
-        double probabilityPercent = s.probability * 100;
+        double probabilityPercent = s.probability;
 
         return String.format(
                 "*%s* → *%s*\n" +
