@@ -62,7 +62,7 @@ public final class DecisionEngineMerged {
                                List<TradingCore.Candle> c1h,
                                CoinCategory cat,
                                long now,
-                               GlobalImpulseController.GlobalContext globalContext){
+                               GlobalImpulseController.GlobalContext globalContext) {
 
         if (!valid(c15) || !valid(c1h)) return null;
 
@@ -73,95 +73,89 @@ public final class DecisionEngineMerged {
         HTFBias bias = detectBias(c1h);
         double scoreLong = 0;
         double scoreShort = 0;
-        // === GLOBAL BTC FILTER ===
-        if (globalContext != null) {
-            // не блокируем сигнал полностью, а уменьшаем силу контртренда
-            if (globalContext.onlyLong && bias == HTFBias.BEAR) {
-                scoreShort *= 0.6; // уменьшаем силу шорта, но не обнуляем
-            }
-            if (globalContext.onlyShort && bias == HTFBias.BULL) {
-                scoreLong *= 0.6; // уменьшаем силу лонга
-            }
+
+        // === GLOBAL BTC INFLUENCE (60%) ===
+        double btcInfluence = 1.0;
+        if (globalContext != null && !symbol.equals("BTCUSDT")) {
+            btcInfluence = 0.6; // альты получают 60% импульса от BTC
         }
+
+        // --- Базовый bias
+        if (bias == HTFBias.BULL) scoreLong += 0.9 * btcInfluence;
+        else if (bias == HTFBias.BEAR) scoreShort += 0.9 * btcInfluence;
+
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
 
-        if (bias == HTFBias.BULL) scoreLong += 0.9;
-        else if (bias == HTFBias.BEAR) scoreShort += 0.9;
-
         // --- Pullback
         if (pullback(c15, true)) {
-            scoreLong += 1.0;
+            scoreLong += 1.0 * btcInfluence;
             reasonWeightsLong.put("Pullback bullish", 1.0);
         }
         if (pullback(c15, false)) {
-            scoreShort += 1.0;
+            scoreShort += 1.0 * btcInfluence;
             reasonWeightsShort.put("Pullback bearish", 1.0);
         }
 
+        // --- Impulse
         if (impulse(c1)) {
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
 
             if (delta > atr * 0.15)
-                scoreLong += state == MarketState.STRONG_TREND ? 0.65 : 0.50;
+                scoreLong += state == MarketState.STRONG_TREND ? 0.65 * btcInfluence : 0.50 * btcInfluence;
 
             else if (delta < -atr * 0.15)
-                scoreShort += state == MarketState.STRONG_TREND ? 0.65 : 0.50;
+                scoreShort += state == MarketState.STRONG_TREND ? 0.65 * btcInfluence : 0.50 * btcInfluence;
         }
+
         // --- Divergence
         if (bullDiv(c15)) {
-            scoreLong += 0.6;
+            scoreLong += 0.6 * btcInfluence;
             reasonWeightsLong.put("Bullish divergence", 0.6);
         }
         if (bearDiv(c15)) {
-            scoreShort += 0.6;
+            scoreShort += 0.6 * btcInfluence;
             reasonWeightsShort.put("Bearish divergence", 0.6);
         }
 
-        // --- RSI Soft Filter (не ломаем тренд)
+        // --- RSI Soft Filter
         double rsi14 = rsi(c15, 14);
-
         if (state != MarketState.STRONG_TREND) {
             if (rsi14 > 82) scoreLong -= 0.15;
             if (rsi14 < 18) scoreShort -= 0.15;
         }
+
         // --- ADX anti-counter-trend
         double adxValue = adx(c15, 14);
-
         if (adxValue > 28) {
-
-            if (bias == HTFBias.BULL && scoreShort > scoreLong)
-                scoreShort *= 0.6;
-
-            if (bias == HTFBias.BEAR && scoreLong > scoreShort)
-                scoreLong *= 0.6;
+            if (bias == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.6;
+            if (bias == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.6;
         }
-        if (bias == HTFBias.BULL && scoreLong > scoreShort)
-            scoreLong += 0.25;
 
-        if (bias == HTFBias.BEAR && scoreShort > scoreLong)
-            scoreShort += 0.25;
-        if (atr < price * 0.0007) {
-            return null;
-        }        double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 1.30 : 1.15;
+        if (bias == HTFBias.BULL && scoreLong > scoreShort) scoreLong += 0.25;
+        if (bias == HTFBias.BEAR && scoreShort > scoreLong) scoreShort += 0.25;
+
+        if (atr < price * 0.0007) return null;
+
+        // --- Dynamic threshold с учетом альтов
+        double dynamicThreshold;
+        if (cat == CoinCategory.TOP) dynamicThreshold = state == MarketState.STRONG_TREND ? 1.30 : 1.15;
+        else dynamicThreshold = state == MarketState.STRONG_TREND ? 1.05 : 0.95; // альты легче проходят
+
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
-// --- Momentum Regime Protection (anti stupid counter-trend)
+
+        // --- Momentum Protection
         double move4 = (last(c15).close - c15.get(c15.size() - 4).close) / price;
-        boolean strongMomentumUp = move4 > 0.018;   // ~1.8% за 4 свечи
+        boolean strongMomentumUp = move4 > 0.018;
         boolean strongMomentumDown = move4 < -0.018;
 
-        if (strongMomentumUp && scoreShort > scoreLong) {
-            scoreShort *= 0.5; // сильно режем контртренд
-        }
+        if (strongMomentumUp && scoreShort > scoreLong) scoreShort *= 0.5;
+        if (strongMomentumDown && scoreLong > scoreShort) scoreLong *= 0.5;
 
-        if (strongMomentumDown && scoreLong > scoreShort) {
-            scoreLong *= 0.5;
-        }
         // --- Decide Side
         TradingCore.Side side;
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-        if (scoreDiff < 0.05) return null; // игнорируем неразличимые сигналы
+        if (scoreDiff < 0.05) return null;
 
         side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
@@ -169,7 +163,9 @@ public final class DecisionEngineMerged {
         if (!cooldownAllowed(symbol, side, cat, now)) return null;
         if (!flipAllowed(symbol, side)) return null;
 
+        // --- Probability с учетом ATR
         double probability = computeConfidence(scoreLong, scoreShort, state, cat, atr, price);
+        probability *= Math.min(1.0, atr / price * 200); // маленький ATR → уменьшаем уверенность
         if (probability < MIN_CONFIDENCE) return null;
 
         // --- Flags
@@ -189,7 +185,6 @@ public final class DecisionEngineMerged {
 
         return new TradeIdea(symbol, side, price, stop, take, probability, flags);
     }
-
     private boolean cooldownAllowed(String symbol, TradingCore.Side side, CoinCategory cat, long now) {
         String key = symbol + "_" + side;
         long base = cat == CoinCategory.TOP ? COOLDOWN_TOP :
