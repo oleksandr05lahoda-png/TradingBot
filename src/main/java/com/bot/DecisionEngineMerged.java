@@ -96,11 +96,11 @@ public final class DecisionEngineMerged {
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
 
             if (delta > atr1 * 0.32) {
-                scoreLong += state == MarketState.STRONG_TREND ? 0.55 : 0.45;
+                scoreLong += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
             }
 
             if (delta < -atr1 * 0.32) {
-                scoreShort += state == MarketState.STRONG_TREND ? 0.55 : 0.45;
+                scoreShort += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
             }
         }
 
@@ -194,8 +194,8 @@ public final class DecisionEngineMerged {
 
         List<String> flags = new ArrayList<>();
 
-        if (atr > price * 0.001) flags.add("ATR↑");
-        if (volumeSpike(c15, cat)) flags.add("vol:true");
+        if (atr / price > 0.0015) flags.add("ATR↑"); // чуть больше порог
+        if (volumeSpike(c15, cat) && atr / price > 0.0015) flags.add("vol:true"); // более строгий фильтр
         if (impulse(c1)) flags.add("impulse:true");
 
         /* ===== Risk ===== */
@@ -203,11 +203,10 @@ public final class DecisionEngineMerged {
         double riskMult =
                 cat == CoinCategory.MEME ? 1.3 :
                         cat == CoinCategory.ALT ? 1.0 : 0.85;
-
-        double rr =
-                probability > 80 ? 3.0 :
-                        probability > 70 ? 2.6 :
-                                2.2;
+        double rr;
+        if (scoreDiff > 0.9) rr = 3.0;
+        else if (scoreDiff > 0.6) rr = 2.6;
+        else rr = 2.2;
 
         double stop =
                 side == com.bot.TradingCore.Side.LONG ?
@@ -284,20 +283,17 @@ public final class DecisionEngineMerged {
             history.removeFirst();
     }
 
-    /* ===== CONFIDENCE ===== */
-
     private double computeConfidence(double rawScore,
                                      MarketState state,
                                      CoinCategory cat,
                                      double atr,
                                      double price) {
 
-        double edge = rawScore - 2.25;
+        // Подкорректированное смещение edge
+        double edge = rawScore - 3.0; // раньше было 2.25
+        double sigmoid = 1.0 / (1.0 + Math.exp(-1.2 * edge)); // раньше -1.4
 
-        double sigmoid =
-                1.0 / (1.0 + Math.exp(-1.4 * edge));
-        double regimeBoost =
-                state == MarketState.STRONG_TREND ? 0.05 : 0;
+        double regimeBoost = state == MarketState.STRONG_TREND ? 0.05 : 0;
 
         double categoryPenalty =
                 cat == CoinCategory.MEME ? -0.04 :
@@ -309,10 +305,10 @@ public final class DecisionEngineMerged {
                         atr / price > 0.01 ? -0.03 :
                                 0;
 
-        double rawProb =
-                clamp(sigmoid + regimeBoost + categoryPenalty + atrFactor, 0, 1);
+        double rawProb = clamp(sigmoid + regimeBoost + categoryPenalty + atrFactor, 0, 1);
 
-        return clamp(50 + rawProb * 35, 50, 85);
+        // Привязка Probability к реальной шкале, но ограничиваем max 80-82
+        return clamp(50 + rawProb * 30, 50, 82);
     }
 
     /* ===== STATE ===== */

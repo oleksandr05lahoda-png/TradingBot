@@ -136,11 +136,11 @@ public final class GlobalImpulseController {
     }
 
     private GlobalRegime determineRegime(TradingCore.Candle last, double strength, boolean bodyOk) {
-        if (!bodyOk || strength < 0.45) return GlobalRegime.NEUTRAL;
+        if (!bodyOk || strength < 0.55) return GlobalRegime.NEUTRAL; // был 0.45
         boolean bullish = last.close > last.open;
         boolean bearish = last.close < last.open;
-        if (bullish && strength > 0.6) return GlobalRegime.BTC_IMPULSE_UP;
-        if (bearish && strength > 0.6) return GlobalRegime.BTC_IMPULSE_DOWN;
+        if (bullish && strength > 0.65) return GlobalRegime.BTC_IMPULSE_UP; // был 0.6
+        if (bearish && strength > 0.65) return GlobalRegime.BTC_IMPULSE_DOWN;
         return GlobalRegime.NEUTRAL;
     }
 
