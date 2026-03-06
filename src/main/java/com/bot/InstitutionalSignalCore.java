@@ -90,7 +90,7 @@ public final class InstitutionalSignalCore {
 
         if (signal == null) return false;
 
-        if (signal.probability < minConfidence + 2.0)
+        if (signal.probability < minConfidence)
             return false;
         if (getActiveSignalsCount() >= maxGlobalSignals)
             return false;
@@ -117,7 +117,7 @@ public final class InstitutionalSignalCore {
             if (diff < minSignalDiff)
                 return false;
 
-            if (Math.abs(a.probability - signal.probability) < 0.015)
+            if (Math.abs(a.probability - signal.probability) < 1.5)
                 return false;
         }
 

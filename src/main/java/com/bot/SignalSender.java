@@ -61,12 +61,12 @@ public class SignalSender {
     private final com.bot.TradingCore.RiskEngine riskEngine = new com.bot.TradingCore.RiskEngine(0.01, 0.05, 1.0);
     private final com.bot.InstitutionalSignalCore core =
             new com.bot.InstitutionalSignalCore(
-                    12,       // max global signals
-                    1,        // max signals per symbol
-                    0.25,     // portfolio risk / exposure
-                    0.58,     // min confidence
-                    0.004,    // min signal diff
-                    15000     // cooldown в миллисекундах (пример: 15 секунд)
+                    20,     // было 12
+                    2,      // было 1
+                    0.35,   // было 0.25
+                    0.52,   // было 0.58
+                    0.002,  // было 0.004
+                    10000   // было 15000
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
     // ========================= PUBLIC API =========================
@@ -74,11 +74,13 @@ public class SignalSender {
 
         List<com.bot.DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
 
-        if (cachedPairs == null || cachedPairs.isEmpty()) {
-            cachedPairs = getTopSymbolsSet(TOP_N);
-        }
+        if (cachedPairs == null || cachedPairs.isEmpty() ||
+                System.currentTimeMillis() - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
 
-        com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
+            cachedPairs = getTopSymbolsSet(TOP_N);
+            lastBinancePairsRefresh = System.currentTimeMillis();
+        }
+        com.bot.DecisionEngineMerged engine = decisionEngine;
 
         for (String pair : cachedPairs) {
 
@@ -141,7 +143,7 @@ public class SignalSender {
         this.TOP_N = envInt("TOP_N", 70);
         this.MIN_CONF = 0.50;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 15);
-        this.KLINES_LIMIT = envInt("KLINES", 240);
+        this.KLINES_LIMIT = envInt("KLINES", 120);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);
 
         this.IMPULSE_PCT = envDouble("IMPULSE_PCT", 0.02);
@@ -1103,8 +1105,11 @@ public class SignalSender {
                 dailyResetTs = System.currentTimeMillis();
             }
 
-            if (cachedPairs == null || cachedPairs.isEmpty()) {
+            if (cachedPairs == null || cachedPairs.isEmpty() ||
+                    System.currentTimeMillis() - lastBinancePairsRefresh > BINANCE_REFRESH_INTERVAL_MS) {
+
                 cachedPairs = getTopSymbolsSet(TOP_N);
+                lastBinancePairsRefresh = System.currentTimeMillis();
             }
 
             com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();

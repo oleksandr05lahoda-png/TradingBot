@@ -129,12 +129,12 @@ public final class SignalOptimizer {
         if (mt.impulse > STRONG_IMPULSE) {
             adjustment = ((isLong && trendUp) ||
                     (!isLong && !trendUp))
-                    ? 0.07 : -0.06;
+                    ? 7.0 : -6.0;
 
         } else if (mt.impulse > WEAK_IMPULSE) {
             adjustment = ((isLong && trendUp) ||
                     (!isLong && !trendUp))
-                    ? 0.03 : -0.03;
+                    ? 3.0 : -3.0;
         }
 
         confidence += adjustment;

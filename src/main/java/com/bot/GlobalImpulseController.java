@@ -29,10 +29,10 @@ public final class GlobalImpulseController {
     // ================= CONTEXT =================
     public static final class GlobalContext {
         public final GlobalRegime regime;
-        public final double impulseStrength;     // 0.0 – 1.0
+        public final double impulseStrength;
         public final double volatilityExpansion;
         public final boolean strongPressure;
-        public final boolean onlyLong;           // для Decision Engine
+        public final boolean onlyLong;
         public final boolean onlyShort;
 
         public GlobalContext(GlobalRegime regime,
@@ -61,7 +61,7 @@ public final class GlobalImpulseController {
         if (btc == null || btc.size() < VOL_LOOKBACK + 2)
             return;
 
-        double avgRange = averageRange(btc, VOL_LOOKBACK);
+        double avgRange = Math.max(averageRange(btc, VOL_LOOKBACK), 0.0000001);
         TradingCore.Candle last = btc.get(btc.size() - 1);
 
         double currentRange = last.high - last.low;
@@ -70,18 +70,15 @@ public final class GlobalImpulseController {
         double bodyExpansion = bodyExpansionScore(btc);
         double volumeSpike = volumeSpikeScore(btc);
 
-        // сырое объединение факторов
-        double rawScore = 0.45 * volatilityExpansion + 0.35 * bodyExpansion + 0.20 * volumeSpike;
+        // объединение факторов
+        double rawScore = 0.45 * volatilityExpansion + 0.40 * bodyExpansion + 0.15 * volumeSpike;
 
         double impulseStrength = normalize(rawScore);
-
-        // проверка размера тела свечи для надежного сигнала
-        double lastBody = Math.abs(last.close - last.open);
-        boolean bodyOk = lastBody >= Math.max(bodyExpansion * 0.8, 0.0001);
+        boolean bodyOk = bodyExpansion >= 0.8;
 
         GlobalRegime regime = determineRegime(last, impulseStrength, bodyOk);
 
-        boolean strong = impulseStrength > 0.65 && volatilityExpansion > 1.25;
+        boolean strong = impulseStrength > 0.6 && volatilityExpansion > 1.2;
 
         boolean onlyLong = regime == GlobalRegime.BTC_IMPULSE_UP;
         boolean onlyShort = regime == GlobalRegime.BTC_IMPULSE_DOWN;
@@ -136,16 +133,16 @@ public final class GlobalImpulseController {
     }
 
     private GlobalRegime determineRegime(TradingCore.Candle last, double strength, boolean bodyOk) {
-        if (!bodyOk || strength < 0.55) return GlobalRegime.NEUTRAL; // был 0.45
+        if (!bodyOk || strength < 0.50) return GlobalRegime.NEUTRAL; // мягче порог
         boolean bullish = last.close > last.open;
         boolean bearish = last.close < last.open;
-        if (bullish && strength > 0.65) return GlobalRegime.BTC_IMPULSE_UP; // был 0.6
-        if (bearish && strength > 0.65) return GlobalRegime.BTC_IMPULSE_DOWN;
+        if (bullish && strength > 0.55) return GlobalRegime.BTC_IMPULSE_UP;
+        if (bearish && strength > 0.55) return GlobalRegime.BTC_IMPULSE_DOWN;
         return GlobalRegime.NEUTRAL;
     }
 
     private double normalize(double value) {
-        double n = value / 1.5; // корректировка диапазона для более частых сигналов
+        double n = value / 1.3; // чуть мягче для частых сигналов
         return Math.min(1.0, Math.max(0.0, n));
     }
 }
