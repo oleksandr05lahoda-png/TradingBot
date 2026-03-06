@@ -755,46 +755,37 @@ public class SignalSender {
             boolean bos,
             boolean liquiditySweep
     ) {
-        double conf = 0.5;
+        double conf = 0.5; // базовая вероятность
 
-        conf += rawScore * 0.55;
+        // влияние rawScore
+        conf += rawScore * 0.4; // уменьшен вес, чтобы не завышать вероятность
 
         // многотаймфреймное подтверждение
-        conf += mtfConfirm * 0.05; // +0.05 за каждый уровень подтверждения
+        conf += mtfConfirm * 0.03; // реальное влияние
 
-        conf += volOk ? 0.05 : -0.02;
-        conf += atrOk ? 0.05 : -0.02;
-        conf += vwapAligned ? 0.03 : 0;
+        // проверка волатильности и ATR
+        conf += volOk ? 0.03 : -0.02;
+        conf += atrOk ? 0.04 : -0.03;
+
+        // VWAP и структура
+        conf += vwapAligned ? 0.03 : -0.01;
         conf += structureAligned ? 0.04 : -0.01;
-        // импульс свечи
-        if (impulse && Math.abs(rawScore) > 0.25) conf += 0.04;
-        else if (!impulse) conf -= 0.02;
 
-        // Break of structure
+        // импульс microTrend
+        if (impulse && Math.abs(rawScore) > 0.25) conf += 0.10; // сильный импульс увеличивает confidence
+        else if (!impulse) conf -= 0.05;
+
+        // Break of Structure
         conf += bos ? 0.05 : 0;
 
         // Liquidity sweep
-        if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.10; // sweep против тренда = возможный разворот
-        else if (liquiditySweep) conf -= 0.05;
+        if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.08; // sweep против тренда = возможный разворот
+        else if (liquiditySweep) conf -= 0.03;
 
-        conf = Math.max(0.20, Math.min(0.90, conf));
+        // ограничиваем реалистичные границы probability
+        conf = Math.max(0.20, Math.min(0.85, conf));
 
         return conf;
-    }
-    private double lastSwingLow(List<com.bot.TradingCore.Candle> candles) {
-        int lookback = Math.min(20, candles.size());
-        double low = Double.POSITIVE_INFINITY;
-        for (int i = candles.size() - lookback; i < candles.size(); i++)
-            low = Math.min(low, candles.get(i).low);
-        return low;
-    }
-
-    private double lastSwingHigh(List<com.bot.TradingCore.Candle> candles) {
-        int lookback = Math.min(20, candles.size());
-        double high = Double.NEGATIVE_INFINITY;
-        for (int i = candles.size() - lookback; i < candles.size(); i++)
-            high = Math.max(high, candles.get(i).high);
-        return high;
     }
     public static class Signal {
         public final String symbol;
@@ -885,7 +876,8 @@ public class SignalSender {
             if (!wsMap.containsKey(pair) || wsMap.get(pair).isInputClosed()) {
                 connectWsInternal(pair);
             }
-        }, 0, 5, TimeUnit.SECONDS);    }
+        }, 0, 5, TimeUnit.SECONDS);
+    }
     private Signal analyzePair(String pair, List<com.bot.TradingCore.Candle> c15m, List<com.bot.TradingCore.Candle> c1h) {
         if(c15m.size()<60 || c1h.size()<60) return null;
 
@@ -899,11 +891,11 @@ public class SignalSender {
         double rsiScore  = strategyRSINorm(closes15);
         double momScore  = strategyMomentumNorm(closes15);
         double macdScore = strategyMACDNorm(closes15);
-        double microBias = Math.tanh(micro.speed * 500);
+        double microBias = Math.tanh(micro.speed * 200); // меньше 500 для адекватной чувствительности
 
-        double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.20 + macdScore*0.15 + microBias*0.25;
-// добавлено округление и нормализация в [-1,1]
-        rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
+        double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.25 + macdScore*0.15 + microBias*0.20;
+        rawScore = Math.max(-1.0, Math.min(1.0, rawScore)); // нормализация в [-1,1]
+
         // --- Confidence ---
         int mtfConfirm = multiTFConfirm(emaDirection(c1h,20,50), emaDirection(c15m,20,50));
         boolean volOk = computeVolatilityOk(c15m, atr(c15m,14));
@@ -918,10 +910,11 @@ public class SignalSender {
 
         // --- Стоп и тейк ---
         double atrValue = atr(c15m,14);
+        double minAtrPct = 0.005; // минимальный стоп 0.5%
+        double risk = Math.max(atrValue*1.2, last.close*minAtrPct);
         double entry = last.close;
-        double risk = atrValue*1.2;
-        double stop = rawScore>=0 ? entry-risk : entry+risk;
-        double take = rawScore>=0 ? entry+risk*2.4 : entry-risk*2.4;
+        double stop = rawScore>=0 ? entry - risk : entry + risk;
+        double take = rawScore>=0 ? entry + risk*2.0 : entry - risk*2.0;
 
         Signal s = new Signal(
                 pair,
