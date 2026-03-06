@@ -52,15 +52,11 @@ public class BotMain {
                 }
                 GlobalImpulseController.GlobalContext ctx = globalImpulse.getContext();
 
-                // 3️⃣ Фильтруем сигналы через глобальный импульс
                 List<DecisionEngineMerged.TradeIdea> filteredSignals = rawSignals.stream()
                         .filter(s -> {
-                            if (ctx.onlyLong && !s.symbol.equals("BTCUSDT"))
-                                return s.side.equals("LONG");
-
-                            if (ctx.onlyShort && !s.symbol.equals("BTCUSDT"))
-                                return s.side.equals("SHORT");
-                            return true; // NEUTRAL – все сигналы
+                            if (ctx.onlyLong) return s.side == com.bot.TradingCore.Side.LONG;
+                            if (ctx.onlyShort) return s.side == com.bot.TradingCore.Side.SHORT;
+                            return true;
                         })
                         .toList();
 

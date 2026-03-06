@@ -140,7 +140,7 @@ public final class DecisionEngineMerged {
         /* ===== Dynamic threshold ===== */
 
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 1.25 : 1.10;
+                state == MarketState.STRONG_TREND ? 1.10 : 1.0;
 
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
             return null;
@@ -153,10 +153,10 @@ public final class DecisionEngineMerged {
         boolean strongMomentumDown = move4 < -0.018;
 
         if (strongMomentumUp && scoreShort > scoreLong)
-            scoreShort *= 0.6;
+            scoreShort *= 0.8;
 
         if (strongMomentumDown && scoreLong > scoreShort)
-            scoreLong *= 0.6;
+            scoreLong *= 0.8;
 
         /* ===== Decide side ===== */
 
