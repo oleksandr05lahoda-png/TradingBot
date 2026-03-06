@@ -29,7 +29,7 @@ public class SignalSender {
     private final double ATR_MIN_PCT;         // min ATR pct for volatility check
     private final long COOLDOWN_MS;           // cooldown per symbol
     private final long BINANCE_REFRESH_INTERVAL_MS; // refresh pairs
-
+    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
     private final LocalTime VWAP_SESSION_START;
 
     // Micro / tick params
@@ -70,6 +70,35 @@ public class SignalSender {
                     -0.20      // scoreThreshold, минимальный score для разрешения сигнала
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
+    public double adjustProbability(
+            DecisionEngineMerged.TradeIdea idea,
+            List<com.bot.TradingCore.Candle> candles
+    ) {
+
+        List<Double> closes = candles.stream()
+                .map(c -> c.close)
+                .collect(Collectors.toList());
+
+        double rsi = rsi(closes, 14);
+        double atrVal = atr(candles, 14);
+        double lastPrice = closes.get(closes.size() - 1);
+
+        double atrPct = atrVal / lastPrice;
+
+        double prob = idea.probability;
+
+        if (rsi > 70 || rsi < 30)
+            prob -= 0.07;
+
+        if (atrPct > 0.01)
+            prob += 0.05;
+
+        if (atrPct < 0.002)
+            prob -= 0.08;
+
+        return Math.max(0.45, Math.min(0.92, prob));
+    }
+
     public List<DecisionEngineMerged.TradeIdea> generateSignals() {
 
         List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
@@ -108,17 +137,27 @@ public class SignalSender {
 
             if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60)
                 continue;
+            double atr15 = atr(m15, 14);
+            double price = m15.get(m15.size()-1).close;
 
+            if (atr15 / price < 0.0015)
+                continue;
             // Анализ
             DecisionEngineMerged.TradeIdea idea =
                     engine.analyze(pair, m1, m5, m15, h1,
                             DecisionEngineMerged.CoinCategory.TOP,
                             context);
+            long now = System.currentTimeMillis();
+            Long last = lastSignalTime.get(pair);
 
+            if (last != null && now - last < 45 * 60 * 1000) {
+                continue;
+            }
             if (idea == null)
                 continue;
 
-            // вероятность
+            idea.probability = adjustProbability(idea, m15);
+
             if (idea.probability < MIN_CONF)
                 continue;
 
@@ -131,6 +170,7 @@ public class SignalSender {
             core.registerSignal(idea, atr);
 
             result.add(idea);
+            lastSignalTime.put(pair, System.currentTimeMillis());
         }
 
         // 6. Сортировка
@@ -141,7 +181,9 @@ public class SignalSender {
         );
 
         return result;
+
     }
+
     public SignalOptimizer getOptimizer() {
         return optimizer;
     }

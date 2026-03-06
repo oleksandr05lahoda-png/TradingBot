@@ -55,7 +55,7 @@ public final class DecisionEngineMerged {
         public final double price;
         public final double stop;
         public final double take;
-        public final double probability;
+        public double probability;
         public final List<String> flags;
 
         public TradeIdea(String symbol,
