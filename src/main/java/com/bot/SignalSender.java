@@ -21,7 +21,7 @@ public class SignalSender {
     private final int TOP_N;
     private final double MIN_CONF;            // 0..1
     private final int INTERVAL_MIN;           // scheduler interval minutes
-    public final int KLINES_LIMIT;           // number of candles fetched per TF
+    private final int KLINES_LIMIT;           // number of candles fetched per TF
     private final long REQUEST_DELAY_MS;      // delay between HTTP calls
 
     private final double IMPULSE_PCT;         // one-minute impulse threshold (relative)
@@ -29,7 +29,7 @@ public class SignalSender {
     private final double ATR_MIN_PCT;         // min ATR pct for volatility check
     private final long COOLDOWN_MS;           // cooldown per symbol
     private final long BINANCE_REFRESH_INTERVAL_MS; // refresh pairs
-    private final Map<String, Long> lastSignalTime = new ConcurrentHashMap<>();
+
     private final LocalTime VWAP_SESSION_START;
 
     // Micro / tick params
@@ -57,138 +57,71 @@ public class SignalSender {
     private final Map<String, List<com.bot.TradingCore.Candle>> histM15 = new ConcurrentHashMap<>();
     private final Map<String, List<com.bot.TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
     private final com.bot.TradingCore.AdaptiveBrain adaptiveBrain;
-    private final SignalOptimizer optimizer;
+    private final com.bot.SignalOptimizer optimizer;
     private final com.bot.TradingCore.RiskEngine riskEngine = new com.bot.TradingCore.RiskEngine(0.01, 0.05, 1.0);
-    private final InstitutionalSignalCore core =
-            new InstitutionalSignalCore(
-                    12,        // max global signals
-                    1,         // max signals per symbol
-                    0.25,      // portfolio risk / exposure
-                    0.58,      // min confidence
-                    0.004,     // min signal diff
-                    15000,     // cooldown в миллисекундах
-                    -0.20      // scoreThreshold, минимальный score для разрешения сигнала
+    private final com.bot.InstitutionalSignalCore core =
+            new com.bot.InstitutionalSignalCore(
+                    12,       // max global signals
+                    1,        // max signals per symbol
+                    0.25,     // portfolio risk / exposure
+                    0.58,     // min confidence
+                    0.004,    // min signal diff
+                    15000     // cooldown в миллисекундах (пример: 15 секунд)
             );
     private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
-    public double adjustProbability(
-            DecisionEngineMerged.TradeIdea idea,
-            List<com.bot.TradingCore.Candle> candles
-    ) {
+    // ========================= PUBLIC API =========================
+    public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
 
-        List<Double> closes = candles.stream()
-                .map(c -> c.close)
-                .collect(Collectors.toList());
+        List<com.bot.DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
 
-        double rsi = rsi(closes, 14);
-        double atrVal = atr(candles, 14);
-        double lastPrice = closes.get(closes.size() - 1);
-
-        double atrPct = atrVal / lastPrice;
-
-        double prob = idea.probability;
-
-        if (rsi > 70 || rsi < 30)
-            prob -= 0.07;
-
-        if (atrPct > 0.01)
-            prob += 0.05;
-
-        if (atrPct < 0.002)
-            prob -= 0.08;
-
-        return Math.max(0.45, Math.min(0.92, prob));
-    }
-
-    public List<DecisionEngineMerged.TradeIdea> generateSignals() {
-
-        List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
-
-        // 1. Получаем топовые символы
         if (cachedPairs == null || cachedPairs.isEmpty()) {
             cachedPairs = getTopSymbolsSet(TOP_N);
         }
 
-        // 2. BTC контекст
-        List<TradingCore.Candle> btcC15 = fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
+        com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
 
-        if (btcC15 == null || btcC15.size() < 60) {
-            System.out.println("[generateSignals] Not enough BTC data");
-            return result;
-        }
-
-        // 3. Глобальный контекст
-        GlobalImpulseController globalImpulse = new GlobalImpulseController();
-        globalImpulse.update(btcC15);
-        GlobalImpulseController.GlobalContext context = globalImpulse.getContext();
-
-        // 4. Движок
-        DecisionEngineMerged engine = new DecisionEngineMerged();
-
-        // 5. Анализируем пары
         for (String pair : cachedPairs) {
 
-            List<TradingCore.Candle> m1  = fetchKlines(pair, "1m", KLINES_LIMIT);
-            List<TradingCore.Candle> m5  = fetchKlines(pair, "5m", KLINES_LIMIT);
-            List<TradingCore.Candle> m15 = fetchKlines(pair, "15m", KLINES_LIMIT);
-            List<TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
-
-            if (m1 == null || m5 == null || m15 == null || h1 == null)
-                continue;
+            List<com.bot.TradingCore.Candle> m1  = fetchKlines(pair,"1m",KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> m5  = fetchKlines(pair,"5m",KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
 
             if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60)
                 continue;
-            double atr15 = atr(m15, 14);
-            double price = m15.get(m15.size()-1).close;
 
-            if (atr15 / price < 0.0015)
-                continue;
-            // Анализ
-            DecisionEngineMerged.TradeIdea idea =
-                    engine.analyze(pair, m1, m5, m15, h1,
-                            DecisionEngineMerged.CoinCategory.TOP,
-                            context);
-            long now = System.currentTimeMillis();
-            Long last = lastSignalTime.get(pair);
+            com.bot.DecisionEngineMerged.TradeIdea idea =
+                    engine.analyze(
+                            pair,
+                            m1,
+                            m5,
+                            m15,
+                            h1,
+                            com.bot.DecisionEngineMerged.CoinCategory.TOP
+                    );
 
-            if (last != null && now - last < 15 * 60 * 1000) {
-                continue;
-            }
-            if (idea == null)
+            if (idea == null || idea.probability < MIN_CONF)
                 continue;
 
-            idea.probability = adjustProbability(idea, m15);
-
-            if (idea.probability < MIN_CONF)
-                continue;
-
-            // core фильтр
             if (!core.allowSignal(idea))
                 continue;
 
-            double atr = getAtr(idea.symbol);
-
-            core.registerSignal(idea, atr);
+            core.registerSignal(idea);
 
             result.add(idea);
-            lastSignalTime.put(pair, System.currentTimeMillis());
         }
 
-        // 6. Сортировка
-        result.sort(
-                Comparator.comparingDouble(
-                        (DecisionEngineMerged.TradeIdea i) -> i.probability
-                ).reversed()
-        );
+        result.sort(Comparator.comparingDouble(
+                (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability
+        ).reversed());
 
         return result;
-
     }
-
-    public SignalOptimizer getOptimizer() {
+    public com.bot.SignalOptimizer getOptimizer() {
         return optimizer;
     }
 
-    public InstitutionalSignalCore getSignalCore() {
+    public com.bot.InstitutionalSignalCore getSignalCore() {
         return core;
     }
 
@@ -228,7 +161,7 @@ public class SignalSender {
         this.decisionEngine = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain = new com.bot.TradingCore.AdaptiveBrain();
         com.bot.TradingCore.AdaptiveBrain brain = new com.bot.TradingCore.AdaptiveBrain();
-        this.optimizer = new SignalOptimizer(this.tickPriceDeque);
+        this.optimizer = new com.bot.SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
     }
 
@@ -681,6 +614,17 @@ public class SignalSender {
         return Double.compare(emaFast, emaSlow);
     }
 
+    private int getBtcTrend() {
+        try {
+            List<com.bot.TradingCore.Candle> btcH1 = fetchKlines("BTCUSDT", "1h", 120);
+            if (btcH1.size() < 60) return 0;
+
+            return emaDirection(btcH1, 20, 50); // 1 = uptrend, -1 = downtrend
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     private double strategyEMANorm(List<Double> closes) {
         if (closes == null || closes.size() < 100) return 0.0;
         double e20 = ema(closes, 20);
@@ -755,37 +699,46 @@ public class SignalSender {
             boolean bos,
             boolean liquiditySweep
     ) {
-        double conf = 0.5; // базовая вероятность
+        double conf = 0.5;
 
-        // влияние rawScore
-        conf += rawScore * 0.4; // уменьшен вес, чтобы не завышать вероятность
+        conf += rawScore * 0.55;
 
         // многотаймфреймное подтверждение
-        conf += mtfConfirm * 0.03; // реальное влияние
+        conf += mtfConfirm * 0.05; // +0.05 за каждый уровень подтверждения
 
-        // проверка волатильности и ATR
-        conf += volOk ? 0.03 : -0.02;
-        conf += atrOk ? 0.04 : -0.03;
-
-        // VWAP и структура
-        conf += vwapAligned ? 0.03 : -0.01;
+        conf += volOk ? 0.05 : -0.02;
+        conf += atrOk ? 0.05 : -0.02;
+        conf += vwapAligned ? 0.03 : 0;
         conf += structureAligned ? 0.04 : -0.01;
+        // импульс свечи
+        if (impulse && Math.abs(rawScore) > 0.25) conf += 0.04;
+        else if (!impulse) conf -= 0.02;
 
-        // импульс microTrend
-        if (impulse && Math.abs(rawScore) > 0.25) conf += 0.10; // сильный импульс увеличивает confidence
-        else if (!impulse) conf -= 0.05;
-
-        // Break of Structure
+        // Break of structure
         conf += bos ? 0.05 : 0;
 
         // Liquidity sweep
-        if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.08; // sweep против тренда = возможный разворот
-        else if (liquiditySweep) conf -= 0.03;
+        if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.10; // sweep против тренда = возможный разворот
+        else if (liquiditySweep) conf -= 0.05;
 
-        // ограничиваем реалистичные границы probability
-        conf = Math.max(0.20, Math.min(0.85, conf));
+        conf = Math.max(0.20, Math.min(0.90, conf));
 
         return conf;
+    }
+    private double lastSwingLow(List<com.bot.TradingCore.Candle> candles) {
+        int lookback = Math.min(20, candles.size());
+        double low = Double.POSITIVE_INFINITY;
+        for (int i = candles.size() - lookback; i < candles.size(); i++)
+            low = Math.min(low, candles.get(i).low);
+        return low;
+    }
+
+    private double lastSwingHigh(List<com.bot.TradingCore.Candle> candles) {
+        int lookback = Math.min(20, candles.size());
+        double high = Double.NEGATIVE_INFINITY;
+        for (int i = candles.size() - lookback; i < candles.size(); i++)
+            high = Math.max(high, candles.get(i).high);
+        return high;
     }
     public static class Signal {
         public final String symbol;
@@ -876,8 +829,7 @@ public class SignalSender {
             if (!wsMap.containsKey(pair) || wsMap.get(pair).isInputClosed()) {
                 connectWsInternal(pair);
             }
-        }, 0, 5, TimeUnit.SECONDS);
-    }
+        }, 0, 5, TimeUnit.SECONDS);    }
     private Signal analyzePair(String pair, List<com.bot.TradingCore.Candle> c15m, List<com.bot.TradingCore.Candle> c1h) {
         if(c15m.size()<60 || c1h.size()<60) return null;
 
@@ -891,11 +843,11 @@ public class SignalSender {
         double rsiScore  = strategyRSINorm(closes15);
         double momScore  = strategyMomentumNorm(closes15);
         double macdScore = strategyMACDNorm(closes15);
-        double microBias = Math.tanh(micro.speed * 200); // меньше 500 для адекватной чувствительности
+        double microBias = Math.tanh(micro.speed * 500);
 
-        double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.25 + macdScore*0.15 + microBias*0.20;
-        rawScore = Math.max(-1.0, Math.min(1.0, rawScore)); // нормализация в [-1,1]
-
+        double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.20 + macdScore*0.15 + microBias*0.25;
+// добавлено округление и нормализация в [-1,1]
+        rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
         // --- Confidence ---
         int mtfConfirm = multiTFConfirm(emaDirection(c1h,20,50), emaDirection(c15m,20,50));
         boolean volOk = computeVolatilityOk(c15m, atr(c15m,14));
@@ -910,11 +862,10 @@ public class SignalSender {
 
         // --- Стоп и тейк ---
         double atrValue = atr(c15m,14);
-        double minAtrPct = 0.005; // минимальный стоп 0.5%
-        double risk = Math.max(atrValue*1.2, last.close*minAtrPct);
         double entry = last.close;
-        double stop = rawScore>=0 ? entry - risk : entry + risk;
-        double take = rawScore>=0 ? entry + risk*2.0 : entry - risk*2.0;
+        double risk = atrValue*1.2;
+        double stop = rawScore>=0 ? entry-risk : entry+risk;
+        double take = rawScore>=0 ? entry+risk*2.4 : entry-risk*2.4;
 
         Signal s = new Signal(
                 pair,
@@ -953,7 +904,7 @@ public class SignalSender {
                         public CompletionStage<?> onText(java.net.http.WebSocket webSocket, CharSequence data, boolean last) {
                             try {
                                 JSONObject json = new JSONObject(data.toString());
-                               double price = Double.parseDouble(json.getString("p"));
+                                double price = Double.parseDouble(json.getString("p"));
                                 long ts = json.getLong("T");
 
                                 synchronized (wsLock) {
@@ -1147,7 +1098,6 @@ public class SignalSender {
         try {
             signalsThisCycle = 0;
 
-            // === DAILY LIMIT RESET ===
             if (System.currentTimeMillis() - dailyResetTs > 24 * 60 * 60_000L) {
                 dailyRequests.set(0);
                 dailyResetTs = System.currentTimeMillis();
@@ -1157,45 +1107,33 @@ public class SignalSender {
                 cachedPairs = getTopSymbolsSet(TOP_N);
             }
 
-            // === BTC GLOBAL CONTEXT ===
-            List<TradingCore.Candle> btcC15 =
-                    fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
+            com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
 
-            if (btcC15.size() < 60) {
-                System.out.println("[Scheduler] Not enough BTC data");
-                return;
-            }
-
-            GlobalImpulseController globalImpulse =
-                    new GlobalImpulseController();
-
-            globalImpulse.update(btcC15);
-
-            GlobalImpulseController.GlobalContext context =
-                    globalImpulse.getContext();
-
-            DecisionEngineMerged engine = new DecisionEngineMerged();
+            // === Получаем глобальный тренд BTC ОДИН раз за цикл ===
+            int btcTrend = getBtcTrend();
 
             for (String pair : cachedPairs) {
 
-                List<TradingCore.Candle> c1  = fetchKlines(pair, "1m", KLINES_LIMIT);
-                List<TradingCore.Candle> c5  = fetchKlines(pair, "5m", KLINES_LIMIT);
-                List<TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
-                List<TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> c1  = fetchKlines(pair, "1m", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> c5  = fetchKlines(pair, "5m", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
 
-                if (c1.size() < 60 || c5.size() < 60 ||
-                        c15.size() < 60 || h1.size() < 60) continue;
+                if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
 
-                // === ANALYZE WITH GLOBAL CONTEXT ===
-                DecisionEngineMerged.TradeIdea idea =
-                        engine.analyze(pair, c1, c5, c15, h1,
-                                DecisionEngineMerged.CoinCategory.TOP,
-                                context);
+                // Получаем сигнал через движок
+                com.bot.DecisionEngineMerged.TradeIdea idea =
+                        engine.analyze(pair, c1, c5, c15, h1, com.bot.DecisionEngineMerged.CoinCategory.TOP);
+
                 if (idea == null || idea.probability < MIN_CONF) continue;
+
+                // === BTC GLOBAL TREND FILTER ===
+                if (btcTrend < 0 && idea.side.name().equals("LONG")) continue;
+                if (btcTrend > 0 && idea.side.name().equals("SHORT")) continue;
 
                 long candleCloseTime = c15.get(c15.size() - 1).closeTime;
 
-                // === BUILD TEMP SIGNAL ===
+                // Собираем Signal
                 Signal tempSignal = new Signal(
                         idea.symbol,
                         idea.side.name(),
@@ -1204,7 +1142,7 @@ public class SignalSender {
                         engine.rsi(c15, 14),
                         Math.max(0.0, idea.probability),
                         1,
-                        engine.volumeSpike(c15, DecisionEngineMerged.CoinCategory.TOP),
+                        engine.volumeSpike(c15, com.bot.DecisionEngineMerged.CoinCategory.TOP),
                         engine.atr(c15, 14) > idea.price * 0.001,
                         true,
                         false,
@@ -1221,8 +1159,7 @@ public class SignalSender {
                 signalHistory.computeIfAbsent(pair, k -> new ArrayList<>()).add(tempSignal);
 
                 if (!core.allowSignal(idea)) continue;
-                double atr = getAtr(idea.symbol); // Берём ATR для символа
-                core.registerSignal(idea, atr);
+                core.registerSignal(idea);
 
                 String message = String.format(
                         "*%s* → *%s*\n" +
