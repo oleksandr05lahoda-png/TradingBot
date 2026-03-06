@@ -150,7 +150,7 @@ public class SignalSender {
             long now = System.currentTimeMillis();
             Long last = lastSignalTime.get(pair);
 
-            if (last != null && now - last < 45 * 60 * 1000) {
+            if (last != null && now - last < 15 * 60 * 1000) {
                 continue;
             }
             if (idea == null)
