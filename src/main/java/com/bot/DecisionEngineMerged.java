@@ -19,7 +19,7 @@ public final class DecisionEngineMerged {
     private static final long COOLDOWN_TOP = 2 * 60_000;
     private static final long COOLDOWN_ALT = 3 * 60_000;
     private static final long COOLDOWN_MEME = 4 * 60_000;
-    private static final double MIN_CONFIDENCE = 58.0;
+    private static final double MIN_CONFIDENCE = 55.0;
     private static final double UNIQUE_PRICE_DIST = 0.006; // 0.6%
     /* ================= STATE ================= */
     private final Map<String, Long> cooldownMap = new ConcurrentHashMap<>();
@@ -175,7 +175,8 @@ public final class DecisionEngineMerged {
 
         if((scoreLong > scoreShort && mt.direction == TradingCore.Side.SHORT) ||
                 (scoreShort > scoreLong && mt.direction == TradingCore.Side.LONG)) {
-            return null; // сигнал против микро-тренда – игнорируем
+            scoreLong *= 0.85;
+            scoreShort *= 0.85;
         }
         // RSI фильтры
         double rsi14 = rsi(c15, 14);
@@ -194,7 +195,7 @@ public final class DecisionEngineMerged {
         if (!flipAllowed(symbol, side)) return null;
 
         double probability = computeConfidence(scoreLong, scoreShort, state, cat, atr, price);
-        probability *= Math.min(1.0, atr/price*200);
+        probability *= Math.min(1.0, atr/price*120);
         probability = clamp(probability, 0, 100);
         if (probability < MIN_CONFIDENCE) return null;
 
@@ -358,7 +359,7 @@ public final class DecisionEngineMerged {
     private boolean pullback(List<TradingCore.Candle> c, boolean bull){
         double ema21=ema(c,21);
         double price=last(c).close;
-        return bull?price<=ema21*0.996:price>=ema21*1.004;
+        return bull?price<=ema21*0.998:price>=ema21*1.002;
     }
     public TradeIdea analyze(String symbol,
                              List<com.bot.TradingCore.Candle> c1,
