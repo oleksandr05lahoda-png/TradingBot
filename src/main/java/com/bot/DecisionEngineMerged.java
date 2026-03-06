@@ -57,8 +57,12 @@ public final class DecisionEngineMerged {
                                CoinCategory cat,
                                long now) {
 
-        if (!valid(c15) || !valid(c1h)) return null;
-
+        if (!valid(c15) || !valid(c1h)) {
+            System.out.println("[DEBUG-DE] Not enough bars for " + symbol +
+                    " | c15=" + (c15 != null ? c15.size() : "null") +
+                    " | c1h=" + (c1h != null ? c1h.size() : "null"));
+            return null;
+        }
         double price = last(c15).close;
         double atr = Math.max(atr(c15, 14), price * 0.0012);
 
@@ -70,7 +74,10 @@ public final class DecisionEngineMerged {
 
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
-
+        System.out.println("[DEBUG-DE] Start generating for symbol=" + symbol +
+                " | state=" + state +
+                " | bias=" + bias +
+                " | last price=" + price);
         /* ===== HTF Bias (balanced) ===== */
 
         if (bias == HTFBias.BULL) {
@@ -187,8 +194,17 @@ public final class DecisionEngineMerged {
                 price
         );
 
-        if (probability < MIN_CONFIDENCE)
+        System.out.println("[DEBUG-DE] symbol=" + symbol +
+                " | scoreLong=" + scoreLong +
+                " | scoreShort=" + scoreShort +
+                " | probability=" + probability +
+                " | atr=" + atr +
+                " | price=" + price);
+
+        if (probability < MIN_CONFIDENCE) {
+            System.out.println("[DEBUG-DE] probability < MIN_CONFIDENCE → rejected");
             return null;
+        }
 
         /* ===== Flags ===== */
 
