@@ -88,43 +88,76 @@ public final class InstitutionalSignalCore {
 
         cleanupExpiredSignals();
 
-        if (signal == null) return false;
+        if (signal == null) {
+            System.out.println("[DEBUG] Signal null → rejected");
+            return false;
+        }
 
-        if (signal.probability < minConfidence)
+        if (signal.probability < minConfidence) {
+            System.out.println("[DEBUG] Signal " + signal.symbol +
+                    " probability " + signal.probability +
+                    " < minConfidence " + minConfidence + " → rejected");
             return false;
-        if (getActiveSignalsCount() >= maxGlobalSignals)
-            return false;
+        }
 
-        if (currentExposure >= maxPortfolioExposure)
+        if (getActiveSignalsCount() >= maxGlobalSignals) {
+            System.out.println("[DEBUG] ActiveSignalsCount " + getActiveSignalsCount() +
+                    " >= maxGlobalSignals " + maxGlobalSignals + " → rejected");
             return false;
+        }
+
+        if (currentExposure >= maxPortfolioExposure) {
+            System.out.println("[DEBUG] CurrentExposure " + currentExposure +
+                    " >= maxPortfolioExposure " + maxPortfolioExposure + " → rejected");
+            return false;
+        }
 
         double score = symbolScore.getOrDefault(signal.symbol, 0.0);
-        if (score < -0.20)
+        if (score < -0.20) {
+            System.out.println("[DEBUG] SymbolScore " + score +
+                    " < -0.2 for " + signal.symbol + " → rejected");
             return false;
+        }
 
         List<ActiveSignal> list =
                 activeSignals.getOrDefault(signal.symbol, List.of());
 
-        if (list.size() >= maxSignalsPerSymbol)
+        if (list.size() >= maxSignalsPerSymbol) {
+            System.out.println("[DEBUG] Active signals for " + signal.symbol +
+                    " size " + list.size() + " >= maxSignalsPerSymbol " + maxSignalsPerSymbol + " → rejected");
             return false;
+        }
 
         for (ActiveSignal a : list) {
 
-            if (a.side != signal.side)
+            if (a.side != signal.side) {
+                System.out.println("[DEBUG] Side mismatch: active=" + a.side + " vs signal=" + signal.side + " → rejected");
                 return false;
+            }
 
             double diff = Math.abs(a.entry - signal.price) / a.entry;
-            if (diff < minSignalDiff)
+            if (diff < minSignalDiff) {
+                System.out.println("[DEBUG] Signal price diff too small: " + diff +
+                        " < minSignalDiff " + minSignalDiff + " → rejected");
                 return false;
+            }
 
-            if (Math.abs(a.probability - signal.probability) < 1.5)
+            if (Math.abs(a.probability - signal.probability) < 1.5) {
+                System.out.println("[DEBUG] Probability too close: " + Math.abs(a.probability - signal.probability) +
+                        " < 1.5 → rejected");
                 return false;
+            }
         }
 
         double estimatedExposure = estimateExposure(signal);
-        if (currentExposure + estimatedExposure > maxPortfolioExposure)
+        if (currentExposure + estimatedExposure > maxPortfolioExposure) {
+            System.out.println("[DEBUG] EstimatedExposure " + estimatedExposure +
+                    " + currentExposure " + currentExposure +
+                    " > maxPortfolioExposure " + maxPortfolioExposure + " → rejected");
             return false;
+        }
 
+        System.out.println("[DEBUG] Signal " + signal.symbol + " allowed! prob=" + signal.probability);
         return true;
     }
 
