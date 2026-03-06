@@ -15,7 +15,7 @@ public final class DecisionEngineMerged {
     public enum HTFBias { BULL, BEAR, NONE }
 
     /* ================= CONFIG ================= */
-    private static final int MIN_BARS = 150;
+    private static final int MIN_BARS = 70;
     private static final long COOLDOWN_TOP = 2 * 60_000;
     private static final long COOLDOWN_ALT = 3 * 60_000;
     private static final long COOLDOWN_MEME = 4 * 60_000;
@@ -187,7 +187,7 @@ public final class DecisionEngineMerged {
 
         // проверка разницы
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-        if (scoreDiff < 0.05) return null;
+        if (scoreDiff < 0.03) return null;
 
         TradingCore.Side side = scoreLong > scoreShort ? TradingCore.Side.LONG : TradingCore.Side.SHORT;
 
@@ -345,7 +345,7 @@ public final class DecisionEngineMerged {
     public boolean impulse(List<TradingCore.Candle> c){
         if(c==null || c.size()<5) return false;
         double atrVal=atr(c,14);
-        return Math.abs(last(c).close-c.get(Math.max(0,c.size()-5)).close)>atrVal*0.12;
+        return Math.abs(last(c).close-c.get(Math.max(0,c.size()-5)).close)>atrVal*0.08;
     }
 
     public boolean volumeSpike(List<TradingCore.Candle> c, CoinCategory cat){
