@@ -12,9 +12,9 @@ public final class DecisionEngineMerged {
 
     private static final int MIN_BARS = 150;
 
-    private static final long COOLDOWN_TOP = 2 * 60_000;
-    private static final long COOLDOWN_ALT = 3 * 60_000;
-    private static final long COOLDOWN_MEME = 4 * 60_000;
+    private static final long COOLDOWN_TOP = 15 * 60_000;
+    private static final long COOLDOWN_ALT = 15 * 60_000;
+    private static final long COOLDOWN_MEME = 15 * 60_000;
 
     private static final double MIN_CONFIDENCE = 58.0;
 
@@ -71,13 +71,16 @@ public final class DecisionEngineMerged {
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
 
-        /* ===== HTF Bias (умеренный) ===== */
+        /* ===== HTF Bias (balanced) ===== */
 
-        if (bias == HTFBias.BULL) scoreLong += 0.45;
-        else if (bias == HTFBias.BEAR) scoreShort += 0.45;
-
-        /* ===== Pullback ===== */
-
+        if (bias == HTFBias.BULL) {
+            scoreLong += 0.45;
+            scoreShort -= 0.20;
+        }
+        else if (bias == HTFBias.BEAR) {
+            scoreShort += 0.45;
+            scoreLong -= 0.20;
+        }
         if (pullback(c15, true)) {
             scoreLong += 0.9;
             reasonWeightsLong.put("Pullback bullish", 0.9);
@@ -87,23 +90,19 @@ public final class DecisionEngineMerged {
             scoreShort += 0.9;
             reasonWeightsShort.put("Pullback bearish", 0.9);
         }
-
-        /* ===== Impulse ===== */
-
         if (impulse(c1)) {
 
+            double atr1 = atr(c1, 14);
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
 
-            if (delta > atr * 0.15) {
+            if (delta > atr1 * 0.32) {
                 scoreLong += state == MarketState.STRONG_TREND ? 0.55 : 0.45;
             }
 
-            if (delta < -atr * 0.15) {
+            if (delta < -atr1 * 0.32) {
                 scoreShort += state == MarketState.STRONG_TREND ? 0.55 : 0.45;
             }
         }
-
-        /* ===== Divergence ===== */
 
         if (bullDiv(c15)) {
             scoreLong += 0.55;
@@ -230,7 +229,6 @@ public final class DecisionEngineMerged {
     private boolean cooldownAllowed(String symbol, com.bot.TradingCore.Side side, CoinCategory cat, long now) {
 
         String key = symbol + "_" + side;
-
         long base =
                 cat == CoinCategory.TOP ? COOLDOWN_TOP :
                         cat == CoinCategory.ALT ? COOLDOWN_ALT :
@@ -275,7 +273,6 @@ public final class DecisionEngineMerged {
     private void registerSignal(String symbol, com.bot.TradingCore.Side side, long now) {
 
         String key = symbol + "_" + side;
-
         cooldownMap.put(key, now);
 
         Deque<String> history =
@@ -295,11 +292,10 @@ public final class DecisionEngineMerged {
                                      double atr,
                                      double price) {
 
-        double edge = rawScore - 1.8;
+        double edge = rawScore - 2.25;
 
         double sigmoid =
-                1.0 / (1.0 + Math.exp(-2.0 * edge));
-
+                1.0 / (1.0 + Math.exp(-1.4 * edge));
         double regimeBoost =
                 state == MarketState.STRONG_TREND ? 0.05 : 0;
 
