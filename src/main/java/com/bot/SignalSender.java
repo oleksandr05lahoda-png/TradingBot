@@ -141,7 +141,7 @@ public class SignalSender {
 
         // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 70);
-        this.MIN_CONF = 0.50;
+        this.MIN_CONF = 54.0;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 15);
         this.KLINES_LIMIT = envInt("KLINES", 120);
         this.REQUEST_DELAY_MS = envLong("REQUEST_DELAY_MS", 120);

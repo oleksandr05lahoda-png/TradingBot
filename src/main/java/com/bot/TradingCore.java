@@ -58,6 +58,8 @@ public final class TradingCore {
         private final double maxRiskPct;
         private final double minRR;
 
+        public static final double MIN_CONF = 0.54; // минимальный порог confidence
+
         public RiskEngine(double minRiskPct,
                           double maxRiskPct,
                           double minRR) {
@@ -109,8 +111,9 @@ public final class TradingCore {
                                      String reason,
                                      CoinType type) {
 
-            if (entry <= 0 || atr <= 0)
-                return null;
+            // проверка базовых условий
+            if (entry <= 0 || atr <= 0 || confidence < MIN_CONF)
+                return null; // фильтр MIN_CONF
 
             double atrPct = atr / entry;
             atrPct = clamp(atrPct, minRiskPct, maxRiskPct);
@@ -118,7 +121,7 @@ public final class TradingCore {
             double typeMultiplier = switch (type) {
                 case TOP -> 1.0;
                 case ALT -> 1.2;
-                case MEME -> 1.4; // снижено с 1.6
+                case MEME -> 1.4;
             };
 
             double riskPct = clamp(
@@ -127,11 +130,13 @@ public final class TradingCore {
                     maxRiskPct
             );
 
+            // RR адаптируется по confidence
             double rr =
                     confidence > 0.85 ? 3.2 :
                             confidence > 0.75 ? 2.6 :
                                     confidence > 0.65 ? 2.2 :
-                                            1.8;
+                                            confidence >= MIN_CONF ? 1.8 :
+                                                    1.5;
 
             rr = Math.max(rr, minRR);
 
@@ -198,7 +203,7 @@ public final class TradingCore {
             if (highVol) conf += 0.025;
             if (lowVol) conf -= 0.03;
 
-            return clamp(conf, 0.40, 0.95);
+            return clamp(conf, 0.40, 0.95); // адаптируемый диапазон
         }
 
         private double strategyBoost(String strategy) {

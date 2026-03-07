@@ -10,13 +10,13 @@ public final class DecisionEngineMerged {
     public enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, VOLATILE }
     public enum HTFBias { BULL, BEAR, NONE }
 
-    private static final int MIN_BARS = 100;
+    private static final int MIN_BARS = 220;
 
     private static final long COOLDOWN_TOP = 15 * 60_000;
     private static final long COOLDOWN_ALT = 15 * 60_000;
     private static final long COOLDOWN_MEME = 15 * 60_000;
-
-    private static final double MIN_CONFIDENCE = 58.0;
+    private final Map<String, Double> lastSignalPrice = new ConcurrentHashMap<>();
+    private static final double MIN_CONFIDENCE = 54.0;
 
     private final Map<String, Long> cooldownMap = new ConcurrentHashMap<>();
     private final Map<String, Deque<String>> recentDirections = new ConcurrentHashMap<>();
@@ -127,8 +127,8 @@ public final class DecisionEngineMerged {
 
         if (state != MarketState.STRONG_TREND) {
 
-            if (rsi14 > 84) scoreLong -= 0.12;
-            if (rsi14 < 16) scoreShort -= 0.12;
+            if (rsi14 > 82) scoreLong -= 0.18;
+            if (rsi14 < 18) scoreShort -= 0.18;
         }
 
         /* ===== ADX trend protection ===== */
@@ -144,20 +144,16 @@ public final class DecisionEngineMerged {
                 scoreLong *= 0.65;
         }
 
-        /* ===== Dynamic threshold ===== */
-
         double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 1.10 : 1.0;
+                state == MarketState.STRONG_TREND ? 0.95 : 0.85;
 
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
             return null;
 
-        /* ===== Momentum protection ===== */
-
         double move4 = (last(c15).close - c15.get(c15.size() - 4).close) / price;
 
-        boolean strongMomentumUp = move4 > 0.018;
-        boolean strongMomentumDown = move4 < -0.018;
+        boolean strongMomentumUp = move4 > 0.012;
+        boolean strongMomentumDown = move4 < -0.012;
 
         if (strongMomentumUp && scoreShort > scoreLong)
             scoreShort *= 0.8;
@@ -165,11 +161,9 @@ public final class DecisionEngineMerged {
         if (strongMomentumDown && scoreLong > scoreShort)
             scoreLong *= 0.8;
 
-        /* ===== Decide side ===== */
-
         double scoreDiff = Math.abs(scoreLong - scoreShort);
 
-        if (scoreDiff < 0.06) return null;
+        if (scoreDiff < 0.18) return null;
 
         com.bot.TradingCore.Side side =
                 scoreLong > scoreShort ?
@@ -233,7 +227,8 @@ public final class DecisionEngineMerged {
                 side == com.bot.TradingCore.Side.LONG ?
                         price + atr * riskMult * rr :
                         price - atr * riskMult * rr;
-
+        if (!priceMovedEnough(symbol, price))
+            return null;
         registerSignal(symbol, side, now);
 
         return new TradeIdea(symbol, side, price, stop, take, probability, flags);
@@ -298,36 +293,38 @@ public final class DecisionEngineMerged {
         if (history.size() > 3)
             history.removeFirst();
     }
-
     private double computeConfidence(double rawScore,
                                      MarketState state,
                                      CoinCategory cat,
                                      double atr,
                                      double price) {
 
-        // Подкорректированное смещение edge
-        double edge = rawScore - 3.0; // раньше было 2.25
-        double sigmoid = 1.0 / (1.0 + Math.exp(-1.2 * edge)); // раньше -1.4
+        double edge = rawScore - 1.0;
 
-        double regimeBoost = state == MarketState.STRONG_TREND ? 0.05 : 0;
+        double sigmoid =
+                1.0 / (1.0 + Math.exp(-2.2 * edge));
+
+        double regimeBoost =
+                state == MarketState.STRONG_TREND ? 0.06 :
+                        state == MarketState.WEAK_TREND ? 0.02 : 0;
 
         double categoryPenalty =
-                cat == CoinCategory.MEME ? -0.04 :
-                        cat == CoinCategory.ALT ? -0.015 :
-                                0;
+                cat == CoinCategory.MEME ? -0.05 :
+                        cat == CoinCategory.ALT ? -0.02 : 0;
 
-        double atrFactor =
-                atr / price < 0.003 ? 0.05 :
-                        atr / price > 0.01 ? -0.03 :
-                                0;
+        double vol = atr / price;
 
-        double rawProb = clamp(sigmoid + regimeBoost + categoryPenalty + atrFactor, 0, 1);
+        double volatilityFactor =
+                vol > 0.012 ? -0.04 :
+                        vol < 0.002 ? -0.02 : 0;
 
-        // Привязка Probability к реальной шкале, но ограничиваем max 80-82
-        return clamp(50 + rawProb * 30, 50, 82);
+        double prob =
+                sigmoid + regimeBoost + categoryPenalty + volatilityFactor;
+
+        prob = clamp(prob, 0.45, 0.92);
+
+        return prob * 100.0;
     }
-
-    /* ===== STATE ===== */
 
     private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
 
@@ -474,7 +471,7 @@ public final class DecisionEngineMerged {
         double atrVal = atr(c, 14);
 
         return Math.abs(last(c).close - c.get(c.size() - 5).close)
-                > atrVal * 0.12;
+                > atrVal * 0.18;
     }
 
     public boolean volumeSpike(List<com.bot.TradingCore.Candle> c, CoinCategory cat) {
@@ -518,7 +515,24 @@ public final class DecisionEngineMerged {
 
         return c != null && c.size() >= MIN_BARS;
     }
+    private boolean priceMovedEnough(String symbol, double price) {
 
+        Double last = lastSignalPrice.get(symbol);
+
+        if (last == null) {
+            lastSignalPrice.put(symbol, price);
+            return true;
+        }
+
+        double diff = Math.abs(price - last) / last;
+
+        if (diff < 0.003)
+            return false;
+
+        lastSignalPrice.put(symbol, price);
+
+        return true;
+    }
     private double clamp(double v, double min, double max) {
 
         return Math.max(min, Math.min(max, v));

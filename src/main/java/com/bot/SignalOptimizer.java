@@ -19,7 +19,7 @@ public final class SignalOptimizer {
     private static final double WEAK_IMPULSE = 0.0006;
 
     private static final double MAX_CONF = 95.0;
-    private static final double MIN_CONF = 40.0;
+    private static final double MIN_CONF = 54.0; // синхронизировано с DecisionEngineMerged
 
     /* ================= STATE ================= */
 
@@ -116,7 +116,8 @@ public final class SignalOptimizer {
 
         double confidence = signal.probability;
 
-        if (mt == ZERO)
+        // устойчивая проверка ZERO
+        if (mt == null || (mt.impulse == 0 && mt.speed == 0 && mt.accel == 0))
             return confidence;
 
         boolean isLong =
@@ -124,20 +125,14 @@ public final class SignalOptimizer {
 
         boolean trendUp = mt.speed > 0;
 
-        double adjustment = 0.0;
+        double factor = 1.0;
 
-        if (mt.impulse > STRONG_IMPULSE) {
-            adjustment = ((isLong && trendUp) ||
-                    (!isLong && !trendUp))
-                    ? 7.0 : -6.0;
+        if (mt.impulse > STRONG_IMPULSE)
+            factor = ((isLong && trendUp) || (!isLong && !trendUp)) ? 1.08 : 0.93;
+        else if (mt.impulse > WEAK_IMPULSE)
+            factor = ((isLong && trendUp) || (!isLong && !trendUp)) ? 1.03 : 0.97;
 
-        } else if (mt.impulse > WEAK_IMPULSE) {
-            adjustment = ((isLong && trendUp) ||
-                    (!isLong && !trendUp))
-                    ? 3.0 : -3.0;
-        }
-
-        confidence += adjustment;
+        confidence *= factor;
 
         return clamp(confidence, MIN_CONF, MAX_CONF);
     }
@@ -159,6 +154,7 @@ public final class SignalOptimizer {
                 signal.flags
         );
     }
+
     /* ================= CLEANUP ================= */
 
     public void clearCacheForSymbol(String symbol) {
@@ -168,7 +164,6 @@ public final class SignalOptimizer {
     public void clearAllCache() {
         microTrendCache.clear();
     }
-
 
     private static double clamp(double v,
                                 double min,

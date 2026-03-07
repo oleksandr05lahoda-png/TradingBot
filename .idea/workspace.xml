@@ -4,7 +4,12 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="" />
+    <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -402,7 +407,8 @@
       <workItem from="1772814260341" duration="23000" />
       <workItem from="1772814293632" duration="8000" />
       <workItem from="1772814307345" duration="8962000" />
-      <workItem from="1772831207712" duration="6783000" />
+      <workItem from="1772831207712" duration="7651000" />
+      <workItem from="1772883520551" duration="2188000" />
     </task>
     <servers />
   </component>
