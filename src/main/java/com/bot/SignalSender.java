@@ -166,6 +166,20 @@ public class SignalSender {
         com.bot.TradingCore.AdaptiveBrain brain = new com.bot.TradingCore.AdaptiveBrain();
         this.optimizer = new com.bot.SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
+        // =================== Scheduler для автозапуска анализа ===================
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                System.out.println("[Scheduler] Start signal generation...");
+                List<com.bot.DecisionEngineMerged.TradeIdea> signals = generateSignals();
+                for (com.bot.DecisionEngineMerged.TradeIdea s : signals) {
+                    bot.sendMessageAsync(s.toString()); // исправлено
+                }
+            } catch (Exception e) {
+                System.out.println("[Scheduler] Error: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
 
     // ========================= Helpers for env parsing =========================
