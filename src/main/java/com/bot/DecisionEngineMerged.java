@@ -199,14 +199,31 @@ public final class DecisionEngineMerged {
 
         /* ===== Probability ===== */
 
-        double probability = computeConfidence(
-                Math.max(scoreLong, scoreShort),
-                state,
-                cat,
-                atr,
-                price
-        );
+        double maxScore = Math.max(scoreLong, scoreShort);
+        double diffScore = Math.abs(scoreLong - scoreShort);
+        double reasonSum = reasonWeightsLong.values().stream().mapToDouble(Double::doubleValue).sum() +
+                reasonWeightsShort.values().stream().mapToDouble(Double::doubleValue).sum();
 
+// базовая probability от 50 до 85% на основе score и причин
+        double baseProb = 50 + Math.min(35, maxScore * 100 * 0.7 + reasonSum * 10);
+
+// поправка по тренду
+        if(state == MarketState.STRONG_TREND) baseProb += 5;
+        if(state == MarketState.WEAK_TREND) baseProb += 2;
+
+// поправка по категории монеты
+        if(cat == CoinCategory.MEME) baseProb -= 5;
+        if(cat == CoinCategory.ALT) baseProb -= 2;
+
+// поправка по волатильности
+        double vol = atr / price;
+        if(vol > 0.012) baseProb -= 3;
+        if(vol < 0.003) baseProb += 2;
+
+// ограничение диапазона
+        baseProb = clamp(baseProb, 50, 85);
+
+        double probability = baseProb;
         System.out.println("[DEBUG-DE] symbol=" + symbol +
                 " | scoreLong=" + scoreLong +
                 " | scoreShort=" + scoreShort +
