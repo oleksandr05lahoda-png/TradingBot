@@ -290,38 +290,29 @@ public final class DecisionEngineMerged {
                                      boolean pullbackUp, boolean pullbackDown,
                                      boolean impulse) {
 
-        // Разница между лонг и шорт, 0..1
-        double baseScore = Math.abs(scoreLong - scoreShort);
+        // 1️⃣ Считаем “сырой” scoreDiff
+        double scoreDiff = scoreLong - scoreShort; // может быть отрицательным
+        double rawScore = Math.abs(scoreDiff);
 
-        // Начальная вероятность 0..100
-        double prob = baseScore * 100;
+        // 2️⃣ Нормируем scoreDiff по максимальному возможному
+        // Максимальный scoreLong = HTF + pullback + div + impulse = примерно 2.45 (0.45+0.9+0.55+0.55)
+        double maxScore = 2.45;
+        double normScore = rawScore / maxScore;  // 0..1
 
-        // ===== бонус по тренду =====
-        switch (state) {
-            case STRONG_TREND -> prob += 5;
-            case WEAK_TREND   -> prob += 2;
-            default           -> {}
-        }
+        // 3️⃣ Добавляем небольшие бонусы
+        if (bullDiv || bearDiv) normScore += 0.05;
+        if (pullbackUp || pullbackDown) normScore += 0.05;
+        if (impulse) normScore += 0.03;
 
-        // ===== штраф по категории монеты =====
-        if (cat == CoinCategory.MEME) prob -= 5;
-        else if (cat == CoinCategory.ALT) prob -= 2;
+        // 4️⃣ Ограничиваем 0..1
+        normScore = Math.min(1.0, normScore);
 
-        // ===== индикаторы =====
-        if (bullDiv || bearDiv) prob += 5;
-        if (pullbackUp || pullbackDown) prob += 5;
-        if (impulse) prob += 3;
+        // 5️⃣ Применяем сигмоид для плавного распределения вероятности
+        // Это убирает “100% на каждом сигнале”
+        double probability = 100.0 / (1.0 + Math.exp(-12 * (normScore - 0.5))); // сигмоид 0..100
 
-        // ===== волатильность =====
-        double vol = atr / price;
-        if (vol > 0.012) prob -= 5;
-        else if (vol < 0.002) prob += 2;
-
-        // Ограничение 0-100%
-        prob = clamp(prob, 0, 100);
-
-        // округляем до целого для красивого процента
-        return Math.round(prob);
+        // 6️⃣ Итоговая вероятность округляется до целого %
+        return Math.round(probability);
     }
     private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
 
