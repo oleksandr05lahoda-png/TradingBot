@@ -47,23 +47,35 @@ public final class DecisionEngineMerged {
             this.probability = probability;
             this.flags = flags != null ? flags : List.of();
         }
+
         @Override
         public String toString() {
+
+            String flagStr =
+                    flags == null || flags.isEmpty()
+                            ? "-"
+                            : String.join(", ", flags);
+
+            String time =
+                    java.time.LocalTime.now()
+                            .withNano(0)
+                            .toString();
+
             return String.format(
-                    "%s → %s\n" +
+                    "*%s* → *%s*\n" +
                             "Price: %.6f\n" +
                             "Probability: %.0f%%\n" +
                             "Stop-Take: %.6f - %.6f\n" +
-                            "Flags: %s",
+                            "Flags: %s\n" +
+                            "_time: %s_",
                     symbol,
                     side,
                     price,
                     probability,
                     stop,
                     take,
-                    flags == null || flags.isEmpty()
-                            ? "-"
-                            : String.join(", ", flags)
+                    flagStr,
+                    time
             );
         }
     }

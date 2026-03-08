@@ -64,10 +64,8 @@ public class BotMain {
                     return;
                 }
 
-                // Отправка сигналов в Telegram
                 for (DecisionEngineMerged.TradeIdea s : filteredSignals) {
-                    double probSafe = s.probability > 0 ? s.probability : 50.0; // защита от null/0
-                    telegram.sendMessageAsync(formatSignal(s, probSafe));
+                    telegram.sendMessageAsync(s.toString());
                 }
 
                 LOGGER.info("Signals sent: " + filteredSignals.size());
@@ -96,32 +94,6 @@ public class BotMain {
             }
         }));
     }
-
-    // ======================= Форматирование сигнала =======================
-    private static String formatSignal(DecisionEngineMerged.TradeIdea s, double probabilityPercent) {
-        String flags = s.flags != null && !s.flags.isEmpty()
-                ? String.join(", ", s.flags)
-                : "—";
-
-        return String.format(
-                "*%s* → *%s*\n" +
-                        "Price: %.6f\n" +
-                        "Probability: %.0f%%\n" +
-                        "Stop-Take: %.6f - %.6f\n" +
-                        "Flags: %s\n" +
-                        "_time: %s_",
-                s.symbol,
-                s.side,
-                s.price,
-                probabilityPercent,
-                s.stop,
-                s.take,
-                flags,
-                LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
-        );
-    }
-
-    // ======================= ThreadFactory =======================
     static class BotThreadFactory implements java.util.concurrent.ThreadFactory {
         @Override
         public Thread newThread(Runnable r) {
