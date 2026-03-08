@@ -290,16 +290,14 @@ public final class DecisionEngineMerged {
                                      boolean pullbackUp, boolean pullbackDown,
                                      boolean impulse) {
 
-        // 1️⃣ Считаем “сырой” scoreDiff
-        double scoreDiff = scoreLong - scoreShort; // может быть отрицательным
-        double rawScore = Math.abs(scoreDiff);
+        // 1️⃣ Разница между LONG и SHORT
+        double scoreDiff = Math.abs(scoreLong - scoreShort);
 
-        // 2️⃣ Нормируем scoreDiff по максимальному возможному
-        // Максимальный scoreLong = HTF + pullback + div + impulse = примерно 2.45 (0.45+0.9+0.55+0.55)
-        double maxScore = 2.45;
-        double normScore = rawScore / maxScore;  // 0..1
+        // 2️⃣ Нормируем по реальному максимуму сигналов
+        double maxScore = 2.45; // HTF + pullback + дивергенции + импульс
+        double normScore = scoreDiff / maxScore;
 
-        // 3️⃣ Добавляем небольшие бонусы
+        // 3️⃣ Дополнительные бонусы от индикаторов
         if (bullDiv || bearDiv) normScore += 0.05;
         if (pullbackUp || pullbackDown) normScore += 0.05;
         if (impulse) normScore += 0.03;
@@ -307,11 +305,20 @@ public final class DecisionEngineMerged {
         // 4️⃣ Ограничиваем 0..1
         normScore = Math.min(1.0, normScore);
 
-        // 5️⃣ Применяем сигмоид для плавного распределения вероятности
-        // Это убирает “100% на каждом сигнале”
-        double probability = 100.0 / (1.0 + Math.exp(-12 * (normScore - 0.5))); // сигмоид 0..100
+        // 5️⃣ Применяем линейное ограничение сверху, максимум ~80%
+        double probability = 50 + normScore * 30; // 50%..80%
 
-        // 6️⃣ Итоговая вероятность округляется до целого %
+        // 6️⃣ Корректировка по тренду и категории (необязательно)
+        if (state == MarketState.STRONG_TREND) probability += 3;  // максимум ~83%
+        else if (state == MarketState.WEAK_TREND) probability += 1; // максимум ~81%
+
+        if (cat == CoinCategory.MEME) probability -= 5; // MEME чуть снижаем
+        else if (cat == CoinCategory.ALT) probability -= 2;
+
+        // 7️⃣ Ограничиваем окончательно
+        probability = clamp(probability, 50, 85);
+
+        // 8️⃣ Округляем до целого %
         return Math.round(probability);
     }
     private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
