@@ -1134,16 +1134,16 @@ public class SignalSender {
 
             for (String pair : cachedPairs) {
 
-                List<com.bot.TradingCore.Candle> m1  = fetchKlines(pair, "1m", KLINES_LIMIT);
-                List<com.bot.TradingCore.Candle> m5  = fetchKlines(pair, "5m", KLINES_LIMIT);
-                List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair, "15m", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> c1  = fetchKlines(pair, "1m", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> c5  = fetchKlines(pair, "5m", KLINES_LIMIT);
+                List<com.bot.TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
                 List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
 
-                if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60) continue;
+                if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
 
                 // Получаем сигнал через движок
                 com.bot.DecisionEngineMerged.TradeIdea idea =
-                        engine.analyze(pair, m1, m5, m15, h1, com.bot.DecisionEngineMerged.CoinCategory.TOP);
+                        engine.analyze(pair, c1, c5, c15, h1, com.bot.DecisionEngineMerged.CoinCategory.TOP);
 
                 if (idea == null || idea.probability < MIN_CONF) continue;
 
@@ -1151,7 +1151,7 @@ public class SignalSender {
                 if (btcTrend < 0 && idea.side.name().equals("LONG")) continue;
                 if (btcTrend > 0 && idea.side.name().equals("SHORT")) continue;
 
-                long candleCloseTime = m15.get(m15.size() - 1).closeTime;
+                long candleCloseTime = c15.get(c15.size() - 1).closeTime;
 
                 // Собираем Signal
                 Signal tempSignal = new Signal(
@@ -1159,17 +1159,17 @@ public class SignalSender {
                         idea.side.name(),
                         idea.probability,
                         idea.price,
-                        engine.rsi(m15, 14),
+                        engine.rsi(c15, 14),
                         Math.max(0.0, idea.probability),
                         1,
-                        engine.volumeSpike(m15, com.bot.DecisionEngineMerged.CoinCategory.TOP),
-                        engine.atr(m15, 14) > idea.price * 0.001,
+                        engine.volumeSpike(c15, com.bot.DecisionEngineMerged.CoinCategory.TOP),
+                        engine.atr(c15, 14) > idea.price * 0.001,
                         true,
                         false,
                         false,
-                        engine.impulse(m1),
-                        engine.rsi(m15, 7),
-                        engine.rsi(m15, 4)
+                        engine.impulse(c1),
+                        engine.rsi(c15, 7),
+                        engine.rsi(c15, 4)
                 );
 
                 if (isCooldown(pair, tempSignal, candleCloseTime)) continue;
