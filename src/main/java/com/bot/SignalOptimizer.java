@@ -95,34 +95,30 @@ public final class SignalOptimizer {
         return result;
     }
 
-    /* ================= CONFIDENCE ================= */
-
     public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
         MicroTrendResult mt = computeMicroTrend(signal.symbol);
         double confidence = signal.probability;
 
-        // устойчивая проверка ZERO
-        if (mt == null || (mt.impulse == 0 && mt.speed == 0 && mt.accel == 0))
+        if (mt == null || mt.impulse < 1e-7)  // нулевой тренд → не меняем
             return confidence;
 
         boolean isLong = signal.side == com.bot.TradingCore.Side.LONG;
         boolean trendUp = mt.speed > 0;
 
-        // --- динамическая корректировка probability ---
+        // Вычисляем выравнивание тренда: +1 если сигнал совпадает с трендом, -1 если против
         double trendAlignment = (isLong && trendUp) || (!isLong && !trendUp) ? 1.0 : -1.0;
-        double impulseFactor = Math.min(mt.impulse / STRONG_IMPULSE, 1.0); // нормируем до 1
-        double factor = 1.0 + 0.08 * impulseFactor * trendAlignment; // максимум +/- 8%
 
-        // слабый шум не изменяет probability
-        if (Math.abs(mt.impulse) < 0.0001) factor = 1.0;
+        // Нормируем импульс в диапазон 0…1 относительно WEAK и STRONG
+        double impulseNorm = Math.min(Math.max(mt.impulse - WEAK_IMPULSE, 0.0) / (STRONG_IMPULSE - WEAK_IMPULSE), 1.0);
+
+        // Плавная коррекция: от ±2% при слабом импульсе до ±8% при сильном
+        double factor = 1.0 + trendAlignment * (0.02 + 0.06 * impulseNorm);
 
         confidence *= factor;
 
         return clamp(confidence, MIN_CONF, MAX_CONF);
     }
-
-    /* ================= STOP / TAKE ================= */
 
     public com.bot.DecisionEngineMerged.TradeIdea withAdjustedConfidence(
             com.bot.DecisionEngineMerged.TradeIdea signal) {
