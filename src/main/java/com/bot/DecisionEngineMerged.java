@@ -47,6 +47,25 @@ public final class DecisionEngineMerged {
             this.probability = probability;
             this.flags = flags != null ? flags : List.of();
         }
+        @Override
+        public String toString() {
+            return String.format(
+                    "%s → %s\n" +
+                            "Price: %.6f\n" +
+                            "Probability: %.0f%%\n" +
+                            "Stop-Take: %.6f - %.6f\n" +
+                            "Flags: %s",
+                    symbol,
+                    side,
+                    price,
+                    probability,
+                    stop,
+                    take,
+                    flags == null || flags.isEmpty()
+                            ? "-"
+                            : String.join(", ", flags)
+            );
+        }
     }
 
     private TradeIdea generate(String symbol,

@@ -3,7 +3,6 @@ package com.bot;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
-import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -15,7 +14,8 @@ public class BotMain {
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.systemDefault();
     private static final int SIGNAL_INTERVAL_MIN = 15;
-    private static final int KLINES_LIMIT = 200; // например, 100 свечей
+    private static final int KLINES_LIMIT = 200;
+
     public static void main(String[] args) {
 
         if (TG_TOKEN == null || TG_TOKEN.isBlank()) {
@@ -30,28 +30,27 @@ public class BotMain {
         telegram.sendMessageAsync("🚀 Trading Bot запущен");
         LOGGER.info("Bot started at " + LocalDateTime.now());
 
-        ScheduledExecutorService scheduler =
-                Executors.newScheduledThreadPool(2, new BotThreadFactory());
+        var scheduler = java.util.concurrent.Executors.newScheduledThreadPool(2, new BotThreadFactory());
 
         Runnable signalTask = () -> {
             try {
                 LOGGER.info("=== SIGNAL SCAN START === " + LocalDateTime.now());
 
-                // 1️⃣ Получаем все сигналы
+                // Получаем все сигналы
                 List<DecisionEngineMerged.TradeIdea> rawSignals = signalSender.generateSignals();
-
                 if (rawSignals == null || rawSignals.isEmpty()) {
                     LOGGER.info("No valid signals this cycle.");
                     return;
                 }
 
-                // 2️⃣ Обновляем глобальный импульс для BTC
+                // Обновляем глобальный импульс для BTC
                 List<TradingCore.Candle> btcCandles = signalSender.fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
                 if (btcCandles != null && btcCandles.size() > 20) {
                     globalImpulse.update(btcCandles);
                 }
                 GlobalImpulseController.GlobalContext ctx = globalImpulse.getContext();
 
+                // Фильтр сигналов по глобальному тренду
                 List<DecisionEngineMerged.TradeIdea> filteredSignals = rawSignals.stream()
                         .filter(s -> {
                             if (ctx.onlyLong) return s.side == com.bot.TradingCore.Side.LONG;
@@ -65,9 +64,10 @@ public class BotMain {
                     return;
                 }
 
-                // 4️⃣ Отправляем в Telegram
+                // Отправка сигналов в Telegram
                 for (DecisionEngineMerged.TradeIdea s : filteredSignals) {
-                    telegram.sendMessageAsync(formatSignal(s));
+                    double probSafe = s.probability > 0 ? s.probability : 50.0; // защита от null/0
+                    telegram.sendMessageAsync(formatSignal(s, probSafe));
                 }
 
                 LOGGER.info("Signals sent: " + filteredSignals.size());
@@ -78,8 +78,8 @@ public class BotMain {
             }
         };
 
-        // Запуск сразу + каждые 15 минут
-        scheduler.scheduleAtFixedRate(signalTask, 0, SIGNAL_INTERVAL_MIN, TimeUnit.MINUTES);
+        // Запуск сразу и каждые 15 минут
+        scheduler.scheduleAtFixedRate(signalTask, 0, SIGNAL_INTERVAL_MIN, java.util.concurrent.TimeUnit.MINUTES);
 
         // Graceful shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -87,7 +87,7 @@ public class BotMain {
             scheduler.shutdown();
             telegram.shutdown();
             try {
-                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                if (!scheduler.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
                     scheduler.shutdownNow();
                 }
             } catch (InterruptedException e) {
@@ -96,50 +96,12 @@ public class BotMain {
             }
         }));
     }
-    /**
-     * Вычисляет вероятность правдивости сигнала на основе индикаторов (flags)
-     */
-    private static double calculateProbability(DecisionEngineMerged.TradeIdea s) {
-        if (s.flags == null || s.flags.isEmpty())
-            return 50; // нейтральный сигнал
 
-        int strong = 0;
-        int medium = 0;
-        int weak = 0;
-
-        for (String flag : s.flags) {
-            switch(flag) {
-                case "ATR↑":
-                case "impulse:true":
-                case "EMA_strong":
-                    strong++;
-                    break;
-                case "Volume↑":
-                case "RSI_good":
-                    medium++;
-                    break;
-                default:
-                    weak++;
-            }
-        }
-
-        double prob = 50; // базовая вероятность
-        prob += (strong * 15);  // каждый сильный индикатор +15%
-        prob += (medium * 7);   // каждый средний +7%
-        prob += (weak * 3);     // каждый слабый +3%
-
-        // Ограничиваем максимум и минимум
-        if (prob > 80) prob = 80;
-        if (prob < 50) prob = 50;
-
-        return prob;
-    }
-    private static String formatSignal(DecisionEngineMerged.TradeIdea s) {
+    // ======================= Форматирование сигнала =======================
+    private static String formatSignal(DecisionEngineMerged.TradeIdea s, double probabilityPercent) {
         String flags = s.flags != null && !s.flags.isEmpty()
                 ? String.join(", ", s.flags)
                 : "—";
-
-        double probabilityPercent = calculateProbability(s);
 
         return String.format(
                 "*%s* → *%s*\n" +
@@ -159,10 +121,8 @@ public class BotMain {
         );
     }
 
-    /**
-     * Кастомный ThreadFactory с защитой от смерти потока
-     */
-    static class BotThreadFactory implements ThreadFactory {
+    // ======================= ThreadFactory =======================
+    static class BotThreadFactory implements java.util.concurrent.ThreadFactory {
         @Override
         public Thread newThread(Runnable r) {
             Thread t = new Thread(r);
@@ -175,9 +135,7 @@ public class BotMain {
         }
     }
 
-    /**
-     * UTC → локальное
-     */
+    // ======================= UTC → локальное время =======================
     public static String formatLocalTime(long utcMillis) {
         return Instant.ofEpochMilli(utcMillis)
                 .atZone(ZONE)
