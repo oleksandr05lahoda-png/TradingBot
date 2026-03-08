@@ -299,28 +299,20 @@ public final class DecisionEngineMerged {
                                      double atr,
                                      double price) {
 
-        double edge = rawScore - 1.0;
-
-        double sigmoid =
-                1.0 / (1.0 + Math.exp(-2.2 * edge));
-
-        double regimeBoost =
-                state == MarketState.STRONG_TREND ? 0.06 :
-                        state == MarketState.WEAK_TREND ? 0.02 : 0;
-
-        double categoryPenalty =
-                cat == CoinCategory.MEME ? -0.05 :
-                        cat == CoinCategory.ALT ? -0.02 : 0;
-
+        double edge = rawScore - 0.5; // смещаем к 0.5 для разнообразия
+        double sigmoid = 1.0 / (1.0 + Math.exp(-3.0 * edge)); // чуть круче кривая
+        double regimeBoost = state == MarketState.STRONG_TREND ? 0.08 :
+                state == MarketState.WEAK_TREND ? 0.03 : 0;
+        double categoryPenalty = cat == CoinCategory.MEME ? -0.08 :
+                cat == CoinCategory.ALT ? -0.03 : 0;
         double vol = atr / price;
+        double volatilityFactor = vol > 0.012 ? -0.05 :
+                vol < 0.002 ? -0.02 : 0;
 
-        double volatilityFactor =
-                vol > 0.012 ? -0.04 :
-                        vol < 0.002 ? -0.02 : 0;
+// Добавляем рандомизацию ±3% для реалистичности
+        double randomFactor = (new Random().nextDouble() - 0.5) * 0.06;
 
-        double prob =
-                sigmoid + regimeBoost + categoryPenalty + volatilityFactor;
-
+        double prob = sigmoid + regimeBoost + categoryPenalty + volatilityFactor + randomFactor;
         prob = clamp(prob, 0.45, 0.92);
 
         return prob * 100.0;
@@ -526,7 +518,7 @@ public final class DecisionEngineMerged {
 
         double diff = Math.abs(price - last) / last;
 
-        if (diff < 0.003)
+        if (diff < 0.0015)
             return false;
 
         lastSignalPrice.put(symbol, price);
