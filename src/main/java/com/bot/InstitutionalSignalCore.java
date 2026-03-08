@@ -95,11 +95,20 @@ public final class InstitutionalSignalCore {
         // используем одну переменную list
         List<ActiveSignal> list = activeSignals.getOrDefault(signal.symbol, new ArrayList<>());
 
-        // Если сигнал практически идентичен предыдущему, отклоняем
+        // Проверка схожих сигналов
         for (ActiveSignal a : list) {
-            if (a.side == signal.side &&
-                    Math.abs(a.entry - signal.price)/a.entry < minSignalDiff &&
-                    Math.abs(a.probability - signal.probability) < 0.01) {
+            double priceDiff = Math.abs(a.entry - signal.price)/a.entry;
+            double probDiff = Math.abs(a.probability - signal.probability);
+
+            // Сигнал почти такой же как существующий
+            if (a.side == signal.side && priceDiff < minSignalDiff && probDiff < 0.015) {
+                System.out.println("[DEBUG] Signal too similar → rejected");
+                return false;
+            }
+
+            // Сигнал с другой стороны, но цена слишком близка
+            if (a.side != signal.side && priceDiff < minSignalDiff) {
+                System.out.println("[DEBUG] Opposite side, price too close → rejected");
                 return false;
             }
         }
@@ -128,27 +137,6 @@ public final class InstitutionalSignalCore {
                     " size " + list.size() + " >= maxSignalsPerSymbol " + maxSignalsPerSymbol + " → rejected");
             return false;
         }
-
-        for (ActiveSignal a : list) {
-            if (a.side != signal.side) {
-                System.out.println("[DEBUG] Side mismatch: active=" + a.side + " vs signal=" + signal.side + " → rejected");
-                return false;
-            }
-
-            double diff = Math.abs(a.entry - signal.price) / a.entry;
-            if (diff < minSignalDiff) {
-                System.out.println("[DEBUG] Signal price diff too small: " + diff +
-                        " < minSignalDiff " + minSignalDiff + " → rejected");
-                return false;
-            }
-
-            if (Math.abs(a.probability - signal.probability) < 1.5) {
-                System.out.println("[DEBUG] Probability too close: " + Math.abs(a.probability - signal.probability) +
-                        " < 1.5 → rejected");
-                return false;
-            }
-        }
-
         double estimatedExposure = estimateExposure(signal);
         if (currentExposure + estimatedExposure > maxPortfolioExposure) {
             System.out.println("[DEBUG] EstimatedExposure " + estimatedExposure +

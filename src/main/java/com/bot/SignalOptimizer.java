@@ -79,58 +79,43 @@ public final class SignalOptimizer {
         double sum = prev;
 
         for (int i = 1; i < buffer.size(); i++) {
-
             double price = buffer.get(i);
             double diff = price - prev;
-
             double prevSpeed = speed;
 
-            speed = EMA_ALPHA * diff +
-                    (1 - EMA_ALPHA) * speed;
-
-            accel = EMA_ALPHA * (speed - prevSpeed) +
-                    (1 - EMA_ALPHA) * accel;
+            speed = EMA_ALPHA * diff + (1 - EMA_ALPHA) * speed;
+            accel = EMA_ALPHA * (speed - prevSpeed) + (1 - EMA_ALPHA) * accel;
 
             prev = price;
             sum += price;
         }
 
-        MicroTrendResult result =
-                new MicroTrendResult(
-                        speed,
-                        accel,
-                        sum / buffer.size());
-
+        MicroTrendResult result = new MicroTrendResult(speed, accel, sum / buffer.size());
         microTrendCache.put(symbol, result);
-
         return result;
     }
 
     /* ================= CONFIDENCE ================= */
 
-    public double adjustConfidence(
-            com.bot.DecisionEngineMerged.TradeIdea signal) {
+    public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
-        MicroTrendResult mt =
-                computeMicroTrend(signal.symbol);
-
+        MicroTrendResult mt = computeMicroTrend(signal.symbol);
         double confidence = signal.probability;
 
         // устойчивая проверка ZERO
         if (mt == null || (mt.impulse == 0 && mt.speed == 0 && mt.accel == 0))
             return confidence;
 
-        boolean isLong =
-                signal.side == com.bot.TradingCore.Side.LONG;
-
+        boolean isLong = signal.side == com.bot.TradingCore.Side.LONG;
         boolean trendUp = mt.speed > 0;
 
-        double factor = 1.0;
+        // --- динамическая корректировка probability ---
+        double trendAlignment = (isLong && trendUp) || (!isLong && !trendUp) ? 1.0 : -1.0;
+        double impulseFactor = Math.min(mt.impulse / STRONG_IMPULSE, 1.0); // нормируем до 1
+        double factor = 1.0 + 0.08 * impulseFactor * trendAlignment; // максимум +/- 8%
 
-        if (mt.impulse > STRONG_IMPULSE)
-            factor = ((isLong && trendUp) || (!isLong && !trendUp)) ? 1.08 : 0.93;
-        else if (mt.impulse > WEAK_IMPULSE)
-            factor = ((isLong && trendUp) || (!isLong && !trendUp)) ? 1.03 : 0.97;
+        // слабый шум не изменяет probability
+        if (Math.abs(mt.impulse) < 0.0001) factor = 1.0;
 
         confidence *= factor;
 
@@ -165,9 +150,9 @@ public final class SignalOptimizer {
         microTrendCache.clear();
     }
 
-    private static double clamp(double v,
-                                double min,
-                                double max) {
+    /* ================= UTIL ================= */
+
+    private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }
 }

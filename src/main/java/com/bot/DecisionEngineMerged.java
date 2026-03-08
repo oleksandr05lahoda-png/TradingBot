@@ -199,44 +199,21 @@ public final class DecisionEngineMerged {
 
         /* ===== Probability ===== */
 
-        double maxScore = Math.max(scoreLong, scoreShort);
-        double diffScore = Math.abs(scoreLong - scoreShort);
-        double reasonSum = reasonWeightsLong.values().stream().mapToDouble(Double::doubleValue).sum() +
-                reasonWeightsShort.values().stream().mapToDouble(Double::doubleValue).sum();
+        // ==== Новая честная probability ====
+        double rawScore = scoreLong > scoreShort ? scoreLong : scoreShort;
+        double probability = computeConfidence(rawScore, state, cat, atr, price);
 
-// базовая probability от 50 до 85% на основе score и причин
-        double baseProb = 50 + Math.min(35, maxScore * 100 * 0.7 + reasonSum * 10);
+        if(probability < MIN_CONFIDENCE) {
+            System.out.println("[DEBUG-DE] probability < MIN_CONFIDENCE → rejected");
+            return null;
+        }
 
-// поправка по тренду
-        if(state == MarketState.STRONG_TREND) baseProb += 5;
-        if(state == MarketState.WEAK_TREND) baseProb += 2;
-
-// поправка по категории монеты
-        if(cat == CoinCategory.MEME) baseProb -= 5;
-        if(cat == CoinCategory.ALT) baseProb -= 2;
-
-// поправка по волатильности
-        double vol = atr / price;
-        if(vol > 0.012) baseProb -= 3;
-        if(vol < 0.003) baseProb += 2;
-
-// ограничение диапазона
-        baseProb = clamp(baseProb, 50, 85);
-
-        double probability = baseProb;
         System.out.println("[DEBUG-DE] symbol=" + symbol +
                 " | scoreLong=" + scoreLong +
                 " | scoreShort=" + scoreShort +
                 " | probability=" + probability +
                 " | atr=" + atr +
                 " | price=" + price);
-
-        if (probability < MIN_CONFIDENCE) {
-            System.out.println("[DEBUG-DE] probability < MIN_CONFIDENCE → rejected");
-            return null;
-        }
-
-        /* ===== Flags ===== */
 
         List<String> flags = new ArrayList<>();
 
