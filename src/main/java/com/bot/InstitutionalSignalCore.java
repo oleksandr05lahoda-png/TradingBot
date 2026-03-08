@@ -9,7 +9,6 @@ public final class InstitutionalSignalCore {
     /* =========================================================
        CONFIGURATION
        ========================================================= */
-
     private final int maxGlobalSignals;
     private final int maxSignalsPerSymbol;
     private final double maxPortfolioExposure;
@@ -23,7 +22,6 @@ public final class InstitutionalSignalCore {
                                    double minConfidence,
                                    double minSignalDiff,
                                    long signalTtlMs) {
-
         this.maxGlobalSignals = maxGlobalSignals;
         this.maxSignalsPerSymbol = maxSignalsPerSymbol;
         this.maxPortfolioExposure = maxPortfolioExposure;
@@ -35,17 +33,14 @@ public final class InstitutionalSignalCore {
     /* =========================================================
        STATE
        ========================================================= */
-
     private final Map<String, List<ActiveSignal>> activeSignals = new ConcurrentHashMap<>();
     private final Map<String, List<ClosedTrade>> history = new ConcurrentHashMap<>();
     private final Map<String, Double> symbolScore = new ConcurrentHashMap<>();
-
     private volatile double currentExposure = 0.0;
 
     /* =========================================================
        MODELS
        ========================================================= */
-
     public static final class ActiveSignal {
         public final String symbol;
         public final com.bot.TradingCore.Side side;
@@ -71,9 +66,7 @@ public final class InstitutionalSignalCore {
         public final double pnl;
         public final long duration;
 
-        public ClosedTrade(String symbol,
-                           double pnl,
-                           long duration) {
+        public ClosedTrade(String symbol, double pnl, long duration) {
             this.symbol = symbol;
             this.pnl = pnl;
             this.duration = duration;
@@ -83,7 +76,6 @@ public final class InstitutionalSignalCore {
     /* =========================================================
        MAIN FILTER
        ========================================================= */
-
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
         cleanupExpiredSignals();
@@ -100,10 +92,22 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        if (getActiveSignalsCount() >= maxGlobalSignals) {
-            System.out.println("[DEBUG] ActiveSignalsCount " + getActiveSignalsCount() +
-                    " >= maxGlobalSignals " + maxGlobalSignals + " → rejected");
-            return false;
+        // используем одну переменную list
+        List<ActiveSignal> list = activeSignals.getOrDefault(signal.symbol, new ArrayList<>());
+
+        // Если сигнал практически идентичен предыдущему, отклоняем
+        for (ActiveSignal a : list) {
+            if (a.side == signal.side &&
+                    Math.abs(a.entry - signal.price)/a.entry < minSignalDiff &&
+                    Math.abs(a.probability - signal.probability) < 0.01) {
+                return false;
+            }
+        }
+
+        // Можно оставить максимум на одну монету, но не глобально
+        if (!list.isEmpty()) {
+            // обновляем существующий сигнал, вместо спама
+            list.clear();
         }
 
         if (currentExposure >= maxPortfolioExposure) {
@@ -119,9 +123,6 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        List<ActiveSignal> list =
-                activeSignals.getOrDefault(signal.symbol, List.of());
-
         if (list.size() >= maxSignalsPerSymbol) {
             System.out.println("[DEBUG] Active signals for " + signal.symbol +
                     " size " + list.size() + " >= maxSignalsPerSymbol " + maxSignalsPerSymbol + " → rejected");
@@ -129,7 +130,6 @@ public final class InstitutionalSignalCore {
         }
 
         for (ActiveSignal a : list) {
-
             if (a.side != signal.side) {
                 System.out.println("[DEBUG] Side mismatch: active=" + a.side + " vs signal=" + signal.side + " → rejected");
                 return false;
@@ -162,11 +162,9 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       REGISTER
+       REGISTER / UPDATE
        ========================================================= */
-
     public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
-
         long now = System.currentTimeMillis();
 
         ActiveSignal active = new ActiveSignal(
@@ -177,45 +175,31 @@ public final class InstitutionalSignalCore {
                 now
         );
 
-        activeSignals
-                .computeIfAbsent(signal.symbol,
-                        k -> new CopyOnWriteArrayList<>())
-                .add(active);
+        // обновляем сигнал, чтобы не было дублирования
+        activeSignals.compute(signal.symbol, (sym, lst) -> {
+            if (lst == null) lst = new CopyOnWriteArrayList<>();
+            lst.clear();
+            lst.add(active);
+            return lst;
+        });
 
-        currentExposure = clamp(
-                currentExposure + estimateExposure(signal),
-                0.0,
-                maxPortfolioExposure
-        );
+        currentExposure = clamp(currentExposure + estimateExposure(signal), 0.0, maxPortfolioExposure);
     }
 
     /* =========================================================
        CLOSE TRADE
        ========================================================= */
-
-    public synchronized void closeTrade(String symbol,
-                                        double pnlPercent) {
-
+    public synchronized void closeTrade(String symbol, double pnlPercent) {
         List<ActiveSignal> list = activeSignals.remove(symbol);
         if (list == null) return;
 
         long now = System.currentTimeMillis();
 
         for (ActiveSignal s : list) {
+            history.computeIfAbsent(symbol, k -> new CopyOnWriteArrayList<>())
+                    .add(new ClosedTrade(symbol, pnlPercent, now - s.timestamp));
 
-            history
-                    .computeIfAbsent(symbol,
-                            k -> new CopyOnWriteArrayList<>())
-                    .add(new ClosedTrade(
-                            symbol,
-                            pnlPercent,
-                            now - s.timestamp));
-
-            currentExposure = clamp(
-                    currentExposure - estimateExposure(s),
-                    0.0,
-                    maxPortfolioExposure);
-
+            currentExposure = clamp(currentExposure - estimateExposure(s), 0.0, maxPortfolioExposure);
             updateSymbolScore(symbol, pnlPercent);
         }
     }
@@ -223,37 +207,24 @@ public final class InstitutionalSignalCore {
     /* =========================================================
        AUTO CLEANUP
        ========================================================= */
-
     private void cleanupExpiredSignals() {
-
         long now = System.currentTimeMillis();
 
-        for (Iterator<Map.Entry<String,
-                List<ActiveSignal>>> it =
-             activeSignals.entrySet().iterator();
-             it.hasNext();) {
-
+        for (Iterator<Map.Entry<String, List<ActiveSignal>>> it = activeSignals.entrySet().iterator(); it.hasNext();) {
             Map.Entry<String, List<ActiveSignal>> e = it.next();
-
             List<ActiveSignal> list = e.getValue();
-
             list.removeIf(s -> now - s.timestamp > signalTtlMs);
-
-            if (list.isEmpty())
-                it.remove();
+            if (list.isEmpty()) it.remove();
         }
 
         recalcExposure();
     }
 
     private void recalcExposure() {
-
         double exposure = 0.0;
-
-        for (List<ActiveSignal> list : activeSignals.values()) {
+        for (List<ActiveSignal> list : activeSignals.values())
             for (ActiveSignal s : list)
                 exposure += estimateExposure(s);
-        }
 
         currentExposure = clamp(exposure, 0.0, maxPortfolioExposure);
     }
@@ -261,27 +232,16 @@ public final class InstitutionalSignalCore {
     /* =========================================================
        SYMBOL PERFORMANCE SCORE
        ========================================================= */
-
-    private void updateSymbolScore(String symbol,
-                                   double pnl) {
-
-        double delta =
-                pnl > 0 ? 0.02 :
-                        pnl < 0 ? -0.025 :
-                                -0.005;
-
+    private void updateSymbolScore(String symbol, double pnl) {
+        double delta = pnl > 0 ? 0.02 : pnl < 0 ? -0.025 : -0.005;
         symbolScore.merge(symbol, delta, Double::sum);
-
-        symbolScore.compute(symbol,
-                (k, v) -> clamp(v, -0.40, 0.40));
+        symbolScore.compute(symbol, (k, v) -> clamp(v, -0.40, 0.40));
     }
 
     /* =========================================================
        EXPOSURE MODEL
        ========================================================= */
-
     private double estimateExposure(com.bot.DecisionEngineMerged.TradeIdea s) {
-
         if (s.probability >= 82) return 0.05;
         if (s.probability >= 75) return 0.035;
         if (s.probability >= 68) return 0.025;
@@ -289,21 +249,17 @@ public final class InstitutionalSignalCore {
     }
 
     private double estimateExposure(ActiveSignal s) {
-
         if (s.probability >= 82) return 0.05;
         if (s.probability >= 75) return 0.035;
         if (s.probability >= 68) return 0.025;
         return 0.02;
     }
+
     /* =========================================================
        STATS API
        ========================================================= */
-
     public synchronized int getActiveSignalsCount() {
-        return activeSignals.values()
-                .stream()
-                .mapToInt(List::size)
-                .sum();
+        return activeSignals.values().stream().mapToInt(List::size).sum();
     }
 
     public synchronized double getCurrentExposure() {
@@ -328,10 +284,7 @@ public final class InstitutionalSignalCore {
     /* =========================================================
        UTIL
        ========================================================= */
-
-    private static double clamp(double v,
-                                double min,
-                                double max) {
+    private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }
 }

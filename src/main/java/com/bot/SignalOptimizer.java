@@ -11,7 +11,7 @@ public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */
 
-    private static final int MIN_TICKS = 8;
+    private static final int MIN_TICKS = 12;
     private static final int MAX_TICKS = 120;
     private static final double EMA_ALPHA = 0.32;
 

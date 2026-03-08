@@ -10,7 +10,7 @@ public final class DecisionEngineMerged {
     public enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, VOLATILE }
     public enum HTFBias { BULL, BEAR, NONE }
 
-    private static final int MIN_BARS = 220;
+    private static final int MIN_BARS = 150;
 
     private static final long COOLDOWN_TOP = 15 * 60_000;
     private static final long COOLDOWN_ALT = 15 * 60_000;
