@@ -324,25 +324,32 @@ public final class DecisionEngineMerged {
                                      double atr,
                                      double price) {
 
-        double edge = rawScore - 0.5; // смещаем к 0.5 для разнообразия
-        double sigmoid = 1.0 / (1.0 + Math.exp(-3.0 * edge)); // чуть круче кривая
-        double regimeBoost = state == MarketState.STRONG_TREND ? 0.08 :
-                state == MarketState.WEAK_TREND ? 0.03 : 0;
-        double categoryPenalty = cat == CoinCategory.MEME ? -0.08 :
-                cat == CoinCategory.ALT ? -0.03 : 0;
-        double vol = atr / price;
-        double volatilityFactor = vol > 0.012 ? -0.05 :
-                vol < 0.002 ? -0.02 : 0;
+        // Edge 0..1
+        double edge = rawScore; // rawScore уже около 0.0..1.0
+        double sigmoid = 1.0 / (1.0 + Math.exp(-6.0 * (edge - 0.5))); // крутая кривая около 0.5
 
-// Добавляем рандомизацию ±3% для реалистичности
-        double randomFactor = (new Random().nextDouble() - 0.5) * 0.06;
+        // Бонусы/штрафы по тренду
+        double regimeBoost = state == MarketState.STRONG_TREND ? 0.05 :
+                state == MarketState.WEAK_TREND   ? 0.02 : 0;
+
+        double categoryPenalty = cat == CoinCategory.MEME ? -0.03 :
+                cat == CoinCategory.ALT  ? -0.01 : 0;
+
+        // Фактор волатильности
+        double vol = atr / price;
+        double volatilityFactor = vol > 0.012 ? -0.03 :
+                vol < 0.002 ? 0.02 : 0;
+
+        // Рандом ±2–3% для реалистичности
+        double randomFactor = (new Random().nextDouble() - 0.5) * 0.04;
 
         double prob = sigmoid + regimeBoost + categoryPenalty + volatilityFactor + randomFactor;
-        prob = clamp(prob, 0.45, 0.92);
+
+        // Ограничиваем минимальной уверенностью, но не завышаем слишком
+        prob = clamp(prob, 0.50, 0.85);
 
         return prob * 100.0;
     }
-
     private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
 
         double adx = adx(c, 14);
