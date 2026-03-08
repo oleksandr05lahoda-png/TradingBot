@@ -6,7 +6,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class DecisionEngineMerged {
 
     public enum CoinCategory { TOP, ALT, MEME }
-    public enum SignalGrade { A, B, C }
     public enum MarketState { STRONG_TREND, WEAK_TREND, RANGE, VOLATILE }
     public enum HTFBias { BULL, BEAR, NONE }
 
@@ -94,6 +93,7 @@ public final class DecisionEngineMerged {
                     " | c1h=" + (c1h != null ? c1h.size() : "null"));
             return null;
         }
+
         double price = last(c15).close;
         double atr = Math.max(atr(c15, 14), price * 0.0012);
 
@@ -105,117 +105,96 @@ public final class DecisionEngineMerged {
 
         Map<String, Double> reasonWeightsLong = new LinkedHashMap<>();
         Map<String, Double> reasonWeightsShort = new LinkedHashMap<>();
+
         System.out.println("[DEBUG-DE] Start generating for symbol=" + symbol +
                 " | state=" + state +
                 " | bias=" + bias +
                 " | last price=" + price);
-        /* ===== HTF Bias (balanced) ===== */
 
+        /* ===== HTF Bias ===== */
         if (bias == HTFBias.BULL) {
             scoreLong += 0.45;
             scoreShort -= 0.20;
-        }
-        else if (bias == HTFBias.BEAR) {
+        } else if (bias == HTFBias.BEAR) {
             scoreShort += 0.45;
             scoreLong -= 0.20;
         }
-        if (pullback(c15, true)) {
+
+        boolean pullbackUpFlag = pullback(c15, true);
+        boolean pullbackDownFlag = pullback(c15, false);
+        boolean impulseFlag = impulse(c1);
+        boolean bullDivFlag = bullDiv(c15);
+        boolean bearDivFlag = bearDiv(c15);
+
+        if (pullbackUpFlag) {
             scoreLong += 0.9;
             reasonWeightsLong.put("Pullback bullish", 0.9);
         }
 
-        if (pullback(c15, false)) {
+        if (pullbackDownFlag) {
             scoreShort += 0.9;
             reasonWeightsShort.put("Pullback bearish", 0.9);
         }
-        if (impulse(c1)) {
 
+        if (impulseFlag) {
             double atr1 = atr(c1, 14);
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
 
-            if (delta > atr1 * 0.32) {
-                scoreLong += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
-            }
-
-            if (delta < -atr1 * 0.32) {
-                scoreShort += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
-            }
+            if (delta > atr1 * 0.32) scoreLong += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
+            if (delta < -atr1 * 0.32) scoreShort += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
         }
 
-        if (bullDiv(c15)) {
+        if (bullDivFlag) {
             scoreLong += 0.55;
             reasonWeightsLong.put("Bullish divergence", 0.55);
         }
 
-        if (bearDiv(c15)) {
+        if (bearDivFlag) {
             scoreShort += 0.55;
             reasonWeightsShort.put("Bearish divergence", 0.55);
         }
 
         /* ===== RSI soft filter ===== */
-
         double rsi14 = rsi(c15, 14);
-
         if (state != MarketState.STRONG_TREND) {
-
             if (rsi14 > 82) scoreLong -= 0.18;
             if (rsi14 < 18) scoreShort -= 0.18;
         }
 
         /* ===== ADX trend protection ===== */
-
         double adxValue = adx(c15, 14);
-
         if (adxValue > 28) {
-
-            if (bias == HTFBias.BULL && scoreShort > scoreLong)
-                scoreShort *= 0.65;
-
-            if (bias == HTFBias.BEAR && scoreLong > scoreShort)
-                scoreLong *= 0.65;
+            if (bias == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.65;
+            if (bias == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.65;
         }
 
-        double dynamicThreshold =
-                state == MarketState.STRONG_TREND ? 0.95 : 0.85;
-
-        if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold)
-            return null;
+        double dynamicThreshold = state == MarketState.STRONG_TREND ? 0.95 : 0.85;
+        if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
 
         double move4 = (last(c15).close - c15.get(c15.size() - 4).close) / price;
-
-        boolean strongMomentumUp = move4 > 0.012;
-        boolean strongMomentumDown = move4 < -0.012;
-
-        if (strongMomentumUp && scoreShort > scoreLong)
-            scoreShort *= 0.8;
-
-        if (strongMomentumDown && scoreLong > scoreShort)
-            scoreLong *= 0.8;
+        if (move4 > 0.012 && scoreShort > scoreLong) scoreShort *= 0.8;
+        if (move4 < -0.012 && scoreLong > scoreShort) scoreLong *= 0.8;
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-
         if (scoreDiff < 0.18) return null;
 
-        com.bot.TradingCore.Side side =
-                scoreLong > scoreShort ?
-                        com.bot.TradingCore.Side.LONG :
-                        com.bot.TradingCore.Side.SHORT;
+        com.bot.TradingCore.Side side = scoreLong > scoreShort ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
 
-        /* ===== Cooldown ===== */
+        /* ===== Cooldown & flip ===== */
+        if (!cooldownAllowed(symbol, side, cat, now)) return null;
+        if (!flipAllowed(symbol, side)) return null;
 
-        if (!cooldownAllowed(symbol, side, cat, now))
-            return null;
+        /* ===== Probability (честная, учитывает все сигналы) ===== */
+        double probability = computeConfidence(
+                scoreLong, scoreShort,
+                state, cat,
+                atr, price,
+                bullDivFlag, bearDivFlag,
+                pullbackUpFlag, pullbackDownFlag,
+                impulseFlag
+        );
 
-        if (!flipAllowed(symbol, side))
-            return null;
-
-        /* ===== Probability ===== */
-
-        // ==== Новая честная probability ====
-        double rawScore = scoreLong > scoreShort ? scoreLong : scoreShort;
-        double probability = computeConfidence(rawScore, state, cat, atr, price);
-
-        if(probability < MIN_CONFIDENCE) {
+        if (probability < MIN_CONFIDENCE) {
             System.out.println("[DEBUG-DE] probability < MIN_CONFIDENCE → rejected");
             return null;
         }
@@ -227,38 +206,24 @@ public final class DecisionEngineMerged {
                 " | atr=" + atr +
                 " | price=" + price);
 
+        /* ===== Flags ===== */
         List<String> flags = new ArrayList<>();
+        if (atr / price > 0.0015) flags.add("ATR↑");
+        if (volumeSpike(c15, cat) && atr / price > 0.0015) flags.add("vol:true");
+        if (impulseFlag) flags.add("impulse:true");
 
-        if (atr / price > 0.0015) flags.add("ATR↑"); // чуть больше порог
-        if (volumeSpike(c15, cat) && atr / price > 0.0015) flags.add("vol:true"); // более строгий фильтр
-        if (impulse(c1)) flags.add("impulse:true");
+        /* ===== Risk & Stop/Take ===== */
+        double riskMult = cat == CoinCategory.MEME ? 1.3 : cat == CoinCategory.ALT ? 1.0 : 0.85;
+        double rr = scoreDiff > 0.9 ? 3.0 : scoreDiff > 0.6 ? 2.6 : 2.2;
 
-        /* ===== Risk ===== */
+        double stop = side == com.bot.TradingCore.Side.LONG ? price - atr * riskMult : price + atr * riskMult;
+        double take = side == com.bot.TradingCore.Side.LONG ? price + atr * riskMult * rr : price - atr * riskMult * rr;
 
-        double riskMult =
-                cat == CoinCategory.MEME ? 1.3 :
-                        cat == CoinCategory.ALT ? 1.0 : 0.85;
-        double rr;
-        if (scoreDiff > 0.9) rr = 3.0;
-        else if (scoreDiff > 0.6) rr = 2.6;
-        else rr = 2.2;
-
-        double stop =
-                side == com.bot.TradingCore.Side.LONG ?
-                        price - atr * riskMult :
-                        price + atr * riskMult;
-
-        double take =
-                side == com.bot.TradingCore.Side.LONG ?
-                        price + atr * riskMult * rr :
-                        price - atr * riskMult * rr;
-        if (!priceMovedEnough(symbol, price))
-            return null;
+        if (!priceMovedEnough(symbol, price)) return null;
         registerSignal(symbol, side, now);
 
         return new TradeIdea(symbol, side, price, stop, take, probability, flags);
     }
-
     /* ===== COOLDOWN ===== */
 
     private boolean cooldownAllowed(String symbol, com.bot.TradingCore.Side side, CoinCategory cat, long now) {
@@ -318,37 +283,45 @@ public final class DecisionEngineMerged {
         if (history.size() > 3)
             history.removeFirst();
     }
-    private double computeConfidence(double rawScore,
-                                     MarketState state,
-                                     CoinCategory cat,
-                                     double atr,
-                                     double price) {
+    private double computeConfidence(double scoreLong, double scoreShort,
+                                     MarketState state, CoinCategory cat,
+                                     double atr, double price,
+                                     boolean bullDiv, boolean bearDiv,
+                                     boolean pullbackUp, boolean pullbackDown,
+                                     boolean impulse) {
 
-        // Edge 0..1
-        double edge = rawScore; // rawScore уже около 0.0..1.0
-        double sigmoid = 1.0 / (1.0 + Math.exp(-6.0 * (edge - 0.5))); // крутая кривая около 0.5
+        // Разница между лонг и шорт, 0..1
+        double baseScore = Math.abs(scoreLong - scoreShort);
 
-        // Бонусы/штрафы по тренду
-        double regimeBoost = state == MarketState.STRONG_TREND ? 0.05 :
-                state == MarketState.WEAK_TREND   ? 0.02 : 0;
+        // Начальная вероятность 0..100
+        double prob = baseScore * 100;
 
-        double categoryPenalty = cat == CoinCategory.MEME ? -0.03 :
-                cat == CoinCategory.ALT  ? -0.01 : 0;
+        // ===== бонус по тренду =====
+        switch (state) {
+            case STRONG_TREND -> prob += 5;
+            case WEAK_TREND   -> prob += 2;
+            default           -> {}
+        }
 
-        // Фактор волатильности
+        // ===== штраф по категории монеты =====
+        if (cat == CoinCategory.MEME) prob -= 5;
+        else if (cat == CoinCategory.ALT) prob -= 2;
+
+        // ===== индикаторы =====
+        if (bullDiv || bearDiv) prob += 5;
+        if (pullbackUp || pullbackDown) prob += 5;
+        if (impulse) prob += 3;
+
+        // ===== волатильность =====
         double vol = atr / price;
-        double volatilityFactor = vol > 0.012 ? -0.03 :
-                vol < 0.002 ? 0.02 : 0;
+        if (vol > 0.012) prob -= 5;
+        else if (vol < 0.002) prob += 2;
 
-        // Рандом ±2–3% для реалистичности
-        double randomFactor = (new Random().nextDouble() - 0.5) * 0.04;
+        // Ограничение 0-100%
+        prob = clamp(prob, 0, 100);
 
-        double prob = sigmoid + regimeBoost + categoryPenalty + volatilityFactor + randomFactor;
-
-        // Ограничиваем минимальной уверенностью, но не завышаем слишком
-        prob = clamp(prob, 0.50, 0.85);
-
-        return prob * 100.0;
+        // округляем до целого для красивого процента
+        return Math.round(prob);
     }
     private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
 
