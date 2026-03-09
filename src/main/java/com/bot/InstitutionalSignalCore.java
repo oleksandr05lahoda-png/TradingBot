@@ -81,12 +81,10 @@ public final class InstitutionalSignalCore {
         cleanupExpiredSignals();
 
         if (signal == null) {
-            System.out.println("[DEBUG] Signal null → rejected");
-            return false;
+            System.out.println("[DEBUG " + getTime() + "] Signal null → rejected");            return false;
         }
-
         if (signal.probability < minConfidence) {
-            System.out.println("[DEBUG] Signal " + signal.symbol +
+            System.out.println("[DEBUG " + getTime() + "] Signal " + signal.symbol +
                     " probability " + signal.probability +
                     " < minConfidence " + minConfidence + " → rejected");
             return false;
@@ -268,7 +266,10 @@ public final class InstitutionalSignalCore {
         long wins = h.stream().filter(t -> t.pnl > 0).count();
         return (double) wins / h.size();
     }
-
+    private static String getTime() {
+        // локальное время системы в формате HH:mm:ss
+        return java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+    }
     /* =========================================================
        UTIL
        ========================================================= */

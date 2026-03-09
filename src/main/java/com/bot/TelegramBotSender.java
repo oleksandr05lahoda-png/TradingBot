@@ -21,8 +21,7 @@ public final class TelegramBotSender {
     private final ScheduledExecutorService sender;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    private static final DateTimeFormatter DTF = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final int RATE_LIMIT_MS = 1200; // безопасно для TG
+    private static final DateTimeFormatter DTF = DateTimeFormatter.ofPattern("HH:mm:ss");    private static final int RATE_LIMIT_MS = 1200; // безопасно для TG
     private static final int MAX_RETRY = 3;
 
     public TelegramBotSender(String token, String chatId) {
