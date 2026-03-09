@@ -56,7 +56,9 @@ public final class DecisionEngineMerged {
                             : String.join(", ", flags);
 
             String time =
-                    java.time.LocalTime.now()
+                    java.time.ZonedDateTime
+                            .now(java.time.ZoneId.systemDefault())
+                            .toLocalTime()
                             .withNano(0)
                             .toString();
 
