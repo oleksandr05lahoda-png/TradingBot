@@ -80,10 +80,7 @@ public class BotMain {
 
                 for (DecisionEngineMerged.TradeIdea s : filteredSignals) {
 
-                    telegram.sendMessageAsync(
-                            "📊 SIGNAL\n\n" + s.toString()
-                    );
-
+                    telegram.sendMessageAsync(s.toString());
                 }
                 LOGGER.info("Signals sent: " + filteredSignals.size());
 
