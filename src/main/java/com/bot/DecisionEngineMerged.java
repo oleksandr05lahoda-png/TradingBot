@@ -100,7 +100,7 @@ public final class DecisionEngineMerged {
         double atr = Math.max(atr(c15, 14), price * 0.0012);
 
         MarketState state = detectState(c15);
-        HTFBias bias = detectBias(c1h);
+        HTFBias bias = detectBias(c15);
 
         double scoreLong = 0;
         double scoreShort = 0;
@@ -158,8 +158,8 @@ public final class DecisionEngineMerged {
         /* ===== RSI soft filter ===== */
         double rsi14 = rsi(c15, 14);
         if (state != MarketState.STRONG_TREND) {
-            if (rsi14 > 82) scoreLong -= 0.18;
-            if (rsi14 < 18) scoreShort -= 0.18;
+            if (rsi14 > 78) scoreLong -= 0.15;
+            if (rsi14 < 22) scoreShort -= 0.15;
         }
 
         /* ===== ADX trend protection ===== */
@@ -168,7 +168,7 @@ public final class DecisionEngineMerged {
             if (bias == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.78;
             if (bias == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.78;
         }
-        double dynamicThreshold = state == MarketState.STRONG_TREND ? 0.85 : 0.75;
+        double dynamicThreshold = state == MarketState.STRONG_TREND ? 0.80 : 0.68;
 
         if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) {
             // позволяем сигналу пройти если есть дивергенция
@@ -471,7 +471,7 @@ public final class DecisionEngineMerged {
         double atrVal = atr(c, 14);
 
         return Math.abs(last(c).close - c.get(c.size() - 5).close)
-                > atrVal * 0.18;
+                > atrVal * 0.25;
     }
 
     public boolean volumeSpike(List<com.bot.TradingCore.Candle> c, CoinCategory cat) {

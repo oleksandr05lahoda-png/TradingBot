@@ -76,7 +76,7 @@ public final class GlobalImpulseController {
         double impulseStrength = normalize(rawScore);
         boolean bodyOk = bodyExpansion >= 0.8;
 
-        GlobalRegime regime = determineRegime(last, impulseStrength, bodyOk);
+        GlobalRegime regime = determineRegime(btc, impulseStrength, bodyOk);
 
         boolean strong = impulseStrength > 0.6 && volatilityExpansion > 1.2;
 
@@ -132,17 +132,28 @@ public final class GlobalImpulseController {
         return avgVol == 0 ? 1.0 : lastVol / avgVol;
     }
 
-    private GlobalRegime determineRegime(TradingCore.Candle last, double strength, boolean bodyOk) {
-        if (!bodyOk || strength < 0.50) return GlobalRegime.NEUTRAL; // мягче порог
-        boolean bullish = last.close > last.open;
-        boolean bearish = last.close < last.open;
-        if (bullish && strength > 0.55) return GlobalRegime.BTC_IMPULSE_UP;
-        if (bearish && strength > 0.55) return GlobalRegime.BTC_IMPULSE_DOWN;
+    private GlobalRegime determineRegime(List<TradingCore.Candle> btc, double strength, boolean bodyOk) {
+
+        if (!bodyOk || strength < 0.50)
+            return GlobalRegime.NEUTRAL;
+
+        int size = btc.size();
+
+        double move =
+                btc.get(size - 1).close -
+                        btc.get(size - 3).close;
+
+        if (move > 0 && strength > 0.55)
+            return GlobalRegime.BTC_IMPULSE_UP;
+
+        if (move < 0 && strength > 0.55)
+            return GlobalRegime.BTC_IMPULSE_DOWN;
+
         return GlobalRegime.NEUTRAL;
     }
 
     private double normalize(double value) {
-        double n = value / 1.3; // чуть мягче для частых сигналов
+        double n = value / 1.5; // чуть мягче для частых сигналов
         return Math.min(1.0, Math.max(0.0, n));
     }
 }
