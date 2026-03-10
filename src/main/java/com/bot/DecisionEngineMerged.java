@@ -57,7 +57,7 @@ public final class DecisionEngineMerged {
 
             String time =
                     java.time.ZonedDateTime
-                            .now(java.time.ZoneId.systemDefault())
+                            .now(java.time.ZoneId.of("Europe/Warsaw"))
                             .toLocalTime()
                             .withNano(0)
                             .toString();
@@ -113,13 +113,12 @@ public final class DecisionEngineMerged {
                 " | bias=" + bias +
                 " | last price=" + price);
 
-        /* ===== HTF Bias ===== */
         if (bias == HTFBias.BULL) {
-            scoreLong += 0.45;
-            scoreShort -= 0.20;
+            scoreLong += 0.35;
+            scoreShort -= 0.10;
         } else if (bias == HTFBias.BEAR) {
-            scoreShort += 0.45;
-            scoreLong -= 0.20;
+            scoreShort += 0.35;
+            scoreLong -= 0.10;
         }
 
         boolean pullbackUpFlag = pullback(c15, true);
@@ -142,8 +141,8 @@ public final class DecisionEngineMerged {
             double atr1 = atr(c1, 14);
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
 
-            if (delta > atr1 * 0.32) scoreLong += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
-            if (delta < -atr1 * 0.32) scoreShort += state == MarketState.STRONG_TREND ? 0.35 : 0.25;
+            if (delta > atr1 * 0.28) scoreLong += state == MarketState.STRONG_TREND ? 0.40 : 0.30;
+            if (delta < -atr1 * 0.28) scoreShort += state == MarketState.STRONG_TREND ? 0.40 : 0.30;
         }
 
         if (bullDivFlag) {
@@ -165,17 +164,22 @@ public final class DecisionEngineMerged {
 
         /* ===== ADX trend protection ===== */
         double adxValue = adx(c15, 14);
-        if (adxValue > 28) {
-            if (bias == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.65;
-            if (bias == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.65;
+        if (adxValue > 30) {
+            if (bias == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.78;
+            if (bias == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.78;
+        }
+        double dynamicThreshold = state == MarketState.STRONG_TREND ? 0.85 : 0.75;
+
+        if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) {
+            // позволяем сигналу пройти если есть дивергенция
+            if (!bullDivFlag && !bearDivFlag)
+                return null;
         }
 
-        double dynamicThreshold = state == MarketState.STRONG_TREND ? 0.95 : 0.85;
-        if (scoreLong < dynamicThreshold && scoreShort < dynamicThreshold) return null;
-
         double move4 = (last(c15).close - c15.get(c15.size() - 4).close) / price;
-        if (move4 > 0.012 && scoreShort > scoreLong) scoreShort *= 0.8;
-        if (move4 < -0.012 && scoreLong > scoreShort) scoreLong *= 0.8;
+
+        if (move4 > 0.015 && scoreShort > scoreLong) scoreShort *= 0.88;
+        if (move4 < -0.015 && scoreLong > scoreShort) scoreLong *= 0.88;
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
         if (scoreDiff < 0.18) return null;
@@ -307,8 +311,7 @@ public final class DecisionEngineMerged {
         // 4️⃣ Ограничиваем 0..1
         normScore = Math.min(1.0, normScore);
 
-        // 5️⃣ Применяем линейное ограничение сверху, максимум ~80%
-        double probability = 50 + normScore * 30; // 50%..80%
+        double probability = 50 + normScore * 42;
 
         // 6️⃣ Корректировка по тренду и категории (необязательно)
         if (state == MarketState.STRONG_TREND) probability += 3;  // максимум ~83%

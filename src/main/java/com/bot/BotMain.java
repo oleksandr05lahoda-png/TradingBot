@@ -12,7 +12,7 @@ public class BotMain {
     private static final Logger LOGGER = Logger.getLogger(BotMain.class.getName());
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
-    private static final ZoneId ZONE = ZoneId.systemDefault();
+    private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
     private static final int SIGNAL_INTERVAL_MIN = 15;
     private static final int KLINES_LIMIT = 200;
 
@@ -49,12 +49,26 @@ public class BotMain {
                     globalImpulse.update(btcCandles);
                 }
                 GlobalImpulseController.GlobalContext ctx = globalImpulse.getContext();
-
-                // Фильтр сигналов по глобальному тренду
+                LOGGER.info("BTC regime: " + ctx.regime +
+                        " | strength=" + ctx.impulseStrength +
+                        " | volExp=" + ctx.volatilityExpansion);
+                // Мягкий фильтр глобального импульса (не блокирует сигналы полностью)
                 List<DecisionEngineMerged.TradeIdea> filteredSignals = rawSignals.stream()
                         .filter(s -> {
-                            if (ctx.onlyLong) return s.side == com.bot.TradingCore.Side.LONG;
-                            if (ctx.onlyShort) return s.side == com.bot.TradingCore.Side.SHORT;
+
+                            // если сильный импульс BTC — немного ограничиваем противоположные сигналы
+                            if (ctx.strongPressure) {
+
+                                if (ctx.onlyLong && s.side == com.bot.TradingCore.Side.SHORT) {
+                                    return s.probability >= 65; // разрешаем только сильные контртрендовые
+                                }
+
+                                if (ctx.onlyShort && s.side == com.bot.TradingCore.Side.LONG) {
+                                    return s.probability >= 65;
+                                }
+
+                            }
+
                             return true;
                         })
                         .toList();
@@ -65,9 +79,12 @@ public class BotMain {
                 }
 
                 for (DecisionEngineMerged.TradeIdea s : filteredSignals) {
-                    telegram.sendMessageAsync(s.toString());
-                }
 
+                    telegram.sendMessageAsync(
+                            "📊 SIGNAL\n\n" + s.toString()
+                    );
+
+                }
                 LOGGER.info("Signals sent: " + filteredSignals.size());
 
             } catch (Throwable t) {

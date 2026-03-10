@@ -124,9 +124,9 @@ public final class InstitutionalSignalCore {
         }
 
         double score = symbolScore.getOrDefault(signal.symbol, 0.0);
-        if (score < -0.20) {
+        if (score < -0.35) {
             System.out.println("[DEBUG] SymbolScore " + score +
-                    " < -0.2 for " + signal.symbol + " → rejected");
+                    " < -0.35 for " + signal.symbol + " → rejected");
             return false;
         }
 
@@ -161,14 +161,13 @@ public final class InstitutionalSignalCore {
                 now
         );
 
-        // обновляем сигнал, чтобы не было дублирования
         activeSignals.compute(signal.symbol, (sym, lst) -> {
             if (lst == null) lst = new CopyOnWriteArrayList<>();
-            lst.clear();
+            // заменяем дублирующий сигнал
+            lst.removeIf(s -> s.side == signal.side && Math.abs(s.entry - signal.price)/s.entry < minSignalDiff);
             lst.add(active);
             return lst;
         });
-
         currentExposure = clamp(currentExposure + estimateExposure(signal), 0.0, maxPortfolioExposure);
     }
 

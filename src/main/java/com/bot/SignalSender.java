@@ -117,7 +117,7 @@ public class SignalSender {
                 (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability
         ).reversed());
 
-        int topN = Math.min(7, result.size()); // берём топ-7 сигналов
+        int topN = Math.min(15, result.size()); // берём топ-7 сигналов
         return result.subList(0, topN);
     }
     public com.bot.SignalOptimizer getOptimizer() {
@@ -1086,7 +1086,7 @@ public class SignalSender {
         return res;
     }
     private boolean computeVolatilityOk(List<com.bot.TradingCore.Candle> candles, double atr) {
-        return atr / candles.get(candles.size() - 1).close > 0.003;
+        return atr / candles.get(candles.size() - 1).close > 0.0015;
     }
 
     private boolean checkVWAPAlignment(List<com.bot.TradingCore.Candle> candles, double price) {
@@ -1147,9 +1147,31 @@ public class SignalSender {
 
                 if (idea == null || idea.probability < MIN_CONF) continue;
 
-                // === BTC GLOBAL TREND FILTER ===
-                if (btcTrend < 0 && idea.side.name().equals("LONG")) continue;
-                if (btcTrend > 0 && idea.side.name().equals("SHORT")) continue;
+                // мягкий фильтр BTC (не блокирует сигналы полностью)
+
+                if (btcTrend < 0 && idea.side.name().equals("LONG")) {
+                    idea = new com.bot.DecisionEngineMerged.TradeIdea(
+                            idea.symbol,
+                            idea.side,
+                            idea.price,
+                            idea.stop,
+                            idea.take,
+                            idea.probability - 5,
+                            idea.flags
+                    );
+                }
+
+                if (btcTrend > 0 && idea.side.name().equals("SHORT")) {
+                    idea = new com.bot.DecisionEngineMerged.TradeIdea(
+                            idea.symbol,
+                            idea.side,
+                            idea.price,
+                            idea.stop,
+                            idea.take,
+                            idea.probability - 5,
+                            idea.flags
+                    );
+                }
 
                 long candleCloseTime = c15.get(c15.size() - 1).closeTime;
 
