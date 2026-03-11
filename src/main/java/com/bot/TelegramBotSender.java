@@ -122,7 +122,6 @@ public final class TelegramBotSender {
                 .build();
     }
 
-
     private void log(String msg) {
         System.out.println("[TG " + LocalDateTime.now().format(DTF) + "] " + msg);
     }

@@ -107,7 +107,7 @@ public final class DecisionEngineMerged {
         atr = Math.max(atr, price * 0.0012);
 
         MarketState state = detectState(c15);
-        HTFBias bias = detectBias(c15);
+        HTFBias bias = detectBias(c1h);
         double scoreLong = 0;
         double scoreShort = 0;
 
@@ -128,6 +128,8 @@ public final class DecisionEngineMerged {
         }
 
         boolean pullbackUpFlag = pullback(c15, true);
+        boolean bullStruct = bullishStructure(c15);
+        boolean bearStruct = bearishStructure(c15);
         boolean pullbackDownFlag = pullback(c15, false);
         boolean impulseFlag = impulse(c1);
         boolean compressionFlag = volatilityCompression(c15);
@@ -135,16 +137,12 @@ public final class DecisionEngineMerged {
         boolean bullDivFlag = bullDiv(c15);
         boolean bearDivFlag = bearDiv(c15);
 
-        if (pullbackUpFlag) {
-            scoreLong += 0.9;
-            reasonWeightsLong.put("Pullback bullish", 0.9);
+        if (pullbackUpFlag && bullStruct) {
+            scoreLong += 1.05;
         }
-
-        if (pullbackDownFlag) {
-            scoreShort += 0.9;
-            reasonWeightsShort.put("Pullback bearish", 0.9);
+        if (pullbackDownFlag && bearStruct) {
+            scoreShort += 1.05;
         }
-
         if (impulseFlag) {
 
             double atr1 = atr(c1, 14);
@@ -494,12 +492,12 @@ public final class DecisionEngineMerged {
 
     public boolean impulse(List<com.bot.TradingCore.Candle> c) {
 
-        if (c == null || c.size() < 5) return false;
+        if (c == null || c.size() < 15) return false;
 
         double atrVal = atr(c, 14);
 
         return Math.abs(last(c).close - c.get(c.size() - 5).close)
-                > atrVal * 0.25;
+                > atrVal * 0.55;
     }
     /* ===== PUMP BREAKOUT ===== */
 
@@ -573,6 +571,7 @@ public final class DecisionEngineMerged {
     }
     private boolean pullback(List<com.bot.TradingCore.Candle> c, boolean bull) {
 
+
         double ema21 = ema(c, 21);
 
         double price = last(c).close;
@@ -581,7 +580,33 @@ public final class DecisionEngineMerged {
                 ? price <= ema21 * 0.996
                 : price >= ema21 * 1.004;
     }
+    /* ===== MARKET STRUCTURE ===== */
 
+    private boolean bullishStructure(List<com.bot.TradingCore.Candle> c) {
+
+        if (c.size() < 10) return false;
+
+        double low1 = c.get(c.size()-6).low;
+        double low2 = c.get(c.size()-3).low;
+
+        double high1 = c.get(c.size()-6).high;
+        double high2 = c.get(c.size()-3).high;
+
+        return high2 > high1 && low2 > low1;
+    }
+
+    private boolean bearishStructure(List<com.bot.TradingCore.Candle> c) {
+
+        if (c.size() < 10) return false;
+
+        double low1 = c.get(c.size()-6).low;
+        double low2 = c.get(c.size()-3).low;
+
+        double high1 = c.get(c.size()-6).high;
+        double high2 = c.get(c.size()-3).high;
+
+        return high2 < high1 && low2 < low1;
+    }
     private com.bot.TradingCore.Candle last(List<com.bot.TradingCore.Candle> c) {
 
         return c.get(c.size() - 1);
