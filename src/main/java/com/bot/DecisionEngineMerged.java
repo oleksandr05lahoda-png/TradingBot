@@ -1,8 +1,5 @@
 package com.bot;
 
-import com.bot.SignalOptimizer;
-import com.bot.GlobalImpulseController;
-import com.bot.TradingCore;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -23,17 +20,8 @@ public final class DecisionEngineMerged {
     private final Map<String, Long> cooldownMap = new ConcurrentHashMap<>();
 
     private final Map<String, Deque<String>> recentDirections = new ConcurrentHashMap<>();
-    private final SignalOptimizer signalOptimizer;
-    private final GlobalImpulseController globalImpulse;
-    public DecisionEngineMerged(Map<String, Deque<Double>> tickPriceDeque,
-                                List<com.bot.TradingCore.Candle> btcCandles) {
-        this.signalOptimizer = new SignalOptimizer(tickPriceDeque);
-        this.globalImpulse = new GlobalImpulseController();
-
-        // сразу апдейтим глобальный контекст BTC
-        this.globalImpulse.update(btcCandles);
+    public DecisionEngineMerged() {
     }
-
     public static final class TradeIdea {
 
         public final String symbol;
@@ -111,11 +99,15 @@ public final class DecisionEngineMerged {
         }
 
         double price = last(c15).close;
-        double atr = Math.max(atr(c15, 14), price * 0.0012);
+        double atr = atr(c15, 14);
+
+        if (atr <= 0)
+            return null;
+
+        atr = Math.max(atr, price * 0.0012);
 
         MarketState state = detectState(c15);
         HTFBias bias = detectBias(c15);
-
         double scoreLong = 0;
         double scoreShort = 0;
 
@@ -138,6 +130,8 @@ public final class DecisionEngineMerged {
         boolean pullbackUpFlag = pullback(c15, true);
         boolean pullbackDownFlag = pullback(c15, false);
         boolean impulseFlag = impulse(c1);
+        boolean compressionFlag = volatilityCompression(c15);
+        boolean pumpFlag = pumpBreakout(c1, cat);
         boolean bullDivFlag = bullDiv(c15);
         boolean bearDivFlag = bearDiv(c15);
 
@@ -152,13 +146,37 @@ public final class DecisionEngineMerged {
         }
 
         if (impulseFlag) {
+
             double atr1 = atr(c1, 14);
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
 
-            if (delta > atr1 * 0.28) scoreLong += state == MarketState.STRONG_TREND ? 0.40 : 0.30;
-            if (delta < -atr1 * 0.28) scoreShort += state == MarketState.STRONG_TREND ? 0.40 : 0.30;
+            double impulseStrength = Math.abs(delta) / atr1;
+
+            if (delta > 0 && impulseStrength > 0.28)
+                scoreLong += state == MarketState.STRONG_TREND ? 0.45 : 0.35;
+
+            if (delta < 0 && impulseStrength > 0.28)
+                scoreShort += state == MarketState.STRONG_TREND ? 0.45 : 0.35;
+        }
+        /* ===== Compression bonus ===== */
+
+        if (compressionFlag) {
+
+            if (scoreLong > scoreShort)
+                scoreLong += 0.20;
+            else
+                scoreShort += 0.20;
         }
 
+        /* ===== Pump breakout ===== */
+
+        if (pumpFlag) {
+
+            if (scoreLong > scoreShort)
+                scoreLong += 0.35;
+            else
+                scoreShort += 0.35;
+        }
         if (bullDivFlag) {
             scoreLong += 0.55;
             reasonWeightsLong.put("Bullish divergence", 0.55);
@@ -172,11 +190,13 @@ public final class DecisionEngineMerged {
         /* ===== RSI soft filter ===== */
         double rsi14 = rsi(c15, 14);
         if (state != MarketState.STRONG_TREND) {
-            if (rsi14 > 78) scoreLong -= 0.15;
-            if (rsi14 < 22) scoreShort -= 0.15;
-        }
 
-        /* ===== ADX trend protection ===== */
+            if (rsi14 > 75)
+                scoreLong -= 0.18;
+
+            if (rsi14 < 25)
+                scoreShort -= 0.18;
+        }
         double adxValue = adx(c15, 14);
         if (adxValue > 30) {
             if (bias == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.78;
@@ -196,7 +216,7 @@ public final class DecisionEngineMerged {
         if (move4 < -0.015 && scoreLong > scoreShort) scoreLong *= 0.88;
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-        if (scoreDiff < 0.18) return null;
+        if (scoreDiff < 0.22) return null;
 
         com.bot.TradingCore.Side side = scoreLong > scoreShort ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
 
@@ -226,11 +246,13 @@ public final class DecisionEngineMerged {
                 " | atr=" + atr +
                 " | price=" + price);
 
-        /* ===== Flags ===== */
         List<String> flags = new ArrayList<>();
+
         if (atr / price > 0.0015) flags.add("ATR↑");
         if (volumeSpike(c15, cat) && atr / price > 0.0015) flags.add("vol:true");
         if (impulseFlag) flags.add("impulse:true");
+        if (compressionFlag) flags.add("compression:true");
+        if (pumpFlag) flags.add("pump:true");
 
         /* ===== Risk & Stop/Take ===== */
         double riskMult = cat == CoinCategory.MEME ? 1.3 : cat == CoinCategory.ALT ? 1.0 : 0.85;
@@ -264,32 +286,24 @@ public final class DecisionEngineMerged {
         return true;
     }
 
-    /* ===== FLIP ===== */
-
     private boolean flipAllowed(String symbol, com.bot.TradingCore.Side newSide) {
 
         Deque<String> history =
                 recentDirections.computeIfAbsent(symbol, k -> new ArrayDeque<>());
 
-        if (!history.isEmpty()) {
+        if (history.size() < 2)
+            return true;
 
-            String last = history.peekLast();
+        Iterator<String> it = history.descendingIterator();
 
-            if (!last.equals(newSide.name())) {
+        String last = it.next();
+        String prev = it.next();
 
-                if (history.size() >= 2) {
-
-                    String prev = history.peekFirst();
-
-                    if (prev.equals(newSide.name()))
-                        return false;
-                }
-            }
-        }
+        if (!last.equals(newSide.name()) && prev.equals(newSide.name()))
+            return false;
 
         return true;
     }
-
     private void registerSignal(String symbol, com.bot.TradingCore.Side side, long now) {
 
         String key = symbol + "_" + side;
@@ -325,7 +339,7 @@ public final class DecisionEngineMerged {
         // 4️⃣ Ограничиваем 0..1
         normScore = Math.min(1.0, normScore);
 
-        double probability = 50 + normScore * 42;
+        double probability = 50 + normScore * 45;
 
         // 6️⃣ Корректировка по тренду и категории (необязательно)
         if (state == MarketState.STRONG_TREND) probability += 3;  // максимум ~83%
@@ -487,7 +501,26 @@ public final class DecisionEngineMerged {
         return Math.abs(last(c).close - c.get(c.size() - 5).close)
                 > atrVal * 0.25;
     }
+    /* ===== PUMP BREAKOUT ===== */
 
+    private boolean pumpBreakout(List<com.bot.TradingCore.Candle> c, CoinCategory cat) {
+
+        if (c.size() < 12) return false;
+
+        double atrVal = atr(c, 14);
+
+        double move =
+                Math.abs(last(c).close - c.get(c.size() - 6).close);
+
+        double strength = move / atrVal;
+
+        double threshold =
+                cat == CoinCategory.MEME ? 0.75 :
+                        cat == CoinCategory.ALT ? 0.85 :
+                                1.0;
+
+        return strength > threshold;
+    }
     public boolean volumeSpike(List<com.bot.TradingCore.Candle> c, CoinCategory cat) {
 
         if (c.size() < 10) return false;
@@ -508,7 +541,36 @@ public final class DecisionEngineMerged {
 
         return lastVol / avg > threshold;
     }
+    /* ===== VOLATILITY COMPRESSION ===== */
 
+    private boolean volatilityCompression(List<com.bot.TradingCore.Candle> c) {
+
+        if (c.size() < 30) return false;
+
+        double atrNow = atr(c, 14);
+
+        double atrPast = 0;
+
+        for (int i = c.size() - 30; i < c.size() - 14; i++) {
+
+            var cur = c.get(i);
+            var prev = c.get(i - 1);
+
+            double tr = Math.max(
+                    cur.high - cur.low,
+                    Math.max(
+                            Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)
+                    )
+            );
+
+            atrPast += tr;
+        }
+
+        atrPast /= 16;
+
+        return atrNow < atrPast * 0.65;
+    }
     private boolean pullback(List<com.bot.TradingCore.Candle> c, boolean bull) {
 
         double ema21 = ema(c, 21);
@@ -540,7 +602,7 @@ public final class DecisionEngineMerged {
 
         double diff = Math.abs(price - last) / last;
 
-        if (diff < 0.0015)
+        if (diff < 0.0022)
             return false;
 
         lastSignalPrice.put(symbol, price);

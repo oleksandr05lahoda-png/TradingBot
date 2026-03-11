@@ -1,6 +1,6 @@
 package com.bot;
 
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class TradingCore {
@@ -10,25 +10,12 @@ public final class TradingCore {
        ============================================================ */
 
     public static final class Candle {
-
         public final long openTime;
-        public final double open;
-        public final double high;
-        public final double low;
-        public final double close;
-        public final double volume;
-        public final double qvol;
+        public final double open, high, low, close, volume, qvol;
         public final long closeTime;
 
-        public Candle(long openTime,
-                      double open,
-                      double high,
-                      double low,
-                      double close,
-                      double volume,
-                      double qvol,
-                      long closeTime) {
-
+        public Candle(long openTime, double open, double high, double low,
+                      double close, double volume, double qvol, long closeTime) {
             this.openTime = openTime;
             this.open = open;
             this.high = high;
@@ -45,52 +32,32 @@ public final class TradingCore {
        ============================================================ */
 
     public enum Side { LONG, SHORT }
-
     public enum CoinType { TOP, ALT, MEME }
 
     /* ============================================================
-       RISK ENGINE (STABLE)
+       RISK ENGINE
        ============================================================ */
 
     public static final class RiskEngine {
+        private final double minRiskPct, maxRiskPct, minRR;
+        public static final double MIN_CONF = 0.54;
 
-        private final double minRiskPct;
-        private final double maxRiskPct;
-        private final double minRR;
-
-        public static final double MIN_CONF = 0.54; // минимальный порог confidence
-
-        public RiskEngine(double minRiskPct,
-                          double maxRiskPct,
-                          double minRR) {
-
+        public RiskEngine(double minRiskPct, double maxRiskPct, double minRR) {
             this.minRiskPct = minRiskPct;
             this.maxRiskPct = maxRiskPct;
             this.minRR = minRR;
         }
 
         public static final class TradeSignal {
-
             public final String symbol;
             public final Side side;
-            public final double entry;
-            public final double stop;
-            public final double take;
-            public final double rr;
-            public final double confidence;
+            public final double entry, stop, take, rr, confidence;
             public final String reason;
             public final CoinType type;
 
-            public TradeSignal(String symbol,
-                               Side side,
-                               double entry,
-                               double stop,
-                               double take,
-                               double rr,
-                               double confidence,
-                               String reason,
-                               CoinType type) {
-
+            public TradeSignal(String symbol, Side side, double entry,
+                               double stop, double take, double rr,
+                               double confidence, String reason, CoinType type) {
                 this.symbol = symbol;
                 this.side = side;
                 this.entry = entry;
@@ -103,99 +70,53 @@ public final class TradingCore {
             }
         }
 
-        public TradeSignal applyRisk(String symbol,
-                                     Side side,
-                                     double entry,
-                                     double atr,
-                                     double confidence,
-                                     String reason,
+        public TradeSignal applyRisk(String symbol, Side side, double entry,
+                                     double atr, double confidence, String reason,
                                      CoinType type) {
 
-            // проверка базовых условий
-            if (entry <= 0 || atr <= 0 || confidence < MIN_CONF)
-                return null; // фильтр MIN_CONF
+            if (entry <= 0 || atr <= 0 || confidence < MIN_CONF) return null;
 
-            double atrPct = atr / entry;
-            atrPct = clamp(atrPct, minRiskPct, maxRiskPct);
+            double atrPct = clamp(atr / entry, minRiskPct, maxRiskPct);
 
             double typeMultiplier = switch (type) {
                 case TOP -> 1.0;
                 case ALT -> 1.2;
                 case MEME -> 1.4;
             };
+            double riskPct = clamp(atrPct * typeMultiplier, minRiskPct, maxRiskPct);
 
-            double riskPct = clamp(
-                    atrPct * typeMultiplier,
-                    minRiskPct,
-                    maxRiskPct
-            );
-
-            // RR адаптируется по confidence
-            double rr =
-                    confidence > 0.85 ? 3.2 :
-                            confidence > 0.75 ? 2.6 :
-                                    confidence > 0.65 ? 2.2 :
-                                            confidence >= MIN_CONF ? 1.8 :
-                                                    1.5;
-
+            double rr = confidence > 0.85 ? 3.2 :
+                    confidence > 0.75 ? 2.6 :
+                            confidence > 0.65 ? 2.2 : 1.8;
             rr = Math.max(rr, minRR);
 
-            double stop;
-            double take;
+            double stop = side == Side.LONG ? entry * (1 - riskPct) : entry * (1 + riskPct);
+            double take = side == Side.LONG ? entry * (1 + riskPct * rr) : entry * (1 - riskPct * rr);
 
-            if (side == Side.LONG) {
-                stop = entry * (1 - riskPct);
-                take = entry * (1 + riskPct * rr);
-            } else {
-                stop = entry * (1 + riskPct);
-                take = entry * (1 - riskPct * rr);
-            }
-
-            return new TradeSignal(
-                    symbol,
-                    side,
-                    entry,
-                    stop,
-                    take,
-                    rr,
-                    confidence,
-                    reason,
-                    type
-            );
+            return new TradeSignal(symbol, side, entry, stop, take, rr, confidence, reason, type);
         }
 
-        private double clamp(double v,
-                             double min,
-                             double max) {
+        private double clamp(double v, double min, double max) {
             return Math.max(min, Math.min(max, v));
         }
     }
 
     /* ============================================================
-       ADAPTIVE BRAIN (PRO SAFE)
+       ADAPTIVE BRAIN
        ============================================================ */
 
     public static final class AdaptiveBrain {
-
         private static final double MAX_BIAS = 0.12;
         private static final double DECAY = 0.992;
         private static final int MAX_STREAK = 5;
 
-        private final Map<String, Double> symbolBias =
-                new ConcurrentHashMap<>();
+        private final Map<String, Double> symbolBias = new ConcurrentHashMap<>();
+        private final Map<String, Integer> streaks = new ConcurrentHashMap<>();
 
-        private final Map<String, Integer> streaks =
-                new ConcurrentHashMap<>();
-
-        public double applyAllAdjustments(String strategy,
-                                          String symbol,
-                                          double baseConfidence,
-                                          CoinType type,
-                                          boolean highVol,
-                                          boolean lowVol) {
-
+        public double applyAllAdjustments(String strategy, String symbol,
+                                          double baseConfidence, CoinType type,
+                                          boolean highVol, boolean lowVol) {
             double conf = baseConfidence;
-
             conf += strategyBoost(strategy);
             conf += symbolBias.getOrDefault(symbol, 0.0);
             conf += typeBoost(type);
@@ -203,13 +124,11 @@ public final class TradingCore {
             if (highVol) conf += 0.025;
             if (lowVol) conf -= 0.03;
 
-            return clamp(conf, 0.40, 0.95); // адаптируемый диапазон
+            return clamp(conf, 0.40, 0.95);
         }
 
         private double strategyBoost(String strategy) {
-            return "ELITE5".equalsIgnoreCase(strategy)
-                    ? 0.02
-                    : 0.0;
+            return "ELITE5".equalsIgnoreCase(strategy) ? 0.02 : 0.0;
         }
 
         private double typeBoost(CoinType type) {
@@ -220,15 +139,8 @@ public final class TradingCore {
             };
         }
 
-        public void registerResult(String symbol,
-                                   boolean win) {
-
-            /* ==== STREAK ==== */
-
-            streaks.merge(symbol,
-                    win ? 1 : -1,
-                    Integer::sum);
-
+        public void registerResult(String symbol, boolean win) {
+            streaks.merge(symbol, win ? 1 : -1, Integer::sum);
             streaks.compute(symbol, (s, val) -> {
                 if (val == null) return 0;
                 if (val > MAX_STREAK) return MAX_STREAK;
@@ -236,23 +148,12 @@ public final class TradingCore {
                 return val;
             });
 
-            /* ==== BIAS ==== */
-
-            symbolBias.merge(symbol,
-                    win ? 0.015 : -0.018,
-                    Double::sum);
+            symbolBias.merge(symbol, win ? 0.015 : -0.018, Double::sum);
             symbolBias.compute(symbol, (s, val) -> {
-
-                if (val == null)
-                    return 0.0;
-
+                if (val == null) return 0.0;
                 val *= DECAY;
-
                 val = clamp(val, -MAX_BIAS, MAX_BIAS);
-
-                if (Math.abs(val) < 0.0005)
-                    return 0.0; // очистка шума
-
+                if (Math.abs(val) < 0.0005) return 0.0;
                 return val;
             });
         }
@@ -267,10 +168,45 @@ public final class TradingCore {
             streaks.clear();
         }
 
-        private double clamp(double v,
-                             double min,
-                             double max) {
+        private double clamp(double v, double min, double max) {
             return Math.max(min, Math.min(max, v));
+        }
+    }
+
+    /* ============================================================
+       INTEGRATED SIGNAL PIPELINE
+       ============================================================ */
+
+    public static final class SignalPipeline {
+        private final SignalOptimizer optimizer;
+        private final AdaptiveBrain brain;
+        private final RiskEngine riskEngine;
+
+        public SignalPipeline(SignalOptimizer optimizer, AdaptiveBrain brain, RiskEngine riskEngine) {
+            this.optimizer = optimizer;
+            this.brain = brain;
+            this.riskEngine = riskEngine;
+        }
+
+        public RiskEngine.TradeSignal process(
+                com.bot.DecisionEngineMerged.TradeIdea signal,
+                String strategy,
+                boolean highVol,
+                boolean lowVol) {
+
+            // 1️⃣ Коррекция confidence по микро-тренду
+            double adjustedConf = optimizer.adjustConfidence(signal);
+
+            // 2️⃣ AdaptiveBrain корректировка
+            adjustedConf = brain.applyAllAdjustments(strategy, signal.symbol,
+                    adjustedConf,
+                    CoinType.TOP, // или сигналная категория
+                    highVol, lowVol);
+
+            // 3️⃣ Применяем RiskEngine для стоп/тейк и RR
+            double atr = Math.max(signal.price - signal.stop, 1e-6);
+            return riskEngine.applyRisk(signal.symbol, signal.side, signal.price,
+                    atr, adjustedConf, "AutoSignal", CoinType.TOP);
         }
     }
 }

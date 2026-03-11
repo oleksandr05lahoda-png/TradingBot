@@ -162,7 +162,7 @@ public class SignalSender {
         this.VOLUME_SPIKE_MULT = envDouble("VOL_SPIKE_MULT", 1.4);
 
         this.STABLE = Set.of("USDT", "USDC", "BUSD");
-        this.decisionEngine = new com.bot.DecisionEngineMerged(tickPriceDeque, btcCandles);
+        this.decisionEngine = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain = new com.bot.TradingCore.AdaptiveBrain();
         this.optimizer = new com.bot.SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
@@ -1128,7 +1128,7 @@ public class SignalSender {
             }
 
             com.bot.DecisionEngineMerged engine =
-                    new com.bot.DecisionEngineMerged(tickPriceDeque, btcCandles);
+                    new com.bot.DecisionEngineMerged();
             // === Получаем глобальный тренд BTC ОДИН раз за цикл ===
             int btcTrend = getBtcTrend();
 
