@@ -43,6 +43,7 @@ public class SignalSender {
     private long lastBinancePairsRefresh = 0L;
     private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
     private final Map<String, Deque<Double>> tickPriceDeque = new ConcurrentHashMap<>();
+    private final List<com.bot.TradingCore.Candle> btcCandles = new CopyOnWriteArrayList<>();
     private final Map<String, Double> lastTickPrice = new ConcurrentHashMap<>();
     private final Map<String, java.net.http.WebSocket> wsMap = new ConcurrentHashMap<>();
     private final ScheduledExecutorService wsWatcher = Executors.newSingleThreadScheduledExecutor();
@@ -161,9 +162,8 @@ public class SignalSender {
         this.VOLUME_SPIKE_MULT = envDouble("VOL_SPIKE_MULT", 1.4);
 
         this.STABLE = Set.of("USDT", "USDC", "BUSD");
-        this.decisionEngine = new com.bot.DecisionEngineMerged();
+        this.decisionEngine = new com.bot.DecisionEngineMerged(tickPriceDeque, btcCandles);
         this.adaptiveBrain = new com.bot.TradingCore.AdaptiveBrain();
-        com.bot.TradingCore.AdaptiveBrain brain = new com.bot.TradingCore.AdaptiveBrain();
         this.optimizer = new com.bot.SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
         // =================== Scheduler для автозапуска анализа ===================
@@ -1127,8 +1127,8 @@ public class SignalSender {
                 lastBinancePairsRefresh = System.currentTimeMillis();
             }
 
-            com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
-
+            com.bot.DecisionEngineMerged engine =
+                    new com.bot.DecisionEngineMerged(tickPriceDeque, btcCandles);
             // === Получаем глобальный тренд BTC ОДИН раз за цикл ===
             int btcTrend = getBtcTrend();
 

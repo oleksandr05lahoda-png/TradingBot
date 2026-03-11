@@ -5,8 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -418,7 +419,17 @@
       <workItem from="1773010598004" duration="5000" />
       <workItem from="1773010693426" duration="3408000" />
       <workItem from="1773098420094" duration="2532000" />
-      <workItem from="1773127995369" duration="4943000" />
+      <workItem from="1773127995369" duration="5105000" />
+      <workItem from="1773141874642" duration="204000" />
+      <workItem from="1773142099302" duration="7000" />
+      <workItem from="1773142211451" duration="6000" />
+      <workItem from="1773142230133" duration="6000" />
+      <workItem from="1773142247847" duration="9000" />
+      <workItem from="1773142268171" duration="6000" />
+      <workItem from="1773142283790" duration="4000" />
+      <workItem from="1773142297187" duration="5000" />
+      <workItem from="1773142429966" duration="746000" />
+      <workItem from="1773221778458" duration="1792000" />
     </task>
     <servers />
   </component>

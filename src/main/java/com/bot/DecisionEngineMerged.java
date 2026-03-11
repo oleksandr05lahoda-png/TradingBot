@@ -1,5 +1,8 @@
 package com.bot;
 
+import com.bot.SignalOptimizer;
+import com.bot.GlobalImpulseController;
+import com.bot.TradingCore;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -18,7 +21,18 @@ public final class DecisionEngineMerged {
     private static final double MIN_CONFIDENCE = 54.0;
 
     private final Map<String, Long> cooldownMap = new ConcurrentHashMap<>();
+
     private final Map<String, Deque<String>> recentDirections = new ConcurrentHashMap<>();
+    private final SignalOptimizer signalOptimizer;
+    private final GlobalImpulseController globalImpulse;
+    public DecisionEngineMerged(Map<String, Deque<Double>> tickPriceDeque,
+                                List<com.bot.TradingCore.Candle> btcCandles) {
+        this.signalOptimizer = new SignalOptimizer(tickPriceDeque);
+        this.globalImpulse = new GlobalImpulseController();
+
+        // сразу апдейтим глобальный контекст BTC
+        this.globalImpulse.update(btcCandles);
+    }
 
     public static final class TradeIdea {
 
