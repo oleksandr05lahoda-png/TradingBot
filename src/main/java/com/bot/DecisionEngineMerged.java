@@ -3,6 +3,15 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * DecisionEngineMerged - Updated Version
+ *
+ * ИЗМЕНЕНИЯ:
+ * - 4H таймфрейм заменён на 1H (более релевантно для 15M торговли)
+ * - Добавлена поддержка 2H для дополнительного подтверждения
+ * - Интеграция с PumpHunter
+ * - Улучшенный расчёт probability
+ */
 public final class DecisionEngineMerged {
 
     public enum CoinCategory { TOP, ALT, MEME }
@@ -22,22 +31,29 @@ public final class DecisionEngineMerged {
     private final Map<String, Long> cooldownMap = new ConcurrentHashMap<>();
     private final Map<String, Deque<String>> recentDirections = new ConcurrentHashMap<>();
 
-    // === НОВОЕ: Хранилище Funding Rate и Open Interest ===
+    // === Хранилище Funding Rate и Open Interest ===
     private final Map<String, FundingOIData> fundingOICache = new ConcurrentHashMap<>();
 
-    // === НОВОЕ: История калибровки probability ===
+    // === История калибровки probability ===
     private final Map<String, Deque<CalibrationRecord>> calibrationHistory = new ConcurrentHashMap<>();
     private static final int CALIBRATION_WINDOW = 100;
+
+    // === НОВОЕ: Интеграция с PumpHunter ===
+    private PumpHunter pumpHunter;
 
     public DecisionEngineMerged() {
     }
 
-    // === НОВОЕ: Структура для Funding Rate + Open Interest ===
+    public void setPumpHunter(PumpHunter pumpHunter) {
+        this.pumpHunter = pumpHunter;
+    }
+
+    // === Структура для Funding Rate + Open Interest ===
     public static final class FundingOIData {
-        public final double fundingRate;      // текущий funding rate (%)
-        public final double openInterest;     // текущий OI в USDT
-        public final double oiChange1h;       // изменение OI за 1 час (%)
-        public final double oiChange4h;       // изменение OI за 4 часа (%)
+        public final double fundingRate;
+        public final double openInterest;
+        public final double oiChange1h;
+        public final double oiChange4h;
         public final long timestamp;
 
         public FundingOIData(double fundingRate, double openInterest, double oiChange1h, double oiChange4h) {
@@ -49,11 +65,11 @@ public final class DecisionEngineMerged {
         }
 
         public boolean isValid() {
-            return System.currentTimeMillis() - timestamp < 5 * 60_000; // 5 минут актуальность
+            return System.currentTimeMillis() - timestamp < 5 * 60_000;
         }
     }
 
-    // === НОВОЕ: Запись для калибровки ===
+    // === Запись для калибровки ===
     private static final class CalibrationRecord {
         final double predictedProb;
         final boolean wasCorrect;
@@ -74,7 +90,6 @@ public final class DecisionEngineMerged {
         public final double take;
         public final double probability;
         public final List<String> flags;
-        // === НОВОЕ: Дополнительная информация ===
         public final double fundingRate;
         public final double oiChange;
         public final String htfBias;
@@ -120,7 +135,6 @@ public final class DecisionEngineMerged {
                     .withNano(0)
                     .toString();
 
-            // === НОВОЕ: Добавляем Funding и OI в вывод ===
             String fundingStr = Math.abs(fundingRate) > 0.001 ?
                     String.format("FR: %.3f%%", fundingRate * 100) : "";
             String oiStr = Math.abs(oiChange) > 0.5 ?
@@ -140,12 +154,10 @@ public final class DecisionEngineMerged {
         }
     }
 
-    // === НОВОЕ: Метод для обновления Funding Rate и OI ===
     public void updateFundingOI(String symbol, double fundingRate, double openInterest, double oiChange1h, double oiChange4h) {
         fundingOICache.put(symbol, new FundingOIData(fundingRate, openInterest, oiChange1h, oiChange4h));
     }
 
-    // === НОВОЕ: Метод для получения актуальных данных ===
     public FundingOIData getFundingOI(String symbol) {
         FundingOIData data = fundingOICache.get(symbol);
         if (data != null && data.isValid()) {
@@ -154,13 +166,13 @@ public final class DecisionEngineMerged {
         return null;
     }
 
-    /* ===== MAIN GENERATE ===== */
+    /* ===== MAIN GENERATE - UPDATED: 4H -> 1H/2H ===== */
     private TradeIdea generate(String symbol,
                                List<com.bot.TradingCore.Candle> c1,
                                List<com.bot.TradingCore.Candle> c5,
                                List<com.bot.TradingCore.Candle> c15,
                                List<com.bot.TradingCore.Candle> c1h,
-                               List<com.bot.TradingCore.Candle> c4h,
+                               List<com.bot.TradingCore.Candle> c2h,  // ИЗМЕНЕНО: 4H -> 2H
                                CoinCategory cat,
                                long now) {
 
@@ -183,18 +195,18 @@ public final class DecisionEngineMerged {
         MarketState state = detectState(c15);
         HTFBias bias1h = detectBias(c1h);
 
-        // === НОВОЕ: 4H BIAS (главный фильтр направления) ===
-        HTFBias bias4h = c4h != null && c4h.size() >= 100 ? detectBias4H(c4h) : HTFBias.NONE;
+        // === ИЗМЕНЕНО: 2H BIAS вместо 4H (ближе к 15M для лучших сигналов) ===
+        HTFBias bias2h = c2h != null && c2h.size() >= 50 ? detectBias2H(c2h) : HTFBias.NONE;
 
-        // === НОВОЕ: Адаптивный MIN_CONFIDENCE ===
-        double btcAtr = atr; // TODO: получить ATR BTC отдельно
+        // === Адаптивный MIN_CONFIDENCE ===
+        double btcAtr = atr;
         adaptMinConfidence(state, btcAtr, price);
 
-        // === SIDEWAYS FILTER === Не торгуем боковик
+        // === SIDEWAYS FILTER ===
         if (state == MarketState.RANGE) {
             double adxVal = adx(c15, 14);
             if (adxVal < 20) {
-                return null; // Явный боковик - пропускаем
+                return null;
             }
         }
 
@@ -202,27 +214,50 @@ public final class DecisionEngineMerged {
         double scoreShort = 0;
         List<String> flags = new ArrayList<>();
 
-        // === HTF BIAS 1H ===
+        // === HTF BIAS 1H (основной) ===
         if (bias1h == HTFBias.BULL) {
-            scoreLong += 0.40;
-            scoreShort -= 0.15;
+            scoreLong += 0.50;   // Увеличен вес 1H
+            scoreShort -= 0.20;
+            flags.add("1H_BULL");
         } else if (bias1h == HTFBias.BEAR) {
+            scoreShort += 0.50;
+            scoreLong -= 0.20;
+            flags.add("1H_BEAR");
+        }
+
+        // === 2H BIAS (подтверждение) - ИЗМЕНЕНО с 4H ===
+        if (bias2h == HTFBias.BULL) {
+            scoreLong += 0.40;
+            scoreShort -= 0.25;
+            flags.add("2H_BULL");
+        } else if (bias2h == HTFBias.BEAR) {
             scoreShort += 0.40;
-            scoreLong -= 0.15;
+            scoreLong -= 0.25;
+            flags.add("2H_BEAR");
         }
 
-        // === НОВОЕ: 4H BIAS (более сильный вес) ===
-        if (bias4h == HTFBias.BULL) {
-            scoreLong += 0.55;
-            scoreShort -= 0.30;
-            flags.add("4H_BULL");
-        } else if (bias4h == HTFBias.BEAR) {
-            scoreShort += 0.55;
-            scoreLong -= 0.30;
-            flags.add("4H_BEAR");
+        // === НОВОЕ: PumpHunter Integration ===
+        if (pumpHunter != null) {
+            PumpHunter.PumpEvent pump = pumpHunter.detectPump(symbol, c1, c5, c15);
+            if (pump != null && pump.strength > 0.4) {
+                if (pump.isBullish()) {
+                    scoreLong += 0.60 + pump.strength * 0.50;
+                    flags.add("PUMP_UP_" + String.format("%.0f", pump.strength * 100));
+                } else if (pump.isBearish()) {
+                    scoreShort += 0.60 + pump.strength * 0.50;
+                    flags.add("PUMP_DOWN_" + String.format("%.0f", pump.strength * 100));
+                }
+
+                // Mega pump = усиленный сигнал
+                if (pump.isMega()) {
+                    if (pump.isBullish()) scoreLong += 0.30;
+                    else scoreShort += 0.30;
+                    flags.add("MEGA");
+                }
+            }
         }
 
-        // === НОВОЕ: FUNDING RATE FILTER ===
+        // === FUNDING RATE FILTER ===
         FundingOIData fundingData = getFundingOI(symbol);
         double fundingRate = 0;
         double oiChange = 0;
@@ -244,8 +279,7 @@ public final class DecisionEngineMerged {
                 flags.add("FR_LOW");
             }
 
-            // === НОВОЕ: OPEN INTEREST ANALYSIS ===
-            // OI растёт + funding высокий = скоро ликвидации
+            // === OPEN INTEREST ANALYSIS ===
             if (fundingData.oiChange1h > 3.0 && fundingRate > 0.0003) {
                 scoreShort += 0.30;
                 flags.add("OI_SQUEEZE_LONG");
@@ -255,7 +289,6 @@ public final class DecisionEngineMerged {
                 flags.add("OI_SQUEEZE_SHORT");
             }
 
-            // OI падает резко = тренд ослабевает
             if (fundingData.oiChange1h < -5.0) {
                 scoreLong *= 0.80;
                 scoreShort *= 0.80;
@@ -278,7 +311,7 @@ public final class DecisionEngineMerged {
             flags.add("pullback_short");
         }
 
-        // === НОВОЕ: FAIR VALUE GAP (FVG) ===
+        // === FAIR VALUE GAP (FVG) ===
         FVGResult fvg = detectFVG(c15);
         if (fvg.detected) {
             if (fvg.isBullish && price < fvg.gapHigh && price > fvg.gapLow) {
@@ -290,7 +323,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // === НОВОЕ: ORDER BLOCK ===
+        // === ORDER BLOCK ===
         OrderBlockResult ob = detectOrderBlock(c15);
         if (ob.detected) {
             if (ob.isBullish && price <= ob.zone * 1.005) {
@@ -302,7 +335,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // === PUMP DETECTOR ===
+        // === PUMP DETECTOR (старый метод для совместимости) ===
         PumpResult pump = detectPump(c1, c5, cat);
         if (pump.detected) {
             if (pump.direction > 0) {
@@ -389,14 +422,25 @@ public final class DecisionEngineMerged {
             if (bias1h == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.70;
         }
 
-        // === НОВОЕ: 4H BIAS VETO (сильный фильтр) ===
-        if (bias4h == HTFBias.BULL && scoreShort > scoreLong && adxValue > 25) {
-            scoreShort *= 0.50; // Сильно режем шорты против 4H тренда
-            flags.add("4H_VETO");
+        // === 2H BIAS VETO (ИЗМЕНЕНО с 4H) ===
+        if (bias2h == HTFBias.BULL && scoreShort > scoreLong && adxValue > 25) {
+            scoreShort *= 0.55;
+            flags.add("2H_VETO");
         }
-        if (bias4h == HTFBias.BEAR && scoreLong > scoreShort && adxValue > 25) {
-            scoreLong *= 0.50; // Сильно режем лонги против 4H тренда
-            flags.add("4H_VETO");
+        if (bias2h == HTFBias.BEAR && scoreLong > scoreShort && adxValue > 25) {
+            scoreLong *= 0.55;
+            flags.add("2H_VETO");
+        }
+
+        // === 1H + 2H ALIGNMENT BONUS ===
+        if (bias1h == bias2h && bias1h != HTFBias.NONE) {
+            if (bias1h == HTFBias.BULL) {
+                scoreLong += 0.25;
+                flags.add("HTF_ALIGNED");
+            } else {
+                scoreShort += 0.25;
+                flags.add("HTF_ALIGNED");
+            }
         }
 
         // === VOLUME CONFIRMATION ===
@@ -406,7 +450,7 @@ public final class DecisionEngineMerged {
             flags.add("vol:true");
         }
 
-        // === TREND EXHAUSTION (движение слишком большое) ===
+        // === TREND EXHAUSTION ===
         double move8 = (last(c15).close - c15.get(c15.size() - 8).close) / price;
         if (move8 > 0.035 && scoreLong > scoreShort) {
             scoreLong *= 0.68;
@@ -435,7 +479,7 @@ public final class DecisionEngineMerged {
         if (!cooldownAllowed(symbol, side, cat, now)) return null;
         if (!flipAllowed(symbol, side)) return null;
 
-        // === НОВОЕ: CALIBRATED PROBABILITY ===
+        // === CALIBRATED PROBABILITY ===
         double probability = computeCalibratedConfidence(
                 symbol,
                 scoreLong, scoreShort,
@@ -445,7 +489,7 @@ public final class DecisionEngineMerged {
                 pullbackUpFlag, pullbackDownFlag,
                 impulseFlag, pump.detected,
                 fundingData,
-                bias4h,
+                bias2h,  // ИЗМЕНЕНО: 4H -> 2H
                 fvg.detected, ob.detected
         );
 
@@ -460,9 +504,9 @@ public final class DecisionEngineMerged {
         double riskMult = cat == CoinCategory.MEME ? 1.35 : cat == CoinCategory.ALT ? 1.05 : 0.88;
         double rr = scoreDiff > 1.0 ? 3.2 : scoreDiff > 0.7 ? 2.7 : 2.3;
 
-        // === НОВОЕ: Фиксированный тейк +2% для фьючерсов ===
-        double targetPct = 0.02; // 2%
-        double stopPct = targetPct / rr; // Динамический стоп под RR
+        // === Фиксированный тейк +2% для фьючерсов ===
+        double targetPct = 0.02;
+        double stopPct = targetPct / rr;
 
         double stop = side == com.bot.TradingCore.Side.LONG
                 ? price * (1 - stopPct)
@@ -475,49 +519,46 @@ public final class DecisionEngineMerged {
         registerSignal(symbol, side, now);
 
         return new TradeIdea(symbol, side, price, stop, take, probability, flags,
-                fundingRate, oiChange, bias4h.name());
+                fundingRate, oiChange, bias2h.name());  // ИЗМЕНЕНО: bias4h -> bias2h
     }
 
-    // === НОВОЕ: Адаптивный MIN_CONFIDENCE ===
+    // === Адаптивный MIN_CONFIDENCE ===
     private void adaptMinConfidence(MarketState state, double atr, double price) {
         double volatility = atr / price;
 
         if (volatility < 0.008) {
-            // Низкая волатильность → строже фильтры
             MIN_CONFIDENCE = 62.0;
         } else if (volatility > 0.025) {
-            // Высокая волатильность → ловим импульсы
             MIN_CONFIDENCE = 54.0;
         } else {
             MIN_CONFIDENCE = 58.0;
         }
 
-        // Сильный тренд → можем быть менее строгими
         if (state == MarketState.STRONG_TREND) {
             MIN_CONFIDENCE -= 3.0;
         }
     }
 
-    // === НОВОЕ: 4H BIAS Detection ===
-    private HTFBias detectBias4H(List<com.bot.TradingCore.Candle> c4h) {
-        if (c4h == null || c4h.size() < 50) return HTFBias.NONE;
+    // === ИЗМЕНЕНО: 2H BIAS Detection (вместо 4H) ===
+    private HTFBias detectBias2H(List<com.bot.TradingCore.Candle> c2h) {
+        if (c2h == null || c2h.size() < 30) return HTFBias.NONE;
 
-        double ema21 = ema(c4h, 21);
-        double ema50 = ema(c4h, 50);
-        double ema100 = c4h.size() >= 100 ? ema(c4h, 100) : ema50;
-        double price = last(c4h).close;
+        double ema12 = ema(c2h, 12);
+        double ema26 = ema(c2h, 26);
+        double ema50 = c2h.size() >= 50 ? ema(c2h, 50) : ema26;
+        double price = last(c2h).close;
 
-        // Проверяем структуру: EMA21 > EMA50 > EMA100 = бычий тренд
-        boolean bullishEMA = ema21 > ema50 && ema50 > ema100 * 0.998;
-        boolean bearishEMA = ema21 < ema50 && ema50 < ema100 * 1.002;
+        // Проверяем структуру EMA
+        boolean bullishEMA = ema12 > ema26 && ema26 > ema50 * 0.998;
+        boolean bearishEMA = ema12 < ema26 && ema26 < ema50 * 1.002;
 
-        // Проверяем позицию цены относительно EMA
-        boolean priceAboveEMA = price > ema21 && price > ema50;
-        boolean priceBelowEMA = price < ema21 && price < ema50;
+        // Позиция цены относительно EMA
+        boolean priceAboveEMA = price > ema12 && price > ema26;
+        boolean priceBelowEMA = price < ema12 && price < ema26;
 
-        // Проверяем Higher Highs / Lower Lows
-        boolean hh_hl = checkHigherHighsHigherLows(c4h);
-        boolean ll_lh = checkLowerLowsLowerHighs(c4h);
+        // Higher Highs / Lower Lows
+        boolean hh_hl = checkHigherHighsHigherLows(c2h);
+        boolean ll_lh = checkLowerLowsLowerHighs(c2h);
 
         // Комбинированное решение
         if (bullishEMA && priceAboveEMA && hh_hl) return HTFBias.BULL;
@@ -529,26 +570,26 @@ public final class DecisionEngineMerged {
     }
 
     private boolean checkHigherHighsHigherLows(List<com.bot.TradingCore.Candle> c) {
-        if (c.size() < 20) return false;
+        if (c.size() < 15) return false;
         int n = c.size();
-        double high1 = c.subList(n - 20, n - 10).stream().mapToDouble(x -> x.high).max().orElse(0);
-        double high2 = c.subList(n - 10, n).stream().mapToDouble(x -> x.high).max().orElse(0);
-        double low1 = c.subList(n - 20, n - 10).stream().mapToDouble(x -> x.low).min().orElse(0);
-        double low2 = c.subList(n - 10, n).stream().mapToDouble(x -> x.low).min().orElse(0);
+        double high1 = c.subList(n - 15, n - 8).stream().mapToDouble(x -> x.high).max().orElse(0);
+        double high2 = c.subList(n - 8, n).stream().mapToDouble(x -> x.high).max().orElse(0);
+        double low1 = c.subList(n - 15, n - 8).stream().mapToDouble(x -> x.low).min().orElse(0);
+        double low2 = c.subList(n - 8, n).stream().mapToDouble(x -> x.low).min().orElse(0);
         return high2 > high1 && low2 > low1;
     }
 
     private boolean checkLowerLowsLowerHighs(List<com.bot.TradingCore.Candle> c) {
-        if (c.size() < 20) return false;
+        if (c.size() < 15) return false;
         int n = c.size();
-        double high1 = c.subList(n - 20, n - 10).stream().mapToDouble(x -> x.high).max().orElse(0);
-        double high2 = c.subList(n - 10, n).stream().mapToDouble(x -> x.high).max().orElse(0);
-        double low1 = c.subList(n - 20, n - 10).stream().mapToDouble(x -> x.low).min().orElse(0);
-        double low2 = c.subList(n - 10, n).stream().mapToDouble(x -> x.low).min().orElse(0);
+        double high1 = c.subList(n - 15, n - 8).stream().mapToDouble(x -> x.high).max().orElse(0);
+        double high2 = c.subList(n - 8, n).stream().mapToDouble(x -> x.high).max().orElse(0);
+        double low1 = c.subList(n - 15, n - 8).stream().mapToDouble(x -> x.low).min().orElse(0);
+        double low2 = c.subList(n - 8, n).stream().mapToDouble(x -> x.low).min().orElse(0);
         return high2 < high1 && low2 < low1;
     }
 
-    // === НОВОЕ: Fair Value Gap (FVG) ===
+    // === Fair Value Gap (FVG) ===
     private static class FVGResult {
         final boolean detected;
         final boolean isBullish;
@@ -566,16 +607,14 @@ public final class DecisionEngineMerged {
     private FVGResult detectFVG(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 10) return new FVGResult(false, false, 0, 0);
 
-        // Ищем FVG в последних 8 свечах
         for (int i = c.size() - 3; i >= c.size() - 8 && i >= 2; i--) {
             com.bot.TradingCore.Candle c1 = c.get(i - 1);
-            com.bot.TradingCore.Candle c2 = c.get(i);     // импульсная свеча
+            com.bot.TradingCore.Candle c2 = c.get(i);
             com.bot.TradingCore.Candle c3 = c.get(i + 1);
 
             double bodySize = Math.abs(c2.close - c2.open);
             double atr = atr(c.subList(Math.max(0, i - 14), i + 1), 14);
 
-            // Bullish FVG: gap между high свечи 1 и low свечи 3
             if (c2.close > c2.open && bodySize > atr * 1.5) {
                 double gapLow = c1.high;
                 double gapHigh = c3.low;
@@ -584,7 +623,6 @@ public final class DecisionEngineMerged {
                 }
             }
 
-            // Bearish FVG: gap между low свечи 1 и high свечи 3
             if (c2.close < c2.open && bodySize > atr * 1.5) {
                 double gapHigh = c1.low;
                 double gapLow = c3.high;
@@ -597,7 +635,7 @@ public final class DecisionEngineMerged {
         return new FVGResult(false, false, 0, 0);
     }
 
-    // === НОВОЕ: Order Block Detection ===
+    // === Order Block Detection ===
     private static class OrderBlockResult {
         final boolean detected;
         final boolean isBullish;
@@ -613,11 +651,9 @@ public final class DecisionEngineMerged {
     private OrderBlockResult detectOrderBlock(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 15) return new OrderBlockResult(false, false, 0);
 
-        // Ищем последнюю свечу перед импульсом
         for (int i = c.size() - 5; i >= c.size() - 12 && i >= 3; i--) {
             com.bot.TradingCore.Candle potential = c.get(i);
 
-            // Проверяем, был ли импульс после этой свечи
             double moveAfter = 0;
             for (int j = i + 1; j < Math.min(i + 4, c.size()); j++) {
                 moveAfter += c.get(j).close - c.get(j).open;
@@ -625,12 +661,10 @@ public final class DecisionEngineMerged {
 
             double atr = atr(c, 14);
 
-            // Bullish Order Block: последняя красная свеча перед сильным ростом
             if (potential.close < potential.open && moveAfter > atr * 2.0) {
                 return new OrderBlockResult(true, true, potential.low);
             }
 
-            // Bearish Order Block: последняя зелёная свеча перед сильным падением
             if (potential.close > potential.open && moveAfter < -atr * 2.0) {
                 return new OrderBlockResult(true, false, potential.high);
             }
@@ -828,7 +862,7 @@ public final class DecisionEngineMerged {
         if (history.size() > 3) history.removeFirst();
     }
 
-    /* ===== НОВОЕ: CALIBRATED CONFIDENCE ===== */
+    /* ===== CALIBRATED CONFIDENCE (UPDATED) ===== */
     private double computeCalibratedConfidence(String symbol,
                                                double scoreLong, double scoreShort,
                                                MarketState state, CoinCategory cat,
@@ -837,15 +871,13 @@ public final class DecisionEngineMerged {
                                                boolean pullbackUp, boolean pullbackDown,
                                                boolean impulse, boolean pump,
                                                FundingOIData fundingData,
-                                               HTFBias bias4h,
+                                               HTFBias bias2h,  // ИЗМЕНЕНО: 4H -> 2H
                                                boolean hasFVG, boolean hasOB) {
 
-        // === Базовый расчёт на основе разницы скоров ===
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-        double maxScore = 4.0; // Увеличен из-за новых индикаторов
+        double maxScore = 4.5;  // Увеличен из-за PumpHunter
         double normScore = scoreDiff / maxScore;
 
-        // === Бонусы за подтверждения ===
         int confirmations = 0;
 
         if (bullDiv || bearDiv) { normScore += 0.05; confirmations++; }
@@ -855,9 +887,8 @@ public final class DecisionEngineMerged {
         if (hasFVG) { normScore += 0.05; confirmations++; }
         if (hasOB) { normScore += 0.05; confirmations++; }
 
-        // === Бонус за Funding Rate ===
+        // Бонус за Funding Rate
         if (fundingData != null) {
-            // Если funding подтверждает направление
             boolean fundingConfirmsLong = fundingData.fundingRate < -0.0003 && scoreLong > scoreShort;
             boolean fundingConfirmsShort = fundingData.fundingRate > 0.0003 && scoreShort > scoreLong;
             if (fundingConfirmsLong || fundingConfirmsShort) {
@@ -866,49 +897,38 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // === Бонус за 4H Bias ===
-        boolean bias4hConfirms = (bias4h == HTFBias.BULL && scoreLong > scoreShort) ||
-                (bias4h == HTFBias.BEAR && scoreShort > scoreLong);
-        if (bias4hConfirms) {
-            normScore += 0.07;
+        // Бонус за 2H Bias (ИЗМЕНЕНО: 4H -> 2H)
+        boolean bias2hConfirms = (bias2h == HTFBias.BULL && scoreLong > scoreShort) ||
+                (bias2h == HTFBias.BEAR && scoreShort > scoreLong);
+        if (bias2hConfirms) {
+            normScore += 0.06;  // Немного меньше чем для 4H
             confirmations++;
         }
 
         normScore = Math.min(1.0, normScore);
 
-        // === Базовая вероятность ===
-        // Калиброванная формула: probability = 50 + (normScore * range)
-        // Range зависит от количества подтверждений
-        double range = 30 + Math.min(confirmations * 3, 15); // 30-45%
+        double range = 30 + Math.min(confirmations * 3, 15);
         double probability = 50 + normScore * range;
 
-        // === Корректировки по состоянию рынка ===
         if (state == MarketState.STRONG_TREND) probability += 3;
         else if (state == MarketState.WEAK_TREND) probability += 1;
         else if (state == MarketState.RANGE) probability -= 3;
 
-        // === Корректировки по категории монеты ===
         if (cat == CoinCategory.MEME) probability -= 5;
         else if (cat == CoinCategory.ALT) probability -= 2;
 
-        // === Калибровка на основе истории (если есть) ===
         Deque<CalibrationRecord> history = calibrationHistory.get(symbol);
         if (history != null && history.size() >= 20) {
             double avgAccuracy = calculateHistoricalAccuracy(history, probability);
-            // Сдвигаем probability к исторической точности
             probability = probability * 0.7 + avgAccuracy * 0.3;
         }
 
-        // === Финальное ограничение ===
-        // Не даём probability > 85% (нет 100% сигналов в трейдинге)
-        // Не даём probability < 50% (это не прогноз)
         probability = clamp(probability, 50, 85);
 
         return Math.round(probability);
     }
 
     private double calculateHistoricalAccuracy(Deque<CalibrationRecord> history, double currentProb) {
-        // Считаем точность для сигналов с похожей probability
         double sumCorrect = 0;
         double count = 0;
 
@@ -923,7 +943,6 @@ public final class DecisionEngineMerged {
         return (sumCorrect / count) * 100;
     }
 
-    // === Метод для записи результата сигнала (вызывать после закрытия сделки) ===
     public void recordSignalResult(String symbol, double predictedProb, boolean wasCorrect) {
         Deque<CalibrationRecord> history = calibrationHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
         history.addLast(new CalibrationRecord(predictedProb, wasCorrect));
@@ -1102,15 +1121,15 @@ public final class DecisionEngineMerged {
         return generate(symbol, c1, c5, c15, c1h, null, cat, now);
     }
 
-    // === НОВЫЙ МЕТОД analyze с 4H ===
+    // === НОВЫЙ МЕТОД analyze с 2H (ИЗМЕНЕНО: 4H -> 2H) ===
     public TradeIdea analyze(String symbol,
                              List<com.bot.TradingCore.Candle> c1,
                              List<com.bot.TradingCore.Candle> c5,
                              List<com.bot.TradingCore.Candle> c15,
                              List<com.bot.TradingCore.Candle> c1h,
-                             List<com.bot.TradingCore.Candle> c4h,
+                             List<com.bot.TradingCore.Candle> c2h,  // ИЗМЕНЕНО: 4H -> 2H
                              CoinCategory cat) {
         long now = System.currentTimeMillis();
-        return generate(symbol, c1, c5, c15, c1h, c4h, cat, now);
+        return generate(symbol, c1, c5, c15, c1h, c2h, cat, now);
     }
 }

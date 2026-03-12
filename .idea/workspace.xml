@@ -5,6 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -448,6 +449,7 @@
       <workItem from="1773348594270" duration="7000" />
       <workItem from="1773348609497" duration="4000" />
       <workItem from="1773348630820" duration="10000" />
+      <workItem from="1773348692471" duration="3194000" />
     </task>
     <servers />
   </component>

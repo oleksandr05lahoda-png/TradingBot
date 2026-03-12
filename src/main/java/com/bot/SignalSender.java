@@ -1,4 +1,5 @@
 package com.bot;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.time.LocalDateTime;
@@ -12,6 +13,14 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
+/**
+ * SignalSender - Updated Version
+ *
+ * ИЗМЕНЕНИЯ:
+ * - 4H таймфрейм заменён на 2H
+ * - Интеграция с PumpHunter
+ * - Улучшенные BTC trend фильтры
+ */
 public class SignalSender {
     private final com.bot.TelegramBotSender bot;
     private final HttpClient http;
@@ -36,8 +45,8 @@ public class SignalSender {
     private final double OBI_THRESHOLD;
     private final double VOLUME_SPIKE_MULT;
 
-    // === НОВОЕ: Интервал обновления Funding Rate ===
-    private static final long FUNDING_REFRESH_INTERVAL_MS = 5 * 60_000; // 5 минут
+    // === Интервал обновления Funding Rate ===
+    private static final long FUNDING_REFRESH_INTERVAL_MS = 5 * 60_000;
     private long lastFundingRefresh = 0L;
 
     // ---------------- internal state ----------------
@@ -61,8 +70,8 @@ public class SignalSender {
     // ========================= HISTORICAL CANDLES =========================
     private final Map<String, List<com.bot.TradingCore.Candle>> histM15 = new ConcurrentHashMap<>();
     private final Map<String, List<com.bot.TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
-    // === НОВОЕ: 4H свечи ===
-    private final Map<String, List<com.bot.TradingCore.Candle>> histH4  = new ConcurrentHashMap<>();
+    // === ИЗМЕНЕНО: 4H -> 2H ===
+    private final Map<String, List<com.bot.TradingCore.Candle>> histH2  = new ConcurrentHashMap<>();
 
     private final com.bot.TradingCore.AdaptiveBrain adaptiveBrain;
     private final com.bot.SignalOptimizer optimizer;
@@ -78,6 +87,9 @@ public class SignalSender {
             );
     private int signalsThisCycle = 0;
 
+    // === НОВОЕ: PumpHunter ===
+    private final com.bot.PumpHunter pumpHunter;
+
     // ========================= PUBLIC API =========================
     public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
 
@@ -90,7 +102,7 @@ public class SignalSender {
             lastBinancePairsRefresh = System.currentTimeMillis();
         }
 
-        // === НОВОЕ: Обновляем Funding Rate для всех пар ===
+        // === Обновляем Funding Rate для всех пар ===
         if (System.currentTimeMillis() - lastFundingRefresh > FUNDING_REFRESH_INTERVAL_MS) {
             refreshAllFundingRates();
             lastFundingRefresh = System.currentTimeMillis();
@@ -104,13 +116,16 @@ public class SignalSender {
             List<com.bot.TradingCore.Candle> m5  = fetchKlines(pair,"5m",KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
-            // === НОВОЕ: 4H свечи ===
-            List<com.bot.TradingCore.Candle> h4  = fetchKlines(pair,"4h", 150);
+            // === ИЗМЕНЕНО: 4H -> 2H ===
+            List<com.bot.TradingCore.Candle> h2  = fetchKlines(pair,"2h", 100);
 
             if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60)
                 continue;
 
-            // === НОВОЕ: Используем analyze с 4H ===
+            // === Обновляем fallback данные для optimizer ===
+            optimizer.updateFromCandles(pair, m15);
+
+            // === ИЗМЕНЕНО: Используем analyze с 2H ===
             com.bot.DecisionEngineMerged.TradeIdea idea =
                     engine.analyze(
                             pair,
@@ -118,11 +133,44 @@ public class SignalSender {
                             m5,
                             m15,
                             h1,
-                            h4,
+                            h2,  // ИЗМЕНЕНО: h4 -> h2
                             com.bot.DecisionEngineMerged.CoinCategory.TOP
                     );
 
             if (idea == null || idea.probability < MIN_CONF)
+                continue;
+
+            // === НОВОЕ: PumpHunter проверка ===
+            PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15);
+            if (pump != null && pump.strength > 0.5) {
+                // Если памп подтверждает направление сигнала - бонус
+                boolean pumpAligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
+                        (idea.side == com.bot.TradingCore.Side.SHORT && pump.isBearish());
+                if (pumpAligned) {
+                    // Создаём улучшенный сигнал
+                    List<String> newFlags = new ArrayList<>(idea.flags);
+                    newFlags.add("PUMP_" + pump.type.name());
+                    newFlags.add("pump_str=" + String.format("%.0f", pump.strength * 100));
+
+                    idea = new com.bot.DecisionEngineMerged.TradeIdea(
+                            idea.symbol,
+                            idea.side,
+                            idea.price,
+                            idea.stop,
+                            idea.take,
+                            Math.min(85, idea.probability + pump.strength * 8),
+                            newFlags,
+                            idea.fundingRate,
+                            idea.oiChange,
+                            idea.htfBias
+                    );
+                }
+            }
+
+            // === SignalOptimizer корректировка ===
+            idea = optimizer.withAdjustedConfidence(idea);
+
+            if (idea.probability < MIN_CONF)
                 continue;
 
             if (!core.allowSignal(idea))
@@ -147,6 +195,11 @@ public class SignalSender {
 
     public com.bot.InstitutionalSignalCore getSignalCore() {
         return core;
+    }
+
+    // === НОВОЕ: Getter для PumpHunter ===
+    public com.bot.PumpHunter getPumpHunter() {
+        return pumpHunter;
     }
 
     public double getAtr(String symbol) {
@@ -183,10 +236,21 @@ public class SignalSender {
         this.VOLUME_SPIKE_MULT = envDouble("VOL_SPIKE_MULT", 1.4);
 
         this.STABLE = Set.of("USDT", "USDC", "BUSD");
+
+        // === Инициализация компонентов ===
         this.decisionEngine = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain = new com.bot.TradingCore.AdaptiveBrain();
         this.optimizer = new com.bot.SignalOptimizer(this.tickPriceDeque);
-        System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
+
+        // === НОВОЕ: Инициализация PumpHunter ===
+        this.pumpHunter = new com.bot.PumpHunter();
+
+        // === Связываем компоненты ===
+        this.decisionEngine.setPumpHunter(this.pumpHunter);
+        this.optimizer.setPumpHunter(this.pumpHunter);
+
+        System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF +
+                " INTERVAL_MIN=" + INTERVAL_MIN + " PumpHunter=ENABLED");
 
         scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> {
@@ -203,12 +267,11 @@ public class SignalSender {
         }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
 
-    // === НОВОЕ: Загрузка Funding Rate для всех пар ===
+    // === Загрузка Funding Rate для всех пар ===
     private void refreshAllFundingRates() {
         try {
             System.out.println("[FundingRate] Refreshing funding rates...");
 
-            // Получаем Premium Index для всех пар
             String url = "https://fapi.binance.com/fapi/v1/premiumIndex";
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -226,11 +289,10 @@ public class SignalSender {
                 fundingRates.put(symbol, fundingRate);
             }
 
-            // Получаем Open Interest для топовых пар
             for (String pair : cachedPairs) {
                 try {
                     fetchAndUpdateOpenInterest(pair, fundingRates.getOrDefault(pair, 0.0));
-                    Thread.sleep(50); // Небольшая задержка чтобы не перегрузить API
+                    Thread.sleep(50);
                 } catch (Exception e) {
                     // Продолжаем с остальными парами
                 }
@@ -243,10 +305,8 @@ public class SignalSender {
         }
     }
 
-    // === НОВОЕ: Загрузка Open Interest для пары ===
     private void fetchAndUpdateOpenInterest(String symbol, double fundingRate) {
         try {
-            // Текущий OI
             String oiUrl = "https://fapi.binance.com/fapi/v1/openInterest?symbol=" + symbol;
             HttpRequest oiReq = HttpRequest.newBuilder()
                     .uri(URI.create(oiUrl))
@@ -257,7 +317,6 @@ public class SignalSender {
             JSONObject oiJson = new JSONObject(oiResp.body());
             double currentOI = oiJson.optDouble("openInterest", 0);
 
-            // Исторический OI (для расчёта изменения)
             String histUrl = "https://fapi.binance.com/futures/data/openInterestHist?symbol=" + symbol +
                     "&period=1h&limit=5";
             HttpRequest histReq = HttpRequest.newBuilder()
@@ -281,11 +340,9 @@ public class SignalSender {
                 oiChange4h = ((currentOI - oi4hAgo) / oi4hAgo) * 100;
             }
 
-            // Обновляем данные в движке
             decisionEngine.updateFundingOI(symbol, fundingRate, currentOI, oiChange1h, oiChange4h);
 
         } catch (Exception e) {
-            // Если не удалось - просто обновляем funding rate без OI
             decisionEngine.updateFundingOI(symbol, fundingRate, 0, 0, 0);
         }
     }
@@ -747,13 +804,13 @@ public class SignalSender {
         }
     }
 
-    // === НОВОЕ: Получение 4H тренда BTC ===
-    private int getBtc4HTrend() {
+    // === ИЗМЕНЕНО: 4H -> 2H для BTC тренда ===
+    private int getBtc2HTrend() {
         try {
-            List<com.bot.TradingCore.Candle> btcH4 = fetchKlines("BTCUSDT", "4h", 100);
-            if (btcH4.size() < 50) return 0;
+            List<com.bot.TradingCore.Candle> btcH2 = fetchKlines("BTCUSDT", "2h", 80);
+            if (btcH2.size() < 40) return 0;
 
-            return emaDirection(btcH4, 21, 50);
+            return emaDirection(btcH2, 12, 26);
         } catch (Exception e) {
             return 0;
         }
@@ -913,14 +970,14 @@ public class SignalSender {
         }
 
         public String toTelegramMessage() {
-            String flags = (strongTrigger ? "⚡strong " : "") +
-                    (atrBreakLong ? "ATR↑ " : "") +
-                    (atrBreakShort ? "ATR↓ " : "") +
+            String flags = (strongTrigger ? "strong " : "") +
+                    (atrBreakLong ? "ATR_UP " : "") +
+                    (atrBreakShort ? "ATR_DOWN " : "") +
                     (impulse ? "IMPULSE " : "");
 
             String timeStr = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
 
-            return String.format("*%s* → *%s*\n" +
+            return String.format("*%s* -> *%s*\n" +
                             "Probability: *%.0f%%*\n" +
                             "Price: %.8f\n" +
                             "SL: %.8f\n" +
@@ -1250,7 +1307,7 @@ public class SignalSender {
                 lastBinancePairsRefresh = System.currentTimeMillis();
             }
 
-            // === НОВОЕ: Обновляем Funding Rate перед циклом ===
+            // === Обновляем Funding Rate перед циклом ===
             if (System.currentTimeMillis() - lastFundingRefresh > FUNDING_REFRESH_INTERVAL_MS) {
                 refreshAllFundingRates();
                 lastFundingRefresh = System.currentTimeMillis();
@@ -1258,9 +1315,9 @@ public class SignalSender {
 
             com.bot.DecisionEngineMerged engine = decisionEngine;
 
-            // === НОВОЕ: Получаем глобальные тренды один раз ===
+            // === Получаем глобальные тренды один раз ===
             int btcTrend = getBtcTrend();
-            int btc4hTrend = getBtc4HTrend();
+            int btc2hTrend = getBtc2HTrend();  // ИЗМЕНЕНО: 4H -> 2H
 
             for (String pair : cachedPairs) {
 
@@ -1268,26 +1325,53 @@ public class SignalSender {
                 List<com.bot.TradingCore.Candle> c5  = fetchKlines(pair, "5m", KLINES_LIMIT);
                 List<com.bot.TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
                 List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
-                // === НОВОЕ: 4H свечи ===
-                List<com.bot.TradingCore.Candle> h4  = fetchKlines(pair, "4h", 150);
+                // === ИЗМЕНЕНО: 4H -> 2H ===
+                List<com.bot.TradingCore.Candle> h2  = fetchKlines(pair, "2h", 100);
 
                 if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
 
-                // === НОВОЕ: Используем analyze с 4H ===
+                // === Обновляем fallback данные для optimizer ===
+                optimizer.updateFromCandles(pair, c15);
+
+                // === ИЗМЕНЕНО: Используем analyze с 2H ===
                 com.bot.DecisionEngineMerged.TradeIdea idea =
-                        engine.analyze(pair, c1, c5, c15, h1, h4, com.bot.DecisionEngineMerged.CoinCategory.TOP);
+                        engine.analyze(pair, c1, c5, c15, h1, h2, com.bot.DecisionEngineMerged.CoinCategory.TOP);
 
                 if (idea == null || idea.probability < MIN_CONF) continue;
 
-                // === УЛУЧШЕНО: BTC trend filter с учётом 4H ===
+                // === PumpHunter проверка ===
+                PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, c1, c5, c15);
+                if (pump != null && pump.strength > 0.5) {
+                    boolean pumpAligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
+                            (idea.side == com.bot.TradingCore.Side.SHORT && pump.isBearish());
+                    if (pumpAligned) {
+                        List<String> newFlags = new ArrayList<>(idea.flags);
+                        newFlags.add("PUMP_" + pump.type.name());
+
+                        idea = new com.bot.DecisionEngineMerged.TradeIdea(
+                                idea.symbol,
+                                idea.side,
+                                idea.price,
+                                idea.stop,
+                                idea.take,
+                                Math.min(85, idea.probability + pump.strength * 8),
+                                newFlags,
+                                idea.fundingRate,
+                                idea.oiChange,
+                                idea.htfBias
+                        );
+                    }
+                }
+
+                // === УЛУЧШЕНО: BTC trend filter с учётом 2H ===
                 double probAdjustment = 0;
 
-                // 4H тренд BTC важнее чем 1H
-                if (btc4hTrend < 0 && idea.side.name().equals("LONG")) {
-                    probAdjustment -= 7;
+                // 2H тренд BTC важнее чем 1H (но меньше чем был 4H)
+                if (btc2hTrend < 0 && idea.side.name().equals("LONG")) {
+                    probAdjustment -= 5;
                 }
-                if (btc4hTrend > 0 && idea.side.name().equals("SHORT")) {
-                    probAdjustment -= 7;
+                if (btc2hTrend > 0 && idea.side.name().equals("SHORT")) {
+                    probAdjustment -= 5;
                 }
 
                 // 1H тренд добавляет/убавляет
@@ -1299,10 +1383,10 @@ public class SignalSender {
                 }
 
                 // Бонус за совпадение с BTC трендом
-                if (btc4hTrend > 0 && idea.side.name().equals("LONG")) {
+                if (btc2hTrend > 0 && idea.side.name().equals("LONG")) {
                     probAdjustment += 3;
                 }
-                if (btc4hTrend < 0 && idea.side.name().equals("SHORT")) {
+                if (btc2hTrend < 0 && idea.side.name().equals("SHORT")) {
                     probAdjustment += 3;
                 }
 
@@ -1353,7 +1437,7 @@ public class SignalSender {
                 if (!core.allowSignal(idea)) continue;
                 core.registerSignal(idea);
 
-                // === УЛУЧШЕНО: Формат сообщения с FR и OI ===
+                // === Формат сообщения с FR и OI ===
                 String fundingInfo = "";
                 if (Math.abs(idea.fundingRate) > 0.0001) {
                     fundingInfo = String.format("\nFR: %.4f%%", idea.fundingRate * 100);
@@ -1364,14 +1448,20 @@ public class SignalSender {
                 }
                 String biasInfo = "";
                 if (!idea.htfBias.equals("NONE")) {
-                    biasInfo = String.format("\n4H Bias: %s", idea.htfBias);
+                    biasInfo = String.format("\n2H Bias: %s", idea.htfBias);  // ИЗМЕНЕНО: 4H -> 2H
+                }
+
+                // === НОВОЕ: Pump info ===
+                String pumpInfo = "";
+                if (pump != null && pump.strength > 0.4) {
+                    pumpInfo = String.format("\nPump: %s (%.0f%%)", pump.type.name(), pump.strength * 100);
                 }
 
                 String message = String.format(
-                        "*%s* → *%s*\n" +
+                        "*%s* -> *%s*\n" +
                                 "Price: %.6f\n" +
                                 "Stop: %.6f | Take: %.6f\n" +
-                                "Probability: *%.0f%%*%s%s%s\n" +
+                                "Probability: *%.0f%%*%s%s%s%s\n" +
                                 "Flags: %s\n" +
                                 "_time: %s_",
                         idea.symbol,
@@ -1383,6 +1473,7 @@ public class SignalSender {
                         fundingInfo,
                         oiInfo,
                         biasInfo,
+                        pumpInfo,
                         idea.flags,
                         LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
                 );
