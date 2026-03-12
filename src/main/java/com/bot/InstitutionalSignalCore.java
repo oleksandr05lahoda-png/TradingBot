@@ -7,7 +7,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class InstitutionalSignalCore {
 
     /* =========================================================
-       CONFIGURATION
+       CONFIGURATION (УЛУЧШЕННЫЕ ПАРАМЕТРЫ)
        ========================================================= */
     private final int maxGlobalSignals;
     private final int maxSignalsPerSymbol;
@@ -28,6 +28,16 @@ public final class InstitutionalSignalCore {
         this.minConfidence = minConfidence;
         this.minSignalDiff = minSignalDiff;
         this.signalTtlMs = signalTtlMs;
+    }
+
+    // Дефолтный конструктор с оптимальными параметрами
+    public InstitutionalSignalCore() {
+        this.maxGlobalSignals = 12;          // было 20 - меньше но качественнее
+        this.maxSignalsPerSymbol = 2;
+        this.maxPortfolioExposure = 0.40;    // 40%
+        this.minConfidence = 58.0;           // было 52 - выше порог
+        this.minSignalDiff = 0.003;          // 0.3% минимум между сигналами
+        this.signalTtlMs = 15 * 60_000;      // было 10 сек - теперь 15 минут!
     }
 
     /* =========================================================
@@ -79,17 +89,22 @@ public final class InstitutionalSignalCore {
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
         cleanupExpiredSignals();
-        if (getActiveSignalsCount() >= maxGlobalSignals) {
-            System.out.println("[DEBUG " + getTime() + "] Global signal limit reached → rejected");
+
+        if (signal == null) {
+            System.out.println("[ISC " + getTime() + "] Signal null → rejected");
             return false;
         }
-        if (signal == null) {
-            System.out.println("[DEBUG " + getTime() + "] Signal null → rejected");            return false;
+
+        // Глобальный лимит
+        if (getActiveSignalsCount() >= maxGlobalSignals) {
+            System.out.println("[ISC " + getTime() + "] Global limit " + maxGlobalSignals + " reached → rejected");
+            return false;
         }
+
+        // Минимальная уверенность
         if (signal.probability < minConfidence) {
-            System.out.println("[DEBUG " + getTime() + "] Signal " + signal.symbol +
-                    " probability " + signal.probability +
-                    " < minConfidence " + minConfidence + " → rejected");
+            System.out.println("[ISC " + getTime() + "] " + signal.symbol +
+                    " prob " + signal.probability + " < " + minConfidence + " → rejected");
             return false;
         }
 
@@ -98,54 +113,55 @@ public final class InstitutionalSignalCore {
                 k -> new CopyOnWriteArrayList<>()
         );
 
-        // Проверка схожих сигналов
+        // Проверка похожих сигналов
         for (ActiveSignal a : list) {
-            double priceDiff = Math.abs(a.entry - signal.price)/a.entry;
+            double priceDiff = Math.abs(a.entry - signal.price) / a.entry;
             double probDiff = Math.abs(a.probability - signal.probability);
 
             // Сигнал почти такой же как существующий
-            if (a.side == signal.side && priceDiff < minSignalDiff && probDiff < 1.5) {
-                System.out.println("[DEBUG] Signal too similar → rejected");
+            if (a.side == signal.side && priceDiff < minSignalDiff && probDiff < 3) {
+                System.out.println("[ISC] " + signal.symbol + " too similar to existing → rejected");
                 return false;
             }
 
-            // Сигнал с другой стороны, но цена слишком близка
-            if (a.side != signal.side && priceDiff < minSignalDiff) {
-                System.out.println("[DEBUG] Opposite side, price too close → rejected");
+            // Противоположный сигнал слишком близко по цене
+            if (a.side != signal.side && priceDiff < minSignalDiff * 1.5) {
+                System.out.println("[ISC] " + signal.symbol + " opposite too close → rejected");
                 return false;
             }
         }
 
+        // Проверка score символа
         double score = symbolScore.getOrDefault(signal.symbol, 0.0);
-
-        if (score < -0.35) {
-
+        if (score < -0.30) {
             double winRate = getWinRate(signal.symbol);
-
-            if (winRate < 0.35) {
-
-                System.out.println("[DEBUG] SymbolScore " + score +
-                        " and winRate " + winRate +
-                        " too low → rejected");
-
+            if (winRate < 0.38) {
+                System.out.println("[ISC] " + signal.symbol + " bad history (score=" +
+                        String.format("%.2f", score) + ", wr=" +
+                        String.format("%.2f", winRate) + ") → rejected");
                 return false;
             }
         }
 
+        // Лимит на символ
         if (list.size() >= maxSignalsPerSymbol) {
-            System.out.println("[DEBUG] Active signals for " + signal.symbol +
-                    " size " + list.size() + " >= maxSignalsPerSymbol " + maxSignalsPerSymbol + " → rejected");
+            System.out.println("[ISC] " + signal.symbol + " has " + list.size() +
+                    " active signals (max=" + maxSignalsPerSymbol + ") → rejected");
             return false;
         }
+
+        // Exposure check
         double estimatedExposure = estimateExposure(signal);
         if (currentExposure + estimatedExposure > maxPortfolioExposure) {
-            System.out.println("[DEBUG] EstimatedExposure " + estimatedExposure +
-                    " + currentExposure " + currentExposure +
-                    " > maxPortfolioExposure " + maxPortfolioExposure + " → rejected");
+            System.out.println("[ISC] Portfolio exposure " +
+                    String.format("%.2f", currentExposure) + " + " +
+                    String.format("%.2f", estimatedExposure) + " > " +
+                    String.format("%.2f", maxPortfolioExposure) + " → rejected");
             return false;
         }
 
-        System.out.println("[DEBUG] Signal " + signal.symbol + " allowed! prob=" + signal.probability);
+        System.out.println("[ISC " + getTime() + "] ✓ " + signal.symbol +
+                " " + signal.side + " prob=" + signal.probability + " → ALLOWED");
         return true;
     }
 
@@ -165,11 +181,13 @@ public final class InstitutionalSignalCore {
 
         activeSignals.compute(signal.symbol, (sym, lst) -> {
             if (lst == null) lst = new CopyOnWriteArrayList<>();
-            // заменяем дублирующий сигнал
-            lst.removeIf(s -> s.side == signal.side && Math.abs(s.entry - signal.price)/s.entry < minSignalDiff);
+            // Удаляем старый похожий сигнал
+            lst.removeIf(s -> s.side == signal.side &&
+                    Math.abs(s.entry - signal.price) / s.entry < minSignalDiff);
             lst.add(active);
             return lst;
         });
+
         currentExposure = clamp(currentExposure + estimateExposure(signal), 0.0, maxPortfolioExposure);
     }
 
@@ -191,14 +209,17 @@ public final class InstitutionalSignalCore {
         }
     }
 
+    /* =========================================================
+       AUTO CLEANUP (ИСПРАВЛЕННЫЙ - без iterator.remove())
+       ========================================================= */
     private void cleanupExpiredSignals() {
         long now = System.currentTimeMillis();
 
-        for (Iterator<Map.Entry<String, List<ActiveSignal>>> it = activeSignals.entrySet().iterator(); it.hasNext();) {
+        for (Iterator<Map.Entry<String, List<ActiveSignal>>> it = activeSignals.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<String, List<ActiveSignal>> e = it.next();
             List<ActiveSignal> list = e.getValue();
 
-            // Используем removeIf вместо iterator.remove()
+            // Используем removeIf вместо iterator.remove() - FIX для CopyOnWriteArrayList
             list.removeIf(s -> {
                 if (now - s.timestamp > signalTtlMs) {
                     currentExposure = clamp(currentExposure - estimateExposure(s), 0.0, maxPortfolioExposure);
@@ -214,12 +235,14 @@ public final class InstitutionalSignalCore {
 
         recalcExposure();
     }
+
     private void recalcExposure() {
         double exposure = 0.0;
-        for (List<ActiveSignal> list : activeSignals.values())
-            for (ActiveSignal s : list)
+        for (List<ActiveSignal> list : activeSignals.values()) {
+            for (ActiveSignal s : list) {
                 exposure += estimateExposure(s);
-
+            }
+        }
         currentExposure = clamp(exposure, 0.0, maxPortfolioExposure);
     }
 
@@ -227,34 +250,29 @@ public final class InstitutionalSignalCore {
        SYMBOL PERFORMANCE SCORE
        ========================================================= */
     private void updateSymbolScore(String symbol, double pnl) {
-        double delta = pnl > 0 ? 0.012 : pnl < 0 ? -0.015 : -0.004;
+        double delta = pnl > 0 ? 0.015 : pnl < 0 ? -0.018 : -0.003;
         symbolScore.merge(symbol, delta, Double::sum);
-        symbolScore.compute(symbol, (k, v) -> clamp(v, -0.40, 0.40));
+        symbolScore.compute(symbol, (k, v) -> clamp(v, -0.45, 0.45));
     }
 
     private double estimateExposure(com.bot.DecisionEngineMerged.TradeIdea s) {
-
         double p = s.probability;
-
         if (p >= 85) return 0.055;
-        if (p >= 80) return 0.045;
-        if (p >= 74) return 0.035;
-        if (p >= 68) return 0.025;
-
-        return 0.018;
+        if (p >= 78) return 0.045;
+        if (p >= 70) return 0.035;
+        if (p >= 62) return 0.028;
+        return 0.020;
     }
 
     private double estimateExposure(ActiveSignal s) {
-
         double p = s.probability;
-
         if (p >= 85) return 0.055;
-        if (p >= 80) return 0.045;
-        if (p >= 74) return 0.035;
-        if (p >= 68) return 0.025;
-
-        return 0.018;
+        if (p >= 78) return 0.045;
+        if (p >= 70) return 0.035;
+        if (p >= 62) return 0.028;
+        return 0.020;
     }
+
     /* =========================================================
        STATS API
        ========================================================= */
@@ -276,14 +294,15 @@ public final class InstitutionalSignalCore {
 
     public double getWinRate(String symbol) {
         List<ClosedTrade> h = history.get(symbol);
-        if (h == null || h.isEmpty()) return 0.0;
+        if (h == null || h.isEmpty()) return 0.5; // Нейтральный если нет истории
         long wins = h.stream().filter(t -> t.pnl > 0).count();
         return (double) wins / h.size();
     }
+
     private static String getTime() {
-        // локальное время системы в формате HH:mm:ss
         return java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
     }
+
     /* =========================================================
        UTIL
        ========================================================= */
