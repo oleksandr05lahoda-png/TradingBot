@@ -48,8 +48,9 @@ public final class SignalOptimizer {
             this.accel = accel;
             this.avg = avg;
 
-            double rawImpulse = Math.abs(speed) + Math.abs(accel) * 0.6;
-
+            double rawImpulse =
+                    Math.abs(speed) * 1.15 +
+                            Math.abs(accel) * 0.75;
             this.impulse = Math.min(rawImpulse, MAX_IMPULSE_CAP);
         }
     }
@@ -62,8 +63,6 @@ public final class SignalOptimizer {
     public MicroTrendResult computeMicroTrend(String symbol) {
 
         MicroTrendResult cached = microTrendCache.get(symbol);
-        if (cached != null)
-            return cached;
 
         Deque<Double> dq = tickPriceDeque.get(symbol);
 
@@ -111,9 +110,7 @@ public final class SignalOptimizer {
         double avg = sum / buffer.size();
 
         MicroTrendResult result = new MicroTrendResult(speed, accel, avg);
-
-        microTrendCache.putIfAbsent(symbol, result);
-
+        microTrendCache.put(symbol, result);
         return result;
     }
 
@@ -151,7 +148,7 @@ public final class SignalOptimizer {
                 );
 
         double factor =
-                1.0 + trendAlignment * (0.02 + 0.06 * impulseNorm);
+                1.0 + trendAlignment * (0.03 + 0.09 * impulseNorm);
 
         confidence *= factor;
 
@@ -159,7 +156,12 @@ public final class SignalOptimizer {
 
         double directionStrength =
                 Math.abs(mt.speed) / Math.max(Math.abs(mt.avg), 1e-9);
+        /* ===== MICRO REVERSAL FILTER ===== */
 
+        if (mt.speed * mt.accel < 0 && Math.abs(mt.accel) > Math.abs(mt.speed)) {
+
+            confidence -= 4.0;
+        }
         if (directionStrength > 0.0018)
             confidence += 2.5;
 

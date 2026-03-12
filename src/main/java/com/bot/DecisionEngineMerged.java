@@ -100,7 +100,11 @@ public final class DecisionEngineMerged {
 
         double price = last(c15).close;
         double atr = atr(c15, 14);
+        double lastRange = last(c15).high - last(c15).low;
 
+        if (lastRange > atr * 2.4) {
+            return null;
+        }
         if (atr <= 0)
             return null;
 
@@ -209,7 +213,17 @@ public final class DecisionEngineMerged {
         }
 
         double move4 = (last(c15).close - c15.get(c15.size() - 4).close) / price;
+// ===== TREND EXHAUSTION FILTER =====
 
+        double move8 = (last(c15).close - c15.get(c15.size() - 8).close) / price;
+
+        if (move8 > 0.03 && scoreLong > scoreShort) {
+            scoreLong *= 0.72;
+        }
+
+        if (move8 < -0.03 && scoreShort > scoreLong) {
+            scoreShort *= 0.72;
+        }
         if (move4 > 0.015 && scoreShort > scoreLong) scoreShort *= 0.88;
         if (move4 < -0.015 && scoreLong > scoreShort) scoreLong *= 0.88;
 
@@ -326,7 +340,7 @@ public final class DecisionEngineMerged {
         double scoreDiff = Math.abs(scoreLong - scoreShort);
 
         // 2️⃣ Нормируем по реальному максимуму сигналов
-        double maxScore = 2.45; // HTF + pullback + дивергенции + импульс
+        double maxScore = 2.7; // HTF + pullback + дивергенции + импульс
         double normScore = scoreDiff / maxScore;
 
         // 3️⃣ Дополнительные бонусы от индикаторов
@@ -512,12 +526,24 @@ public final class DecisionEngineMerged {
 
         double strength = move / atrVal;
 
-        double threshold =
-                cat == CoinCategory.MEME ? 0.75 :
-                        cat == CoinCategory.ALT ? 0.85 :
-                                1.0;
+        double volume =
+                c.get(c.size()-1).volume;
 
-        return strength > threshold;
+        double avgVolume =
+                c.subList(c.size()-8, c.size()-1)
+                        .stream()
+                        .mapToDouble(cd -> cd.volume)
+                        .average()
+                        .orElse(volume);
+
+        double volumeBoost = volume / avgVolume;
+
+        double threshold =
+                cat == CoinCategory.MEME ? 0.8 :
+                        cat == CoinCategory.ALT ? 0.9 :
+                                1.1;
+
+        return strength > threshold && volumeBoost > 1.15;
     }
     public boolean volumeSpike(List<com.bot.TradingCore.Candle> c, CoinCategory cat) {
 

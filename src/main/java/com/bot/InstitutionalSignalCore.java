@@ -117,10 +117,19 @@ public final class InstitutionalSignalCore {
         }
 
         double score = symbolScore.getOrDefault(signal.symbol, 0.0);
+
         if (score < -0.35) {
-            System.out.println("[DEBUG] SymbolScore " + score +
-                    " < -0.35 for " + signal.symbol + " → rejected");
-            return false;
+
+            double winRate = getWinRate(signal.symbol);
+
+            if (winRate < 0.35) {
+
+                System.out.println("[DEBUG] SymbolScore " + score +
+                        " and winRate " + winRate +
+                        " too low → rejected");
+
+                return false;
+            }
         }
 
         if (list.size() >= maxSignalsPerSymbol) {
@@ -191,7 +200,22 @@ public final class InstitutionalSignalCore {
         for (Iterator<Map.Entry<String, List<ActiveSignal>>> it = activeSignals.entrySet().iterator(); it.hasNext();) {
             Map.Entry<String, List<ActiveSignal>> e = it.next();
             List<ActiveSignal> list = e.getValue();
-            list.removeIf(s -> now - s.timestamp > signalTtlMs);
+            Iterator<ActiveSignal> itSig = list.iterator();
+
+            while (itSig.hasNext()) {
+
+                ActiveSignal s = itSig.next();
+
+                if (now - s.timestamp > signalTtlMs) {
+
+                    currentExposure =
+                            clamp(currentExposure - estimateExposure(s),
+                                    0.0,
+                                    maxPortfolioExposure);
+
+                    itSig.remove();
+                }
+            }
             if (list.isEmpty()) it.remove();
         }
 
@@ -216,23 +240,29 @@ public final class InstitutionalSignalCore {
         symbolScore.compute(symbol, (k, v) -> clamp(v, -0.40, 0.40));
     }
 
-    /* =========================================================
-       EXPOSURE MODEL
-       ========================================================= */
     private double estimateExposure(com.bot.DecisionEngineMerged.TradeIdea s) {
-        if (s.probability >= 82) return 0.05;
-        if (s.probability >= 75) return 0.035;
-        if (s.probability >= 68) return 0.025;
-        return 0.02;
+
+        double p = s.probability;
+
+        if (p >= 85) return 0.055;
+        if (p >= 80) return 0.045;
+        if (p >= 74) return 0.035;
+        if (p >= 68) return 0.025;
+
+        return 0.018;
     }
 
     private double estimateExposure(ActiveSignal s) {
-        if (s.probability >= 82) return 0.05;
-        if (s.probability >= 75) return 0.035;
-        if (s.probability >= 68) return 0.025;
-        return 0.02;
-    }
 
+        double p = s.probability;
+
+        if (p >= 85) return 0.055;
+        if (p >= 80) return 0.045;
+        if (p >= 74) return 0.035;
+        if (p >= 68) return 0.025;
+
+        return 0.018;
+    }
     /* =========================================================
        STATS API
        ========================================================= */
