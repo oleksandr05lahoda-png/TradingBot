@@ -15,33 +15,36 @@ import java.util.stream.Collectors;
 public class SignalSender {
     private final com.bot.TelegramBotSender bot;
     private final HttpClient http;
-    MarketContext ctx = null; // инициализируем позже в evaluate
-    private final Object wsLock = new Object(); // для безопасного добавления тиков из WebSocket
+    MarketContext ctx = null;
+    private final Object wsLock = new Object();
 
     private final int TOP_N;
-    private final double MIN_CONF;            // 0..1
-    private final int INTERVAL_MIN;           // scheduler interval minutes
-    private final int KLINES_LIMIT;           // number of candles fetched per TF
-    private final long REQUEST_DELAY_MS;      // delay between HTTP calls
+    private final double MIN_CONF;
+    private final int INTERVAL_MIN;
+    private final int KLINES_LIMIT;
+    private final long REQUEST_DELAY_MS;
 
-    private final double IMPULSE_PCT;         // one-minute impulse threshold (relative)
-    private final double VOL_MULTIPLIER;      // lastQ >= avgQ * VOL_MULTIPLIER
-    private final double ATR_MIN_PCT;         // min ATR pct for volatility check
-    private final long COOLDOWN_MS;           // cooldown per symbol
-    private final long BINANCE_REFRESH_INTERVAL_MS; // refresh pairs
+    private final double IMPULSE_PCT;
+    private final double VOL_MULTIPLIER;
+    private final double ATR_MIN_PCT;
+    private final long COOLDOWN_MS;
+    private final long BINANCE_REFRESH_INTERVAL_MS;
 
     private final LocalTime VWAP_SESSION_START;
 
-    // Micro / tick params
     private final int TICK_HISTORY;
     private final double OBI_THRESHOLD;
     private final double VOLUME_SPIKE_MULT;
 
+    // === НОВОЕ: Интервал обновления Funding Rate ===
+    private static final long FUNDING_REFRESH_INTERVAL_MS = 5 * 60_000; // 5 минут
+    private long lastFundingRefresh = 0L;
+
     // ---------------- internal state ----------------
-    private final Set<String> STABLE; // tokens to skip
+    private final Set<String> STABLE;
     private Set<String> BINANCE_PAIRS = new HashSet<>();
     private long lastBinancePairsRefresh = 0L;
-    private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>(); // last confidence
+    private final Map<String, Double> lastSentConfidence = new ConcurrentHashMap<>();
     private final Map<String, Deque<Double>> tickPriceDeque = new ConcurrentHashMap<>();
     private final List<com.bot.TradingCore.Candle> btcCandles = new CopyOnWriteArrayList<>();
     private final Map<String, Double> lastTickPrice = new ConcurrentHashMap<>();
@@ -54,22 +57,27 @@ public class SignalSender {
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private Set<String> cachedPairs = new HashSet<>();
     private final com.bot.DecisionEngineMerged decisionEngine;
+
     // ========================= HISTORICAL CANDLES =========================
     private final Map<String, List<com.bot.TradingCore.Candle>> histM15 = new ConcurrentHashMap<>();
     private final Map<String, List<com.bot.TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
+    // === НОВОЕ: 4H свечи ===
+    private final Map<String, List<com.bot.TradingCore.Candle>> histH4  = new ConcurrentHashMap<>();
+
     private final com.bot.TradingCore.AdaptiveBrain adaptiveBrain;
     private final com.bot.SignalOptimizer optimizer;
     private final com.bot.TradingCore.RiskEngine riskEngine = new com.bot.TradingCore.RiskEngine(0.01, 0.05, 1.0);
     private final com.bot.InstitutionalSignalCore core =
             new com.bot.InstitutionalSignalCore(
-                    20,     // было 12
-                    2,      // было 1
-                    0.35,   // было 0.25
-                    0.52,   // было 0.58
-                    0.002,  // было 0.004
-                    10000   // было 15000
+                    20,
+                    2,
+                    0.35,
+                    0.52,
+                    0.002,
+                    10000
             );
-    private int signalsThisCycle = 0;  // <-- ДОБАВИТЬ
+    private int signalsThisCycle = 0;
+
     // ========================= PUBLIC API =========================
     public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
 
@@ -81,6 +89,13 @@ public class SignalSender {
             cachedPairs = getTopSymbolsSet(TOP_N);
             lastBinancePairsRefresh = System.currentTimeMillis();
         }
+
+        // === НОВОЕ: Обновляем Funding Rate для всех пар ===
+        if (System.currentTimeMillis() - lastFundingRefresh > FUNDING_REFRESH_INTERVAL_MS) {
+            refreshAllFundingRates();
+            lastFundingRefresh = System.currentTimeMillis();
+        }
+
         com.bot.DecisionEngineMerged engine = decisionEngine;
 
         for (String pair : cachedPairs) {
@@ -89,10 +104,13 @@ public class SignalSender {
             List<com.bot.TradingCore.Candle> m5  = fetchKlines(pair,"5m",KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> m15 = fetchKlines(pair,"15m",KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair,"1h",KLINES_LIMIT);
+            // === НОВОЕ: 4H свечи ===
+            List<com.bot.TradingCore.Candle> h4  = fetchKlines(pair,"4h", 150);
 
             if (m1.size() < 60 || m5.size() < 60 || m15.size() < 60 || h1.size() < 60)
                 continue;
 
+            // === НОВОЕ: Используем analyze с 4H ===
             com.bot.DecisionEngineMerged.TradeIdea idea =
                     engine.analyze(
                             pair,
@@ -100,6 +118,7 @@ public class SignalSender {
                             m5,
                             m15,
                             h1,
+                            h4,
                             com.bot.DecisionEngineMerged.CoinCategory.TOP
                     );
 
@@ -118,9 +137,10 @@ public class SignalSender {
                 (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability
         ).reversed());
 
-        int topN = Math.min(15, result.size()); // берём топ-7 сигналов
+        int topN = Math.min(15, result.size());
         return result.subList(0, topN);
     }
+
     public com.bot.SignalOptimizer getOptimizer() {
         return optimizer;
     }
@@ -133,15 +153,16 @@ public class SignalSender {
         List<com.bot.TradingCore.Candle> candles = histM15.getOrDefault(symbol, Collections.emptyList());
         return atr(candles, 14);
     }
+
     private final Map<String, List<Signal>> signalHistory = new ConcurrentHashMap<>();
     private long dailyResetTs = System.currentTimeMillis();
     private ScheduledExecutorService scheduler;
+
     public SignalSender(com.bot.TelegramBotSender bot) {
 
         this.bot = bot;
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
-        // defaults (use env to override)
         this.TOP_N = envInt("TOP_N", 70);
         this.MIN_CONF = 0.50;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 15);
@@ -166,20 +187,107 @@ public class SignalSender {
         this.adaptiveBrain = new com.bot.TradingCore.AdaptiveBrain();
         this.optimizer = new com.bot.SignalOptimizer(this.tickPriceDeque);
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF + " INTERVAL_MIN=" + INTERVAL_MIN);
-        // =================== Scheduler для автозапуска анализа ===================
+
         scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 System.out.println("[Scheduler] Start signal generation...");
                 List<com.bot.DecisionEngineMerged.TradeIdea> signals = generateSignals();
                 for (com.bot.DecisionEngineMerged.TradeIdea s : signals) {
-                    bot.sendMessageAsync(s.toString()); // исправлено
+                    bot.sendMessageAsync(s.toString());
                 }
             } catch (Exception e) {
                 System.out.println("[Scheduler] Error: " + e.getMessage());
                 e.printStackTrace();
             }
         }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
+    }
+
+    // === НОВОЕ: Загрузка Funding Rate для всех пар ===
+    private void refreshAllFundingRates() {
+        try {
+            System.out.println("[FundingRate] Refreshing funding rates...");
+
+            // Получаем Premium Index для всех пар
+            String url = "https://fapi.binance.com/fapi/v1/premiumIndex";
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(15))
+                    .GET().build();
+
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            JSONArray arr = new JSONArray(resp.body());
+
+            Map<String, Double> fundingRates = new HashMap<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject obj = arr.getJSONObject(i);
+                String symbol = obj.getString("symbol");
+                double fundingRate = obj.optDouble("lastFundingRate", 0);
+                fundingRates.put(symbol, fundingRate);
+            }
+
+            // Получаем Open Interest для топовых пар
+            for (String pair : cachedPairs) {
+                try {
+                    fetchAndUpdateOpenInterest(pair, fundingRates.getOrDefault(pair, 0.0));
+                    Thread.sleep(50); // Небольшая задержка чтобы не перегрузить API
+                } catch (Exception e) {
+                    // Продолжаем с остальными парами
+                }
+            }
+
+            System.out.println("[FundingRate] Updated " + fundingRates.size() + " pairs");
+
+        } catch (Exception e) {
+            System.out.println("[FundingRate] Error: " + e.getMessage());
+        }
+    }
+
+    // === НОВОЕ: Загрузка Open Interest для пары ===
+    private void fetchAndUpdateOpenInterest(String symbol, double fundingRate) {
+        try {
+            // Текущий OI
+            String oiUrl = "https://fapi.binance.com/fapi/v1/openInterest?symbol=" + symbol;
+            HttpRequest oiReq = HttpRequest.newBuilder()
+                    .uri(URI.create(oiUrl))
+                    .timeout(Duration.ofSeconds(5))
+                    .GET().build();
+
+            HttpResponse<String> oiResp = http.send(oiReq, HttpResponse.BodyHandlers.ofString());
+            JSONObject oiJson = new JSONObject(oiResp.body());
+            double currentOI = oiJson.optDouble("openInterest", 0);
+
+            // Исторический OI (для расчёта изменения)
+            String histUrl = "https://fapi.binance.com/futures/data/openInterestHist?symbol=" + symbol +
+                    "&period=1h&limit=5";
+            HttpRequest histReq = HttpRequest.newBuilder()
+                    .uri(URI.create(histUrl))
+                    .timeout(Duration.ofSeconds(5))
+                    .GET().build();
+
+            HttpResponse<String> histResp = http.send(histReq, HttpResponse.BodyHandlers.ofString());
+            JSONArray histArr = new JSONArray(histResp.body());
+
+            double oiChange1h = 0;
+            double oiChange4h = 0;
+
+            if (histArr.length() >= 2) {
+                double oi1hAgo = histArr.getJSONObject(histArr.length() - 2).optDouble("sumOpenInterest", currentOI);
+                oiChange1h = ((currentOI - oi1hAgo) / oi1hAgo) * 100;
+            }
+
+            if (histArr.length() >= 5) {
+                double oi4hAgo = histArr.getJSONObject(0).optDouble("sumOpenInterest", currentOI);
+                oiChange4h = ((currentOI - oi4hAgo) / oi4hAgo) * 100;
+            }
+
+            // Обновляем данные в движке
+            decisionEngine.updateFundingOI(symbol, fundingRate, currentOI, oiChange1h, oiChange4h);
+
+        } catch (Exception e) {
+            // Если не удалось - просто обновляем funding rate без OI
+            decisionEngine.updateFundingOI(symbol, fundingRate, 0, 0, 0);
+        }
     }
 
     // ========================= Helpers for env parsing =========================
@@ -192,7 +300,7 @@ public class SignalSender {
     }
 
     private String getLocalTimeString() {
-        LocalDateTime now = LocalDateTime.now(); // локальное системное время
+        LocalDateTime now = LocalDateTime.now();
         DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss");
         return now.format(fmt);
     }
@@ -229,7 +337,6 @@ public class SignalSender {
                 String symbol = s.getString("symbol");
                 String status = s.optString("status", "TRADING");
                 String contractType = s.optString("contractType", "");
-                // only USDT perpetual / TRADING
                 if ("TRADING".equalsIgnoreCase(status) && symbol.endsWith("USDT")) {
                     result.add(symbol);
                 }
@@ -241,6 +348,7 @@ public class SignalSender {
             return Set.of("BTCUSDT", "ETHUSDT", "BNBUSDT");
         }
     }
+
     enum MarketPhase {
         TREND_CONTINUATION,
         TREND_EXHAUSTION,
@@ -274,7 +382,7 @@ public class SignalSender {
             this.higherTFTrend = higherTFTrend;
         }
     }
-    // Проверяем последние n сигналов на такое же направление
+
     private boolean wasSameDirectionRecently(String pair, String direction, int lastNCycles) {
         List<Signal> history = signalHistory.getOrDefault(pair, Collections.emptyList());
         if (history.isEmpty()) return false;
@@ -288,7 +396,6 @@ public class SignalSender {
         return false;
     }
 
-    // Проверяем последние n сигналов на противоположное направление
     private boolean isRecentOppositeSignal(String pair, String direction, int lastNCycles) {
         List<Signal> history = signalHistory.getOrDefault(pair, Collections.emptyList());
         if (history.isEmpty()) return false;
@@ -296,11 +403,12 @@ public class SignalSender {
         int count = 0;
         for (int i = history.size() - 1; i >= 0 && count < lastNCycles; i--, count++) {
             if (!history.get(i).direction.equals(direction)) {
-                return true; // был сигнал в противоположную сторону
+                return true;
             }
         }
         return false;
     }
+
     public CompletableFuture<List<com.bot.TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
         try {
             String url = String.format(
@@ -314,11 +422,11 @@ public class SignalSender {
                     .build();
 
             return http.sendAsync(req, HttpResponse.BodyHandlers.ofString())
-                    .thenApply((HttpResponse<String> resp) -> {  // явный тип
+                    .thenApply((HttpResponse<String> resp) -> {
                         String body = resp.body();
                         if (!body.trim().startsWith("[")) {
                             System.out.println("[Binance] Unexpected response for " + symbol + ": " + body);
-                            return Collections.<com.bot.TradingCore.Candle>emptyList(); // явный тип
+                            return Collections.<com.bot.TradingCore.Candle>emptyList();
                         }
                         JSONArray arr = new JSONArray(body);
                         List<com.bot.TradingCore.Candle> list = new ArrayList<>();
@@ -330,7 +438,7 @@ public class SignalSender {
                             double low   = Double.parseDouble(k.getString(3));
                             double close = Double.parseDouble(k.getString(4));
                             double vol   = Double.parseDouble(k.getString(5));
-                            double qvol  = k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0; // <-- исправлено
+                            double qvol  = k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0;
                             long closeTime = k.getLong(6);
 
                             list.add(new com.bot.TradingCore.Candle(openTime, open, high, low, close, vol, qvol, closeTime));
@@ -339,16 +447,16 @@ public class SignalSender {
                     })
                     .exceptionally(e -> {
                         System.out.println("[Binance] Error fetching klines for " + symbol + ": " + e.getMessage());
-                        return Collections.<com.bot.TradingCore.Candle>emptyList(); // явный тип
+                        return Collections.<com.bot.TradingCore.Candle>emptyList();
                     });
 
         } catch (Exception e) {
             System.out.println("[Binance] Error preparing klines request for " + symbol + ": " + e.getMessage());
-            return CompletableFuture.completedFuture(Collections.<com.bot.TradingCore.Candle>emptyList()); // явный тип
+            return CompletableFuture.completedFuture(Collections.<com.bot.TradingCore.Candle>emptyList());
         }
     }
 
-    // ========================= Micro candle builder (ticks -> tiny candles) =========================
+    // ========================= Micro candle builder =========================
     public static class MicroCandleBuilder {
         private final int intervalMs;
         private long currentBucketStart = -1;
@@ -451,8 +559,6 @@ public class SignalSender {
         return 100.0 - (100.0 / (1.0 + rs));
     }
 
-
-    // ATR
     public static double atr(List<com.bot.TradingCore.Candle> candles, int period) {
         if (candles == null || candles.size() <= period) return 0.0;
         List<Double> trs = new ArrayList<>();
@@ -471,7 +577,6 @@ public class SignalSender {
         return sum / period;
     }
 
-    // Momentum % over n candles
     public static double momentumPct(List<Double> prices, int n) {
         if (prices == null || prices.size() <= n) return 0.0;
         double last = prices.get(prices.size() - 1);
@@ -545,13 +650,14 @@ public class SignalSender {
         if (ll && lh) return -1;
         return 0;
     }
+
     private MarketPhase detectMarketPhase(
             List<com.bot.TradingCore.Candle> c15m,
             MicroTrendResult micro
     ) {
         int structure = marketStructure(c15m);
         if (structure == 0) {
-            return MarketPhase.NO_TRADE; // флэт = не торгуем
+            return MarketPhase.NO_TRADE;
         }
 
         List<Double> closes = c15m.stream().map(c -> c.close).toList();
@@ -564,14 +670,12 @@ public class SignalSender {
 
         double trendStrength = Math.abs(ema20 - ema50) / atr;
 
-        // ---- 1. СЕРЕДИНА ТРЕНДА ----
         if (trendStrength > 0.6 && trendStrength < 1.2) {
             if (Math.abs(micro.accel) < 0.0003) {
                 return MarketPhase.TREND_CONTINUATION;
             }
         }
 
-        // ---- 2. КОНЕЦ ТРЕНДА (EXHAUSTION) ----
         if (trendStrength >= 1.2) {
             boolean momentumFading =
                     Math.abs(micro.speed) < 0.0006 &&
@@ -588,6 +692,7 @@ public class SignalSender {
 
         return MarketPhase.NO_TRADE;
     }
+
     public static boolean detectBOS(List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 10) return false;
         List<Integer> highs = detectSwingHighs(candles, 3);
@@ -636,7 +741,19 @@ public class SignalSender {
             List<com.bot.TradingCore.Candle> btcH1 = fetchKlines("BTCUSDT", "1h", 120);
             if (btcH1.size() < 60) return 0;
 
-            return emaDirection(btcH1, 20, 50); // 1 = uptrend, -1 = downtrend
+            return emaDirection(btcH1, 20, 50);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    // === НОВОЕ: Получение 4H тренда BTC ===
+    private int getBtc4HTrend() {
+        try {
+            List<com.bot.TradingCore.Candle> btcH4 = fetchKlines("BTCUSDT", "4h", 100);
+            if (btcH4.size() < 50) return 0;
+
+            return emaDirection(btcH4, 21, 50);
         } catch (Exception e) {
             return 0;
         }
@@ -650,13 +767,12 @@ public class SignalSender {
         double a = (e20 - e50) / (e50 + 1e-12);
         double b = (e50 - e100) / (e100 + 1e-12);
         double combined = (a + b) / 2.0;
-        return Math.max(-1.0, Math.min(1.0, combined)); // делим уже внутри a и b, нормализируем до [-1,1]
+        return Math.max(-1.0, Math.min(1.0, combined));
     }
 
     private double strategyRSINorm(List<Double> closes) {
         double r = rsi(closes, 14);
-        // 50 -> нейтрально, >50 -> LONG, <50 -> SHORT
-        double score = (r - 50) / 50.0;  // теперь результат в [-1,1]
+        double score = (r - 50) / 50.0;
         return Math.max(-1.0, Math.min(1.0, score));
     }
 
@@ -700,8 +816,8 @@ public class SignalSender {
         int score = 0;
         score += dir1h * 3;
         score += dir15m * 2;
-        if (score > 1) return 1;   // раньше было >2
-        if (score < -1) return -1; // раньше было <-2
+        if (score > 1) return 1;
+        if (score < -1) return -1;
         return 0;
     }
 
@@ -720,28 +836,25 @@ public class SignalSender {
 
         conf += rawScore * 0.55;
 
-        // многотаймфреймное подтверждение
-        conf += mtfConfirm * 0.05; // +0.05 за каждый уровень подтверждения
+        conf += mtfConfirm * 0.05;
 
         conf += volOk ? 0.05 : -0.02;
         conf += atrOk ? 0.05 : -0.02;
         conf += vwapAligned ? 0.03 : 0;
         conf += structureAligned ? 0.04 : -0.01;
-        // импульс свечи
         if (impulse && Math.abs(rawScore) > 0.25) conf += 0.04;
         else if (!impulse) conf -= 0.02;
 
-        // Break of structure
         conf += bos ? 0.05 : 0;
 
-        // Liquidity sweep
-        if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.10; // sweep против тренда = возможный разворот
+        if (liquiditySweep && rawScore * mtfConfirm < 0) conf += 0.10;
         else if (liquiditySweep) conf -= 0.05;
 
         conf = Math.max(0.20, Math.min(0.90, conf));
 
         return conf;
     }
+
     private double lastSwingLow(List<com.bot.TradingCore.Candle> candles) {
         int lookback = Math.min(20, candles.size());
         double low = Double.POSITIVE_INFINITY;
@@ -757,6 +870,7 @@ public class SignalSender {
             high = Math.max(high, candles.get(i).high);
         return high;
     }
+
     public static class Signal {
         public final String symbol;
         public final String direction;
@@ -831,11 +945,13 @@ public class SignalSender {
 
     private final Map<String, Map<String, Long>> lastSignalTimeDir = new ConcurrentHashMap<>();
     private final Map<String, String> lastDirection = new ConcurrentHashMap<>();
+
     private boolean isCooldown(String pair, Signal s, long candleCloseTime) {
         Map<String, Long> dirMap = lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>());
         Long lastCloseTime = dirMap.get(s.direction);
         return lastCloseTime != null && candleCloseTime - lastCloseTime < 15 * 60_000;
     }
+
     private void markSignalSent(String pair, String direction, long candleCloseTime) {
         lastSignalTimeDir.computeIfAbsent(pair, k -> new ConcurrentHashMap<>())
                 .put(direction, candleCloseTime);
@@ -846,7 +962,9 @@ public class SignalSender {
             if (!wsMap.containsKey(pair) || wsMap.get(pair).isInputClosed()) {
                 connectWsInternal(pair);
             }
-        }, 0, 5, TimeUnit.SECONDS);    }
+        }, 0, 5, TimeUnit.SECONDS);
+    }
+
     private Signal analyzePair(String pair, List<com.bot.TradingCore.Candle> c15m, List<com.bot.TradingCore.Candle> c1h) {
         if(c15m.size()<60 || c1h.size()<60) return null;
 
@@ -854,7 +972,6 @@ public class SignalSender {
         List<Double> closes15 = c15m.stream().map(c -> c.close).toList();
         List<Double> closes1h = c1h.stream().map(c -> c.close).toList();
 
-        // --- Расчет rawScore ---
         MicroTrendResult micro = computeMicroTrend(pair, tickPriceDeque.get(pair));
         double emaScore  = strategyEMANorm(closes15);
         double rsiScore  = strategyRSINorm(closes15);
@@ -863,9 +980,8 @@ public class SignalSender {
         double microBias = Math.tanh(micro.speed * 500);
 
         double rawScore = emaScore*0.25 + rsiScore*0.15 + momScore*0.20 + macdScore*0.15 + microBias*0.25;
-// добавлено округление и нормализация в [-1,1]
         rawScore = Math.max(-1.0, Math.min(1.0, rawScore));
-        // --- Confidence ---
+
         int mtfConfirm = multiTFConfirm(emaDirection(c1h,20,50), emaDirection(c15m,20,50));
         boolean volOk = computeVolatilityOk(c15m, atr(c15m,14));
         boolean atrOk = atr(c15m,14)/last.close > ATR_MIN_PCT;
@@ -877,7 +993,6 @@ public class SignalSender {
 
         double confidence = composeConfidence(rawScore, mtfConfirm, volOk, atrOk, impulse, vwapAligned, structureAligned, bos, sweep);
 
-        // --- Стоп и тейк ---
         double atrValue = atr(c15m,14);
         double entry = last.close;
         double risk = atrValue*1.2;
@@ -895,8 +1010,8 @@ public class SignalSender {
                 volOk,
                 atrOk,
                 Math.abs(rawScore)>0.6,
-                rawScore>=0 && entry>stop, // atrBreakLong
-                rawScore<0 && entry<stop,  // atrBreakShort
+                rawScore>=0 && entry>stop,
+                rawScore<0 && entry<stop,
                 impulse,
                 rsi(closes15,7),
                 rsi(closes15,4)
@@ -906,6 +1021,7 @@ public class SignalSender {
         s.take = take;
         return s;
     }
+
     private void connectWsInternal(String pair) {
         try {
             final String symbol = pair.toLowerCase();
@@ -966,9 +1082,11 @@ public class SignalSender {
             reconnect(pair);
         }
     }
+
     private void reconnect(String pair) {
         wsWatcher.schedule(() -> connectWsInternal(pair), 5, TimeUnit.SECONDS);
     }
+
     private MicroTrendResult computeMicroTrend(String pair, Deque<Double> dq) {
         if(dq==null || dq.size()<5) return new MicroTrendResult(0,0,0);
         List<Double> arr = new ArrayList<>(dq);
@@ -988,6 +1106,7 @@ public class SignalSender {
         double avg = arr.stream().mapToDouble(Double::doubleValue).average().orElse(arr.get(arr.size()-1));
         return new MicroTrendResult(speed,accel,avg);
     }
+
     private boolean isVolumeStrong(String pair, double lastPrice) {
         OrderbookSnapshot obs = orderbookMap.get(pair);
         if (obs == null) return false;
@@ -995,6 +1114,7 @@ public class SignalSender {
         double obi = Math.abs(obs.obi());
         return obi > OBI_THRESHOLD;
     }
+
     public List<com.bot.TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         try {
             List<com.bot.TradingCore.Candle> candles =
@@ -1016,14 +1136,13 @@ public class SignalSender {
             return Collections.emptyList();
         }
     }
+
     public Set<String> getTopSymbolsSet(int limit) {
         try {
-            // Все реально торгуемые пары на Binance
             Set<String> binancePairs = getBinanceSymbolsFutures();
 
-            // Берём топ монет с CoinGecko (market cap)
             String url = "https://api.coingecko.com/api/v3/coins/markets" +
-                    "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"; // <- больше, чтобы компенсировать фильтр
+                    "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1";
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(15))
@@ -1033,7 +1152,7 @@ public class SignalSender {
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             JSONArray arr = new JSONArray(resp.body());
 
-            Set<String> topPairs = new LinkedHashSet<>(); // сохраняем порядок
+            Set<String> topPairs = new LinkedHashSet<>();
             for (int i = 0; i < arr.length(); i++) {
                 String sym = arr.getJSONObject(i).getString("symbol").toUpperCase();
                 if (Set.of("USDT", "USDC", "BUSD").contains(sym)) continue;
@@ -1044,7 +1163,6 @@ public class SignalSender {
                 if (topPairs.size() >= limit) break;
             }
 
-            // Если меньше limit, добиваем просто реальными парами с Binance
             if (topPairs.size() < limit) {
                 for (String p : binancePairs) {
                     if (topPairs.size() >= limit) break;
@@ -1057,9 +1175,10 @@ public class SignalSender {
 
         } catch (Exception e) {
             System.out.println("[PAIRS] ERROR fetching top symbols: " + e.getMessage());
-            return Set.of("BTCUSDT", "ETHUSDT"); // fallback
+            return Set.of("BTCUSDT", "ETHUSDT");
         }
     }
+
     private List<com.bot.TradingCore.Candle> aggregate(List<com.bot.TradingCore.Candle> base, int factor) {
         List<com.bot.TradingCore.Candle> res = new ArrayList<>();
         if (base == null || base.size() < factor) return res;
@@ -1085,6 +1204,7 @@ public class SignalSender {
         }
         return res;
     }
+
     private boolean computeVolatilityOk(List<com.bot.TradingCore.Candle> candles, double atr) {
         return atr / candles.get(candles.size() - 1).close > 0.0015;
     }
@@ -1094,23 +1214,26 @@ public class SignalSender {
         double v = vwap(candles);
         return price > v * 0.995 && price < v * 1.005;
     }
+
     private boolean checkStructureAlignment(List<com.bot.TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
         return structure == dir;
     }
+
     public void startScheduler() {
-        if (scheduler != null && !scheduler.isShutdown()) return; // уже запущен
+        if (scheduler != null && !scheduler.isShutdown()) return;
 
         scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(
-                this::runScheduleCycle,       // метод который вызывается
-                0,                             // первый запуск сразу
-                INTERVAL_MIN,                  // период в минутах
+                this::runScheduleCycle,
+                0,
+                INTERVAL_MIN,
                 TimeUnit.MINUTES
         );
 
         System.out.println("[Scheduler] Scheduler started, interval " + INTERVAL_MIN + " min");
     }
+
     private void runScheduleCycle() {
         try {
             signalsThisCycle = 0;
@@ -1127,10 +1250,17 @@ public class SignalSender {
                 lastBinancePairsRefresh = System.currentTimeMillis();
             }
 
-            com.bot.DecisionEngineMerged engine =
-                    new com.bot.DecisionEngineMerged();
-            // === Получаем глобальный тренд BTC ОДИН раз за цикл ===
+            // === НОВОЕ: Обновляем Funding Rate перед циклом ===
+            if (System.currentTimeMillis() - lastFundingRefresh > FUNDING_REFRESH_INTERVAL_MS) {
+                refreshAllFundingRates();
+                lastFundingRefresh = System.currentTimeMillis();
+            }
+
+            com.bot.DecisionEngineMerged engine = decisionEngine;
+
+            // === НОВОЕ: Получаем глобальные тренды один раз ===
             int btcTrend = getBtcTrend();
+            int btc4hTrend = getBtc4HTrend();
 
             for (String pair : cachedPairs) {
 
@@ -1138,44 +1268,64 @@ public class SignalSender {
                 List<com.bot.TradingCore.Candle> c5  = fetchKlines(pair, "5m", KLINES_LIMIT);
                 List<com.bot.TradingCore.Candle> c15 = fetchKlines(pair, "15m", KLINES_LIMIT);
                 List<com.bot.TradingCore.Candle> h1  = fetchKlines(pair, "1h", KLINES_LIMIT);
+                // === НОВОЕ: 4H свечи ===
+                List<com.bot.TradingCore.Candle> h4  = fetchKlines(pair, "4h", 150);
 
                 if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
 
-                // Получаем сигнал через движок
+                // === НОВОЕ: Используем analyze с 4H ===
                 com.bot.DecisionEngineMerged.TradeIdea idea =
-                        engine.analyze(pair, c1, c5, c15, h1, com.bot.DecisionEngineMerged.CoinCategory.TOP);
+                        engine.analyze(pair, c1, c5, c15, h1, h4, com.bot.DecisionEngineMerged.CoinCategory.TOP);
 
                 if (idea == null || idea.probability < MIN_CONF) continue;
 
-                // мягкий фильтр BTC (не блокирует сигналы полностью)
+                // === УЛУЧШЕНО: BTC trend filter с учётом 4H ===
+                double probAdjustment = 0;
 
+                // 4H тренд BTC важнее чем 1H
+                if (btc4hTrend < 0 && idea.side.name().equals("LONG")) {
+                    probAdjustment -= 7;
+                }
+                if (btc4hTrend > 0 && idea.side.name().equals("SHORT")) {
+                    probAdjustment -= 7;
+                }
+
+                // 1H тренд добавляет/убавляет
                 if (btcTrend < 0 && idea.side.name().equals("LONG")) {
+                    probAdjustment -= 3;
+                }
+                if (btcTrend > 0 && idea.side.name().equals("SHORT")) {
+                    probAdjustment -= 3;
+                }
+
+                // Бонус за совпадение с BTC трендом
+                if (btc4hTrend > 0 && idea.side.name().equals("LONG")) {
+                    probAdjustment += 3;
+                }
+                if (btc4hTrend < 0 && idea.side.name().equals("SHORT")) {
+                    probAdjustment += 3;
+                }
+
+                if (probAdjustment != 0) {
                     idea = new com.bot.DecisionEngineMerged.TradeIdea(
                             idea.symbol,
                             idea.side,
                             idea.price,
                             idea.stop,
                             idea.take,
-                            idea.probability - 5,
-                            idea.flags
+                            idea.probability + probAdjustment,
+                            idea.flags,
+                            idea.fundingRate,
+                            idea.oiChange,
+                            idea.htfBias
                     );
                 }
 
-                if (btcTrend > 0 && idea.side.name().equals("SHORT")) {
-                    idea = new com.bot.DecisionEngineMerged.TradeIdea(
-                            idea.symbol,
-                            idea.side,
-                            idea.price,
-                            idea.stop,
-                            idea.take,
-                            idea.probability - 5,
-                            idea.flags
-                    );
-                }
+                // После корректировки проверяем порог
+                if (idea.probability < MIN_CONF * 100) continue;
 
                 long candleCloseTime = c15.get(c15.size() - 1).closeTime;
 
-                // Собираем Signal
                 Signal tempSignal = new Signal(
                         idea.symbol,
                         idea.side.name(),
@@ -1203,13 +1353,26 @@ public class SignalSender {
                 if (!core.allowSignal(idea)) continue;
                 core.registerSignal(idea);
 
+                // === УЛУЧШЕНО: Формат сообщения с FR и OI ===
+                String fundingInfo = "";
+                if (Math.abs(idea.fundingRate) > 0.0001) {
+                    fundingInfo = String.format("\nFR: %.4f%%", idea.fundingRate * 100);
+                }
+                String oiInfo = "";
+                if (Math.abs(idea.oiChange) > 0.5) {
+                    oiInfo = String.format(" | OI: %+.1f%%", idea.oiChange);
+                }
+                String biasInfo = "";
+                if (!idea.htfBias.equals("NONE")) {
+                    biasInfo = String.format("\n4H Bias: %s", idea.htfBias);
+                }
+
                 String message = String.format(
                         "*%s* → *%s*\n" +
                                 "Price: %.6f\n" +
-                                "Stop: %.6f\n" +
-                                "Take: %.6f\n" +
-                                "Probability: *%.2f*\n" +
-                                "Reason: %s\n" +
+                                "Stop: %.6f | Take: %.6f\n" +
+                                "Probability: *%.0f%%*%s%s%s\n" +
+                                "Flags: %s\n" +
                                 "_time: %s_",
                         idea.symbol,
                         idea.side,
@@ -1217,6 +1380,9 @@ public class SignalSender {
                         idea.stop,
                         idea.take,
                         idea.probability,
+                        fundingInfo,
+                        oiInfo,
+                        biasInfo,
                         idea.flags,
                         LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
                 );
