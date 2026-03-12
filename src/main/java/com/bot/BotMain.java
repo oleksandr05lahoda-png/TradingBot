@@ -30,7 +30,7 @@ public class BotMain {
         telegram.sendMessageAsync("🚀 Trading Bot запущен");
         LOGGER.info("Bot started at " + LocalDateTime.now());
 
-        var scheduler = java.util.concurrent.Executors.newScheduledThreadPool(2, new BotThreadFactory());
+        var scheduler = java.util.concurrent.Executors.newScheduledThreadPool(1, new BotThreadFactory());
 
         Runnable signalTask = () -> {
             try {
@@ -86,7 +86,7 @@ public class BotMain {
 
             } catch (Throwable t) {
                 LOGGER.log(Level.SEVERE, "CRITICAL ERROR in signal cycle", t);
-                telegram.sendMessageAsync("⚠ Ошибка цикла: " + t.getMessage());
+                telegram.sendMessageAsync("⚠ Ошибка цикла: " + t);
             }
         };
 

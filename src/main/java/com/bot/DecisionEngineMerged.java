@@ -102,7 +102,7 @@ public final class DecisionEngineMerged {
         double atr = atr(c15, 14);
         double lastRange = last(c15).high - last(c15).low;
 
-        if (lastRange > atr * 2.4) {
+        if (lastRange > atr * 3.8) {
             return null;
         }
         if (atr <= 0)
@@ -228,7 +228,7 @@ public final class DecisionEngineMerged {
         if (move4 < -0.015 && scoreLong > scoreShort) scoreLong *= 0.88;
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-        if (scoreDiff < 0.22) return null;
+        if (scoreDiff < 0.18) return null;
 
         com.bot.TradingCore.Side side = scoreLong > scoreShort ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
 
