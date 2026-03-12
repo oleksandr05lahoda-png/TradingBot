@@ -191,37 +191,29 @@ public final class InstitutionalSignalCore {
         }
     }
 
-    /* =========================================================
-       AUTO CLEANUP
-       ========================================================= */
     private void cleanupExpiredSignals() {
         long now = System.currentTimeMillis();
 
         for (Iterator<Map.Entry<String, List<ActiveSignal>>> it = activeSignals.entrySet().iterator(); it.hasNext();) {
             Map.Entry<String, List<ActiveSignal>> e = it.next();
             List<ActiveSignal> list = e.getValue();
-            Iterator<ActiveSignal> itSig = list.iterator();
 
-            while (itSig.hasNext()) {
-
-                ActiveSignal s = itSig.next();
-
+            // Используем removeIf вместо iterator.remove()
+            list.removeIf(s -> {
                 if (now - s.timestamp > signalTtlMs) {
-
-                    currentExposure =
-                            clamp(currentExposure - estimateExposure(s),
-                                    0.0,
-                                    maxPortfolioExposure);
-
-                    itSig.remove();
+                    currentExposure = clamp(currentExposure - estimateExposure(s), 0.0, maxPortfolioExposure);
+                    return true;
                 }
+                return false;
+            });
+
+            if (list.isEmpty()) {
+                it.remove();
             }
-            if (list.isEmpty()) it.remove();
         }
 
         recalcExposure();
     }
-
     private void recalcExposure() {
         double exposure = 0.0;
         for (List<ActiveSignal> list : activeSignals.values())
