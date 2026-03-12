@@ -79,7 +79,10 @@ public final class InstitutionalSignalCore {
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
         cleanupExpiredSignals();
-
+        if (getActiveSignalsCount() >= maxGlobalSignals) {
+            System.out.println("[DEBUG " + getTime() + "] Global signal limit reached → rejected");
+            return false;
+        }
         if (signal == null) {
             System.out.println("[DEBUG " + getTime() + "] Signal null → rejected");            return false;
         }
@@ -90,8 +93,10 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        // используем одну переменную list
-        List<ActiveSignal> list = activeSignals.getOrDefault(signal.symbol, new ArrayList<>());
+        List<ActiveSignal> list = activeSignals.computeIfAbsent(
+                signal.symbol,
+                k -> new CopyOnWriteArrayList<>()
+        );
 
         // Проверка схожих сигналов
         for (ActiveSignal a : list) {
@@ -99,7 +104,7 @@ public final class InstitutionalSignalCore {
             double probDiff = Math.abs(a.probability - signal.probability);
 
             // Сигнал почти такой же как существующий
-            if (a.side == signal.side && priceDiff < minSignalDiff && probDiff < 0.015) {
+            if (a.side == signal.side && priceDiff < minSignalDiff && probDiff < 1.5) {
                 System.out.println("[DEBUG] Signal too similar → rejected");
                 return false;
             }
@@ -109,18 +114,6 @@ public final class InstitutionalSignalCore {
                 System.out.println("[DEBUG] Opposite side, price too close → rejected");
                 return false;
             }
-        }
-
-        // Можно оставить максимум на одну монету, но не глобально
-        if (!list.isEmpty()) {
-            // обновляем существующий сигнал, вместо спама
-            list.clear();
-        }
-
-        if (currentExposure >= maxPortfolioExposure) {
-            System.out.println("[DEBUG] CurrentExposure " + currentExposure +
-                    " >= maxPortfolioExposure " + maxPortfolioExposure + " → rejected");
-            return false;
         }
 
         double score = symbolScore.getOrDefault(signal.symbol, 0.0);
@@ -218,7 +211,7 @@ public final class InstitutionalSignalCore {
        SYMBOL PERFORMANCE SCORE
        ========================================================= */
     private void updateSymbolScore(String symbol, double pnl) {
-        double delta = pnl > 0 ? 0.02 : pnl < 0 ? -0.025 : -0.005;
+        double delta = pnl > 0 ? 0.012 : pnl < 0 ? -0.015 : -0.004;
         symbolScore.merge(symbol, delta, Double::sum);
         symbolScore.compute(symbol, (k, v) -> clamp(v, -0.40, 0.40));
     }

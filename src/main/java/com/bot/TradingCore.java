@@ -85,12 +85,17 @@ public final class TradingCore {
             };
             double riskPct = clamp(atrPct * typeMultiplier, minRiskPct, maxRiskPct);
 
-            double rr = confidence > 0.85 ? 3.2 :
-                    confidence > 0.75 ? 2.6 :
-                            confidence > 0.65 ? 2.2 : 1.8;
+            double rr = confidence > 0.88 ? 3.4 :
+                    confidence > 0.78 ? 2.8 :
+                            confidence > 0.68 ? 2.3 : 1.9;
             rr = Math.max(rr, minRR);
 
             double stop = side == Side.LONG ? entry * (1 - riskPct) : entry * (1 + riskPct);
+
+            double minStop = entry * 0.0012;
+            if (Math.abs(entry - stop) < minStop) {
+                stop = side == Side.LONG ? entry - minStop : entry + minStop;
+            }
             double take = side == Side.LONG ? entry * (1 + riskPct * rr) : entry * (1 - riskPct * rr);
 
             return new TradeSignal(symbol, side, entry, stop, take, rr, confidence, reason, type);
@@ -107,7 +112,7 @@ public final class TradingCore {
 
     public static final class AdaptiveBrain {
         private static final double MAX_BIAS = 0.12;
-        private static final double DECAY = 0.992;
+        private static final double DECAY = 0.985;
         private static final int MAX_STREAK = 5;
 
         private final Map<String, Double> symbolBias = new ConcurrentHashMap<>();
@@ -148,7 +153,7 @@ public final class TradingCore {
                 return val;
             });
 
-            symbolBias.merge(symbol, win ? 0.015 : -0.018, Double::sum);
+            symbolBias.merge(symbol, win ? 0.010 : -0.012, Double::sum);
             symbolBias.compute(symbol, (s, val) -> {
                 if (val == null) return 0.0;
                 val *= DECAY;
@@ -203,8 +208,8 @@ public final class TradingCore {
                     CoinType.TOP, // или сигналная категория
                     highVol, lowVol);
 
-            // 3️⃣ Применяем RiskEngine для стоп/тейк и RR
-            double atr = Math.max(signal.price - signal.stop, 1e-6);
+            double atr = Math.abs(signal.price - signal.stop);
+            atr = Math.max(atr, signal.price * 0.0015);
             return riskEngine.applyRisk(signal.symbol, signal.side, signal.price,
                     atr, adjustedConf, "AutoSignal", CoinType.TOP);
         }

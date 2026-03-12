@@ -8,7 +8,7 @@ public final class SignalOptimizer {
     /* ================= CONFIG ================= */
 
     private static final int MIN_TICKS = 12;
-    private static final int MAX_TICKS = 120;
+    private static final int MAX_TICKS = 150;
 
     private static final double EMA_ALPHA = 0.32;
 
@@ -48,7 +48,7 @@ public final class SignalOptimizer {
             this.accel = accel;
             this.avg = avg;
 
-            double rawImpulse = Math.abs(speed) + Math.abs(accel);
+            double rawImpulse = Math.abs(speed) + Math.abs(accel) * 0.6;
 
             this.impulse = Math.min(rawImpulse, MAX_IMPULSE_CAP);
         }
@@ -95,7 +95,7 @@ public final class SignalOptimizer {
 
             double price = buffer.get(i);
 
-            double diff = price - prev;
+            double diff = (price - prev) / Math.max(prev, 1e-9);
 
             double prevSpeed = speed;
 
@@ -112,7 +112,7 @@ public final class SignalOptimizer {
 
         MicroTrendResult result = new MicroTrendResult(speed, accel, avg);
 
-        microTrendCache.put(symbol, result);
+        microTrendCache.putIfAbsent(symbol, result);
 
         return result;
     }
@@ -132,7 +132,7 @@ public final class SignalOptimizer {
                 signal.side == com.bot.TradingCore.Side.LONG;
 
         boolean trendUp =
-                mt.speed > 0;
+                mt.speed > 0 || mt.accel > 0;
 
         double trendAlignment =
                 (isLong && trendUp) || (!isLong && !trendUp)
@@ -160,8 +160,8 @@ public final class SignalOptimizer {
         double directionStrength =
                 Math.abs(mt.speed) / Math.max(Math.abs(mt.avg), 1e-9);
 
-        if (directionStrength > 0.0008)
-            confidence += 2.0;
+        if (directionStrength > 0.0018)
+            confidence += 2.5;
 
         return clamp(confidence, MIN_CONF, MAX_CONF);
     }
