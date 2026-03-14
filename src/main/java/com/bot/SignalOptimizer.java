@@ -3,16 +3,6 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * SignalOptimizer - Improved Version
- *
- * Улучшения:
- * - Лучший микро-тренд анализ
- * - Интеграция с PumpHunter
- * - Более точная корректировка confidence
- * - Детекция momentum exhaustion
- * - Multi-timeframe momentum alignment
- */
 public final class SignalOptimizer {
 
     /* ================= CONFIG ================= */

@@ -7,8 +7,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class InstitutionalSignalCore {
 
     /* =========================================================
-       CONFIGURATION (УЛУЧШЕННЫЕ ПАРАМЕТРЫ)
-       ========================================================= */
+    CONFIGURATION (УЛУЧШЕННЫЕ ПАРАМЕТРЫ)
+    ========================================================= */
     private final int maxGlobalSignals;
     private final int maxSignalsPerSymbol;
     private final double maxPortfolioExposure;
@@ -41,16 +41,16 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       STATE
-       ========================================================= */
+    STATE
+    ========================================================= */
     private final Map<String, List<ActiveSignal>> activeSignals = new ConcurrentHashMap<>();
     private final Map<String, List<ClosedTrade>> history = new ConcurrentHashMap<>();
     private final Map<String, Double> symbolScore = new ConcurrentHashMap<>();
     private volatile double currentExposure = 0.0;
 
     /* =========================================================
-       MODELS
-       ========================================================= */
+    MODELS
+    ========================================================= */
     public static final class ActiveSignal {
         public final String symbol;
         public final com.bot.TradingCore.Side side;
@@ -84,8 +84,8 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       MAIN FILTER
-       ========================================================= */
+    MAIN FILTER
+    ========================================================= */
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
         cleanupExpiredSignals();
@@ -95,13 +95,13 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        // Глобальный лимит
+// Глобальный лимит
         if (getActiveSignalsCount() >= maxGlobalSignals) {
             System.out.println("[ISC " + getTime() + "] Global limit " + maxGlobalSignals + " reached → rejected");
             return false;
         }
 
-        // Минимальная уверенность
+// Минимальная уверенность
         if (signal.probability < minConfidence) {
             System.out.println("[ISC " + getTime() + "] " + signal.symbol +
                     " prob " + signal.probability + " < " + minConfidence + " → rejected");
@@ -113,25 +113,25 @@ public final class InstitutionalSignalCore {
                 k -> new CopyOnWriteArrayList<>()
         );
 
-        // Проверка похожих сигналов
+// Проверка похожих сигналов
         for (ActiveSignal a : list) {
             double priceDiff = Math.abs(a.entry - signal.price) / a.entry;
             double probDiff = Math.abs(a.probability - signal.probability);
 
-            // Сигнал почти такой же как существующий
+// Сигнал почти такой же как существующий
             if (a.side == signal.side && priceDiff < minSignalDiff && probDiff < 3) {
                 System.out.println("[ISC] " + signal.symbol + " too similar to existing → rejected");
                 return false;
             }
 
-            // Противоположный сигнал слишком близко по цене
+// Противоположный сигнал слишком близко по цене
             if (a.side != signal.side && priceDiff < minSignalDiff * 1.5) {
                 System.out.println("[ISC] " + signal.symbol + " opposite too close → rejected");
                 return false;
             }
         }
 
-        // Проверка score символа
+// Проверка score символа
         double score = symbolScore.getOrDefault(signal.symbol, 0.0);
         if (score < -0.30) {
             double winRate = getWinRate(signal.symbol);
@@ -143,14 +143,14 @@ public final class InstitutionalSignalCore {
             }
         }
 
-        // Лимит на символ
+// Лимит на символ
         if (list.size() >= maxSignalsPerSymbol) {
             System.out.println("[ISC] " + signal.symbol + " has " + list.size() +
                     " active signals (max=" + maxSignalsPerSymbol + ") → rejected");
             return false;
         }
 
-        // Exposure check
+// Exposure check
         double estimatedExposure = estimateExposure(signal);
         if (currentExposure + estimatedExposure > maxPortfolioExposure) {
             System.out.println("[ISC] Portfolio exposure " +
@@ -166,8 +166,8 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       REGISTER / UPDATE
-       ========================================================= */
+    REGISTER / UPDATE
+    ========================================================= */
     public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         long now = System.currentTimeMillis();
 
@@ -181,7 +181,7 @@ public final class InstitutionalSignalCore {
 
         activeSignals.compute(signal.symbol, (sym, lst) -> {
             if (lst == null) lst = new CopyOnWriteArrayList<>();
-            // Удаляем старый похожий сигнал
+// Удаляем старый похожий сигнал
             lst.removeIf(s -> s.side == signal.side &&
                     Math.abs(s.entry - signal.price) / s.entry < minSignalDiff);
             lst.add(active);
@@ -192,8 +192,8 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       CLOSE TRADE
-       ========================================================= */
+    CLOSE TRADE
+    ========================================================= */
     public synchronized void closeTrade(String symbol, double pnlPercent) {
         List<ActiveSignal> list = activeSignals.remove(symbol);
         if (list == null) return;
@@ -210,8 +210,8 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       AUTO CLEANUP (ИСПРАВЛЕННЫЙ - без iterator.remove())
-       ========================================================= */
+    AUTO CLEANUP (ИСПРАВЛЕННЫЙ - без iterator.remove())
+    ========================================================= */
     private void cleanupExpiredSignals() {
         long now = System.currentTimeMillis();
 
@@ -219,7 +219,7 @@ public final class InstitutionalSignalCore {
             Map.Entry<String, List<ActiveSignal>> e = it.next();
             List<ActiveSignal> list = e.getValue();
 
-            // Используем removeIf вместо iterator.remove() - FIX для CopyOnWriteArrayList
+// Используем removeIf вместо iterator.remove() - FIX для CopyOnWriteArrayList
             list.removeIf(s -> {
                 if (now - s.timestamp > signalTtlMs) {
                     currentExposure = clamp(currentExposure - estimateExposure(s), 0.0, maxPortfolioExposure);
@@ -247,8 +247,8 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       SYMBOL PERFORMANCE SCORE
-       ========================================================= */
+    SYMBOL PERFORMANCE SCORE
+    ========================================================= */
     private void updateSymbolScore(String symbol, double pnl) {
         double delta = pnl > 0 ? 0.015 : pnl < 0 ? -0.018 : -0.003;
         symbolScore.merge(symbol, delta, Double::sum);
@@ -274,8 +274,8 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       STATS API
-       ========================================================= */
+    STATS API
+    ========================================================= */
     public synchronized int getActiveSignalsCount() {
         return activeSignals.values().stream().mapToInt(List::size).sum();
     }
@@ -304,8 +304,8 @@ public final class InstitutionalSignalCore {
     }
 
     /* =========================================================
-       UTIL
-       ========================================================= */
+    UTIL
+    ========================================================= */
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
     }

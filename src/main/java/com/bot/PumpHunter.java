@@ -3,16 +3,6 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * PumpHunter - Professional Pump/Dump Detection System
- *
- * Детектирует огромные импульсные свечи на основе:
- * - Volume Analysis (объёмный всплеск)
- * - Price Action (размер тела свечи относительно ATR)
- * - Momentum Acceleration (ускорение движения)
- * - Liquidity Sweep Detection (сбор ликвидности)
- * - Order Flow Imbalance (дисбаланс заявок)
- */
 public final class PumpHunter {
 
     // ======================= CONFIG =======================

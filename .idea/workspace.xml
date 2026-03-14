@@ -5,8 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -449,7 +452,18 @@
       <workItem from="1773348594270" duration="7000" />
       <workItem from="1773348609497" duration="4000" />
       <workItem from="1773348630820" duration="10000" />
-      <workItem from="1773348692471" duration="3194000" />
+      <workItem from="1773348692471" duration="4059000" />
+      <workItem from="1773394246532" duration="2553000" />
+      <workItem from="1773400464088" duration="2379000" />
+      <workItem from="1773481792393" duration="2688000" />
+      <workItem from="1773487118041" duration="7000" />
+      <workItem from="1773487153957" duration="8000" />
+      <workItem from="1773487173968" duration="4000" />
+      <workItem from="1773487187452" duration="5000" />
+      <workItem from="1773487201467" duration="4000" />
+      <workItem from="1773487214876" duration="7000" />
+      <workItem from="1773487235030" duration="5000" />
+      <workItem from="1773487250339" duration="16000" />
     </task>
     <servers />
   </component>
