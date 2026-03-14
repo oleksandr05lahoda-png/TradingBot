@@ -198,19 +198,23 @@ public final class SignalOptimizer {
         Deque<Double> momHistory = momentumHistory.get(symbol);
         if (momHistory == null || momHistory.size() < 10) return false;
 
-        // Условия истощения:
-        // 1. Momentum падает (accel противоположен speed)
-        // 2. Текущий momentum меньше среднего исторического
-        // 3. Speed замедляется
-
+        // [MOD] Улучшенная логика истощения
         boolean speedAccelDiverge = speed * accel < 0;
 
         List<Double> recentMom = new ArrayList<>(momHistory);
         double avgMom = recentMom.stream().mapToDouble(d -> Math.abs(d)).average().orElse(0);
+        double currentMomAbs = Math.abs(momentum);
+        boolean momentumWeakening = currentMomAbs < avgMom * 0.6;
 
-        boolean momentumWeakening = Math.abs(momentum) < avgMom * 0.6;
+        boolean momentumDecreasing = false;
+        if (recentMom.size() >= 3) {
+            double last = recentMom.get(recentMom.size()-1);
+            double prev = recentMom.get(recentMom.size()-2);
+            double prev2 = recentMom.get(recentMom.size()-3);
+            momentumDecreasing = (Math.abs(last) < Math.abs(prev)) && (Math.abs(prev) < Math.abs(prev2));
+        }
 
-        return speedAccelDiverge && momentumWeakening && Math.abs(accel) > ACCELERATION_THRESHOLD;
+        return (speedAccelDiverge || momentumDecreasing) && momentumWeakening && Math.abs(accel) > ACCELERATION_THRESHOLD;
     }
 
     /* ================= UPDATE FALLBACK FROM CANDLES ================= */
@@ -286,8 +290,8 @@ public final class SignalOptimizer {
 
         // === 5. EXHAUSTION FILTER ===
         if (mt.isExhausted) {
-            // При истощении снижаем confidence для продолжения тренда
-            confidence -= 5.0;
+            // [MOD] Увеличен штраф за истощение
+            confidence -= 10.0;
         }
 
         // === 6. MOMENTUM CONFIRMATION ===

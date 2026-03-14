@@ -69,6 +69,8 @@ public final class GlobalImpulseController {
     // ================= STATE =================
     private GlobalContext current =
             new GlobalContext(GlobalRegime.NEUTRAL, 0.0, 1.0, false, false, false, 0);
+    // [MOD] Для отслеживания изменения импульса
+    private double prevImpulseStrength = 0.0;
 
     // ================= UPDATE =================
     public void update(List<TradingCore.Candle> btc) {
@@ -113,6 +115,9 @@ public final class GlobalImpulseController {
                 onlyShort,
                 btcTrend
         );
+
+        // [MOD] Сохраняем предыдущую силу импульса для анализа затухания
+        this.prevImpulseStrength = this.current.impulseStrength;
     }
 
     public GlobalContext getContext() {
@@ -225,6 +230,9 @@ public final class GlobalImpulseController {
 
         GlobalContext ctx = current;
 
+        // [MOD] Определяем, ослабевает ли импульс
+        boolean impulseFading = prevImpulseStrength > ctx.impulseStrength && ctx.impulseStrength > 0.5;
+
         // Нейтральный режим - пропускаем всё
         if (ctx.regime == GlobalRegime.NEUTRAL) {
             return 1.0;
@@ -245,11 +253,18 @@ public final class GlobalImpulseController {
 
         // Обычный импульс вверх - немного снижаем шорты
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_UP && isShort) {
+            // [MOD] Если импульс ослабевает, контр-тренд становится чуть допустимее
+            if (impulseFading) {
+                return 0.9;
+            }
             return signal.probability >= 65 ? 0.92 : 0.75;
         }
 
         // Обычный импульс вниз - немного снижаем лонги
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN && isLong) {
+            if (impulseFading) {
+                return 0.9;
+            }
             return signal.probability >= 65 ? 0.92 : 0.75;
         }
 

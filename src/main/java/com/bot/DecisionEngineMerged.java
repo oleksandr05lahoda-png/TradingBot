@@ -11,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * - Добавлена поддержка 2H для дополнительного подтверждения
  * - Интеграция с PumpHunter
  * - Улучшенный расчёт probability
+ * - [MOD] Усилены фильтры истощения, дивергенции и перекупленности
  */
 public final class DecisionEngineMerged {
 
@@ -240,11 +241,16 @@ public final class DecisionEngineMerged {
         if (pumpHunter != null) {
             PumpHunter.PumpEvent pump = pumpHunter.detectPump(symbol, c1, c5, c15);
             if (pump != null && pump.strength > 0.4) {
+                // [MOD] Учёт подтверждения пампа
+                double bonus = pump.strength * 0.5;
+                if (!pump.isConfirmed) {
+                    bonus *= 0.5; // не подтверждён – половинный бонус
+                }
                 if (pump.isBullish()) {
-                    scoreLong += 0.60 + pump.strength * 0.50;
+                    scoreLong += 0.60 + bonus;
                     flags.add("PUMP_UP_" + String.format("%.0f", pump.strength * 100));
                 } else if (pump.isBearish()) {
-                    scoreShort += 0.60 + pump.strength * 0.50;
+                    scoreShort += 0.60 + bonus;
                     flags.add("PUMP_DOWN_" + String.format("%.0f", pump.strength * 100));
                 }
 
@@ -393,9 +399,27 @@ public final class DecisionEngineMerged {
         double rsi14 = rsi(c15, 14);
         double rsi7 = rsi(c15, 7);
 
+        // [MOD] Дивергенция против направления – жесткий штраф
+        if (bearDivFlag && scoreLong > scoreShort) {
+            scoreLong *= 0.35;
+            flags.add("bearish_div_vs_long");
+        }
+        if (bullDivFlag && scoreShort > scoreLong) {
+            scoreShort *= 0.35;
+            flags.add("bullish_div_vs_short");
+        }
+
+        // === ADX и его изменение ===
+        double adxValue = adx(c15, 14);
+        double adxPrev = adx(c15.subList(0, c15.size()-1), 14);
+        boolean adxFalling = adxPrev > adxValue;
+
         // === ФИЛЬТР ПЛОХИХ ЛОНГОВ (в конце тренда) ===
         if (scoreLong > scoreShort) {
-            if (isLongExhausted(c15, c1h, rsi14, rsi7, price)) {
+            boolean exhausted = isLongExhausted(c15, c1h, rsi14, rsi7, price);
+            if (adxValue > 30 && adxFalling) exhausted = true;
+            if (bearDivFlag) exhausted = true;
+            if (exhausted) {
                 scoreLong *= 0.45;
                 flags.add("exhausted_long_filtered");
             }
@@ -403,10 +427,25 @@ public final class DecisionEngineMerged {
 
         // === ФИЛЬТР ПЛОХИХ ШОРТОВ (в конце даунтренда) ===
         if (scoreShort > scoreLong) {
-            if (isShortExhausted(c15, c1h, rsi14, rsi7, price)) {
+            boolean exhausted = isShortExhausted(c15, c1h, rsi14, rsi7, price);
+            if (adxValue > 30 && adxFalling) exhausted = true;
+            if (bullDivFlag) exhausted = true;
+            if (exhausted) {
                 scoreShort *= 0.45;
                 flags.add("exhausted_short_filtered");
             }
+        }
+
+        // [MOD] Фильтр перекупленности / перепроданности
+        double ema50 = ema(c15, 50);
+        double deviation = (price - ema50) / ema50;
+        if (scoreLong > scoreShort && deviation > 0.06) {
+            scoreLong *= 0.5;
+            flags.add("overextended_long");
+        }
+        if (scoreShort > scoreLong && deviation < -0.06) {
+            scoreShort *= 0.5;
+            flags.add("overextended_short");
         }
 
         // RSI экстремумы (мягкий фильтр)
@@ -416,7 +455,6 @@ public final class DecisionEngineMerged {
         }
 
         // === ADX TREND CONFIRMATION ===
-        double adxValue = adx(c15, 14);
         if (adxValue > 32) {
             if (bias1h == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.70;
             if (bias1h == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.70;
