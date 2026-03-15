@@ -241,9 +241,11 @@ public final class DecisionEngineMerged {
             flags.add("⚠REVERSE_" + reverseWarning.type);
 
             if (reverseWarning.type.equals("LONG_EXHAUSTION")) {
-                scoreLong *= 0.40;  // Сильный штраф
+                scoreLong *= 0.20;  // УСИЛЕНО: 0.40 → 0.20 (сильнее режем)
+                if (scoreLong < 0.3) return null;  // НОВОЕ: если совсем низко - отклоняем
             } else if (reverseWarning.type.equals("SHORT_EXHAUSTION")) {
-                scoreShort *= 0.40;
+                scoreShort *= 0.20;
+                if (scoreShort < 0.3) return null;
             }
         }
 
@@ -418,7 +420,12 @@ public final class DecisionEngineMerged {
             scoreShort += 0.55;
             flags.add("bearish_div");
         }
-
+        if (bearDivFlag && scoreLong > scoreShort) {
+            flags.remove("bullish_div");  // убираем бычий флаг если есть медвежий
+        }
+        if (bullDivFlag && scoreShort > scoreLong) {
+            flags.remove("bearish_div");  // убираем медвежий флаг если есть бычий
+        }
         // === RSI FILTER ===
         double rsi14 = rsi(c15, 14);
         double rsi7 = rsi(c15, 7);
@@ -441,9 +448,12 @@ public final class DecisionEngineMerged {
         if (scoreLong > scoreShort) {
             boolean exhausted = isLongExhausted(c15, c1h, rsi14, rsi7, price);
             if (adxValue > 30 && adxFalling) exhausted = true;
-            if (bearDivFlag) exhausted = true;
+            if (bearDivFlag) {
+                exhausted = true;
+                flags.add("bearish_div_rejection");  // ПЕРЕИМЕНОВАНО для ясности
+            }
             if (exhausted) {
-                scoreLong *= 0.45;
+                scoreLong *= 0.30;  // УСИЛЕНО: 0.45 �� 0.30
                 flags.add("exhausted_long_filtered");
             }
         }
