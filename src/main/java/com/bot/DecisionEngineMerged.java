@@ -235,7 +235,6 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // === НОВОЕ: Reverse Detection (фильтруем плохие тренды) ===
         ReverseWarning reverseWarning = detectReversePattern(symbol, c15, c1h, state);
         if (reverseWarning != null && reverseWarning.confidence > 0.55) {
             flags.add("⚠REVERSE_" + reverseWarning.type);
