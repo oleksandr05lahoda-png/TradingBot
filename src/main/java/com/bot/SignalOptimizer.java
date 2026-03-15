@@ -304,6 +304,34 @@ public final class SignalOptimizer {
             confidence -= 8.0;  // Дополнительный штраф
         }
 
+        if (mt != null && mt.momentum != 0) {
+            Deque<Double> momHist = momentumHistory.get(signal.symbol);
+            if (momHist != null && momHist.size() >= 5) {
+                List<Double> recentMom = new ArrayList<>(momHist);
+
+                // Берём последние 5 значений momentum
+                double lastMom = Math.abs(recentMom.get(recentMom.size()-1));
+                double prevMom = Math.abs(recentMom.get(recentMom.size()-2));
+                double prev2Mom = Math.abs(recentMom.get(recentMom.size()-3));
+
+                // КЛЮЧЕВОЙ ПРИЗНАК: momentum падает 2 раза подряд = конец тренда!
+                boolean momentumFalling = lastMom < prevMom * 0.70 && prevMom < prev2Mom * 0.70;
+
+                // Плюс: speed и accel разнонаправлены
+                boolean speedAccelDiverge = mt.speed * mt.accel < 0 && Math.abs(mt.accel) > 0.00018;
+
+                if ((momentumFalling || speedAccelDiverge) && Math.abs(mt.smoothSpeed) > 0.0005) {
+                    confidence -= 8.0;  // СИЛЬНЫЙ штраф за усталость тренда!
+                    System.out.println("[Exhaustion] " + signal.symbol + " momentum fading, confidence -8%");
+                }
+            }
+        }
+
+        if (trendAlignment < 0 && impulseNorm > 0.5 && mt.isExhausted) {
+            confidence -= 12.0;  // Очень сильный штраф
+            System.out.println("[ContraTrend] Exhaustion detected, blocking");
+        }
+
         return clamp(confidence, MIN_CONF, MAX_CONF);
     }
 

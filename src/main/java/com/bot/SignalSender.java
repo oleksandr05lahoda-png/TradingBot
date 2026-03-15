@@ -56,7 +56,7 @@ public class SignalSender {
     private final AtomicLong dailyRequests = new AtomicLong(0);
     private Set<String> cachedPairs = new HashSet<>();
     private final com.bot.DecisionEngineMerged decisionEngine;
-
+    private final com.bot.GlobalImpulseController globalImpulse;
     private final Map<String, List<com.bot.TradingCore.Candle>> histM15 = new ConcurrentHashMap<>();
     private final Map<String, List<com.bot.TradingCore.Candle>> histH1  = new ConcurrentHashMap<>();
     private final Map<String, List<com.bot.TradingCore.Candle>> histH2  = new ConcurrentHashMap<>();
@@ -219,7 +219,7 @@ public class SignalSender {
         this.decisionEngine = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain = new com.bot.TradingCore.AdaptiveBrain();
         this.optimizer = new com.bot.SignalOptimizer(this.tickPriceDeque);
-
+        this.globalImpulse = new com.bot.GlobalImpulseController();
         this.pumpHunter = new com.bot.PumpHunter();
 
         this.decisionEngine.setPumpHunter(this.pumpHunter);
@@ -1074,6 +1074,19 @@ public class SignalSender {
                                 lastTickPrice.put(pair, price);
                                 lastTickTime.put(pair, ts);
 
+                                // ✅ ИСПРАВЛЕНО: вызываем ВНЕШНИЙ метод класса
+                                com.bot.DecisionEngineMerged.TradeIdea earlySignal =
+                                        generateEarlyTickSignal(pair, price, tickPriceDeque.get(pair));
+
+                                if (earlySignal != null && earlySignal.probability > 65) {
+                                    System.out.println("[EARLY_TICK] " + earlySignal.symbol + " " + earlySignal.side +
+                                            " prob=" + earlySignal.probability);
+                                    // ✅ ПРИМЕНЯЕМ ФИЛЬТРЫ
+                                    if (filterEarlySignal(earlySignal)) {
+                                        bot.sendMessageAsync(earlySignal.toString());
+                                    }
+                                }
+
                             } catch (Exception ignored) {}
                             return CompletableFuture.completedFuture(null);
                         }
@@ -1106,6 +1119,110 @@ public class SignalSender {
             System.out.println("[WS] Failed connect " + pair + " retry in 5s: " + e.getMessage());
             reconnect(pair);
         }
+    }
+
+    // ✅ ВЫНЕСЕНО ВО ВНЕШНИЙ МЕТОД КЛАССА
+    private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(
+            String symbol, double currentPrice, Deque<Double> dq) {
+
+        if (dq == null || dq.size() < 8) return null;
+
+        List<Double> buffer = new ArrayList<>(dq);
+        int n = buffer.size();
+
+        double move = buffer.get(n-1) - buffer.get(n-8);
+        double avgPrice = buffer.stream().mapToDouble(Double::doubleValue).average().orElse(currentPrice);
+        double velocity = Math.abs(move) / Math.max(avgPrice, 1e-9);
+
+        double move1 = buffer.get(n/2-1) - buffer.get(0);
+        double move2 = buffer.get(n-1) - buffer.get(n/2);
+        boolean accelerating = Math.abs(move2) > Math.abs(move1) * 1.15;
+
+        boolean fastVelocity = velocity > 0.0007;
+        boolean upMove = move > 0;
+
+        if (fastVelocity && accelerating) {
+            List<String> flags = new ArrayList<>();
+            flags.add("EARLY_TICK");
+            flags.add(upMove ? "UP_PUMP" : "DOWN_DUMP");
+            flags.add("velocity=" + String.format("%.2e", velocity));
+
+            double stopDist = currentPrice * 0.0055;
+            double takeDist = currentPrice * 0.0185;
+
+            double stop = upMove ? currentPrice - stopDist : currentPrice + stopDist;
+            double take = upMove ? currentPrice + takeDist : currentPrice - takeDist;
+
+            double confidence = 55 + velocity * 15000;
+
+            return new com.bot.DecisionEngineMerged.TradeIdea(
+                    symbol,
+                    upMove ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
+                    currentPrice,
+                    stop,
+                    take,
+                    Math.min(75, confidence),
+                    flags
+            );
+        }
+
+        return null;
+    }
+
+    // ✅ НОВЫЙ МЕТОД: применяем все фильтры к раннему сигналу
+    private boolean filterEarlySignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
+
+        // Фильтр 1: GlobalImpulse (BTC контекст)
+        GlobalImpulseController.GlobalContext ctx = getLatestBTCContext();
+        if (ctx != null) {
+            double coeff = globalImpulse.filterSignal(signal);
+            if (coeff <= 0.05) {
+                System.out.println("[EARLY] GlobalImpulse BLOCKED: " + signal.symbol);
+                return false;
+            }
+        }
+
+        // Фильтр 2: Institutional risk check
+        if (!core.allowSignal(signal)) {
+            System.out.println("[EARLY] ISC REJECTED: " + signal.symbol);
+            return false;
+        }
+
+        // Фильтр 3: SignalOptimizer exhaustion check
+        double adjustedConf = optimizer.adjustConfidence(signal);
+        if (adjustedConf < 55) {
+            System.out.println("[EARLY] Exhaustion filter blocked: " + signal.symbol);
+            return false;
+        }
+
+        return true;
+    }
+
+    // ✅ КЕШИРУЕМ последний BTC контекст
+    private GlobalImpulseController.GlobalContext cachedBTCContext = null;
+    private long lastBTCContextUpdate = 0;
+
+    private GlobalImpulseController.GlobalContext getLatestBTCContext() {
+        // Если кеш свежий (< 1 мин), используем его
+        if (System.currentTimeMillis() - lastBTCContextUpdate < 60_000) {
+            return cachedBTCContext;
+        }
+
+        // Иначе обновляем
+        try {
+            List<com.bot.TradingCore.Candle> btcCandles = fetchKlines("BTCUSDT", "15m", 200);
+            if (btcCandles != null && btcCandles.size() > 20) {
+                GlobalImpulseController gic = new GlobalImpulseController();
+                gic.update(btcCandles);
+                cachedBTCContext = gic.getContext();
+                lastBTCContextUpdate = System.currentTimeMillis();
+                return cachedBTCContext;
+            }
+        } catch (Exception e) {
+            System.out.println("[BTC] Error updating context: " + e.getMessage());
+        }
+
+        return cachedBTCContext;  // вернём старый кеш если ошибка
     }
 
     private void reconnect(String pair) {

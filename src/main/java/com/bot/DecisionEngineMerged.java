@@ -616,38 +616,61 @@ public final class DecisionEngineMerged {
         double prevBody = Math.abs(prev1m.close - prev1m.open);
         double currVolRatio = curr1m.volume / avgVol1;
 
+        // ✅ ДОБАВЛЕНО: Проверка силы тренда через скорость
+        double speedLast2 = Math.abs(curr1m.close - c1.get(Math.max(0, n1-3)).close);
+        double speedPrev2 = Math.abs(c1.get(Math.max(0, n1-3)).close - c1.get(Math.max(0, n1-5)).close);
+        boolean accelerating = speedLast2 > speedPrev2 * 1.2 && speedLast2 > atr1 * 0.8;
+
         // === АГРЕССИВНАЯ ДЕТЕКЦИЯ ===
 
-        // Вариант 1: Одна мощная свеча (памп)
-        if (currBody > atr1 * 1.7 && currVolRatio > 1.5) {
+        // Вариант 1: Одна мощная свеча (памп) — УСИЛЕНО
+        if (currBody > atr1 * 1.5 && currVolRatio > 1.4 && accelerating) {  // БЫЛО 1.7 и 1.5
             int dir = curr1m.close > curr1m.open ? 1 : -1;
-            double strength = Math.min(0.80, (currBody / atr1 - 1.5) * 0.45);
-            if (strength > 0.45) {
+            double strength = Math.min(0.85, (currBody / atr1 - 1.3) * 0.50);  // БЫЛО 0.80, 1.5, 0.45
+            if (strength > 0.40) {  // БЫЛО 0.45
                 return new AntiLagSignal(dir, strength, 0);
             }
         }
 
-        // Вариант 2: Две сильные подряд
-        if (currBody > atr1 * 1.3 && prevBody > atr1 * 1.2) {
+        // Вариант 2: Две сильные подряд — УСИЛЕНО
+        if (currBody > atr1 * 1.2 && prevBody > atr1 * 1.1 && accelerating) {  // БЫЛО 1.3, 1.2
             double totalMove = curr1m.close - prev1m.open;
             int dir = totalMove > 0 ? 1 : -1;
-            double strength = Math.min(0.70, Math.abs(totalMove) / atr1 * 0.40);
-            if (strength > 0.45) {
+            double strength = Math.min(0.75, Math.abs(totalMove) / atr1 * 0.45);  // БЫЛО 0.70, 0.40
+            if (strength > 0.40) {
                 return new AntiLagSignal(dir, strength, 1);
             }
         }
 
-        // Вариант 3: На 5M большой разрыв
+        // Вариант 3: На 5M большой разрыв — НОВОЕ
         com.bot.TradingCore.Candle curr5m = c5.get(n5 - 1);
         double atr5 = atr(c5, 14);
         double body5m = Math.abs(curr5m.close - curr5m.open);
         double avgVol5 = c5.subList(Math.max(0, n5-10), n5-1).stream()
                 .mapToDouble(c -> c.volume).average().orElse(1);
 
-        if (body5m > atr5 * 2.0 && curr5m.volume > avgVol5 * 1.4) {
+        if (body5m > atr5 * 1.8 && curr5m.volume > avgVol5 * 1.3) {  // БЫЛО 2.0, 1.4
             int dir = curr5m.close > curr5m.open ? 1 : -1;
-            double strength = Math.min(0.75, (body5m / atr5 - 1.8) * 0.35);
-            if (strength > 0.45) {
+            double strength = Math.min(0.80, (body5m / atr5 - 1.6) * 0.40);  // БЫЛО 0.75, 1.8, 0.35
+            if (strength > 0.40) {
+                return new AntiLagSignal(dir, strength, 0);
+            }
+        }
+
+        // Вариант 4: Быстрая серия из 3-4 монолитных свечей — НОВОЕ
+        int greenCount = 0, redCount = 0;
+        double seriesMove = 0;
+        for (int i = Math.max(0, n1 - 4); i < n1; i++) {
+            com.bot.TradingCore.Candle c = c1.get(i);
+            if (c.close > c.open) greenCount++;
+            else redCount++;
+            seriesMove += c.close - c.open;
+        }
+
+        if ((greenCount >= 3 || redCount >= 3) && Math.abs(seriesMove) > atr1 * 1.5) {
+            int dir = seriesMove > 0 ? 1 : -1;
+            double strength = Math.min(0.70, Math.abs(seriesMove) / atr1 * 0.35);
+            if (strength > 0.38) {
                 return new AntiLagSignal(dir, strength, 0);
             }
         }
@@ -667,9 +690,6 @@ public final class DecisionEngineMerged {
         }
     }
 
-    /**
-     * КРИТИЧНО: Детекция разворота ПЕРЕД тем как он произойдёт
-     */
     private ReverseWarning detectReversePattern(String symbol,
                                                 List<com.bot.TradingCore.Candle> c15,
                                                 List<com.bot.TradingCore.Candle> c1h,
@@ -680,97 +700,108 @@ public final class DecisionEngineMerged {
         List<String> warnings = new ArrayList<>();
         double warningScore = 0.0;
 
-        // === ФАКТОР 1: RSI экстремумы на 1H (разворот часто случается здесь) ===
+        // === ФАКТОР 1: RSI экстремумы (БЕЗ ИЗМЕНЕНИЙ) ===
         double rsi1h = rsi(c1h, 14);
-
-        // Лонг в опасности если RSI > 75 на 1H
         if (rsi1h > 75.0) {
             warnings.add("RSI1H_OVERBOUGHT");
             warningScore += 0.25;
         }
-        // Шорт в опасности если RSI < 25 на 1H
         if (rsi1h < 25.0) {
             warnings.add("RSI1H_OVERSOLD");
             warningScore += 0.25;
         }
 
-        // === ФАКТОР 2: Momentum divergence (УСИЛЕНО) ===
+        // === ФАКТОР 2: Momentum divergence — УСИЛЕНО ===
         double momentum15_curr = calculateMomentum(c15, 5);
         double momentum15_prev = calculateMomentumPrev(c15, 5, 5);
         double momentum15_prev2 = calculateMomentumPrev(c15, 5, 10);
 
-// Momentum падает 2 раза подряд = сильный сигнал разворота
-        boolean momLongFading = momentum15_curr < momentum15_prev * 0.70 &&  // БЫЛО 0.65
-                momentum15_prev < momentum15_prev2 * 0.75 &&
+        boolean momLongFading = momentum15_curr < momentum15_prev * 0.65 &&  // БЫЛО 0.70
+                momentum15_prev < momentum15_prev2 * 0.70 &&  // БЫЛО 0.75
                 momentum15_prev > 0;
         if (momLongFading) {
             warnings.add("MOMENTUM_DIV_LONG");
-            warningScore += 0.40;  // БЫЛО 0.30 → 0.40 (сильнее)
+            warningScore += 0.45;  // БЫЛО 0.40 — УСИЛИЛИ
         }
 
-        boolean momShortFading = momentum15_curr > momentum15_prev * 1.30 &&  // БЫЛО 1.35
-                momentum15_prev > momentum15_prev2 * 1.25 &&
+        boolean momShortFading = momentum15_curr > momentum15_prev * 1.35 &&  // БЫЛО 1.30
+                momentum15_prev > momentum15_prev2 * 1.30 &&  // БЫЛО 1.25
                 momentum15_prev < 0;
         if (momShortFading) {
             warnings.add("MOMENTUM_DIV_SHORT");
-            warningScore += 0.40;  // БЫЛО 0.30 → 0.40
+            warningScore += 0.45;  // БЫЛО 0.40
         }
 
-        // === ФАКТОР 3: Volume collapse = нет больше покупателей/продавцов ===
+        // === ФАКТОР 3: Volume collapse ===
         double avgVol = c15.subList(Math.max(0, c15.size()-15), c15.size()-3).stream()
                 .mapToDouble(c -> c.volume).average().orElse(1);
         double lastVol = last(c15).volume;
 
-        if (lastVol < avgVol * 0.60) {  // Объём упал на 40%
+        if (lastVol < avgVol * 0.55) {  // БЫЛО 0.60 — УЖЕСТОЧИЛИ
             warnings.add("VOL_COLLAPSE");
-            warningScore += 0.25;
+            warningScore += 0.30;  // БЫЛО 0.25
         }
 
-        // === ФАКТОР 4: Wick против движения = отскок ===
+        // === ФАКТОР 4: Wick rejection (ВОТ ТУТ ГЛАВНОЕ) ===
         com.bot.TradingCore.Candle lastC = last(c15);
         double upperWick = lastC.high - Math.max(lastC.open, lastC.close);
         double lowerWick = Math.min(lastC.open, lastC.close) - lastC.low;
         double body = Math.abs(lastC.close - lastC.open);
 
-        // Большой верхний wick при рост = rejection
-        if (upperWick > body * 2.0 && lastC.close > lastC.open) {
+        // ОЧЕНЬ ВАЖНО: большой wick = отскок от уровня!
+        if (upperWick > body * 2.5 && lastC.close < lastC.open) {  // БЫЛО 2.0
             warnings.add("UPPER_WICK_REJECTION");
-            warningScore += 0.25;
+            warningScore += 0.35;  // БЫЛО 0.25
         }
-        // Большой нижний wick при падении = rejection
-        if (lowerWick > body * 2.0 && lastC.close < lastC.open) {
+        if (lowerWick > body * 2.5 && lastC.close > lastC.open) {
             warnings.add("LOWER_WICK_REJECTION");
-            warningScore += 0.25;
+            warningScore += 0.35;
         }
 
-        // === ФАКТОР 5: ADX falling = тренд слабеет ===
+        // === ФАКТОР 5: ADX falling (свеча слабеет) ===
         double adxVal = adx(c15, 14);
         if (c15.size() >= 2) {
             double adxPrev = adx(c15.subList(0, c15.size()-1), 14);
-            if (adxPrev > adxVal && adxVal > 25) {
+            if (adxPrev > adxVal && adxVal > 22) {  // БЫЛО 25
                 warnings.add("ADX_FALLING");
-                warningScore += 0.20;
+                warningScore += 0.25;  // БЫЛО 0.20
             }
         }
 
-        // === ФАКТОР 6: Three Candle Exhaustion ===
+        // === ФАКТОР 6: Three Candle Exhaustion — НОВОЕ ПРАВИЛО! ===
         if (c15.size() >= 3) {
             com.bot.TradingCore.Candle c1 = c15.get(c15.size()-3);
             com.bot.TradingCore.Candle c2 = c15.get(c15.size()-2);
             com.bot.TradingCore.Candle c3 = c15.get(c15.size()-1);
 
-            // Три зелёные идущие по убыванию тела
+            // Три зелёные с УМЕНЬШАЮЩИМСЯ телом = усталость быков
             boolean threeGreenDecline = c1.close > c1.open && c2.close > c2.open && c3.close > c3.open &&
-                    Math.abs(c1.close - c1.open) > Math.abs(c2.close - c2.open) &&
-                    Math.abs(c2.close - c2.open) > Math.abs(c3.close - c3.open) * 0.9;
+                    Math.abs(c1.close - c1.open) > Math.abs(c2.close - c2.open) * 1.05 &&
+                    Math.abs(c2.close - c2.open) > Math.abs(c3.close - c3.open) * 1.05;
 
             if (threeGreenDecline) {
                 warnings.add("THREE_CANDLE_EXHAUSTION");
-                warningScore += 0.20;
+                warningScore += 0.30;  // БЫЛО 0.20
             }
         }
 
-        if (warningScore < 0.45) return null;
+        // === ФАКТОР 7: НОВОЕ — Хвост против движения! ===
+        if (c15.size() >= 2) {
+            com.bot.TradingCore.Candle curr = c15.get(c15.size()-1);
+            com.bot.TradingCore.Candle prev = c15.get(c15.size()-2);
+
+            // Если пре��ыдущая была БОЛЬШАЯ зелёная, а нынешняя — маленькая с верхним хвостом
+            if (prev.close > prev.open && curr.high > prev.high) {
+                double prevBody = prev.close - prev.open;
+                double currBody = Math.abs(curr.close - curr.open);
+                if (prevBody > currBody * 2.0 && upperWick > body * 1.8) {
+                    warnings.add("TAIL_REJECTION_AFTER_PUMP");
+                    warningScore += 0.35;
+                }
+            }
+        }
+
+        if (warningScore < 0.50) return null;  // БЫЛО 0.45 — УЖЕСТОЧИЛИ
 
         String reverseType = rsi1h > 75.0 ? "LONG_EXHAUSTION" :
                 rsi1h < 25.0 ? "SHORT_EXHAUSTION" : "REVERSAL";

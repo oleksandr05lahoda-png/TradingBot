@@ -211,7 +211,6 @@ public final class GlobalImpulseController {
 
         boolean impulseFading = prevImpulseStrength > ctx.impulseStrength && ctx.impulseStrength > 0.5;
 
-        // Нейтральный режим - пропускаем всё
         if (ctx.regime == GlobalRegime.NEUTRAL) {
             return 1.0;
         }
@@ -219,33 +218,33 @@ public final class GlobalImpulseController {
         boolean isLong = signal.side == TradingCore.Side.LONG;
         boolean isShort = signal.side == TradingCore.Side.SHORT;
 
-        // === УЛУЧШЕННЫЕ ФИЛЬТРЫ ===
+        // === УЖЕСТОЧЕННЫЕ ФИЛЬТРЫ ===
 
-        // STRONG_UP = только лонги, редко шорты
+        // STRONG_UP = ОЧЕНЬ редко шорты!
         if (ctx.regime == GlobalRegime.BTC_STRONG_UP && isShort) {
-            if (signal.probability >= 78) return 0.70;  // БЫЛО 75 и 0.65 → 78 и 0.70
-            return 0.10;  // БЫЛО 0.0 → 0.10 (не полная блокировка, а ослабление)
+            if (signal.probability >= 82) return 0.50;  // БЫЛО 78, 0.70 → 82, 0.50 (жёстче)
+            return 0.05;  // БЫЛО 0.10 → 0.05
         }
 
-        // STRONG_DOWN = только шорты, редко лонги
+        // STRONG_DOWN = ОЧЕНЬ редко лонги!
         if (ctx.regime == GlobalRegime.BTC_STRONG_DOWN && isLong) {
-            if (signal.probability >= 78) return 0.70;
-            return 0.10;
+            if (signal.probability >= 82) return 0.50;  // БЫЛО 78, 0.70
+            return 0.05;  // БЫЛО 0.10
         }
 
-        // IMPULSE_UP = контр-тренд очень трудно
+        // IMPULSE_UP = контр-тренд почти невозможен!
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_UP && isShort) {
             if (impulseFading) {
-                return signal.probability >= 70 ? 0.80 : 0.40;  // БЫЛО 68 и 0.85
+                return signal.probability >= 75 ? 0.60 : 0.20;  // БЫЛО 70, 0.80, 0.40
             }
-            return signal.probability >= 73 ? 0.75 : 0.05;  // БЫЛО 72 и 0.80, вместо 0.0 сейчас 0.05
+            return signal.probability >= 76 ? 0.65 : 0.02;  // БЫЛО 73, 0.75, 0.05 → 0.02 (почти блокируем)
         }
 
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN && isLong) {
             if (impulseFading) {
-                return signal.probability >= 70 ? 0.80 : 0.40;
+                return signal.probability >= 75 ? 0.60 : 0.20;
             }
-            return signal.probability >= 73 ? 0.75 : 0.05;
+            return signal.probability >= 76 ? 0.65 : 0.02;
         }
 
         return 1.0;

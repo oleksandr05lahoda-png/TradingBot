@@ -12,7 +12,7 @@ public class BotMain {
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
-    private static final int SIGNAL_INTERVAL_MIN = 15;  // ОСТАЕТСЯ 15 (оптимально для 15M)
+    private static final int SIGNAL_INTERVAL_MIN = 15;
     private static final int KLINES_LIMIT = 200;
 
     public static void main(String[] args) {
@@ -22,10 +22,10 @@ public class BotMain {
             return;
         }
 
-        TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
-        SignalSender signalSender = new SignalSender(telegram);
-        GlobalImpulseController globalImpulse = new GlobalImpulseController();
-        InstitutionalSignalCore institutionalCore = new InstitutionalSignalCore();
+        final TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
+        final SignalSender signalSender = new SignalSender(telegram);
+        final GlobalImpulseController globalImpulse = new GlobalImpulseController();
+        final InstitutionalSignalCore institutionalCore = new InstitutionalSignalCore();
 
         telegram.sendMessageAsync("🚀 Bot запущен | 15M | Anti-Lag + ReverseDetect ACTIVE");
         LOGGER.info("Bot started at " + LocalDateTime.now());
