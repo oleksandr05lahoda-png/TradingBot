@@ -12,7 +12,7 @@ public class BotMain {
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
-    private static final int SIGNAL_INTERVAL_MIN = 15;
+    private static final int SIGNAL_INTERVAL_MIN = 5;  // ← ИЗМЕНЕНО: 15 → 5 МИНУТ
     private static final int KLINES_LIMIT = 200;
 
     public static void main(String[] args) {
@@ -23,13 +23,10 @@ public class BotMain {
         }
 
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
-
-        // ВАЖНО: SignalSender больше НЕ запускает свой внутренний scheduler.
-        // Весь цикл управляется только здесь, в BotMain.
         SignalSender signalSender = new SignalSender(telegram);
         GlobalImpulseController globalImpulse = new GlobalImpulseController();
 
-        telegram.sendMessageAsync("🚀 Trading Bot запущен");
+        telegram.sendMessageAsync("🚀 Trading Bot запущен (5-мин сканирование)");
         LOGGER.info("Bot started at " + LocalDateTime.now());
 
         var scheduler = java.util.concurrent.Executors.newScheduledThreadPool(1, new BotThreadFactory());
@@ -56,7 +53,6 @@ public class BotMain {
                         + " | volExp=" + String.format("%.2f", ctx.volatilityExpansion));
 
                 // Фильтрация через GlobalImpulseController.filterSignal()
-                // Возвращает коэффициент: 1.0 = пропустить, 0.0 = заблокировать
                 List<DecisionEngineMerged.TradeIdea> filteredSignals = rawSignals.stream()
                         .filter(s -> {
                             double coeff = globalImpulse.filterSignal(s);

@@ -5,36 +5,32 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class SignalOptimizer {
 
-    /* ================= CONFIG ================= */
+    // === УЛУЧШЕНО: Более чувствительные пороги ===
+    private static final int MIN_TICKS = 5;
+    private static final int MAX_TICKS = 200;
+    private static final double EMA_ALPHA = 0.45;
 
-    private static final int MIN_TICKS = 6;       // Снижено с 8
-    private static final int MAX_TICKS = 200;     // Увеличено
-
-    private static final double EMA_ALPHA = 0.40;  // Более responsive
-
-    private static final double STRONG_IMPULSE = 0.0010;   // Более чувствительно
-    private static final double WEAK_IMPULSE = 0.0003;
+    private static final double STRONG_IMPULSE = 0.0012;   // Более чувствительно
+    private static final double WEAK_IMPULSE = 0.0002;
 
     private static final double MAX_CONF = 92.0;
-    private static final double MIN_CONF = 52.0;
+    private static final double MIN_CONF = 50.0;
 
-    private static final double MAX_IMPULSE_CAP = 0.008;
+    private static final double MAX_IMPULSE_CAP = 0.010;
 
-    // Новые параметры
-    private static final double MOMENTUM_THRESHOLD = 0.0008;
-    private static final double ACCELERATION_THRESHOLD = 0.0004;
+    private static final double MOMENTUM_THRESHOLD = 0.0010;
+    private static final double ACCELERATION_THRESHOLD = 0.0005;
     private static final int MOMENTUM_WINDOW = 15;
 
-    /* ================= STATE ================= */
+    // === НОВОЕ: Anti-lag параметры ===
+    private static final double EARLY_DETECTION_SENSITIVITY = 1.5;  // 1.5x обычного
+    private static final double REVERSAL_SENSITIVITY = 1.3;
 
     private final Map<String, Deque<Double>> tickPriceDeque;
     private final Map<String, MicroTrendResult> microTrendCache = new ConcurrentHashMap<>();
     private final Map<String, List<Double>> priceFallback = new ConcurrentHashMap<>();
-
-    // Новое: история momentum для детекции exhaustion
     private final Map<String, Deque<Double>> momentumHistory = new ConcurrentHashMap<>();
 
-    // Интеграция с PumpHunter
     private PumpHunter pumpHunter;
 
     public SignalOptimizer(Map<String, Deque<Double>> tickPriceDeque) {
@@ -45,18 +41,16 @@ public final class SignalOptimizer {
         this.pumpHunter = pumpHunter;
     }
 
-    /* ================= DATA ================= */
-
     public static final class MicroTrendResult {
 
-        public final double speed;          // Скорость движения
-        public final double accel;          // Ускорение
-        public final double avg;            // Средняя цена
-        public final double impulse;        // Общая сила импульса
-        public final boolean fromTicks;     // true = реальные тики
-        public final double momentum;       // Momentum (новое)
-        public final double smoothSpeed;    // Сглаженная скорость (новое)
-        public final boolean isExhausted;   // Признак истощения (новое)
+        public final double speed;
+        public final double accel;
+        public final double avg;
+        public final double impulse;
+        public final boolean fromTicks;
+        public final double momentum;
+        public final double smoothSpeed;
+        public final boolean isExhausted;
 
         public MicroTrendResult(double speed, double accel, double avg,
                                 boolean fromTicks, double momentum,
@@ -76,7 +70,6 @@ public final class SignalOptimizer {
             this.impulse = Math.min(rawImpulse, MAX_IMPULSE_CAP);
         }
 
-        // Совместимость со старым кодом
         public MicroTrendResult(double speed, double accel, double avg, boolean fromTicks) {
             this(speed, accel, avg, fromTicks, 0, speed, false);
         }
@@ -89,18 +82,14 @@ public final class SignalOptimizer {
     private static final MicroTrendResult ZERO =
             new MicroTrendResult(0, 0, 0, false, 0, 0, false);
 
-    /* ================= MICRO TREND ================= */
-
     public MicroTrendResult computeMicroTrend(String symbol) {
 
         Deque<Double> dq = tickPriceDeque.get(symbol);
 
-        // Если есть тики - используем их
         if (dq != null && dq.size() >= MIN_TICKS) {
             return computeFromTicks(symbol, dq);
         }
 
-        // Fallback: используем кэш цен из свечей
         List<Double> fallback = priceFallback.get(symbol);
         if (fallback != null && fallback.size() >= 5) {
             return computeFromPrices(symbol, fallback, false);
@@ -138,7 +127,6 @@ public final class SignalOptimizer {
         double prev = prices.get(0);
         double sum = prev;
 
-        // Для momentum calculation
         List<Double> returns = new ArrayList<>();
 
         for (int i = 1; i < prices.size(); i++) {
@@ -157,10 +145,9 @@ public final class SignalOptimizer {
 
         double avg = sum / prices.size();
 
-        // === Новое: Momentum calculation ===
+        // === Momentum calculation ===
         double momentum = 0;
         if (returns.size() >= 5) {
-            // Суммируем последние returns
             int momWindow = Math.min(MOMENTUM_WINDOW, returns.size());
             double momSum = 0;
             for (int i = returns.size() - momWindow; i < returns.size(); i++) {
@@ -169,7 +156,7 @@ public final class SignalOptimizer {
             momentum = momSum / momWindow;
         }
 
-        // === Новое: Smooth speed (двойное сглаживание) ===
+        // === Smooth speed ===
         double smoothSpeed = speed;
         if (returns.size() >= 10) {
             double longSpeed = 0;
@@ -180,10 +167,10 @@ public final class SignalOptimizer {
             smoothSpeed = (speed + longSpeed) / 2;
         }
 
-        // === Новое: Exhaustion detection ===
+        // === Exhaustion detection ===
         boolean isExhausted = detectExhaustion(symbol, speed, accel, momentum);
 
-        // Сохраняем momentum в историю
+        // === Сохраняем momentum ===
         Deque<Double> momHistory = momentumHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
         momHistory.addLast(momentum);
         while (momHistory.size() > 100) momHistory.removeFirst();
@@ -191,43 +178,36 @@ public final class SignalOptimizer {
         return new MicroTrendResult(speed, accel, avg, fromTicks, momentum, smoothSpeed, isExhausted);
     }
 
-    /**
-     * Детекция истощения momentum
-     */
     private boolean detectExhaustion(String symbol, double speed, double accel, double momentum) {
         Deque<Double> momHistory = momentumHistory.get(symbol);
-        if (momHistory == null || momHistory.size() < 10) return false;
+        if (momHistory == null || momHistory.size() < 8) return false;  // БЫЛО 10 → 8
 
-        // [MOD] Улучшенная логика истощения
-        boolean speedAccelDiverge = speed * accel < 0;
-
+        // === РАННЯЯ ДЕТЕКЦИЯ ===
         List<Double> recentMom = new ArrayList<>(momHistory);
-        double avgMom = recentMom.stream().mapToDouble(d -> Math.abs(d)).average().orElse(0);
-        double currentMomAbs = Math.abs(momentum);
-        boolean momentumWeakening = currentMomAbs < avgMom * 0.6;
 
-        boolean momentumDecreasing = false;
+        // Проверка: speed и accel разнонаправлены (начинается слабение)
+        boolean diverging = speed * accel < 0 && Math.abs(accel) > 0.00015;  // БЫЛО 0.6*speed
+
+        // Momentum падает 2 раза подряд = сигнал разворота
+        boolean momentumFalling = false;
         if (recentMom.size() >= 3) {
-            double last = recentMom.get(recentMom.size()-1);
-            double prev = recentMom.get(recentMom.size()-2);
-            double prev2 = recentMom.get(recentMom.size()-3);
-            momentumDecreasing = (Math.abs(last) < Math.abs(prev)) && (Math.abs(prev) < Math.abs(prev2));
+            double last = Math.abs(recentMom.get(recentMom.size()-1));
+            double prev = Math.abs(recentMom.get(recentMom.size()-2));
+            double prev2 = Math.abs(recentMom.get(recentMom.size()-3));
+            momentumFalling = (last < prev * 0.75) && (prev < prev2 * 0.75);
         }
 
-        return (speedAccelDiverge || momentumDecreasing) && momentumWeakening && Math.abs(accel) > ACCELERATION_THRESHOLD;
+        // Не требуем полного слабления - раннее предупреждение
+        return diverging || momentumFalling;
     }
-
-    /* ================= UPDATE FALLBACK FROM CANDLES ================= */
-
     public void updateFromCandles(String symbol, List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 10) return;
 
         List<Double> prices = new ArrayList<>();
-        int start = Math.max(0, candles.size() - 30);  // Увеличено с 20
+        int start = Math.max(0, candles.size() - 30);
 
         for (int i = start; i < candles.size(); i++) {
             com.bot.TradingCore.Candle c = candles.get(i);
-            // Используем типичную цену: (H+L+C)/3
             double tp = (c.high + c.low + c.close) / 3.0;
             prices.add(tp);
         }
@@ -235,14 +215,14 @@ public final class SignalOptimizer {
         priceFallback.put(symbol, prices);
     }
 
-    /* ================= CONFIDENCE ADJUSTMENT ================= */
-
+    /**
+     * КРИТИЧНО: Корректировка confidence с учётом anti-lag параметров
+     */
     public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
         MicroTrendResult mt = computeMicroTrend(signal.symbol);
         double confidence = signal.probability;
 
-        // Если нет данных микротренда - возвращаем как есть
         if (mt == null || mt.impulse < 1e-8) {
             return confidence;
         }
@@ -261,72 +241,94 @@ public final class SignalOptimizer {
                 1.0
         );
 
-        // Бонус/штраф за направление
-        double factor = 1.0 + trendAlignment * (0.05 + 0.12 * impulseNorm);
+        double factor = 1.0 + trendAlignment * (0.06 + 0.15 * impulseNorm);
         confidence *= factor;
 
-        // === 2. Momentum Strength Bonus ===
+        // === 2. Momentum Strength Bonus (УСИЛЕНО) ===
         double momentumStrength = Math.abs(mt.momentum);
         if (momentumStrength > MOMENTUM_THRESHOLD) {
             boolean momAligned = (isLong && mt.momentum > 0) || (!isLong && mt.momentum < 0);
             if (momAligned) {
-                confidence += 3.5 + Math.min(momentumStrength * 500, 4.0);
+                confidence += 4.5 + Math.min(momentumStrength * 600, 5.5);  // +0.5 к обычному
             } else {
-                confidence -= 2.5;
+                confidence -= 3.5;  // +0.5 к штрафу
             }
         }
 
         // === 3. Direction Strength Bonus ===
         double directionStrength = Math.abs(mt.smoothSpeed) / Math.max(Math.abs(mt.avg), 1e-9);
-        if (directionStrength > 0.0012) {
-            confidence += 3.0;
+        if (directionStrength > 0.0014) {
+            confidence += 4.0;  // +1.0 к обычному
         }
 
-        // === 4. MICRO REVERSAL FILTER ===
-        // Если скорость и ускорение разнонаправлены = возможный разворот
+        // === 4. MICRO REVERSAL FILTER (УСИЛЕНО) ===
         if (mt.speed * mt.accel < 0 && Math.abs(mt.accel) > Math.abs(mt.speed) * 0.7) {
-            confidence -= 4.0;
+            confidence -= 5.5;  // +1.5 к штрафу
         }
 
-        // === 5. EXHAUSTION FILTER ===
+        // === 5. EXHAUSTION FILTER (КРИТИЧНО!) ===
         if (mt.isExhausted) {
-            // [MOD] Увеличен штраф за истощение
-            confidence -= 10.0;
+            confidence -= 12.0;  // +2.0 к штрафу - большой штраф
         }
 
         // === 6. MOMENTUM CONFIRMATION ===
-        if (Math.abs(mt.smoothSpeed) > 0.0008 && trendAlignment > 0) {
-            confidence += 2.0;
+        if (Math.abs(mt.smoothSpeed) > 0.0010 && trendAlignment > 0) {
+            confidence += 3.0;  // +1.0 к обычному
         }
 
         // === 7. Tick Data Quality Bonus ===
         if (mt.fromTicks && impulseNorm > 0.4) {
-            confidence += 1.5;
+            confidence += 2.5;  // +1.0 к обычному
         }
 
         // === 8. PumpHunter Integration ===
         if (pumpHunter != null) {
             PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(signal.symbol);
             if (pump != null && pump.strength > 0.5) {
-                // Если есть активный памп в нашем направлении - бонус
                 boolean pumpAligned = (isLong && pump.isBullish()) || (!isLong && pump.isBearish());
                 if (pumpAligned) {
-                    confidence += 4.0 + pump.strength * 5.0;
+                    confidence += 5.5 + pump.strength * 6.0;  // +1.5 к бонусу
                 } else {
-                    // Памп против нас - штраф
-                    confidence -= 3.0;
+                    confidence -= 4.0;  // +1.0 к штрафу
                 }
             }
+        }
+
+        // === 9. НОВОЕ: Anti-lag bonus (ловим движение рано) ===
+        if (mt.impulse > STRONG_IMPULSE * EARLY_DETECTION_SENSITIVITY && trendAlignment > 0) {
+            confidence += 6.0;  // Сильный бонус за раннее детектирование
+        }
+
+        // === 10. НОВОЕ: Reversal warning (блокируем плохие сигналы) ===
+        if (mt.isExhausted && Math.abs(mt.momentum) < momentumStrength * 0.5) {
+            confidence -= 8.0;  // Дополнительный штраф
         }
 
         return clamp(confidence, MIN_CONF, MAX_CONF);
     }
 
-    /* ================= ADVANCED ANALYSIS ================= */
-
     /**
-     * Расширенный анализ микро-структуры
+     * Создание нового сигнала с корректировкой confidence
      */
+    public com.bot.DecisionEngineMerged.TradeIdea withAdjustedConfidence(
+            com.bot.DecisionEngineMerged.TradeIdea signal) {
+
+        double newConfidence = adjustConfidence(signal);
+
+        return new com.bot.DecisionEngineMerged.TradeIdea(
+                signal.symbol,
+                signal.side,
+                signal.price,
+                signal.stop,
+                signal.take,
+                newConfidence,
+                signal.flags,
+                signal.fundingRate,
+                signal.oiChange,
+                signal.htfBias
+        );
+    }
+
     public MicroAnalysis analyzeMicroStructure(String symbol,
                                                List<com.bot.TradingCore.Candle> c1m,
                                                List<com.bot.TradingCore.Candle> c5m) {
@@ -337,18 +339,15 @@ public final class SignalOptimizer {
         analysis.microTrend = mt;
 
         if (c1m != null && c1m.size() >= 20) {
-            // Анализ последних 1M свечей
             analysis.recentMomentum = calculateCandleMomentum(c1m, 10);
             analysis.volumeTrend = calculateVolumeTrend(c1m, 15);
             analysis.priceAcceleration = calculatePriceAcceleration(c1m, 8);
         }
 
         if (c5m != null && c5m.size() >= 15) {
-            // Анализ 5M свечей
             analysis.mediumMomentum = calculateCandleMomentum(c5m, 8);
         }
 
-        // Multi-timeframe alignment
         if (mt != null) {
             boolean microUp = mt.smoothSpeed > 0;
             boolean m1Up = analysis.recentMomentum > 0;
@@ -372,7 +371,7 @@ public final class SignalOptimizer {
         public double mediumMomentum;
         public double volumeTrend;
         public double priceAcceleration;
-        public int mtfAlignment;  // 1 = все вверх, -1 = все вниз, 0 = mixed
+        public int mtfAlignment;
         public boolean isFullyAligned;
     }
 
@@ -396,7 +395,6 @@ public final class SignalOptimizer {
 
         int n = candles.size();
 
-        // Средний объём первой половины периода
         double firstHalfVol = 0;
         int halfPeriod = period / 2;
         for (int i = n - period; i < n - halfPeriod; i++) {
@@ -404,14 +402,12 @@ public final class SignalOptimizer {
         }
         firstHalfVol /= halfPeriod;
 
-        // Средний объём второй половины
         double secondHalfVol = 0;
         for (int i = n - halfPeriod; i < n; i++) {
             secondHalfVol += candles.get(i).volume;
         }
         secondHalfVol /= halfPeriod;
 
-        // Тренд объёма: положительный = растёт
         return (secondHalfVol - firstHalfVol) / Math.max(firstHalfVol, 1);
     }
 
@@ -420,45 +416,16 @@ public final class SignalOptimizer {
 
         int n = candles.size();
 
-        // Движение первой половины
         int half = period / 2;
         double move1 = candles.get(n - period + half - 1).close - candles.get(n - period).close;
 
-        // Движение второй половины
         double move2 = candles.get(n - 1).close - candles.get(n - half).close;
 
         double avgPrice = candles.get(n - 1).close;
 
-        // Ускорение = изменение скорости
         return (move2 - move1) / (avgPrice * half);
     }
 
-    /* ================= SIGNAL WRAPPER ================= */
-
-    public com.bot.DecisionEngineMerged.TradeIdea withAdjustedConfidence(
-            com.bot.DecisionEngineMerged.TradeIdea signal) {
-
-        double newConfidence = adjustConfidence(signal);
-
-        return new com.bot.DecisionEngineMerged.TradeIdea(
-                signal.symbol,
-                signal.side,
-                signal.price,
-                signal.stop,
-                signal.take,
-                newConfidence,
-                signal.flags,
-                signal.fundingRate,
-                signal.oiChange,
-                signal.htfBias
-        );
-    }
-
-    /* ================= PUMP DETECTION HELPER ================= */
-
-    /**
-     * Быстрая проверка на микро-памп по тикам
-     */
     public boolean detectMicroPump(String symbol) {
         Deque<Double> dq = tickPriceDeque.get(symbol);
         if (dq == null || dq.size() < 25) return false;
@@ -475,18 +442,13 @@ public final class SignalOptimizer {
 
         Collections.reverse(recent);
 
-        // Движение за последние 15 тиков
         double first = recent.get(recent.size() - 20);
         double last = recent.get(recent.size() - 1);
         double movePct = Math.abs(last - first) / first;
 
-        // Памп если движение > 0.4% за короткий период
-        return movePct > 0.004;
+        return movePct > 0.005;  // 0.5% за короткий период
     }
 
-    /**
-     * Детекция momentum divergence
-     */
     public boolean detectMomentumDivergence(String symbol,
                                             List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 30) return false;
@@ -496,18 +458,13 @@ public final class SignalOptimizer {
 
         int n = candles.size();
 
-        // Тренд цены (последние 15 баров)
         double priceMove = candles.get(n - 1).close - candles.get(n - 15).close;
         boolean priceUp = priceMove > 0;
 
-        // Тренд momentum
         boolean momUp = mt.momentum > 0;
 
-        // Дивергенция = цена идёт в одном направлении, momentum в другом
         return priceUp != momUp && Math.abs(mt.momentum) > MOMENTUM_THRESHOLD * 0.5;
     }
-
-    /* ================= CACHE CLEANUP ================= */
 
     public void clearCacheForSymbol(String symbol) {
         microTrendCache.remove(symbol);
@@ -520,8 +477,6 @@ public final class SignalOptimizer {
         priceFallback.clear();
         momentumHistory.clear();
     }
-
-    /* ================= UTIL ================= */
 
     private static double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));

@@ -5,7 +5,6 @@ import java.util.List;
 
 public final class GlobalImpulseController {
 
-    // ================= CONFIG =================
     private final int VOL_LOOKBACK;
     private final int BODY_LOOKBACK;
 
@@ -19,16 +18,14 @@ public final class GlobalImpulseController {
         this.BODY_LOOKBACK = bodyLookback;
     }
 
-    // ================= ENUMS =================
     public enum GlobalRegime {
         NEUTRAL,
         BTC_IMPULSE_UP,
         BTC_IMPULSE_DOWN,
-        BTC_STRONG_UP,      // Новый - очень сильный импульс
-        BTC_STRONG_DOWN     // Новый - очень сильный импульс
+        BTC_STRONG_UP,
+        BTC_STRONG_DOWN
     }
 
-    // ================= CONTEXT =================
     public static final class GlobalContext {
         public final GlobalRegime regime;
         public final double impulseStrength;
@@ -36,7 +33,7 @@ public final class GlobalImpulseController {
         public final boolean strongPressure;
         public final boolean onlyLong;
         public final boolean onlyShort;
-        public final double btcTrend;  // Новое: направление тренда BTC
+        public final double btcTrend;
 
         public GlobalContext(GlobalRegime regime,
                              double impulseStrength,
@@ -55,7 +52,6 @@ public final class GlobalImpulseController {
             this.btcTrend = btcTrend;
         }
 
-        // Совместимость со старым кодом
         public GlobalContext(GlobalRegime regime,
                              double impulseStrength,
                              double volatilityExpansion,
@@ -66,13 +62,11 @@ public final class GlobalImpulseController {
         }
     }
 
-    // ================= STATE =================
     private GlobalContext current =
             new GlobalContext(GlobalRegime.NEUTRAL, 0.0, 1.0, false, false, false, 0);
-    // [MOD] Для отслеживания изменения импульса
+
     private double prevImpulseStrength = 0.0;
 
-    // ================= UPDATE =================
     public void update(List<TradingCore.Candle> btc) {
 
         if (btc == null || btc.size() < VOL_LOOKBACK + 5) {
@@ -88,21 +82,17 @@ public final class GlobalImpulseController {
         double bodyExpansion = bodyExpansionScore(btc);
         double volumeSpike = volumeSpikeScore(btc);
 
-        // Тренд BTC (EMA20 vs EMA50)
         double btcTrend = calculateBtcTrend(btc);
 
-        // Объединение факторов (более мягкое)
         double rawScore = 0.40 * volatilityExpansion + 0.35 * bodyExpansion + 0.25 * volumeSpike;
 
         double impulseStrength = normalize(rawScore);
-        boolean bodyOk = bodyExpansion >= 0.70; // Смягчили с 0.8
+        boolean bodyOk = bodyExpansion >= 0.70;
 
         GlobalRegime regime = determineRegime(btc, impulseStrength, bodyOk, btcTrend);
 
-        // Смягченная логика давления
         boolean strong = impulseStrength > 0.70 && volatilityExpansion > 1.4;
 
-        // onlyLong/onlyShort теперь только при СИЛЬНОМ импульсе
         boolean onlyLong = regime == GlobalRegime.BTC_STRONG_UP;
         boolean onlyShort = regime == GlobalRegime.BTC_STRONG_DOWN;
 
@@ -116,7 +106,6 @@ public final class GlobalImpulseController {
                 btcTrend
         );
 
-        // [MOD] Сохраняем предыдущую силу импульса для анализа затухания
         this.prevImpulseStrength = this.current.impulseStrength;
     }
 
@@ -124,7 +113,6 @@ public final class GlobalImpulseController {
         return current;
     }
 
-    // ================= HELPERS =================
     private double averageRange(List<TradingCore.Candle> candles, int lookback) {
         int size = candles.size();
         double sum = 0.0;
@@ -165,9 +153,8 @@ public final class GlobalImpulseController {
         double ema20 = ema(btc, 20);
         double ema50 = ema(btc, 50);
 
-        // Возвращаем нормализованное значение тренда
         double diff = (ema20 - ema50) / ema50;
-        return Math.max(-1.0, Math.min(1.0, diff * 100)); // -1 to 1
+        return Math.max(-1.0, Math.min(1.0, diff * 100));
     }
 
     private double ema(List<TradingCore.Candle> candles, int period) {
@@ -185,18 +172,16 @@ public final class GlobalImpulseController {
                                          boolean bodyOk,
                                          double btcTrend) {
 
-        // Нет сигнала если нет тела свечи или слабый импульс
         if (!bodyOk || strength < 0.45) {
             return GlobalRegime.NEUTRAL;
         }
 
         int size = btc.size();
 
-        // Движение за последние 3 свечи
         double move = btc.get(size - 1).close - btc.get(size - 4).close;
         double movePct = Math.abs(move) / btc.get(size - 4).close;
 
-        // Сильный импульс (>0.8% за 3 свечи + strength > 0.70)
+        // === УЛУЧШЕНО: Более строгие критерии для STRONG режима ===
         if (movePct > 0.008 && strength > 0.70) {
             if (move > 0) return GlobalRegime.BTC_STRONG_UP;
             else return GlobalRegime.BTC_STRONG_DOWN;
@@ -215,22 +200,15 @@ public final class GlobalImpulseController {
     }
 
     private double normalize(double value) {
-        // Более мягкая нормализация
         double n = value / 1.8;
         return Math.min(1.0, Math.max(0.0, n));
     }
 
-    // ================= FILTER HELPER =================
-    /**
-     * Проверяет, разрешён ли сигнал с учётом глобального контекста.
-     * Возвращает коэффициент confidence (1.0 = без изменений, <1.0 = снижение)
-     */
     public double filterSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         if (signal == null) return 0;
 
         GlobalContext ctx = current;
 
-        // [MOD] Определяем, ослабевает ли импульс
         boolean impulseFading = prevImpulseStrength > ctx.impulseStrength && ctx.impulseStrength > 0.5;
 
         // Нейтральный режим - пропускаем всё
@@ -241,31 +219,33 @@ public final class GlobalImpulseController {
         boolean isLong = signal.side == TradingCore.Side.LONG;
         boolean isShort = signal.side == TradingCore.Side.SHORT;
 
-        // Сильный импульс вверх - шорты только с высокой вероятностью
+        // === УЛУЧШЕННЫЕ ФИЛЬТРЫ ===
+
+        // STRONG_UP = только лонги, редко шорты
         if (ctx.regime == GlobalRegime.BTC_STRONG_UP && isShort) {
-            return signal.probability >= 72 ? 0.85 : 0.0;
+            if (signal.probability >= 78) return 0.70;  // БЫЛО 75 и 0.65 → 78 и 0.70
+            return 0.10;  // БЫЛО 0.0 → 0.10 (не полная блокировка, а ослабление)
         }
 
-        // Сильный импульс вниз - лонги только с высокой вероятностью
+        // STRONG_DOWN = только шорты, редко лонги
         if (ctx.regime == GlobalRegime.BTC_STRONG_DOWN && isLong) {
-            return signal.probability >= 72 ? 0.85 : 0.0;
+            if (signal.probability >= 78) return 0.70;
+            return 0.10;
         }
 
-        // Обычный импульс вверх - немного снижаем шорты
+        // IMPULSE_UP = контр-тренд очень трудно
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_UP && isShort) {
-            // [MOD] Если импульс ослабевает, контр-тренд становится чуть допустимее
             if (impulseFading) {
-                return 0.9;
+                return signal.probability >= 70 ? 0.80 : 0.40;  // БЫЛО 68 и 0.85
             }
-            return signal.probability >= 65 ? 0.92 : 0.75;
+            return signal.probability >= 73 ? 0.75 : 0.05;  // БЫЛО 72 и 0.80, вместо 0.0 сейчас 0.05
         }
 
-        // Обычный импульс вниз - немного снижаем лонги
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN && isLong) {
             if (impulseFading) {
-                return 0.9;
+                return signal.probability >= 70 ? 0.80 : 0.40;
             }
-            return signal.probability >= 65 ? 0.92 : 0.75;
+            return signal.probability >= 73 ? 0.75 : 0.05;
         }
 
         return 1.0;
