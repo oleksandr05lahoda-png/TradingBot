@@ -267,7 +267,20 @@ public final class DecisionEngineMerged {
             scoreLong -= 0.25;
             flags.add("2H_BEAR");
         }
+// === НОВОЕ: ANTI-CONFLICT - если 1H и 2H противоречат, блокируем слабые сигналы ===
+        if ((bias1h == HTFBias.BULL && bias2h == HTFBias.BEAR) ||
+                (bias1h == HTFBias.BEAR && bias2h == HTFBias.BULL)) {
 
+            // Если противоречие, то требуем ОЧЕНЬ сильный сигнал
+            if (scoreLong < 1.5) {
+                scoreLong *= 0.25;  // Режем лонг при противоречии
+                flags.add("HTF_CONFLICT");
+            }
+            if (scoreShort < 1.5) {
+                scoreShort *= 0.25;  // Режем шорт при противоречии
+                flags.add("HTF_CONFLICT");
+            }
+        }
         // === PumpHunter Integration ===
         if (pumpHunter != null) {
             PumpHunter.PumpEvent pump = pumpHunter.detectPump(symbol, c1, c5, c15);
@@ -378,24 +391,35 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // === IMPULSE ===
         boolean impulseFlag = impulse(c1);
         if (impulseFlag) {
             double atr1 = atr(c1, 14);
             double delta = last(c1).close - c1.get(c1.size() - 5).close;
             double impulseStrength = Math.abs(delta) / atr1;
 
+            // === ДОБАВЛЕНО: Проверка согласованности импульса с ценой ===
             if (delta > 0 && impulseStrength > 0.30) {
-                scoreLong += state == MarketState.STRONG_TREND ? 0.50 : 0.38;
-                flags.add("impulse:true");
+                // Импульс вверх - бонус ТОЛЬКО если нет медвежьего 2H
+                if (bias2h != HTFBias.BEAR) {
+                    scoreLong += state == MarketState.STRONG_TREND ? 0.50 : 0.38;
+                    flags.add("impulse:up");
+                } else {
+                    scoreLong += 0.15;  // Очень маленький бонус при конфликте
+                    flags.add("impulse:up_conflict");
+                }
             }
             if (delta < 0 && impulseStrength > 0.30) {
-                scoreShort += state == MarketState.STRONG_TREND ? 0.50 : 0.38;
-                flags.add("impulse:true");
+                // Импульс вниз - бонус ТОЛЬКО если нет бычьего 2H
+                if (bias2h != HTFBias.BULL) {
+                    scoreShort += state == MarketState.STRONG_TREND ? 0.50 : 0.38;
+                    flags.add("impulse:down");
+                } else {
+                    scoreShort += 0.15;
+                    flags.add("impulse:down_conflict");
+                }
             }
         }
 
-        // === COMPRESSION BREAKOUT ===
         CompressionResult compression = detectCompressionBreakout(c15, c1);
         if (compression.breakout) {
             if (compression.direction > 0) {
@@ -462,8 +486,16 @@ public final class DecisionEngineMerged {
             boolean exhausted = isShortExhausted(c15, c1h, rsi14, rsi7, price);
             if (adxValue > 30 && adxFalling) exhausted = true;
             if (bullDivFlag) exhausted = true;
+
+            // НОВОЕ: если SHORT против бычьего 1H/2H = extra penalty
+            if ((bias1h == HTFBias.BULL || bias2h == HTFBias.BULL) && scoreShort < 1.0) {
+                exhausted = true;
+                flags.add("short_vs_bull_bias");
+            }
+
             if (exhausted) {
-                scoreShort *= 0.45;
+                scoreShort *= 0.25;  // БЫЛО 0.45 → УСИЛЕНО 0.25
+                if (scoreShort < 0.2) return null;  // НОВОЕ: полная блокировка
                 flags.add("exhausted_short_filtered");
             }
         }
@@ -490,21 +522,25 @@ public final class DecisionEngineMerged {
         }
 
         if (bias2h == HTFBias.BULL && scoreShort > scoreLong && adxValue > 25) {
-            scoreShort *= 0.55;
+            scoreShort *= 0.15;  // БЫЛО 0.55 → УСИЛЕНО ДО 0.15
             flags.add("2H_VETO");
-        }
-        if (bias2h == HTFBias.BEAR && scoreLong > scoreShort && adxValue > 25) {
-            scoreLong *= 0.55;
-            flags.add("2H_VETO");
+            if (scoreShort < 0.2) return null;  // НОВОЕ: полная блокировка слабых сигналов
         }
 
+        if (bias2h == HTFBias.BEAR && scoreLong > scoreShort && adxValue > 25) {
+            scoreLong *= 0.15;  // БЫЛО 0.55 → 0.15
+            flags.add("2H_VETO");
+            if (scoreLong < 0.2) return null;  // НОВОЕ
+        }
         if (bias1h == bias2h && bias1h != HTFBias.NONE) {
             if (bias1h == HTFBias.BULL) {
-                scoreLong += 0.25;
-                flags.add("HTF_ALIGNED");
-            } else {
-                scoreShort += 0.25;
-                flags.add("HTF_ALIGNED");
+                scoreLong += 0.50;
+                scoreShort -= 0.35;  // БЫЛО -0.20 → -0.35 (сильнее штрафуем SHORT при BULL 1H)
+                flags.add("1H_BULL");
+            } else if (bias1h == HTFBias.BEAR) {
+                scoreShort += 0.50;
+                scoreLong -= 0.35;  // БЫЛО -0.20 → -0.35
+                flags.add("1H_BEAR");
             }
         }
 
@@ -801,8 +837,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        if (warningScore < 0.50) return null;  // БЫЛО 0.45 — УЖЕСТОЧИЛИ
-
+        if (warningScore < 0.55) return null;
         String reverseType = rsi1h > 75.0 ? "LONG_EXHAUSTION" :
                 rsi1h < 25.0 ? "SHORT_EXHAUSTION" : "REVERSAL";
 
