@@ -597,7 +597,7 @@ public final class DecisionEngineMerged {
         int n5 = c5.size();
 
         double atr1 = atr(c1, 14);
-        double avgVol1 = c1.subList(Math.max(0, n1-15), n1-1).stream()  // БЫЛО 10 → 15 (точнее)
+        double avgVol1 = c1.subList(Math.max(0, n1-15), n1-1).stream()
                 .mapToDouble(c -> c.volume).average().orElse(1);
 
         com.bot.TradingCore.Candle curr1m = c1.get(n1 - 1);
@@ -607,33 +607,40 @@ public final class DecisionEngineMerged {
         double prevBody = Math.abs(prev1m.close - prev1m.open);
         double currVolRatio = curr1m.volume / avgVol1;
 
-        // === РАННЕЕ ДЕТЕКТИРОВАНИЕ (низкие пороги) ===
-        // Критерий 1: Сильное тело + объём
-        if (currBody > atr1 * 2.0 && currVolRatio > 1.8) {  // БЫЛО 2.5 и 2.2 → 2.0 и 1.8
+        // === АГРЕССИВНАЯ ДЕТЕКЦИЯ ===
+
+        // Вариант 1: Одна мощная свеча (памп)
+        if (currBody > atr1 * 1.7 && currVolRatio > 1.5) {
             int dir = curr1m.close > curr1m.open ? 1 : -1;
-            double strength = Math.min(0.70, (currBody / atr1 - 1.8) * 0.35);  // Более щедрая оценка
-            return new AntiLagSignal(dir, strength, 0);
+            double strength = Math.min(0.80, (currBody / atr1 - 1.5) * 0.45);
+            if (strength > 0.45) {
+                return new AntiLagSignal(dir, strength, 0);
+            }
         }
 
-        // Критерий 2: Серия из 2+ сильных свечей
-        if (currBody > atr1 * 1.6 && prevBody > atr1 * 1.5) {  // БЫЛО 2.0 и 1.8
+        // Вариант 2: Две сильные подряд
+        if (currBody > atr1 * 1.3 && prevBody > atr1 * 1.2) {
             double totalMove = curr1m.close - prev1m.open;
             int dir = totalMove > 0 ? 1 : -1;
-            double strength = Math.min(0.60, Math.abs(totalMove) / atr1 * 0.30);  // Повыше
-            return new AntiLagSignal(dir, strength, 1);
+            double strength = Math.min(0.70, Math.abs(totalMove) / atr1 * 0.40);
+            if (strength > 0.45) {
+                return new AntiLagSignal(dir, strength, 1);
+            }
         }
 
-        // Критерий 3: 5M разрыв (более релаксантный)
+        // Вариант 3: На 5M большой разрыв
         com.bot.TradingCore.Candle curr5m = c5.get(n5 - 1);
         double atr5 = atr(c5, 14);
         double body5m = Math.abs(curr5m.close - curr5m.open);
         double avgVol5 = c5.subList(Math.max(0, n5-10), n5-1).stream()
                 .mapToDouble(c -> c.volume).average().orElse(1);
 
-        if (body5m > atr5 * 2.5 && curr5m.volume > avgVol5 * 1.7) {  // БЫЛО 3.0 и 2.0 → 2.5 и 1.7
+        if (body5m > atr5 * 2.0 && curr5m.volume > avgVol5 * 1.4) {
             int dir = curr5m.close > curr5m.open ? 1 : -1;
-            double strength = Math.min(0.65, (body5m / atr5 - 2.0) * 0.30);
-            return new AntiLagSignal(dir, strength, 0);
+            double strength = Math.min(0.75, (body5m / atr5 - 1.8) * 0.35);
+            if (strength > 0.45) {
+                return new AntiLagSignal(dir, strength, 0);
+            }
         }
 
         return null;

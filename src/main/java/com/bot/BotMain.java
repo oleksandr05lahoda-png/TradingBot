@@ -12,7 +12,7 @@ public class BotMain {
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
-    private static final int SIGNAL_INTERVAL_MIN = 5;  // ← ИЗМЕНЕНО: 15 → 5 МИНУТ
+    private static final int SIGNAL_INTERVAL_MIN = 15;  // ОСТАЕТСЯ 15 (оптимально для 15M)
     private static final int KLINES_LIMIT = 200;
 
     public static void main(String[] args) {
@@ -25,8 +25,9 @@ public class BotMain {
         TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
         SignalSender signalSender = new SignalSender(telegram);
         GlobalImpulseController globalImpulse = new GlobalImpulseController();
+        InstitutionalSignalCore institutionalCore = new InstitutionalSignalCore();
 
-        telegram.sendMessageAsync("🚀 Trading Bot запущен (5-мин сканирование)");
+        telegram.sendMessageAsync("🚀 Bot запущен | 15M | Anti-Lag + ReverseDetect ACTIVE");
         LOGGER.info("Bot started at " + LocalDateTime.now());
 
         var scheduler = java.util.concurrent.Executors.newScheduledThreadPool(1, new BotThreadFactory());
@@ -41,49 +42,69 @@ public class BotMain {
                     return;
                 }
 
-                // Обновляем глобальный импульс BTC
+                // === ГЛОБАЛЬНЫЙ ИМПУЛЬС (BTC контекст) ===
                 List<TradingCore.Candle> btcCandles = signalSender.fetchKlines("BTCUSDT", "15m", KLINES_LIMIT);
                 if (btcCandles != null && btcCandles.size() > 20) {
                     globalImpulse.update(btcCandles);
                 }
 
                 GlobalImpulseController.GlobalContext ctx = globalImpulse.getContext();
-                LOGGER.info("BTC regime: " + ctx.regime
+                LOGGER.info("BTC: " + ctx.regime
                         + " | strength=" + String.format("%.2f", ctx.impulseStrength)
-                        + " | volExp=" + String.format("%.2f", ctx.volatilityExpansion));
+                        + " | vol=" + String.format("%.2f", ctx.volatilityExpansion));
 
-                // Фильтрация через GlobalImpulseController.filterSignal()
-                List<DecisionEngineMerged.TradeIdea> filteredSignals = rawSignals.stream()
+                // === ФИЛЬТР 1: GlobalImpulse ===
+                List<DecisionEngineMerged.TradeIdea> impulseFiltered = rawSignals.stream()
                         .filter(s -> {
                             double coeff = globalImpulse.filterSignal(s);
                             if (coeff <= 0.0) {
-                                LOGGER.info("Blocked by GlobalImpulse: " + s.symbol + " " + s.side);
+                                LOGGER.fine("GlobalImpulse BLOCKED: " + s.symbol);
                                 return false;
                             }
                             return true;
                         })
                         .toList();
 
-                if (filteredSignals.isEmpty()) {
-                    LOGGER.info("No signals after global impulse filter.");
+                if (impulseFiltered.isEmpty()) {
+                    LOGGER.info("No signals after GlobalImpulse filter.");
                     return;
                 }
 
-                for (DecisionEngineMerged.TradeIdea s : filteredSignals) {
-                    telegram.sendMessageAsync(s.toString());
+                // === ФИЛЬТР 2: Institutional (Portfolio Risk) ===
+                List<DecisionEngineMerged.TradeIdea> finalSignals = impulseFiltered.stream()
+                        .filter(s -> {
+                            if (!institutionalCore.allowSignal(s)) {
+                                LOGGER.fine("ISC REJECTED: " + s.symbol);
+                                return false;
+                            }
+                            institutionalCore.registerSignal(s);
+                            return true;
+                        })
+                        .toList();
+
+                if (finalSignals.isEmpty()) {
+                    LOGGER.info("No signals after ISC filter.");
+                    return;
                 }
-                LOGGER.info("Signals sent: " + filteredSignals.size());
+
+                // === ОТПРАВКА ===
+                for (DecisionEngineMerged.TradeIdea s : finalSignals) {
+                    telegram.sendMessageAsync(s.toString());
+                    LOGGER.info("SIGNAL SENT: " + s.symbol + " | " + s.side + " | Prob:" + s.probability);
+                }
+
+                LOGGER.info("=== Signals sent: " + finalSignals.size() + " ===");
 
             } catch (Throwable t) {
-                LOGGER.log(Level.SEVERE, "CRITICAL ERROR in signal cycle", t);
-                telegram.sendMessageAsync("⚠ Ошибка цикла: " + t);
+                LOGGER.log(Level.SEVERE, "CRITICAL ERROR", t);
+                telegram.sendMessageAsync("⚠️ ERROR: " + t.getMessage());
             }
         };
 
         scheduler.scheduleAtFixedRate(signalTask, 0, SIGNAL_INTERVAL_MIN, java.util.concurrent.TimeUnit.MINUTES);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOGGER.info("Shutting down bot...");
+            LOGGER.info("Shutting down...");
             scheduler.shutdown();
             telegram.shutdown();
             try {
@@ -104,7 +125,7 @@ public class BotMain {
             t.setName("SignalSchedulerThread");
             t.setDaemon(false);
             t.setUncaughtExceptionHandler((thread, ex) ->
-                    Logger.getLogger(BotMain.class.getName()).log(Level.SEVERE, "UNCAUGHT in " + thread.getName(), ex));
+                    Logger.getLogger(BotMain.class.getName()).log(Level.SEVERE, "UNCAUGHT", ex));
             return t;
         }
     }
