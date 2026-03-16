@@ -228,19 +228,6 @@ public class SignalSender {
         System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N + " MIN_CONF=" + MIN_CONF +
                 " INTERVAL_MIN=" + INTERVAL_MIN + " PumpHunter=ENABLED");
 
-        scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                System.out.println("[Scheduler] Start signal generation...");
-                List<com.bot.DecisionEngineMerged.TradeIdea> signals = generateSignals();
-                for (com.bot.DecisionEngineMerged.TradeIdea s : signals) {
-                    bot.sendMessageAsync(s.toString());
-                }
-            } catch (Exception e) {
-                System.out.println("[Scheduler] Error: " + e.getMessage());
-                e.printStackTrace();
-            }
-        }, 0, INTERVAL_MIN, TimeUnit.MINUTES);
     }
 
     private void refreshAllFundingRates() {
@@ -1367,20 +1354,6 @@ public class SignalSender {
     private boolean checkStructureAlignment(List<com.bot.TradingCore.Candle> candles, int dir) {
         int structure = marketStructure(candles);
         return structure == dir;
-    }
-
-    public void startScheduler() {
-        if (scheduler != null && !scheduler.isShutdown()) return;
-
-        scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(
-                this::runScheduleCycle,
-                0,
-                INTERVAL_MIN,
-                TimeUnit.MINUTES
-        );
-
-        System.out.println("[Scheduler] Scheduler started, interval " + INTERVAL_MIN + " min");
     }
 
     private void runScheduleCycle() {

@@ -5,7 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -477,6 +477,15 @@
       <workItem from="1773685565951" duration="329000" />
       <workItem from="1773685912523" duration="1686000" />
       <workItem from="1773689875653" duration="2140000" />
+      <workItem from="1773697284274" duration="2368000" />
+      <workItem from="1773703184728" duration="7000" />
+      <workItem from="1773703202245" duration="7000" />
+      <workItem from="1773703216875" duration="6000" />
+      <workItem from="1773703234739" duration="5000" />
+      <workItem from="1773703249551" duration="7000" />
+      <workItem from="1773703264517" duration="17000" />
+      <workItem from="1773703293853" duration="8000" />
+      <workItem from="1773703313664" duration="6000" />
     </task>
     <servers />
   </component>
