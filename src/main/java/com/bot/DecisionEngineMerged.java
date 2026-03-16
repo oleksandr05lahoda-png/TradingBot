@@ -266,19 +266,27 @@ public final class DecisionEngineMerged {
             scoreShort += 0.40;
             scoreLong -= 0.25;
             flags.add("2H_BEAR");
-        }
-// === НОВОЕ: ANTI-CONFLICT - если 1H и 2H противоречат, блокируем слабые сигналы ===
+        }// Найти блок ANTI-CONFLICT и заменить на этот:
         if ((bias1h == HTFBias.BULL && bias2h == HTFBias.BEAR) ||
                 (bias1h == HTFBias.BEAR && bias2h == HTFBias.BULL)) {
 
-            // Если противоречие, то требуем ОЧЕНЬ сильный сигнал
-            if (scoreLong < 1.5) {
-                scoreLong *= 0.25;  // Режем лонг при противоречии
+            // Сделали требования одинаковыми (1.2 вместо 1.5) и множители равными
+            if (scoreLong < 1.2) {
+                scoreLong *= 0.50;
                 flags.add("HTF_CONFLICT");
             }
-            if (scoreShort < 1.5) {
-                scoreShort *= 0.40;  // Режем шорт при противоречии
+            if (scoreShort < 1.2) {
+                scoreShort *= 0.50; // Было 0.40 (штраф шорта был сильнее)
                 flags.add("HTF_CONFLICT");
+            }
+        }
+
+        if (reverseWarning != null && reverseWarning.confidence > 0.55) {
+            flags.add("⚠REVERSE_" + reverseWarning.type);
+            if (reverseWarning.type.equals("LONG_EXHAUSTION")) {
+                scoreLong *= 0.40; // Смягчили (было 0.20)
+            } else if (reverseWarning.type.equals("SHORT_EXHAUSTION")) {
+                scoreShort *= 0.40; // Сделали симметрично
             }
         }
         // === PumpHunter Integration ===

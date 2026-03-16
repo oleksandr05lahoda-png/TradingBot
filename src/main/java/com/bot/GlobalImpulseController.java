@@ -251,4 +251,36 @@ public final class GlobalImpulseController {
 
         return 1.0;
     }
+    public double getMultiplier(DecisionEngineMerged.TradeIdea signal, GlobalContext ctx) {
+        boolean isLong = signal.side == TradingCore.Side.LONG;
+        boolean isShort = signal.side == TradingCore.Side.SHORT;
+
+        // BTC STRONG UP - смягчаем блокировку шортов
+        if (ctx.regime == GlobalRegime.BTC_STRONG_UP && isShort) {
+            // Если альткоин ОЧЕНЬ уверенно падает (prob > 80), даем шанс
+            if (signal.probability >= 80) return 0.75;
+            if (ctx.volatilityExpansion > 1.5) return 0.60;
+            return 0.45; // Было 0.05 - это и была главная ошибка
+        }
+
+        // BTC IMPULSE UP - даем шортам дышать
+        if (ctx.regime == GlobalRegime.BTC_IMPULSE_UP && isShort) {
+            if (signal.probability >= 75) return 0.80;
+            return 0.55; // Было 0.02
+        }
+
+        // BTC STRONG DOWN - теперь симметрично защищаем лонги
+        if (ctx.regime == GlobalRegime.BTC_STRONG_DOWN && isLong) {
+            if (signal.probability >= 80) return 0.75;
+            return 0.45;
+        }
+
+        // BTC IMPULSE DOWN - симметрично для лонгов
+        if (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN && isLong) {
+            if (signal.probability >= 75) return 0.80;
+            return 0.55;
+        }
+
+        return 1.0;
+    }
 }
