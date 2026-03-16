@@ -16,7 +16,7 @@ public final class DecisionEngineMerged {
     private static final long COOLDOWN_MEME = 15 * 60_000;
     private final Map<String, Double> lastSignalPrice = new ConcurrentHashMap<>();
 
-    private double MIN_CONFIDENCE = 58.0;
+    private double MIN_CONFIDENCE = 54.0;
 
     private final Map<String, Long> cooldownMap = new ConcurrentHashMap<>();
     private final Map<String, Deque<String>> recentDirections = new ConcurrentHashMap<>();
@@ -521,10 +521,15 @@ public final class DecisionEngineMerged {
             if (bias1h == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.70;
         }
 
-        if (bias2h == HTFBias.BULL && scoreShort > scoreLong && adxValue > 25) {
-            scoreShort *= 0.15;  // БЫЛО 0.55 → УСИЛЕНО ДО 0.15
-            flags.add("2H_VETO");
-            if (scoreShort < 0.2) return null;  // НОВОЕ: полная блокировка слабых сигналов
+        // Умягчаем вето: если локальный импульс (Anti-Lag) сильный, разрешаем шорт против тренда
+        if (bias2h == HTFBias.BULL && scoreShort > scoreLong) {
+            if (antiLag.direction < 0 && antiLag.strength > 0.7) {
+                scoreShort *= 0.85; // Только небольшая штрафная санкция за контртренд
+                flags.add("HTF_REVERSAL_ATTEMPT");
+            } else {
+                scoreShort *= 0.45; // Снижаем, но не убиваем в ноль
+                flags.add("2H_BULL_PRESSURE");
+            }
         }
 
         if (bias2h == HTFBias.BEAR && scoreLong > scoreShort && adxValue > 25) {

@@ -268,7 +268,7 @@ public final class SignalOptimizer {
 
         // === 5. EXHAUSTION FILTER (КРИТИЧНО!) ===
         if (mt.isExhausted) {
-            confidence -= 12.0;  // +2.0 к штрафу - большой штраф
+            confidence -= 6.0;  // +2.0 к штрафу - большой штраф
         }
 
         // === 6. MOMENTUM CONFIRMATION ===
@@ -301,12 +301,12 @@ public final class SignalOptimizer {
 
         // === 10. НОВОЕ: Reversal warning (блокируем плохие сигналы) ===
         if (mt.isExhausted && Math.abs(mt.momentum) < momentumStrength * 0.5) {
-            confidence -= 15.0;  // БЫЛО -8.0 → -15.0 (сильнее штрафуем)
+            confidence -= 8.0;  // БЫЛО -8.0 → -15.0 (сильнее штрафуем)
         }
 
 // НОВОЕ: ОЧЕНЬ ЖЁСТКИЙ ФИЛЬТР НА РАЗВОРОТАХ
         if (mt.isExhausted && trendAlignment < 0) {
-            confidence -= 20.0;  // Максимальный штраф за exhaustion против тренда
+            confidence -= 10.0;  // Максимальный штраф за exhaustion против тренда
         }
 
         if (mt != null && mt.momentum != 0) {

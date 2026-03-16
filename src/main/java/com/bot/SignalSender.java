@@ -195,7 +195,7 @@ public class SignalSender {
         this.bot = bot;
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
-        this.TOP_N = envInt("TOP_N", 70);
+        this.TOP_N = envInt("TOP_N", 100);
         this.MIN_CONF = 0.50;
         this.INTERVAL_MIN = envInt("INTERVAL_MINUTES", 15);
         this.KLINES_LIMIT = envInt("KLINES", 220);

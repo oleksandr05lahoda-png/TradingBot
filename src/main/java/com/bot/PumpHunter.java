@@ -16,7 +16,8 @@ public final class PumpHunter {
     private static final double MIN_MOVE_PCT = 0.012;           // Было 0.8%, стало 1.2%
     private static final double STRONG_MOVE_PCT = 0.022;        // Было 1.5%, стало 2.2%
     private static final double MEGA_MOVE_PCT = 0.035;          // Было 2.5%, стало 3.5%
-
+    private static final double DUMP_MOVE_PCT = -0.012; // Минимум 1.2% падения для детекции
+    private static final double STRONG_DUMP_PCT = -0.022;
     // Временные окна
     private static final int VOLUME_LOOKBACK = 20;
     private static final int ATR_PERIOD = 14;
@@ -32,7 +33,15 @@ public final class PumpHunter {
     private final Map<String, Deque<PumpEvent>> pumpHistory = new ConcurrentHashMap<>();
 
     // ======================= MODELS =======================
+    public boolean isDump(List<TradingCore.Candle> candles) {
+        if (candles.size() < 2) return false;
+        TradingCore.Candle last = candles.get(candles.size() - 1);
+        double body = Math.abs(last.close - last.open);
+        double change = (last.close - last.open) / last.open;
 
+        // Если свеча красная, большая и на объеме
+        return change <= DUMP_MOVE_PCT && last.volume > calculateAvgVolume(candles, 20) * VOLUME_SPIKE_MULT;
+    }
     public enum PumpType {
         NONE,
         PUMP_UP,          // Обычный памп вверх
@@ -116,6 +125,7 @@ public final class PumpHunter {
     /**
      * Основной метод детекции памп-свечей
      */
+
     public PumpEvent detectPump(String symbol,
                                 List<TradingCore.Candle> c1m,
                                 List<TradingCore.Candle> c5m,

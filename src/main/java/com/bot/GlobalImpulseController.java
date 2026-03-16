@@ -218,33 +218,30 @@ public final class GlobalImpulseController {
         boolean isLong = signal.side == TradingCore.Side.LONG;
         boolean isShort = signal.side == TradingCore.Side.SHORT;
 
-        // === УЖЕСТОЧЕННЫЕ ФИЛЬТРЫ ===
-
-        // STRONG_UP = ОЧЕНЬ редко шорты!
         if (ctx.regime == GlobalRegime.BTC_STRONG_UP && isShort) {
-            if (signal.probability >= 82) return 0.50;  // БЫЛО 78, 0.70 → 82, 0.50 (жёстче)
-            return 0.05;  // БЫЛО 0.10 → 0.05
+            // Улучшение: если волатильность растет, разрешаем шорт смелее (0.45 вместо 0.15)
+            double volatilityBonus = ctx.volatilityExpansion > 1.2 ? 0.30 : 0.0;
+            double threshold = signal.symbol.contains("BTC") ? 80 : 70;
+            if (signal.probability >= threshold) return 0.75;
+            if (ctx.volatilityExpansion > 1.5) return 0.9;
+            return 0.40;
         }
 
-        // STRONG_DOWN = ОЧЕНЬ редко лонги!
         if (ctx.regime == GlobalRegime.BTC_STRONG_DOWN && isLong) {
-            if (signal.probability >= 82) return 0.50;  // БЫЛО 78, 0.70
-            return 0.05;  // БЫЛО 0.10
+            double threshold = signal.symbol.contains("BTC") ? 82 : 75;
+            if (signal.probability >= threshold) return 0.60;
+            return 0.15;
         }
 
-        // IMPULSE_UP = контр-тренд почти невозможен!
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_UP && isShort) {
-            if (impulseFading) {
-                return signal.probability >= 75 ? 0.60 : 0.20;  // БЫЛО 70, 0.80, 0.40
-            }
-            return signal.probability >= 76 ? 0.65 : 0.02;  // БЫЛО 73, 0.75, 0.05 → 0.02 (почти блокируем)
+            if (impulseFading) return signal.probability >= 70 ? 0.80 : 0.40;
+            // Оставляем хотя бы 0.25, чтобы супер-сильные альтовые сетапы проходили
+            return signal.probability >= 72 ? 0.70 : 0.25;
         }
 
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN && isLong) {
-            if (impulseFading) {
-                return signal.probability >= 75 ? 0.60 : 0.20;
-            }
-            return signal.probability >= 76 ? 0.65 : 0.02;
+            if (impulseFading) return signal.probability >= 70 ? 0.80 : 0.40;
+            return signal.probability >= 72 ? 0.70 : 0.25;
         }
 
         return 1.0;
