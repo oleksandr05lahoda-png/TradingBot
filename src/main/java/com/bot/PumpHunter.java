@@ -13,10 +13,9 @@ public final class PumpHunter {
     private static final double VOLUME_SPIKE_MULT = 2.5;        // Объём > 2.5x среднего
     private static final double MEGA_VOLUME_SPIKE_MULT = 4.0;   // Мега-объём > 4x
 
-    // Параметры импульса
-    private static final double MIN_MOVE_PCT = 0.008;           // Минимум 0.8% движение
-    private static final double STRONG_MOVE_PCT = 0.015;        // Сильное движение 1.5%
-    private static final double MEGA_MOVE_PCT = 0.025;          // Мега-движение 2.5%
+    private static final double MIN_MOVE_PCT = 0.012;           // Было 0.8%, стало 1.2%
+    private static final double STRONG_MOVE_PCT = 0.022;        // Было 1.5%, стало 2.2%
+    private static final double MEGA_MOVE_PCT = 0.035;          // Было 2.5%, стало 3.5%
 
     // Временные окна
     private static final int VOLUME_LOOKBACK = 20;

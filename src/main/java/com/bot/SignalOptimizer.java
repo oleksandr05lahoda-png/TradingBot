@@ -10,7 +10,7 @@ public final class SignalOptimizer {
     private static final int MAX_TICKS = 200;
     private static final double EMA_ALPHA = 0.45;
 
-    private static final double STRONG_IMPULSE = 0.0012;   // Более чувствительно
+    private static final double STRONG_IMPULSE = 0.0025;   // Более чувствительно
     private static final double WEAK_IMPULSE = 0.0002;
 
     private static final double MAX_CONF = 92.0;
@@ -18,7 +18,7 @@ public final class SignalOptimizer {
 
     private static final double MAX_IMPULSE_CAP = 0.010;
 
-    private static final double MOMENTUM_THRESHOLD = 0.0010;
+    private static final double MOMENTUM_THRESHOLD = 0.0020;
     private static final double ACCELERATION_THRESHOLD = 0.0005;
     private static final int MOMENTUM_WINDOW = 15;
 

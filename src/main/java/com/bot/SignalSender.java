@@ -1125,20 +1125,22 @@ public class SignalSender {
     private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(
             String symbol, double currentPrice, Deque<Double> dq) {
 
-        if (dq == null || dq.size() < 8) return null;
+        // УЛУЧШЕНИЕ: Ждем больше тиков для сглаживания и требуем бОльшую скорость.
+        if (dq == null || dq.size() < 20) return null; // Было 8, стало 20 (фильтруем сквизы)
 
         List<Double> buffer = new ArrayList<>(dq);
         int n = buffer.size();
 
-        double move = buffer.get(n-1) - buffer.get(n-8);
+        double move = buffer.get(n-1) - buffer.get(n-20);
         double avgPrice = buffer.stream().mapToDouble(Double::doubleValue).average().orElse(currentPrice);
         double velocity = Math.abs(move) / Math.max(avgPrice, 1e-9);
 
         double move1 = buffer.get(n/2-1) - buffer.get(0);
         double move2 = buffer.get(n-1) - buffer.get(n/2);
-        boolean accelerating = Math.abs(move2) > Math.abs(move1) * 1.15;
+        boolean accelerating = Math.abs(move2) > Math.abs(move1) * 1.5; // Было 1.15, стало 1.5 (строже)
 
-        boolean fastVelocity = velocity > 0.0007;
+        // Требуем скорости минимум 0.15% за 20 тиков
+        boolean fastVelocity = velocity > 0.0015; // Было 0.0007, убрали реакцию на микро-шум
         boolean upMove = move > 0;
 
         if (fastVelocity && accelerating) {
@@ -1147,13 +1149,18 @@ public class SignalSender {
             flags.add(upMove ? "UP_PUMP" : "DOWN_DUMP");
             flags.add("velocity=" + String.format("%.2e", velocity));
 
-            double stopDist = currentPrice * 0.0055;
-            double takeDist = currentPrice * 0.0185;
+            // Захват текущего ATR, если он есть, иначе дефолт
+            double atr = getAtr(symbol);
+            if (atr <= 0) atr = currentPrice * 0.005;
+
+            double stopDist = atr * 1.5;
+            double takeDist = atr * 3.0;
 
             double stop = upMove ? currentPrice - stopDist : currentPrice + stopDist;
             double take = upMove ? currentPrice + takeDist : currentPrice - takeDist;
 
-            double confidence = 55 + velocity * 15000;
+            // Смягчили безумную прибавку к вероятности (+15000 * velocity было ошибкой)
+            double confidence = 55 + (velocity * 5000);
 
             return new com.bot.DecisionEngineMerged.TradeIdea(
                     symbol,

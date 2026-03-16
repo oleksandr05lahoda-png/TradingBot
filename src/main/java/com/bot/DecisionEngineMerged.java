@@ -601,15 +601,15 @@ public final class DecisionEngineMerged {
         double riskMult = cat == CoinCategory.MEME ? 1.35 : cat == CoinCategory.ALT ? 1.05 : 0.88;
         double rr = scoreDiff > 1.0 ? 3.2 : scoreDiff > 0.7 ? 2.7 : 2.3;
 
-        double targetPct = 0.02;
-        double stopPct = targetPct / rr;
+        double stopDist = atr * 1.8 * riskMult;
 
         double stop = side == com.bot.TradingCore.Side.LONG
-                ? price * (1 - stopPct)
-                : price * (1 + stopPct);
+                ? price - stopDist
+                : price + stopDist;
+
         double take = side == com.bot.TradingCore.Side.LONG
-                ? price * (1 + targetPct)
-                : price * (1 - targetPct);
+                ? price + (stopDist * rr)
+                : price - (stopDist * rr);
 
         if (!priceMovedEnough(symbol, price)) return null;
         registerSignal(symbol, side, now);
@@ -1278,11 +1278,26 @@ public final class DecisionEngineMerged {
         }
     }
 
-    private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
-        double adx = adx(c, 14);
-        if (adx > 28) return MarketState.STRONG_TREND;
-        if (adx > 20) return MarketState.WEAK_TREND;
-        return MarketState.RANGE;
+    private MarketState detectState(List<TradingCore.Candle> c) {
+        int n = c.size();
+        double ema20 = ema(c, 20);
+        double ema50 = ema(c, 50);
+
+        // Считаем наклон EMA20 за последние 5 свечей
+        double emaPrev = ema(c.subList(0, n - 5), 20);
+        double slope = (ema20 - emaPrev) / emaPrev;
+
+        // Считаем волатильность (ATR) относительно цены
+        double atr = atr(c, 14);
+        double volRelative = atr / c.get(n-1).close;
+
+        // УЛУЧШЕНИЕ: Если наклон почти нулевой или волатильность слишком низкая — это БОКОВИК.
+        // Бот перестанет открывать сделки там, где цена просто «пилит» на месте.
+        if (Math.abs(slope) < 0.0005 || volRelative < 0.0015) {
+            return MarketState.RANGE;
+        }
+
+        return (ema20 > ema50 && slope > 0) ? MarketState.STRONG_TREND : MarketState.WEAK_TREND;
     }
 
     private HTFBias detectBias(List<com.bot.TradingCore.Candle> c) {
@@ -1391,7 +1406,12 @@ public final class DecisionEngineMerged {
     private boolean pullback(List<com.bot.TradingCore.Candle> c, boolean bull) {
         double ema21 = ema(c, 21);
         double price = last(c).close;
-        return bull ? price <= ema21 * 0.997 : price >= ema21 * 1.003;
+        double rsi14 = rsi(c, 14);
+        if (bull) {
+            return price <= ema21 * 1.001 && price >= ema21 * 0.995 && rsi14 > 40 && rsi14 < 55;
+        } else {
+            return price >= ema21 * 0.999 && price <= ema21 * 1.005 && rsi14 < 60 && rsi14 > 45;
+        }
     }
 
     private boolean bullishStructure(List<com.bot.TradingCore.Candle> c) {
