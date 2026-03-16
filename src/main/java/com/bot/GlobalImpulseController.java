@@ -181,7 +181,7 @@ public final class GlobalImpulseController {
         double move = btc.get(size - 1).close - btc.get(size - 4).close;
         double movePct = Math.abs(move) / btc.get(size - 4).close;
 
-        // === УЛУЧШЕНО: Более строгие критерии для STRONG режима ===
+        // УЛУЧШЕНО: Более строгие критерии для STRONG режима
         if (movePct > 0.008 && strength > 0.70) {
             if (move > 0) return GlobalRegime.BTC_STRONG_UP;
             else return GlobalRegime.BTC_STRONG_DOWN;
@@ -218,30 +218,35 @@ public final class GlobalImpulseController {
         boolean isLong = signal.side == TradingCore.Side.LONG;
         boolean isShort = signal.side == TradingCore.Side.SHORT;
 
+        // ИСПРАВЛЕНО: Сделано симметрично для LONG и SHORT
+        // BTC STRONG UP - штрафуем SHORT, но не так сильно (было 0.40, стало 0.65)
         if (ctx.regime == GlobalRegime.BTC_STRONG_UP && isShort) {
-            // Улучшение: если волатильность растет, разрешаем шорт смелее (0.45 вместо 0.15)
-            double volatilityBonus = ctx.volatilityExpansion > 1.2 ? 0.30 : 0.0;
+            double volatilityBonus = ctx.volatilityExpansion > 1.2 ? 0.25 : 0.0;
             double threshold = signal.symbol.contains("BTC") ? 80 : 70;
-            if (signal.probability >= threshold) return 0.75;
-            if (ctx.volatilityExpansion > 1.5) return 0.9;
-            return 0.40;
+            if (signal.probability >= threshold) return 0.85;
+            if (ctx.volatilityExpansion > 1.5) return 0.90;
+            return 0.65;  // Уменьшили штраф с 0.40 до 0.65
         }
 
+        // BTC STRONG DOWN - штрафуем LONG, симметрично (было 0.15, стало 0.65)
         if (ctx.regime == GlobalRegime.BTC_STRONG_DOWN && isLong) {
+            double volatilityBonus = ctx.volatilityExpansion > 1.2 ? 0.25 : 0.0;
             double threshold = signal.symbol.contains("BTC") ? 82 : 75;
-            if (signal.probability >= threshold) return 0.60;
-            return 0.15;
+            if (signal.probability >= threshold) return 0.85;
+            if (ctx.volatilityExpansion > 1.5) return 0.90;
+            return 0.65;  // Увеличили с 0.15 до 0.65 для симметрии
         }
 
+        // BTC IMPULSE UP - смягчаем штраф для SHORT (было 0.25/0.70, стало 0.50/0.80)
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_UP && isShort) {
-            if (impulseFading) return signal.probability >= 70 ? 0.80 : 0.40;
-            // Оставляем хотя бы 0.25, чтобы супер-сильные альтовые сетапы проходили
-            return signal.probability >= 72 ? 0.70 : 0.25;
+            if (impulseFading) return signal.probability >= 70 ? 0.85 : 0.55;
+            return signal.probability >= 72 ? 0.80 : 0.50;  // Увеличили с 0.25/0.70
         }
 
+        // BTC IMPULSE DOWN - смягчаем штраф для LONG (было 0.25/0.70, стало 0.50/0.80)
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN && isLong) {
-            if (impulseFading) return signal.probability >= 70 ? 0.80 : 0.40;
-            return signal.probability >= 72 ? 0.70 : 0.25;
+            if (impulseFading) return signal.probability >= 70 ? 0.85 : 0.55;
+            return signal.probability >= 72 ? 0.80 : 0.50;  // Увеличили с 0.25/0.70
         }
 
         return 1.0;

@@ -277,7 +277,7 @@ public final class DecisionEngineMerged {
                 flags.add("HTF_CONFLICT");
             }
             if (scoreShort < 1.5) {
-                scoreShort *= 0.25;  // Режем шорт при противоречии
+                scoreShort *= 0.40;  // Режем шорт при противоречии
                 flags.add("HTF_CONFLICT");
             }
         }
@@ -487,14 +487,17 @@ public final class DecisionEngineMerged {
             if (adxValue > 30 && adxFalling) exhausted = true;
             if (bullDivFlag) exhausted = true;
 
-            // НОВОЕ: если SHORT против бычьего 1H/2H = extra penalty
-            if ((bias1h == HTFBias.BULL || bias2h == HTFBias.BULL) && scoreShort < 1.0) {
+            if ((bias1h == HTFBias.BULL || bias2h == HTFBias.BULL) && scoreShort < 0.5) {
                 exhausted = true;
                 flags.add("short_vs_bull_bias");
             }
+            if ((bias1h == HTFBias.BEAR || bias2h == HTFBias.BEAR) && scoreLong < 0.5) {
+                exhausted = true;
+                flags.add("long_vs_bear_bias");
+            }
 
             if (exhausted) {
-                scoreShort *= 0.25;  // БЫЛО 0.45 → УСИЛЕНО 0.25
+                scoreShort *= 0.40;  // БЫЛО 0.45 → УСИЛЕНО 0.25
                 if (scoreShort < 0.2) return null;  // НОВОЕ: полная блокировка
                 flags.add("exhausted_short_filtered");
             }
@@ -521,19 +524,19 @@ public final class DecisionEngineMerged {
             if (bias1h == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.70;
         }
 
-        // Умягчаем вето: если локальный импульс (Anti-Lag) сильный, разрешаем шорт против тренда
+        // Умягчаем вето: безопасно проверяем antiLag на null
         if (bias2h == HTFBias.BULL && scoreShort > scoreLong) {
-            if (antiLag.direction < 0 && antiLag.strength > 0.7) {
-                scoreShort *= 0.85; // Только небольшая штрафная санкция за контртренд
+            if (antiLag != null && antiLag.direction < 0 && antiLag.strength > 0.7) {
+                scoreShort *= 0.85;
                 flags.add("HTF_REVERSAL_ATTEMPT");
             } else {
-                scoreShort *= 0.45; // Снижаем, но не убиваем в ноль
+                scoreShort *= 0.45;
                 flags.add("2H_BULL_PRESSURE");
             }
         }
 
         if (bias2h == HTFBias.BEAR && scoreLong > scoreShort && adxValue > 25) {
-            scoreLong *= 0.15;  // БЫЛО 0.55 → 0.15
+            scoreLong *= 0.40;  // БЫЛО 0.55 → 0.15
             flags.add("2H_VETO");
             if (scoreLong < 0.2) return null;  // НОВОЕ
         }
@@ -1161,6 +1164,25 @@ public final class DecisionEngineMerged {
             if (rsiH1 < 22) return true;
         }
 
+        // ДОБАВЛЕНО: Умная проверка затухания красных свечей и падения объемов продаж
+        if (c15.size() >= 6) {
+            double body1 = Math.abs(c15.get(c15.size()-1).close - c15.get(c15.size()-1).open);
+            double body2 = Math.abs(c15.get(c15.size()-2).close - c15.get(c15.size()-2).open);
+            double body3 = Math.abs(c15.get(c15.size()-3).close - c15.get(c15.size()-3).open);
+            if (body1 < body2 * 0.6 && body2 < body3 * 0.8) return true;
+
+            double vol1 = c15.get(c15.size()-1).volume;
+            double vol2 = c15.get(c15.size()-2).volume;
+            double vol3 = c15.get(c15.size()-3).volume;
+            if (price < ema21 && vol1 < vol2 * 0.8 && vol2 < vol3 * 0.9) return true;
+        }
+
+        // ДОБАВЛЕНО: Проверка на откуп снизу (длинная нижняя тень)
+        com.bot.TradingCore.Candle last = c15.get(c15.size()-1);
+        double lowerWick = Math.min(last.open, last.close) - last.low;
+        double body = Math.abs(last.close - last.open);
+        if (lowerWick > body * 1.5 && last.close > last.open) return true;
+
         return false;
     }
 
@@ -1296,13 +1318,16 @@ public final class DecisionEngineMerged {
         double atr = atr(c, 14);
         double volRelative = atr / c.get(n-1).close;
 
-        // УЛУЧШЕНИЕ: Если наклон почти нулевой или волатильность слишком низкая — это БОКОВИК.
-        // Бот перестанет открывать сделки там, где цена просто «пилит» на месте.
         if (Math.abs(slope) < 0.0005 || volRelative < 0.0015) {
             return MarketState.RANGE;
         }
 
-        return (ema20 > ema50 && slope > 0) ? MarketState.STRONG_TREND : MarketState.WEAK_TREND;
+        // НОВОЕ: Сильный тренд — это и мощный рост, и мощное падение
+        if ((ema20 > ema50 && slope > 0) || (ema20 < ema50 && slope < 0)) {
+            return MarketState.STRONG_TREND;
+        }
+
+        return MarketState.WEAK_TREND;
     }
 
     private HTFBias detectBias(List<com.bot.TradingCore.Candle> c) {

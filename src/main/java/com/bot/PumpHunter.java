@@ -7,24 +7,22 @@ public final class PumpHunter {
 
     // ======================= CONFIG =======================
 
-    // Пороги для детекции памп-свечей
-    private static final double PUMP_BODY_ATR_MULT = 2.2;       // Тело свечи > 2.2 * ATR
-    private static final double MEGA_PUMP_BODY_ATR_MULT = 3.5;  // Мега-памп > 3.5 * ATR
-    private static final double VOLUME_SPIKE_MULT = 2.5;        // Объём > 2.5x среднего
-    private static final double MEGA_VOLUME_SPIKE_MULT = 4.0;   // Мега-объём > 4x
+    private static final double PUMP_BODY_ATR_MULT = 2.2;
+    private static final double MEGA_PUMP_BODY_ATR_MULT = 3.5;
+    private static final double VOLUME_SPIKE_MULT = 2.5;
+    private static final double MEGA_VOLUME_SPIKE_MULT = 4.0;
 
-    private static final double MIN_MOVE_PCT = 0.012;           // Было 0.8%, стало 1.2%
-    private static final double STRONG_MOVE_PCT = 0.022;        // Было 1.5%, стало 2.2%
-    private static final double MEGA_MOVE_PCT = 0.035;          // Было 2.5%, стало 3.5%
-    private static final double DUMP_MOVE_PCT = -0.012; // Минимум 1.2% падения для детекции
+    private static final double MIN_MOVE_PCT = 0.012;
+    private static final double STRONG_MOVE_PCT = 0.022;
+    private static final double MEGA_MOVE_PCT = 0.035;
+    private static final double DUMP_MOVE_PCT = -0.012;
     private static final double STRONG_DUMP_PCT = -0.022;
-    // Временные окна
+
     private static final int VOLUME_LOOKBACK = 20;
     private static final int ATR_PERIOD = 14;
     private static final int PUMP_CONFIRM_BARS = 3;
 
-    // Cooldown между сигналами (мс)
-    private static final long PUMP_COOLDOWN_MS = 10 * 60_000;   // 10 минут
+    private static final long PUMP_COOLDOWN_MS = 10 * 60_000;
 
     // ======================= STATE =======================
 
@@ -33,35 +31,39 @@ public final class PumpHunter {
     private final Map<String, Deque<PumpEvent>> pumpHistory = new ConcurrentHashMap<>();
 
     // ======================= MODELS =======================
-    public boolean isDump(List<TradingCore.Candle> candles) {
-        if (candles.size() < 2) return false;
-        TradingCore.Candle last = candles.get(candles.size() - 1);
-        double body = Math.abs(last.close - last.open);
-        double change = (last.close - last.open) / last.open;
 
-        // Если свеча красная, большая и на объеме
-        return change <= DUMP_MOVE_PCT && last.volume > calculateAvgVolume(candles, 20) * VOLUME_SPIKE_MULT;
+    public boolean isDump(List<TradingCore.Candle> candles) {
+        if (candles == null || candles.size() < VOLUME_LOOKBACK + 2) return false;
+
+        TradingCore.Candle last = candles.get(candles.size() - 1);
+        TradingCore.Candle prev = candles.get(candles.size() - 2);
+
+        double change = (last.close - prev.close) / prev.close;
+        double avgVol = averageVolume(candles, VOLUME_LOOKBACK);
+
+        return change <= DUMP_MOVE_PCT && last.volume > avgVol * VOLUME_SPIKE_MULT;
     }
+
     public enum PumpType {
         NONE,
-        PUMP_UP,          // Обычный памп вверх
-        PUMP_DOWN,        // Обычный дамп вниз
-        MEGA_PUMP_UP,     // Мега-памп вверх
-        MEGA_PUMP_DOWN,   // Мега-дамп вниз
-        SQUEEZE_UP,       // Short squeeze
-        SQUEEZE_DOWN,     // Long squeeze
-        BREAKOUT_UP,      // Пробой уровня вверх
-        BREAKOUT_DOWN     // Пробой уровня вниз
+        PUMP_UP,
+        PUMP_DOWN,
+        MEGA_PUMP_UP,
+        MEGA_PUMP_DOWN,
+        SQUEEZE_UP,
+        SQUEEZE_DOWN,
+        BREAKOUT_UP,
+        BREAKOUT_DOWN
     }
 
     public static final class PumpEvent {
         public final String symbol;
         public final PumpType type;
-        public final double strength;           // 0.0 - 1.0
-        public final double movePct;            // процент движения
-        public final double volumeRatio;        // отношение к среднему объёму
-        public final double bodyToAtrRatio;     // отношение тела к ATR
-        public final boolean isConfirmed;       // подтверждено ли следующими свечами
+        public final double strength;
+        public final double movePct;
+        public final double volumeRatio;
+        public final double bodyToAtrRatio;
+        public final boolean isConfirmed;
         public final long timestamp;
         public final List<String> flags;
 
@@ -122,10 +124,6 @@ public final class PumpHunter {
 
     // ======================= MAIN DETECTION =======================
 
-    /**
-     * Основной метод детекции памп-свечей
-     */
-
     public PumpEvent detectPump(String symbol,
                                 List<TradingCore.Candle> c1m,
                                 List<TradingCore.Candle> c5m,
@@ -137,7 +135,6 @@ public final class PumpHunter {
             return null;
         }
 
-        // Cooldown check
         Long lastPump = lastPumpTime.get(symbol);
         if (lastPump != null && System.currentTimeMillis() - lastPump < PUMP_COOLDOWN_MS) {
             return null;
@@ -145,25 +142,17 @@ public final class PumpHunter {
 
         List<String> flags = new ArrayList<>();
 
-        // === 1. Анализ последней свечи 1M ===
         PumpMetrics m1 = analyzeCandle(c1m, ATR_PERIOD);
-
-        // === 2. Анализ последней свечи 5M ===
         PumpMetrics m5 = analyzeCandle(c5m, ATR_PERIOD);
-
-        // === 3. Анализ последней свечи 15M ===
         PumpMetrics m15 = analyzeCandle(c15m, ATR_PERIOD);
 
-        // === 4. Детекция типа события ===
         PumpType type = PumpType.NONE;
         double strength = 0;
         double movePct = 0;
         double volumeRatio = 0;
         double bodyToAtr = 0;
 
-        // Приоритет: проверяем от более крупных TF к мелким
-
-        // Проверка МЕГА-пампа на 15M
+        // 15M Analysis
         if (m15.bodyToAtr >= MEGA_PUMP_BODY_ATR_MULT &&
                 m15.volumeRatio >= MEGA_VOLUME_SPIKE_MULT &&
                 Math.abs(m15.movePct) >= MEGA_MOVE_PCT) {
@@ -174,9 +163,8 @@ public final class PumpHunter {
             volumeRatio = m15.volumeRatio;
             bodyToAtr = m15.bodyToAtr;
             flags.add("15M_MEGA");
-        }
-        // Проверка обычного пампа на 15M
-        else if (m15.bodyToAtr >= PUMP_BODY_ATR_MULT &&
+
+        } else if (m15.bodyToAtr >= PUMP_BODY_ATR_MULT &&
                 m15.volumeRatio >= VOLUME_SPIKE_MULT &&
                 Math.abs(m15.movePct) >= STRONG_MOVE_PCT) {
 
@@ -187,7 +175,7 @@ public final class PumpHunter {
             bodyToAtr = m15.bodyToAtr;
             flags.add("15M_PUMP");
         }
-        // Проверка на 5M
+        // 5M Analysis
         else if (m5.bodyToAtr >= PUMP_BODY_ATR_MULT * 0.9 &&
                 m5.volumeRatio >= VOLUME_SPIKE_MULT &&
                 Math.abs(m5.movePct) >= MIN_MOVE_PCT) {
@@ -205,7 +193,7 @@ public final class PumpHunter {
             volumeRatio = m5.volumeRatio;
             bodyToAtr = m5.bodyToAtr;
         }
-        // Быстрый памп на 1M (серия свечей)
+        // 1M Series Analysis
         else {
             SeriesPumpResult series = detectSeriesPump(c1m);
             if (series.detected) {
@@ -223,18 +211,14 @@ public final class PumpHunter {
             return null;
         }
 
-        // === 5. Дополнительные проверки ===
-
-        // Проверка на сквиз (резкий разворот после сильного движения)
-        SqueezeResult squeeze = detectSqueeze(c1m, c5m, type);
+        SqueezeResult squeeze = detectSqueeze(c5m);
         if (squeeze.detected) {
             type = squeeze.isUp ? PumpType.SQUEEZE_UP : PumpType.SQUEEZE_DOWN;
             strength = Math.min(1.0, strength + 0.15);
             flags.add("SQUEEZE");
         }
 
-        // Проверка на пробой уровня
-        BreakoutResult breakout = detectBreakout(c15m, type);
+        BreakoutResult breakout = detectBreakout(c15m);
         if (breakout.detected) {
             type = breakout.isUp ? PumpType.BREAKOUT_UP : PumpType.BREAKOUT_DOWN;
             strength = Math.min(1.0, strength + 0.10);
@@ -242,25 +226,21 @@ public final class PumpHunter {
             flags.add("level=" + String.format("%.6f", breakout.level));
         }
 
-        // Проверка Volume Profile
         if (isVolumeClimaxing(c1m)) {
             strength = Math.min(1.0, strength + 0.08);
             flags.add("VOL_CLIMAX");
         }
 
-        // Проверка подтверждения следующими барами
         boolean confirmed = checkConfirmation(c1m, type);
         if (confirmed) {
             strength = Math.min(1.0, strength + 0.05);
             flags.add("CONFIRMED");
         }
 
-        // === 6. Создание события ===
         PumpEvent event = new PumpEvent(
                 symbol, type, strength, movePct, volumeRatio, bodyToAtr, confirmed, flags
         );
 
-        // Сохраняем
         lastPumpTime.put(symbol, System.currentTimeMillis());
         recentPumps.put(symbol, event);
 
@@ -273,17 +253,10 @@ public final class PumpHunter {
         return event;
     }
 
-    /**
-     * Генерация торгового сигнала на основе PumpEvent
-     */
     public PumpSignal generateSignal(PumpEvent event, double currentPrice) {
         if (event == null || event.type == PumpType.NONE) {
             return null;
         }
-
-        // Определяем направление сигнала
-        // При пампе торгуем В НАПРАВЛЕНИИ движения (momentum следование)
-        // При сквизе - потенциальный разворот
 
         com.bot.TradingCore.Side side;
         String strategy;
@@ -291,25 +264,21 @@ public final class PumpHunter {
 
         switch (event.type) {
             case PUMP_UP, MEGA_PUMP_UP, BREAKOUT_UP -> {
-                // Продолжение движения вверх
                 side = com.bot.TradingCore.Side.LONG;
                 strategy = "PUMP_CONTINUATION";
                 confidence = 55 + event.strength * 25;
             }
             case PUMP_DOWN, MEGA_PUMP_DOWN, BREAKOUT_DOWN -> {
-                // Продолжение движения вниз
                 side = com.bot.TradingCore.Side.SHORT;
                 strategy = "DUMP_CONTINUATION";
                 confidence = 55 + event.strength * 25;
             }
             case SQUEEZE_UP -> {
-                // Short squeeze = LONG
                 side = com.bot.TradingCore.Side.LONG;
                 strategy = "SHORT_SQUEEZE";
                 confidence = 60 + event.strength * 20;
             }
             case SQUEEZE_DOWN -> {
-                // Long squeeze = SHORT
                 side = com.bot.TradingCore.Side.SHORT;
                 strategy = "LONG_SQUEEZE";
                 confidence = 60 + event.strength * 20;
@@ -319,12 +288,10 @@ public final class PumpHunter {
             }
         }
 
-        // Бонусы за подтверждения
         if (event.isConfirmed) confidence += 3;
         if (event.isMega()) confidence += 5;
         if (event.flags.contains("VOL_CLIMAX")) confidence += 2;
 
-        // Ограничение
         confidence = Math.min(85, Math.max(55, confidence));
 
         return new PumpSignal(event.symbol, side, currentPrice, confidence, event, strategy);
@@ -343,44 +310,32 @@ public final class PumpHunter {
 
     private PumpMetrics analyzeCandle(List<TradingCore.Candle> candles, int atrPeriod) {
         PumpMetrics m = new PumpMetrics();
-
-        if (candles.size() < atrPeriod + 1) {
-            return m;
-        }
+        if (candles == null || candles.size() < atrPeriod + 1) return m;
 
         TradingCore.Candle last = candles.get(candles.size() - 1);
+        TradingCore.Candle prev = candles.get(candles.size() - 2);
 
-        // ATR
         m.atr = calculateATR(candles, atrPeriod);
         if (m.atr <= 0) m.atr = (last.high - last.low);
 
-        // Body
         m.bodySize = Math.abs(last.close - last.open);
         m.bodyToAtr = m.bodySize / Math.max(m.atr, 1e-10);
 
-        // Volume ratio
         double avgVol = averageVolume(candles, VOLUME_LOOKBACK);
         m.volumeRatio = last.volume / Math.max(avgVol, 1e-10);
 
-        // Move %
-        TradingCore.Candle prev = candles.get(candles.size() - 2);
         m.movePct = (last.close - prev.close) / prev.close;
-
-        // Direction
         m.isGreen = last.close > last.open;
 
         return m;
     }
 
     private double calculateStrength(PumpMetrics m, boolean isMega) {
-        // Базовая сила на основе метрик
         double bodyScore = Math.min(1.0, m.bodyToAtr / (isMega ? MEGA_PUMP_BODY_ATR_MULT : PUMP_BODY_ATR_MULT) / 1.5);
         double volScore = Math.min(1.0, m.volumeRatio / (isMega ? MEGA_VOLUME_SPIKE_MULT : VOLUME_SPIKE_MULT) / 1.5);
         double moveScore = Math.min(1.0, Math.abs(m.movePct) / (isMega ? MEGA_MOVE_PCT : STRONG_MOVE_PCT));
 
-        // Взвешенная сумма
         double strength = bodyScore * 0.35 + volScore * 0.35 + moveScore * 0.30;
-
         return Math.min(1.0, strength);
     }
 
@@ -398,14 +353,12 @@ public final class PumpHunter {
 
     private SeriesPumpResult detectSeriesPump(List<TradingCore.Candle> c1m) {
         SeriesPumpResult result = new SeriesPumpResult();
-
-        if (c1m.size() < 10) return result;
+        if (c1m == null || c1m.size() < 10) return result;
 
         int n = c1m.size();
         double atr = calculateATR(c1m, ATR_PERIOD);
         double avgVol = averageVolume(c1m, VOLUME_LOOKBACK);
 
-        // Проверяем последние 5-6 баров
         int greenCount = 0;
         int redCount = 0;
         double totalMove = 0;
@@ -428,11 +381,10 @@ public final class PumpHunter {
         TradingCore.Candle startBar = c1m.get(n - lookback);
         TradingCore.Candle endBar = c1m.get(n - 1);
 
-        double totalMovePct = (endBar.close - startBar.open) / startBar.open;
+        double totalMovePct = (endBar.close - startBar.open) / Math.max(startBar.open, 1e-10);
         double avgVolRatio = totalVolRatio / lookback;
         double avgBodyAtr = totalBodyAtr / lookback;
 
-        // Условия детекции серии
         boolean isUpSeries = greenCount >= 4 && Math.abs(totalMovePct) >= MIN_MOVE_PCT;
         boolean isDownSeries = redCount >= 4 && Math.abs(totalMovePct) >= MIN_MOVE_PCT;
         boolean volumeOk = avgVolRatio >= 1.5;
@@ -461,43 +413,28 @@ public final class PumpHunter {
         boolean isUp;
     }
 
-    private SqueezeResult detectSqueeze(List<TradingCore.Candle> c1m,
-                                        List<TradingCore.Candle> c5m,
-                                        PumpType currentType) {
+    private SqueezeResult detectSqueeze(List<TradingCore.Candle> c5m) {
         SqueezeResult result = new SqueezeResult();
-
-        if (c5m.size() < 20) return result;
+        if (c5m == null || c5m.size() < 20) return result;
 
         int n = c5m.size();
 
-        // Ищем признаки сквиза:
-        // 1. Сильное движение в одном направлении
-        // 2. Резкий разворот с высоким объёмом
-
-        // Проверяем предыдущее движение (последние 10-15 баров)
         double prevTrend = 0;
         for (int i = n - 15; i < n - 3; i++) {
-            if (i >= 0) {
-                prevTrend += c5m.get(i).close - c5m.get(i).open;
-            }
+            prevTrend += c5m.get(i).close - c5m.get(i).open;
         }
 
-        // Текущее движение (последние 3 бара)
         double currentMove = 0;
         for (int i = n - 3; i < n; i++) {
             currentMove += c5m.get(i).close - c5m.get(i).open;
         }
 
-        // Сквиз: предыдущий тренд вниз, текущее резкое движение вверх (short squeeze)
-        if (prevTrend < 0 && currentMove > 0 &&
-                Math.abs(currentMove) > Math.abs(prevTrend) * 0.5) {
+        if (prevTrend < 0 && currentMove > 0 && Math.abs(currentMove) > Math.abs(prevTrend) * 0.6) {
             result.detected = true;
             result.isUp = true;
         }
 
-        // Сквиз: предыдущий тренд вверх, текущее резкое движение вниз (long squeeze)
-        if (prevTrend > 0 && currentMove < 0 &&
-                Math.abs(currentMove) > Math.abs(prevTrend) * 0.5) {
+        if (prevTrend > 0 && currentMove < 0 && Math.abs(currentMove) > Math.abs(prevTrend) * 0.6) {
             result.detected = true;
             result.isUp = false;
         }
@@ -513,34 +450,27 @@ public final class PumpHunter {
         double level;
     }
 
-    private BreakoutResult detectBreakout(List<TradingCore.Candle> c15m, PumpType currentType) {
+    private BreakoutResult detectBreakout(List<TradingCore.Candle> c15m) {
         BreakoutResult result = new BreakoutResult();
-
-        if (c15m.size() < 30) return result;
+        if (c15m == null || c15m.size() < 30) return result;
 
         int n = c15m.size();
         TradingCore.Candle last = c15m.get(n - 1);
 
-        // Находим уровни поддержки/сопротивления
         double recentHigh = Double.MIN_VALUE;
         double recentLow = Double.MAX_VALUE;
 
-        // Ищем хай/лоу за последние 20 баров (исключая последние 3)
         for (int i = n - 23; i < n - 3; i++) {
-            if (i >= 0) {
-                recentHigh = Math.max(recentHigh, c15m.get(i).high);
-                recentLow = Math.min(recentLow, c15m.get(i).low);
-            }
+            recentHigh = Math.max(recentHigh, c15m.get(i).high);
+            recentLow = Math.min(recentLow, c15m.get(i).low);
         }
 
-        // Пробой вверх
         if (last.close > recentHigh * 1.002 && last.close > last.open) {
             result.detected = true;
             result.isUp = true;
             result.level = recentHigh;
         }
 
-        // Пробой вниз
         if (last.close < recentLow * 0.998 && last.close < last.open) {
             result.detected = true;
             result.isUp = false;
@@ -553,25 +483,23 @@ public final class PumpHunter {
     // ======================= VOLUME CLIMAX =======================
 
     private boolean isVolumeClimaxing(List<TradingCore.Candle> candles) {
-        if (candles.size() < 15) return false;
+        if (candles == null || candles.size() < 21) return false;
 
         int n = candles.size();
         TradingCore.Candle last = candles.get(n - 1);
 
-        // Находим максимальный объём за последние 20 баров
         double maxVol = 0;
-        for (int i = Math.max(0, n - 20); i < n - 1; i++) {
+        for (int i = n - 21; i < n - 1; i++) {
             maxVol = Math.max(maxVol, candles.get(i).volume);
         }
 
-        // Volume climax = текущий объём > 90% от максимума за период
         return last.volume >= maxVol * 0.90;
     }
 
     // ======================= CONFIRMATION =======================
 
     private boolean checkConfirmation(List<TradingCore.Candle> c1m, PumpType type) {
-        if (c1m.size() < PUMP_CONFIRM_BARS + 2) return false;
+        if (c1m == null || c1m.size() < PUMP_CONFIRM_BARS + 2) return false;
 
         int n = c1m.size();
         TradingCore.Candle pumpBar = c1m.get(n - PUMP_CONFIRM_BARS - 1);
@@ -579,7 +507,6 @@ public final class PumpHunter {
         boolean isUp = type == PumpType.PUMP_UP || type == PumpType.MEGA_PUMP_UP ||
                 type == PumpType.SQUEEZE_UP || type == PumpType.BREAKOUT_UP;
 
-        // Проверяем, что следующие бары держат направление
         int confirmCount = 0;
         for (int i = n - PUMP_CONFIRM_BARS; i < n; i++) {
             TradingCore.Candle c = c1m.get(i);
@@ -593,7 +520,7 @@ public final class PumpHunter {
     // ======================= UTILITY =======================
 
     private double calculateATR(List<TradingCore.Candle> candles, int period) {
-        if (candles.size() < period + 1) return 0;
+        if (candles == null || candles.size() < period + 1) return 0;
 
         double sum = 0;
         int n = candles.size();
@@ -612,7 +539,7 @@ public final class PumpHunter {
     }
 
     private double averageVolume(List<TradingCore.Candle> candles, int lookback) {
-        if (candles.size() < lookback + 1) return 1;
+        if (candles == null || candles.size() < lookback + 1) return 1;
 
         double sum = 0;
         int n = candles.size();
@@ -628,41 +555,26 @@ public final class PumpHunter {
 
     // ======================= PUBLIC API =======================
 
-    /**
-     * Получить последний памп для символа
-     */
     public PumpEvent getRecentPump(String symbol) {
         return recentPumps.get(symbol);
     }
 
-    /**
-     * Проверить, был ли недавний памп
-     */
     public boolean hadRecentPump(String symbol, long withinMs) {
         Long lastTime = lastPumpTime.get(symbol);
         return lastTime != null && System.currentTimeMillis() - lastTime < withinMs;
     }
 
-    /**
-     * Получить историю пампов для символа
-     */
     public List<PumpEvent> getPumpHistory(String symbol) {
         Deque<PumpEvent> history = pumpHistory.get(symbol);
         return history != null ? new ArrayList<>(history) : List.of();
     }
 
-    /**
-     * Очистить данные для символа
-     */
     public void clearSymbol(String symbol) {
         lastPumpTime.remove(symbol);
         recentPumps.remove(symbol);
         pumpHistory.remove(symbol);
     }
 
-    /**
-     * Очистить все данные
-     */
     public void clearAll() {
         lastPumpTime.clear();
         recentPumps.clear();
