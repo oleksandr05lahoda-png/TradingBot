@@ -13,7 +13,7 @@ public final class SignalOptimizer {
     private static final double STRONG_IMPULSE = 0.0025;   // Более чувствительно
     private static final double WEAK_IMPULSE = 0.0002;
 
-    private static final double MAX_CONF = 92.0;
+    private static final double MAX_CONF = 88.0;
     private static final double MIN_CONF = 50.0;
 
     private static final double MAX_IMPULSE_CAP = 0.010;
@@ -303,10 +303,13 @@ public final class SignalOptimizer {
         if (mt.isExhausted && Math.abs(mt.momentum) < momentumStrength * 0.5) {
             confidence -= 8.0;  // БЫЛО -8.0 → -15.0 (сильнее штрафуем)
         }
-
-// НОВОЕ: ОЧЕНЬ ЖЁСТКИЙ ФИЛЬТР НА РАЗВОРОТАХ
         if (mt.isExhausted && trendAlignment < 0) {
-            confidence -= 10.0;  // Максимальный штраф за exhaustion против тренда
+            confidence -= 40.0;  // УНИЧТОЖАЕМ уверенность. Сигнал против тренда на истощении должен умереть.
+        }
+
+        if (confidence > 85.0) {
+            // Искусственно прижимаем всё, что выше 85%, чтобы 92% появлялись только на идеальных сетапах
+            confidence = 85.0 + (confidence - 85.0) * 0.2;
         }
 
         if (mt != null && mt.momentum != 0) {

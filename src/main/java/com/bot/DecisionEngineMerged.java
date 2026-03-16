@@ -475,21 +475,30 @@ public final class DecisionEngineMerged {
         double adxPrev = adx(c15.subList(0, c15.size()-1), 14);
         boolean adxFalling = adxPrev > adxValue;
 
-        // === ФИЛЬТР ПЛОХИХ ЛОНГОВ ===
+        // === ФИЛЬТР ПЛОХИХ ЛОНГОВ (ЖЕСТКАЯ БЛОКИРОВКА) ===
         if (scoreLong > scoreShort) {
             boolean exhausted = isLongExhausted(c15, c1h, rsi14, rsi7, price);
             if (adxValue > 30 && adxFalling) exhausted = true;
             if (bearDivFlag) {
                 exhausted = true;
-                flags.add("bearish_div_rejection");  // ПЕРЕИМЕНОВАНО для ясности
+                flags.add("bearish_div_rejection");
             }
             if (exhausted) {
-                scoreLong *= 0.30;  // УСИЛЕНО: 0.45 �� 0.30
+                // НОВОЕ: Если есть медвежья дивергенция или сильная перекупленность — блокируем сделку полностью.
+                if (bearDivFlag || rsi14 > 72) {
+                    return null; // Никаких лонгов на истощении!
+                }
+
+                scoreLong *= 0.15; // Если просто легкая усталость, режем очки почти в ноль
                 flags.add("exhausted_long_filtered");
+
+                // НОВОЕ: Если после штрафа очков слишком мало, отменяем сигнал
+                if (scoreLong < 0.4) {
+                    return null;
+                }
             }
         }
 
-        // === ФИЛЬТР ПЛОХИХ ШОРТОВ ===
         if (scoreShort > scoreLong) {
             boolean exhausted = isShortExhausted(c15, c1h, rsi14, rsi7, price);
             if (adxValue > 30 && adxFalling) exhausted = true;
@@ -550,13 +559,18 @@ public final class DecisionEngineMerged {
         }
         if (bias1h == bias2h && bias1h != HTFBias.NONE) {
             if (bias1h == HTFBias.BULL) {
-                scoreLong += 0.50;
-                scoreShort -= 0.35;  // БЫЛО -0.20 → -0.35 (сильнее штрафуем SHORT при BULL 1H)
-                flags.add("1H_BULL");
+                scoreLong += 0.35; // Немного убавили бонус лонгам
+                // НОВОЕ: Не штрафуем шорт, если на 15m есть четкий сигнал вниз (например импульс)
+                if (impulseFlag && last(c15).close < c15.get(c15.size() - 2).close) {
+                    scoreShort -= 0.05;
+                } else {
+                    scoreShort -= 0.20; // Вернули более адекватный штраф
+                }
+                flags.add("1H_2H_BULL");
             } else if (bias1h == HTFBias.BEAR) {
-                scoreShort += 0.50;
-                scoreLong -= 0.35;  // БЫЛО -0.20 → -0.35
-                flags.add("1H_BEAR");
+                scoreShort += 0.40;
+                scoreLong -= 0.30;
+                flags.add("1H_2H_BEAR");
             }
         }
 
