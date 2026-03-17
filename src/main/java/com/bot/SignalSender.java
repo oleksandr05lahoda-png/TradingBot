@@ -1392,6 +1392,12 @@ public class SignalSender {
 
                 if (c1.size() < 60 || c5.size() < 60 || c15.size() < 60 || h1.size() < 60) continue;
 
+                c1.remove(c1.size() - 1);
+                c5.remove(c5.size() - 1);
+                c15.remove(c15.size() - 1);
+                h1.remove(h1.size() - 1);
+                h2.remove(h2.size() - 1);
+
                 optimizer.updateFromCandles(pair, c15);
 
                 com.bot.DecisionEngineMerged.TradeIdea idea =

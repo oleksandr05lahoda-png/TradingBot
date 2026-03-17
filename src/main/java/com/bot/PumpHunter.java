@@ -20,7 +20,7 @@ public final class PumpHunter {
 
     private static final int VOLUME_LOOKBACK = 20;
     private static final int ATR_PERIOD = 14;
-    private static final int PUMP_CONFIRM_BARS = 3;
+    private static final int PUMP_CONFIRM_BARS = 1;
 
     private static final long PUMP_COOLDOWN_MS = 10 * 60_000;
 

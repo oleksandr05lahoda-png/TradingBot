@@ -12,7 +12,7 @@ public class BotMain {
     private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID = "953233853";
     private static final ZoneId ZONE = ZoneId.of("Europe/Warsaw");
-    private static final int SIGNAL_INTERVAL_MIN = 15;
+    private static final int SIGNAL_INTERVAL_MIN = 1;
     private static final int KLINES_LIMIT = 200;
 
     public static void main(String[] args) {

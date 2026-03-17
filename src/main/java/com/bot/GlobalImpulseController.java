@@ -237,13 +237,12 @@ public final class GlobalImpulseController {
             return 0.65;  // Увеличили с 0.15 до 0.65 для симметрии
         }
 
-        // BTC IMPULSE UP - смягчаем штраф для SHORT (было 0.25/0.70, стало 0.50/0.80)
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_UP && isShort) {
-            if (impulseFading) return signal.probability >= 70 ? 0.85 : 0.55;
-            return signal.probability >= 72 ? 0.80 : 0.50;  // Увеличили с 0.25/0.70
+            // Если у альткоина есть внятный сетап (prob >= 65), он может падать против битка.
+            if (impulseFading) return signal.probability >= 65 ? 0.95 : 0.75;
+            return signal.probability >= 68 ? 0.90 : 0.65;
         }
 
-        // BTC IMPULSE DOWN - смягчаем штраф для LONG (было 0.25/0.70, стало 0.50/0.80)
         if (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN && isLong) {
             if (impulseFading) return signal.probability >= 70 ? 0.85 : 0.55;
             return signal.probability >= 72 ? 0.80 : 0.50;  // Увеличили с 0.25/0.70

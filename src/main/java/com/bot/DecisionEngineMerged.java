@@ -281,14 +281,6 @@ public final class DecisionEngineMerged {
             }
         }
 
-        if (reverseWarning != null && reverseWarning.confidence > 0.55) {
-            flags.add("⚠REVERSE_" + reverseWarning.type);
-            if (reverseWarning.type.equals("LONG_EXHAUSTION")) {
-                scoreLong *= 0.40; // Смягчили (было 0.20)
-            } else if (reverseWarning.type.equals("SHORT_EXHAUSTION")) {
-                scoreShort *= 0.40; // Сделали симметрично
-            }
-        }
         // === PumpHunter Integration ===
         if (pumpHunter != null) {
             PumpHunter.PumpEvent pump = pumpHunter.detectPump(symbol, c1, c5, c15);
@@ -504,7 +496,7 @@ public final class DecisionEngineMerged {
             if (adxValue > 30 && adxFalling) exhausted = true;
             if (bullDivFlag) exhausted = true;
 
-            if ((bias1h == HTFBias.BULL || bias2h == HTFBias.BULL) && scoreShort < 0.5) {
+            if ((bias1h == HTFBias.BULL || bias2h == HTFBias.BULL) && scoreShort < 0.3 && (antiLag == null || antiLag.direction >= 0)) {
                 exhausted = true;
                 flags.add("short_vs_bull_bias");
             }
@@ -541,13 +533,17 @@ public final class DecisionEngineMerged {
             if (bias1h == HTFBias.BEAR && scoreLong > scoreShort) scoreLong *= 0.70;
         }
 
-        // Умягчаем вето: безопасно проверяем antiLag на null
+        // ДИНАМИЧЕСКИЙ ПРИОРИТЕТ: Позволяем сильным шортам игнорировать бычий 2H
         if (bias2h == HTFBias.BULL && scoreShort > scoreLong) {
-            if (antiLag != null && antiLag.direction < 0 && antiLag.strength > 0.7) {
-                scoreShort *= 0.85;
-                flags.add("HTF_REVERSAL_ATTEMPT");
+            boolean strongLocalBear = (antiLag != null && antiLag.direction < 0 && antiLag.strength > 0.55) ||
+                    (pump != null && pump.detected && pump.direction < 0 && pump.strength > 0.45) ||
+                    (adxValue > 30 && !adxFalling);
+
+            if (strongLocalBear) {
+                scoreShort *= 0.95; // Почти не штрафуем! Локальный дамп важнее истории.
+                flags.add("DYN_PRIORITY_SHORT");
             } else {
-                scoreShort *= 0.45;
+                scoreShort *= 0.70; // Смягчили базовый штраф с 0.45 до 0.70, чтобы дать шортам дышать.
                 flags.add("2H_BULL_PRESSURE");
             }
         }
