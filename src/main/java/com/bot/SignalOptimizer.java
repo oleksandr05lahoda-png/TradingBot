@@ -10,7 +10,7 @@ public final class SignalOptimizer {
     private static final int MAX_TICKS = 200;
     private static final double EMA_ALPHA = 0.45;
 
-    private static final double STRONG_IMPULSE = 0.0015;   // Более чувствительно
+    private static final double STRONG_IMPULSE = 0.0025;   // Более чувствительно
     private static final double WEAK_IMPULSE = 0.0002;
 
     private static final double MAX_CONF = 88.0;
@@ -24,20 +24,20 @@ public final class SignalOptimizer {
 
     // === НОВОЕ: Anti-lag параметры ===
     private static final double EARLY_DETECTION_SENSITIVITY = 1.5;  // 1.5x обычного
-    private static final double REVERSAL_SENSITIVITY = 1.6;
+    private static final double REVERSAL_SENSITIVITY = 1.3;
 
     private final Map<String, Deque<Double>> tickPriceDeque;
     private final Map<String, MicroTrendResult> microTrendCache = new ConcurrentHashMap<>();
     private final Map<String, List<Double>> priceFallback = new ConcurrentHashMap<>();
     private final Map<String, Deque<Double>> momentumHistory = new ConcurrentHashMap<>();
 
-    private PumpHunter pumpHunter;
+    private com.bot.PumpHunter pumpHunter;
 
     public SignalOptimizer(Map<String, Deque<Double>> tickPriceDeque) {
         this.tickPriceDeque = tickPriceDeque;
     }
 
-    public void setPumpHunter(PumpHunter pumpHunter) {
+    public void setPumpHunter(com.bot.PumpHunter pumpHunter) {
         this.pumpHunter = pumpHunter;
     }
 
@@ -283,7 +283,7 @@ public final class SignalOptimizer {
 
         // === 8. PumpHunter Integration ===
         if (pumpHunter != null) {
-            PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(signal.symbol);
+            com.bot.PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(signal.symbol);
             if (pump != null && pump.strength > 0.5) {
                 boolean pumpAligned = (isLong && pump.isBullish()) || (!isLong && pump.isBearish());
                 if (pumpAligned) {
@@ -303,11 +303,10 @@ public final class SignalOptimizer {
         if (mt.isExhausted && Math.abs(mt.momentum) < momentumStrength * 0.5) {
             confidence -= 8.0;  // БЫЛО -8.0 → -15.0 (сильнее штрафуем)
         }
-        // ДИНАМИЧЕСКИЙ ПРИОРИТЕТ: Смягчаем удар. У InstitutionalCore уже есть жесткие лимиты, не нужно убивать сигнал заранее.
         if (mt.isExhausted && trendAlignment < 0) {
-            confidence -= 15.0;  // Оставляем шанс выжить, если остальные факторы (pump, FVG, OB) предельно сильны.
-            System.out.println("[ContraTrend] Exhaustion detected, confidence -15 (softened)");
+            confidence -= 40.0;  // УНИЧТОЖАЕМ уверенность. Сигнал против тренда на истощении должен умереть.
         }
+
         if (confidence > 85.0) {
             // Искусственно прижимаем всё, что выше 85%, чтобы 92% появлялись только на идеальных сетапах
             confidence = 85.0 + (confidence - 85.0) * 0.2;

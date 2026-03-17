@@ -20,7 +20,7 @@ public final class PumpHunter {
 
     private static final int VOLUME_LOOKBACK = 20;
     private static final int ATR_PERIOD = 14;
-    private static final int PUMP_CONFIRM_BARS = 1;
+    private static final int PUMP_CONFIRM_BARS = 3;
 
     private static final long PUMP_COOLDOWN_MS = 10 * 60_000;
 
@@ -32,11 +32,11 @@ public final class PumpHunter {
 
     // ======================= MODELS =======================
 
-    public boolean isDump(List<TradingCore.Candle> candles) {
+    public boolean isDump(List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < VOLUME_LOOKBACK + 2) return false;
 
-        TradingCore.Candle last = candles.get(candles.size() - 1);
-        TradingCore.Candle prev = candles.get(candles.size() - 2);
+        com.bot.TradingCore.Candle last = candles.get(candles.size() - 1);
+        com.bot.TradingCore.Candle prev = candles.get(candles.size() - 2);
 
         double change = (last.close - prev.close) / prev.close;
         double avgVol = averageVolume(candles, VOLUME_LOOKBACK);
@@ -125,9 +125,9 @@ public final class PumpHunter {
     // ======================= MAIN DETECTION =======================
 
     public PumpEvent detectPump(String symbol,
-                                List<TradingCore.Candle> c1m,
-                                List<TradingCore.Candle> c5m,
-                                List<TradingCore.Candle> c15m) {
+                                List<com.bot.TradingCore.Candle> c1m,
+                                List<com.bot.TradingCore.Candle> c5m,
+                                List<com.bot.TradingCore.Candle> c15m) {
 
         if (c1m == null || c1m.size() < 30 ||
                 c5m == null || c5m.size() < 20 ||
@@ -308,12 +308,12 @@ public final class PumpHunter {
         double atr;
     }
 
-    private PumpMetrics analyzeCandle(List<TradingCore.Candle> candles, int atrPeriod) {
+    private PumpMetrics analyzeCandle(List<com.bot.TradingCore.Candle> candles, int atrPeriod) {
         PumpMetrics m = new PumpMetrics();
         if (candles == null || candles.size() < atrPeriod + 1) return m;
 
-        TradingCore.Candle last = candles.get(candles.size() - 1);
-        TradingCore.Candle prev = candles.get(candles.size() - 2);
+        com.bot.TradingCore.Candle last = candles.get(candles.size() - 1);
+        com.bot.TradingCore.Candle prev = candles.get(candles.size() - 2);
 
         m.atr = calculateATR(candles, atrPeriod);
         if (m.atr <= 0) m.atr = (last.high - last.low);
@@ -351,7 +351,7 @@ public final class PumpHunter {
         int barsCount;
     }
 
-    private SeriesPumpResult detectSeriesPump(List<TradingCore.Candle> c1m) {
+    private SeriesPumpResult detectSeriesPump(List<com.bot.TradingCore.Candle> c1m) {
         SeriesPumpResult result = new SeriesPumpResult();
         if (c1m == null || c1m.size() < 10) return result;
 
@@ -368,7 +368,7 @@ public final class PumpHunter {
         int lookback = Math.min(6, n - 1);
 
         for (int i = n - lookback; i < n; i++) {
-            TradingCore.Candle c = c1m.get(i);
+            com.bot.TradingCore.Candle c = c1m.get(i);
 
             if (c.close > c.open) greenCount++;
             else redCount++;
@@ -378,8 +378,8 @@ public final class PumpHunter {
             totalBodyAtr += Math.abs(c.close - c.open) / Math.max(atr, 1e-10);
         }
 
-        TradingCore.Candle startBar = c1m.get(n - lookback);
-        TradingCore.Candle endBar = c1m.get(n - 1);
+        com.bot.TradingCore.Candle startBar = c1m.get(n - lookback);
+        com.bot.TradingCore.Candle endBar = c1m.get(n - 1);
 
         double totalMovePct = (endBar.close - startBar.open) / Math.max(startBar.open, 1e-10);
         double avgVolRatio = totalVolRatio / lookback;
@@ -413,7 +413,7 @@ public final class PumpHunter {
         boolean isUp;
     }
 
-    private SqueezeResult detectSqueeze(List<TradingCore.Candle> c5m) {
+    private SqueezeResult detectSqueeze(List<com.bot.TradingCore.Candle> c5m) {
         SqueezeResult result = new SqueezeResult();
         if (c5m == null || c5m.size() < 20) return result;
 
@@ -450,12 +450,12 @@ public final class PumpHunter {
         double level;
     }
 
-    private BreakoutResult detectBreakout(List<TradingCore.Candle> c15m) {
+    private BreakoutResult detectBreakout(List<com.bot.TradingCore.Candle> c15m) {
         BreakoutResult result = new BreakoutResult();
         if (c15m == null || c15m.size() < 30) return result;
 
         int n = c15m.size();
-        TradingCore.Candle last = c15m.get(n - 1);
+        com.bot.TradingCore.Candle last = c15m.get(n - 1);
 
         double recentHigh = Double.MIN_VALUE;
         double recentLow = Double.MAX_VALUE;
@@ -482,11 +482,11 @@ public final class PumpHunter {
 
     // ======================= VOLUME CLIMAX =======================
 
-    private boolean isVolumeClimaxing(List<TradingCore.Candle> candles) {
+    private boolean isVolumeClimaxing(List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 21) return false;
 
         int n = candles.size();
-        TradingCore.Candle last = candles.get(n - 1);
+        com.bot.TradingCore.Candle last = candles.get(n - 1);
 
         double maxVol = 0;
         for (int i = n - 21; i < n - 1; i++) {
@@ -498,18 +498,18 @@ public final class PumpHunter {
 
     // ======================= CONFIRMATION =======================
 
-    private boolean checkConfirmation(List<TradingCore.Candle> c1m, PumpType type) {
+    private boolean checkConfirmation(List<com.bot.TradingCore.Candle> c1m, PumpType type) {
         if (c1m == null || c1m.size() < PUMP_CONFIRM_BARS + 2) return false;
 
         int n = c1m.size();
-        TradingCore.Candle pumpBar = c1m.get(n - PUMP_CONFIRM_BARS - 1);
+        com.bot.TradingCore.Candle pumpBar = c1m.get(n - PUMP_CONFIRM_BARS - 1);
 
         boolean isUp = type == PumpType.PUMP_UP || type == PumpType.MEGA_PUMP_UP ||
                 type == PumpType.SQUEEZE_UP || type == PumpType.BREAKOUT_UP;
 
         int confirmCount = 0;
         for (int i = n - PUMP_CONFIRM_BARS; i < n; i++) {
-            TradingCore.Candle c = c1m.get(i);
+            com.bot.TradingCore.Candle c = c1m.get(i);
             if (isUp && c.close >= pumpBar.close * 0.998) confirmCount++;
             if (!isUp && c.close <= pumpBar.close * 1.002) confirmCount++;
         }
@@ -519,15 +519,15 @@ public final class PumpHunter {
 
     // ======================= UTILITY =======================
 
-    private double calculateATR(List<TradingCore.Candle> candles, int period) {
+    private double calculateATR(List<com.bot.TradingCore.Candle> candles, int period) {
         if (candles == null || candles.size() < period + 1) return 0;
 
         double sum = 0;
         int n = candles.size();
 
         for (int i = n - period; i < n; i++) {
-            TradingCore.Candle cur = candles.get(i);
-            TradingCore.Candle prev = candles.get(i - 1);
+            com.bot.TradingCore.Candle cur = candles.get(i);
+            com.bot.TradingCore.Candle prev = candles.get(i - 1);
 
             double tr = Math.max(cur.high - cur.low,
                     Math.max(Math.abs(cur.high - prev.close),
@@ -538,7 +538,7 @@ public final class PumpHunter {
         return sum / period;
     }
 
-    private double averageVolume(List<TradingCore.Candle> candles, int lookback) {
+    private double averageVolume(List<com.bot.TradingCore.Candle> candles, int lookback) {
         if (candles == null || candles.size() < lookback + 1) return 1;
 
         double sum = 0;
