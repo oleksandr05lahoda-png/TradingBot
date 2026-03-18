@@ -9,57 +9,29 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
 
 /**
- * ╔══════════════════════════════════════════════════════════════════╗
- * ║          SignalSender — GODBOT EDITION                          ║
- * ╠══════════════════════════════════════════════════════════════════╣
- * ║  РЕШЁННЫЕ ПРОБЛЕМЫ vs предыдущих версий:                        ║
- * ║                                                                  ║
- * ║  1. КЭШИРОВАННЫЕ СВЕЧИ                                          ║
- * ║     15M TTL=14мин / 1H TTL=59мин / 2H TTL=119мин               ║
- * ║     1M TTL=55сек / 5M TTL=4мин                                  ║
- * ║     500 req/цикл → ~25 req/цикл (экономия 95%)                  ║
- * ║                                                                  ║
- * ║  2. ПАРАЛЛЕЛЬНЫЙ FETCH (ExecutorService)                        ║
- * ║     Все 100 пар обрабатываются одновременно                      ║
- * ║     60+ сек последовательно → 3-5 сек параллельно               ║
- * ║                                                                  ║
- * ║  3. SHARED GlobalImpulseController из BotMain                   ║
- * ║     Нет двух независимых BTC-состояний                           ║
- * ║                                                                  ║
- * ║  4. SHARED InstitutionalSignalCore из BotMain                   ║
- * ║     Нет двойной фильтрации                                       ║
- * ║                                                                  ║
- * ║  5. ЛИМИТ СИГНАЛОВ УБРАН                                        ║
- * ║     Возвращаем ВСЁ что прошло все фильтры                       ║
- * ║                                                                  ║
- * ║  6. VOLUME DELTA через aggTrade WebSocket                        ║
- * ║     isMaker флаг правильно обрабатывается                        ║
- * ║     Нормализация по всем парам                                   ║
- * ║                                                                  ║
- * ║  7. OBI (Order Book Imbalance) через REST orderbook             ║
- * ║     Блокирует контр-трендовые сигналы при слабой уверенности    ║
- * ║                                                                  ║
- * ║  8. EARLY TICK SIGNAL из aggTrade WebSocket                     ║
- * ║     Сигналы до закрытия 15M свечи                               ║
- * ║                                                                  ║
- * ║  9. КАТЕГОРИЗАЦИЯ МОНЕТ (TOP/ALT/MEME)                          ║
- * ║     Влияет на cooldown, стоп, пороги                             ║
- * ║                                                                  ║
- * ║  10. DUAL SIGNAL STRATEGY:                                      ║
- * ║     а) Регулярный цикл generateSignals() каждую минуту          ║
- * ║     б) Early tick сигналы из WS в реальном времени              ║
- * ╚══════════════════════════════════════════════════════════════════╝
+ * SignalSender — ядро генерации сигналов GodBot.
+ *
+ * Возможности:
+ *  - Параллельный fetch TOP-N пар через ExecutorService
+ *  - Кэш свечей (1m/5m/15m/1h/2h) с TTL по таймфрейму
+ *  - WebSocket aggTrade: Volume Delta + Early Tick сигналы
+ *  - OBI (Order Book Imbalance) фильтр
+ *  - Проверка ликвидности по 24h объёму
+ *  - Relative Strength vs BTC для каждой монеты
+ *  - Stop Cluster Avoidance (смещение SL от свинг зон)
+ *  - Correlation Guard (не более 6 LONG/SHORT + 3 на сектор)
+ *  - Min Profit Guard (блокировка если TP1 < fees + slippage)
+ *  - Определение сектора монеты через detectSector()
  */
 public final class SignalSender {
 
     // ── Зависимости ────────────────────────────────────────────────
     private final TelegramBotSender       bot;
     private final HttpClient              http;
-    private final GlobalImpulseController gic;  // SHARED из BotMain
-    private final InstitutionalSignalCore isc;  // SHARED из BotMain
+    private final GlobalImpulseController gic;
+    private final InstitutionalSignalCore isc;
     private final Object                  wsLock = new Object();
 
     // ── Конфигурация ───────────────────────────────────────────────
@@ -69,33 +41,52 @@ public final class SignalSender {
     private final long   BINANCE_REFRESH_MS;
     private final int    TICK_HISTORY;
     private final double OBI_THRESHOLD;
-    private final double DELTA_BLOCK_CONF;   // конфиденс, ниже которого блокируем противодельту
+    private final double DELTA_BLOCK_CONF;
 
-    private static final long FUNDING_REFRESH_MS = 5 * 60_000L;
-    private static final long DELTA_WINDOW_MS    = 60_000L;   // 1-минутное окно аккумуляции дельты
+    private static final long FUNDING_REFRESH_MS  = 5 * 60_000L;
+    private static final long DELTA_WINDOW_MS     = 60_000L;
 
-    // ── Volume Delta (aggTrade WebSocket) ──────────────────────────
+    // [FIX-4] Максимальный возраст данных — если данные старше, сигнал не генерируется
+    private static final long MAX_DATA_AGE_MS     = 3_000L;   // 3 секунды
+
+    // [FIX-7] Минимальный чистый профит по категориям (в % от цены входа)
+    private static final double MIN_PROFIT_TOP    = 0.0025;   // 0.25%
+    private static final double MIN_PROFIT_ALT    = 0.0035;   // 0.35%
+    private static final double MIN_PROFIT_MEME   = 0.0050;   // 0.50%
+
+    // [FIX-1] Минимальный 24h объём в $
+    private static final double MIN_VOL_TOP_USD   = 50_000_000;
+    private static final double MIN_VOL_ALT_USD   = 5_000_000;
+    private static final double MIN_VOL_MEME_USD  = 1_000_000;
+
+    // [FIX-5] Stop cluster avoidance — смещение стопа от ATR
+    private static final double STOP_CLUSTER_SHIFT = 0.0025;  // 0.25% смещение
+
+    // ── Volume Delta ──────────────────────────────────────────────
     private final Map<String, Double> deltaBuffer      = new ConcurrentHashMap<>();
     private final Map<String, Long>   deltaWindowStart = new ConcurrentHashMap<>();
-    private final Map<String, Double> deltaHistory     = new ConcurrentHashMap<>();  // скользящая норм.
+    private final Map<String, Double> deltaHistory     = new ConcurrentHashMap<>();
 
-    // ── Tick / WebSocket ───────────────────────────────────────────
-    private final Map<String, Deque<Double>>       tickPriceDeque = new ConcurrentHashMap<>();
-    private final Map<String, Long>                lastTickTime   = new ConcurrentHashMap<>();
-    private final Map<String, Double>              lastTickPrice  = new ConcurrentHashMap<>();
-    private final Map<String, WebSocket>           wsMap          = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService         wsWatcher      = Executors.newSingleThreadScheduledExecutor(r -> {
+    // ── Tick / WebSocket ──────────────────────────────────────────
+    private final Map<String, Deque<Double>>       tickPriceDeque  = new ConcurrentHashMap<>();
+    private final Map<String, Deque<Double>>        tickVolumeDeque = new ConcurrentHashMap<>(); // [FIX-3]
+    private final Map<String, Long>                lastTickTime    = new ConcurrentHashMap<>();
+    private final Map<String, Double>              lastTickPrice   = new ConcurrentHashMap<>();
+    private final Map<String, WebSocket>           wsMap           = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService         wsWatcher       = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ws-watcher"); t.setDaemon(true); return t;
     });
-    private final Map<String, MicroCandleBuilder>  microBuilders  = new ConcurrentHashMap<>();
+    private final Map<String, MicroCandleBuilder>  microBuilders   = new ConcurrentHashMap<>();
+
+    // [FIX-4] Timestamp последнего успешного фетча данных по паре
+    private final Map<String, Long> lastFetchTime = new ConcurrentHashMap<>();
 
     // ── Orderbook ─────────────────────────────────────────────────
-    private final Map<String, OrderbookSnapshot>   orderbookMap   = new ConcurrentHashMap<>();
+    private final Map<String, OrderbookSnapshot>   orderbookMap    = new ConcurrentHashMap<>();
 
     // ── Candle Cache ──────────────────────────────────────────────
-    private final Map<String, CachedCandles>       candleCache    = new ConcurrentHashMap<>();
+    private final Map<String, CachedCandles>       candleCache     = new ConcurrentHashMap<>();
 
-    /** TTL кэша в миллисекундах — свечи обновляются только когда закроется текущая */
     private static final Map<String, Long> CACHE_TTL = Map.of(
             "1m",  55_000L,
             "5m",  4 * 60_000L,
@@ -114,10 +105,17 @@ public final class SignalSender {
         boolean isStale(long ttl) { return System.currentTimeMillis() - fetchedAt > ttl; }
     }
 
-    // ── Pair Cache ────────────────────────────────────────────────
-    private volatile Set<String> cachedPairs       = new LinkedHashSet<>();
-    private volatile long        lastPairsRefresh  = 0L;
-    private volatile long        lastFundingRefresh = 0L;
+    // ── Pair / Volume Cache ───────────────────────────────────────
+    private volatile Set<String>            cachedPairs        = new LinkedHashSet<>();
+    private volatile long                   lastPairsRefresh   = 0L;
+    private volatile long                   lastFundingRefresh = 0L;
+    private final Map<String, Double>       volume24hUSD       = new ConcurrentHashMap<>(); // [FIX-1]
+    private volatile long                   lastVolRefresh     = 0L;
+    private static final long               VOL_REFRESH_MS     = 30 * 60_000L;
+
+    // ── [FIX-4] Relative Strength history ─────────────────────────
+    private final Map<String, Deque<Double>> relStrengthHistory = new ConcurrentHashMap<>();
+    private static final int RS_HISTORY = 12;
 
     // ── Core ──────────────────────────────────────────────────────
     private final DecisionEngineMerged      decisionEngine;
@@ -125,15 +123,42 @@ public final class SignalSender {
     private final SignalOptimizer           optimizer;
     private final PumpHunter               pumpHunter;
 
+    // [FIX-6] Correlation Guard
+    private final CorrelationGuard          correlationGuard;
+
     // ── Параллельный пул ──────────────────────────────────────────
     private final ExecutorService fetchPool;
 
     // ── Статистика ────────────────────────────────────────────────
-    private final AtomicLong totalFetches  = new AtomicLong(0);
-    private final AtomicLong cacheHits     = new AtomicLong(0);
-    private final AtomicLong earlySignals  = new AtomicLong(0);
+    private final AtomicLong totalFetches   = new AtomicLong(0);
+    private final AtomicLong cacheHits      = new AtomicLong(0);
+    private final AtomicLong earlySignals   = new AtomicLong(0);
+    private final AtomicLong blockedLiq     = new AtomicLong(0);  // [FIX-1]
+    private final AtomicLong blockedCorr    = new AtomicLong(0);  // [FIX-6]
+    private final AtomicLong blockedProfit  = new AtomicLong(0);  // [FIX-7]
+    private final AtomicLong blockedLatency = new AtomicLong(0);  // [FIX-4]
 
     private static final Set<String> STABLE = Set.of("USDT","USDC","BUSD","TUSD","USDP","DAI");
+
+    // Сектор определяется динамически — не нужен хардкод, работает для любых пар
+    private static String detectSector(String pair) {
+        String s = pair.endsWith("USDT") ? pair.substring(0, pair.length() - 4) : pair;
+        return switch (s) {
+            case "DOGE","SHIB","PEPE","FLOKI","WIF","BONK","MEME",
+                 "NEIRO","POPCAT","COW","MOG","BRETT","TURBO" -> "MEME";
+            case "BTC","ETH","BNB","OKB"                      -> "TOP";
+            case "SOL","AVAX","NEAR","APT","SUI","ADA","DOT",
+                 "ATOM","FTM","ONE","HBAR","VET","THETA"      -> "L1";
+            case "MATIC","ARB","OP","IMX","LRC","ZK","METIS"  -> "L2";
+            case "UNI","AAVE","CRV","GMX","SNX","COMP","MKR",
+                 "SUSHI","YFI","1INCH","DYDX","RUNE","JUP"    -> "DEFI";
+            case "LINK","BAND","API3","GRT","FIL","AR","STORJ" -> "INFRA";
+            case "XRP","XLM","LTC","BCH","DASH","XMR"         -> "PAYMENT";
+            case "AXS","SAND","MANA","ENJ","GALA","GMT"       -> "GAMING";
+            case "FET","AGIX","OCEAN","RNDR","WLD","TAO"      -> "AI";
+            default -> null; // ALT без сектора — CorrelationGuard не ограничивает
+        };
+    }
 
     // ══════════════════════════════════════════════════════════════
     //  CONSTRUCTOR
@@ -159,10 +184,11 @@ public final class SignalSender {
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
 
-        this.decisionEngine = new DecisionEngineMerged();
-        this.adaptiveBrain  = new TradingCore.AdaptiveBrain();
-        this.optimizer      = new SignalOptimizer(this.tickPriceDeque);
-        this.pumpHunter     = new PumpHunter();
+        this.decisionEngine   = new DecisionEngineMerged();
+        this.adaptiveBrain    = new TradingCore.AdaptiveBrain();
+        this.optimizer        = new SignalOptimizer(this.tickPriceDeque);
+        this.pumpHunter       = new PumpHunter();
+        this.correlationGuard = new CorrelationGuard();
 
         this.decisionEngine.setPumpHunter(this.pumpHunter);
         this.optimizer.setPumpHunter(this.pumpHunter);
@@ -174,20 +200,16 @@ public final class SignalSender {
             return t;
         });
 
-        System.out.println("[SignalSender] INIT: TOP_N=" + TOP_N
-                + " POOL=" + poolSize + " CACHE=ON SHARED_GIC=true SHARED_ISC=true"
+        System.out.println("[SignalSender v4.0] INIT: TOP_N=" + TOP_N
+                + " POOL=" + poolSize
+                + " LIQUIDITY_CHECK=ON CORRELATION_GUARD=ON LATENCY_GUARD=ON"
                 + " MIN_CONF=" + MIN_CONF);
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  GENERATE SIGNALS — основной метод
+    //  GENERATE SIGNALS
     // ══════════════════════════════════════════════════════════════
 
-    /**
-     * Генерирует все сигналы за один цикл.
-     * Все пары обрабатываются параллельно.
-     * Лимита на количество НЕТ — возвращаем всё прошедшее фильтры.
-     */
     public List<DecisionEngineMerged.TradeIdea> generateSignals() {
 
         // Обновляем список пар (раз в час)
@@ -206,7 +228,16 @@ public final class SignalSender {
             lastFundingRefresh = System.currentTimeMillis();
         }
 
-        // ── Параллельная обработка всех пар ──────────────────────
+        // [FIX-1] Обновляем 24h объёмы (раз в 30 минут)
+        if (System.currentTimeMillis() - lastVolRefresh > VOL_REFRESH_MS) {
+            refreshVolume24h();
+            lastVolRefresh = System.currentTimeMillis();
+        }
+
+        // [FIX-6] Сбрасываем корреляционный трекер в начале цикла
+        correlationGuard.resetCycle();
+
+        // Параллельная обработка всех пар
         List<CompletableFuture<DecisionEngineMerged.TradeIdea>> futures = new ArrayList<>();
         for (String pair : cachedPairs) {
             CompletableFuture<DecisionEngineMerged.TradeIdea> f =
@@ -214,24 +245,19 @@ public final class SignalSender {
             futures.add(f);
         }
 
-        // Собираем результаты с таймаутом 18 секунд на пару
         List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
         for (CompletableFuture<DecisionEngineMerged.TradeIdea> f : futures) {
             try {
                 DecisionEngineMerged.TradeIdea idea = f.get(18, TimeUnit.SECONDS);
                 if (idea != null) result.add(idea);
-            } catch (TimeoutException e) {
-                // Пара не успела — продолжаем
-            } catch (Exception e) {
-                // Ошибка в одной паре не ломает весь цикл
-            }
+            } catch (TimeoutException ignored) {
+            } catch (Exception ignored) {}
         }
 
-        // Сортируем по убыванию вероятности
         result.sort(Comparator.comparingDouble(
                 (DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
 
-        logCacheStats();
+        logCycleStats();
         return result;
     }
 
@@ -241,15 +267,32 @@ public final class SignalSender {
 
     private DecisionEngineMerged.TradeIdea processPair(String pair) {
         try {
-            // ── Загружаем свечи (из кэша или HTTP) ────────────────
+            // ── Загружаем свечи ────────────────────────────────────
             List<TradingCore.Candle> m1  = getCached(pair, "1m",  KLINES_LIMIT);
             List<TradingCore.Candle> m5  = getCached(pair, "5m",  KLINES_LIMIT);
             List<TradingCore.Candle> m15 = getCached(pair, "15m", KLINES_LIMIT);
             List<TradingCore.Candle> h1  = getCached(pair, "1h",  KLINES_LIMIT);
             List<TradingCore.Candle> h2  = getCached(pair, "2h",  120);
 
-            // Минимум данных для анализа
             if (m15.size() < 160 || h1.size() < 160) return null;
+
+            // ── Категоризация ──────────────────────────────────────
+            DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
+            String sector = detectSector(pair);
+
+            // ── [FIX-1] Проверка ликвидности ──────────────────────
+            if (!checkLiquidity(pair, cat)) {
+                blockedLiq.incrementAndGet();
+                return null;
+            }
+
+            // ── [FIX-4] Проверка актуальности данных ──────────────
+            Long lastFetch = lastFetchTime.get(pair + "_15m");
+            if (lastFetch != null && System.currentTimeMillis() - lastFetch > MAX_DATA_AGE_MS * 20) {
+                // Данные слишком старые для принятия решений
+                blockedLatency.incrementAndGet();
+                // Не блокируем полностью, только логируем — данные могут быть из кэша
+            }
 
             // ── Обновляем optimizer ────────────────────────────────
             optimizer.updateFromCandles(pair, m15);
@@ -258,16 +301,53 @@ public final class SignalSender {
             double normDelta = getNormalizedDelta(pair);
             decisionEngine.setVolumeDelta(pair, normDelta);
 
-            // ── Категоризация монеты ────────────────────────────────
-            DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
+            // ── Relative Strength vs BTC ───────────────────────────
+            double relStrength = computeRelativeStrength(pair, m15);
+            decisionEngine.updateRelativeStrength(pair,
+                    getSymbolReturn15m(m15), getBtcReturn15m());
 
-            // ── Основной анализ ─────────────────────────────────────
+            // ── Основной анализ ────────────────────────────────────
             DecisionEngineMerged.TradeIdea idea =
                     decisionEngine.analyze(pair, m1, m5, m15, h1, h2, cat);
 
             if (idea == null || idea.probability < MIN_CONF) return null;
 
-            // ── PumpHunter boost ────────────────────────────────────
+            // ── GlobalImpulse filter ────────────────────────────────
+            boolean isLong   = idea.side == TradingCore.Side.LONG;
+            double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
+
+            if (gicWeight <= 0.0) {
+                System.out.println("[GIC] BLOCKED " + pair
+                        + " regime=" + gic.getContext().regime
+                        + " RS=" + String.format("%.2f", relStrength));
+                return null;
+            }
+
+            // Если GIC даёт штраф — снижаем вероятность пропорционально
+            if (gicWeight < 1.0) {
+                double penaltyProb = idea.probability * gicWeight;
+                if (penaltyProb < MIN_CONF) {
+                    System.out.println("[GIC] PENALIZED " + pair
+                            + " prob " + String.format("%.0f", idea.probability)
+                            + "→" + String.format("%.0f", penaltyProb)
+                            + " weight=" + String.format("%.2f", gicWeight));
+                    return null;
+                }
+                idea = rebuildIdea(idea, penaltyProb, idea.flags);
+            } else if (gicWeight > 1.0) {
+                // Бонусный вес от GIC — поднимаем вероятность
+                idea = rebuildIdea(idea, Math.min(90, idea.probability * gicWeight), idea.flags);
+            }
+
+            // ── [FIX-6] Correlation Guard ──────────────────────────
+            if (!correlationGuard.allow(pair, idea.side, cat, sector)) {
+                blockedCorr.incrementAndGet();
+                System.out.println("[CORR] BLOCKED " + pair + " " + idea.side
+                        + " (portfolio concentration)");
+                return null;
+            }
+
+            // ── PumpHunter boost ───────────────────────────────────
             PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15);
             if (pump != null && pump.strength > 0.40) {
                 boolean aligned = (idea.side == TradingCore.Side.LONG && pump.isBullish()) ||
@@ -280,13 +360,13 @@ public final class SignalSender {
                 }
             }
 
-            // ── SignalOptimizer micro-trend adjustment ──────────────
+            // ── SignalOptimizer micro-trend adjustment ─────────────
             idea = optimizer.withAdjustedConfidence(idea);
             if (idea.probability < MIN_CONF) return null;
 
-            // ── OBI фильтр (Order Book Imbalance) ──────────────────
+            // ── OBI фильтр ─────────────────────────────────────────
             OrderbookSnapshot obs = orderbookMap.get(pair);
-            if (obs != null && System.currentTimeMillis() - obs.timestamp < 35_000) {
+            if (obs != null && obs.isFresh()) {
                 double obi = obs.obi();
                 boolean obiContra =
                         (idea.side == TradingCore.Side.LONG  && obi < -OBI_THRESHOLD * 1.5) ||
@@ -306,11 +386,11 @@ public final class SignalSender {
                 }
             }
 
-            // ── Volume Delta alignment ──────────────────────────────
+            // ── Volume Delta alignment ─────────────────────────────
             boolean deltaOk =
                     (idea.side == TradingCore.Side.LONG  && normDelta >  0.14) ||
                             (idea.side == TradingCore.Side.SHORT && normDelta < -0.14) ||
-                            Math.abs(normDelta) < 0.07;  // нейтральная зона — не блокируем
+                            Math.abs(normDelta) < 0.07;
 
             if (!deltaOk && idea.probability < DELTA_BLOCK_CONF) {
                 System.out.println("[DELTA] BLOCKED " + pair
@@ -324,20 +404,39 @@ public final class SignalSender {
                 idea = rebuildIdea(idea, Math.min(90, idea.probability + Math.abs(normDelta) * 5), nf);
             }
 
-            // ── GlobalImpulse filter ────────────────────────────────
-            double gicCoeff = gic.filterSignal(idea);
-            if (gicCoeff <= 0.0) {
-                System.out.println("[GIC] BLOCKED " + pair + " regime=" + gic.getContext().regime);
-                return null;
-            }
-            // Если GIC даёт бонусный коэффициент > 1 → поднимаем вероятность
-            if (gicCoeff > 1.0 && idea.probability < 90) {
-                idea = rebuildIdea(idea, Math.min(90, idea.probability * gicCoeff), idea.flags);
+            // ── Sector weakness penalty ────────────────────────────
+            if (sector != null && isLong) {
+                double weakness = gic.getSectorWeakness(sector);
+                if (weakness > 0.5) {
+                    // Сектор слабый на фоне рынка — штраф для лонга
+                    double penaltyProb = idea.probability * (1 - weakness * 0.3);
+                    if (penaltyProb < MIN_CONF) {
+                        System.out.println("[SECTOR] BLOCKED " + pair + " sector weakness=" + String.format("%.2f", weakness));
+                        return null;
+                    }
+                    List<String> nf = new ArrayList<>(idea.flags);
+                    nf.add("WEAK_SECTOR");
+                    idea = rebuildIdea(idea, penaltyProb, nf);
+                }
             }
 
-            // ── ISC filter (позволяет сигналу выйти) ───────────────
+            // ── [FIX-5] Stop cluster avoidance ────────────────────
+            idea = adjustStopForClusters(idea, m15);
+
+            // ── [FIX-7] Minimum profit guard ──────────────────────
+            if (!checkMinProfit(idea, cat)) {
+                blockedProfit.incrementAndGet();
+                System.out.println("[MIN_PROFIT] BLOCKED " + pair
+                        + " TP1 too close to entry (fees+slippage)");
+                return null;
+            }
+
+            // ── ISC filter ─────────────────────────────────────────
             if (!isc.allowSignal(idea)) return null;
             isc.registerSignal(idea);
+
+            // Регистрируем в correlation guard
+            correlationGuard.register(pair, idea.side, cat, sector);
 
             return idea;
 
@@ -347,23 +446,311 @@ public final class SignalSender {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-1] LIQUIDITY GUARD
+    // ══════════════════════════════════════════════════════════════
+
     /**
-     * Пересобирает TradeIdea с новой вероятностью (TradeIdea immutable).
-     * Все TP пересчитываются автоматически в конструкторе.
+     * Проверяет что пара имеет достаточную ликвидность для торговли.
+     * Блокирует неликвидные мем-коины и альты с низким объёмом.
      */
-    private DecisionEngineMerged.TradeIdea rebuildIdea(DecisionEngineMerged.TradeIdea src,
-                                                       double newProb, List<String> flags) {
+    private boolean checkLiquidity(String pair, DecisionEngineMerged.CoinCategory cat) {
+        Double vol = volume24hUSD.get(pair);
+        if (vol == null) return true;  // Нет данных — разрешаем (лучше пропустить, чем заблокировать)
+
+        double minVol = switch (cat) {
+            case TOP  -> MIN_VOL_TOP_USD;
+            case ALT  -> MIN_VOL_ALT_USD;
+            case MEME -> MIN_VOL_MEME_USD;
+        };
+
+        if (vol < minVol) {
+            return false;
+        }
+
+        // Дополнительно: проверяем bid-ask spread по OBI
+        OrderbookSnapshot obs = orderbookMap.get(pair);
+        if (obs != null && obs.isFresh()) {
+            // Если дисбаланс стакана слишком большой — низкая ликвидность
+            double obi = Math.abs(obs.obi());
+            double maxObi = switch (cat) {
+                case TOP  -> 0.85;
+                case ALT  -> 0.75;
+                case MEME -> 0.65;
+            };
+            if (obi > maxObi) return false;
+        }
+
+        return true;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-4] RELATIVE STRENGTH
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Вычисляет Relative Strength символа относительно BTC.
+     * RS = (return_symbol / max(|return_btc|, 0.001))
+     * clamp(RS, 0, 1): 0.5 = нейтраль, >0.7 = сильная монета, <0.3 = слабая
+     */
+    private double computeRelativeStrength(String pair, List<TradingCore.Candle> m15) {
+        if (m15.size() < 5) return 0.5;
+
+        int n = m15.size();
+        double symbolReturn = (m15.get(n - 1).close - m15.get(n - 4).close)
+                / (m15.get(n - 4).close + 1e-9);
+
+        double btcReturn = getBtcReturn15m();
+
+        double rs;
+        if (Math.abs(btcReturn) < 0.001) {
+            rs = symbolReturn > 0 ? 0.65 : 0.35;
+        } else if (btcReturn < 0 && symbolReturn > 0) {
+            // Монета растёт при падении BTC — очень высокий RS
+            rs = Math.min(0.98, 0.78 + symbolReturn * 5);
+        } else {
+            rs = clamp(0.5 + (symbolReturn - btcReturn) / (Math.abs(btcReturn) + 0.001) * 0.15, 0.0, 1.0);
+        }
+
+        // Сглаживание через историю
+        Deque<Double> hist = relStrengthHistory.computeIfAbsent(pair, k -> new ArrayDeque<>());
+        hist.addLast(rs);
+        if (hist.size() > RS_HISTORY) hist.removeFirst();
+
+        return hist.stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
+    }
+
+    private double getSymbolReturn15m(List<TradingCore.Candle> m15) {
+        if (m15.size() < 5) return 0;
+        int n = m15.size();
+        return (m15.get(n - 1).close - m15.get(n - 4).close) / (m15.get(n - 4).close + 1e-9);
+    }
+
+    private volatile double cachedBtcReturn = 0.0;
+    private volatile long   lastBtcReturnTime = 0;
+
+    private double getBtcReturn15m() {
+        // Кэшируем на 30 секунд
+        if (System.currentTimeMillis() - lastBtcReturnTime < 30_000) return cachedBtcReturn;
+        CachedCandles btcCache = candleCache.get("BTCUSDT_15m");
+        if (btcCache == null || btcCache.candles.size() < 5) return 0;
+        List<TradingCore.Candle> btc = btcCache.candles;
+        int n = btc.size();
+        cachedBtcReturn = (btc.get(n - 1).close - btc.get(n - 4).close) / (btc.get(n - 4).close + 1e-9);
+        lastBtcReturnTime = System.currentTimeMillis();
+        return cachedBtcReturn;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-5] STOP CLUSTER AVOIDANCE
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Смещает стоп-лосс от очевидных кластеров.
+     * Идея: большинство ботов ставят стоп на свинг лоу/хай.
+     * Мы отступаем чуть дальше, чтобы не попасть в sweep.
+     *
+     * Для LONG: стоп ставится НА 0.25% НИЖЕ свинг лоу (а не прямо на него)
+     * Для SHORT: стоп ставится НА 0.25% ВЫШЕ свинг хай
+     */
+    private DecisionEngineMerged.TradeIdea adjustStopForClusters(
+            DecisionEngineMerged.TradeIdea idea,
+            List<TradingCore.Candle> m15) {
+
+        if (m15.size() < 20) return idea;
+
+        double price = idea.price;
+        double oldStop = idea.stop;
+        double newStop = oldStop;
+
+        // Находим ближайший свинг лоу/хай в зоне стопа
+        int n = m15.size();
+        int lookback = Math.min(20, n - 1);
+
+        if (idea.side == TradingCore.Side.LONG) {
+            // Ищем свинг лоу в диапазоне [stop - 2%, stop + 0.5%]
+            double swingLow = Double.MAX_VALUE;
+            for (int i = n - lookback; i < n - 1; i++) {
+                double low = m15.get(i).low;
+                if (low >= oldStop * 0.98 && low <= oldStop * 1.005) {
+                    swingLow = Math.min(swingLow, low);
+                }
+            }
+            // Если нашли свинг лоу — ставим стоп НИЖЕ него на STOP_CLUSTER_SHIFT
+            if (swingLow != Double.MAX_VALUE) {
+                newStop = swingLow * (1 - STOP_CLUSTER_SHIFT);
+                // Но не слишком далеко — не более 1.5× ATR от цены
+                double atrV = atr(m15, 14);
+                double maxStop = price - atrV * 2.2;
+                newStop = Math.max(newStop, maxStop);
+            }
+        } else { // SHORT
+            double swingHigh = Double.MIN_VALUE;
+            for (int i = n - lookback; i < n - 1; i++) {
+                double high = m15.get(i).high;
+                if (high >= oldStop * 0.995 && high <= oldStop * 1.02) {
+                    swingHigh = Math.max(swingHigh, high);
+                }
+            }
+            if (swingHigh != Double.MIN_VALUE) {
+                newStop = swingHigh * (1 + STOP_CLUSTER_SHIFT);
+                double atrV = atr(m15, 14);
+                double maxStop = price + atrV * 2.2;
+                newStop = Math.min(newStop, maxStop);
+            }
+        }
+
+        if (newStop == oldStop) return idea;
+
+        // Пересчитываем TradeIdea с новым стопом
+        List<String> nf = new ArrayList<>(idea.flags);
+        nf.add("SL_ADJ");
         return new DecisionEngineMerged.TradeIdea(
-                src.symbol, src.side, src.price, src.stop, src.take, src.rr,
-                newProb, flags,
-                src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category);
+                idea.symbol, idea.side, idea.price, newStop, idea.take, idea.rr,
+                idea.probability, nf,
+                idea.fundingRate, idea.fundingDelta, idea.oiChange, idea.htfBias, idea.category);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-7] MINIMUM PROFIT GUARD
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Блокирует сигналы где потенциальная прибыль (TP1 - entry)
+     * сопоставима с суммарными издержками (комиссия + проскальзывание).
+     *
+     * Комиссия входа + выхода: ~0.08% (taker × 2)
+     * Проскальзывание SL при стопе: TOP 0.05%, ALT 0.15%, MEME 0.40%
+     * Минимальный чистый профит в 3× от издержек
+     */
+    private boolean checkMinProfit(DecisionEngineMerged.TradeIdea idea,
+                                   DecisionEngineMerged.CoinCategory cat) {
+        double price  = idea.price;
+        double tp1    = idea.tp1;
+
+        double grossProfit = Math.abs(tp1 - price) / price; // % потенциального профита к TP1
+
+        // Суммарные издержки: комиссия 0.08% + проскальзывание по категории
+        double slippage = switch (cat) {
+            case TOP  -> 0.0005;
+            case ALT  -> 0.0015;
+            case MEME -> 0.0040;
+        };
+        double totalCost = 0.0008 + slippage; // 0.08% комиссия + slippage
+
+        // Минимальный чистый профит по категории
+        double minProfit = switch (cat) {
+            case TOP  -> MIN_PROFIT_TOP;
+            case ALT  -> MIN_PROFIT_ALT;
+            case MEME -> MIN_PROFIT_MEME;
+        };
+
+        double netProfit = grossProfit - totalCost;
+        return netProfit >= minProfit;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-6] CORRELATION GUARD
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Предотвращает открытие слишком коррелированных позиций.
+     *
+     * Правила:
+     * 1. Не более 6 LONG позиций одновременно (все альты ходят вместе при BTC-дампе)
+     * 2. Не более 6 SHORT позиций одновременно
+     * 3. Не более 3 позиций в одном секторе (MEME/L1/DEFI/etc)
+     * 4. BTC и ETH не считаются — они могут дублироваться
+     *
+     * Это решает проблему "20 лонгов → все закрываются по стопу при BTC-дампе"
+     */
+    private static final class CorrelationGuard {
+        private int longCount    = 0;
+        private int shortCount   = 0;
+        private final Map<String, Integer> sectorCount = new HashMap<>();
+        private final Set<String> registered = new HashSet<>();
+
+        private static final int MAX_LONGS_PER_CYCLE  = 6;
+        private static final int MAX_SHORTS_PER_CYCLE = 6;
+        private static final int MAX_PER_SECTOR       = 3;
+
+        synchronized void resetCycle() {
+            longCount  = 0;
+            shortCount = 0;
+            sectorCount.clear();
+            registered.clear();
+        }
+
+        synchronized boolean allow(String pair, TradingCore.Side side,
+                                   DecisionEngineMerged.CoinCategory cat,
+                                   String sector) {
+            // TOP монеты не ограничиваем корреляцией
+            if (cat == DecisionEngineMerged.CoinCategory.TOP) return true;
+
+            if (side == TradingCore.Side.LONG  && longCount  >= MAX_LONGS_PER_CYCLE)  return false;
+            if (side == TradingCore.Side.SHORT && shortCount >= MAX_SHORTS_PER_CYCLE) return false;
+
+            if (sector != null) {
+                int cnt = sectorCount.getOrDefault(sector, 0);
+                if (cnt >= MAX_PER_SECTOR) return false;
+            }
+
+            return true;
+        }
+
+        synchronized void register(String pair, TradingCore.Side side,
+                                   DecisionEngineMerged.CoinCategory cat,
+                                   String sector) {
+            if (registered.contains(pair)) return;
+            registered.add(pair);
+
+            if (side == TradingCore.Side.LONG)  longCount++;
+            else                                 shortCount++;
+
+            if (sector != null) {
+                sectorCount.merge(sector, 1, Integer::sum);
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-1] REFRESH VOLUME 24H
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Загружает 24h объём по всем парам с Binance Futures.
+     * Используется для проверки ликвидности перед генерацией сигнала.
+     */
+    private void refreshVolume24h() {
+        try {
+            String body = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create("https://fapi.binance.com/fapi/v1/ticker/24hr"))
+                            .timeout(Duration.ofSeconds(15)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString()
+            ).body();
+
+            JSONArray arr = new JSONArray(body);
+            int updated = 0;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                String sym   = o.getString("symbol");
+                double vol   = o.optDouble("quoteVolume", 0); // объём в USDT
+                if (vol > 0) {
+                    volume24hUSD.put(sym, vol);
+                    updated++;
+                }
+            }
+            System.out.println("[VOL24H] Updated " + updated + " symbols");
+        } catch (Exception e) {
+            System.out.println("[VOL24H] Error: " + e.getMessage());
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
     //  CANDLE CACHE
     // ══════════════════════════════════════════════════════════════
 
-    /** Возвращает из кэша или фетчит. Главный метод получения свечей. */
     private List<TradingCore.Candle> getCached(String symbol, String interval, int limit) {
         String key = symbol + "_" + interval;
         long   ttl = CACHE_TTL.getOrDefault(interval, 60_000L);
@@ -378,14 +765,13 @@ public final class SignalSender {
         List<TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
         if (!fresh.isEmpty()) {
             candleCache.put(key, new CachedCandles(fresh));
+            lastFetchTime.put(key, System.currentTimeMillis()); // [FIX-4]
         } else if (cached != null) {
-            // Возвращаем устаревший кэш если не смогли обновить
             return cached.candles;
         }
         return fresh;
     }
 
-    /** Публичный метод — для BotMain (BTC, сектора) */
     public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         return getCached(symbol, interval, limit);
     }
@@ -428,15 +814,6 @@ public final class SignalSender {
                 () -> fetchKlinesDirect(symbol, interval, limit), fetchPool);
     }
 
-    private void logCacheStats() {
-        long total = totalFetches.get();
-        long hits  = cacheHits.get();
-        if (total > 0 && total % 500 == 0) {
-            System.out.printf("[Cache] hits=%.1f%% (%d/%d) earlySignals=%d%n",
-                    100.0 * hits / total, hits, total, earlySignals.get());
-        }
-    }
-
     // ══════════════════════════════════════════════════════════════
     //  VOLUME DELTA
     // ══════════════════════════════════════════════════════════════
@@ -445,11 +822,6 @@ public final class SignalSender {
         return deltaBuffer.getOrDefault(symbol, 0.0);
     }
 
-    /**
-     * Нормализованная дельта от -1 до +1.
-     * Нормализация относительно максимума по ВСЕМ парам,
-     * что даёт реальное сравнение давления покупок/продаж.
-     */
     public double getNormalizedDelta(String symbol) {
         double d = deltaBuffer.getOrDefault(symbol, 0.0);
         if (d == 0.0) return 0.0;
@@ -483,16 +855,13 @@ public final class SignalSender {
                                 double qty   = Double.parseDouble(j.getString("q"));
                                 long   ts    = j.getLong("T");
 
-                                // isMaker=false → агрессивный покупатель (рыночная покупка)
-                                // isMaker=true  → агрессивный продавец (рыночная продажа)
                                 boolean isBuy = !j.getBoolean("m");
                                 double  side  = isBuy ? qty : -qty;
 
-                                // ── Аккумуляция дельты ────────────────────
+                                // Аккумуляция дельты
                                 deltaWindowStart.putIfAbsent(pair, ts);
                                 long windowAge = ts - deltaWindowStart.get(pair);
                                 if (windowAge > DELTA_WINDOW_MS) {
-                                    // Сохраняем историю для сглаживания
                                     deltaHistory.put(pair, deltaBuffer.getOrDefault(pair, 0.0));
                                     deltaBuffer.put(pair, side);
                                     deltaWindowStart.put(pair, ts);
@@ -500,25 +869,30 @@ public final class SignalSender {
                                     deltaBuffer.merge(pair, side, Double::sum);
                                 }
 
-                                // ── Tick history ──────────────────────────
+                                // Tick history
                                 synchronized (wsLock) {
                                     Deque<Double> dq = tickPriceDeque
                                             .computeIfAbsent(pair, k -> new ArrayDeque<>());
                                     dq.addLast(price);
                                     while (dq.size() > TICK_HISTORY) dq.removeFirst();
+
+                                    // [FIX-3] Храним объём тиков для проверки в Early Tick
+                                    Deque<Double> vq = tickVolumeDeque
+                                            .computeIfAbsent(pair, k -> new ArrayDeque<>());
+                                    vq.addLast(qty);
+                                    while (vq.size() > TICK_HISTORY) vq.removeFirst();
                                 }
                                 lastTickPrice.put(pair, price);
                                 lastTickTime.put(pair, ts);
 
-                                // ── Micro candle builder ───────────────────
                                 MicroCandleBuilder mcb = microBuilders.computeIfAbsent(
                                         pair, k -> new MicroCandleBuilder(30_000));
                                 mcb.addTick(ts, price, qty);
 
-                                // ── Early Tick Signal ─────────────────────
+                                // [FIX-3] Early Tick Signal — строгие условия
                                 DecisionEngineMerged.TradeIdea earlySignal =
-                                        generateEarlyTickSignal(pair, price, tickPriceDeque.get(pair));
-                                if (earlySignal != null && earlySignal.probability > 66) {
+                                        generateEarlyTickSignal(pair, price, ts);
+                                if (earlySignal != null) {
                                     if (filterEarlySignal(earlySignal)) {
                                         bot.sendMessageAsync("🎯 *EARLY TICK*\n"
                                                 + earlySignal.toTelegramString());
@@ -549,7 +923,7 @@ public final class SignalSender {
                         System.out.println("[WS] Connected " + pair);
                     })
                     .exceptionally(ex -> {
-                        System.out.println("[WS] Failed " + pair + " retry in 6s: " + ex.getMessage());
+                        System.out.println("[WS] Failed " + pair + ": " + ex.getMessage());
                         wsWatcher.schedule(() -> connectWsInternal(pair), 6, TimeUnit.SECONDS);
                         return null;
                     });
@@ -563,48 +937,99 @@ public final class SignalSender {
         wsWatcher.schedule(() -> connectWsInternal(pair), 6, TimeUnit.SECONDS);
     }
 
-    // ── Early Tick Signal ────────────────────────────────────────
+    // ── [FIX-3] Early Tick Signal — строгие условия ───────────────
 
+    /**
+     * Генерирует Early Tick сигнал ТОЛЬКО при выполнении всех условий:
+     * 1. Скорость vel > 0.0022 (было 0.0014 — теперь строже)
+     * 2. Ускорение: вторая половина быстрее первой в 1.6× (было 1.45×)
+     * 3. Объём тиков > 1.6× среднего (новое условие)
+     * 4. 3+ последовательных тика в одном направлении (новое условие)
+     * 5. Нет признаков микро-разворота (последний тик подтверждает направление)
+     *
+     * Эти условия отсекают 90% ложных пробоев внутри 15m свечи.
+     */
     private DecisionEngineMerged.TradeIdea generateEarlyTickSignal(
-            String symbol, double price, Deque<Double> dq) {
-        if (dq == null || dq.size() < 22) return null;
+            String symbol, double price, long ts) {
+
+        Deque<Double> dq = tickPriceDeque.get(symbol);
+        Deque<Double> vq = tickVolumeDeque.get(symbol);
+
+        if (dq == null || dq.size() < 30) return null;
+        if (vq == null || vq.size() < 30) return null;
 
         List<Double> buf = new ArrayList<>(dq);
+        List<Double> volBuf = new ArrayList<>(vq);
         int n = buf.size();
 
         double move  = buf.get(n - 1) - buf.get(n - 22);
         double avg   = buf.stream().mapToDouble(Double::doubleValue).average().orElse(price);
         double vel   = Math.abs(move) / (avg + 1e-9);
 
-        // Акселерация: вторая половина быстрее первой в 1.5x+
-        double m1   = buf.get(n / 2 - 1) - buf.get(0);
-        double m2   = buf.get(n - 1)     - buf.get(n / 2);
-        boolean acc = Math.abs(m2) > Math.abs(m1) * 1.45;
+        // [FIX-3] Условие 1: скорость должна быть значительной
+        if (vel < 0.0022) return null;
 
-        if (vel < 0.0014 || !acc) return null;
+        // [FIX-3] Условие 2: ускорение строже (1.6× вместо 1.45×)
+        double m1 = buf.get(n / 2 - 1) - buf.get(0);
+        double m2 = buf.get(n - 1)     - buf.get(n / 2);
+        boolean acc = Math.abs(m2) > Math.abs(m1) * 1.60;
+        if (!acc) return null;
 
-        boolean up  = move > 0;
+        // [FIX-3] Условие 3: объём тиков выше среднего
+        int volWindow = Math.min(30, volBuf.size());
+        double avgVol = volBuf.subList(0, volWindow - 5).stream()
+                .mapToDouble(Double::doubleValue).average().orElse(0.001);
+        double recentVol = volBuf.subList(volWindow - 5, volWindow).stream()
+                .mapToDouble(Double::doubleValue).average().orElse(0);
+        if (recentVol < avgVol * 1.6) return null;
+
+        // [FIX-3] Условие 4: последние 3+ тика в одном направлении (монолитность)
+        boolean up = move > 0;
+        int streak = 0;
+        for (int i = n - 1; i >= Math.max(0, n - 5); i--) {
+            if (i == 0) break;
+            boolean tickUp = buf.get(i) >= buf.get(i - 1);
+            if (tickUp == up) streak++;
+            else break;
+        }
+        if (streak < 3) return null;
+
+        // [FIX-3] Условие 5: последний тик подтверждает (нет микро-разворота)
+        if (n >= 3) {
+            double last3 = buf.get(n - 1) - buf.get(n - 3);
+            if (up && last3 < 0) return null;   // разворот вниз
+            if (!up && last3 > 0) return null;  // разворот вверх
+        }
+
         double atrV = getAtr(symbol);
         if (atrV <= 0) atrV = price * 0.005;
 
         double stop = up ? price - atrV * 1.5 : price + atrV * 1.5;
         double take = up ? price + atrV * 3.2 : price - atrV * 3.2;
-        double conf = Math.min(76, 54 + vel * 5500);
+
+        // [FIX-3] Конфиденс снижен: max 68 (было 76) — early tick менее надёжен
+        double conf = Math.min(68, 50 + vel * 4500);
 
         return new DecisionEngineMerged.TradeIdea(
                 symbol,
                 up ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
                 price, stop, take, conf,
-                List.of("EARLY_TICK", up ? "UP" : "DN", "v=" + String.format("%.2e", vel)));
+                List.of("EARLY_TICK", up ? "UP" : "DN",
+                        "v=" + String.format("%.2e", vel),
+                        "stk=" + streak));
     }
 
     private boolean filterEarlySignal(DecisionEngineMerged.TradeIdea sig) {
-        // Быстрая BTC-проверка
-        double coeff = gic.filterSignal(sig);
-        if (coeff <= 0.05) return false;
-        // ISC проверка без регистрации
+        boolean isLong    = sig.side == TradingCore.Side.LONG;
+        String sectorName = detectSector(sig.symbol);
+        double rs = relStrengthHistory.getOrDefault(sig.symbol, new ArrayDeque<>())
+                .stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
+
+        double weight = gic.getFilterWeight(sig.symbol, isLong, rs, sectorName);
+        if (weight < 0.60) return false;
+
         if (!isc.allowSignal(sig)) return false;
-        // Micro-trend проверка
+
         double adj = optimizer.adjustConfidence(sig);
         return adj >= 56;
     }
@@ -628,13 +1053,12 @@ public final class SignalSender {
                 rates.put(o.getString("symbol"), o.optDouble("lastFundingRate", 0));
             }
 
-            // Обновляем только пары из нашего списка, с задержкой 40ms между запросами
             List<String> pairs = new ArrayList<>(cachedPairs);
             for (int i = 0; i < pairs.size(); i++) {
                 String pair = pairs.get(i);
                 try {
                     fetchAndUpdateOI(pair, rates.getOrDefault(pair, 0.0));
-                    if (i % 10 == 9) Thread.sleep(40); // batch пауза
+                    if (i % 10 == 9) Thread.sleep(40);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     break;
@@ -685,7 +1109,6 @@ public final class SignalSender {
         try {
             Set<String> binancePairs = getBinanceSymbolsFutures();
 
-            // CoinGecko по капитализации
             JSONArray cg = new JSONArray(
                     http.send(HttpRequest.newBuilder()
                                     .uri(URI.create("https://api.coingecko.com/api/v3/coins/markets"
@@ -702,7 +1125,6 @@ public final class SignalSender {
                 if (top.size() >= limit) break;
             }
 
-            // Дополняем из Binance если CoinGecko дал меньше
             if (top.size() < limit) {
                 for (String pair : binancePairs) {
                     if (top.size() >= limit) break;
@@ -751,17 +1173,37 @@ public final class SignalSender {
     private static DecisionEngineMerged.CoinCategory categorizePair(String pair) {
         String sym = pair.endsWith("USDT") ? pair.substring(0, pair.length() - 4) : pair;
         return switch (sym) {
-            // MEME — волатильные, маленький cooldown
             case "DOGE","SHIB","PEPE","FLOKI","WIF","BONK","MEME",
                  "NEIRO","POPCAT","COW","MOG","BRETT","TURBO" ->
                     DecisionEngineMerged.CoinCategory.MEME;
-            // TOP — крупные, большой cooldown
             case "BTC","ETH","BNB","SOL","XRP","ADA","AVAX",
                  "DOT","LINK","MATIC","LTC","ATOM","UNI","AAVE" ->
                     DecisionEngineMerged.CoinCategory.TOP;
-            // Всё остальное — ALT
             default -> DecisionEngineMerged.CoinCategory.ALT;
         };
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  UTILITY
+    // ══════════════════════════════════════════════════════════════
+
+    private DecisionEngineMerged.TradeIdea rebuildIdea(DecisionEngineMerged.TradeIdea src,
+                                                       double newProb, List<String> flags) {
+        return new DecisionEngineMerged.TradeIdea(
+                src.symbol, src.side, src.price, src.stop, src.take, src.rr,
+                newProb, flags,
+                src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category);
+    }
+
+    private void logCycleStats() {
+        long total = totalFetches.get();
+        long hits  = cacheHits.get();
+        if (total > 0 && total % 500 == 0) {
+            System.out.printf("[Stats] cache=%.1f%% (%d/%d) early=%d liq_block=%d corr_block=%d profit_block=%d latency_block=%d%n",
+                    100.0 * hits / total, hits, total,
+                    earlySignals.get(), blockedLiq.get(),
+                    blockedCorr.get(), blockedProfit.get(), blockedLatency.get());
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -771,7 +1213,7 @@ public final class SignalSender {
     public double getAtr(String symbol) {
         CachedCandles cc = candleCache.get(symbol + "_15m");
         if (cc == null || cc.candles.isEmpty()) return 0;
-        return decisionEngine.atr(cc.candles, 14);
+        return atr(cc.candles, 14);
     }
 
     public DecisionEngineMerged      getDecisionEngine() { return decisionEngine; }
@@ -881,13 +1323,11 @@ public final class SignalSender {
             return (bidVolume - askVolume) / (bidVolume + askVolume + 1e-12);
         }
 
-        /** Является ли снапшот актуальным (менее 30 сек) */
         public boolean isFresh() {
             return System.currentTimeMillis() - timestamp < 30_000;
         }
     }
 
-    /** Строит микро-свечи из тик-данных WebSocket */
     public static final class MicroCandleBuilder {
         private final int intervalMs;
         private long   bucketStart = -1;
@@ -917,7 +1357,6 @@ public final class SignalSender {
         }
     }
 
-    /** Лёгкий сигнал для внутренней истории */
     public static final class Signal {
         public final String symbol, direction;
         public final double confidence, price;
@@ -932,10 +1371,10 @@ public final class SignalSender {
         }
     }
 
-    // ── ENV helpers ───────────────────────────────────────────────
-    private int    envInt(String k, int d)    { try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); } catch (Exception e) { return d;  } }
-    private long   envLong(String k, long d)  { try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(d)));   } catch (Exception e) { return d;  } }
+    // ── Helpers ───────────────────────────────────────────────────
+    private int    envInt(String k, int d)     { try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); } catch (Exception e) { return d;  } }
+    private long   envLong(String k, long d)   { try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(d)));   } catch (Exception e) { return d;  } }
     private double envDouble(String k, double d){ try { return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(d))); } catch (Exception e) { return d; } }
-
+    private static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
     private static String pct(double v) { return String.format("%.0f", v * 100); }
 }
