@@ -67,8 +67,11 @@ public final class BotMain {
         // Time Stop: уведомляем в Telegram когда сигнал закрывается по времени
         isc.setTimeStopCallback((sym, msg) -> telegram.sendMessageAsync(msg));
 
+        // [v6.0] PanicManager callback — уведомление о режиме паники в Telegram
+        gic.setPanicCallback(msg -> telegram.sendMessageAsync(msg));
+
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ GodBot v3.1 стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ GodBot v6.0 стартовал " + nowWarsawStr() + " ═══");
 
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(
                 1, r -> {
@@ -202,7 +205,7 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "🚀 *GodBot v4.0 запущен*\n"
+        return "🚀 *GodBot v6.0 запущен*\n"
                 + "Таймфрейм: 15M | Пары: TOP-100\n"
                 + "Тихие часы: UTC 02:00–05:30\n"
                 + "Кулдаун: TOP=4m / ALT=3m / MEME=2m\n"

@@ -230,6 +230,7 @@ public final class SignalSender {
         this.correlationGuard = new CorrelationGuard();
 
         this.decisionEngine.setPumpHunter(this.pumpHunter);
+        this.decisionEngine.setGIC(this.gic); // [v6.0] GIC link for crash-aware scoring
         this.optimizer.setPumpHunter(this.pumpHunter);
 
         int poolSize = Math.max(6, Math.min(TOP_N / 4, 25));
@@ -275,6 +276,17 @@ public final class SignalSender {
 
         // [FIX-6] Сбрасываем корреляционный трекер в начале цикла
         correlationGuard.resetCycle();
+
+        // [v6.0] Обновляем GIC быстрыми 5m BTC данными для ранней детекции краша
+        // 5m свечи дают сигнал на 10-15 минут раньше 15m
+        try {
+            List<com.bot.TradingCore.Candle> btc5m = getCached("BTCUSDT", "5m", 30);
+            if (btc5m != null && btc5m.size() >= 10) {
+                gic.updateFast(btc5m);
+            }
+        } catch (Exception e) {
+            System.out.println("[GIC-FAST] BTC 5m update failed: " + e.getMessage());
+        }
 
         // Параллельная обработка всех пар
         List<CompletableFuture<com.bot.DecisionEngineMerged.TradeIdea>> futures = new ArrayList<>();
