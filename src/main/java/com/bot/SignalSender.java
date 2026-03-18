@@ -370,13 +370,15 @@ public final class SignalSender {
                 if (penaltyProb < MIN_CONF) return null;
                 idea = rebuildIdea(idea, penaltyProb, idea.flags);
             } else if (gicWeight > 1.0) {
-                idea = rebuildIdea(idea, Math.min(90, idea.probability * gicWeight), idea.flags);
+                // [v7.0 FIX] Cap at 88 (not 90) to respect DecisionEngine calibration
+                idea = rebuildIdea(idea, Math.min(88, idea.probability * gicWeight), idea.flags);
             }
 
             if (!correlationGuard.allow(pair, idea.side, cat, sector)) {
                 blockedCorr.incrementAndGet(); return null;
             }
 
+            // [v7.0] PumpHunter: diminishing boost, cap 88
             com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15);
             if (pump != null && pump.strength > 0.40) {
                 boolean aligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
@@ -384,13 +386,17 @@ public final class SignalSender {
                 if (aligned) {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("PH_" + pump.type.name());
-                    idea = rebuildIdea(idea, Math.min(90, idea.probability + pump.strength * 9), nf);
+                    // [v7.0] Diminishing: бонус уменьшается чем выше текущая probability
+                    double headroom = 88.0 - idea.probability;
+                    double bonus = Math.min(pump.strength * 6, headroom * 0.5);
+                    idea = rebuildIdea(idea, Math.min(88, idea.probability + bonus), nf);
                 }
             }
 
             idea = optimizer.withAdjustedConfidence(idea);
             if (idea.probability < MIN_CONF) return null;
 
+            // [v7.0] OBI: diminishing boost, cap 88
             OrderbookSnapshot obs = orderbookMap.get(pair);
             if (obs != null && obs.isFresh()) {
                 double obi = obs.obi();
@@ -401,16 +407,21 @@ public final class SignalSender {
                 if (obiAligned) {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("OBI" + String.format("%+.0f", obi * 100));
-                    idea = rebuildIdea(idea, Math.min(90, idea.probability + Math.abs(obi) * 6), nf);
+                    double headroom = 88.0 - idea.probability;
+                    double bonus = Math.min(Math.abs(obi) * 4, headroom * 0.4);
+                    idea = rebuildIdea(idea, Math.min(88, idea.probability + bonus), nf);
                 }
             }
 
+            // [v7.0] Delta: diminishing boost, cap 88
             boolean deltaOk = (isLong && normDelta > 0.14) || (!isLong && normDelta < -0.14) || Math.abs(normDelta) < 0.07;
             if (!deltaOk && idea.probability < DELTA_BLOCK_CONF) return null;
             if (Math.abs(normDelta) > 0.28) {
                 List<String> nf = new ArrayList<>(idea.flags);
                 nf.add("Δ" + (normDelta > 0 ? "BUY" : "SELL") + pct(Math.abs(normDelta)));
-                idea = rebuildIdea(idea, Math.min(90, idea.probability + Math.abs(normDelta) * 5), nf);
+                double headroom = 88.0 - idea.probability;
+                double bonus = Math.min(Math.abs(normDelta) * 3, headroom * 0.35);
+                idea = rebuildIdea(idea, Math.min(88, idea.probability + bonus), nf);
             }
 
             if (sector != null && isLong) {
@@ -864,16 +875,24 @@ public final class SignalSender {
         private int longCount = 0, shortCount = 0;
         private final Map<String, Integer> sectorCount = new HashMap<>();
         private final Set<String> registered = new HashSet<>();
-        private static final int MAX_DIR = 6, MAX_SECTOR = 3;
+        // [v7.0] TOP coins no longer bypass limits. Increased MAX_DIR slightly to compensate.
+        private static final int MAX_DIR = 8, MAX_SECTOR = 3, MAX_TOP_SAME_DIR = 4;
 
         synchronized void resetCycle() { longCount = 0; shortCount = 0; sectorCount.clear(); registered.clear(); }
 
         synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
-            if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) return true;
+            // [v7.0 FIX] TOP coins are no longer exempt — 6 BTC/ETH/SOL longs in a crash = catastrophe
             if (side == com.bot.TradingCore.Side.LONG  && longCount  >= MAX_DIR) return false;
             if (side == com.bot.TradingCore.Side.SHORT && shortCount >= MAX_DIR) return false;
             if (sector != null && sectorCount.getOrDefault(sector, 0) >= MAX_SECTOR) return false;
+            // [v7.0] Extra limit: max 4 TOP coins in same direction
+            if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
+                long topSameDir = registered.stream()
+                        .filter(p -> categorizePair(p) == com.bot.DecisionEngineMerged.CoinCategory.TOP)
+                        .count();
+                if (topSameDir >= MAX_TOP_SAME_DIR) return false;
+            }
             return true;
         }
 

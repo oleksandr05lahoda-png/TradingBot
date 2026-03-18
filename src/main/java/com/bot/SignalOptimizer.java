@@ -329,10 +329,21 @@ public final class SignalOptimizer {
     //  Это позволяет корректно различать +1% и +4% движения
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * [v7.0] TAMED adjustConfidence — уважает кластерную калибровку из DecisionEngine.
+     *
+     * Принцип: DecisionEngine даёт калиброванную probability (50-88%).
+     * Optimizer корректирует на основе микро-тренда, НО:
+     * - Максимальное ОБЩЕЕ изменение: ±12 единиц (было ±30+)
+     * - Потолок: 88% (совпадает с DecisionEngine)
+     * - Нет стекинга бонусов — каждый блок дополняет, но не перезаписывает
+     * - Exhaustion = единственный случай сильного штрафа (-15 max)
+     */
     public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
 
         MicroTrendResult mt = computeMicroTrend(signal.symbol);
         double confidence = signal.probability;
+        double originalConf = confidence; // запоминаем для ограничения дельты
 
         if (mt == null || mt.impulse < 1e-8) {
             return confidence;
@@ -347,9 +358,6 @@ public final class SignalOptimizer {
         double range = STRONG_IMPULSE - WEAK_IMPULSE;
         if (range <= 0) return confidence;
 
-        // [FIX-BUG-2] Логарифмическая нормализация вместо линейной
-        // Линейная: impulse=0.04 → norm=1.0, impulse=0.01 → norm=1.0 (ВОТ БАГ — всё >= STRONG_IMPULSE одинаково)
-        // Логарифмическая: impulse=0.04 → norm=0.95, impulse=0.01 → norm=0.65, impulse=0.001 → norm=0.20
         double adaptiveCap = computeAdaptiveImpulseCap(signal.symbol);
         double impulseNorm;
         if (mt.impulse <= WEAK_IMPULSE) {
@@ -357,83 +365,77 @@ public final class SignalOptimizer {
         } else if (mt.impulse >= adaptiveCap) {
             impulseNorm = 1.0;
         } else {
-            // Логарифмическое масштабирование в диапазоне [WEAK_IMPULSE, adaptiveCap]
             double logMin = Math.log(WEAK_IMPULSE + 1e-9);
             double logMax = Math.log(adaptiveCap + 1e-9);
             double logVal = Math.log(mt.impulse + 1e-9);
             impulseNorm = Math.max(0.0, Math.min(1.0, (logVal - logMin) / (logMax - logMin)));
         }
 
-        double factor = 1.0 + trendAlignment * (0.06 + 0.15 * impulseNorm);
+        // [v7.0] Мягкий множитель вместо агрессивного
+        double factor = 1.0 + trendAlignment * (0.03 + 0.08 * impulseNorm);
         confidence *= factor;
 
-        // === 2. Momentum Strength Bonus ===
+        // === 2. Momentum Strength (HALVED) ===
         double momentumStrength = Math.abs(mt.momentum);
         if (momentumStrength > MOMENTUM_THRESHOLD) {
             boolean momAligned = (isLong && mt.momentum > 0) || (!isLong && mt.momentum < 0);
             if (momAligned) {
-                confidence += 4.5 + Math.min(momentumStrength * 600, 5.5);
+                confidence += 2.0 + Math.min(momentumStrength * 300, 3.0);
             } else {
-                confidence -= 3.5;
+                confidence -= 2.0;
             }
         }
 
-        // === 3. Direction Strength Bonus ===
+        // === 3. Direction Strength (HALVED) ===
         double directionStrength = Math.abs(mt.smoothSpeed) / Math.max(Math.abs(mt.avg), 1e-9);
         if (directionStrength > 0.0014) {
-            confidence += 4.0;
+            confidence += 2.0;
         }
 
         // === 4. MICRO REVERSAL FILTER ===
         if (mt.speed * mt.accel < 0 && Math.abs(mt.accel) > Math.abs(mt.speed) * 0.7) {
-            confidence -= 5.5;
+            confidence -= 3.0;
         }
 
-        // === 5. EXHAUSTION FILTER ===
+        // === 5. EXHAUSTION FILTER (единственный сильный штраф) ===
         if (mt.isExhausted) {
-            confidence -= 6.0;
+            confidence -= 4.0;
         }
 
-        // === 6. MOMENTUM CONFIRMATION ===
+        // === 6. MOMENTUM CONFIRMATION (HALVED) ===
         if (Math.abs(mt.smoothSpeed) > 0.0010 && trendAlignment > 0) {
-            confidence += 3.0;
+            confidence += 1.5;
         }
 
-        // === 7. Tick Data Quality Bonus ===
+        // === 7. Tick Data Quality Bonus (HALVED) ===
         if (mt.fromTicks && impulseNorm > 0.4) {
-            confidence += 2.5;
+            confidence += 1.5;
         }
 
-        // === 8. PumpHunter Integration ===
+        // === 8. PumpHunter Integration (HALVED + CAPPED) ===
         if (pumpHunter != null) {
             com.bot.PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(signal.symbol);
             if (pump != null && pump.strength > 0.5) {
                 boolean pumpAligned = (isLong && pump.isBullish()) || (!isLong && pump.isBearish());
                 if (pumpAligned) {
-                    confidence += 5.5 + pump.strength * 6.0;
+                    confidence += Math.min(3.0 + pump.strength * 3.0, 5.0);
                 } else {
-                    confidence -= 4.0;
+                    confidence -= 2.5;
                 }
             }
         }
 
-        // === 9. Strong impulse early detection bonus ===
-        // [FIX-BUG-2] Теперь работает корректно — impulseNorm различает 1% и 4%
+        // === 9. Strong impulse early detection (HALVED) ===
         if (impulseNorm > 0.75 && trendAlignment > 0) {
-            confidence += 6.0;  // Сильный бонус за высокий impulseNorm (раньше срабатывал при любом > 1%)
+            confidence += 3.0;
         }
 
         // === 10. Momentum exhaustion warning ===
         if (mt.isExhausted && Math.abs(mt.momentum) < momentumStrength * 0.5) {
-            confidence -= 8.0;
+            confidence -= 4.0;
         }
         if (mt.isExhausted && trendAlignment < 0) {
-            confidence -= 40.0;  // Уничтожаем confidence: сигнал против тренда на истощении
-        }
-
-        // Компрессия в диапазоне выше 85%
-        if (confidence > 85.0) {
-            confidence = 85.0 + (confidence - 85.0) * 0.2;
+            confidence -= 15.0;  // Сильный штраф за сигнал против тренда на истощении
         }
 
         // === 11. Momentum fading check ===
@@ -448,12 +450,22 @@ public final class SignalOptimizer {
             boolean speedAccelDiverge = mt.speed * mt.accel < 0 && Math.abs(mt.accel) > 0.00018;
 
             if ((momentumFalling || speedAccelDiverge) && Math.abs(mt.smoothSpeed) > 0.0005) {
-                confidence -= 8.0;
+                confidence -= 4.0;
             }
         }
 
         if (trendAlignment < 0 && impulseNorm > 0.5 && mt.isExhausted) {
-            confidence -= 12.0;
+            confidence -= 6.0;
+        }
+
+        // [v7.0] ЖЁСТКИЙ КАП: общее изменение не более ±12 от оригинала
+        double delta = confidence - originalConf;
+        if (delta > 12.0)  confidence = originalConf + 12.0;
+        if (delta < -15.0) confidence = originalConf - 15.0;
+
+        // [v7.0] Компрессия выше 82% — совместимо с DecisionEngine cap 88%
+        if (confidence > 82.0) {
+            confidence = 82.0 + (confidence - 82.0) * 0.25;
         }
 
         return clamp(confidence, MIN_CONF, MAX_CONF);

@@ -77,6 +77,91 @@ public final class InstitutionalSignalCore {
         this.timeStopCallback = cb;
     }
 
+    // ════════════════════════════════════════════════════════════════
+    //  [v7.0] GLOBAL STREAK TRACKER + ADAPTIVE CONFIDENCE
+    //
+    //  Отслеживает последние N закрытых сделок ГЛОБАЛЬНО (не по символу).
+    //  При серии лоссов — ПОВЫШАЕТ минимальный порог confidence.
+    //  Это НЕ пауза — бот продолжает работать, но берёт только
+    //  самые уверенные сигналы, пока не восстановится.
+    //
+    //  Логика:
+    //  - 2 лосса подряд → minConf +3 (берём только лучшие сигналы)
+    //  - 3 лосса подряд → minConf +6
+    //  - 4+ лосса подряд → minConf +10 (только 🔥 сигналы)
+    //  - При первом вине → порог сбрасывается
+    //
+    //  Это мягкий drawdown guard: бот не останавливается,
+    //  но фильтрует слабые сигналы в плохой серии.
+    // ════════════════════════════════════════════════════════════════
+
+    private final Deque<Boolean> globalResultStreak = new java.util.ArrayDeque<>();
+    private static final int STREAK_WINDOW = 10; // помним последние 10 результатов
+    private volatile int    currentLossStreak    = 0;
+    private volatile double streakConfidenceBoost = 0.0;
+
+    // [v7.0] Бэктест EV для адаптации (обновляется из BotMain)
+    private volatile double lastBacktestEV = 0.0;
+    private volatile long   lastBacktestTime = 0;
+
+    /**
+     * [v7.0] Устанавливает результат последнего бэктеста.
+     * Используется для адаптации порогов confidence.
+     */
+    public void setBacktestResult(double ev, long timestamp) {
+        this.lastBacktestEV = ev;
+        this.lastBacktestTime = timestamp;
+        log("Backtest EV updated: " + String.format("%.4f", ev));
+    }
+
+    public double getLastBacktestEV() { return lastBacktestEV; }
+
+    /**
+     * [v7.0] Регистрирует глобальный результат сделки (win/loss).
+     * Обновляет streak и confidence boost.
+     */
+    private void registerGlobalResult(boolean win) {
+        globalResultStreak.addLast(win);
+        while (globalResultStreak.size() > STREAK_WINDOW) globalResultStreak.removeFirst();
+
+        if (win) {
+            currentLossStreak = 0;
+            streakConfidenceBoost = 0.0;
+        } else {
+            currentLossStreak++;
+            streakConfidenceBoost = switch (currentLossStreak) {
+                case 1 -> 0.0;   // один лосс — нормально
+                case 2 -> 3.0;   // 2 подряд — +3% порог
+                case 3 -> 6.0;   // 3 подряд — +6%
+                default -> 10.0; // 4+ — только топ сигналы
+            };
+            if (streakConfidenceBoost > 0) {
+                log("STREAK GUARD: " + currentLossStreak + " losses → minConf +"
+                        + String.format("%.0f", streakConfidenceBoost));
+            }
+        }
+    }
+
+    /**
+     * [v7.0] Возвращает текущий эффективный minConfidence
+     * с учётом streak penalty и backtest EV.
+     */
+    public double getEffectiveMinConfidence() {
+        double base = minConfidence;
+        base += streakConfidenceBoost;
+
+        // Если бэктест показал отрицательный EV за последние 2 часа — ужесточаем
+        if (lastBacktestEV < -0.01
+                && System.currentTimeMillis() - lastBacktestTime < 2 * 60 * 60_000L) {
+            base += 4.0;
+        }
+
+        return Math.min(base, 78.0); // никогда не выше 78 — иначе бот замолкнет
+    }
+
+    public int getCurrentLossStreak() { return currentLossStreak; }
+    public double getStreakConfBoost() { return streakConfidenceBoost; }
+
     // ── Models ─────────────────────────────────────────────────────
 
     public static final class ActiveSignal {
@@ -159,9 +244,12 @@ public final class InstitutionalSignalCore {
 
         String sym = signal.symbol;
 
-        // ── 1. Минимальная уверенность ────────────────────────────
-        if (signal.probability < minConfidence) {
-            log(sym + " prob=" + signal.probability + " < " + minConfidence + " → rejected");
+        // ── 1. Минимальная уверенность (с учётом streak guard) ────
+        double effectiveMinConf = getEffectiveMinConfidence();
+        if (signal.probability < effectiveMinConf) {
+            log(sym + " prob=" + signal.probability + " < " + String.format("%.1f", effectiveMinConf)
+                    + " (base=" + minConfidence + " +streak=" + String.format("%.0f", streakConfidenceBoost)
+                    + ") → rejected");
             return false;
         }
 
@@ -262,6 +350,9 @@ public final class InstitutionalSignalCore {
                 updateSymbolScore(symbol, pnlPct);
                 if (pnlPct > 0) symbolLastWin.put(symbol, now);
                 toRemove.add(s);
+
+                // [v7.0] Регистрируем глобальный результат для streak guard
+                registerGlobalResult(pnlPct > 0);
             }
         }
 
@@ -294,6 +385,8 @@ public final class InstitutionalSignalCore {
                         history.computeIfAbsent(sym, k -> new CopyOnWriteArrayList<>())
                                 .add(new ClosedTrade(sym, s.side, 0.0, now - s.timestamp));
                         updateSymbolScore(sym, 0.0); // BE — штраф -0.005
+                        // [v7.0] Time stop считается как лосс для streak guard
+                        registerGlobalResult(false);
                         if (timeStopCallback != null) {
                             try {
                                 timeStopCallback.accept(sym,
@@ -405,11 +498,14 @@ public final class InstitutionalSignalCore {
 
     /** Краткая статистика для логов */
     public synchronized String getStats() {
-        return String.format("ISC[active=%d/%d exp=%.1f%%/%.0f%% closed=%d wr=%.0f%%]",
+        return String.format("ISC[active=%d/%d exp=%.1f%%/%.0f%% closed=%d wr=%.0f%% streak=%d conf+%.0f ev=%.4f]",
                 getActiveSignalsCount(), maxGlobalSignals,
                 currentExposure * 100, maxPortfolioExposure * 100,
                 getTotalClosedTrades(),
-                getOverallWinRate() * 100);
+                getOverallWinRate() * 100,
+                currentLossStreak,
+                streakConfidenceBoost,
+                lastBacktestEV);
     }
 
     /** Полная статистика (для Telegram сообщения) */

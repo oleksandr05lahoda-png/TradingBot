@@ -71,7 +71,7 @@ public final class BotMain {
         gic.setPanicCallback(msg -> telegram.sendMessageAsync(msg));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ GodBot v6.0 стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ GodBot v7.0 CLUSTER стартовал " + nowWarsawStr() + " ═══");
 
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(
                 1, r -> {
@@ -94,16 +94,88 @@ public final class BotMain {
                 15, 15, TimeUnit.MINUTES
         );
 
+        // [v7.0] Бэктест каждые 2 часа — обновляет EV в ISC для адаптивных порогов
+        ScheduledExecutorService backtestScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "BacktestThread"); t.setDaemon(true); return t;
+        });
+        backtestScheduler.scheduleAtFixedRate(
+                () -> runPeriodicBacktest(sender, isc, telegram),
+                30, 120, TimeUnit.MINUTES // первый через 30 мин, потом каждые 2 часа
+        );
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Завершение работы...");
             scheduler.shutdown();
             statsScheduler.shutdown();
+            backtestScheduler.shutdown();
             telegram.sendMessageAsync("🛑 GodBot остановлен. Циклов: " + totalCycles.get()
                     + " | Сигналов: " + totalSignals.get());
             telegram.shutdown();
             try { scheduler.awaitTermination(8, TimeUnit.SECONDS); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); scheduler.shutdownNow(); }
         }, "ShutdownHook"));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v7.0] PERIODIC BACKTEST
+    //  Раз в 2 часа бот запускает бэктест на BTCUSDT и ETHUSDT
+    //  и обновляет ISC с текущим EV. Если EV отрицательный —
+    //  ISC повышает минимальный порог confidence.
+    // ══════════════════════════════════════════════════════════════
+
+    private static void runPeriodicBacktest(com.bot.SignalSender sender,
+                                            com.bot.InstitutionalSignalCore isc,
+                                            com.bot.TelegramBotSender telegram) {
+        try {
+            com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
+            String[] testSymbols = { "BTCUSDT", "ETHUSDT" };
+
+            double totalEV = 0;
+            int    count   = 0;
+
+            for (String sym : testSymbols) {
+                try {
+                    List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 500);
+                    List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h", 200);
+                    List<com.bot.TradingCore.Candle> m1  = sender.fetchKlines(sym, "1m", 500);
+                    List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m", 300);
+
+                    if (m15 == null || m15.size() < 250) continue;
+
+                    com.bot.SimpleBacktester.BacktestResult result =
+                            bt.run(sym, m1, m5, m15, h1,
+                                    com.bot.DecisionEngineMerged.CoinCategory.TOP);
+
+                    if (result.total >= 5) {
+                        totalEV += result.ev;
+                        count++;
+                        LOG.info("[BACKTEST] " + sym + ": trades=" + result.total
+                                + " wr=" + String.format("%.0f%%", result.winRate * 100)
+                                + " ev=" + String.format("%.4f", result.ev)
+                                + " net=" + String.format("%+.2f%%", result.totalPnL));
+                    }
+                } catch (Exception e) {
+                    LOG.warning("[BACKTEST] " + sym + " failed: " + e.getMessage());
+                }
+            }
+
+            if (count > 0) {
+                double avgEV = totalEV / count;
+                isc.setBacktestResult(avgEV, System.currentTimeMillis());
+
+                String emoji = avgEV > 0.05 ? "✅" : avgEV > 0 ? "⚠️" : "❌";
+                String msg = String.format(
+                        "%s *Backtest Update*\nEV: %.4f | %s\nStreak: %d losses | Conf+%.0f",
+                        emoji, avgEV,
+                        avgEV > 0 ? "Стратегия прибыльна" : "⚠️ Стратегия под вопросом",
+                        isc.getCurrentLossStreak(),
+                        isc.getStreakConfBoost()
+                );
+                telegram.sendMessageAsync(msg);
+            }
+        } catch (Exception e) {
+            LOG.warning("[BACKTEST] Error: " + e.getMessage());
+        }
     }
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
@@ -205,13 +277,15 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "🚀 *GodBot v6.0 запущен*\n"
+        return "🚀 *GodBot v7.0 CLUSTER запущен*\n"
                 + "Таймфрейм: 15M | Пары: TOP-100\n"
                 + "Тихие часы: UTC 02:00–05:30\n"
                 + "Кулдаун: TOP=4m / ALT=3m / MEME=2m\n"
                 + "Time Stop: 90 мин (6 свечей)\n"
-                + "Фильтры: 26 факторов + GIC + ISC + OBI + LiqGuard + CorrGuard\n"
-                + "Веса: динамические (ATR-нормализация)\n"
+                + "Scoring: 5 кластеров + confluence\n"
+                + "Фильтры: GIC + ISC(streak) + OBI + LiqGuard + CorrGuard\n"
+                + "Confidence: 50-88% | Diminishing boosts\n"
+                + "Бэктест: автоматический (каждые 2 часа)\n"
                 + "_" + nowWarsawStr() + " Warsaw_";
     }
 
