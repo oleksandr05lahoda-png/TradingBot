@@ -6,40 +6,35 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║        DecisionEngineMerged — GODBOT v7.1 CLUSTER + EARLY              ║
+ * ║        DecisionEngineMerged — GODBOT v8.0 GRAIL EDITION                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║                                                                          ║
- * ║  ПОЛНАЯ ПЕРЕРАБОТКА SCORING СИСТЕМЫ v7.0:                               ║
+ * ║  v8.0 GRAIL EDITION — финальная переработка:                            ║
  * ║                                                                          ║
- * ║  [CLUSTER] Кластерная система вместо суммирования:                      ║
- * ║    27 факторов → 5 независимых кластеров:                               ║
- * ║    1. STRUCTURE — BOS, HH/HL, Market Structure, FVG, OB, LiqSweep      ║
- * ║    2. MOMENTUM  — Impulse, AntiLag, PumpHunter, Compression            ║
- * ║    3. VOLUME    — VolumeDelta, VolumeSpike, OBI                        ║
- * ║    4. HTF       — 1H bias, 2H bias, VWAP alignment                    ║
- * ║    5. DERIVATIVES — Funding Rate, OI, Divergences                      ║
- * ║    Внутри кластера: max(LONG scores), max(SHORT scores)                ║
- * ║    Между кластерами: сумма — это убирает корреляцию                     ║
- * ║    Бонус за confluence: если 3+ кластера согласны → +0.15              ║
+ * ║  [SYMMETRIC] Зеркальная симметрия LONG/SHORT:                           ║
+ * ║    - 2H VETO одинаков для обоих направлений                             ║
+ * ║    - SHORT_VS_BULL / LONG_VS_BEAR — зеркальные фильтры                ║
+ * ║    - Exhaustion confirmation для обоих направлений                       ║
+ * ║    - HTF штрафы аддитивные (вычитание), не множительные                ║
  * ║                                                                          ║
- * ║  [CONF-FIX] Калиброванная уверенность:                                  ║
- * ║    - Базовая 50% + нормализованный score → 50-88%                      ║
- * ║    - Потолок 88% (никогда выше — защита от overconfidence)              ║
- * ║    - Бонус за количество согласных кластеров, а не факторов             ║
- * ║    - Историческая калибровка сохранена                                   ║
+ * ║  [SOFT-PENALTIES] Мягкие штрафы вместо убийственных:                    ║
+ * ║    - Exhaustion: *= 0.45 (было 0.13 — убивало сигнал)                  ║
+ * ║    - 2H VETO: -= 0.25 аддитивный (было *= 0.52 — слишком жёстко)      ║
+ * ║    - OVEREXT: *= 0.60 (было 0.48)                                      ║
+ * ║    - TREND_EXH: *= 0.72 (было 0.62)                                    ║
  * ║                                                                          ║
- * ║  [CRASH] Crash Mode v2.0:                                               ║
- * ║    - При aggressiveShort: SHORT_EXHAUSTION, TREND_EXH_S = ignored      ║
- * ║    - btcCrashScore → direct SHORT boost (до фильтров)                  ║
- * ║    - btcMomentumAccel → early SHORT detection                           ║
- * ║    - 2H_VETO при краше не блокирует SHORT                              ║
+ * ║  [EARLY-SOLO] Кластер EARLY может работать как единственный:            ║
+ * ║    - Если EARLY strength > 0.65 → MIN_CLUSTERS = 1                     ║
+ * ║    - Это позволяет ловить развороты ДО подтверждения структуры          ║
+ * ║    - Но только если EARLY + хотя бы один другой сигнал (volume/deriv)  ║
  * ║                                                                          ║
- * ║  [QUALITY] Фильтры качества сигнала:                                    ║
- * ║    - Минимум 2 согласных кластера для сигнала                           ║
- * ║    - Pullback confirmation на 1m/5m                                     ║
- * ║    - Volume delta gate для дивергенций                                   ║
- * ║    - Relative Strength filter (RS Trap при краше)                       ║
- * ║    - Cooldown: TOP=4m / ALT=3m / MEME=2m                               ║
+ * ║  [CONTRA-TREND] Контр-трендовые сигналы разрешены:                      ║
+ * ║    - SHORT при бычьем HTF: штраф -0.20 вместо *= 0.52                  ║
+ * ║    - Если RS падает при растущем BTC → контр-тренд разрешён             ║
+ * ║    - EARLY + DERIVATIVES = достаточно для контр-трендового входа        ║
+ * ║                                                                          ║
+ * ║  6 кластеров: STRUCTURE, MOMENTUM, VOLUME, HTF, DERIVATIVES, EARLY     ║
+ * ║  Confidence: 50-88% | Cluster confluence | Historical calibration       ║
  * ║                                                                          ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  */
@@ -601,14 +596,15 @@ public final class DecisionEngineMerged {
             else                         cHTF.boostShort(mctx.s(0.35), "1H2H_BEAR");
         }
 
-        // HTF конфликт = ослабление
+        // HTF конфликт = мягкое ослабление (аддитивное, не множительное)
         if ((bias1h == HTFBias.BULL && bias2h == HTFBias.BEAR) ||
                 (bias1h == HTFBias.BEAR && bias2h == HTFBias.BULL)) {
             if (!aggressiveShort) {
-                cHTF.penalizeLong(0.50);
-                cHTF.penalizeShort(0.50);
+                // [v8.0] Аддитивный штраф вместо *= 0.50
+                cHTF.boostLong(-0.15, null);
+                cHTF.boostShort(-0.15, null);
             } else {
-                cHTF.penalizeLong(0.30);
+                cHTF.boostLong(-0.20, null);
             }
             allFlags.add("HTF_CONFLICT");
         }
@@ -743,16 +739,22 @@ public final class DecisionEngineMerged {
         if (rw != null && rw.confidence > 0.48) {
             allFlags.add("⚠REV_" + rw.type);
             if ("LONG_EXHAUSTION".equals(rw.type)) {
-                scoreLong *= 0.16;
-                if (scoreLong < 0.22) return null;
+                // [v8.0 SYMMETRIC] LONG exhaustion gets confirmation chance too
+                boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.SHORT);
+                if (!confirmed) {
+                    scoreLong *= 0.35; // [v8.0] Было 0.16 — убийственно. Теперь 0.35
+                    if (scoreLong < 0.20) return null;
+                } else {
+                    allFlags.add("LEXH_CONFIRMED_1M");
+                }
             } else if ("SHORT_EXHAUSTION".equals(rw.type)) {
                 if (aggressiveShort) {
                     allFlags.add("REV_IGNORED_CRASH");
                 } else {
                     boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.LONG);
                     if (!confirmed) {
-                        scoreShort *= 0.16;
-                        if (scoreShort < 0.22) return null;
+                        scoreShort *= 0.35; // [v8.0] Было 0.16
+                        if (scoreShort < 0.20) return null;
                     } else {
                         allFlags.add("REV_CONFIRMED_1M");
                     }
@@ -773,10 +775,18 @@ public final class DecisionEngineMerged {
                 ex = true; allFlags.add("BEAR_DIV_EXH");
             }
             if (ex) {
-                if (rsi14 > 74) return null;
-                scoreLong *= 0.13;
-                allFlags.add("EXH_LONG");
-                if (scoreLong < 0.30) return null;
+                if (rsi14 > 78) return null; // [v8.0] Только RSI > 78 = hard kill (было 74)
+                // [v8.0 SOFT] Мягкий штраф вместо убийственного
+                // Даём шанс confirmReversalStructure спасти сигнал
+                boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.LONG);
+                if (confirmed) {
+                    scoreLong *= 0.65; // Confirmed: мягче
+                    allFlags.add("EXH_LONG_CONF");
+                } else {
+                    scoreLong *= 0.45; // [v8.0] Было 0.13 — убивало. Теперь 0.45 — сильный сигнал пробьётся
+                    allFlags.add("EXH_LONG");
+                }
+                if (scoreLong < 0.25) return null;
             }
         }
 
@@ -785,13 +795,21 @@ public final class DecisionEngineMerged {
                 boolean ex = isShortExhausted(c15, c1h, rsi14, rsi7, price);
                 if (adxV > 30 && adxFalling) ex = true;
                 if (bullDiv) ex = true;
-                if ((bias1h == HTFBias.BULL || bias2h == HTFBias.BULL) && !bosDown && scoreShort < 0.60) {
+                // [v8.0 SYMMETRIC] Требуем ОБА HTF бычьих (не один!) для SHORT_VS_BULL
+                if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL && !bosDown && !liqSweep && scoreShort < 0.50) {
                     ex = true; allFlags.add("SHORT_VS_BULL");
                 }
                 if (ex) {
-                    scoreShort *= 0.32;
+                    // [v8.0 SOFT] Мягкий штраф + confirmation
+                    boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.SHORT);
+                    if (confirmed) {
+                        scoreShort *= 0.65;
+                        allFlags.add("EXH_SHORT_CONF");
+                    } else {
+                        scoreShort *= 0.45; // [v8.0] Было 0.32 — убивало шорты
+                        allFlags.add("EXH_SHORT");
+                    }
                     if (scoreShort < 0.18) return null;
-                    allFlags.add("EXH_SHORT");
                 }
             } else {
                 if (rsi14 < 12) {
@@ -801,41 +819,80 @@ public final class DecisionEngineMerged {
             }
         }
 
+        // [v8.0 SYMMETRIC] LONG_VS_BEAR — зеркальный фильтр для лонгов при медвежьем HTF
+        if (scoreLong > scoreShort && !aggressiveShort) {
+            if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR && !bosUp && !liqSweep && scoreLong < 0.50) {
+                scoreLong *= 0.45;
+                if (scoreLong < 0.18) return null;
+                allFlags.add("LONG_VS_BEAR");
+            }
+        }
+
         // ════════════════════════════════════════════════════════
         // EMA50 OVEREXTENDED
         // ════════════════════════════════════════════════════════
         double ema50  = ema(c15, 50);
         double devEma = (price - ema50) / (ema50 + 1e-9);
-        if (scoreLong  > scoreShort && devEma >  0.065) { scoreLong  *= 0.48; allFlags.add("OVEREXT_L"); }
+        if (scoreLong  > scoreShort && devEma >  0.065) { scoreLong  *= 0.60; allFlags.add("OVEREXT_L"); }
         if (scoreShort > scoreLong  && devEma < -0.065) {
-            if (!aggressiveShort) { scoreShort *= 0.48; allFlags.add("OVEREXT_S"); }
+            if (!aggressiveShort) { scoreShort *= 0.60; allFlags.add("OVEREXT_S"); }
             else { allFlags.add("OVEREXT_S_SKIP"); }
         }
 
         // ════════════════════════════════════════════════════════
-        // 2H VETO
+        // 2H VETO — [v8.0] SYMMETRIC + ADDITIVE + CONTRA-TREND
+        // Вместо *= 0.52 (убивало шорты) → -= 0.25 (аддитивный штраф)
+        // Оба направления требуют adxV > 20
+        // RS dropping = контр-тренд разрешён (крупный игрок выходит)
         // ════════════════════════════════════════════════════════
-        if (bias2h == HTFBias.BULL && scoreShort > scoreLong) {
+        if (bias2h == HTFBias.BULL && scoreShort > scoreLong && adxV > 20) {
             if (!aggressiveShort) {
-                boolean strongLocalBear =
-                        (antiLag != null && antiLag.direction < 0 && antiLag.strength > 0.52) ||
-                                (oldPump.detected && oldPump.direction < 0 && oldPump.strength > 0.48) ||
-                                bosDown || liqSweep;
-                scoreShort *= strongLocalBear ? 0.88 : 0.52;
-                allFlags.add(strongLocalBear ? "DYN_SHORT_2H" : "2H_BULL_PRESS");
+                // Проверяем: RS падает при растущем BTC? = крупный игрок выходит
+                double rs = getRelativeStrength(symbol);
+                boolean rsDropping = rs < 0.40; // RS < 0.40 = монета слабеет на бычьем рынке
+
+                if (rsDropping) {
+                    // [v8.0] Контр-тренд РАЗРЕШЁН: RS падает = smart money выходят
+                    allFlags.add("CONTRA_SHORT_RS" + String.format("%.0f", rs * 100));
+                    // Без штрафа — шорт проходит
+                } else {
+                    boolean strongLocalBear =
+                            (antiLag != null && antiLag.direction < 0 && antiLag.strength > 0.52) ||
+                                    (oldPump.detected && oldPump.direction < 0 && oldPump.strength > 0.48) ||
+                                    bosDown || liqSweep;
+                    if (strongLocalBear) {
+                        scoreShort -= 0.12; // [v8.0] Мягкий аддитивный штраф
+                        allFlags.add("DYN_SHORT_2H");
+                    } else {
+                        scoreShort -= 0.25; // [v8.0] Было *= 0.52. Теперь аддитивный -0.25
+                        allFlags.add("2H_BULL_PRESS");
+                    }
+                }
             } else {
                 allFlags.add("2H_BULL_IGNORED_CRASH");
             }
         }
 
+        // [v8.0 SYMMETRIC] 2H BEAR VETO для LONG — зеркально
         if (bias2h == HTFBias.BEAR && scoreLong > scoreShort && adxV > 20) {
             double rs = getRelativeStrength(symbol);
-            if (rs > 0.75) {
-                scoreLong *= 0.60;
-                allFlags.add("2H_VETO_WEAK_RS" + String.format("%.0f", rs * 100));
+            boolean rsRising = rs > 0.70; // RS > 0.70 = монета сильнее BTC
+
+            if (rsRising) {
+                // Контр-тренд LONG РАЗРЕШЁН: монета сильнее рынка
+                allFlags.add("CONTRA_LONG_RS" + String.format("%.0f", rs * 100));
             } else {
-                scoreLong *= 0.32;
-                allFlags.add("2H_VETO");
+                boolean strongLocalBull =
+                        (antiLag != null && antiLag.direction > 0 && antiLag.strength > 0.52) ||
+                                (oldPump.detected && oldPump.direction > 0 && oldPump.strength > 0.48) ||
+                                bosUp || liqSweep;
+                if (strongLocalBull) {
+                    scoreLong -= 0.12;
+                    allFlags.add("DYN_LONG_2H");
+                } else {
+                    scoreLong -= 0.25;
+                    allFlags.add("2H_BEAR_PRESS");
+                }
             }
             if (scoreLong < 0.18) return null;
         }
@@ -844,10 +901,10 @@ public final class DecisionEngineMerged {
         // TREND EXHAUSTION (8-bar)
         // ════════════════════════════════════════════════════════
         double move8 = (last(c15).close - c15.get(c15.size() - 8).close) / price;
-        if (move8 >  0.038 && scoreLong  > scoreShort) { scoreLong  *= 0.62; allFlags.add("TREND_EXH_L"); }
+        if (move8 >  0.038 && scoreLong  > scoreShort) { scoreLong  *= 0.72; allFlags.add("TREND_EXH_L"); }
         if (move8 < -0.038 && scoreShort > scoreLong) {
             if (!aggressiveShort) {
-                scoreShort *= 0.62;
+                scoreShort *= 0.72;
                 allFlags.add("TREND_EXH_S");
             } else {
                 allFlags.add("TREND_EXH_S_SKIP_CRASH");
@@ -855,9 +912,10 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // [v7.0] МИНИМУМ КЛАСТЕРОВ СОГЛАСИЯ
-        // Если < 2 кластеров поддерживают направление — нет сигнала
-        // (кроме aggressiveShort с crashBoost)
+        // [v8.0] МИНИМУМ КЛАСТЕРОВ — АДАПТИВНЫЙ
+        // Обычно: 2 кластера
+        // Если EARLY сильный (> 0.65): достаточно 1 кластер
+        // Это позволяет ловить развороты ДО подтверждения структуры
         // ════════════════════════════════════════════════════════
         com.bot.TradingCore.Side candidateSide = scoreLong > scoreShort
                 ? com.bot.TradingCore.Side.LONG
@@ -866,11 +924,25 @@ public final class DecisionEngineMerged {
         int supportingClusters = candidateSide == com.bot.TradingCore.Side.LONG
                 ? longClusters : shortClusters;
 
-        if (supportingClusters < MIN_AGREEING_CLUSTERS) {
+        // [v8.0] EARLY-SOLO: сильный ранний сигнал может пройти с 1 кластером
+        boolean earlyStrong = earlyRev.detected && earlyRev.strength > 0.65;
+        boolean earlySoloAllowed = earlyStrong && (
+                // EARLY + хотя бы Volume или Derivatives — контр-тренд подтверждён
+                (candidateSide == com.bot.TradingCore.Side.SHORT && cEarly.favorsShort()
+                        && (cVolume.favorsShort() || cDerivatives.favorsShort())) ||
+                        (candidateSide == com.bot.TradingCore.Side.LONG && cEarly.favorsLong()
+                                && (cVolume.favorsLong() || cDerivatives.favorsLong()))
+        );
+
+        int requiredClusters = earlySoloAllowed ? 1 : MIN_AGREEING_CLUSTERS;
+
+        if (supportingClusters < requiredClusters) {
             if (!(aggressiveShort && candidateSide == com.bot.TradingCore.Side.SHORT && crashBoost > 0.30)) {
-                return null; // Недостаточно независимых подтверждений
+                return null;
             }
         }
+
+        if (earlySoloAllowed) allFlags.add("EARLY_SOLO");
 
         // ════════════════════════════════════════════════════════
         // MINIMUM SCORE DIFFERENCE

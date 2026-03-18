@@ -940,13 +940,17 @@ public final class GlobalImpulseController {
                             double cr = getCascadeDumpRisk(relStrength);
                             weight = cr >= 0.45 ? 0.28 : relStrength > 0.65 ? 0.75 : 0.50;
                         } else {
-                            // Лёгкий буст для SHORT при импульсном падении
-                            weight = Math.min(1.20, ctx.shortBoost * 0.85);
+                            // [v8.0] Чуть сильнее SHORT boost при импульсном падении
+                            weight = Math.min(1.25, ctx.shortBoost * 0.90);
                         }
                     }
 
                     case BTC_IMPULSE_UP -> {
-                        if (!isLong) weight = 0.70;
+                        if (!isLong) {
+                            // [v8.0] Мягче: было 0.70 для всех шортов
+                            // Если монета слабеет на бычьем BTC — шорт разрешён мягче
+                            weight = relStrength < 0.35 ? 0.85 : 0.78;
+                        }
                     }
 
                     case NEUTRAL -> {
