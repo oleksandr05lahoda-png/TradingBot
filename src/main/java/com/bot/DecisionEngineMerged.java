@@ -6,7 +6,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║        DecisionEngineMerged — GODBOT v7.0 CLUSTER EDITION              ║
+ * ║        DecisionEngineMerged — GODBOT v7.1 CLUSTER + EARLY              ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║                                                                          ║
  * ║  ПОЛНАЯ ПЕРЕРАБОТКА SCORING СИСТЕМЫ v7.0:                               ║
@@ -437,6 +437,7 @@ public final class DecisionEngineMerged {
         ClusterScores cVolume      = new ClusterScores(); // VolumeDelta, VolumeSpike
         ClusterScores cHTF         = new ClusterScores(); // 1H, 2H bias, VWAP
         ClusterScores cDerivatives = new ClusterScores(); // Funding, OI, Divergences
+        ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
         List<String> allFlags = new ArrayList<>();
 
         // ════════════════════════════════════════════════════════
@@ -667,11 +668,31 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
+        // КЛАСТЕР 6: EARLY — РАННИЙ РАЗВОРОТ
+        // [v7.1] Ловит момент когда текущий тренд ОСЛАБЕВАЕТ
+        // но ещё не сломалась структура на 15m.
+        // Использует 1m/5m micro-structure + momentum deceleration
+        // + volume divergence + wick rejection + RSI shift.
+        // Даёт сигнал на 1-2 свечи РАНЬШЕ чем Structure/Momentum.
+        // ════════════════════════════════════════════════════════
+
+        EarlyReversalResult earlyRev = detectEarlyReversal(c1, c5, c15, rsi14, rsi7, price, atr14);
+        if (earlyRev.detected && earlyRev.strength > 0.35) {
+            double earlyScore = mctx.s(earlyRev.strength * 0.70);
+            if (earlyRev.direction > 0) {
+                cEarly.addLong(earlyScore, "EARLY_BULL");
+            } else {
+                cEarly.addShort(earlyScore, "EARLY_BEAR");
+            }
+            allFlags.addAll(earlyRev.flags);
+        }
+
+        // ════════════════════════════════════════════════════════
         //  АГРЕГАЦИЯ КЛАСТЕРОВ
         // ════════════════════════════════════════════════════════
 
-        ClusterScores[] clusters = { cStructure, cMomentum, cVolume, cHTF, cDerivatives };
-        String[] clusterNames = { "STR", "MOM", "VOL", "HTF", "DRV" };
+        ClusterScores[] clusters = { cStructure, cMomentum, cVolume, cHTF, cDerivatives, cEarly };
+        String[] clusterNames = { "STR", "MOM", "VOL", "HTF", "DRV", "EARLY" };
 
         double totalLong  = 0;
         double totalShort = 0;
@@ -949,9 +970,9 @@ public final class DecisionEngineMerged {
         // Базовая нормализация score difference
         double norm = Math.min(1.0, scoreDiff / 5.0); // было 6.5, теперь 5.0 (кластеры дают меньше)
 
-        // [v7.0] Бонус за количество согласных КЛАСТЕРОВ (а не факторов)
-        // Это ключевое отличие — 5 факторов из 1 кластера ≠ 5 независимых сигналов
+        // [v7.1] Бонус за количество согласных КЛАСТЕРОВ (теперь из 6)
         double clusterBonus = switch (clusters) {
+            case 6 -> 0.14;  // все 6 согласны = очень сильный сигнал
             case 5 -> 0.12;
             case 4 -> 0.08;
             case 3 -> 0.04;
@@ -1228,6 +1249,220 @@ public final class DecisionEngineMerged {
         int n = c.size();
         double base = c.get(n - offset - bars - 1).close;
         return (c.get(n - offset - 1).close - base) / (base + 1e-9);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v7.1] EARLY REVERSAL DETECTION
+    //  5 независимых сигналов раннего разворота:
+    //  1. Momentum Deceleration — свечи уменьшаются, тренд слабеет
+    //  2. Volume Divergence — цена = новый экстремум, объём падает
+    //  3. Wick Rejection — длинная тень на 1m/5m = отвергли уровень
+    //  4. RSI Momentum Shift — RSI разворачивается раньше цены
+    //  5. Micro Structure Break — на 1m сломалась структура
+    // ══════════════════════════════════════════════════════════════
+
+    private static final class EarlyReversalResult {
+        final boolean detected;
+        final int     direction; // +1 = reversal to LONG, -1 = reversal to SHORT
+        final double  strength;  // 0..1
+        final List<String> flags;
+
+        EarlyReversalResult(boolean d, int dir, double s, List<String> f) {
+            detected = d; direction = dir; strength = s; flags = f;
+        }
+    }
+
+    private EarlyReversalResult detectEarlyReversal(
+            List<com.bot.TradingCore.Candle> c1,
+            List<com.bot.TradingCore.Candle> c5,
+            List<com.bot.TradingCore.Candle> c15,
+            double rsi14, double rsi7,
+            double price, double atr14) {
+
+        if (c15.size() < 12) return new EarlyReversalResult(false, 0, 0, List.of());
+
+        double score = 0;
+        int bullSignals = 0, bearSignals = 0;
+        List<String> flags = new ArrayList<>();
+
+        // ── Определяем текущий тренд на 15m ──────────────────
+        double move4 = (last(c15).close - c15.get(c15.size() - 5).close) / price;
+        boolean inUptrend   = move4 > 0.003;
+        boolean inDowntrend = move4 < -0.003;
+
+        // Если нет выраженного тренда — ранний разворот не применяется
+        if (!inUptrend && !inDowntrend) return new EarlyReversalResult(false, 0, 0, List.of());
+
+        // ═══════════════════════════════════════════════════════
+        // 1. MOMENTUM DECELERATION
+        // Тренд идёт вверх/вниз, но свечи УМЕНЬШАЮТСЯ.
+        // Тело 3-й < тело 2-й < тело 1-й = тренд теряет силу.
+        // ═══════════════════════════════════════════════════════
+        if (c15.size() >= 5) {
+            double b1 = Math.abs(c15.get(c15.size()-1).close - c15.get(c15.size()-1).open);
+            double b2 = Math.abs(c15.get(c15.size()-2).close - c15.get(c15.size()-2).open);
+            double b3 = Math.abs(c15.get(c15.size()-3).close - c15.get(c15.size()-3).open);
+
+            // Все 3 свечи в одном направлении, но уменьшаются
+            boolean allUp = c15.get(c15.size()-1).close > c15.get(c15.size()-1).open
+                    && c15.get(c15.size()-2).close > c15.get(c15.size()-2).open
+                    && c15.get(c15.size()-3).close > c15.get(c15.size()-3).open;
+            boolean allDown = c15.get(c15.size()-1).close < c15.get(c15.size()-1).open
+                    && c15.get(c15.size()-2).close < c15.get(c15.size()-2).open
+                    && c15.get(c15.size()-3).close < c15.get(c15.size()-3).open;
+
+            if (allUp && b1 < b2 * 0.72 && b2 < b3 * 0.82) {
+                // Лонг-тренд слабеет → разворот вниз
+                score += 0.30;
+                bearSignals++;
+                flags.add("DECEL_UP");
+            }
+            if (allDown && b1 < b2 * 0.72 && b2 < b3 * 0.82) {
+                // Шорт-тренд слабеет → разворот вверх
+                score += 0.30;
+                bullSignals++;
+                flags.add("DECEL_DN");
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // 2. VOLUME DIVERGENCE
+        // Цена делает новый хай/лой, но объём падает.
+        // Smart money уже вышли — розница догоняет.
+        // ═══════════════════════════════════════════════════════
+        if (c15.size() >= 6) {
+            com.bot.TradingCore.Candle cur  = c15.get(c15.size() - 1);
+            com.bot.TradingCore.Candle prev = c15.get(c15.size() - 2);
+            double avgVol3 = (c15.get(c15.size()-4).volume + c15.get(c15.size()-3).volume
+                    + c15.get(c15.size()-2).volume) / 3.0;
+
+            if (inUptrend && cur.high > prev.high && cur.volume < avgVol3 * 0.70) {
+                score += 0.28;
+                bearSignals++;
+                flags.add("VDIV_UP");
+            }
+            if (inDowntrend && cur.low < prev.low && cur.volume < avgVol3 * 0.70) {
+                score += 0.28;
+                bullSignals++;
+                flags.add("VDIV_DN");
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // 3. WICK REJECTION на 1m/5m
+        // Длинная тень в направлении тренда = цену отвергли.
+        // Если на 5m последняя свеча имеет тень > 2× тело
+        // в направлении тренда — это rejection.
+        // ═══════════════════════════════════════════════════════
+        if (c5 != null && c5.size() >= 3) {
+            com.bot.TradingCore.Candle lc5 = c5.get(c5.size() - 1);
+            double body5 = Math.abs(lc5.close - lc5.open) + 1e-10;
+            double upperWick5 = lc5.high - Math.max(lc5.open, lc5.close);
+            double lowerWick5 = Math.min(lc5.open, lc5.close) - lc5.low;
+
+            if (inUptrend && upperWick5 > body5 * 2.0 && lc5.close < lc5.open) {
+                // Длинная верхняя тень при аптренде + медвежья свеча = rejection сверху
+                score += 0.32;
+                bearSignals++;
+                flags.add("WICK_REJ_UP");
+            }
+            if (inDowntrend && lowerWick5 > body5 * 2.0 && lc5.close > lc5.open) {
+                // Длинная нижняя тень при даунтренде + бычья свеча = rejection снизу
+                score += 0.32;
+                bullSignals++;
+                flags.add("WICK_REJ_DN");
+            }
+        }
+
+        // Дополнительно проверяем на 1m
+        if (c1 != null && c1.size() >= 5) {
+            com.bot.TradingCore.Candle lc1 = c1.get(c1.size() - 1);
+            double body1 = Math.abs(lc1.close - lc1.open) + 1e-10;
+            double uWick1 = lc1.high - Math.max(lc1.open, lc1.close);
+            double lWick1 = Math.min(lc1.open, lc1.close) - lc1.low;
+
+            if (inUptrend && uWick1 > body1 * 2.5) {
+                score += 0.18;
+                bearSignals++;
+                flags.add("WICK1M_UP");
+            }
+            if (inDowntrend && lWick1 > body1 * 2.5) {
+                score += 0.18;
+                bullSignals++;
+                flags.add("WICK1M_DN");
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // 4. RSI MOMENTUM SHIFT
+        // RSI7 начинает падать с зоны перекупленности/перепроданности
+        // РАНЬШЕ чем цена развернулась.
+        // ═══════════════════════════════════════════════════════
+        if (inUptrend && rsi7 < 62 && rsi14 > 65) {
+            // RSI7 уже упал ниже 62, но RSI14 ещё выше 65 = дивергенция скоростей
+            score += 0.25;
+            bearSignals++;
+            flags.add("RSI_SHIFT_DN");
+        }
+        if (inDowntrend && rsi7 > 38 && rsi14 < 35) {
+            // RSI7 уже поднялся выше 38, но RSI14 ещё ниже 35
+            score += 0.25;
+            bullSignals++;
+            flags.add("RSI_SHIFT_UP");
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // 5. MICRO STRUCTURE BREAK на 1m
+        // На 15m ещё HH/HL (бычий), но на 1m уже появился LH
+        // (Lower High) — микро-структура сломалась РАНЬШЕ.
+        // ═══════════════════════════════════════════════════════
+        if (c1 != null && c1.size() >= 15) {
+            int n1 = c1.size();
+            // Ищем структуру на последних 12 минутных свечах
+            double micro1H = Double.NEGATIVE_INFINITY;
+            double micro2H = Double.NEGATIVE_INFINITY;
+            double micro1L = Double.POSITIVE_INFINITY;
+            double micro2L = Double.POSITIVE_INFINITY;
+
+            // Первая половина (6 свечей назад)
+            for (int i = n1 - 12; i < n1 - 6; i++) {
+                micro1H = Math.max(micro1H, c1.get(i).high);
+                micro1L = Math.min(micro1L, c1.get(i).low);
+            }
+            // Вторая половина (последние 6 свечей)
+            for (int i = n1 - 6; i < n1; i++) {
+                micro2H = Math.max(micro2H, c1.get(i).high);
+                micro2L = Math.min(micro2L, c1.get(i).low);
+            }
+
+            if (inUptrend && micro2H < micro1H * 0.9995) {
+                // LH на 1m при аптренде на 15m = ранний медвежий сигнал
+                score += 0.26;
+                bearSignals++;
+                flags.add("MICRO_LH");
+            }
+            if (inDowntrend && micro2L > micro1L * 1.0005) {
+                // HL на 1m при даунтренде на 15m = ранний бычий сигнал
+                score += 0.26;
+                bullSignals++;
+                flags.add("MICRO_HL");
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // АГРЕГАЦИЯ
+        // Нужно минимум 2 сигнала в одном направлении
+        // ═══════════════════════════════════════════════════════
+        if (bearSignals >= 2 && inUptrend && score >= 0.45) {
+            // Ранний разворот вниз (SHORT): тренд был вверх, но слабеет
+            return new EarlyReversalResult(true, -1, Math.min(score, 0.85), flags);
+        }
+        if (bullSignals >= 2 && inDowntrend && score >= 0.45) {
+            // Ранний разворот вверх (LONG): тренд был вниз, но слабеет
+            return new EarlyReversalResult(true, 1, Math.min(score, 0.85), flags);
+        }
+
+        return new EarlyReversalResult(false, 0, 0, flags);
     }
 
     // ══════════════════════════════════════════════════════════════
