@@ -90,7 +90,7 @@ public final class BotMain {
             Thread t = new Thread(r, "StatsThread"); t.setDaemon(true); return t;
         });
         statsScheduler.scheduleAtFixedRate(
-                () -> logStats(telegram, gic, isc),
+                () -> logStats(telegram, gic, isc, sender),
                 15, 15, TimeUnit.MINUTES
         );
 
@@ -217,16 +217,21 @@ public final class BotMain {
 
     private static void logStats(com.bot.TelegramBotSender telegram,
                                  com.bot.GlobalImpulseController gic,
-                                 com.bot.InstitutionalSignalCore isc) {
+                                 com.bot.InstitutionalSignalCore isc,
+                                 com.bot.SignalSender sender) {
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         String msg = String.format(
-                "📊 *GodBot Stats*\n"
+                "📊 *GodBot Stats v7.0*\n"
                         + "Uptime: %d min | Циклов: %d | Сигналов: %d\n"
                         + "BTC: %s (str=%.2f, vol=%.2f)\n"
+                        + "WS: %d active | UDS: %s | Bal: $%.2f\n"
                         + "Ошибок: %d | %s",
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 ctx.regime, ctx.impulseStrength, ctx.volatilityExpansion,
+                sender.getActiveWsCount(),
+                sender.isUdsConnected() ? "✅" : "❌",
+                sender.getAccountBalance(),
                 errorCount.get(),
                 isc.getStats()
         );
