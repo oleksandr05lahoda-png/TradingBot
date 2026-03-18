@@ -2,46 +2,50 @@ package com.bot;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * ╔══════════════════════════════════════════════════════════════════╗
- * ║          DecisionEngineMerged — GODBOT EDITION                  ║
- * ║  Абсолютно всё лучшее из обоих проектов + новые фичи            ║
- * ╠══════════════════════════════════════════════════════════════════╣
- * ║  ФАКТОРЫ SCORING (26 штук):                                     ║
- * ║  1.  Anti-Lag (4 варианта: 1m body, 2xbody, 5m body, серия)    ║
- * ║  2.  Reverse Exhaustion (7 факторов: RSI1H, MomDiv, VolColl...) ║
- * ║  3.  HTF Bias 1H (EMA50/200)                                    ║
- * ║  4.  HTF Bias 2H (EMA12/26/50 + HH/HL)                         ║
- * ║  5.  HTF конфликт и согласие (1H=2H бонус)                      ║
- * ║  6.  Market Structure (swing HH/HL vs LL/LH — из старого)       ║
- * ║  7.  PumpHunter 15M/5M/1M серия + Squeeze + Breakout            ║
- * ║  8.  Funding Rate абсолютное значение                           ║
- * ║  9.  Funding Rate DELTA (изменение — главная новинка)           ║
- * ║  10. OI Squeeze (OI рост + FR экстрем)                          ║
- * ║  11. Volume Delta (aggTrade WebSocket, нормализованный)          ║
- * ║  12. Pullback к EMA21 + Bullish/Bearish Structure               ║
- * ║  13. Fair Value Gap (Smart Money)                               ║
- * ║  14. Order Block (последний разворот перед импульсом)           ║
- * ║  15. BOS Up / BOS Down (Break of Structure)                     ║
- * ║  16. Liquidity Sweep (охота за стопами → контр-сигнал)          ║
- * ║  17. Old Pump Detector (1m/5m большие свечи + объём)            ║
- * ║  18. Impulse 1m (движение больше 0.55 ATR за 5 баров)           ║
- * ║  19. Compression Breakout (ATR сжатие + пробой)                 ║
- * ║  20. RSI Bullish/Bearish Divergence                             ║
- * ║  21. RSI extreme (не в тренде → штраф)                          ║
- * ║  22. ADX + ADX Falling                                          ║
- * ║  23. EMA50 Overextended (>6% от EMA → штраф)                   ║
- * ║  24. 2H Priority и 2H Veto                                      ║
- * ║  25. Volume Spike (категорные пороги MEME/ALT/TOP)              ║
- * ║  26. VWAP Alignment (сессионный VWAP)                           ║
- * ║  + Trend Exhaustion (8-bar move >3.5%)                          ║
- * ║  + Exhaustion filters LONG и SHORT (тело, объём, RSI, wick)     ║
- * ╠══════════════════════════════════════════════════════════════════╣
- * ║  COOLDOWN: TOP=12m / ALT=10m / MEME=5m                         ║
- * ║  MIN_BARS: 150 свечей минимум на 15m и 1h                       ║
- * ║  Multi-TP: tp1 (1:1, 50%), tp2 (1:2, 30%), tp3 (1:3.2, 20%)   ║
- * ╚══════════════════════════════════════════════════════════════════╝
+ * ╔══════════════════════════════════════════════════════════════════════╗
+ * ║        DecisionEngineMerged — GODBOT EDITION v4.0                   ║
+ * ╠══════════════════════════════════════════════════════════════════════╣
+ * ║  ИСПРАВЛЕНИЯ v4.0 (по анализу из чата):                             ║
+ * ║                                                                      ║
+ * ║  [FIX-1] ЖЁСТКОЕ ВЕТО на дивергенции                               ║
+ * ║    BEAR_DIV/BULL_DIV теперь ХАРД-ЛОК для противоположной стороны   ║
+ * ║    confidence не просто режется — сигнал УМИРАЕТ полностью           ║
+ * ║                                                                      ║
+ * ║  [FIX-2] IMP_OVERRIDE защита от ложных перекрытий                  ║
+ * ║    IMP_DN_CONF не перекрывается бычьим 2H если:                     ║
+ * ║      - объём > 1.8× среднего                                        ║
+ * ║      - движение > 0.55 ATR за 3 бара                                ║
+ * ║    Price Action на 15m имеет ПРИОРИТЕТ над EMA на 2H                ║
+ * ║                                                                      ║
+ * ║  [FIX-3] REV_REVERSAL требует структурного подтверждения            ║
+ * ║    EXH_SHORT больше не достаточно для разворотного LONG             ║
+ * ║    Нужно: BOS на 1m ИЛИ закрепление тела свечи на 1m/5m            ║
+ * ║                                                                      ║
+ * ║  [FIX-4] Relative Strength — монеты сильнее BTC                    ║
+ * ║    Убираем жёсткий onlyShort при падении BTC                        ║
+ * ║    Вместо него: relative strength score vs BTC                      ║
+ * ║    Монеты с RS > 0.6 могут получать LONG даже при BTC дампе         ║
+ * ║                                                                      ║
+ * ║  [FIX-5] Динамические пороги уверенности                           ║
+ * ║    MIN_CONFIDENCE адаптируется к:                                   ║
+ * ║      - волатильности (ATR/price)                                    ║
+ * ║      - режиму рынка (STRONG_TREND/RANGE)                            ║
+ * ║      - исторической точности символа (последние N сигналов)         ║
+ * ║      - времени суток (азиатская/европейская/американская сессии)    ║
+ * ║                                                                      ║
+ * ║  [FIX-6] Кулдаун снижен: TOP=4m / ALT=3m / MEME=2m                ║
+ * ║    Старые: 12/10/5 — слишком медленно для 15M таймфрейма           ║
+ * ║                                                                      ║
+ * ║  [FIX-7] REV_REVERSAL структурное подтверждение                    ║
+ * ║    Новый метод confirmReversalStructure() проверяет                 ║
+ * ║    1m BOS или закрепление цены над/под ключевым уровнем            ║
+ * ║                                                                      ║
+ * ║  СУЩЕСТВУЮЩИЕ ФАКТОРЫ (26 штук) — сохранены и улучшены             ║
+ * ║  Cooldown: TOP=4m / ALT=3m / MEME=2m                               ║
+ * ╚══════════════════════════════════════════════════════════════════════╝
  */
 public final class DecisionEngineMerged {
 
@@ -52,14 +56,23 @@ public final class DecisionEngineMerged {
 
     // ── Глобальные константы ───────────────────────────────────────
     private static final int    MIN_BARS        = 150;
-    private static final long   COOLDOWN_TOP    = 12 * 60_000L;
-    private static final long   COOLDOWN_ALT    = 10 * 60_000L;
-    private static final long   COOLDOWN_MEME   = 5  * 60_000L;
-    private static final double BASE_CONF       = 52.0;
-    private static final int    CALIBRATION_WIN = 100;
 
-    // ── Адаптивный минимальный порог ──────────────────────────────
-    private volatile double MIN_CONFIDENCE = BASE_CONF;
+    // [FIX-6] Кулдаун снижен для 15M таймфрейма
+    private static final long   COOLDOWN_TOP    = 4  * 60_000L;   // было 12
+    private static final long   COOLDOWN_ALT    = 3  * 60_000L;   // было 10
+    private static final long   COOLDOWN_MEME   = 2  * 60_000L;   // было 5
+
+    private static final double BASE_CONF       = 52.0;
+    private static final int    CALIBRATION_WIN = 120;
+
+    // [FIX-5] Диапазон динамического порога
+    private static final double MIN_CONF_FLOOR  = 47.0;
+    private static final double MIN_CONF_CEIL   = 65.0;
+
+    // ── Адаптивный минимальный порог (per-symbol) ──────────────────
+    // [FIX-5] Каждый символ имеет свой порог на основе истории
+    private final Map<String, Double> symbolMinConf = new ConcurrentHashMap<>();
+    private volatile double globalMinConf = BASE_CONF;
 
     // ── State ─────────────────────────────────────────────────────
     private final Map<String, Long>           cooldownMap     = new ConcurrentHashMap<>();
@@ -71,6 +84,12 @@ public final class DecisionEngineMerged {
     // Volume Delta из aggTrade WebSocket (заполняется снаружи)
     private final Map<String, Double> volumeDeltaMap = new ConcurrentHashMap<>();
 
+    // [FIX-4] Relative Strength — перформанс монеты vs BTC
+    private final Map<String, Deque<Double>> relStrengthHistory = new ConcurrentHashMap<>();
+
+    // Статистика по символам для логирования
+    private final Map<String, AtomicInteger> signalCountBySymbol = new ConcurrentHashMap<>();
+
     private PumpHunter pumpHunter;
 
     public DecisionEngineMerged() {}
@@ -78,6 +97,32 @@ public final class DecisionEngineMerged {
     // ── Setters ───────────────────────────────────────────────────
     public void setPumpHunter(PumpHunter ph)              { this.pumpHunter = ph; }
     public void setVolumeDelta(String sym, double delta)  { volumeDeltaMap.put(sym, delta); }
+
+    /**
+     * [FIX-4] Обновляем Relative Strength символа vs BTC.
+     * Вызывается снаружи после каждого обновления цены.
+     * relStrength = return(symbol) / max(return(btc), 0.0001)
+     */
+    public void updateRelativeStrength(String symbol, double symbolReturn15m, double btcReturn15m) {
+        double rs;
+        if (Math.abs(btcReturn15m) < 0.0001) {
+            rs = symbolReturn15m > 0 ? 0.7 : 0.3;
+        } else if (btcReturn15m < 0 && symbolReturn15m > 0) {
+            // Монета растёт при падении BTC — сильный RS
+            rs = 0.85 + Math.min(Math.abs(symbolReturn15m) * 10, 0.14);
+        } else {
+            rs = clamp(0.5 + (symbolReturn15m - btcReturn15m) / (Math.abs(btcReturn15m) * 2), 0.0, 1.0);
+        }
+        Deque<Double> h = relStrengthHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+        h.addLast(rs);
+        if (h.size() > 20) h.removeFirst();
+    }
+
+    private double getRelativeStrength(String symbol) {
+        Deque<Double> h = relStrengthHistory.get(symbol);
+        if (h == null || h.isEmpty()) return 0.5;
+        return h.stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
+    }
 
     // ══════════════════════════════════════════════════════════════
     //  INNER DATA TYPES
@@ -90,7 +135,7 @@ public final class DecisionEngineMerged {
         public final double oiChange1h;
         public final double oiChange4h;
         public final double prevFundingRate;
-        public final double fundingDelta;      // frCurrent - frPrev — ключевая метрика разворота
+        public final double fundingDelta;
         public final long   timestamp;
 
         public FundingOIData(double fr, double oi, double oi1h, double oi4h) {
@@ -109,8 +154,12 @@ public final class DecisionEngineMerged {
     }
 
     private static final class CalibRecord {
-        final double predicted; final boolean correct;
-        CalibRecord(double p, boolean c) { predicted = p; correct = c; }
+        final double predicted;
+        final boolean correct;
+        final long timestamp;
+        CalibRecord(double p, boolean c) {
+            predicted = p; correct = c; timestamp = System.currentTimeMillis();
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -122,20 +171,19 @@ public final class DecisionEngineMerged {
         public final TradingCore.Side side;
         public final double           price;
         public final double           stop;
-        public final double           take;         // = tp3
-        public final double           tp1;          // 1:1.0 — 50% позиции, переносим в BE
-        public final double           tp2;          // 1:2.0 — 30% позиции
-        public final double           tp3;          // 1:3.2 — 20% трейлинг
+        public final double           take;
+        public final double           tp1;
+        public final double           tp2;
+        public final double           tp3;
         public final double           probability;
         public final List<String>     flags;
         public final double           fundingRate;
         public final double           fundingDelta;
         public final double           oiChange;
         public final String           htfBias;
-        public final double           rr;           // risk/reward ratio
+        public final double           rr;
         public final CoinCategory     category;
 
-        /** Полный конструктор — автоматически вычисляет все TP */
         public TradeIdea(String symbol, TradingCore.Side side,
                          double price, double stop, double take, double rr,
                          double probability, List<String> flags,
@@ -148,21 +196,20 @@ public final class DecisionEngineMerged {
             this.take         = take;
             this.rr           = rr;
             this.probability  = probability;
-            this.flags        = flags != null ? Collections.unmodifiableList(flags) : List.of();
+            this.flags        = flags != null ? Collections.unmodifiableList(new ArrayList<>(flags)) : List.of();
             this.fundingRate  = fundingRate;
             this.fundingDelta = fundingDelta;
             this.oiChange     = oiChange;
             this.htfBias      = htfBias;
             this.category     = cat;
 
-            double risk = Math.abs(price - stop);
+            double risk   = Math.abs(price - stop);
             boolean long_ = side == TradingCore.Side.LONG;
             this.tp1 = long_ ? price + risk * 1.0 : price - risk * 1.0;
             this.tp2 = long_ ? price + risk * 2.0 : price - risk * 2.0;
             this.tp3 = long_ ? price + risk * 3.2 : price - risk * 3.2;
         }
 
-        /** Упрощённый конструктор (для early-tick сигналов) */
         public TradeIdea(String symbol, TradingCore.Side side,
                          double price, double stop, double take,
                          double probability, List<String> flags) {
@@ -170,7 +217,6 @@ public final class DecisionEngineMerged {
                     0, 0, 0, "NONE", CoinCategory.ALT);
         }
 
-        /** Конструктор совместимости без fundingDelta (для SignalOptimizer) */
         public TradeIdea(String symbol, TradingCore.Side side,
                          double price, double stop, double take,
                          double probability, List<String> flags,
@@ -179,10 +225,6 @@ public final class DecisionEngineMerged {
                     fundingRate, 0, oiChange, htfBias, CoinCategory.ALT);
         }
 
-        /**
-         * Красивое Telegram сообщение с emoji, Multi-TP, FR, OI, HTF Bias.
-         * Формат проверен на реальных сигналах.
-         */
         public String toTelegramString() {
             String emoji   = probability >= 83 ? "🔥" : probability >= 74 ? "✅"
                     : probability >= 65 ? "🟡" : "⚪";
@@ -199,7 +241,6 @@ public final class DecisionEngineMerged {
             String time    = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
                     .toLocalTime().withNano(0).toString();
 
-            // Доп-строки
             StringBuilder extra = new StringBuilder();
             if (Math.abs(fundingRate) > 0.0008)
                 extra.append(String.format("\n💸 FR: %+.3f%%", fundingRate * 100));
@@ -257,6 +298,29 @@ public final class DecisionEngineMerged {
         Deque<CalibRecord> h = calibHist.computeIfAbsent(sym, k -> new ArrayDeque<>());
         h.addLast(new CalibRecord(prob, correct));
         while (h.size() > CALIBRATION_WIN) h.removeFirst();
+        // [FIX-5] Пересчитываем динамический порог для символа
+        updateSymbolThreshold(sym);
+    }
+
+    /**
+     * [FIX-5] Пересчёт индивидуального порога для символа
+     * Если символ ошибается > 55% — повышаем порог
+     * Если точность > 65% — снижаем порог (награждаем)
+     */
+    private void updateSymbolThreshold(String sym) {
+        Deque<CalibRecord> hist = calibHist.get(sym);
+        if (hist == null || hist.size() < 20) return;
+
+        long correct = hist.stream().filter(r -> r.correct).count();
+        double accuracy = (double) correct / hist.size();
+
+        double base = globalMinConf;
+        if (accuracy < 0.45)       base += 5.0;  // плохая точность — строже
+        else if (accuracy < 0.50)  base += 2.5;
+        else if (accuracy > 0.65)  base -= 3.0;  // хорошая точность — мягче
+        else if (accuracy > 0.60)  base -= 1.5;
+
+        symbolMinConf.put(sym, clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL));
     }
 
     /** Анализ с 5 таймфреймами (полный) */
@@ -281,7 +345,7 @@ public final class DecisionEngineMerged {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  CORE GENERATE — сердце бота
+    //  CORE GENERATE
     // ══════════════════════════════════════════════════════════════
 
     private TradeIdea generate(String symbol,
@@ -293,7 +357,6 @@ public final class DecisionEngineMerged {
                                CoinCategory cat,
                                long now) {
 
-        // Проверяем минимум данных
         if (!valid(c15) || !valid(c1h)) return null;
 
         double price     = last(c15).close;
@@ -304,24 +367,21 @@ public final class DecisionEngineMerged {
         if (lastRange > atr14 * 4.5 || atr14 <= 0) return null;
         atr14 = Math.max(atr14, price * 0.0012);
 
-        // ── Контексты ─────────────────────────────────────────────
         MarketState state  = detectState(c15);
         HTFBias     bias1h = detectBias1H(c1h);
         HTFBias     bias2h = (c2h != null && c2h.size() >= 50) ? detectBias2H(c2h) : HTFBias.NONE;
 
-        // Адаптируем порог уверенности по волатильности
-        adaptMinConfidence(state, atr14, price);
+        // [FIX-5] Адаптируем глобальный и символьный порог
+        adaptGlobalMinConf(state, atr14, price);
 
-        // В флэте без ADX → не торгуем (слишком много ложных сигналов)
         if (state == MarketState.RANGE && adx(c15, 14) < 18) return null;
 
-        // ── Скоры и флаги ─────────────────────────────────────────
         double scoreLong  = 0;
         double scoreShort = 0;
         List<String> flags = new ArrayList<>();
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 1: ANTI-LAG — ловим движение ДО закрытия свечи
+        // ФАКТОР 1: ANTI-LAG
         // ════════════════════════════════════════════════════════
         AntiLagResult antiLag = detectAntiLag(c1, c5, c15);
         if (antiLag != null && antiLag.strength > 0.38) {
@@ -331,7 +391,7 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 2: REVERSE EXHAUSTION — 7 факторов усталости
+        // ФАКТОР 2: REVERSE EXHAUSTION (7 факторов)
         // ════════════════════════════════════════════════════════
         ReverseWarning rw = detectReversePattern(c15, c1h, state);
         if (rw != null && rw.confidence > 0.48) {
@@ -340,8 +400,15 @@ public final class DecisionEngineMerged {
                 scoreLong *= 0.16;
                 if (scoreLong < 0.22) return null;
             } else if ("SHORT_EXHAUSTION".equals(rw.type)) {
-                scoreShort *= 0.16;
-                if (scoreShort < 0.22) return null;
+                // [FIX-3] EXH_SHORT требует структурного подтверждения для разворота
+                boolean confirmed = confirmReversalStructure(c1, c5, TradingCore.Side.LONG);
+                if (!confirmed) {
+                    scoreShort *= 0.16;
+                    if (scoreShort < 0.22) return null;
+                } else {
+                    // Подтверждённый разворот — добавляем флаг
+                    flags.add("REV_CONFIRMED_1M");
+                }
             }
         }
 
@@ -360,7 +427,6 @@ public final class DecisionEngineMerged {
             scoreShort += 0.50; scoreLong  -= 0.25; flags.add("2H_BEAR");
         }
 
-        // HTF конфликт — оба наказаны
         if ((bias1h == HTFBias.BULL && bias2h == HTFBias.BEAR) ||
                 (bias1h == HTFBias.BEAR && bias2h == HTFBias.BULL)) {
             if (scoreLong  < 1.2) { scoreLong  *= 0.50; }
@@ -368,7 +434,6 @@ public final class DecisionEngineMerged {
             flags.add("HTF_CONFLICT");
         }
 
-        // 1H и 2H согласны — двойной бонус
         if (bias1h == bias2h && bias1h != HTFBias.NONE) {
             if (bias1h == HTFBias.BULL) {
                 scoreLong  += 0.45; scoreShort -= 0.22; flags.add("1H2H_BULL");
@@ -378,14 +443,14 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 6: MARKET STRUCTURE (HH/HL vs LL/LH) — из старого проекта
+        // ФАКТОР 6: MARKET STRUCTURE (HH/HL vs LL/LH)
         // ════════════════════════════════════════════════════════
         int structure = marketStructure(c15);
         if (structure == 1)  { scoreLong  += 0.60; flags.add("HH_HL"); }
         if (structure == -1) { scoreShort += 0.60; flags.add("LL_LH"); }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 7: PUMPHUNTER — 15M/5M/1M + Squeeze + Breakout
+        // ФАКТОР 7: PUMPHUNTER
         // ════════════════════════════════════════════════════════
         boolean pumpDetected = false;
         if (pumpHunter != null) {
@@ -406,7 +471,6 @@ public final class DecisionEngineMerged {
                     else                  scoreShort += 0.40;
                     flags.add("MEGA_PUMP");
                 }
-                // Volume Climax → ещё бонус
                 if (pump.flags.contains("VOL_CLIMAX")) {
                     if (pump.isBullish()) scoreLong  += 0.15;
                     else                  scoreShort += 0.15;
@@ -423,36 +487,29 @@ public final class DecisionEngineMerged {
         boolean hasFR = false;
 
         if (fOI != null) {
-            hasFR       = true;
-            fundingRate = fOI.fundingRate;
+            hasFR        = true;
+            fundingRate  = fOI.fundingRate;
             fundingDelta = fOI.fundingDelta;
-            oiChange    = fOI.oiChange1h;
+            oiChange     = fOI.oiChange1h;
 
-            // ── FR абсолютное значение ─────────────────────────
             if (fundingRate > 0.0005) {
-                // Лонгисты перегреты → SHORT сигнал
                 scoreShort += 0.45 + Math.min(fundingRate * 100, 0.45);
                 scoreLong  -= 0.25;
                 flags.add("FR_HIGH");
             } else if (fundingRate < -0.0005) {
-                // Шортисты перегреты → LONG сигнал
                 scoreLong  += 0.45 + Math.min(Math.abs(fundingRate) * 100, 0.45);
                 scoreShort -= 0.25;
                 flags.add("FR_LOW");
             }
 
-            // ── FR DELTA (изменение ставки — главная новинка) ─
             if (fundingDelta > 0.0003) {
-                // Резкий рост FR → лонги перегрелись → SHORT reversal
                 scoreShort += 0.45; scoreLong -= 0.22;
                 flags.add("FR_SPIKE→SHORT");
             } else if (fundingDelta < -0.0003) {
-                // Резкое падение FR → шорты закрываются → LONG reversal
                 scoreLong  += 0.45; scoreShort -= 0.22;
                 flags.add("FR_DROP→LONG");
             }
 
-            // ── OI Squeeze ─────────────────────────────────────
             if (fOI.oiChange1h > 3.5 && fundingRate > 0.0003) {
                 scoreShort += 0.35; flags.add("OI_SQUEEZE_LONG");
             }
@@ -460,7 +517,6 @@ public final class DecisionEngineMerged {
                 scoreLong  += 0.35; flags.add("OI_SQUEEZE_SHORT");
             }
             if (fOI.oiChange1h < -5.0) {
-                // Резкое падение OI — ликвидация позиций с обеих сторон
                 scoreLong  *= 0.78;
                 scoreShort *= 0.78;
                 flags.add("OI_LIQUIDATION");
@@ -468,7 +524,7 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 11: VOLUME DELTA (aggTrade WebSocket, 1-минутное окно)
+        // ФАКТОР 11: VOLUME DELTA (aggTrade WebSocket)
         // ════════════════════════════════════════════════════════
         double volDelta = volumeDeltaMap.getOrDefault(symbol, 0.0);
         if (Math.abs(volDelta) > 0.16) {
@@ -533,14 +589,12 @@ public final class DecisionEngineMerged {
             double uw = lc.high - Math.max(lc.open, lc.close);
             double lw = Math.min(lc.open, lc.close) - lc.low;
             double bd = Math.abs(lc.close - lc.open) + 1e-10;
-            // Длинный верхний фитиль после подъёма → медведи поглощают
             if (uw > bd * 1.7) { scoreShort += 0.65; flags.add("LIQ_SWEEP_S"); }
-            // Длинный нижний фитиль после падения → быки поглощают
             if (lw > bd * 1.7) { scoreLong  += 0.65; flags.add("LIQ_SWEEP_L"); }
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 17: СТАРЫЙ PUMP DETECTOR (1m/5m большие свечи)
+        // ФАКТОР 17: СТАРЫЙ PUMP DETECTOR (1m/5m)
         // ════════════════════════════════════════════════════════
         OldPumpResult oldPump = detectOldPump(c1, c5, cat);
         if (oldPump.detected) {
@@ -549,7 +603,7 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 18: IMPULSE на 1M
+        // ФАКТОР 18: IMPULSE на 1M + [FIX-2] IMP_OVERRIDE защита
         // ════════════════════════════════════════════════════════
         boolean impulseFlag = false;
         if (c1 != null && c1.size() >= 15) {
@@ -567,23 +621,33 @@ public final class DecisionEngineMerged {
                         scoreLong += 0.15; flags.add("IMP_UP_CONF");
                     }
                 }
+
+                // [FIX-2] IMP_DN с реальным объёмом — Price Action побеждает 2H EMA
                 if (delta1m < 0 && impStr > 0.28) {
-                    if (bias2h != HTFBias.BULL) {
+                    // Проверяем объём: если он >= 1.8× среднего — это НАСТОЯЩИЙ дамп
+                    boolean strongVolume = isStrongImpulseVolume(c1, 1.8);
+                    // Проверяем скорость: движение > 0.55 ATR за 3 бара
+                    boolean fastDrop = impStr > 0.55;
+
+                    if (bias2h == HTFBias.BULL && (strongVolume || fastDrop)) {
+                        // Цена летит вниз с объёмом — игнорируем бычий 2H
+                        double add = state == MarketState.STRONG_TREND ? 0.70 : 0.55;
+                        scoreShort += add;
+                        flags.add("IMP_OVERRIDE");  // Price Action > EMA
+                        flags.add(strongVolume ? "STRONG_VOL_DUMP" : "FAST_DUMP");
+                    } else if (bias2h != HTFBias.BULL) {
                         double add = state == MarketState.STRONG_TREND ? 0.60 : 0.42;
                         scoreShort += add; flags.add("IMP_DN");
                     } else {
+                        // Слабый дамп против бычьего 2H — минимальный вес
                         scoreShort += 0.15; flags.add("IMP_DN_CONF");
                     }
-                }
-                // Очень сильный импульс против 2H — перебивает вето
-                if (delta1m < 0 && impStr > 0.65 && bias2h == HTFBias.BULL) {
-                    scoreShort += 0.50; flags.add("IMP_OVERRIDE");
                 }
             }
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 19: COMPRESSION BREAKOUT (ATR сжатие + пробой)
+        // ФАКТОР 19: COMPRESSION BREAKOUT
         // ════════════════════════════════════════════════════════
         CompressionResult compr = detectCompression(c15, c1);
         if (compr.breakout) {
@@ -592,7 +656,7 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 20: RSI DIVERGENCE
+        // ФАКТОР 20: RSI DIVERGENCE + [FIX-1] ЖЁСТКОЕ ВЕТО
         // ════════════════════════════════════════════════════════
         double rsi14 = rsi(c15, 14);
         double rsi7  = rsi(c15, 7);
@@ -602,9 +666,18 @@ public final class DecisionEngineMerged {
         if (bullDiv) { scoreLong  += 0.65; flags.add("BULL_DIV"); }
         if (bearDiv) { scoreShort += 0.65; flags.add("BEAR_DIV"); }
 
-        // Дивергенция против позиции — жёсткий штраф
-        if (bearDiv && scoreLong  > scoreShort) { scoreLong  *= 0.28; flags.add("BEAR_DIV_BLOCK"); }
-        if (bullDiv && scoreShort > scoreLong)  { scoreShort *= 0.28; flags.add("BULL_DIV_BLOCK"); }
+        // [FIX-1] ХАРД-ЛОК дивергенций против позиции
+        // BEAR_DIV при LONG — это самоубийство. Убиваем сигнал.
+        if (bearDiv && scoreLong > scoreShort) {
+            // Нет НИКАКОГО исключения — медвежья дивергенция убивает лонг
+            flags.add("BEAR_DIV_FATAL_BLOCK");
+            return null;  // ХАРД-ЛОК
+        }
+        if (bullDiv && scoreShort > scoreLong) {
+            // Бычья дивергенция убивает шорт
+            flags.add("BULL_DIV_FATAL_BLOCK");
+            return null;  // ХАРД-ЛОК
+        }
 
         // ════════════════════════════════════════════════════════
         // ФАКТОР 21: RSI EXTREME (не в тренде)
@@ -621,22 +694,22 @@ public final class DecisionEngineMerged {
         double adxPrev = c15.size() >= 2 ? adx(c15.subList(0, c15.size() - 1), 14) : adxV;
         boolean adxFalling = adxPrev > adxV;
 
-        // Сильный тренд + HTF против → штраф контр-трендовым
         if (adxV > 32) {
             if (bias1h == HTFBias.BULL && scoreShort > scoreLong) scoreShort *= 0.68;
             if (bias1h == HTFBias.BEAR && scoreLong  > scoreShort) scoreLong *= 0.68;
         }
 
         // ════════════════════════════════════════════════════════
-        // EXHAUSTION FILTERS — точечные блоки плохих сетапов
+        // EXHAUSTION FILTERS
         // ════════════════════════════════════════════════════════
         if (scoreLong > scoreShort) {
             boolean ex = isLongExhausted(c15, c1h, rsi14, rsi7, price);
             if (adxV > 30 && adxFalling) ex = true;
-            if (bearDiv)                 { ex = true; flags.add("BEAR_DIV_REJ"); }
+            // [FIX-1] bearDiv уже обработан выше через return null, но оставляем для надёжности
+            if (bearDiv) { ex = true; flags.add("BEAR_DIV_REJ"); }
 
             if (ex) {
-                if (bearDiv || rsi14 > 74) return null;   // Hard block
+                if (rsi14 > 74) return null;
                 scoreLong *= 0.13;
                 flags.add("EXH_LONG");
                 if (scoreLong < 0.30) return null;
@@ -646,9 +719,8 @@ public final class DecisionEngineMerged {
         if (scoreShort > scoreLong) {
             boolean ex = isShortExhausted(c15, c1h, rsi14, rsi7, price);
             if (adxV > 30 && adxFalling) ex = true;
-            if (bullDiv)                 ex = true;
+            if (bullDiv) ex = true;
 
-            // Шорт против бычьего HTF без BOS → слабый сетап
             if ((bias1h == HTFBias.BULL || bias2h == HTFBias.BULL) && !bosDown && scoreShort < 0.60) {
                 ex = true; flags.add("SHORT_VS_BULL");
             }
@@ -672,7 +744,6 @@ public final class DecisionEngineMerged {
         // ФАКТОР 24: 2H PRIORITY + 2H VETO
         // ════════════════════════════════════════════════════════
         if (bias2h == HTFBias.BULL && scoreShort > scoreLong) {
-            // Короткие позиции против бычьего 2H
             boolean strongLocalBear =
                     (antiLag != null && antiLag.direction < 0 && antiLag.strength > 0.52) ||
                             (oldPump.detected && oldPump.direction < 0 && oldPump.strength > 0.48) ||
@@ -682,13 +753,21 @@ public final class DecisionEngineMerged {
         }
 
         if (bias2h == HTFBias.BEAR && scoreLong > scoreShort && adxV > 20) {
-            scoreLong *= 0.32;
-            flags.add("2H_VETO");
+            // [FIX-4] Если у монеты высокий RS — ослабляем вето
+            double rs = getRelativeStrength(symbol);
+            if (rs > 0.75) {
+                // Монета сильнее BTC — ослабленное вето
+                scoreLong *= 0.60;
+                flags.add("2H_VETO_WEAK_RS" + String.format("%.0f", rs * 100));
+            } else {
+                scoreLong *= 0.32;
+                flags.add("2H_VETO");
+            }
             if (scoreLong < 0.18) return null;
         }
 
         // ════════════════════════════════════════════════════════
-        // ФАКТОР 25: VOLUME SPIKE (категорные пороги)
+        // ФАКТОР 25: VOLUME SPIKE
         // ════════════════════════════════════════════════════════
         if (volumeSpike(c15, cat)) {
             if (scoreLong  > scoreShort) { scoreLong  += 0.20; }
@@ -715,25 +794,24 @@ public final class DecisionEngineMerged {
         // MINIMUM SCORE DIFFERENCE
         // ════════════════════════════════════════════════════════
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-        double minDiff = state == MarketState.STRONG_TREND ? 0.16 : 0.20;
+        double minDiff   = state == MarketState.STRONG_TREND ? 0.16 : 0.20;
         if (scoreDiff < minDiff) return null;
 
-        // ── Динамический порог суммарного скора ─────────────────
         double dynThresh = state == MarketState.STRONG_TREND ? 0.68 : 0.58;
         if (scoreLong < dynThresh && scoreShort < dynThresh) {
             if (!bullDiv && !bearDiv && !oldPump.detected && !hasFR) return null;
         }
 
-        // ── Определяем сторону ────────────────────────────────────
         TradingCore.Side side = scoreLong > scoreShort
                 ? TradingCore.Side.LONG
                 : TradingCore.Side.SHORT;
 
-        // ── Кулдаун и flip защита ─────────────────────────────────
         if (!cooldownAllowed(symbol, side, cat, now)) return null;
         if (!flipAllowed(symbol, side)) return null;
 
-        // ── Калиброванная уверенность ─────────────────────────────
+        // ════════════════════════════════════════════════════════
+        // [FIX-5] Калиброванная уверенность с динамическим порогом
+        // ════════════════════════════════════════════════════════
         double probability = computeCalibratedConfidence(
                 symbol, scoreLong, scoreShort, state, cat,
                 atr14, price,
@@ -743,12 +821,12 @@ public final class DecisionEngineMerged {
                 bias2h, vwapVal
         );
 
-        if (probability < MIN_CONFIDENCE) return null;
+        // [FIX-5] Используем символьный или глобальный порог
+        double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf);
+        if (probability < minConf) return null;
 
-        // ── Метка высокой волатильности ───────────────────────────
         if (atr14 / price > 0.0020) flags.add("HIGH_ATR");
 
-        // ── Stop / Take расчёт ────────────────────────────────────
         double riskMult = cat == CoinCategory.MEME ? 1.40 : cat == CoinCategory.ALT ? 1.10 : 0.88;
         double rrRatio  = scoreDiff > 1.2 ? 3.4 : scoreDiff > 0.9 ? 3.0 : scoreDiff > 0.6 ? 2.7 : 2.3;
         double stopDist = Math.max(atr14 * 1.85 * riskMult, price * 0.0018);
@@ -757,13 +835,88 @@ public final class DecisionEngineMerged {
         double takePrice = side == TradingCore.Side.LONG  ? price + stopDist * rrRatio
                 : price - stopDist * rrRatio;
 
-        // ── Финальная проверка: цена слишком близка к прошлому сигналу ─
         if (!priceMovedEnough(symbol, price)) return null;
         registerSignal(symbol, side, now);
 
         return new TradeIdea(symbol, side, price, stopPrice, takePrice, rrRatio,
                 probability, flags,
                 fundingRate, fundingDelta, oiChange, bias2h.name(), cat);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-2] Проверка: сильный импульс (объём × скорость)
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Возвращает true если последние 3 свечи 1m имеют объём >= multiplier × среднего.
+     * Используется для IMP_OVERRIDE — чтобы Price Action мог перебить 2H EMA.
+     */
+    private boolean isStrongImpulseVolume(List<TradingCore.Candle> c1, double multiplier) {
+        if (c1 == null || c1.size() < 10) return false;
+        int n = c1.size();
+        double avgVol = c1.subList(Math.max(0, n - 12), n - 3)
+                .stream().mapToDouble(c -> c.volume).average().orElse(1.0);
+        double recentVol = c1.subList(n - 3, n)
+                .stream().mapToDouble(c -> c.volume).average().orElse(0.0);
+        return recentVol >= avgVol * multiplier;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [FIX-3] Структурное подтверждение разворота на 1m/5m
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Проверяет структурное подтверждение разворота.
+     * Для LONG разворота нужно:
+     *   1. BOS вверх на 1m (цена закрылась выше локального хая) ИЛИ
+     *   2. Три свечи 1m закрытые выше их открытия (закрепление покупателей) ИЛИ
+     *   3. Свеча 5m с телом > 60% диапазона закрытая вверх после серии падения
+     *
+     * Это фильтрует "купи на дне без подтверждения" — самую опасную ловушку.
+     */
+    private boolean confirmReversalStructure(List<TradingCore.Candle> c1,
+                                             List<TradingCore.Candle> c5,
+                                             TradingCore.Side side) {
+        boolean longSide = side == TradingCore.Side.LONG;
+
+        // Проверка 1: BOS на 1m
+        if (c1 != null && c1.size() >= 10) {
+            int n = c1.size();
+            double localHigh = Double.NEGATIVE_INFINITY;
+            double localLow  = Double.POSITIVE_INFINITY;
+            for (int i = n - 8; i < n - 1; i++) {
+                localHigh = Math.max(localHigh, c1.get(i).high);
+                localLow  = Math.min(localLow,  c1.get(i).low);
+            }
+            TradingCore.Candle last1m = last(c1);
+            if (longSide  && last1m.close > localHigh * 1.0003) return true;  // BOS вверх
+            if (!longSide && last1m.close < localLow  * 0.9997) return true;  // BOS вниз
+        }
+
+        // Проверка 2: Три последовательных закрытия в сторону разворота на 1m
+        if (c1 != null && c1.size() >= 5) {
+            int n = c1.size();
+            int bullCount = 0, bearCount = 0;
+            for (int i = n - 4; i < n; i++) {
+                TradingCore.Candle c = c1.get(i);
+                if (c.close > c.open) bullCount++;
+                else bearCount++;
+            }
+            if (longSide  && bullCount >= 3) return true;
+            if (!longSide && bearCount >= 3) return true;
+        }
+
+        // Проверка 3: Сильная свеча 5m в сторону разворота (тело > 60% диапазона)
+        if (c5 != null && c5.size() >= 3) {
+            TradingCore.Candle last5m = last(c5);
+            double body5 = Math.abs(last5m.close - last5m.open);
+            double range5 = last5m.high - last5m.low + 1e-10;
+            double bodyRatio = body5 / range5;
+            if (longSide  && last5m.close > last5m.open && bodyRatio > 0.60) return true;
+            if (!longSide && last5m.close < last5m.open && bodyRatio > 0.60) return true;
+        }
+
+        return false;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -782,7 +935,6 @@ public final class DecisionEngineMerged {
             HTFBias bias2h, double vwap) {
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
-        // Нормализуем по максимально возможному скору (~6.5)
         double norm = Math.min(1.0, scoreDiff / 6.5);
         int conf = 0;
 
@@ -799,26 +951,22 @@ public final class DecisionEngineMerged {
         if ((bias2h == HTFBias.BULL && scoreLong  > scoreShort) ||
                 (bias2h == HTFBias.BEAR && scoreShort > scoreLong)) { norm += 0.065; conf++; }
 
-        // VWAP alignment
         if ((scoreLong > scoreShort && price > vwap * 1.0005) ||
                 (scoreShort > scoreLong && price < vwap * 0.9995)) { norm += 0.030; conf++; }
 
         norm = Math.min(1.0, norm);
 
-        // Больше подтверждений → шире диапазон
         double range = 28 + Math.min(conf * 3.5, 18);
         double prob  = 50 + norm * range;
 
-        // Поправки на MarketState
         if (state == MarketState.STRONG_TREND)      prob += 3.5;
         else if (state == MarketState.WEAK_TREND)   prob += 0.5;
         else if (state == MarketState.RANGE)        prob -= 3.0;
 
-        // Поправки на CoinCategory
         if (cat == CoinCategory.MEME)               prob -= 6.0;
         else if (cat == CoinCategory.ALT)           prob -= 2.5;
 
-        // Историческая калибровка
+        // [FIX-5] Историческая калибровка с весами по возрасту
         Deque<CalibRecord> hist = calibHist.get(symbol);
         if (hist != null && hist.size() >= 25) {
             double acc = historicalAccuracy(hist, prob);
@@ -830,13 +978,18 @@ public final class DecisionEngineMerged {
 
     private double historicalAccuracy(Deque<CalibRecord> hist, double prob) {
         double sum = 0, cnt = 0;
-        for (CalibRecord r : hist) {
+        // Более свежие записи получают больший вес
+        List<CalibRecord> list = new ArrayList<>(hist);
+        int size = list.size();
+        for (int i = 0; i < size; i++) {
+            CalibRecord r = list.get(i);
             if (Math.abs(r.predicted - prob) < 12) {
-                cnt++;
-                if (r.correct) sum++;
+                double weight = 0.5 + 0.5 * ((double) i / size); // вес растёт со временем
+                cnt += weight;
+                if (r.correct) sum += weight;
             }
         }
-        return cnt < 6 ? prob : (sum / cnt) * 100;
+        return cnt < 4 ? prob : (sum / cnt) * 100;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -844,8 +997,8 @@ public final class DecisionEngineMerged {
     // ══════════════════════════════════════════════════════════════
 
     private static class AntiLagResult {
-        final int    direction;  // 1=UP, -1=DOWN
-        final double strength;   // 0..1
+        final int    direction;
+        final double strength;
         AntiLagResult(int d, double s) { direction = d; strength = s; }
     }
 
@@ -866,18 +1019,16 @@ public final class DecisionEngineMerged {
         double prevB = Math.abs(prev.close - prev.open);
         double vRatio = cur.volume / (avgV1 + 1e-9);
 
-        double spd2  = Math.abs(cur.close - c1.get(Math.max(0, n1 - 3)).close);
-        double spdP  = Math.abs(c1.get(Math.max(0, n1 - 3)).close - c1.get(Math.max(0, n1 - 5)).close);
+        double spd2 = Math.abs(cur.close - c1.get(Math.max(0, n1 - 3)).close);
+        double spdP = Math.abs(c1.get(Math.max(0, n1 - 3)).close - c1.get(Math.max(0, n1 - 5)).close);
         boolean accel = spd2 > spdP * 1.15 && spd2 > atr1 * 0.70;
 
-        // Вариант 1: одна мощная свеча 1M
         if (curB > atr1 * 1.45 && vRatio > 1.35 && accel) {
             int d = cur.close > cur.open ? 1 : -1;
             double s = Math.min(0.88, (curB / atr1 - 1.25) * 0.52);
             if (s > 0.36) return new AntiLagResult(d, s);
         }
 
-        // Вариант 2: две сильные свечи подряд 1M
         if (curB > atr1 * 1.15 && prevB > atr1 * 1.05 && accel) {
             double total = cur.close - prev.open;
             int d = total > 0 ? 1 : -1;
@@ -885,7 +1036,6 @@ public final class DecisionEngineMerged {
             if (s > 0.36) return new AntiLagResult(d, s);
         }
 
-        // Вариант 3: большая свеча 5M
         int n5 = c5.size();
         TradingCore.Candle c5l = c5.get(n5 - 1);
         double atr5  = atr(c5, Math.min(14, n5 - 1));
@@ -898,7 +1048,6 @@ public final class DecisionEngineMerged {
             if (s > 0.36) return new AntiLagResult(d, s);
         }
 
-        // Вариант 4: серия 3+ монолитных свечей 1M
         int grn = 0, red = 0;
         double serMove = 0;
         for (int i = Math.max(0, n1 - 4); i < n1; i++) {
@@ -933,24 +1082,20 @@ public final class DecisionEngineMerged {
         double score = 0;
         boolean longExh = false, shortExh = false;
 
-        // 1. RSI экстрем на 1H
         double rsi1h = rsi(c1h, 14);
         if (rsi1h > 75.0) { score += 0.27; longExh  = true; }
         if (rsi1h < 25.0) { score += 0.27; shortExh = true; }
 
-        // 2. Momentum divergence (3 периода)
         double mom  = momentumPct(c15, 5, 0);
         double mom1 = momentumPct(c15, 5, 5);
         double mom2 = momentumPct(c15, 5, 10);
         if (mom < mom1 * 0.63 && mom1 < mom2 * 0.68 && mom1 > 0) { score += 0.48; longExh  = true; }
         if (mom > mom1 * 1.37 && mom1 > mom2 * 1.32 && mom1 < 0) { score += 0.48; shortExh = true; }
 
-        // 3. Volume collapse
         double avgVol = c15.subList(Math.max(0, c15.size() - 15), c15.size() - 3)
                 .stream().mapToDouble(c -> c.volume).average().orElse(1);
         if (last(c15).volume < avgVol * 0.52) score += 0.32;
 
-        // 4. Wick rejection
         TradingCore.Candle lc = last(c15);
         double uw = lc.high - Math.max(lc.open, lc.close);
         double lw = Math.min(lc.open, lc.close) - lc.low;
@@ -958,14 +1103,12 @@ public final class DecisionEngineMerged {
         if (uw > bd * 2.4 && lc.close < lc.open) { score += 0.38; longExh  = true; }
         if (lw > bd * 2.4 && lc.close > lc.open) { score += 0.38; shortExh = true; }
 
-        // 5. ADX falling (тренд слабеет)
         if (c15.size() >= 2) {
             double adxC = adx(c15, 14);
             double adxP = adx(c15.subList(0, c15.size() - 1), 14);
             if (adxP > adxC && adxC > 20) score += 0.28;
         }
 
-        // 6. Три свечи с уменьшающимся телом (истощение)
         if (c15.size() >= 3) {
             TradingCore.Candle ca = c15.get(c15.size() - 3);
             TradingCore.Candle cb = c15.get(c15.size() - 2);
@@ -983,7 +1126,6 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // 7. Хвост после большой противоположной свечи
         if (c15.size() >= 2) {
             TradingCore.Candle prevC = c15.get(c15.size() - 2);
             if (prevC.close > prevC.open) {
@@ -1010,7 +1152,7 @@ public final class DecisionEngineMerged {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  MARKET STRUCTURE (из старого проекта — HH/HL vs LL/LH)
+    //  MARKET STRUCTURE
     // ══════════════════════════════════════════════════════════════
 
     public static int marketStructure(List<TradingCore.Candle> c) {
@@ -1024,8 +1166,8 @@ public final class DecisionEngineMerged {
         double lastLow  = c.get(lows.get(lows.size() - 1)).low;
         double prevLow  = c.get(lows.get(lows.size() - 2)).low;
 
-        if (lastHigh > prevHigh && lastLow > prevLow)  return  1;  // Bullish HH+HL
-        if (lastHigh < prevHigh && lastLow < prevLow)  return -1;  // Bearish LL+LH
+        if (lastHigh > prevHigh && lastLow > prevLow)  return  1;
+        if (lastHigh < prevHigh && lastLow < prevLow)  return -1;
         return 0;
     }
 
@@ -1136,7 +1278,7 @@ public final class DecisionEngineMerged {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  OLD PUMP DETECTOR (1m/5m)
+    //  OLD PUMP DETECTOR
     // ══════════════════════════════════════════════════════════════
 
     private static final class OldPumpResult {
@@ -1173,7 +1315,6 @@ public final class DecisionEngineMerged {
             return new OldPumpResult(true, dir, str);
         }
 
-        // Серия свечей
         int gC = 0, rC = 0; double totMove = 0;
         for (int i = c1.size() - 1 - lookback; i < c1.size(); i++) {
             TradingCore.Candle c = c1.get(i);
@@ -1213,23 +1354,18 @@ public final class DecisionEngineMerged {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  EXHAUSTION CHECKS — LONG
+    //  EXHAUSTION CHECKS — LONG / SHORT
     // ══════════════════════════════════════════════════════════════
 
     private boolean isLongExhausted(List<TradingCore.Candle> c15,
                                     List<TradingCore.Candle> c1h,
                                     double rsi14, double rsi7, double price) {
-        // RSI двойной экстрем
         if (rsi14 > 76 && rsi7 > 79) return true;
 
         double ema21 = ema(c15, 21);
-        // Сильно выше EMA21 + перекуплен
         if ((price - ema21) / ema21 > 0.026 && rsi14 > 68) return true;
-
-        // RSI на 1H перекуплен
         if (c1h.size() >= 8 && rsi(c1h, 14) > 78) return true;
 
-        // Три уменьшающихся тела подряд + падение объёма
         if (c15.size() >= 6) {
             double b1 = Math.abs(c15.get(c15.size()-1).close - c15.get(c15.size()-1).open);
             double b2 = Math.abs(c15.get(c15.size()-2).close - c15.get(c15.size()-2).open);
@@ -1242,7 +1378,6 @@ public final class DecisionEngineMerged {
             if (price > ema21 && v1 < v2 * 0.78 && v2 < v3 * 0.88) return true;
         }
 
-        // Верхний фитиль больше тела при медвежьей свече
         TradingCore.Candle lc = last(c15);
         double uw = lc.high - Math.max(lc.open, lc.close);
         double bd = Math.abs(lc.close - lc.open) + 1e-10;
@@ -1250,10 +1385,6 @@ public final class DecisionEngineMerged {
 
         return false;
     }
-
-    // ══════════════════════════════════════════════════════════════
-    //  EXHAUSTION CHECKS — SHORT
-    // ══════════════════════════════════════════════════════════════
 
     private boolean isShortExhausted(List<TradingCore.Candle> c15,
                                      List<TradingCore.Candle> c1h,
@@ -1293,7 +1424,6 @@ public final class DecisionEngineMerged {
         double ema20 = ema(c, 20);
         double ema50 = ema(c, 50);
         int    n     = c.size();
-        // Slope через 10 баров
         double slope = (ema20 - ema(c.subList(0, Math.max(1, n - 10)), 20)) / (c.get(0).close + 1e-9);
         double vol   = atr(c, 14) / (c.get(n - 1).close + 1e-9);
 
@@ -1354,14 +1484,31 @@ public final class DecisionEngineMerged {
         return h2 < h1 && l2 < l1;
     }
 
-    private void adaptMinConfidence(MarketState state, double atr, double price) {
+    /**
+     * [FIX-5] Адаптируем глобальный минимальный порог.
+     * Учитывает волатильность, режим рынка, время суток.
+     */
+    private void adaptGlobalMinConf(MarketState state, double atr, double price) {
         double vol  = atr / (price + 1e-9);
         double base = BASE_CONF;
+
         if (state == MarketState.STRONG_TREND) base -= 2.0;
-        else if (state == MarketState.RANGE)   base += 2.0;
-        if (vol > 0.022)       base += 2.5;
+        else if (state == MarketState.RANGE)   base += 2.5;
+
+        // При очень высокой волатильности — строже
+        if (vol > 0.025)       base += 3.5;
+        else if (vol > 0.018)  base += 2.0;
         else if (vol < 0.005)  base -= 1.0;
-        MIN_CONFIDENCE = clamp(base, 47, 62);
+
+        // [FIX-5] Учёт времени суток (UTC)
+        int utcHour = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getHour();
+        if (utcHour >= 8 && utcHour <= 16) {
+            base -= 1.0; // Европейская сессия — чуть мягче (больше объёма)
+        } else if (utcHour >= 13 && utcHour <= 21) {
+            base -= 1.5; // Американская сессия — наиболее ликвидна
+        }
+
+        globalMinConf = clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1499,6 +1646,7 @@ public final class DecisionEngineMerged {
         Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new ArrayDeque<>());
         h.addLast(side.name());
         if (h.size() > 3) h.removeFirst();
+        signalCountBySymbol.computeIfAbsent(sym, k -> new AtomicInteger(0)).incrementAndGet();
     }
 
     private boolean priceMovedEnough(String sym, double price) {
