@@ -109,11 +109,50 @@ public final class SignalSender {
     private volatile Set<String>            cachedPairs        = new LinkedHashSet<>();
     private volatile long                   lastPairsRefresh   = 0L;
     private volatile long                   lastFundingRefresh = 0L;
-    private final Map<String, Double>       volume24hUSD       = new ConcurrentHashMap<>(); // [FIX-1]
+    private final Map<String, Double>       volume24hUSD       = new ConcurrentHashMap<>();
     private volatile long                   lastVolRefresh     = 0L;
     private static final long               VOL_REFRESH_MS     = 30 * 60_000L;
 
-    // ── [FIX-4] Relative Strength history ─────────────────────────
+    // ── Binance Rate Limiter — защита от бана ─────────────────────
+    // Лимит Binance Futures: 2400 weight/мин. Klines = 5 weight.
+    // Мы ограничиваем себя до 1800 weight/мин (75%) с запасом.
+    private static final int  RATE_LIMIT_MAX_WEIGHT = 1800;
+    private static final long RATE_LIMIT_WINDOW_MS  = 60_000L;
+    private final java.util.concurrent.atomic.AtomicInteger usedWeight
+            = new java.util.concurrent.atomic.AtomicInteger(0);
+    private volatile long weightWindowStart = System.currentTimeMillis();
+    private volatile boolean rateLimitPaused = false;
+
+    /** Записывает использованный weight, при превышении — вводит паузу */
+    private void trackWeight(int weight) {
+        long now = System.currentTimeMillis();
+        if (now - weightWindowStart > RATE_LIMIT_WINDOW_MS) {
+            usedWeight.set(0);
+            weightWindowStart = now;
+            rateLimitPaused   = false;
+        }
+        int total = usedWeight.addAndGet(weight);
+        if (total > RATE_LIMIT_MAX_WEIGHT && !rateLimitPaused) {
+            rateLimitPaused = true;
+            System.out.println("[RATE] Weight " + total + "/" + RATE_LIMIT_MAX_WEIGHT
+                    + " — пауза до следующей минуты");
+        }
+    }
+
+    /** Проверяет можно ли делать запрос, иначе ждёт следующей минуты */
+    private void awaitRateLimit() {
+        if (!rateLimitPaused) return;
+        long waitMs = RATE_LIMIT_WINDOW_MS - (System.currentTimeMillis() - weightWindowStart);
+        if (waitMs > 0) {
+            try { Thread.sleep(Math.min(waitMs + 200, RATE_LIMIT_WINDOW_MS)); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+        usedWeight.set(0);
+        weightWindowStart = System.currentTimeMillis();
+        rateLimitPaused   = false;
+    }
+
+    // ── Relative Strength history ─────────────────────────────────
     private final Map<String, Deque<Double>> relStrengthHistory = new ConcurrentHashMap<>();
     private static final int RS_HISTORY = 12;
 
@@ -777,6 +816,7 @@ public final class SignalSender {
     }
 
     private List<TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
+        awaitRateLimit();
         try {
             String url = String.format(
                     "https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
@@ -785,7 +825,31 @@ public final class SignalSender {
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(10))
                     .GET().build();
-            String body = http.send(req, HttpResponse.BodyHandlers.ofString()).body();
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+
+            // Читаем реальный использованный weight из заголовка Binance
+            resp.headers().firstValue("X-MBX-USED-WEIGHT-1M").ifPresent(w -> {
+                try {
+                    int serverWeight = Integer.parseInt(w);
+                    // Синхронизируем наш счётчик с серверным (более точно)
+                    usedWeight.set(Math.max(usedWeight.get(), serverWeight));
+                    if (serverWeight > 2000) {
+                        System.out.println("[RATE] Server weight=" + serverWeight + " HIGH — замедляемся");
+                        rateLimitPaused = true;
+                    }
+                } catch (NumberFormatException ignored) {}
+            });
+
+            // HTTP 429 = Too Many Requests — ждём и повторяем
+            if (resp.statusCode() == 429 || resp.statusCode() == 418) {
+                System.out.println("[RATE] HTTP " + resp.statusCode() + " for " + symbol + " — пауза 30с");
+                rateLimitPaused = true;
+                try { Thread.sleep(30_000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                return Collections.emptyList();
+            }
+
+            trackWeight(5); // klines = 5 weight
+            String body = resp.body();
             if (!body.trim().startsWith("[")) return Collections.emptyList();
             JSONArray arr = new JSONArray(body);
             List<TradingCore.Candle> list = new ArrayList<>(arr.length());

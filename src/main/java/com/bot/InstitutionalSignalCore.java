@@ -65,27 +65,65 @@ public final class InstitutionalSignalCore {
     private final Map<String, Long>               symbolLastWin = new ConcurrentHashMap<>();
     private volatile double currentExposure = 0.0;
 
+    // Time Stop: 15m свечей до принудительного закрытия сигнала без результата
+    // 6 свечей = 90 минут. Если за это время цена не пошла к TP1 — сценарий не сработал.
+    private static final int TIME_STOP_BARS_15M = 6;
+    private static final long TIME_STOP_MS = TIME_STOP_BARS_15M * 15 * 60_000L; // 90 мин
+
+    // Callback для уведомления о Time Stop (опционально)
+    private volatile java.util.function.BiConsumer<String, String> timeStopCallback = null;
+
+    public void setTimeStopCallback(java.util.function.BiConsumer<String, String> cb) {
+        this.timeStopCallback = cb;
+    }
+
     // ── Models ─────────────────────────────────────────────────────
 
     public static final class ActiveSignal {
         public final String           symbol;
         public final TradingCore.Side side;
         public final double           entry;
+        public final double           tp1;    // первый тейк — ориентир для Time Stop
+        public final double           stop;   // стоп для проверки
         public final double           probability;
         public final long             timestamp;
         public final String           category;
 
         public ActiveSignal(String sym, TradingCore.Side side, double entry,
-                            double prob, long ts, String cat) {
+                            double tp1, double stop, double prob, long ts, String cat) {
             this.symbol      = sym;
             this.side        = side;
             this.entry       = entry;
+            this.tp1         = tp1;
+            this.stop        = stop;
             this.probability = prob;
             this.timestamp   = ts;
             this.category    = cat;
         }
 
+        /** Обратная совместимость (без tp1/stop) */
+        public ActiveSignal(String sym, TradingCore.Side side, double entry,
+                            double prob, long ts, String cat) {
+            this(sym, side, entry, 0, 0, prob, ts, cat);
+        }
+
         public long ageMs() { return System.currentTimeMillis() - timestamp; }
+
+        /** Сигнал живёт дольше Time Stop */
+        public boolean isTimeExpired() { return ageMs() > TIME_STOP_MS; }
+
+        /**
+         * Проверяет, идёт ли цена по сценарию.
+         * Если через 3 свечи (45 мин) цена не сдвинулась хотя бы на 25% к TP1 — плохой знак.
+         */
+        public boolean isStalled(double currentPrice) {
+            if (tp1 == 0 || ageMs() < 3 * 15 * 60_000L) return false;
+            double totalDist = Math.abs(tp1 - entry);
+            double progress  = side == TradingCore.Side.LONG
+                    ? currentPrice - entry
+                    : entry - currentPrice;
+            return progress / (totalDist + 1e-9) < 0.25;
+        }
     }
 
     public static final class ClosedTrade {
@@ -191,11 +229,11 @@ public final class InstitutionalSignalCore {
 
         ActiveSignal active = new ActiveSignal(
                 signal.symbol, signal.side, signal.price,
+                signal.tp1, signal.stop,
                 signal.probability, now, catName);
 
         activeSignals.compute(signal.symbol, (sym, lst) -> {
             if (lst == null) lst = new CopyOnWriteArrayList<>();
-            // Удаляем устаревший похожий сигнал того же направления
             lst.removeIf(s -> s.side == signal.side &&
                     Math.abs(s.entry - signal.price) / (s.entry + 1e-9) < minSignalDiff);
             lst.add(active);
@@ -241,11 +279,31 @@ public final class InstitutionalSignalCore {
         for (Iterator<Map.Entry<String, List<ActiveSignal>>> it =
              activeSignals.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<String, List<ActiveSignal>> e = it.next();
+            String sym = e.getKey();
             e.getValue().removeIf(s -> {
-                if (now - s.timestamp > signalTtlMs) {
+                boolean ttlExpired  = (now - s.timestamp > signalTtlMs);
+                boolean timeStop    = s.isTimeExpired();
+
+                if (ttlExpired || timeStop) {
                     currentExposure = clamp(
                             currentExposure - estimateExposure(s.probability, s.category),
                             0, maxPortfolioExposure);
+
+                    // Time Stop — сигнал жил 90 мин без результата
+                    if (timeStop && !ttlExpired) {
+                        history.computeIfAbsent(sym, k -> new CopyOnWriteArrayList<>())
+                                .add(new ClosedTrade(sym, s.side, 0.0, now - s.timestamp));
+                        updateSymbolScore(sym, 0.0); // BE — штраф -0.005
+                        if (timeStopCallback != null) {
+                            try {
+                                timeStopCallback.accept(sym,
+                                        "⏱ *TIME STOP* " + sym + " " + s.side
+                                                + " — 6 свечей без результата. Сценарий не сработал.");
+                            } catch (Exception ignored) {}
+                        }
+                        log("TIME STOP: " + sym + " " + s.side
+                                + " age=" + (now - s.timestamp) / 60_000 + "min");
+                    }
                     return true;
                 }
                 return false;

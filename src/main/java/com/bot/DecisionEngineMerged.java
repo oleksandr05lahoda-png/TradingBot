@@ -94,6 +94,56 @@ public final class DecisionEngineMerged {
 
     public DecisionEngineMerged() {}
 
+    // ══════════════════════════════════════════════════════════════
+    //  MARKET CONTEXT — динамическая нормализация весов
+    //  Решает проблему "магических чисел" (Overfitting):
+    //  все веса скоринга масштабируются по текущей волатильности
+    //  относительно базовой (7-дневный ATR). При низкой воле
+    //  пороги мягче, при высокой — строже. Автоматически.
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Хранит нормализованный контекст рынка для одного символа.
+     * volMultiplier: 1.0 = нормальная воля, >1 = высокая, <1 = низкая.
+     * scoreScale:    масштаб добавляемых очков (адаптируется к воле).
+     * thresholdScale: масштаб порогов (при высокой воле — строже).
+     */
+    private static final class MarketContext {
+        final double volMultiplier;   // текущий ATR% / базовый ATR% (7д)
+        final double scoreScale;      // мультипликатор для весов скора
+        final double thresholdScale;  // мультипликатор для порогов входа
+        final double atrPct;          // текущий ATR / price
+
+        MarketContext(double volMult, double atrPct) {
+            this.volMultiplier  = volMult;
+            this.atrPct         = atrPct;
+            // При высокой воле — уменьшаем веса (рынок уже без нас движется)
+            // При низкой воле — увеличиваем (каждое движение важнее)
+            this.scoreScale     = clamp(1.0 / Math.sqrt(volMult), 0.65, 1.45);
+            // Пороги ATR/объёма масштабируются пропорционально воле
+            this.thresholdScale = clamp(volMult, 0.5, 2.0);
+        }
+
+        /** Масштабирует добавку к скору */
+        double s(double baseScore) { return baseScore * scoreScale; }
+        /** Масштабирует ATR-зависимый порог */
+        double t(double baseThreshold) { return baseThreshold * thresholdScale; }
+
+        static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
+    }
+
+    /** Считает MarketContext из 15m свечей. Базой служит ATR за 7 дней (672 свечи). */
+    private MarketContext buildMarketContext(List<TradingCore.Candle> c15, double price) {
+        double atrCurrent = atr(c15, 14);
+        // Базовый ATR — медиана за последние 7 дней (минимум 100 свечей)
+        int baseWindow = Math.min(c15.size() - 14, 672);
+        double atrBase = baseWindow >= 50
+                ? atr(c15.subList(0, baseWindow), Math.min(14, baseWindow - 1))
+                : atrCurrent;
+        double volMult = atrBase > 0 ? atrCurrent / atrBase : 1.0;
+        return new MarketContext(clamp(volMult, 0.3, 3.0), atrCurrent / (price + 1e-9));
+    }
+
     // ── Setters ───────────────────────────────────────────────────
     public void setPumpHunter(PumpHunter ph)              { this.pumpHunter = ph; }
     public void setVolumeDelta(String sym, double delta)  { volumeDeltaMap.put(sym, delta); }
@@ -367,11 +417,13 @@ public final class DecisionEngineMerged {
         if (lastRange > atr14 * 4.5 || atr14 <= 0) return null;
         atr14 = Math.max(atr14, price * 0.0012);
 
+        // Динамический контекст рынка — масштабирует все веса и пороги
+        MarketContext mctx = buildMarketContext(c15, price);
+
         MarketState state  = detectState(c15);
         HTFBias     bias1h = detectBias1H(c1h);
         HTFBias     bias2h = (c2h != null && c2h.size() >= 50) ? detectBias2H(c2h) : HTFBias.NONE;
 
-        // [FIX-5] Адаптируем глобальный и символьный порог
         adaptGlobalMinConf(state, atr14, price);
 
         if (state == MarketState.RANGE && adx(c15, 14) < 18) return null;
@@ -385,7 +437,7 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
         AntiLagResult antiLag = detectAntiLag(c1, c5, c15);
         if (antiLag != null && antiLag.strength > 0.38) {
-            double bonus = antiLag.strength * 1.30;
+            double bonus = mctx.s(antiLag.strength * 1.30);
             if (antiLag.direction > 0) { scoreLong  += bonus; flags.add("ANTI_LAG_UP"); }
             else                       { scoreShort += bonus; flags.add("ANTI_LAG_DN"); }
         }
@@ -416,15 +468,15 @@ public final class DecisionEngineMerged {
         // ФАКТОРЫ 3-5: HTF BIAS 1H + 2H + согласие/конфликт
         // ════════════════════════════════════════════════════════
         if (bias1h == HTFBias.BULL) {
-            scoreLong  += 0.55; scoreShort -= 0.20; flags.add("1H_BULL");
+            scoreLong  += mctx.s(0.55); scoreShort -= mctx.s(0.20); flags.add("1H_BULL");
         } else if (bias1h == HTFBias.BEAR) {
-            scoreShort += 0.55; scoreLong  -= 0.20; flags.add("1H_BEAR");
+            scoreShort += mctx.s(0.55); scoreLong  -= mctx.s(0.20); flags.add("1H_BEAR");
         }
 
         if (bias2h == HTFBias.BULL) {
-            scoreLong  += 0.50; scoreShort -= 0.25; flags.add("2H_BULL");
+            scoreLong  += mctx.s(0.50); scoreShort -= mctx.s(0.25); flags.add("2H_BULL");
         } else if (bias2h == HTFBias.BEAR) {
-            scoreShort += 0.50; scoreLong  -= 0.25; flags.add("2H_BEAR");
+            scoreShort += mctx.s(0.50); scoreLong  -= mctx.s(0.25); flags.add("2H_BEAR");
         }
 
         if ((bias1h == HTFBias.BULL && bias2h == HTFBias.BEAR) ||
@@ -436,9 +488,9 @@ public final class DecisionEngineMerged {
 
         if (bias1h == bias2h && bias1h != HTFBias.NONE) {
             if (bias1h == HTFBias.BULL) {
-                scoreLong  += 0.45; scoreShort -= 0.22; flags.add("1H2H_BULL");
+                scoreLong  += mctx.s(0.45); scoreShort -= mctx.s(0.22); flags.add("1H2H_BULL");
             } else {
-                scoreShort += 0.50; scoreLong  -= 0.30; flags.add("1H2H_BEAR");
+                scoreShort += mctx.s(0.50); scoreLong  -= mctx.s(0.30); flags.add("1H2H_BEAR");
             }
         }
 
@@ -446,8 +498,8 @@ public final class DecisionEngineMerged {
         // ФАКТОР 6: MARKET STRUCTURE (HH/HL vs LL/LH)
         // ════════════════════════════════════════════════════════
         int structure = marketStructure(c15);
-        if (structure == 1)  { scoreLong  += 0.60; flags.add("HH_HL"); }
-        if (structure == -1) { scoreShort += 0.60; flags.add("LL_LH"); }
+        if (structure == 1)  { scoreLong  += mctx.s(0.60); flags.add("HH_HL"); }
+        if (structure == -1) { scoreShort += mctx.s(0.60); flags.add("LL_LH"); }
 
         // ════════════════════════════════════════════════════════
         // ФАКТОР 7: PUMPHUNTER
@@ -459,21 +511,21 @@ public final class DecisionEngineMerged {
                 pumpDetected = true;
                 double bonus = pump.strength * 0.60 * (pump.isConfirmed ? 1.0 : 0.65);
                 if (pump.isBullish()) {
-                    scoreLong  += 0.70 + bonus;
+                    scoreLong += mctx.s(0.70) + bonus;
                     flags.add("PUMP_UP_" + pct(pump.strength));
                 }
                 if (pump.isBearish()) {
-                    scoreShort += 0.70 + bonus;
+                    scoreShort += mctx.s(0.70) + bonus;
                     flags.add("PUMP_DN_" + pct(pump.strength));
                 }
                 if (pump.isMega()) {
-                    if (pump.isBullish()) scoreLong  += 0.40;
-                    else                  scoreShort += 0.40;
+                    if (pump.isBullish()) scoreLong += mctx.s(0.40);
+                    else                  scoreShort += mctx.s(0.40);
                     flags.add("MEGA_PUMP");
                 }
                 if (pump.flags.contains("VOL_CLIMAX")) {
-                    if (pump.isBullish()) scoreLong  += 0.15;
-                    else                  scoreShort += 0.15;
+                    if (pump.isBullish()) scoreLong += mctx.s(0.15);
+                    else                  scoreShort += mctx.s(0.15);
                     flags.add("VOL_CLIMAX");
                 }
             }
@@ -493,28 +545,28 @@ public final class DecisionEngineMerged {
             oiChange     = fOI.oiChange1h;
 
             if (fundingRate > 0.0005) {
-                scoreShort += 0.45 + Math.min(fundingRate * 100, 0.45);
-                scoreLong  -= 0.25;
+                scoreShort += mctx.s(0.45) + Math.min(fundingRate * 100, 0.45);
+                scoreLong -= mctx.s(0.25);
                 flags.add("FR_HIGH");
             } else if (fundingRate < -0.0005) {
-                scoreLong  += 0.45 + Math.min(Math.abs(fundingRate) * 100, 0.45);
-                scoreShort -= 0.25;
+                scoreLong += mctx.s(0.45) + Math.min(Math.abs(fundingRate) * 100, 0.45);
+                scoreShort -= mctx.s(0.25);
                 flags.add("FR_LOW");
             }
 
             if (fundingDelta > 0.0003) {
-                scoreShort += 0.45; scoreLong -= 0.22;
+                scoreShort += mctx.s(0.45); scoreLong -= mctx.s(0.22);
                 flags.add("FR_SPIKE→SHORT");
             } else if (fundingDelta < -0.0003) {
-                scoreLong  += 0.45; scoreShort -= 0.22;
+                scoreLong += mctx.s(0.45); scoreShort -= mctx.s(0.22);
                 flags.add("FR_DROP→LONG");
             }
 
             if (fOI.oiChange1h > 3.5 && fundingRate > 0.0003) {
-                scoreShort += 0.35; flags.add("OI_SQUEEZE_LONG");
+                scoreShort += mctx.s(0.35); flags.add("OI_SQUEEZE_LONG");
             }
             if (fOI.oiChange1h > 3.5 && fundingRate < -0.0003) {
-                scoreLong  += 0.35; flags.add("OI_SQUEEZE_SHORT");
+                scoreLong += mctx.s(0.35); flags.add("OI_SQUEEZE_SHORT");
             }
             if (fOI.oiChange1h < -5.0) {
                 scoreLong  *= 0.78;
@@ -556,10 +608,10 @@ public final class DecisionEngineMerged {
         boolean hasFVG = fvg.detected;
         if (fvg.detected) {
             if ( fvg.isBullish && price < fvg.gapHigh && price > fvg.gapLow) {
-                scoreLong  += 0.55; flags.add("FVG_BULL");
+                scoreLong += mctx.s(0.55); flags.add("FVG_BULL");
             }
             if (!fvg.isBullish && price > fvg.gapLow && price < fvg.gapHigh) {
-                scoreShort += 0.55; flags.add("FVG_BEAR");
+                scoreShort += mctx.s(0.55); flags.add("FVG_BEAR");
             }
         }
 
@@ -569,8 +621,8 @@ public final class DecisionEngineMerged {
         OrderBlockResult ob = detectOrderBlock(c15);
         boolean hasOB = ob.detected;
         if (ob.detected) {
-            if (ob.isBullish  && price <= ob.zone * 1.006) { scoreLong  += 0.60; flags.add("OB_BULL"); }
-            if (!ob.isBullish && price >= ob.zone * 0.994) { scoreShort += 0.60; flags.add("OB_BEAR"); }
+            if (ob.isBullish  && price <= ob.zone * 1.006) { scoreLong += mctx.s(0.60); flags.add("OB_BULL"); }
+            if (!ob.isBullish && price >= ob.zone * 0.994) { scoreShort += mctx.s(0.60); flags.add("OB_BEAR"); }
         }
 
         // ════════════════════════════════════════════════════════
@@ -580,8 +632,8 @@ public final class DecisionEngineMerged {
         boolean bosDown = detectBOSDown(c15);
         boolean hasBOS  = bosUp || bosDown;
 
-        if (bosUp)   { scoreLong  += 0.55; flags.add("BOS_UP"); }
-        if (bosDown) { scoreShort += 0.55; flags.add("BOS_DOWN"); }
+        if (bosUp)   { scoreLong += mctx.s(0.55); flags.add("BOS_UP"); }
+        if (bosDown) { scoreShort += mctx.s(0.55); flags.add("BOS_DOWN"); }
 
         boolean liqSweep = detectLiquiditySweep(c15);
         if (liqSweep) {
@@ -589,8 +641,8 @@ public final class DecisionEngineMerged {
             double uw = lc.high - Math.max(lc.open, lc.close);
             double lw = Math.min(lc.open, lc.close) - lc.low;
             double bd = Math.abs(lc.close - lc.open) + 1e-10;
-            if (uw > bd * 1.7) { scoreShort += 0.65; flags.add("LIQ_SWEEP_S"); }
-            if (lw > bd * 1.7) { scoreLong  += 0.65; flags.add("LIQ_SWEEP_L"); }
+            if (uw > bd * 1.7) { scoreShort += mctx.s(0.65); flags.add("LIQ_SWEEP_S"); }
+            if (lw > bd * 1.7) { scoreLong += mctx.s(0.65); flags.add("LIQ_SWEEP_L"); }
         }
 
         // ════════════════════════════════════════════════════════
@@ -618,16 +670,16 @@ public final class DecisionEngineMerged {
                         double add = state == MarketState.STRONG_TREND ? 0.60 : 0.42;
                         scoreLong  += add; flags.add("IMP_UP");
                     } else {
-                        scoreLong += 0.15; flags.add("IMP_UP_CONF");
+                        scoreLong += mctx.s(0.15); flags.add("IMP_UP_CONF");
                     }
                 }
 
                 // [FIX-2] IMP_DN с реальным объёмом — Price Action побеждает 2H EMA
                 if (delta1m < 0 && impStr > 0.28) {
-                    // Проверяем объём: если он >= 1.8× среднего — это НАСТОЯЩИЙ дамп
-                    boolean strongVolume = isStrongImpulseVolume(c1, 1.8);
-                    // Проверяем скорость: движение > 0.55 ATR за 3 бара
-                    boolean fastDrop = impStr > 0.55;
+                    // Объём >= (1.8 × volMultiplier) среднего — масштабируется с волой
+                    boolean strongVolume = isStrongImpulseVolume(c1, mctx.t(1.8));
+                    // Скорость > 0.55 ATR (масштабируется)
+                    boolean fastDrop = impStr > mctx.t(0.55);
 
                     if (bias2h == HTFBias.BULL && (strongVolume || fastDrop)) {
                         // Цена летит вниз с объёмом — игнорируем бычий 2H
@@ -640,7 +692,7 @@ public final class DecisionEngineMerged {
                         scoreShort += add; flags.add("IMP_DN");
                     } else {
                         // Слабый дамп против бычьего 2H — минимальный вес
-                        scoreShort += 0.15; flags.add("IMP_DN_CONF");
+                        scoreShort += mctx.s(0.15); flags.add("IMP_DN_CONF");
                     }
                 }
             }
@@ -651,8 +703,8 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
         CompressionResult compr = detectCompression(c15, c1);
         if (compr.breakout) {
-            if (compr.direction > 0) { scoreLong  += 0.75; flags.add("COMPRESS_UP"); }
-            else                     { scoreShort += 0.75; flags.add("COMPRESS_DN"); }
+            if (compr.direction > 0) { scoreLong += mctx.s(0.75); flags.add("COMPRESS_UP"); }
+            else                     { scoreShort += mctx.s(0.75); flags.add("COMPRESS_DN"); }
         }
 
         // ════════════════════════════════════════════════════════
@@ -663,8 +715,8 @@ public final class DecisionEngineMerged {
         boolean bullDiv = bullDiv(c15);
         boolean bearDiv = bearDiv(c15);
 
-        if (bullDiv) { scoreLong  += 0.65; flags.add("BULL_DIV"); }
-        if (bearDiv) { scoreShort += 0.65; flags.add("BEAR_DIV"); }
+        if (bullDiv) { scoreLong += mctx.s(0.65); flags.add("BULL_DIV"); }
+        if (bearDiv) { scoreShort += mctx.s(0.65); flags.add("BEAR_DIV"); }
 
         // [FIX-1] ХАРД-ЛОК дивергенций против позиции
         // BEAR_DIV при LONG — это самоубийство. Убиваем сигнал.
@@ -683,8 +735,8 @@ public final class DecisionEngineMerged {
         // ФАКТОР 21: RSI EXTREME (не в тренде)
         // ════════════════════════════════════════════════════════
         if (state != MarketState.STRONG_TREND) {
-            if (rsi14 > 78) { scoreLong  -= 0.28; }
-            if (rsi14 < 22) { scoreShort -= 0.28; }
+            if (rsi14 > 78) { scoreLong -= mctx.s(0.28); }
+            if (rsi14 < 22) { scoreShort -= mctx.s(0.28); }
         }
 
         // ════════════════════════════════════════════════════════
@@ -770,8 +822,8 @@ public final class DecisionEngineMerged {
         // ФАКТОР 25: VOLUME SPIKE
         // ════════════════════════════════════════════════════════
         if (volumeSpike(c15, cat)) {
-            if (scoreLong  > scoreShort) { scoreLong  += 0.20; }
-            else                         { scoreShort += 0.20; }
+            if (scoreLong  > scoreShort) { scoreLong += mctx.s(0.20); }
+            else                         { scoreShort += mctx.s(0.20); }
             flags.add("VOL_SPIKE");
         }
 
@@ -780,8 +832,8 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
         int vwapLen = Math.min(50, c15.size());
         double vwapVal = vwap(c15.subList(c15.size() - vwapLen, c15.size()));
-        if (price > vwapVal * 1.0008 && scoreLong  > scoreShort) { scoreLong  += 0.22; flags.add("VWAP_BULL"); }
-        if (price < vwapVal * 0.9992 && scoreShort > scoreLong)  { scoreShort += 0.22; flags.add("VWAP_BEAR"); }
+        if (price > vwapVal * 1.0008 && scoreLong  > scoreShort) { scoreLong += mctx.s(0.22); flags.add("VWAP_BULL"); }
+        if (price < vwapVal * 0.9992 && scoreShort > scoreLong)  { scoreShort += mctx.s(0.22); flags.add("VWAP_BEAR"); }
 
         // ════════════════════════════════════════════════════════
         // TREND EXHAUSTION (8-bar big move)

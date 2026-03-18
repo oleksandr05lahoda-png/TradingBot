@@ -64,6 +64,9 @@ public final class BotMain {
         final InstitutionalSignalCore  isc      = new InstitutionalSignalCore();
         final SignalSender             sender   = new SignalSender(telegram, gic, isc);
 
+        // Time Stop: уведомляем в Telegram когда сигнал закрывается по времени
+        isc.setTimeStopCallback((sym, msg) -> telegram.sendMessageAsync(msg));
+
         telegram.sendMessageAsync(buildStartMessage());
         LOG.info("═══ GodBot v3.1 стартовал " + nowWarsawStr() + " ═══");
 
@@ -199,11 +202,13 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "🚀 *GodBot v3.1 запущен*\n"
+        return "🚀 *GodBot v4.0 запущен*\n"
                 + "Таймфрейм: 15M | Пары: TOP-100\n"
-                + "Тихие часы: UTC 02:00–05:30 (было 03:00–07:00)\n"
-                + "Кулдаун: TOP=4m / ALT=3m / MEME=2m (было 12/10/5)\n"
-                + "Лимит сигналов: ∞ | Фильтры: 26 факторов + GIC + ISC + OBI\n"
+                + "Тихие часы: UTC 02:00–05:30\n"
+                + "Кулдаун: TOP=4m / ALT=3m / MEME=2m\n"
+                + "Time Stop: 90 мин (6 свечей)\n"
+                + "Фильтры: 26 факторов + GIC + ISC + OBI + LiqGuard + CorrGuard\n"
+                + "Веса: динамические (ATR-нормализация)\n"
                 + "_" + nowWarsawStr() + " Warsaw_";
     }
 
