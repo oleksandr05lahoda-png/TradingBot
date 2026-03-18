@@ -1209,7 +1209,6 @@ public final class GlobalImpulseController {
         return Math.max(lo, Math.min(hi, v));
     }
 
-    /** @deprecated используйте getFilterWeight(symbol, isLong, relStrength, sectorName) */
     @Deprecated
     public double filterSignal(String symbol, boolean isLong, double confidence,
                                com.bot.DecisionEngineMerged.CoinCategory cat) {
