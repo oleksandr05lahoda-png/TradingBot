@@ -81,7 +81,7 @@ public final class InstitutionalSignalCore {
 
     public static final class ActiveSignal {
         public final String           symbol;
-        public final TradingCore.Side side;
+        public final com.bot.TradingCore.Side side;
         public final double           entry;
         public final double           tp1;    // первый тейк — ориентир для Time Stop
         public final double           stop;   // стоп для проверки
@@ -89,7 +89,7 @@ public final class InstitutionalSignalCore {
         public final long             timestamp;
         public final String           category;
 
-        public ActiveSignal(String sym, TradingCore.Side side, double entry,
+        public ActiveSignal(String sym, com.bot.TradingCore.Side side, double entry,
                             double tp1, double stop, double prob, long ts, String cat) {
             this.symbol      = sym;
             this.side        = side;
@@ -102,7 +102,7 @@ public final class InstitutionalSignalCore {
         }
 
         /** Обратная совместимость (без tp1/stop) */
-        public ActiveSignal(String sym, TradingCore.Side side, double entry,
+        public ActiveSignal(String sym, com.bot.TradingCore.Side side, double entry,
                             double prob, long ts, String cat) {
             this(sym, side, entry, 0, 0, prob, ts, cat);
         }
@@ -119,7 +119,7 @@ public final class InstitutionalSignalCore {
         public boolean isStalled(double currentPrice) {
             if (tp1 == 0 || ageMs() < 3 * 15 * 60_000L) return false;
             double totalDist = Math.abs(tp1 - entry);
-            double progress  = side == TradingCore.Side.LONG
+            double progress  = side == com.bot.TradingCore.Side.LONG
                     ? currentPrice - entry
                     : entry - currentPrice;
             return progress / (totalDist + 1e-9) < 0.25;
@@ -128,12 +128,12 @@ public final class InstitutionalSignalCore {
 
     public static final class ClosedTrade {
         public final String           symbol;
-        public final TradingCore.Side side;
+        public final com.bot.TradingCore.Side side;
         public final double           pnlPct;
         public final long             duration;
         public final long             closedAt;
 
-        public ClosedTrade(String sym, TradingCore.Side side,
+        public ClosedTrade(String sym, com.bot.TradingCore.Side side,
                            double pnl, long dur) {
             this.symbol   = sym;
             this.side     = side;
@@ -149,7 +149,7 @@ public final class InstitutionalSignalCore {
     //  MAIN FILTER
     // ══════════════════════════════════════════════════════════════
 
-    public synchronized boolean allowSignal(DecisionEngineMerged.TradeIdea signal) {
+    public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpiredSignals();
 
         if (signal == null) {
@@ -223,7 +223,7 @@ public final class InstitutionalSignalCore {
         return true;
     }
 
-    public synchronized void registerSignal(DecisionEngineMerged.TradeIdea signal) {
+    public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         long now = System.currentTimeMillis();
         String catName = signal.category != null ? signal.category.name() : "ALT";
 
@@ -245,7 +245,7 @@ public final class InstitutionalSignalCore {
     }
 
     /** Вызывается когда позиция закрыта (из внешней системы мониторинга) */
-    public synchronized void closeTrade(String symbol, TradingCore.Side side, double pnlPct) {
+    public synchronized void closeTrade(String symbol, com.bot.TradingCore.Side side, double pnlPct) {
         List<ActiveSignal> list = activeSignals.get(symbol);
         if (list == null) return;
 

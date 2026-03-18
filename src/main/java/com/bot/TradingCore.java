@@ -183,11 +183,11 @@ public final class TradingCore {
        ============================================================ */
 
     public static final class SignalPipeline {
-        private final SignalOptimizer optimizer;
+        private final com.bot.SignalOptimizer optimizer;
         private final AdaptiveBrain brain;
         private final RiskEngine riskEngine;
 
-        public SignalPipeline(SignalOptimizer optimizer, AdaptiveBrain brain, RiskEngine riskEngine) {
+        public SignalPipeline(com.bot.SignalOptimizer optimizer, AdaptiveBrain brain, RiskEngine riskEngine) {
             this.optimizer = optimizer;
             this.brain = brain;
             this.riskEngine = riskEngine;

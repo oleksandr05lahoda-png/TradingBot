@@ -59,10 +59,10 @@ public final class BotMain {
         startTimeMs = System.currentTimeMillis();
         lastErrorWindowStart = startTimeMs;
 
-        final TelegramBotSender        telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
-        final GlobalImpulseController  gic      = new GlobalImpulseController();
-        final InstitutionalSignalCore  isc      = new InstitutionalSignalCore();
-        final SignalSender             sender   = new SignalSender(telegram, gic, isc);
+        final com.bot.TelegramBotSender telegram = new com.bot.TelegramBotSender(TG_TOKEN, CHAT_ID);
+        final com.bot.GlobalImpulseController gic      = new com.bot.GlobalImpulseController();
+        final com.bot.InstitutionalSignalCore isc      = new com.bot.InstitutionalSignalCore();
+        final com.bot.SignalSender sender   = new com.bot.SignalSender(telegram, gic, isc);
 
         // Time Stop: уведомляем в Telegram когда сигнал закрывается по времени
         isc.setTimeStopCallback((sym, msg) -> telegram.sendMessageAsync(msg));
@@ -103,10 +103,10 @@ public final class BotMain {
         }, "ShutdownHook"));
     }
 
-    private static void runCycle(TelegramBotSender telegram,
-                                 GlobalImpulseController gic,
-                                 InstitutionalSignalCore isc,
-                                 SignalSender sender) {
+    private static void runCycle(com.bot.TelegramBotSender telegram,
+                                 com.bot.GlobalImpulseController gic,
+                                 com.bot.InstitutionalSignalCore isc,
+                                 com.bot.SignalSender sender) {
         long cycleStart = System.currentTimeMillis();
         try {
             // ── ИСПРАВЛЕНИЕ: улучшенная проверка тихих часов
@@ -145,14 +145,14 @@ public final class BotMain {
             updateBtcContext(sender, gic);
             updateSectors(sender, gic);
 
-            GlobalImpulseController.GlobalContext ctx = gic.getContext();
+            com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
             LOG.info("BTC: " + ctx.regime
                     + " | str=" + String.format("%.2f", ctx.impulseStrength)
                     + " | vol=" + String.format("%.2f", ctx.volatilityExpansion)
                     + " | trend=" + String.format("%.2f", ctx.btcTrend)
                     + " | " + isc.getStats());
 
-            List<DecisionEngineMerged.TradeIdea> signals = sender.generateSignals();
+            List<com.bot.DecisionEngineMerged.TradeIdea> signals = sender.generateSignals();
 
             if (signals == null || signals.isEmpty()) {
                 LOG.info("Нет сигналов. " + isc.getStats());
@@ -160,7 +160,7 @@ public final class BotMain {
             }
 
             int sent = 0;
-            for (DecisionEngineMerged.TradeIdea s : signals) {
+            for (com.bot.DecisionEngineMerged.TradeIdea s : signals) {
                 telegram.sendMessageAsync(s.toTelegramString());
                 LOG.info("► СИГНАЛ: " + s.symbol + " " + s.side
                         + " prob=" + String.format("%.0f%%", s.probability)
@@ -181,19 +181,19 @@ public final class BotMain {
         }
     }
 
-    private static void updateBtcContext(SignalSender sender, GlobalImpulseController gic) {
+    private static void updateBtcContext(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         try {
-            List<TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", "15m", KLINES);
+            List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", "15m", KLINES);
             if (btc != null && btc.size() > 30) gic.update(btc);
         } catch (Exception e) {
             LOG.warning("BTC context update failed: " + e.getMessage());
         }
     }
 
-    private static void updateSectors(SignalSender sender, GlobalImpulseController gic) {
+    private static void updateSectors(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         for (Map.Entry<String, String> e : SECTOR_LEADERS.entrySet()) {
             try {
-                List<TradingCore.Candle> sc = sender.fetchKlines(e.getKey(), "15m", 80);
+                List<com.bot.TradingCore.Candle> sc = sender.fetchKlines(e.getKey(), "15m", 80);
                 if (sc != null && sc.size() > 25) gic.updateSector(e.getValue(), sc);
             } catch (Exception ex) {
                 // Продолжаем без этого сектора
@@ -212,11 +212,11 @@ public final class BotMain {
                 + "_" + nowWarsawStr() + " Warsaw_";
     }
 
-    private static void logStats(TelegramBotSender telegram,
-                                 GlobalImpulseController gic,
-                                 InstitutionalSignalCore isc) {
+    private static void logStats(com.bot.TelegramBotSender telegram,
+                                 com.bot.GlobalImpulseController gic,
+                                 com.bot.InstitutionalSignalCore isc) {
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
-        GlobalImpulseController.GlobalContext ctx = gic.getContext();
+        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         String msg = String.format(
                 "📊 *GodBot Stats*\n"
                         + "Uptime: %d min | Циклов: %d | Сигналов: %d\n"

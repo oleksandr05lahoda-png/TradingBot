@@ -80,7 +80,7 @@ public final class DecisionEngineMerged {
     // Статистика по символам для логирования
     private final Map<String, AtomicInteger> signalCountBySymbol = new ConcurrentHashMap<>();
 
-    private PumpHunter pumpHunter;
+    private com.bot.PumpHunter pumpHunter;
 
     public DecisionEngineMerged() {}
 
@@ -107,7 +107,7 @@ public final class DecisionEngineMerged {
         static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
     }
 
-    private MarketContext buildMarketContext(List<TradingCore.Candle> c15, double price) {
+    private MarketContext buildMarketContext(List<com.bot.TradingCore.Candle> c15, double price) {
         double atrCurrent = atr(c15, 14);
         int baseWindow = Math.min(c15.size() - 14, 672);
         double atrBase = baseWindow >= 50
@@ -118,7 +118,7 @@ public final class DecisionEngineMerged {
     }
 
     // ── Setters ───────────────────────────────────────────────────
-    public void setPumpHunter(PumpHunter ph)              { this.pumpHunter = ph; }
+    public void setPumpHunter(com.bot.PumpHunter ph)              { this.pumpHunter = ph; }
 
     /**
      * Обновляет Volume Delta для символа.
@@ -209,7 +209,7 @@ public final class DecisionEngineMerged {
 
     public static final class TradeIdea {
         public final String           symbol;
-        public final TradingCore.Side side;
+        public final com.bot.TradingCore.Side side;
         public final double           price;
         public final double           stop;
         public final double           take;
@@ -225,7 +225,7 @@ public final class DecisionEngineMerged {
         public final double           rr;
         public final CoinCategory     category;
 
-        public TradeIdea(String symbol, TradingCore.Side side,
+        public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take, double rr,
                          double probability, List<String> flags,
                          double fundingRate, double fundingDelta,
@@ -245,20 +245,20 @@ public final class DecisionEngineMerged {
             this.category     = cat;
 
             double risk   = Math.abs(price - stop);
-            boolean long_ = side == TradingCore.Side.LONG;
+            boolean long_ = side == com.bot.TradingCore.Side.LONG;
             this.tp1 = long_ ? price + risk * 1.0 : price - risk * 1.0;
             this.tp2 = long_ ? price + risk * 2.0 : price - risk * 2.0;
             this.tp3 = long_ ? price + risk * 3.2 : price - risk * 3.2;
         }
 
-        public TradeIdea(String symbol, TradingCore.Side side,
+        public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take,
                          double probability, List<String> flags) {
             this(symbol, side, price, stop, take, 2.0, probability, flags,
                     0, 0, 0, "NONE", CoinCategory.ALT);
         }
 
-        public TradeIdea(String symbol, TradingCore.Side side,
+        public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take,
                          double probability, List<String> flags,
                          double fundingRate, double oiChange, String htfBias) {
@@ -269,7 +269,7 @@ public final class DecisionEngineMerged {
         public String toTelegramString() {
             String emoji   = probability >= 83 ? "🔥" : probability >= 74 ? "✅"
                     : probability >= 65 ? "🟡" : "⚪";
-            String sideStr = side == TradingCore.Side.LONG ? "📈 LONG" : "📉 SHORT";
+            String sideStr = side == com.bot.TradingCore.Side.LONG ? "📈 LONG" : "📉 SHORT";
             String catStr  = category == CoinCategory.MEME ? "🐸 MEME"
                     : category == CoinCategory.TOP  ? "👑 TOP" : "🔷 ALT";
 
@@ -360,21 +360,21 @@ public final class DecisionEngineMerged {
 
     /** Анализ с 5 таймфреймами (полный) */
     public TradeIdea analyze(String symbol,
-                             List<TradingCore.Candle> c1,
-                             List<TradingCore.Candle> c5,
-                             List<TradingCore.Candle> c15,
-                             List<TradingCore.Candle> c1h,
-                             List<TradingCore.Candle> c2h,
+                             List<com.bot.TradingCore.Candle> c1,
+                             List<com.bot.TradingCore.Candle> c5,
+                             List<com.bot.TradingCore.Candle> c15,
+                             List<com.bot.TradingCore.Candle> c1h,
+                             List<com.bot.TradingCore.Candle> c2h,
                              CoinCategory cat) {
         return generate(symbol, c1, c5, c15, c1h, c2h, cat, System.currentTimeMillis());
     }
 
     /** Анализ без 2H (обратная совместимость) */
     public TradeIdea analyze(String symbol,
-                             List<TradingCore.Candle> c1,
-                             List<TradingCore.Candle> c5,
-                             List<TradingCore.Candle> c15,
-                             List<TradingCore.Candle> c1h,
+                             List<com.bot.TradingCore.Candle> c1,
+                             List<com.bot.TradingCore.Candle> c5,
+                             List<com.bot.TradingCore.Candle> c15,
+                             List<com.bot.TradingCore.Candle> c1h,
                              CoinCategory cat) {
         return generate(symbol, c1, c5, c15, c1h, null, cat, System.currentTimeMillis());
     }
@@ -384,11 +384,11 @@ public final class DecisionEngineMerged {
     // ══════════════════════════════════════════════════════════════
 
     private TradeIdea generate(String symbol,
-                               List<TradingCore.Candle> c1,
-                               List<TradingCore.Candle> c5,
-                               List<TradingCore.Candle> c15,
-                               List<TradingCore.Candle> c1h,
-                               List<TradingCore.Candle> c2h,
+                               List<com.bot.TradingCore.Candle> c1,
+                               List<com.bot.TradingCore.Candle> c5,
+                               List<com.bot.TradingCore.Candle> c15,
+                               List<com.bot.TradingCore.Candle> c1h,
+                               List<com.bot.TradingCore.Candle> c2h,
                                CoinCategory cat,
                                long now) {
 
@@ -435,7 +435,7 @@ public final class DecisionEngineMerged {
                 if (scoreLong < 0.22) return null;
             } else if ("SHORT_EXHAUSTION".equals(rw.type)) {
                 // [FIX-7] EXH_SHORT требует структурного подтверждения для разворота
-                boolean confirmed = confirmReversalStructure(c1, c5, TradingCore.Side.LONG);
+                boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.LONG);
                 if (!confirmed) {
                     scoreShort *= 0.16;
                     if (scoreShort < 0.22) return null;
@@ -534,7 +534,7 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
         boolean liqSweep = detectLiquiditySweep(c15);
         if (liqSweep) {
-            TradingCore.Candle lc = last(c15);
+            com.bot.TradingCore.Candle lc = last(c15);
             double uw = lc.high - Math.max(lc.open, lc.close);
             double lw = Math.min(lc.open, lc.close) - lc.low;
             if (lw > uw) { scoreLong  += mctx.s(0.50); flags.add("LIQ_SWEEP_L"); }
@@ -598,7 +598,7 @@ public final class DecisionEngineMerged {
         // ФАКТОР 18: PumpHunter интеграция
         // ════════════════════════════════════════════════════════
         if (pumpHunter != null) {
-            PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(symbol);
+            com.bot.PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(symbol);
             if (pump != null && pump.strength > 0.45) {
                 if (pump.isBullish()) { scoreLong  += mctx.s(pump.strength * 0.48); flags.add("PUMP_HUNT_B"); }
                 if (pump.isBearish()) { scoreShort += mctx.s(pump.strength * 0.48); flags.add("PUMP_HUNT_S"); }
@@ -785,9 +785,9 @@ public final class DecisionEngineMerged {
             if (!bullDiv && !bearDiv && !oldPump.detected && !hasFR) return null;
         }
 
-        TradingCore.Side side = scoreLong > scoreShort
-                ? TradingCore.Side.LONG
-                : TradingCore.Side.SHORT;
+        com.bot.TradingCore.Side side = scoreLong > scoreShort
+                ? com.bot.TradingCore.Side.LONG
+                : com.bot.TradingCore.Side.SHORT;
 
         if (!cooldownAllowed(symbol, side, cat, now)) return null;
         if (!flipAllowed(symbol, side)) return null;
@@ -813,8 +813,8 @@ public final class DecisionEngineMerged {
         double rrRatio  = scoreDiff > 1.2 ? 3.4 : scoreDiff > 0.9 ? 3.0 : scoreDiff > 0.6 ? 2.7 : 2.3;
         double stopDist = Math.max(atr14 * 1.85 * riskMult, price * 0.0018);
 
-        double stopPrice = side == TradingCore.Side.LONG  ? price - stopDist : price + stopDist;
-        double takePrice = side == TradingCore.Side.LONG  ? price + stopDist * rrRatio
+        double stopPrice = side == com.bot.TradingCore.Side.LONG  ? price - stopDist : price + stopDist;
+        double takePrice = side == com.bot.TradingCore.Side.LONG  ? price + stopDist * rrRatio
                 : price - stopDist * rrRatio;
 
         if (!priceMovedEnough(symbol, price)) return null;
@@ -829,7 +829,7 @@ public final class DecisionEngineMerged {
     //  [FIX-2] Проверка: сильный импульс (объём × скорость)
     // ══════════════════════════════════════════════════════════════
 
-    private boolean isStrongImpulseVolume(List<TradingCore.Candle> c1, double multiplier) {
+    private boolean isStrongImpulseVolume(List<com.bot.TradingCore.Candle> c1, double multiplier) {
         if (c1 == null || c1.size() < 10) return false;
         int n = c1.size();
         double avgVol = c1.subList(Math.max(0, n - 12), n - 3)
@@ -843,10 +843,10 @@ public final class DecisionEngineMerged {
     //  [FIX-7] Структурное подтверждение разворота на 1m/5m
     // ══════════════════════════════════════════════════════════════
 
-    private boolean confirmReversalStructure(List<TradingCore.Candle> c1,
-                                             List<TradingCore.Candle> c5,
-                                             TradingCore.Side side) {
-        boolean longSide = side == TradingCore.Side.LONG;
+    private boolean confirmReversalStructure(List<com.bot.TradingCore.Candle> c1,
+                                             List<com.bot.TradingCore.Candle> c5,
+                                             com.bot.TradingCore.Side side) {
+        boolean longSide = side == com.bot.TradingCore.Side.LONG;
 
         if (c1 != null && c1.size() >= 10) {
             int n = c1.size();
@@ -856,7 +856,7 @@ public final class DecisionEngineMerged {
                 localHigh = Math.max(localHigh, c1.get(i).high);
                 localLow  = Math.min(localLow,  c1.get(i).low);
             }
-            TradingCore.Candle last1m = last(c1);
+            com.bot.TradingCore.Candle last1m = last(c1);
             if (longSide  && last1m.close > localHigh * 1.0003) return true;
             if (!longSide && last1m.close < localLow  * 0.9997) return true;
         }
@@ -865,7 +865,7 @@ public final class DecisionEngineMerged {
             int n = c1.size();
             int bullCount = 0, bearCount = 0;
             for (int i = n - 4; i < n; i++) {
-                TradingCore.Candle c = c1.get(i);
+                com.bot.TradingCore.Candle c = c1.get(i);
                 if (c.close > c.open) bullCount++;
                 else bearCount++;
             }
@@ -874,7 +874,7 @@ public final class DecisionEngineMerged {
         }
 
         if (c5 != null && c5.size() >= 3) {
-            TradingCore.Candle last5m = last(c5);
+            com.bot.TradingCore.Candle last5m = last(c5);
             double body5 = Math.abs(last5m.close - last5m.open);
             double range5 = last5m.high - last5m.low + 1e-10;
             double bodyRatio = body5 / range5;
@@ -966,9 +966,9 @@ public final class DecisionEngineMerged {
         AntiLagResult(int d, double s) { direction = d; strength = s; }
     }
 
-    private AntiLagResult detectAntiLag(List<TradingCore.Candle> c1,
-                                        List<TradingCore.Candle> c5,
-                                        List<TradingCore.Candle> c15) {
+    private AntiLagResult detectAntiLag(List<com.bot.TradingCore.Candle> c1,
+                                        List<com.bot.TradingCore.Candle> c5,
+                                        List<com.bot.TradingCore.Candle> c15) {
         if (c1 == null || c1.size() < 5 || c5 == null || c5.size() < 3) return null;
 
         int n1 = c1.size();
@@ -986,7 +986,7 @@ public final class DecisionEngineMerged {
         // Тип 2: 5m импульс с объёмом
         int n5 = c5.size();
         double atr5 = atr(c5, Math.min(14, n5 - 1));
-        TradingCore.Candle lc5 = last(c5);
+        com.bot.TradingCore.Candle lc5 = last(c5);
         double avgV5 = c5.subList(Math.max(0, n5 - 8), n5 - 1)
                 .stream().mapToDouble(c -> c.volume).average().orElse(lc5.volume);
         if (lc5.volume > avgV5 * 1.7) {
@@ -1002,7 +1002,7 @@ public final class DecisionEngineMerged {
         int grn = 0, red = 0;
         double serMove = 0;
         for (int i = Math.max(0, n1 - 4); i < n1; i++) {
-            TradingCore.Candle c = c1.get(i);
+            com.bot.TradingCore.Candle c = c1.get(i);
             if (c.close > c.open) grn++; else red++;
             serMove += c.close - c.open;
         }
@@ -1025,8 +1025,8 @@ public final class DecisionEngineMerged {
         ReverseWarning(String t, double c) { type = t; confidence = c; }
     }
 
-    private ReverseWarning detectReversePattern(List<TradingCore.Candle> c15,
-                                                List<TradingCore.Candle> c1h,
+    private ReverseWarning detectReversePattern(List<com.bot.TradingCore.Candle> c15,
+                                                List<com.bot.TradingCore.Candle> c1h,
                                                 MarketState state) {
         if (c15.size() < 8 || c1h.size() < 5) return null;
 
@@ -1047,7 +1047,7 @@ public final class DecisionEngineMerged {
                 .stream().mapToDouble(c -> c.volume).average().orElse(1);
         if (last(c15).volume < avgVol * 0.52) score += 0.32;
 
-        TradingCore.Candle lc = last(c15);
+        com.bot.TradingCore.Candle lc = last(c15);
         double uw = lc.high - Math.max(lc.open, lc.close);
         double lw = Math.min(lc.open, lc.close) - lc.low;
         double bd = Math.abs(lc.close - lc.open) + 1e-10;
@@ -1061,9 +1061,9 @@ public final class DecisionEngineMerged {
         }
 
         if (c15.size() >= 3) {
-            TradingCore.Candle ca = c15.get(c15.size() - 3);
-            TradingCore.Candle cb = c15.get(c15.size() - 2);
-            TradingCore.Candle cc = c15.get(c15.size() - 1);
+            com.bot.TradingCore.Candle ca = c15.get(c15.size() - 3);
+            com.bot.TradingCore.Candle cb = c15.get(c15.size() - 2);
+            com.bot.TradingCore.Candle cc = c15.get(c15.size() - 1);
             double ba = Math.abs(ca.close - ca.open);
             double bb = Math.abs(cb.close - cb.open);
             double bc = Math.abs(cc.close - cc.open);
@@ -1078,7 +1078,7 @@ public final class DecisionEngineMerged {
         }
 
         if (c15.size() >= 2) {
-            TradingCore.Candle prevC = c15.get(c15.size() - 2);
+            com.bot.TradingCore.Candle prevC = c15.get(c15.size() - 2);
             if (prevC.close > prevC.open) {
                 double prevBd = prevC.close - prevC.open;
                 if (prevBd > bd * 2.0 && uw > bd * 1.7) { score += 0.38; longExh = true; }
@@ -1095,7 +1095,7 @@ public final class DecisionEngineMerged {
         return new ReverseWarning(type, score);
     }
 
-    private double momentumPct(List<TradingCore.Candle> c, int bars, int offset) {
+    private double momentumPct(List<com.bot.TradingCore.Candle> c, int bars, int offset) {
         if (c.size() < bars + offset + 1) return 0;
         int n = c.size();
         double base = c.get(n - offset - bars - 1).close;
@@ -1106,7 +1106,7 @@ public final class DecisionEngineMerged {
     //  MARKET STRUCTURE
     // ══════════════════════════════════════════════════════════════
 
-    public static int marketStructure(List<TradingCore.Candle> c) {
+    public static int marketStructure(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 20) return 0;
         List<Integer> highs = swingHighs(c, 5);
         List<Integer> lows  = swingLows(c, 5);
@@ -1122,7 +1122,7 @@ public final class DecisionEngineMerged {
         return 0;
     }
 
-    public static List<Integer> swingHighs(List<TradingCore.Candle> c, int lr) {
+    public static List<Integer> swingHighs(List<com.bot.TradingCore.Candle> c, int lr) {
         List<Integer> res = new ArrayList<>();
         for (int i = lr; i < c.size() - lr; i++) {
             double v = c.get(i).high; boolean ok = true;
@@ -1133,7 +1133,7 @@ public final class DecisionEngineMerged {
         return res;
     }
 
-    public static List<Integer> swingLows(List<TradingCore.Candle> c, int lr) {
+    public static List<Integer> swingLows(List<com.bot.TradingCore.Candle> c, int lr) {
         List<Integer> res = new ArrayList<>();
         for (int i = lr; i < c.size() - lr; i++) {
             double v = c.get(i).low; boolean ok = true;
@@ -1156,10 +1156,10 @@ public final class DecisionEngineMerged {
         }
     }
 
-    private FVGResult detectFVG(List<TradingCore.Candle> c) {
+    private FVGResult detectFVG(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 10) return new FVGResult(false, false, 0, 0);
         for (int i = c.size() - 3; i >= c.size() - 9 && i >= 2; i--) {
-            TradingCore.Candle c1 = c.get(i - 1), c2 = c.get(i), c3 = c.get(i + 1);
+            com.bot.TradingCore.Candle c1 = c.get(i - 1), c2 = c.get(i), c3 = c.get(i + 1);
             double bs   = Math.abs(c2.close - c2.open);
             double atrL = atr(c.subList(Math.max(0, i - 14), i + 1), Math.min(14, i));
             if (atrL <= 0) continue;
@@ -1181,11 +1181,11 @@ public final class DecisionEngineMerged {
         OrderBlockResult(boolean d, boolean b, double z) { detected = d; isBullish = b; zone = z; }
     }
 
-    private OrderBlockResult detectOrderBlock(List<TradingCore.Candle> c) {
+    private OrderBlockResult detectOrderBlock(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 15) return new OrderBlockResult(false, false, 0);
         double atrL = atr(c, 14);
         for (int i = c.size() - 5; i >= c.size() - 13 && i >= 3; i--) {
-            TradingCore.Candle pot = c.get(i);
+            com.bot.TradingCore.Candle pot = c.get(i);
             double move = 0;
             for (int j = i + 1; j < Math.min(i + 5, c.size()); j++)
                 move += c.get(j).close - c.get(j).open;
@@ -1201,7 +1201,7 @@ public final class DecisionEngineMerged {
     //  BOS + LIQUIDITY SWEEP
     // ══════════════════════════════════════════════════════════════
 
-    private boolean detectBOSUp(List<TradingCore.Candle> c) {
+    private boolean detectBOSUp(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 8) return false;
         int sz = c.size();
         double localHigh = Double.NEGATIVE_INFINITY;
@@ -1209,7 +1209,7 @@ public final class DecisionEngineMerged {
         return last(c).close > localHigh * 1.0004;
     }
 
-    private boolean detectBOSDown(List<TradingCore.Candle> c) {
+    private boolean detectBOSDown(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 8) return false;
         int sz = c.size();
         double localLow = Double.POSITIVE_INFINITY;
@@ -1217,10 +1217,10 @@ public final class DecisionEngineMerged {
         return last(c).close < localLow * 0.9996;
     }
 
-    public static boolean detectLiquiditySweep(List<TradingCore.Candle> c) {
+    public static boolean detectLiquiditySweep(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 6) return false;
-        TradingCore.Candle la = c.get(c.size() - 1);
-        TradingCore.Candle pr = c.get(c.size() - 2);
+        com.bot.TradingCore.Candle la = c.get(c.size() - 1);
+        com.bot.TradingCore.Candle pr = c.get(c.size() - 2);
         double uw = la.high - Math.max(la.open, la.close);
         double lw = Math.min(la.open, la.close) - la.low;
         double bd = Math.abs(la.close - la.open) + 1e-10;
@@ -1237,14 +1237,14 @@ public final class DecisionEngineMerged {
         OldPumpResult(boolean d, int dir, double s) { detected = d; direction = dir; strength = s; }
     }
 
-    private OldPumpResult detectOldPump(List<TradingCore.Candle> c1,
-                                        List<TradingCore.Candle> c5,
+    private OldPumpResult detectOldPump(List<com.bot.TradingCore.Candle> c1,
+                                        List<com.bot.TradingCore.Candle> c5,
                                         CoinCategory cat) {
         if (c1 == null || c1.size() < 10 || c5 == null || c5.size() < 6)
             return new OldPumpResult(false, 0, 0);
 
         double atr1 = atr(c1, Math.min(14, c1.size() - 1));
-        TradingCore.Candle l1 = last(c1);
+        com.bot.TradingCore.Candle l1 = last(c1);
         double cSize = Math.abs(l1.close - l1.open);
         double fRng  = l1.high - l1.low;
         double bRatio = cSize / (fRng + 1e-12);
@@ -1268,7 +1268,7 @@ public final class DecisionEngineMerged {
 
         int gC = 0, rC = 0; double totMove = 0;
         for (int i = c1.size() - 1 - lookback; i < c1.size(); i++) {
-            TradingCore.Candle c = c1.get(i);
+            com.bot.TradingCore.Candle c = c1.get(i);
             if (c.close > c.open) gC++; else rC++;
             totMove += c.close - c.open;
         }
@@ -1288,8 +1288,8 @@ public final class DecisionEngineMerged {
         CompressionResult(boolean b, int d) { breakout = b; direction = d; }
     }
 
-    private CompressionResult detectCompression(List<TradingCore.Candle> c15,
-                                                List<TradingCore.Candle> c1) {
+    private CompressionResult detectCompression(List<com.bot.TradingCore.Candle> c15,
+                                                List<com.bot.TradingCore.Candle> c1) {
         if (c15.size() < 30 || c1 == null || c1.size() < 10)
             return new CompressionResult(false, 0);
         double atrRecent = atr(c15.subList(c15.size() - 8, c15.size()), 7);
@@ -1308,8 +1308,8 @@ public final class DecisionEngineMerged {
     //  EXHAUSTION CHECKS — LONG / SHORT
     // ══════════════════════════════════════════════════════════════
 
-    private boolean isLongExhausted(List<TradingCore.Candle> c15,
-                                    List<TradingCore.Candle> c1h,
+    private boolean isLongExhausted(List<com.bot.TradingCore.Candle> c15,
+                                    List<com.bot.TradingCore.Candle> c1h,
                                     double rsi14, double rsi7, double price) {
         if (rsi14 > 76 && rsi7 > 79) return true;
 
@@ -1329,7 +1329,7 @@ public final class DecisionEngineMerged {
             if (price > ema21 && v1 < v2 * 0.78 && v2 < v3 * 0.88) return true;
         }
 
-        TradingCore.Candle lc = last(c15);
+        com.bot.TradingCore.Candle lc = last(c15);
         double uw = lc.high - Math.max(lc.open, lc.close);
         double bd = Math.abs(lc.close - lc.open) + 1e-10;
         if (uw > bd * 1.6 && lc.close < lc.open) return true;
@@ -1337,8 +1337,8 @@ public final class DecisionEngineMerged {
         return false;
     }
 
-    private boolean isShortExhausted(List<TradingCore.Candle> c15,
-                                     List<TradingCore.Candle> c1h,
+    private boolean isShortExhausted(List<com.bot.TradingCore.Candle> c15,
+                                     List<com.bot.TradingCore.Candle> c1h,
                                      double rsi14, double rsi7, double price) {
         if (rsi14 < 24 && rsi7 < 21) return true;
 
@@ -1358,7 +1358,7 @@ public final class DecisionEngineMerged {
             if (price < ema21 && v1 < v2 * 0.78 && v2 < v3 * 0.88) return true;
         }
 
-        TradingCore.Candle lc = last(c15);
+        com.bot.TradingCore.Candle lc = last(c15);
         double lw = Math.min(lc.open, lc.close) - lc.low;
         double bd = Math.abs(lc.close - lc.open) + 1e-10;
         if (lw > bd * 1.6 && lc.close > lc.open) return true;
@@ -1370,7 +1370,7 @@ public final class DecisionEngineMerged {
     //  MARKET STATE + HTF BIAS
     // ══════════════════════════════════════════════════════════════
 
-    private MarketState detectState(List<TradingCore.Candle> c) {
+    private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 55) return MarketState.WEAK_TREND;
         double ema20 = ema(c, 20);
         double ema50 = ema(c, 50);
@@ -1384,7 +1384,7 @@ public final class DecisionEngineMerged {
         return MarketState.WEAK_TREND;
     }
 
-    private HTFBias detectBias1H(List<TradingCore.Candle> c) {
+    private HTFBias detectBias1H(List<com.bot.TradingCore.Candle> c) {
         if (!valid(c)) return HTFBias.NONE;
         double e50  = ema(c, 50);
         double e200 = ema(c, 200);
@@ -1393,7 +1393,7 @@ public final class DecisionEngineMerged {
         return HTFBias.NONE;
     }
 
-    private HTFBias detectBias2H(List<TradingCore.Candle> c) {
+    private HTFBias detectBias2H(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 30) return HTFBias.NONE;
         double ema12 = ema(c, 12);
         double ema26 = ema(c, 26);
@@ -1415,7 +1415,7 @@ public final class DecisionEngineMerged {
         return HTFBias.NONE;
     }
 
-    private boolean checkHH_HL(List<TradingCore.Candle> c) {
+    private boolean checkHH_HL(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 15) return false;
         int n = c.size();
         double h1 = c.subList(n-15,n-8).stream().mapToDouble(x->x.high).max().orElse(0);
@@ -1425,7 +1425,7 @@ public final class DecisionEngineMerged {
         return h2 > h1 && l2 > l1;
     }
 
-    private boolean checkLL_LH(List<TradingCore.Candle> c) {
+    private boolean checkLL_LH(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 15) return false;
         int n = c.size();
         double h1 = c.subList(n-15,n-8).stream().mapToDouble(x->x.high).max().orElse(0);
@@ -1463,12 +1463,12 @@ public final class DecisionEngineMerged {
     //  MATH PRIMITIVES
     // ══════════════════════════════════════════════════════════════
 
-    public double atr(List<TradingCore.Candle> c, int n) {
+    public double atr(List<com.bot.TradingCore.Candle> c, int n) {
         int p = Math.min(n, c.size() - 1);
         if (p <= 0) return 0;
         double sum = 0;
         for (int i = c.size() - p; i < c.size(); i++) {
-            TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
+            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
             sum += Math.max(cur.high - cur.low,
                     Math.max(Math.abs(cur.high - prev.close),
                             Math.abs(cur.low  - prev.close)));
@@ -1476,11 +1476,11 @@ public final class DecisionEngineMerged {
         return sum / p;
     }
 
-    private double adx(List<TradingCore.Candle> c, int n) {
+    private double adx(List<com.bot.TradingCore.Candle> c, int n) {
         if (c.size() < n + 1) return 15;
         double trS = 0, plusDM = 0, minusDM = 0;
         for (int i = c.size() - n; i < c.size(); i++) {
-            TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
+            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
             double hd = cur.high - prev.high, ld = prev.low - cur.low;
             double tr = Math.max(cur.high - cur.low,
                     Math.max(Math.abs(cur.high - prev.close),
@@ -1495,7 +1495,7 @@ public final class DecisionEngineMerged {
         return 100 * Math.abs(pDI - mDI) / Math.max(pDI + mDI, 1);
     }
 
-    private double ema(List<TradingCore.Candle> c, int p) {
+    private double ema(List<com.bot.TradingCore.Candle> c, int p) {
         if (c.size() < p) return last(c).close;
         double k = 2.0 / (p + 1), e = c.get(c.size() - p).close;
         for (int i = c.size() - p + 1; i < c.size(); i++)
@@ -1503,7 +1503,7 @@ public final class DecisionEngineMerged {
         return e;
     }
 
-    public double rsi(List<TradingCore.Candle> c, int period) {
+    public double rsi(List<com.bot.TradingCore.Candle> c, int period) {
         if (c.size() < period + 1) return 50.0;
         double gain = 0, loss = 0;
         for (int i = c.size() - period; i < c.size(); i++) {
@@ -1514,26 +1514,26 @@ public final class DecisionEngineMerged {
         return 100 - (100 / (1 + rs));
     }
 
-    private boolean bullDiv(List<TradingCore.Candle> c) {
+    private boolean bullDiv(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 25) return false;
         int i1 = c.size() - 8, i2 = c.size() - 1;
         return c.get(i2).low < c.get(i1).low * 0.998 &&
                 rsi(c, 14) > rsi(c.subList(0, i1 + 1), 14) + 3;
     }
 
-    private boolean bearDiv(List<TradingCore.Candle> c) {
+    private boolean bearDiv(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 25) return false;
         int i1 = c.size() - 8, i2 = c.size() - 1;
         return c.get(i2).high > c.get(i1).high * 1.002 &&
                 rsi(c, 14) < rsi(c.subList(0, i1 + 1), 14) - 3;
     }
 
-    public boolean impulse(List<TradingCore.Candle> c) {
+    public boolean impulse(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 15) return false;
         return Math.abs(last(c).close - c.get(c.size() - 5).close) > atr(c, 14) * 0.55;
     }
 
-    public boolean volumeSpike(List<TradingCore.Candle> c, CoinCategory cat) {
+    public boolean volumeSpike(List<com.bot.TradingCore.Candle> c, CoinCategory cat) {
         if (c.size() < 10) return false;
         double avg = c.subList(c.size() - 10, c.size() - 1)
                 .stream().mapToDouble(cd -> cd.volume).average().orElse(1);
@@ -1541,28 +1541,28 @@ public final class DecisionEngineMerged {
         return last(c).volume / avg > thr;
     }
 
-    private boolean pullback(List<TradingCore.Candle> c, boolean bull) {
+    private boolean pullback(List<com.bot.TradingCore.Candle> c, boolean bull) {
         double e21 = ema(c, 21), p = last(c).close, r = rsi(c, 14);
         return bull
                 ? p <= e21 * 1.0012 && p >= e21 * 0.993 && r > 37 && r < 58
                 : p >= e21 * 0.9988 && p <= e21 * 1.007 && r < 63 && r > 42;
     }
 
-    private boolean bullishStructure(List<TradingCore.Candle> c) {
+    private boolean bullishStructure(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 12) return false;
         return c.get(c.size()-4).high > c.get(c.size()-8).high &&
                 c.get(c.size()-4).low  > c.get(c.size()-8).low;
     }
 
-    private boolean bearishStructure(List<TradingCore.Candle> c) {
+    private boolean bearishStructure(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 12) return false;
         return c.get(c.size()-4).high < c.get(c.size()-8).high &&
                 c.get(c.size()-4).low  < c.get(c.size()-8).low;
     }
 
-    private double vwap(List<TradingCore.Candle> c) {
+    private double vwap(List<com.bot.TradingCore.Candle> c) {
         double pv = 0, vol = 0;
-        for (TradingCore.Candle x : c) {
+        for (com.bot.TradingCore.Candle x : c) {
             double tp = (x.high + x.low + x.close) / 3.0;
             pv += tp * x.volume; vol += x.volume;
         }
@@ -1571,7 +1571,7 @@ public final class DecisionEngineMerged {
 
     // ── Cooldown / Flip ──────────────────────────────────────────
 
-    private boolean cooldownAllowed(String sym, TradingCore.Side side, CoinCategory cat, long now) {
+    private boolean cooldownAllowed(String sym, com.bot.TradingCore.Side side, CoinCategory cat, long now) {
         String key = sym + "_" + side;
         long base  = cat == CoinCategory.TOP  ? COOLDOWN_TOP :
                 cat == CoinCategory.ALT  ? COOLDOWN_ALT : COOLDOWN_MEME;
@@ -1581,7 +1581,7 @@ public final class DecisionEngineMerged {
         return true;
     }
 
-    private boolean flipAllowed(String sym, TradingCore.Side newSide) {
+    private boolean flipAllowed(String sym, com.bot.TradingCore.Side newSide) {
         Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new ArrayDeque<>());
         if (h.size() < 2) return true;
         Iterator<String> it = h.descendingIterator();
@@ -1589,7 +1589,7 @@ public final class DecisionEngineMerged {
         return !(!last.equals(newSide.name()) && prev.equals(newSide.name()));
     }
 
-    private void registerSignal(String sym, TradingCore.Side side, long now) {
+    private void registerSignal(String sym, com.bot.TradingCore.Side side, long now) {
         cooldownMap.put(sym + "_" + side, now);
         Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new ArrayDeque<>());
         h.addLast(side.name());
@@ -1606,7 +1606,7 @@ public final class DecisionEngineMerged {
     }
 
     // ── Utility ─────────────────────────────────────────────────
-    private TradingCore.Candle last(List<TradingCore.Candle> c) { return c.get(c.size() - 1); }
+    private com.bot.TradingCore.Candle last(List<com.bot.TradingCore.Candle> c) { return c.get(c.size() - 1); }
     private boolean valid(List<?> c)  { return c != null && c.size() >= MIN_BARS; }
     private double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
 }

@@ -28,10 +28,10 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class SignalSender {
 
     // ── Зависимости ────────────────────────────────────────────────
-    private final TelegramBotSender       bot;
+    private final com.bot.TelegramBotSender bot;
     private final HttpClient              http;
-    private final GlobalImpulseController gic;
-    private final InstitutionalSignalCore isc;
+    private final com.bot.GlobalImpulseController gic;
+    private final com.bot.InstitutionalSignalCore isc;
     private final Object                  wsLock = new Object();
 
     // ── Конфигурация ───────────────────────────────────────────────
@@ -96,9 +96,9 @@ public final class SignalSender {
     );
 
     private static final class CachedCandles {
-        final List<TradingCore.Candle> candles;
+        final List<com.bot.TradingCore.Candle> candles;
         final long fetchedAt;
-        CachedCandles(List<TradingCore.Candle> c) {
+        CachedCandles(List<com.bot.TradingCore.Candle> c) {
             this.candles   = Collections.unmodifiableList(c);
             this.fetchedAt = System.currentTimeMillis();
         }
@@ -157,10 +157,10 @@ public final class SignalSender {
     private static final int RS_HISTORY = 12;
 
     // ── Core ──────────────────────────────────────────────────────
-    private final DecisionEngineMerged      decisionEngine;
-    private final TradingCore.AdaptiveBrain adaptiveBrain;
-    private final SignalOptimizer           optimizer;
-    private final PumpHunter               pumpHunter;
+    private final com.bot.DecisionEngineMerged decisionEngine;
+    private final com.bot.TradingCore.AdaptiveBrain adaptiveBrain;
+    private final com.bot.SignalOptimizer optimizer;
+    private final com.bot.PumpHunter pumpHunter;
 
     // [FIX-6] Correlation Guard
     private final CorrelationGuard          correlationGuard;
@@ -203,9 +203,9 @@ public final class SignalSender {
     //  CONSTRUCTOR
     // ══════════════════════════════════════════════════════════════
 
-    public SignalSender(TelegramBotSender bot,
-                        GlobalImpulseController sharedGIC,
-                        InstitutionalSignalCore sharedISC) {
+    public SignalSender(com.bot.TelegramBotSender bot,
+                        com.bot.GlobalImpulseController sharedGIC,
+                        com.bot.InstitutionalSignalCore sharedISC) {
         this.bot  = bot;
         this.gic  = sharedGIC;
         this.isc  = sharedISC;
@@ -223,10 +223,10 @@ public final class SignalSender {
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
 
-        this.decisionEngine   = new DecisionEngineMerged();
-        this.adaptiveBrain    = new TradingCore.AdaptiveBrain();
-        this.optimizer        = new SignalOptimizer(this.tickPriceDeque);
-        this.pumpHunter       = new PumpHunter();
+        this.decisionEngine   = new com.bot.DecisionEngineMerged();
+        this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();
+        this.optimizer        = new com.bot.SignalOptimizer(this.tickPriceDeque);
+        this.pumpHunter       = new com.bot.PumpHunter();
         this.correlationGuard = new CorrelationGuard();
 
         this.decisionEngine.setPumpHunter(this.pumpHunter);
@@ -249,7 +249,7 @@ public final class SignalSender {
     //  GENERATE SIGNALS
     // ══════════════════════════════════════════════════════════════
 
-    public List<DecisionEngineMerged.TradeIdea> generateSignals() {
+    public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
 
         // Обновляем список пар (раз в час)
         if (cachedPairs.isEmpty() ||
@@ -277,24 +277,24 @@ public final class SignalSender {
         correlationGuard.resetCycle();
 
         // Параллельная обработка всех пар
-        List<CompletableFuture<DecisionEngineMerged.TradeIdea>> futures = new ArrayList<>();
+        List<CompletableFuture<com.bot.DecisionEngineMerged.TradeIdea>> futures = new ArrayList<>();
         for (String pair : cachedPairs) {
-            CompletableFuture<DecisionEngineMerged.TradeIdea> f =
+            CompletableFuture<com.bot.DecisionEngineMerged.TradeIdea> f =
                     CompletableFuture.supplyAsync(() -> processPair(pair), fetchPool);
             futures.add(f);
         }
 
-        List<DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
-        for (CompletableFuture<DecisionEngineMerged.TradeIdea> f : futures) {
+        List<com.bot.DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
+        for (CompletableFuture<com.bot.DecisionEngineMerged.TradeIdea> f : futures) {
             try {
-                DecisionEngineMerged.TradeIdea idea = f.get(18, TimeUnit.SECONDS);
+                com.bot.DecisionEngineMerged.TradeIdea idea = f.get(18, TimeUnit.SECONDS);
                 if (idea != null) result.add(idea);
             } catch (TimeoutException ignored) {
             } catch (Exception ignored) {}
         }
 
         result.sort(Comparator.comparingDouble(
-                (DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
+                (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
 
         logCycleStats();
         return result;
@@ -304,19 +304,19 @@ public final class SignalSender {
     //  PROCESS PAIR — полная обработка одной пары
     // ══════════════════════════════════════════════════════════════
 
-    private DecisionEngineMerged.TradeIdea processPair(String pair) {
+    private com.bot.DecisionEngineMerged.TradeIdea processPair(String pair) {
         try {
             // ── Загружаем свечи ────────────────────────────────────
-            List<TradingCore.Candle> m1  = getCached(pair, "1m",  KLINES_LIMIT);
-            List<TradingCore.Candle> m5  = getCached(pair, "5m",  KLINES_LIMIT);
-            List<TradingCore.Candle> m15 = getCached(pair, "15m", KLINES_LIMIT);
-            List<TradingCore.Candle> h1  = getCached(pair, "1h",  KLINES_LIMIT);
-            List<TradingCore.Candle> h2  = getCached(pair, "2h",  120);
+            List<com.bot.TradingCore.Candle> m1  = getCached(pair, "1m",  KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> m5  = getCached(pair, "5m",  KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> m15 = getCached(pair, "15m", KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> h1  = getCached(pair, "1h",  KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> h2  = getCached(pair, "2h",  120);
 
             if (m15.size() < 160 || h1.size() < 160) return null;
 
             // ── Категоризация ──────────────────────────────────────
-            DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
+            com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
             String sector = detectSector(pair);
 
             // ── [FIX-1] Проверка ликвидности ──────────────────────
@@ -346,13 +346,13 @@ public final class SignalSender {
                     getSymbolReturn15m(m15), getBtcReturn15m());
 
             // ── Основной анализ ────────────────────────────────────
-            DecisionEngineMerged.TradeIdea idea =
+            com.bot.DecisionEngineMerged.TradeIdea idea =
                     decisionEngine.analyze(pair, m1, m5, m15, h1, h2, cat);
 
             if (idea == null || idea.probability < MIN_CONF) return null;
 
             // ── GlobalImpulse filter ────────────────────────────────
-            boolean isLong   = idea.side == TradingCore.Side.LONG;
+            boolean isLong   = idea.side == com.bot.TradingCore.Side.LONG;
             double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
 
             if (gicWeight <= 0.0) {
@@ -387,10 +387,10 @@ public final class SignalSender {
             }
 
             // ── PumpHunter boost ───────────────────────────────────
-            PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15);
+            com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15);
             if (pump != null && pump.strength > 0.40) {
-                boolean aligned = (idea.side == TradingCore.Side.LONG && pump.isBullish()) ||
-                        (idea.side == TradingCore.Side.SHORT && pump.isBearish());
+                boolean aligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
+                        (idea.side == com.bot.TradingCore.Side.SHORT && pump.isBearish());
                 if (aligned) {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("PH_" + pump.type.name());
@@ -408,11 +408,11 @@ public final class SignalSender {
             if (obs != null && obs.isFresh()) {
                 double obi = obs.obi();
                 boolean obiContra =
-                        (idea.side == TradingCore.Side.LONG  && obi < -OBI_THRESHOLD * 1.5) ||
-                                (idea.side == TradingCore.Side.SHORT && obi >  OBI_THRESHOLD * 1.5);
+                        (idea.side == com.bot.TradingCore.Side.LONG  && obi < -OBI_THRESHOLD * 1.5) ||
+                                (idea.side == com.bot.TradingCore.Side.SHORT && obi >  OBI_THRESHOLD * 1.5);
                 boolean obiAligned =
-                        (idea.side == TradingCore.Side.LONG  && obi >  OBI_THRESHOLD) ||
-                                (idea.side == TradingCore.Side.SHORT && obi < -OBI_THRESHOLD);
+                        (idea.side == com.bot.TradingCore.Side.LONG  && obi >  OBI_THRESHOLD) ||
+                                (idea.side == com.bot.TradingCore.Side.SHORT && obi < -OBI_THRESHOLD);
 
                 if (obiContra && idea.probability < 77) {
                     System.out.println("[OBI] BLOCKED " + pair + " obi=" + String.format("%.2f", obi));
@@ -427,8 +427,8 @@ public final class SignalSender {
 
             // ── Volume Delta alignment ─────────────────────────────
             boolean deltaOk =
-                    (idea.side == TradingCore.Side.LONG  && normDelta >  0.14) ||
-                            (idea.side == TradingCore.Side.SHORT && normDelta < -0.14) ||
+                    (idea.side == com.bot.TradingCore.Side.LONG  && normDelta >  0.14) ||
+                            (idea.side == com.bot.TradingCore.Side.SHORT && normDelta < -0.14) ||
                             Math.abs(normDelta) < 0.07;
 
             if (!deltaOk && idea.probability < DELTA_BLOCK_CONF) {
@@ -493,7 +493,7 @@ public final class SignalSender {
      * Проверяет что пара имеет достаточную ликвидность для торговли.
      * Блокирует неликвидные мем-коины и альты с низким объёмом.
      */
-    private boolean checkLiquidity(String pair, DecisionEngineMerged.CoinCategory cat) {
+    private boolean checkLiquidity(String pair, com.bot.DecisionEngineMerged.CoinCategory cat) {
         Double vol = volume24hUSD.get(pair);
         if (vol == null) return true;  // Нет данных — разрешаем (лучше пропустить, чем заблокировать)
 
@@ -532,7 +532,7 @@ public final class SignalSender {
      * RS = (return_symbol / max(|return_btc|, 0.001))
      * clamp(RS, 0, 1): 0.5 = нейтраль, >0.7 = сильная монета, <0.3 = слабая
      */
-    private double computeRelativeStrength(String pair, List<TradingCore.Candle> m15) {
+    private double computeRelativeStrength(String pair, List<com.bot.TradingCore.Candle> m15) {
         if (m15.size() < 5) return 0.5;
 
         int n = m15.size();
@@ -559,7 +559,7 @@ public final class SignalSender {
         return hist.stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
     }
 
-    private double getSymbolReturn15m(List<TradingCore.Candle> m15) {
+    private double getSymbolReturn15m(List<com.bot.TradingCore.Candle> m15) {
         if (m15.size() < 5) return 0;
         int n = m15.size();
         return (m15.get(n - 1).close - m15.get(n - 4).close) / (m15.get(n - 4).close + 1e-9);
@@ -573,7 +573,7 @@ public final class SignalSender {
         if (System.currentTimeMillis() - lastBtcReturnTime < 30_000) return cachedBtcReturn;
         CachedCandles btcCache = candleCache.get("BTCUSDT_15m");
         if (btcCache == null || btcCache.candles.size() < 5) return 0;
-        List<TradingCore.Candle> btc = btcCache.candles;
+        List<com.bot.TradingCore.Candle> btc = btcCache.candles;
         int n = btc.size();
         cachedBtcReturn = (btc.get(n - 1).close - btc.get(n - 4).close) / (btc.get(n - 4).close + 1e-9);
         lastBtcReturnTime = System.currentTimeMillis();
@@ -592,9 +592,9 @@ public final class SignalSender {
      * Для LONG: стоп ставится НА 0.25% НИЖЕ свинг лоу (а не прямо на него)
      * Для SHORT: стоп ставится НА 0.25% ВЫШЕ свинг хай
      */
-    private DecisionEngineMerged.TradeIdea adjustStopForClusters(
-            DecisionEngineMerged.TradeIdea idea,
-            List<TradingCore.Candle> m15) {
+    private com.bot.DecisionEngineMerged.TradeIdea adjustStopForClusters(
+            com.bot.DecisionEngineMerged.TradeIdea idea,
+            List<com.bot.TradingCore.Candle> m15) {
 
         if (m15.size() < 20) return idea;
 
@@ -606,7 +606,7 @@ public final class SignalSender {
         int n = m15.size();
         int lookback = Math.min(20, n - 1);
 
-        if (idea.side == TradingCore.Side.LONG) {
+        if (idea.side == com.bot.TradingCore.Side.LONG) {
             // Ищем свинг лоу в диапазоне [stop - 2%, stop + 0.5%]
             double swingLow = Double.MAX_VALUE;
             for (int i = n - lookback; i < n - 1; i++) {
@@ -644,7 +644,7 @@ public final class SignalSender {
         // Пересчитываем TradeIdea с новым стопом
         List<String> nf = new ArrayList<>(idea.flags);
         nf.add("SL_ADJ");
-        return new DecisionEngineMerged.TradeIdea(
+        return new com.bot.DecisionEngineMerged.TradeIdea(
                 idea.symbol, idea.side, idea.price, newStop, idea.take, idea.rr,
                 idea.probability, nf,
                 idea.fundingRate, idea.fundingDelta, idea.oiChange, idea.htfBias, idea.category);
@@ -662,8 +662,8 @@ public final class SignalSender {
      * Проскальзывание SL при стопе: TOP 0.05%, ALT 0.15%, MEME 0.40%
      * Минимальный чистый профит в 3× от издержек
      */
-    private boolean checkMinProfit(DecisionEngineMerged.TradeIdea idea,
-                                   DecisionEngineMerged.CoinCategory cat) {
+    private boolean checkMinProfit(com.bot.DecisionEngineMerged.TradeIdea idea,
+                                   com.bot.DecisionEngineMerged.CoinCategory cat) {
         double price  = idea.price;
         double tp1    = idea.tp1;
 
@@ -720,14 +720,14 @@ public final class SignalSender {
             registered.clear();
         }
 
-        synchronized boolean allow(String pair, TradingCore.Side side,
-                                   DecisionEngineMerged.CoinCategory cat,
+        synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
+                                   com.bot.DecisionEngineMerged.CoinCategory cat,
                                    String sector) {
             // TOP монеты не ограничиваем корреляцией
-            if (cat == DecisionEngineMerged.CoinCategory.TOP) return true;
+            if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) return true;
 
-            if (side == TradingCore.Side.LONG  && longCount  >= MAX_LONGS_PER_CYCLE)  return false;
-            if (side == TradingCore.Side.SHORT && shortCount >= MAX_SHORTS_PER_CYCLE) return false;
+            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= MAX_LONGS_PER_CYCLE)  return false;
+            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= MAX_SHORTS_PER_CYCLE) return false;
 
             if (sector != null) {
                 int cnt = sectorCount.getOrDefault(sector, 0);
@@ -737,13 +737,13 @@ public final class SignalSender {
             return true;
         }
 
-        synchronized void register(String pair, TradingCore.Side side,
-                                   DecisionEngineMerged.CoinCategory cat,
+        synchronized void register(String pair, com.bot.TradingCore.Side side,
+                                   com.bot.DecisionEngineMerged.CoinCategory cat,
                                    String sector) {
             if (registered.contains(pair)) return;
             registered.add(pair);
 
-            if (side == TradingCore.Side.LONG)  longCount++;
+            if (side == com.bot.TradingCore.Side.LONG)  longCount++;
             else                                 shortCount++;
 
             if (sector != null) {
@@ -790,7 +790,7 @@ public final class SignalSender {
     //  CANDLE CACHE
     // ══════════════════════════════════════════════════════════════
 
-    private List<TradingCore.Candle> getCached(String symbol, String interval, int limit) {
+    private List<com.bot.TradingCore.Candle> getCached(String symbol, String interval, int limit) {
         String key = symbol + "_" + interval;
         long   ttl = CACHE_TTL.getOrDefault(interval, 60_000L);
         CachedCandles cached = candleCache.get(key);
@@ -801,7 +801,7 @@ public final class SignalSender {
             return cached.candles;
         }
 
-        List<TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
+        List<com.bot.TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
         if (!fresh.isEmpty()) {
             candleCache.put(key, new CachedCandles(fresh));
             lastFetchTime.put(key, System.currentTimeMillis()); // [FIX-4]
@@ -811,11 +811,11 @@ public final class SignalSender {
         return fresh;
     }
 
-    public List<TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
+    public List<com.bot.TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
         return getCached(symbol, interval, limit);
     }
 
-    private List<TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
+    private List<com.bot.TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
         awaitRateLimit();
         try {
             String url = String.format(
@@ -852,10 +852,10 @@ public final class SignalSender {
             String body = resp.body();
             if (!body.trim().startsWith("[")) return Collections.emptyList();
             JSONArray arr = new JSONArray(body);
-            List<TradingCore.Candle> list = new ArrayList<>(arr.length());
+            List<com.bot.TradingCore.Candle> list = new ArrayList<>(arr.length());
             for (int i = 0; i < arr.length(); i++) {
                 JSONArray k = arr.getJSONArray(i);
-                list.add(new TradingCore.Candle(
+                list.add(new com.bot.TradingCore.Candle(
                         k.getLong(0),
                         Double.parseDouble(k.getString(1)),
                         Double.parseDouble(k.getString(2)),
@@ -872,7 +872,7 @@ public final class SignalSender {
         }
     }
 
-    public CompletableFuture<List<TradingCore.Candle>> fetchKlinesAsync(
+    public CompletableFuture<List<com.bot.TradingCore.Candle>> fetchKlinesAsync(
             String symbol, String interval, int limit) {
         return CompletableFuture.supplyAsync(
                 () -> fetchKlinesDirect(symbol, interval, limit), fetchPool);
@@ -954,7 +954,7 @@ public final class SignalSender {
                                 mcb.addTick(ts, price, qty);
 
                                 // [FIX-3] Early Tick Signal — строгие условия
-                                DecisionEngineMerged.TradeIdea earlySignal =
+                                com.bot.DecisionEngineMerged.TradeIdea earlySignal =
                                         generateEarlyTickSignal(pair, price, ts);
                                 if (earlySignal != null) {
                                     if (filterEarlySignal(earlySignal)) {
@@ -1013,7 +1013,7 @@ public final class SignalSender {
      *
      * Эти условия отсекают 90% ложных пробоев внутри 15m свечи.
      */
-    private DecisionEngineMerged.TradeIdea generateEarlyTickSignal(
+    private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(
             String symbol, double price, long ts) {
 
         Deque<Double> dq = tickPriceDeque.get(symbol);
@@ -1074,17 +1074,17 @@ public final class SignalSender {
         // [FIX-3] Конфиденс снижен: max 68 (было 76) — early tick менее надёжен
         double conf = Math.min(68, 50 + vel * 4500);
 
-        return new DecisionEngineMerged.TradeIdea(
+        return new com.bot.DecisionEngineMerged.TradeIdea(
                 symbol,
-                up ? TradingCore.Side.LONG : TradingCore.Side.SHORT,
+                up ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
                 price, stop, take, conf,
                 List.of("EARLY_TICK", up ? "UP" : "DN",
                         "v=" + String.format("%.2e", vel),
                         "stk=" + streak));
     }
 
-    private boolean filterEarlySignal(DecisionEngineMerged.TradeIdea sig) {
-        boolean isLong    = sig.side == TradingCore.Side.LONG;
+    private boolean filterEarlySignal(com.bot.DecisionEngineMerged.TradeIdea sig) {
+        boolean isLong    = sig.side == com.bot.TradingCore.Side.LONG;
         String sectorName = detectSector(sig.symbol);
         double rs = relStrengthHistory.getOrDefault(sig.symbol, new ArrayDeque<>())
                 .stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
@@ -1234,16 +1234,16 @@ public final class SignalSender {
     //  COIN CATEGORIZATION
     // ══════════════════════════════════════════════════════════════
 
-    private static DecisionEngineMerged.CoinCategory categorizePair(String pair) {
+    private static com.bot.DecisionEngineMerged.CoinCategory categorizePair(String pair) {
         String sym = pair.endsWith("USDT") ? pair.substring(0, pair.length() - 4) : pair;
         return switch (sym) {
             case "DOGE","SHIB","PEPE","FLOKI","WIF","BONK","MEME",
                  "NEIRO","POPCAT","COW","MOG","BRETT","TURBO" ->
-                    DecisionEngineMerged.CoinCategory.MEME;
+                    com.bot.DecisionEngineMerged.CoinCategory.MEME;
             case "BTC","ETH","BNB","SOL","XRP","ADA","AVAX",
                  "DOT","LINK","MATIC","LTC","ATOM","UNI","AAVE" ->
-                    DecisionEngineMerged.CoinCategory.TOP;
-            default -> DecisionEngineMerged.CoinCategory.ALT;
+                    com.bot.DecisionEngineMerged.CoinCategory.TOP;
+            default -> com.bot.DecisionEngineMerged.CoinCategory.ALT;
         };
     }
 
@@ -1251,9 +1251,9 @@ public final class SignalSender {
     //  UTILITY
     // ══════════════════════════════════════════════════════════════
 
-    private DecisionEngineMerged.TradeIdea rebuildIdea(DecisionEngineMerged.TradeIdea src,
-                                                       double newProb, List<String> flags) {
-        return new DecisionEngineMerged.TradeIdea(
+    private com.bot.DecisionEngineMerged.TradeIdea rebuildIdea(com.bot.DecisionEngineMerged.TradeIdea src,
+                                                               double newProb, List<String> flags) {
+        return new com.bot.DecisionEngineMerged.TradeIdea(
                 src.symbol, src.side, src.price, src.stop, src.take, src.rr,
                 newProb, flags,
                 src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category);
@@ -1280,22 +1280,22 @@ public final class SignalSender {
         return atr(cc.candles, 14);
     }
 
-    public DecisionEngineMerged      getDecisionEngine() { return decisionEngine; }
-    public SignalOptimizer            getOptimizer()      { return optimizer; }
-    public InstitutionalSignalCore    getSignalCore()     { return isc; }
-    public PumpHunter                 getPumpHunter()     { return pumpHunter; }
-    public GlobalImpulseController    getGIC()            { return gic; }
+    public com.bot.DecisionEngineMerged getDecisionEngine() { return decisionEngine; }
+    public com.bot.SignalOptimizer getOptimizer()      { return optimizer; }
+    public com.bot.InstitutionalSignalCore getSignalCore()     { return isc; }
+    public com.bot.PumpHunter getPumpHunter()     { return pumpHunter; }
+    public com.bot.GlobalImpulseController getGIC()            { return gic; }
     public Map<String, Deque<Double>> getTickDeque()      { return tickPriceDeque; }
 
     // ══════════════════════════════════════════════════════════════
     //  STATIC UTILITY METHODS
     // ══════════════════════════════════════════════════════════════
 
-    public static double atr(List<TradingCore.Candle> c, int period) {
+    public static double atr(List<com.bot.TradingCore.Candle> c, int period) {
         if (c == null || c.size() <= period) return 0;
         double sum = 0;
         for (int i = c.size() - period; i < c.size(); i++) {
-            TradingCore.Candle prev = c.get(i - 1), cur = c.get(i);
+            com.bot.TradingCore.Candle prev = c.get(i - 1), cur = c.get(i);
             sum += Math.max(cur.high - cur.low,
                     Math.max(Math.abs(cur.high - prev.close),
                             Math.abs(cur.low  - prev.close)));
@@ -1328,10 +1328,10 @@ public final class SignalSender {
         return sum / period;
     }
 
-    public static double vwap(List<TradingCore.Candle> c) {
+    public static double vwap(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.isEmpty()) return 0;
         double pv = 0, vol = 0;
-        for (TradingCore.Candle x : c) {
+        for (com.bot.TradingCore.Candle x : c) {
             double tp = (x.high + x.low + x.close) / 3.0;
             pv += tp * x.volume; vol += x.volume;
         }
@@ -1345,30 +1345,30 @@ public final class SignalSender {
         return (last - prev) / (prev + 1e-12);
     }
 
-    public static boolean detectBOS(List<TradingCore.Candle> c) {
+    public static boolean detectBOS(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 10) return false;
-        List<Integer> highs = DecisionEngineMerged.swingHighs(c, 3);
-        List<Integer> lows  = DecisionEngineMerged.swingLows(c, 3);
-        TradingCore.Candle last = c.get(c.size() - 1);
+        List<Integer> highs = com.bot.DecisionEngineMerged.swingHighs(c, 3);
+        List<Integer> lows  = com.bot.DecisionEngineMerged.swingLows(c, 3);
+        com.bot.TradingCore.Candle last = c.get(c.size() - 1);
         if (!highs.isEmpty() && last.close > c.get(highs.get(highs.size()-1)).high * 1.0005) return true;
         if (!lows.isEmpty()  && last.close < c.get(lows.get(lows.size()-1)).low   * 0.9995) return true;
         return false;
     }
 
-    public static List<Integer> detectSwingHighs(List<TradingCore.Candle> c, int lr) {
-        return DecisionEngineMerged.swingHighs(c, lr);
+    public static List<Integer> detectSwingHighs(List<com.bot.TradingCore.Candle> c, int lr) {
+        return com.bot.DecisionEngineMerged.swingHighs(c, lr);
     }
 
-    public static List<Integer> detectSwingLows(List<TradingCore.Candle> c, int lr) {
-        return DecisionEngineMerged.swingLows(c, lr);
+    public static List<Integer> detectSwingLows(List<com.bot.TradingCore.Candle> c, int lr) {
+        return com.bot.DecisionEngineMerged.swingLows(c, lr);
     }
 
-    public static int marketStructure(List<TradingCore.Candle> c) {
-        return DecisionEngineMerged.marketStructure(c);
+    public static int marketStructure(List<com.bot.TradingCore.Candle> c) {
+        return com.bot.DecisionEngineMerged.marketStructure(c);
     }
 
-    public static boolean detectLiquiditySweep(List<TradingCore.Candle> c) {
-        return DecisionEngineMerged.detectLiquiditySweep(c);
+    public static boolean detectLiquiditySweep(List<com.bot.TradingCore.Candle> c) {
+        return com.bot.DecisionEngineMerged.detectLiquiditySweep(c);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1401,7 +1401,7 @@ public final class SignalSender {
 
         public MicroCandleBuilder(int intervalMs) { this.intervalMs = intervalMs; }
 
-        public Optional<TradingCore.Candle> addTick(long ts, double price, double qty) {
+        public Optional<com.bot.TradingCore.Candle> addTick(long ts, double price, double qty) {
             long bucket = (ts / intervalMs) * intervalMs;
             if (bucketStart == -1) {
                 bucketStart = bucket; open = high = low = close = price;
@@ -1413,7 +1413,7 @@ public final class SignalSender {
                 close = price; volume += qty;
                 return Optional.empty();
             }
-            TradingCore.Candle c = new TradingCore.Candle(
+            com.bot.TradingCore.Candle c = new com.bot.TradingCore.Candle(
                     bucketStart, open, high, low, close, volume, volume, closeTime);
             bucketStart = bucket; open = high = low = close = price;
             volume = qty; closeTime = bucket + intervalMs - 1;

@@ -6,7 +6,13 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -495,7 +501,28 @@
       <workItem from="1773788288945" duration="459000" />
       <workItem from="1773792095518" duration="3431000" />
       <workItem from="1773795729099" duration="15000" />
-      <workItem from="1773826024588" duration="2163000" />
+      <workItem from="1773826024588" duration="3402000" />
+      <workItem from="1773841673546" duration="625000" />
+      <workItem from="1773843539267" duration="5000" />
+      <workItem from="1773843552050" duration="6000" />
+      <workItem from="1773843566707" duration="5000" />
+      <workItem from="1773843585952" duration="6000" />
+      <workItem from="1773843600264" duration="4000" />
+      <workItem from="1773843612824" duration="6000" />
+      <workItem from="1773843631443" duration="6000" />
+      <workItem from="1773843664138" duration="6000" />
+      <workItem from="1773843679843" duration="6000" />
+      <workItem from="1773843721679" duration="1922000" />
+      <workItem from="1773847210803" duration="106000" />
+      <workItem from="1773847329218" duration="5000" />
+      <workItem from="1773847341115" duration="7000" />
+      <workItem from="1773847357154" duration="13000" />
+      <workItem from="1773847378308" duration="12000" />
+      <workItem from="1773847396407" duration="6000" />
+      <workItem from="1773847408469" duration="5000" />
+      <workItem from="1773847419596" duration="5000" />
+      <workItem from="1773847437679" duration="19000" />
+      <workItem from="1773847464608" duration="7000" />
     </task>
     <servers />
   </component>

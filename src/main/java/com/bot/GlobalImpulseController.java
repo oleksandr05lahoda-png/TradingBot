@@ -180,13 +180,13 @@ public final class GlobalImpulseController {
     //  UPDATE — вызывается из BotMain с BTC свечами
     // ══════════════════════════════════════════════════════════════
 
-    public void update(List<TradingCore.Candle> btcCandles) {
+    public void update(List<com.bot.TradingCore.Candle> btcCandles) {
         if (btcCandles == null || btcCandles.size() < 30) return;
 
         int n = btcCandles.size();
-        TradingCore.Candle last = btcCandles.get(n - 1);
-        TradingCore.Candle prev1 = btcCandles.get(n - 2);
-        TradingCore.Candle prev2 = btcCandles.get(n - 3);
+        com.bot.TradingCore.Candle last = btcCandles.get(n - 1);
+        com.bot.TradingCore.Candle prev1 = btcCandles.get(n - 2);
+        com.bot.TradingCore.Candle prev2 = btcCandles.get(n - 3);
 
         double atr14    = atr(btcCandles, 14);
         double avgVol   = avgVolume(btcCandles, VOL_LOOKBACK);
@@ -286,11 +286,11 @@ public final class GlobalImpulseController {
     //  UPDATE SECTOR
     // ══════════════════════════════════════════════════════════════
 
-    public void updateSector(String sector, List<TradingCore.Candle> candles) {
+    public void updateSector(String sector, List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 25) return;
 
         int n = candles.size();
-        TradingCore.Candle last = candles.get(n - 1);
+        com.bot.TradingCore.Candle last = candles.get(n - 1);
 
         double ema10   = ema(candles, 10);
         double ema25   = ema(candles, 25);
@@ -530,7 +530,7 @@ public final class GlobalImpulseController {
      */
     @Deprecated
     public double filterSignal(String symbol, boolean isLong, double confidence,
-                               DecisionEngineMerged.CoinCategory cat) {
+                               com.bot.DecisionEngineMerged.CoinCategory cat) {
         double rs = 0.5;
         double weight = getFilterWeight(symbol, isLong, rs, null);
         return confidence * weight;
@@ -695,12 +695,12 @@ public final class GlobalImpulseController {
     //  MATH PRIMITIVES
     // ══════════════════════════════════════════════════════════════
 
-    private double atr(List<TradingCore.Candle> c, int n) {
+    private double atr(List<com.bot.TradingCore.Candle> c, int n) {
         int p = Math.min(n, c.size() - 1);
         if (p <= 0) return 0;
         double sum = 0;
         for (int i = c.size() - p; i < c.size(); i++) {
-            TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
+            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
             sum += Math.max(cur.high - cur.low,
                     Math.max(Math.abs(cur.high - prev.close),
                             Math.abs(cur.low  - prev.close)));
@@ -708,7 +708,7 @@ public final class GlobalImpulseController {
         return sum / p;
     }
 
-    private double ema(List<TradingCore.Candle> c, int p) {
+    private double ema(List<com.bot.TradingCore.Candle> c, int p) {
         if (c.size() < p) return c.get(c.size() - 1).close;
         double k = 2.0 / (p + 1), e = c.get(c.size() - p).close;
         for (int i = c.size() - p + 1; i < c.size(); i++)
@@ -716,13 +716,13 @@ public final class GlobalImpulseController {
         return e;
     }
 
-    private double avgVolume(List<TradingCore.Candle> c, int n) {
+    private double avgVolume(List<com.bot.TradingCore.Candle> c, int n) {
         int start = Math.max(0, c.size() - n);
         return c.subList(start, c.size()).stream()
                 .mapToDouble(x -> x.volume).average().orElse(1);
     }
 
-    private double avgBodyPct(List<TradingCore.Candle> c, int n) {
+    private double avgBodyPct(List<com.bot.TradingCore.Candle> c, int n) {
         int start = Math.max(0, c.size() - n);
         return c.subList(start, c.size()).stream()
                 .mapToDouble(x -> Math.abs(x.close - x.open) / (x.close + 1e-9))

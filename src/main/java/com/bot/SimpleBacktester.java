@@ -1,41 +1,10 @@
 package com.bot;
 
 import java.util.*;
-import java.util.concurrent.*;
 
-/**
- * ╔══════════════════════════════════════════════════════════════════════╗
- * ║  SimpleBacktester — GODBOT EDITION v5.0                              ║
- * ╠══════════════════════════════════════════════════════════════════════╣
- * ║  ИСПРАВЛЕНИЯ v5.0:                                                   ║
- * ║                                                                      ║
- * ║  [FIX-BUG-5] ВНУТРИСВЕЧНЫЙ ПОРЯДОК SL vs TP (BUG #5 из аудита)    ║
- * ║    Было: всегда проверяем SL first, TP second — даже если свеча     ║
- * ║    пошла сначала вверх (к TP), а потом вниз (к SL)                  ║
- * ║    Результат: ~15-20% сделок записывались как убыток, хотя по       ║
- * ║    факту сначала цена достигала TP                                   ║
- * ║                                                                      ║
- * ║    Стало: используем эвристику на основе открытия свечи:            ║
- * ║    - LONG: если open ближе к low — цена вероятно шла вниз первой   ║
- * ║      (SL first). Если open ближе к high — TP first                  ║
- * ║    - Аналогично для SHORT                                            ║
- * ║    - При использовании 1m данных — точный порядок по 1m свечам      ║
- * ║                                                                      ║
- * ║    Дополнительно: новый метод resolveIntraCandle() для точного      ║
- * ║    определения порядка по 1m свечам если они доступны               ║
- * ║                                                                      ║
- * ║  СОХРАНЕНО из v4.0:                                                  ║
- * ║  [FIX-COMM]    Комиссии 0.04% taker in+out                          ║
- * ║  [FIX-FUND]    Funding rate per 15m                                  ║
- * ║  [FIX-SLIP]    Проскальзывание по категории монеты                   ║
- * ║  [FIX-PARTIAL] Multi-TP: 50% на TP1, 50% на TP2                     ║
- * ║  [FIX-EV]      Expected Value с учётом всех издержек                 ║
- * ║  [NEW]         sweepConfidence / sweepSlippage / sweepFunding        ║
- * ╚══════════════════════════════════════════════════════════════════════╝
- */
 public final class SimpleBacktester {
 
-    private final DecisionEngineMerged engine = new DecisionEngineMerged();
+    private final com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
 
     // ── Параметры по умолчанию ────────────────────────────────────
     private double  takerFee      = 0.0004;           // 0.04% taker fee (Binance Futures)
@@ -43,10 +12,10 @@ public final class SimpleBacktester {
     private boolean useMultiTP    = true;             // частичное закрытие по TP1
 
     /** Проскальзывание по категории монеты */
-    private static final Map<DecisionEngineMerged.CoinCategory, Double> SLIP_MAP = Map.of(
-            DecisionEngineMerged.CoinCategory.TOP,  0.0005,  // 0.05%
-            DecisionEngineMerged.CoinCategory.ALT,  0.0015,  // 0.15%
-            DecisionEngineMerged.CoinCategory.MEME, 0.0040   // 0.40%
+    private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIP_MAP = Map.of(
+            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0005,  // 0.05%
+            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0015,  // 0.15%
+            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0040   // 0.40%
     );
 
     // ── Конфигурация ─────────────────────────────────────────────
@@ -144,13 +113,13 @@ public final class SimpleBacktester {
      * @param tp       уровень тейк-профита
      * @param m1Slice  1m свечи за период этой 15m свечи (если доступны)
      */
-    private HitOrder resolveIntraCandle(TradingCore.Candle c, boolean isLong,
+    private HitOrder resolveIntraCandle(com.bot.TradingCore.Candle c, boolean isLong,
                                         double sl, double tp,
-                                        List<TradingCore.Candle> m1Slice) {
+                                        List<com.bot.TradingCore.Candle> m1Slice) {
 
         // ── МЕТОД 1: точный, по 1m данным ──────────────────────
         if (m1Slice != null && m1Slice.size() >= 3) {
-            for (TradingCore.Candle m1 : m1Slice) {
+            for (com.bot.TradingCore.Candle m1 : m1Slice) {
                 if (isLong) {
                     if (m1.low <= sl) return HitOrder.SL_FIRST;
                     if (m1.high >= tp) return HitOrder.TP_FIRST;
@@ -207,19 +176,19 @@ public final class SimpleBacktester {
     // ══════════════════════════════════════════════════════════════
 
     public BacktestResult run(String symbol,
-                              List<TradingCore.Candle> m1,
-                              List<TradingCore.Candle> m5,
-                              List<TradingCore.Candle> m15,
-                              List<TradingCore.Candle> h1) {
-        return run(symbol, m1, m5, m15, h1, DecisionEngineMerged.CoinCategory.ALT);
+                              List<com.bot.TradingCore.Candle> m1,
+                              List<com.bot.TradingCore.Candle> m5,
+                              List<com.bot.TradingCore.Candle> m15,
+                              List<com.bot.TradingCore.Candle> h1) {
+        return run(symbol, m1, m5, m15, h1, com.bot.DecisionEngineMerged.CoinCategory.ALT);
     }
 
     public BacktestResult run(String symbol,
-                              List<TradingCore.Candle> m1,
-                              List<TradingCore.Candle> m5,
-                              List<TradingCore.Candle> m15,
-                              List<TradingCore.Candle> h1,
-                              DecisionEngineMerged.CoinCategory cat) {
+                              List<com.bot.TradingCore.Candle> m1,
+                              List<com.bot.TradingCore.Candle> m5,
+                              List<com.bot.TradingCore.Candle> m15,
+                              List<com.bot.TradingCore.Candle> h1,
+                              com.bot.DecisionEngineMerged.CoinCategory cat) {
         BacktestResult res = new BacktestResult(symbol);
         final int WINDOW  = 200;
         final int FORWARD = 12;   // 12 × 15m = 3 часа вперёд
@@ -236,12 +205,12 @@ public final class SimpleBacktester {
         double sumRR = 0, sumLoss = 0;
 
         for (int i = WINDOW; i < m15.size() - FORWARD; i++) {
-            List<TradingCore.Candle> slice15 = m15.subList(i - WINDOW, i);
-            List<TradingCore.Candle> sliceH1 = getH1Slice(h1, i, m15);
-            List<TradingCore.Candle> sliceM1 = getM1Slice(m1, i, m15);
-            List<TradingCore.Candle> sliceM5 = getM5Slice(m5, i, m15);
+            List<com.bot.TradingCore.Candle> slice15 = m15.subList(i - WINDOW, i);
+            List<com.bot.TradingCore.Candle> sliceH1 = getH1Slice(h1, i, m15);
+            List<com.bot.TradingCore.Candle> sliceM1 = getM1Slice(m1, i, m15);
+            List<com.bot.TradingCore.Candle> sliceM5 = getM5Slice(m5, i, m15);
 
-            DecisionEngineMerged.TradeIdea idea;
+            com.bot.DecisionEngineMerged.TradeIdea idea;
             try {
                 idea = engine.analyze(symbol, sliceM1, sliceM5, slice15, sliceH1,
                         Collections.emptyList(), cat);
@@ -254,7 +223,7 @@ public final class SimpleBacktester {
             double sl    = idea.stop;
             double tp1   = idea.tp1;
             double tp2   = idea.tp2;
-            boolean isLong = idea.side == TradingCore.Side.LONG;
+            boolean isLong = idea.side == com.bot.TradingCore.Side.LONG;
 
             // [FIX-SLIP] Реальный стоп хуже заявленного
             double realSL = isLong ? sl * (1 - slip) : sl * (1 + slip);
@@ -269,11 +238,11 @@ public final class SimpleBacktester {
             boolean closed   = false;
 
             for (int j = i; j < Math.min(i + FORWARD, m15.size()) && !closed; j++) {
-                TradingCore.Candle c = m15.get(j);
+                com.bot.TradingCore.Candle c = m15.get(j);
                 barsHeld++;
 
                 // Получаем 1m подсвечи для точного определения порядка
-                List<TradingCore.Candle> intraM1 = getIntraM1Candles(m1, c);
+                List<com.bot.TradingCore.Candle> intraM1 = getIntraM1Candles(m1, c);
 
                 boolean slHit = isLong ? c.low  <= realSL : c.high >= realSL;
                 boolean tpHit = isLong ? c.high >= tp1    : c.low  <= tp1;
@@ -398,7 +367,7 @@ public final class SimpleBacktester {
      * Возвращает P&L.
      */
     private double handleTp1Hit(int j, int i,
-                                List<TradingCore.Candle> m15,
+                                List<com.bot.TradingCore.Candle> m15,
                                 double entry, double tp1, double tp2,
                                 boolean isLong) {
         if (isLong) return (tp1 - entry) / entry;
@@ -411,7 +380,7 @@ public final class SimpleBacktester {
      * Оставшиеся 50% → ждём TP2 до 6 свечей.
      */
     private double handleTp1HitMulti(int j, int i,
-                                     List<TradingCore.Candle> m15,
+                                     List<com.bot.TradingCore.Candle> m15,
                                      double entry, double tp1, double tp2,
                                      boolean isLong) {
         double partial = isLong
@@ -422,7 +391,7 @@ public final class SimpleBacktester {
         double  fullPnl = partial; // дефолт: только первая половина
 
         for (int k = j + 1; k < Math.min(j + 7, m15.size()) && !tp2Hit; k++) {
-            TradingCore.Candle fc = m15.get(k);
+            com.bot.TradingCore.Candle fc = m15.get(k);
             if (isLong) {
                 if (fc.high >= tp2) {
                     fullPnl = partial + (tp2 - entry) / entry * 0.5;
@@ -467,8 +436,8 @@ public final class SimpleBacktester {
     }
 
     public List<SweepResult> sweepConfidence(String symbol,
-                                             List<TradingCore.Candle> m15,
-                                             List<TradingCore.Candle> h1,
+                                             List<com.bot.TradingCore.Candle> m15,
+                                             List<com.bot.TradingCore.Candle> h1,
                                              double minC, double maxC, double step) {
         List<SweepResult> results = new ArrayList<>();
         for (double c = minC; c <= maxC; c += step) {
@@ -482,9 +451,9 @@ public final class SimpleBacktester {
     }
 
     public List<SweepResult> sweepSlippage(String symbol,
-                                           List<TradingCore.Candle> m15,
-                                           List<TradingCore.Candle> h1,
-                                           DecisionEngineMerged.CoinCategory cat) {
+                                           List<com.bot.TradingCore.Candle> m15,
+                                           List<com.bot.TradingCore.Candle> h1,
+                                           com.bot.DecisionEngineMerged.CoinCategory cat) {
         List<SweepResult> results = new ArrayList<>();
         double[] slippages = {0.0, 0.001, 0.002, 0.005, 0.010, 0.020};
 
@@ -498,8 +467,8 @@ public final class SimpleBacktester {
     }
 
     public List<SweepResult> sweepFunding(String symbol,
-                                          List<TradingCore.Candle> m15,
-                                          List<TradingCore.Candle> h1) {
+                                          List<com.bot.TradingCore.Candle> m15,
+                                          List<com.bot.TradingCore.Candle> h1) {
         List<SweepResult> results = new ArrayList<>();
         double[] fundingRates8h = {0.0, 0.0001, 0.0005, 0.001, 0.003};
 
@@ -519,9 +488,9 @@ public final class SimpleBacktester {
      * Полный отчёт по символу с анализом всех издержек.
      */
     public String fullReport(String symbol,
-                             List<TradingCore.Candle> m15,
-                             List<TradingCore.Candle> h1,
-                             DecisionEngineMerged.CoinCategory cat) {
+                             List<com.bot.TradingCore.Candle> m15,
+                             List<com.bot.TradingCore.Candle> h1,
+                             com.bot.DecisionEngineMerged.CoinCategory cat) {
         StringBuilder sb = new StringBuilder();
         sb.append("\n═══════════════════════════════════════════════\n");
         sb.append("  ПОЛНЫЙ БЭКТЕСТ v5.0: ").append(symbol).append("\n");
@@ -562,11 +531,11 @@ public final class SimpleBacktester {
     // ══════════════════════════════════════════════════════════════
 
     private BacktestResult runWithSlippage(String symbol,
-                                           List<TradingCore.Candle> m1,
-                                           List<TradingCore.Candle> m5,
-                                           List<TradingCore.Candle> m15,
-                                           List<TradingCore.Candle> h1,
-                                           DecisionEngineMerged.CoinCategory cat,
+                                           List<com.bot.TradingCore.Candle> m1,
+                                           List<com.bot.TradingCore.Candle> m5,
+                                           List<com.bot.TradingCore.Candle> m15,
+                                           List<com.bot.TradingCore.Candle> h1,
+                                           com.bot.DecisionEngineMerged.CoinCategory cat,
                                            double slippage) {
         BacktestResult res = new BacktestResult(symbol);
         final int WINDOW  = 200;
@@ -577,12 +546,12 @@ public final class SimpleBacktester {
         double totalGross = 0, totalFees = 0, totalFunding = 0;
 
         for (int i = WINDOW; i < m15.size() - FORWARD; i++) {
-            List<TradingCore.Candle> slice15 = m15.subList(i - WINDOW, i);
-            List<TradingCore.Candle> sliceH1 = getH1Slice(h1, i, m15);
-            List<TradingCore.Candle> sliceM1 = getM1Slice(m1, i, m15);
-            List<TradingCore.Candle> sliceM5 = getM5Slice(m5, i, m15);
+            List<com.bot.TradingCore.Candle> slice15 = m15.subList(i - WINDOW, i);
+            List<com.bot.TradingCore.Candle> sliceH1 = getH1Slice(h1, i, m15);
+            List<com.bot.TradingCore.Candle> sliceM1 = getM1Slice(m1, i, m15);
+            List<com.bot.TradingCore.Candle> sliceM5 = getM5Slice(m5, i, m15);
 
-            DecisionEngineMerged.TradeIdea idea;
+            com.bot.DecisionEngineMerged.TradeIdea idea;
             try {
                 idea = engine.analyze(symbol, sliceM1, sliceM5, slice15, sliceH1,
                         Collections.emptyList(), cat);
@@ -590,7 +559,7 @@ public final class SimpleBacktester {
             if (idea == null) continue;
 
             double entry   = idea.price;
-            boolean isLong = idea.side == TradingCore.Side.LONG;
+            boolean isLong = idea.side == com.bot.TradingCore.Side.LONG;
             double realSL  = isLong ? idea.stop * (1 - slippage) : idea.stop * (1 + slippage);
 
             boolean win = false;
@@ -599,10 +568,10 @@ public final class SimpleBacktester {
             int     barsHeld = 0;
 
             for (int j = i; j < Math.min(i + FORWARD, m15.size()) && !closed; j++) {
-                TradingCore.Candle c = m15.get(j);
+                com.bot.TradingCore.Candle c = m15.get(j);
                 barsHeld++;
 
-                List<TradingCore.Candle> intraM1 = getIntraM1Candles(m1, c);
+                List<com.bot.TradingCore.Candle> intraM1 = getIntraM1Candles(m1, c);
 
                 boolean slHit = isLong ? c.low  <= realSL      : c.high >= realSL;
                 boolean tpHit = isLong ? c.high >= idea.tp1    : c.low  <= idea.tp1;
@@ -654,8 +623,8 @@ public final class SimpleBacktester {
     //  SLICE HELPERS
     // ══════════════════════════════════════════════════════════════
 
-    private List<TradingCore.Candle> getH1Slice(List<TradingCore.Candle> h1, int i15,
-                                                List<TradingCore.Candle> m15) {
+    private List<com.bot.TradingCore.Candle> getH1Slice(List<com.bot.TradingCore.Candle> h1, int i15,
+                                                        List<com.bot.TradingCore.Candle> m15) {
         if (h1 == null || h1.isEmpty()) return Collections.emptyList();
         long targetTime = m15.get(i15).openTime;
         int found = -1;
@@ -666,8 +635,8 @@ public final class SimpleBacktester {
         return h1.subList(Math.max(0, found - 200), found + 1);
     }
 
-    private List<TradingCore.Candle> getM1Slice(List<TradingCore.Candle> m1, int i15,
-                                                List<TradingCore.Candle> m15) {
+    private List<com.bot.TradingCore.Candle> getM1Slice(List<com.bot.TradingCore.Candle> m1, int i15,
+                                                        List<com.bot.TradingCore.Candle> m15) {
         if (m1 == null || m1.isEmpty()) return Collections.emptyList();
         long targetTime = m15.get(i15).openTime;
         int found = -1;
@@ -678,8 +647,8 @@ public final class SimpleBacktester {
         return m1.subList(Math.max(0, found - 60), found + 1);
     }
 
-    private List<TradingCore.Candle> getM5Slice(List<TradingCore.Candle> m5, int i15,
-                                                List<TradingCore.Candle> m15) {
+    private List<com.bot.TradingCore.Candle> getM5Slice(List<com.bot.TradingCore.Candle> m5, int i15,
+                                                        List<com.bot.TradingCore.Candle> m15) {
         if (m5 == null || m5.isEmpty()) return Collections.emptyList();
         long targetTime = m15.get(i15).openTime;
         int found = -1;
@@ -694,15 +663,15 @@ public final class SimpleBacktester {
      * Извлекает 1m свечи, принадлежащие данной 15m свече (по openTime/closeTime).
      * Возвращает пустой список если 1m данных нет.
      */
-    private List<TradingCore.Candle> getIntraM1Candles(List<TradingCore.Candle> m1,
-                                                       TradingCore.Candle c15) {
+    private List<com.bot.TradingCore.Candle> getIntraM1Candles(List<com.bot.TradingCore.Candle> m1,
+                                                               com.bot.TradingCore.Candle c15) {
         if (m1 == null || m1.isEmpty()) return Collections.emptyList();
 
         long start = c15.openTime;
         long end   = c15.closeTime;
 
-        List<TradingCore.Candle> result = new ArrayList<>(15);
-        for (TradingCore.Candle m : m1) {
+        List<com.bot.TradingCore.Candle> result = new ArrayList<>(15);
+        for (com.bot.TradingCore.Candle m : m1) {
             if (m.openTime >= start && m.closeTime <= end) {
                 result.add(m);
             }
