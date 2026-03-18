@@ -359,7 +359,13 @@ public final class SignalSender {
             com.bot.DecisionEngineMerged.TradeIdea idea =
                     decisionEngine.analyze(pair, m1, m5, m15, h1, h2, cat);
 
-            if (idea == null || idea.probability < MIN_CONF) return null;
+            if (idea == null) return null;
+
+            // [v7.0 FIX] Используем ISC effective min confidence (с учётом streak guard)
+            // вместо хардкодного MIN_CONF=50. Это предотвращает бесполезную работу
+            // GIC/PumpHunter/OBI/Optimizer на сигналах которые ISC потом отклонит.
+            double earlyMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence());
+            if (idea.probability < earlyMinConf) return null;
 
             boolean isLong   = idea.side == com.bot.TradingCore.Side.LONG;
             double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
