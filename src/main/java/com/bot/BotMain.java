@@ -7,46 +7,107 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.*;
 
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║       BotMain v9.0 — ALL FIXES INTEGRATED                               ║
+ * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                          ║
+ * ║  [FIX-THREAD-DEATH] SafeRunnable: catches ALL Throwable                 ║
+ * ║  [FIX-WATCHDOG] Built-in subsystem monitoring + Telegram alerts          ║
+ * ║  [FIX-TRADE-RESOLVER] REST-based trade monitoring when UDS ❌            ║
+ * ║  [FIX-SIGNAL-DROUGHT] Auto-diagnosis when no signals > 30 min           ║
+ * ║  [FIX-SELF-HEAL] Auto streak guard reset when bot self-strangulates     ║
+ * ║                                                                          ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ */
 public final class BotMain {
 
     private static final Logger LOG = Logger.getLogger(BotMain.class.getName());
 
-    private static final String TG_TOKEN  = System.getenv("TELEGRAM_TOKEN");
-    private static final String CHAT_ID   = System.getenv().getOrDefault("CHAT_ID", "953233853");
-    private static final ZoneId ZONE      = ZoneId.of("Europe/Warsaw");
-    private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 1);
-    private static final int    KLINES    = envInt("KLINES_LIMIT", 220);
+    private static final String TG_TOKEN = System.getenv("TELEGRAM_TOKEN");
+    private static final String CHAT_ID  = System.getenv().getOrDefault("CHAT_ID", "953233853");
+    private static final ZoneId ZONE     = ZoneId.of("Europe/Warsaw");
+    private static final int    INTERVAL = envInt("SIGNAL_INTERVAL_MIN", 1);
+    private static final int    KLINES   = envInt("KLINES_LIMIT", 220);
 
-    // ── ИСПРАВЛЕНИЕ: сужаем тихие часы
-    //    Было: UTC 03:00–07:00 (4 часа)
-    //    Стало: UTC 02:00–05:30 (3.5 часа)
-    //    05:30 UTC = открытие Токио — уже есть объём на Asian pairs
-    //    02:00–05:30 UTC — настоящая мёртвая зона (конец США, до Токио)
-    private static final int  QUIET_START_H = 2;    // 02:00 UTC
-    private static final int  QUIET_END_H   = 5;    // 05:xx UTC — check minutes too
-    private static final int  QUIET_END_M   = 30;   // до 05:30 тихо, после — торгуем
+    private static final int  QUIET_START_H = 2;
+    private static final int  QUIET_END_H   = 5;
+    private static final int  QUIET_END_M   = 30;
 
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
-        put("DOGEUSDT",  "MEME");
-        put("SOLUSDT",   "L1");
-        put("UNIUSDT",   "DEFI");
-        put("LINKUSDT",  "INFRA");
-        put("ETHUSDT",   "TOP");
-        put("XRPUSDT",   "PAYMENT");
+        put("DOGEUSDT","MEME"); put("SOLUSDT","L1"); put("UNIUSDT","DEFI");
+        put("LINKUSDT","INFRA"); put("ETHUSDT","TOP"); put("XRPUSDT","PAYMENT");
     }};
 
-    private static final AtomicLong totalCycles    = new AtomicLong(0);
-    private static final AtomicLong totalSignals   = new AtomicLong(0);
-    private static final AtomicLong skippedQuiet   = new AtomicLong(0);
-    private static final AtomicLong errorCount     = new AtomicLong(0);
+    private static final AtomicLong totalCycles  = new AtomicLong(0);
+    private static final AtomicLong totalSignals = new AtomicLong(0);
+    private static final AtomicLong skippedQuiet = new AtomicLong(0);
+    private static final AtomicLong errorCount   = new AtomicLong(0);
     private static long startTimeMs = 0;
 
-    // ── Circuit breaker: > 5 ошибок за 5 минут → пауза 2 мин
+    // Circuit breaker
     private static final int  CB_THRESHOLD = 5;
     private static final long CB_WINDOW_MS = 5 * 60_000L;
     private static final long CB_PAUSE_MS  = 2 * 60_000L;
     private static long lastErrorWindowStart = 0;
     private static int  errorsInWindow = 0;
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v9.0] WATCHDOG STATE — built into BotMain
+    // ══════════════════════════════════════════════════════════════
+    private static volatile long lastSignalMs      = 0;
+    private static volatile long lastCycleSuccessMs = 0;
+    private static volatile long lastStatsSuccessMs = 0;
+    private static volatile long lastWatchdogAlertMs = 0;
+    private static final long SIGNAL_DROUGHT_MS   = 30 * 60_000L;
+    private static final long WATCHDOG_COOLDOWN_MS = 10 * 60_000L;
+    private static final AtomicLong watchdogAlerts = new AtomicLong(0);
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v9.0] TRADE RESOLVER STATE — built into BotMain
+    //  REST-based price check for active signals when UDS is down
+    // ══════════════════════════════════════════════════════════════
+    static final ConcurrentHashMap<String, TrackedSignal> trackedSignals = new ConcurrentHashMap<>();
+
+    static final class TrackedSignal {
+        final String symbol;
+        final com.bot.TradingCore.Side side;
+        final double entry, sl, tp1, tp2;
+        final long createdAt;
+        volatile boolean tp1Hit = false;
+
+        TrackedSignal(String sym, com.bot.TradingCore.Side side,
+                      double entry, double sl, double tp1, double tp2) {
+            this.symbol = sym; this.side = side; this.entry = entry;
+            this.sl = sl; this.tp1 = tp1; this.tp2 = tp2;
+            this.createdAt = System.currentTimeMillis();
+        }
+        long ageMs() { return System.currentTimeMillis() - createdAt; }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v9.0] SAFE RUNNABLE — prevents silent thread death
+    // ══════════════════════════════════════════════════════════════
+    private static Runnable safe(String name, Runnable task,
+                                 com.bot.TelegramBotSender tg) {
+        return () -> {
+            try {
+                task.run();
+            } catch (Throwable t) {
+                LOG.log(Level.SEVERE, "[SAFE] Task '" + name + "' FAILED", t);
+                try {
+                    if (tg != null) {
+                        tg.sendMessageAsync("⚠️ Task '" + name + "' crashed: "
+                                + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    }
+                } catch (Exception ignored) {}
+            }
+        };
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  MAIN
+    // ══════════════════════════════════════════════════════════════
 
     public static void main(String[] args) {
         configureLogger();
@@ -58,275 +119,399 @@ public final class BotMain {
 
         startTimeMs = System.currentTimeMillis();
         lastErrorWindowStart = startTimeMs;
+        lastSignalMs = startTimeMs;
+        lastCycleSuccessMs = startTimeMs;
+        lastStatsSuccessMs = startTimeMs;
 
         final com.bot.TelegramBotSender telegram = new com.bot.TelegramBotSender(TG_TOKEN, CHAT_ID);
-        final com.bot.GlobalImpulseController gic      = new com.bot.GlobalImpulseController();
-        final com.bot.InstitutionalSignalCore isc      = new com.bot.InstitutionalSignalCore();
-        final com.bot.SignalSender sender   = new com.bot.SignalSender(telegram, gic, isc);
+        final com.bot.GlobalImpulseController gic = new com.bot.GlobalImpulseController();
+        final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
+        final com.bot.SignalSender sender = new com.bot.SignalSender(telegram, gic, isc);
 
-        // Time Stop: уведомляем в Telegram когда сигнал закрывается по времени
         isc.setTimeStopCallback((sym, msg) -> telegram.sendMessageAsync(msg));
-
-        // [v6.0] PanicManager callback — уведомление о режиме паники в Telegram
         gic.setPanicCallback(msg -> telegram.sendMessageAsync(msg));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ GodBot v7.0 CLUSTER стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ GodBot v9.0 FIXED стартовал " + nowWarsawStr() + " ═══");
 
-        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(
-                1, r -> {
-                    Thread t = new Thread(r, "GodBotMain");
-                    t.setDaemon(false);
-                    t.setUncaughtExceptionHandler((th, ex) ->
-                            LOG.log(Level.SEVERE, "UNCAUGHT in " + th.getName(), ex));
-                    return t;
-                });
-
-        Runnable cycle = () -> runCycle(telegram, gic, isc, sender);
-        scheduler.scheduleAtFixedRate(cycle, 0, INTERVAL, TimeUnit.MINUTES);
-
-        // Статистика каждые 15 минут (было 30 — так чаще видим что происходит)
-        ScheduledExecutorService statsScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "StatsThread"); t.setDaemon(true); return t;
+        // ── Main scheduler with SAFE wrappers ────────────────────
+        ScheduledExecutorService mainSched = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r, "GodBotMain");
+            t.setDaemon(false);
+            t.setUncaughtExceptionHandler((th, ex) ->
+                    LOG.log(Level.SEVERE, "UNCAUGHT in " + th.getName(), ex));
+            return t;
         });
-        statsScheduler.scheduleAtFixedRate(
-                () -> logStats(telegram, gic, isc, sender),
-                15, 15, TimeUnit.MINUTES
-        );
 
-        // [v7.0] Бэктест каждые 2 часа — обновляет EV в ISC для адаптивных порогов
-        ScheduledExecutorService backtestScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "BacktestThread"); t.setDaemon(true); return t;
+        ScheduledExecutorService auxSched = Executors.newScheduledThreadPool(3, r -> {
+            Thread t = new Thread(r, "GodBotAux"); t.setDaemon(true); return t;
         });
-        backtestScheduler.scheduleAtFixedRate(
-                () -> runPeriodicBacktest(sender, isc, telegram),
-                30, 120, TimeUnit.MINUTES // первый через 30 мин, потом каждые 2 часа
-        );
+
+        // Main cycle — SAFE wrapped
+        mainSched.scheduleAtFixedRate(
+                safe("MainCycle", () -> runCycle(telegram, gic, isc, sender), telegram),
+                0, INTERVAL, TimeUnit.MINUTES);
+
+        // Stats every 15 min — SAFE wrapped
+        auxSched.scheduleAtFixedRate(
+                safe("Stats", () -> logStats(telegram, gic, isc, sender), telegram),
+                15, 15, TimeUnit.MINUTES);
+
+        // [v9.0] Watchdog every 60 sec — SAFE wrapped
+        auxSched.scheduleAtFixedRate(
+                safe("Watchdog", () -> runWatchdog(telegram, gic, isc, sender), telegram),
+                60, 60, TimeUnit.SECONDS);
+
+        // [v9.0] TradeResolver: REST price check every 2 min — SAFE wrapped
+        auxSched.scheduleAtFixedRate(
+                safe("TradeResolver", () -> runTradeResolver(sender, isc, telegram), telegram),
+                90, 120, TimeUnit.SECONDS);
+
+        // Backtest every 2 hours — SAFE wrapped
+        auxSched.scheduleAtFixedRate(
+                safe("Backtest", () -> runPeriodicBacktest(sender, isc, telegram), telegram),
+                30, 120, TimeUnit.MINUTES);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Завершение работы...");
-            scheduler.shutdown();
-            statsScheduler.shutdown();
-            backtestScheduler.shutdown();
-            telegram.sendMessageAsync("🛑 GodBot остановлен. Циклов: " + totalCycles.get()
+            mainSched.shutdown(); auxSched.shutdown();
+            telegram.sendMessageAsync("🛑 GodBot v9.0 остановлен. Циклов: " + totalCycles.get()
                     + " | Сигналов: " + totalSignals.get());
             telegram.shutdown();
-            try { scheduler.awaitTermination(8, TimeUnit.SECONDS); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); scheduler.shutdownNow(); }
+            try { mainSched.awaitTermination(8, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); mainSched.shutdownNow(); }
         }, "ShutdownHook"));
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  [v7.0] PERIODIC BACKTEST
-    //  Раз в 2 часа бот запускает бэктест на BTCUSDT и ETHUSDT
-    //  и обновляет ISC с текущим EV. Если EV отрицательный —
-    //  ISC повышает минимальный порог confidence.
+    //  [v9.0] WATCHDOG — checks health every 60s
     // ══════════════════════════════════════════════════════════════
 
-    private static void runPeriodicBacktest(com.bot.SignalSender sender,
-                                            com.bot.InstitutionalSignalCore isc,
-                                            com.bot.TelegramBotSender telegram) {
-        try {
-            com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
-            String[] testSymbols = { "BTCUSDT", "ETHUSDT" };
+    private static void runWatchdog(com.bot.TelegramBotSender telegram,
+                                    com.bot.GlobalImpulseController gic,
+                                    com.bot.InstitutionalSignalCore isc,
+                                    com.bot.SignalSender sender) {
+        if (isQuietHours()) return;
+        long now = System.currentTimeMillis();
+        List<String> issues = new ArrayList<>();
 
-            double totalEV = 0;
-            int    count   = 0;
+        // 1. Main cycle dead?
+        if (now - lastCycleSuccessMs > 3 * 60_000L) {
+            issues.add("💀 MainCycle silent " + (now - lastCycleSuccessMs)/1000 + "s");
+        }
 
-            for (String sym : testSymbols) {
-                try {
-                    List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 500);
-                    List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h", 200);
-                    List<com.bot.TradingCore.Candle> m1  = sender.fetchKlines(sym, "1m", 500);
-                    List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m", 300);
+        // 2. Stats dead?
+        if (now - lastStatsSuccessMs > 20 * 60_000L) {
+            issues.add("💀 Stats silent " + (now - lastStatsSuccessMs)/60_000 + "min");
+        }
 
-                    if (m15 == null || m15.size() < 250) continue;
+        // 3. Signal drought
+        if (now - lastSignalMs > SIGNAL_DROUGHT_MS) {
+            long droughtMin = (now - lastSignalMs) / 60_000;
+            StringBuilder diag = new StringBuilder();
+            diag.append("📭 No signals for ").append(droughtMin).append(" min\n");
 
-                    com.bot.SimpleBacktester.BacktestResult result =
-                            bt.run(sym, m1, m5, m15, h1,
-                                    com.bot.DecisionEngineMerged.CoinCategory.TOP);
+            double effConf = isc.getEffectiveMinConfidence();
+            if (effConf > 62) {
+                diag.append("  ⚠️ ISC effConf=").append(String.format("%.0f", effConf)).append("%");
+                if (effConf > 68) diag.append(" 🔴 HIGH");
+                diag.append("\n");
+            }
+            diag.append("  WS=").append(sender.getActiveWsCount())
+                    .append(" UDS=").append(sender.isUdsConnected() ? "✅" : "❌")
+                    .append(" ").append(isc.getStats());
+            issues.add(diag.toString());
 
-                    if (result.total >= 5) {
-                        totalEV += result.ev;
-                        count++;
-                        LOG.info("[BACKTEST] " + sym + ": trades=" + result.total
-                                + " wr=" + String.format("%.0f%%", result.winRate * 100)
-                                + " ev=" + String.format("%.4f", result.ev)
-                                + " net=" + String.format("%+.2f%%", result.totalPnL));
-                    }
-                } catch (Exception e) {
-                    LOG.warning("[BACKTEST] " + sym + " failed: " + e.getMessage());
+            // [v10.0] Smart self-heal: only reset if GIC shows market calmed down
+            // Issue 6: blind time-based reset can wake bot into active crash
+            if (effConf > 68 && isc.getCurrentLossStreak() >= 2) {
+                com.bot.GlobalImpulseController.GlobalContext wdCtx = gic.getContext();
+                boolean marketCalm = wdCtx.volRegime == com.bot.GlobalImpulseController.VolatilityRegime.NORMAL
+                        || wdCtx.volRegime == com.bot.GlobalImpulseController.VolatilityRegime.LOW;
+                boolean notCrashing = wdCtx.cascadeLevel == com.bot.GlobalImpulseController.CascadeLevel.NONE
+                        || wdCtx.cascadeLevel == com.bot.GlobalImpulseController.CascadeLevel.WATCH;
+                if (marketCalm && notCrashing) {
+                    LOG.info("[WATCHDOG] Smart-heal: reset streak (market calm, effConf=" + effConf + ")");
+                    isc.resetStreakGuard();
+                    issues.add("🔧 Smart-reset streak guard (vol=" + wdCtx.volRegime + ")");
+                } else {
+                    LOG.info("[WATCHDOG] Streak high but market volatile — NOT resetting");
+                    issues.add("⚠️ Streak high (effConf=" + String.format("%.0f", effConf)
+                            + ") but market " + wdCtx.volRegime + "/" + wdCtx.cascadeLevel + " — holding guard");
                 }
             }
+        }
 
-            if (count > 0) {
-                double avgEV = totalEV / count;
-                isc.setBacktestResult(avgEV, System.currentTimeMillis());
+        // 4. WebSocket health
+        if (sender.getActiveWsCount() < 3 && !isQuietHours()) {
+            issues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
+        }
 
-                String emoji = avgEV > 0.05 ? "✅" : avgEV > 0 ? "⚠️" : "❌";
-                String msg = String.format(
-                        "%s *Backtest Update*\nEV: %.4f | %s\nStreak: %d losses | Conf+%.0f",
-                        emoji, avgEV,
-                        avgEV > 0 ? "Стратегия прибыльна" : "⚠️ Стратегия под вопросом",
-                        isc.getCurrentLossStreak(),
-                        isc.getStreakConfBoost()
-                );
-                telegram.sendMessageAsync(msg);
-            }
-        } catch (Exception e) {
-            LOG.warning("[BACKTEST] Error: " + e.getMessage());
+        // Alert
+        if (!issues.isEmpty() && now - lastWatchdogAlertMs > WATCHDOG_COOLDOWN_MS) {
+            lastWatchdogAlertMs = now;
+            watchdogAlerts.incrementAndGet();
+            String msg = "🚨 *WATCHDOG* (" + nowWarsawStr() + ")\n" + String.join("\n", issues);
+            telegram.sendMessageAsync(msg);
+            LOG.warning("[WATCHDOG] " + msg.replace("\n", " | "));
         }
     }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v9.0] TRADE RESOLVER — REST fallback for UDS
+    // ══════════════════════════════════════════════════════════════
+
+    static void trackSignal(com.bot.DecisionEngineMerged.TradeIdea idea) {
+        if (idea == null) return;
+        String key = idea.symbol + "_" + idea.side;
+        trackedSignals.put(key, new TrackedSignal(
+                idea.symbol, idea.side, idea.price, idea.stop, idea.tp1, idea.tp2));
+    }
+
+    private static void runTradeResolver(com.bot.SignalSender sender,
+                                         com.bot.InstitutionalSignalCore isc,
+                                         com.bot.TelegramBotSender telegram) {
+        if (trackedSignals.isEmpty()) return;
+
+        long now = System.currentTimeMillis();
+
+        for (Iterator<Map.Entry<String, TrackedSignal>> it =
+             trackedSignals.entrySet().iterator(); it.hasNext(); ) {
+
+            Map.Entry<String, TrackedSignal> entry = it.next();
+            TrackedSignal ts = entry.getValue();
+
+            // Expired (90 min) — remove as NEUTRAL (NOT loss!)
+            if (ts.ageMs() > 90 * 60_000L) {
+                it.remove();
+                LOG.info("[TradeResolver] EXPIRED (neutral): " + ts.symbol + " " + ts.side);
+                // НЕ вызываем isc.registerConfirmedResult(false) !!!
+                continue;
+            }
+
+            // Get current price
+            double price = 0;
+            try {
+                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(ts.symbol, "1m", 1);
+                if (c != null && !c.isEmpty()) price = c.get(c.size() - 1).close;
+            } catch (Exception ignored) { continue; }
+
+            if (price <= 0) continue;
+
+            boolean isLong = ts.side == com.bot.TradingCore.Side.LONG;
+
+            // SL hit
+            boolean slHit = isLong ? price <= ts.sl : price >= ts.sl;
+            if (slHit) {
+                double pnl = isLong ? (ts.sl - ts.entry) / ts.entry * 100
+                        : (ts.entry - ts.sl) / ts.entry * 100;
+                it.remove();
+                isc.registerConfirmedResult(false); // CONFIRMED loss
+                isc.closeTrade(ts.symbol, ts.side, pnl);
+                telegram.sendMessageAsync(String.format("❌ *SL HIT* %s %s PnL: %+.2f%%",
+                        ts.symbol, ts.side, pnl));
+                LOG.info("[TradeResolver] SL HIT: " + ts.symbol + " pnl=" + pnl);
+                continue;
+            }
+
+            // TP1 hit
+            boolean tp1Hit = isLong ? price >= ts.tp1 : price <= ts.tp1;
+            if (tp1Hit && !ts.tp1Hit) {
+                ts.tp1Hit = true;
+                telegram.sendMessageAsync(String.format("🎯 *TP1 HIT* %s %s → SL→BE", ts.symbol, ts.side));
+            }
+
+            // After TP1: check TP2 or BE
+            if (ts.tp1Hit) {
+                boolean tp2Hit = isLong ? price >= ts.tp2 : price <= ts.tp2;
+                if (tp2Hit) {
+                    double pnl = isLong ? (price - ts.entry) / ts.entry * 100
+                            : (ts.entry - price) / ts.entry * 100;
+                    it.remove();
+                    isc.registerConfirmedResult(true); // CONFIRMED win
+                    isc.closeTrade(ts.symbol, ts.side, pnl);
+                    telegram.sendMessageAsync(String.format("✅ *TP2 HIT* %s %s PnL: %+.2f%%",
+                            ts.symbol, ts.side, pnl));
+                    continue;
+                }
+                // BE exit after TP1
+                boolean beHit = isLong ? price <= ts.entry * 1.001 : price >= ts.entry * 0.999;
+                if (beHit) {
+                    double tp1Pnl = isLong ? (ts.tp1 - ts.entry) / ts.entry * 100 * 0.5
+                            : (ts.entry - ts.tp1) / ts.entry * 100 * 0.5;
+                    it.remove();
+                    isc.registerConfirmedResult(true); // Partial win
+                    isc.closeTrade(ts.symbol, ts.side, tp1Pnl);
+                    telegram.sendMessageAsync(String.format("➡️ *BE EXIT* %s %s (TP1 partial: %+.2f%%)",
+                            ts.symbol, ts.side, tp1Pnl));
+                }
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  MAIN CYCLE
+    // ══════════════════════════════════════════════════════════════
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
                                  com.bot.GlobalImpulseController gic,
                                  com.bot.InstitutionalSignalCore isc,
                                  com.bot.SignalSender sender) {
         long cycleStart = System.currentTimeMillis();
-        try {
-            // ── ИСПРАВЛЕНИЕ: улучшенная проверка тихих часов
-            ZonedDateTime utcNow = ZonedDateTime.now(ZoneId.of("UTC"));
-            int utcH = utcNow.getHour();
-            int utcM = utcNow.getMinute();
 
-            boolean quiet = false;
-            if (utcH == QUIET_START_H && utcM >= 0) quiet = true;       // 02:00–03:00
-            if (utcH == 3 || utcH == 4)              quiet = true;       // 03:xx–04:xx
-            if (utcH == QUIET_END_H && utcM < QUIET_END_M) quiet = true; // 05:00–05:29
+        // Quiet hours
+        ZonedDateTime utcNow = ZonedDateTime.now(ZoneId.of("UTC"));
+        int utcH = utcNow.getHour(), utcM = utcNow.getMinute();
+        boolean quiet = (utcH == QUIET_START_H) || (utcH == 3) || (utcH == 4)
+                || (utcH == QUIET_END_H && utcM < QUIET_END_M);
+        if (quiet) { skippedQuiet.incrementAndGet(); return; }
 
-            if (quiet) {
-                skippedQuiet.incrementAndGet();
-                if (skippedQuiet.get() % 15 == 1)
-                    LOG.info("Тихие часы UTC " + utcH + ":" + String.format("%02d", utcM));
-                return;
-            }
+        // Circuit breaker
+        long now = System.currentTimeMillis();
+        if (now - lastErrorWindowStart > CB_WINDOW_MS) { lastErrorWindowStart = now; errorsInWindow = 0; }
+        if (errorsInWindow >= CB_THRESHOLD) {
+            LOG.warning("Circuit breaker — пауза " + CB_PAUSE_MS/1000 + "s");
+            try { Thread.sleep(CB_PAUSE_MS); } catch (InterruptedException ignored) {}
+            errorsInWindow = 0;
+            return;
+        }
 
-            // ── Circuit breaker
-            long now = System.currentTimeMillis();
-            if (now - lastErrorWindowStart > CB_WINDOW_MS) {
-                lastErrorWindowStart = now;
-                errorsInWindow = 0;
-            }
-            if (errorsInWindow >= CB_THRESHOLD) {
-                LOG.warning("Circuit breaker: " + errorsInWindow + " ошибок за 5 мин — пауза");
-                Thread.sleep(CB_PAUSE_MS);
-                errorsInWindow = 0;
-                return;
-            }
+        long cycle = totalCycles.incrementAndGet();
+        LOG.info("══ ЦИКЛ #" + cycle + " ══ " + nowWarsawStr());
 
-            long cycle = totalCycles.incrementAndGet();
-            LOG.info("══ ЦИКЛ #" + cycle + " START ══ " + nowWarsawStr());
+        updateBtcContext(sender, gic);
+        updateSectors(sender, gic);
 
-            updateBtcContext(sender, gic);
-            updateSectors(sender, gic);
+        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
+        LOG.info("BTC: " + ctx.regime + " str=" + String.format("%.2f", ctx.impulseStrength)
+                + " vol=" + String.format("%.2f", ctx.volatilityExpansion) + " | " + isc.getStats());
 
-            com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
-            LOG.info("BTC: " + ctx.regime
-                    + " | str=" + String.format("%.2f", ctx.impulseStrength)
-                    + " | vol=" + String.format("%.2f", ctx.volatilityExpansion)
-                    + " | trend=" + String.format("%.2f", ctx.btcTrend)
-                    + " | " + isc.getStats());
+        List<com.bot.DecisionEngineMerged.TradeIdea> signals = sender.generateSignals();
 
-            List<com.bot.DecisionEngineMerged.TradeIdea> signals = sender.generateSignals();
+        lastCycleSuccessMs = System.currentTimeMillis(); // Watchdog heartbeat
 
-            if (signals == null || signals.isEmpty()) {
-                LOG.info("Нет сигналов. " + isc.getStats());
-                return;
-            }
+        if (signals == null || signals.isEmpty()) {
+            LOG.info("Нет сигналов. " + isc.getStats());
+            return;
+        }
 
-            int sent = 0;
-            for (com.bot.DecisionEngineMerged.TradeIdea s : signals) {
-                telegram.sendMessageAsync(s.toTelegramString());
-                LOG.info("► СИГНАЛ: " + s.symbol + " " + s.side
-                        + " prob=" + String.format("%.0f%%", s.probability)
-                        + " flags=" + s.flags);
-                totalSignals.incrementAndGet();
-                sent++;
-            }
+        int sent = 0;
+        for (com.bot.DecisionEngineMerged.TradeIdea s : signals) {
+            telegram.sendMessageAsync(s.toTelegramString());
+            LOG.info("► " + s.symbol + " " + s.side + " prob=" + String.format("%.0f%%", s.probability));
+            totalSignals.incrementAndGet();
+            sent++;
+            trackSignal(s);      // [v9.0] TradeResolver tracking
+            lastSignalMs = System.currentTimeMillis(); // [v9.0] Watchdog
+        }
 
-            long cycleMs = System.currentTimeMillis() - cycleStart;
-            LOG.info("══ ЦИКЛ #" + cycle + " END ══ sent=" + sent
-                    + " time=" + cycleMs + "ms");
+        LOG.info("══ ЦИКЛ #" + cycle + " END ══ sent=" + sent
+                + " time=" + (System.currentTimeMillis() - cycleStart) + "ms");
+    }
 
-        } catch (Throwable t) {
-            errorsInWindow++;
-            LOG.log(Level.SEVERE, "CRITICAL ERROR в цикле", t);
-            telegram.sendMessageAsync("⚠️ GodBot ERROR: " + t.getClass().getSimpleName()
-                    + ": " + t.getMessage());
+    // ══════════════════════════════════════════════════════════════
+    //  BACKTEST
+    // ══════════════════════════════════════════════════════════════
+
+    private static void runPeriodicBacktest(com.bot.SignalSender sender,
+                                            com.bot.InstitutionalSignalCore isc,
+                                            com.bot.TelegramBotSender telegram) {
+        com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
+        String[] syms = {"BTCUSDT","ETHUSDT"};
+        double totalEV = 0; int count = 0;
+
+        for (String sym : syms) {
+            try {
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym,"15m",500);
+                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym,"1h",200);
+                List<com.bot.TradingCore.Candle> m1  = sender.fetchKlines(sym,"1m",500);
+                List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym,"5m",300);
+                if (m15 == null || m15.size() < 250) continue;
+
+                com.bot.SimpleBacktester.BacktestResult r = bt.run(sym, m1, m5, m15, h1,
+                        com.bot.DecisionEngineMerged.CoinCategory.TOP);
+                if (r.total >= 5) { totalEV += r.ev; count++; }
+            } catch (Exception e) { LOG.warning("[BT] " + sym + ": " + e.getMessage()); }
+        }
+        if (count > 0) {
+            double avgEV = totalEV / count;
+            isc.setBacktestResult(avgEV, System.currentTimeMillis());
+            telegram.sendMessageAsync(String.format("%s *Backtest* EV=%.4f effConf=%.0f%%",
+                    avgEV > 0.05 ? "✅" : avgEV > 0 ? "⚠️" : "❌",
+                    avgEV, isc.getEffectiveMinConfidence()));
         }
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  HELPERS
+    // ══════════════════════════════════════════════════════════════
+
     private static void updateBtcContext(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         try {
-            List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", "15m", KLINES);
+            List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT","15m",KLINES);
             if (btc != null && btc.size() > 30) gic.update(btc);
-        } catch (Exception e) {
-            LOG.warning("BTC context update failed: " + e.getMessage());
-        }
+        } catch (Exception e) { LOG.warning("BTC ctx fail: " + e.getMessage()); }
     }
 
     private static void updateSectors(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         for (Map.Entry<String, String> e : SECTOR_LEADERS.entrySet()) {
             try {
-                List<com.bot.TradingCore.Candle> sc = sender.fetchKlines(e.getKey(), "15m", 80);
+                List<com.bot.TradingCore.Candle> sc = sender.fetchKlines(e.getKey(),"15m",80);
                 if (sc != null && sc.size() > 25) gic.updateSector(e.getValue(), sc);
-            } catch (Exception ex) {
-                // Продолжаем без этого сектора
-            }
+            } catch (Exception ignored) {}
         }
     }
 
+    private static boolean isQuietHours() {
+        ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
+        int h = utc.getHour(), m = utc.getMinute();
+        return (h == QUIET_START_H) || (h == 3) || (h == 4) || (h == QUIET_END_H && m < QUIET_END_M);
+    }
+
     private static String buildStartMessage() {
-        return "🚀 *GodBot v7.0 CLUSTER запущен*\n"
-                + "Таймфрейм: 15M | Пары: TOP-100\n"
-                + "Тихие часы: UTC 02:00–05:30\n"
-                + "Кулдаун: TOP=4m / ALT=3m / MEME=2m\n"
-                + "Time Stop: 90 мин (6 свечей)\n"
-                + "Scoring: 5 кластеров + confluence\n"
-                + "Фильтры: GIC + ISC(streak) + OBI + LiqGuard + CorrGuard\n"
-                + "Confidence: 50-88% | Diminishing boosts\n"
-                + "Бэктест: автоматический (каждые 2 часа)\n"
-                + "_" + nowWarsawStr() + " Warsaw_";
+        return "🚀 *GodBot v9.0 FIXED*\n"
+                + "15M | TOP-100 | UTC 02:00–05:30 quiet\n"
+                + "🆕 Safe tasks (no silent death)\n"
+                + "🆕 Watchdog (auto-alerts+self-heal)\n"
+                + "🆕 TradeResolver (REST when UDS ❌)\n"
+                + "🆕 ISC v9.0 (TIME_STOP≠loss, decay)\n"
+                + "_" + nowWarsawStr() + "_";
     }
 
     private static void logStats(com.bot.TelegramBotSender telegram,
                                  com.bot.GlobalImpulseController gic,
                                  com.bot.InstitutionalSignalCore isc,
                                  com.bot.SignalSender sender) {
+        lastStatsSuccessMs = System.currentTimeMillis(); // Watchdog heartbeat
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         String msg = String.format(
-                "📊 *GodBot Stats v7.0*\n"
-                        + "Uptime: %d min | Циклов: %d | Сигналов: %d\n"
-                        + "BTC: %s (str=%.2f, vol=%.2f)\n"
-                        + "WS: %d active | UDS: %s | Bal: $%.2f\n"
-                        + "Ошибок: %d | %s",
-                uptimeMin, totalCycles.get(), totalSignals.get(),
+                "📊 *GodBot v9.0*\n"
+                        + "Up: %dm | Cyc: %d | Sig: %d | Tracked: %d\n"
+                        + "BTC: %s (str=%.2f vol=%.2f)\n"
+                        + "WS: %d | UDS: %s | Bal: $%.2f\n"
+                        + "Err: %d | WD_alerts: %d\n%s",
+                uptimeMin, totalCycles.get(), totalSignals.get(), trackedSignals.size(),
                 ctx.regime, ctx.impulseStrength, ctx.volatilityExpansion,
-                sender.getActiveWsCount(),
-                sender.isUdsConnected() ? "✅" : "❌",
-                sender.getAccountBalance(),
-                errorCount.get(),
-                isc.getStats()
-        );
+                sender.getActiveWsCount(), sender.isUdsConnected() ? "✅" : "❌",
+                sender.getAccountBalance(), errorCount.get(), watchdogAlerts.get(),
+                isc.getStats());
         telegram.sendMessageAsync(msg);
-        LOG.info("[STATS] " + msg.replace("\n", " | "));
+        LOG.info("[STATS] " + msg.replace("\n"," | "));
     }
 
     private static String nowWarsawStr() {
-        return ZonedDateTime.now(ZONE)
-                .format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"));
+        return ZonedDateTime.now(ZONE).format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"));
     }
 
     public static String formatLocalTime(long utcMillis) {
-        return Instant.ofEpochMilli(utcMillis)
-                .atZone(ZONE)
+        return Instant.ofEpochMilli(utcMillis).atZone(ZONE)
                 .format(DateTimeFormatter.ofPattern("HH:mm"));
     }
 
-    private static int envInt(String key, int def) {
-        try { return Integer.parseInt(System.getenv().getOrDefault(key, String.valueOf(def))); }
-        catch (Exception e) { return def; }
+    private static int envInt(String k, int d) {
+        try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); }
+        catch (Exception e) { return d; }
     }
 
     private static void configureLogger() {

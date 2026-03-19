@@ -12,10 +12,14 @@ public final class SimpleBacktester {
     private boolean useMultiTP    = true;             // частичное закрытие по TP1
 
     /** Проскальзывание по категории монеты */
+    // [v10.0] Realistic slippage: previous values were 2-3x too optimistic
+    // Real-world ALT slippage on Binance Futures = 0.15-0.30% depending on book depth
+    // MEME coins can see 0.5-1.0% slippage on market orders during volatility
+    // These values ensure backtest EV is "dirty" (net of real costs)
     private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIP_MAP = Map.of(
-            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0005,  // 0.05%
-            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0015,  // 0.15%
-            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0040   // 0.40%
+            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0008,  // 0.08% (was 0.05%)
+            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0025,  // 0.25% (was 0.15%)
+            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0060   // 0.60% (was 0.40%)
     );
 
     // ── Конфигурация ─────────────────────────────────────────────
@@ -139,34 +143,29 @@ public final class SimpleBacktester {
         // 0 = open у low, 1 = open у high
         double openPos = (c.open - c.low) / range;
 
-        // Порог: если open в нижних 30% свечи — медвежий initial move
-        // Если open в верхних 30% — бычий initial move
+        // [v10.0] Conservative bias: when open is in middle zone (40-60% of range),
+        // we default to SL_FIRST. This prevents backtest optimism where the heuristic
+        // guesses TP_FIRST based on candle body — which is wrong ~50% of the time.
+        // Only clear cases (open in extreme 30% of range) get directional guess.
         final double BIAS_THRESHOLD = 0.30;
 
         if (isLong) {
-            // Для LONG: SL = ниже, TP = выше
             if (openPos < BIAS_THRESHOLD) {
-                // Open у нижней части → цена скорее сначала пошла вниз → SL first
                 return HitOrder.SL_FIRST;
             } else if (openPos > (1.0 - BIAS_THRESHOLD)) {
-                // Open у верхней части → цена скорее сначала пошла вверх → TP first
                 return HitOrder.TP_FIRST;
             } else {
-                // Open в середине — смотрим на тело свечи
-                // Медвежья свеча (close < open) = сначала скорее вниз
-                return c.close < c.open ? HitOrder.SL_FIRST : HitOrder.TP_FIRST;
+                // [v10.0] Ambiguous → conservative = SL first
+                return HitOrder.SL_FIRST;
             }
         } else {
-            // Для SHORT: SL = выше, TP = ниже
             if (openPos > (1.0 - BIAS_THRESHOLD)) {
-                // Open у верхней части → цена скорее сначала пошла вверх → SL first
                 return HitOrder.SL_FIRST;
             } else if (openPos < BIAS_THRESHOLD) {
-                // Open у нижней части → TP first
                 return HitOrder.TP_FIRST;
             } else {
-                // Бычья свеча (close > open) = сначала скорее вверх = SL first для шорта
-                return c.close > c.open ? HitOrder.SL_FIRST : HitOrder.TP_FIRST;
+                // [v10.0] Ambiguous → conservative = SL first
+                return HitOrder.SL_FIRST;
             }
         }
     }

@@ -137,24 +137,30 @@ public final class DecisionEngineMerged {
         double shortScore = 0;
         final List<String> flags = new ArrayList<>();
 
+        // [v10.0] Per-cluster cap: prevents single market event
+        // from inflating one cluster's score via correlated sub-signals.
+        // Without this, AntiLag+Impulse+Pump+PumpHunter can stack to 2.0+
+        // in cMomentum, making bot think it has strong multi-source confirmation
+        // when it's really one impulsive candle seen 4 different ways.
+        private static final double CLUSTER_CAP = 0.85;
+
         void addLong(double score, String flag) {
-            longScore = Math.max(longScore, score);
+            longScore = Math.min(CLUSTER_CAP, Math.max(longScore, score));
             if (flag != null) flags.add(flag);
         }
 
         void addShort(double score, String flag) {
-            shortScore = Math.max(shortScore, score);
+            shortScore = Math.min(CLUSTER_CAP, Math.max(shortScore, score));
             if (flag != null) flags.add(flag);
         }
 
-        // Мягкое добавление — accumulate вместо max (для бонусов)
         void boostLong(double score, String flag) {
-            longScore += score;
+            longScore = Math.min(CLUSTER_CAP, longScore + score);
             if (flag != null) flags.add(flag);
         }
 
         void boostShort(double score, String flag) {
-            shortScore += score;
+            shortScore = Math.min(CLUSTER_CAP, shortScore + score);
             if (flag != null) flags.add(flag);
         }
 
@@ -837,6 +843,31 @@ public final class DecisionEngineMerged {
         if (scoreShort > scoreLong  && devEma < -0.065) {
             if (!aggressiveShort) { scoreShort *= 0.60; allFlags.add("OVEREXT_S"); }
             else { allFlags.add("OVEREXT_S_SKIP"); }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // [v10.0] EMA21 + 2×ATR OVEREXTENSION GUARD
+        // Issue: lagging indicators (ADX, RSI, EMA) confirm trend
+        // when 70% of the move is already done. Bot enters on the
+        // tail end, gets immediate reversal.
+        // Fix: if price > EMA21 + 2×ATR → hard kill for LONG
+        //      if price < EMA21 - 2×ATR → hard kill for SHORT
+        // This catches the "entering on exhausted move" problem.
+        // ════════════════════════════════════════════════════════
+        double ema21val = ema(c15, 21);
+        double ema21dev = Math.abs(price - ema21val);
+        if (ema21dev > atr14 * 2.0) {
+            boolean priceAbove = price > ema21val;
+            if (priceAbove && scoreLong > scoreShort) {
+                scoreLong *= 0.40;
+                allFlags.add("EMA21_OVEREXT_L");
+                if (scoreLong < 0.20) return null;
+            }
+            if (!priceAbove && scoreShort > scoreLong && !aggressiveShort) {
+                scoreShort *= 0.40;
+                allFlags.add("EMA21_OVEREXT_S");
+                if (scoreShort < 0.20) return null;
+            }
         }
 
         // ════════════════════════════════════════════════════════

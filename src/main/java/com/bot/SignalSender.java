@@ -122,31 +122,93 @@ public final class SignalSender {
     private volatile double accountBalance    = 100.0;
     private volatile long   lastBalanceRefresh = 0;
 
-    // Rate limiter
-    private static final int  RATE_LIMIT_MAX_WEIGHT = 1800;
-    private static final long RATE_LIMIT_WINDOW_MS  = 60_000L;
-    private final AtomicInteger usedWeight = new AtomicInteger(0);
-    private volatile long weightWindowStart = System.currentTimeMillis();
-    private volatile boolean rateLimitPaused = false;
+    // ══════════════════════════════════════════════════════════════
+    //  [v9.0] RATE LIMITER — Semaphore + Token Bucket + Backoff
+    //  Replaces broken volatile-based rate limiter that caused
+    //  silent request drops and potential IP bans.
+    // ══════════════════════════════════════════════════════════════
+    private static final int    RL_MAX_WEIGHT      = 2400;
+    private static final int    RL_SAFE_WEIGHT     = 1800;
+    private static final int    RL_CRITICAL_WEIGHT = 2100;
+    private static final long   RL_WINDOW_MS       = 60_000L;
+    private static final int    RL_MAX_CONCURRENT  = 10;
 
-    private void trackWeight(int weight) {
-        long now = System.currentTimeMillis();
-        if (now - weightWindowStart > RATE_LIMIT_WINDOW_MS) {
-            usedWeight.set(0); weightWindowStart = now; rateLimitPaused = false;
+    private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
+    private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
+    private final AtomicLong    rlWindowStart   = new AtomicLong(System.currentTimeMillis());
+    private volatile int        rlServerWeight  = 0;
+    private volatile long       rlBackoffUntil  = 0;
+    private volatile boolean    rlIpBanned      = false;
+    private volatile long       rlIpBanUntil    = 0;
+    private volatile int        rl429Count      = 0;
+    private final AtomicLong    rlTotalWaits    = new AtomicLong(0);
+
+    /**
+     * Acquire permission to make a Binance request.
+     * Blocks if too many concurrent or weight budget exhausted.
+     * Returns false = skip request (IP banned or timeout).
+     */
+    private boolean rlAcquire(int weight) {
+        // IP ban
+        if (rlIpBanned && System.currentTimeMillis() < rlIpBanUntil) return false;
+        if (rlIpBanned) rlIpBanned = false;
+
+        // Backoff
+        long backoffWait = rlBackoffUntil - System.currentTimeMillis();
+        if (backoffWait > 0) {
+            if (backoffWait > 30_000) return false;
+            try { rlTotalWaits.incrementAndGet(); Thread.sleep(backoffWait); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
         }
-        if (usedWeight.addAndGet(weight) > RATE_LIMIT_MAX_WEIGHT && !rateLimitPaused) {
-            rateLimitPaused = true;
+
+        // Rotate window
+        if (System.currentTimeMillis() - rlWindowStart.get() > RL_WINDOW_MS) {
+            rlWindowStart.set(System.currentTimeMillis());
+            rlCurrentWeight.set(0); rlServerWeight = 0;
         }
+
+        // Weight check
+        int eff = Math.max(rlCurrentWeight.get(), rlServerWeight);
+        if (eff + weight > RL_CRITICAL_WEIGHT) {
+            long wait = RL_WINDOW_MS - (System.currentTimeMillis() - rlWindowStart.get()) + 200;
+            if (wait > 0 && wait < RL_WINDOW_MS) {
+                try { rlTotalWaits.incrementAndGet(); Thread.sleep(wait); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+                rlWindowStart.set(System.currentTimeMillis());
+                rlCurrentWeight.set(0); rlServerWeight = 0;
+            }
+        } else if (eff + weight > RL_SAFE_WEIGHT) {
+            try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        }
+
+        // Concurrency
+        try {
+            if (!rlSemaphore.tryAcquire(8, java.util.concurrent.TimeUnit.SECONDS)) return false;
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+
+        rlCurrentWeight.addAndGet(weight);
+        return true;
     }
 
-    private void awaitRateLimit() {
-        if (!rateLimitPaused) return;
-        long waitMs = RATE_LIMIT_WINDOW_MS - (System.currentTimeMillis() - weightWindowStart);
-        if (waitMs > 0) {
-            try { Thread.sleep(Math.min(waitMs + 200, RATE_LIMIT_WINDOW_MS)); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        }
-        usedWeight.set(0); weightWindowStart = System.currentTimeMillis(); rateLimitPaused = false;
+    private void rlRelease() { rlSemaphore.release(); }
+
+    private void rlOnSuccess(int reportedWeight) {
+        rl429Count = 0;
+        if (reportedWeight > 0) { rlServerWeight = reportedWeight; }
+    }
+
+    private void rlOn429() {
+        rl429Count++;
+        long backoff = Math.min(5000L * (1L << Math.min(rl429Count, 5)), 120_000L);
+        rlBackoffUntil = System.currentTimeMillis() + backoff;
+        System.out.println("[RL] 429 #" + rl429Count + " backoff=" + backoff + "ms");
+        if (rl429Count >= 3) bot.sendMessageAsync("⚠️ Binance 429 x" + rl429Count);
+    }
+
+    private void rlOn418() {
+        rlIpBanned = true; rlIpBanUntil = System.currentTimeMillis() + 5*60_000L;
+        System.out.println("[RL] 418 IP BAN!");
+        bot.sendMessageAsync("🚨 Binance IP BAN 5min!");
     }
 
     // RS history
@@ -547,23 +609,26 @@ public final class SignalSender {
                                       com.bot.DecisionEngineMerged.CoinCategory cat) {
         double balance = Math.max(accountBalance, 100.0);
 
+        // [v10.0] Conservative risk per trade — halved for real money safety
+        // Issue 1: confidence inflation means high-prob signals aren't as reliable
+        // as their number suggests. Keep risk low until 100+ real trades confirm edge.
         double riskPct = switch (cat) {
-            case TOP  -> 0.015; // 1.5% риска для топ-монет
-            case ALT  -> 0.020; // 2.0% для альтов
-            case MEME -> 0.010; // 1.0% для мем-коинов
+            case TOP  -> 0.010; // 1.0% (was 1.5%)
+            case ALT  -> 0.010; // 1.0% (was 2.0% — way too high for unproven system)
+            case MEME -> 0.006; // 0.6% (was 1.0%)
         };
 
-        // Высокая уверенность → чуть больше позиция
-        if (idea.probability >= 80)      riskPct *= 1.30;
-        else if (idea.probability >= 70) riskPct *= 1.15;
-        else if (idea.probability < 58)  riskPct *= 0.75;
+        // [v10.0] Confidence scaling tightened — less aggressive
+        if (idea.probability >= 82)      riskPct *= 1.20;  // was 1.30
+        else if (idea.probability >= 72) riskPct *= 1.10;  // was 1.15
+        else if (idea.probability < 58)  riskPct *= 0.65;  // was 0.75
 
         double riskUsdt  = balance * riskPct;
         double stopPct   = Math.max(0.005, Math.abs(idea.price - idea.stop) / idea.price);
         double posSize   = riskUsdt / stopPct;
 
-        // Лимиты: не более 20% баланса, не менее $6.5
-        posSize = Math.min(posSize, balance * 0.20);
+        // [v10.0] Max position = 15% of balance (was 20%)
+        posSize = Math.min(posSize, balance * 0.15);
         posSize = Math.max(posSize, 6.5);
 
         return Math.round(posSize * 100.0) / 100.0;
@@ -691,9 +756,13 @@ public final class SignalSender {
                             ? com.bot.TradingCore.Side.SHORT
                             : com.bot.TradingCore.Side.LONG;
                     double pnlPct = avgPrice > 0 ? realizedPnl / (avgPrice * qty) * 100 : 0;
+                    // [v9.0] UDS confirmed result → register in ISC properly
+                    isc.registerConfirmedResult(realizedPnl >= 0);
                     isc.closeTrade(symbol, closedSide, pnlPct);
+                    // [v9.0] Remove from BotMain TradeResolver tracking
+                    com.bot.BotMain.trackedSignals.remove(symbol + "_" + closedSide);
                     String emoji = realizedPnl >= 0 ? "✅" : "❌";
-                    bot.sendMessageAsync(String.format("%s *CLOSED* %s %s\nPnL: %+.4f$ (%+.2f%%)",
+                    bot.sendMessageAsync(String.format("%s *UDS CLOSED* %s %s\nPnL: %+.4f$ (%+.2f%%)",
                             emoji, symbol, closedSide, realizedPnl, pnlPct));
                     System.out.printf("[UDS] CLOSED %s %s PnL=%+.4f%n", symbol, closedSide, realizedPnl);
                 }
@@ -881,18 +950,27 @@ public final class SignalSender {
         private int longCount = 0, shortCount = 0;
         private final Map<String, Integer> sectorCount = new HashMap<>();
         private final Set<String> registered = new HashSet<>();
-        // [v7.0] TOP coins no longer bypass limits. Increased MAX_DIR slightly to compensate.
-        private static final int MAX_DIR = 8, MAX_SECTOR = 3, MAX_TOP_SAME_DIR = 4;
+
+        // [v10.0] Weekend-aware directional limits
+        // Issue 5: weekends have 30-50% less liquidity, alts cascade without BTC trigger
+        private static final int MAX_DIR_NORMAL  = 6;   // was 8 — too many correlated positions
+        private static final int MAX_DIR_WEEKEND = 3;   // hard cap on weekends
+        private static final int MAX_SECTOR = 3;
+        private static final int MAX_TOP_SAME_DIR = 3;  // was 4
+
+        private static boolean isWeekend() {
+            java.time.DayOfWeek day = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getDayOfWeek();
+            return day == java.time.DayOfWeek.SATURDAY || day == java.time.DayOfWeek.SUNDAY;
+        }
 
         synchronized void resetCycle() { longCount = 0; shortCount = 0; sectorCount.clear(); registered.clear(); }
 
         synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
-            // [v7.0 FIX] TOP coins are no longer exempt — 6 BTC/ETH/SOL longs in a crash = catastrophe
-            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= MAX_DIR) return false;
-            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= MAX_DIR) return false;
+            int maxDir = isWeekend() ? MAX_DIR_WEEKEND : MAX_DIR_NORMAL;
+            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= maxDir) return false;
+            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= maxDir) return false;
             if (sector != null && sectorCount.getOrDefault(sector, 0) >= MAX_SECTOR) return false;
-            // [v7.0] Extra limit: max 4 TOP coins in same direction
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
                 long topSameDir = registered.stream()
                         .filter(p -> categorizePair(p) == com.bot.DecisionEngineMerged.CoinCategory.TOP)
@@ -934,7 +1012,7 @@ public final class SignalSender {
     }
 
     private List<com.bot.TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
-        awaitRateLimit();
+        if (!rlAcquire(5)) return Collections.emptyList(); // [v9.0] semaphore acquire
         try {
             String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
                     symbol, interval, limit);
@@ -942,18 +1020,15 @@ public final class SignalSender {
                     HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
 
+            // [v9.0] Server-side weight tracking
             resp.headers().firstValue("X-MBX-USED-WEIGHT-1M").ifPresent(w -> {
-                try { int sw = Integer.parseInt(w); usedWeight.set(Math.max(usedWeight.get(), sw)); if (sw > 2000) rateLimitPaused = true; }
-                catch (NumberFormatException ignored) {}
+                try { rlOnSuccess(Integer.parseInt(w)); } catch (NumberFormatException ignored) {}
             });
 
-            if (resp.statusCode() == 429 || resp.statusCode() == 418) {
-                rateLimitPaused = true;
-                try { Thread.sleep(30_000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                return Collections.emptyList();
-            }
+            // [v9.0] Proper 429/418 handling with backoff
+            if (resp.statusCode() == 429) { rlOn429(); return Collections.emptyList(); }
+            if (resp.statusCode() == 418) { rlOn418(); return Collections.emptyList(); }
 
-            trackWeight(5);
             String body = resp.body();
             if (!body.trim().startsWith("[")) return Collections.emptyList();
             JSONArray arr = new JSONArray(body);
@@ -968,6 +1043,7 @@ public final class SignalSender {
             }
             return list;
         } catch (Exception e) { return Collections.emptyList(); }
+        finally { rlRelease(); } // [v9.0] ALWAYS release semaphore
     }
 
     public CompletableFuture<List<com.bot.TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
