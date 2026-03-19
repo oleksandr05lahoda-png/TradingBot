@@ -156,7 +156,7 @@ public final class BotMain {
 
         // [v9.0] Watchdog every 60 sec — SAFE wrapped
         auxSched.scheduleAtFixedRate(
-                safe("Watchdog", () -> runWatchdog(telegram, isc, sender), telegram),
+                safe("Watchdog", () -> runWatchdog(telegram, gic, isc, sender), telegram),
                 60, 60, TimeUnit.SECONDS);
 
         // [v9.0] TradeResolver: REST price check every 2 min — SAFE wrapped
@@ -185,6 +185,7 @@ public final class BotMain {
     // ══════════════════════════════════════════════════════════════
 
     private static void runWatchdog(com.bot.TelegramBotSender telegram,
+                                    com.bot.GlobalImpulseController gic,
                                     com.bot.InstitutionalSignalCore isc,
                                     com.bot.SignalSender sender) {
         if (isQuietHours()) return;
@@ -218,11 +219,19 @@ public final class BotMain {
                     .append(" ").append(isc.getStats());
             issues.add(diag.toString());
 
-            // [v9.0] Self-heal: reset streak if minConf too high
+            // [v10.0] Smart self-heal: only reset if market calmed down
             if (effConf > 68 && isc.getCurrentLossStreak() >= 2) {
-                LOG.info("[WATCHDOG] Self-heal: resetting streak guard (effConf=" + effConf + ")");
-                isc.resetStreakGuard();
-                issues.add("🔧 Auto-reset streak guard");
+                com.bot.GlobalImpulseController.GlobalContext wdCtx = gic.getContext();
+                boolean calm = wdCtx.volRegime == com.bot.GlobalImpulseController.VolatilityRegime.NORMAL
+                        || wdCtx.volRegime == com.bot.GlobalImpulseController.VolatilityRegime.LOW;
+                boolean safe = wdCtx.cascadeLevel == com.bot.GlobalImpulseController.CascadeLevel.NONE
+                        || wdCtx.cascadeLevel == com.bot.GlobalImpulseController.CascadeLevel.WATCH;
+                if (calm && safe) {
+                    LOG.info("[WATCHDOG] Smart reset: market calm, effConf=" + effConf);
+                    isc.resetStreakGuard();
+                } else {
+                    LOG.info("[WATCHDOG] Streak high BUT market " + wdCtx.volRegime + "/" + wdCtx.cascadeLevel + " — NOT resetting");
+                }
             }
         }
 
@@ -272,24 +281,32 @@ public final class BotMain {
                 continue;
             }
 
-            // Get current price
-            double price = 0;
+            // Get current price — use HIGH and LOW, not just close!
+            // [v10.0] FIX: old code checked only close. If candle wicked through SL
+            // but closed above it, TradeResolver missed the SL hit.
+            // On the exchange, SL is triggered by ANY price touch, not close.
+            double priceLow = 0, priceHigh = 0, priceClose = 0;
             try {
-                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(ts.symbol, "1m", 1);
-                if (c != null && !c.isEmpty()) price = c.get(c.size() - 1).close;
+                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(ts.symbol, "1m", 2);
+                if (c != null && !c.isEmpty()) {
+                    com.bot.TradingCore.Candle last = c.get(c.size() - 1);
+                    priceLow = last.low;
+                    priceHigh = last.high;
+                    priceClose = last.close;
+                }
             } catch (Exception ignored) { continue; }
 
-            if (price <= 0) continue;
+            if (priceClose <= 0) continue;
 
             boolean isLong = ts.side == com.bot.TradingCore.Side.LONG;
 
-            // SL hit
-            boolean slHit = isLong ? price <= ts.sl : price >= ts.sl;
+            // SL hit — check extremes (high/low), not close
+            boolean slHit = isLong ? priceLow <= ts.sl : priceHigh >= ts.sl;
             if (slHit) {
                 double pnl = isLong ? (ts.sl - ts.entry) / ts.entry * 100
                         : (ts.entry - ts.sl) / ts.entry * 100;
                 it.remove();
-                isc.registerConfirmedResult(false); // CONFIRMED loss
+                isc.registerConfirmedResult(false);
                 isc.closeTrade(ts.symbol, ts.side, pnl);
                 telegram.sendMessageAsync(String.format("❌ *SL HIT* %s %s PnL: %+.2f%%",
                         ts.symbol, ts.side, pnl));
@@ -297,8 +314,8 @@ public final class BotMain {
                 continue;
             }
 
-            // TP1 hit
-            boolean tp1Hit = isLong ? price >= ts.tp1 : price <= ts.tp1;
+            // TP1 hit — check extremes
+            boolean tp1Hit = isLong ? priceHigh >= ts.tp1 : priceLow <= ts.tp1;
             if (tp1Hit && !ts.tp1Hit) {
                 ts.tp1Hit = true;
                 telegram.sendMessageAsync(String.format("🎯 *TP1 HIT* %s %s → SL→BE", ts.symbol, ts.side));
@@ -306,24 +323,24 @@ public final class BotMain {
 
             // After TP1: check TP2 or BE
             if (ts.tp1Hit) {
-                boolean tp2Hit = isLong ? price >= ts.tp2 : price <= ts.tp2;
+                boolean tp2Hit = isLong ? priceHigh >= ts.tp2 : priceLow <= ts.tp2;
                 if (tp2Hit) {
-                    double pnl = isLong ? (price - ts.entry) / ts.entry * 100
-                            : (ts.entry - price) / ts.entry * 100;
+                    double pnl = isLong ? (ts.tp2 - ts.entry) / ts.entry * 100
+                            : (ts.entry - ts.tp2) / ts.entry * 100;
                     it.remove();
-                    isc.registerConfirmedResult(true); // CONFIRMED win
+                    isc.registerConfirmedResult(true);
                     isc.closeTrade(ts.symbol, ts.side, pnl);
                     telegram.sendMessageAsync(String.format("✅ *TP2 HIT* %s %s PnL: %+.2f%%",
                             ts.symbol, ts.side, pnl));
                     continue;
                 }
-                // BE exit after TP1
-                boolean beHit = isLong ? price <= ts.entry * 1.001 : price >= ts.entry * 0.999;
+                // BE exit after TP1 — use close for BE (not wick)
+                boolean beHit = isLong ? priceClose <= ts.entry * 1.001 : priceClose >= ts.entry * 0.999;
                 if (beHit) {
                     double tp1Pnl = isLong ? (ts.tp1 - ts.entry) / ts.entry * 100 * 0.5
                             : (ts.entry - ts.tp1) / ts.entry * 100 * 0.5;
                     it.remove();
-                    isc.registerConfirmedResult(true); // Partial win
+                    isc.registerConfirmedResult(true);
                     isc.closeTrade(ts.symbol, ts.side, tp1Pnl);
                     telegram.sendMessageAsync(String.format("➡️ *BE EXIT* %s %s (TP1 partial: %+.2f%%)",
                             ts.symbol, ts.side, tp1Pnl));

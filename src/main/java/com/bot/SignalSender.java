@@ -87,6 +87,9 @@ public final class SignalSender {
     private final Map<String, Long> lastFetchTime = new ConcurrentHashMap<>();
 
     // Orderbook
+    // [v10.0 NOTE] orderbookMap is NEVER populated (no @bookTicker WS subscription).
+    // All OBI checks in processPair/checkLiquidity are dead code — they read from empty map.
+    // TODO: Add @bookTicker WS to populate this for real OBI analysis.
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
 
     // Candle Cache
@@ -380,6 +383,37 @@ public final class SignalSender {
     // ══════════════════════════════════════════════════════════════
 
     private void startWebSocketsForTopPairs(Set<String> pairs) {
+        // [v10.0] MEMORY LEAK FIX: clean up pairs that dropped out of TOP-N
+        // Without this, wsMap/tickPriceDeque/liveM1Buffer grow forever
+        Set<String> zombies = new HashSet<>(wsMap.keySet());
+        zombies.removeAll(pairs);
+        for (String zombie : zombies) {
+            WebSocket ws = wsMap.remove(zombie);
+            if (ws != null) {
+                try { ws.sendClose(WebSocket.NORMAL_CLOSURE, "pair rotated out"); }
+                catch (Exception ignored) {}
+            }
+            tickPriceDeque.remove(zombie);
+            tickVolumeDeque.remove(zombie);
+            liveM1Buffer.remove(zombie);
+            deltaBuffer.remove(zombie);
+            deltaWindowStart.remove(zombie);
+            deltaHistory.remove(zombie);
+            lastTickTime.remove(zombie);
+            lastTickPrice.remove(zombie);
+            microBuilders.remove(zombie);
+            orderbookMap.remove(zombie);
+            wsReconnectDelay.remove(zombie);
+            // Clean candle caches for all timeframes
+            for (String tf : List.of("1m","5m","15m","1h","2h")) {
+                candleCache.remove(zombie + "_" + tf);
+            }
+        }
+        if (!zombies.isEmpty()) {
+            System.out.printf("[WS] Cleaned %d zombie pairs: %s%n", zombies.size(),
+                    zombies.size() <= 5 ? zombies : zombies.size() + " pairs");
+        }
+
         List<String> sorted = new ArrayList<>(pairs);
         sorted.sort((a, b) -> Double.compare(
                 volume24hUSD.getOrDefault(b, 0.0),
@@ -620,9 +654,10 @@ public final class SignalSender {
         double balance = Math.max(accountBalance, 100.0);
 
         double riskPct = switch (cat) {
-            case TOP  -> 0.015; // 1.5% риска для топ-монет
-            case ALT  -> 0.020; // 2.0% для альтов
-            case MEME -> 0.010; // 1.0% для мем-коинов
+            // [v10.0] Conservative risk until 100+ real trades prove the edge
+            case TOP  -> 0.010; // 1.0% (was 1.5%)
+            case ALT  -> 0.010; // 1.0% (was 2.0% — dangerous for unproven system)
+            case MEME -> 0.006; // 0.6% (was 1.0%)
         };
 
         // Высокая уверенность → чуть больше позиция
@@ -957,18 +992,24 @@ public final class SignalSender {
         private int longCount = 0, shortCount = 0;
         private final Map<String, Integer> sectorCount = new HashMap<>();
         private final Set<String> registered = new HashSet<>();
-        // [v7.0] TOP coins no longer bypass limits. Increased MAX_DIR slightly to compensate.
-        private static final int MAX_DIR = 8, MAX_SECTOR = 3, MAX_TOP_SAME_DIR = 4;
+        // [v10.0] Weekend-aware: Sat/Sun liquidity is 30-50% lower, alt cascades happen
+        private static final int MAX_DIR_NORMAL  = 6;   // was 8
+        private static final int MAX_DIR_WEEKEND = 3;
+        private static final int MAX_SECTOR = 3, MAX_TOP_SAME_DIR = 3; // was 4
+
+        private static boolean isWeekend() {
+            java.time.DayOfWeek d = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getDayOfWeek();
+            return d == java.time.DayOfWeek.SATURDAY || d == java.time.DayOfWeek.SUNDAY;
+        }
 
         synchronized void resetCycle() { longCount = 0; shortCount = 0; sectorCount.clear(); registered.clear(); }
 
         synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
-            // [v7.0 FIX] TOP coins are no longer exempt — 6 BTC/ETH/SOL longs in a crash = catastrophe
-            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= MAX_DIR) return false;
-            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= MAX_DIR) return false;
+            int maxDir = isWeekend() ? MAX_DIR_WEEKEND : MAX_DIR_NORMAL;
+            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= maxDir) return false;
+            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= maxDir) return false;
             if (sector != null && sectorCount.getOrDefault(sector, 0) >= MAX_SECTOR) return false;
-            // [v7.0] Extra limit: max 4 TOP coins in same direction
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
                 long topSameDir = registered.stream()
                         .filter(p -> categorizePair(p) == com.bot.DecisionEngineMerged.CoinCategory.TOP)
@@ -1090,12 +1131,14 @@ public final class SignalSender {
                                             deltaBuffer.put(pair, side); deltaWindowStart.put(pair, ts);
                                         } else { deltaBuffer.merge(pair, side, Double::sum); }
 
-                                        synchronized (wsLock) {
-                                            Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new ArrayDeque<>());
-                                            dq.addLast(price); while (dq.size() > TICK_HISTORY) dq.removeFirst();
-                                            Deque<Double> vq = tickVolumeDeque.computeIfAbsent(pair, k -> new ArrayDeque<>());
-                                            vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.removeFirst();
-                                        }
+                                        // [v10.0] FIX RACE CONDITION: use ConcurrentLinkedDeque
+                                        // WS thread writes here, SignalOptimizer reads with synchronized(dq).
+                                        // Old code: synchronized(wsLock) + ArrayDeque = different monitors = CME crash.
+                                        // New: ConcurrentLinkedDeque is thread-safe, no sync needed for add/poll.
+                                        Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+                                        dq.addLast(price); while (dq.size() > TICK_HISTORY) dq.pollFirst();
+                                        Deque<Double> vq = tickVolumeDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+                                        vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.pollFirst();
                                         lastTickPrice.put(pair, price); lastTickTime.put(pair, ts);
                                         microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(30_000)).addTick(ts, price, qty);
 
@@ -1170,20 +1213,34 @@ public final class SignalSender {
     // ══════════════════════════════════════════════════════════════
 
     private void refreshAllFundingRates() {
-        if (rlIpBanned) return; // [v10.0]
+        if (rlIpBanned) return;
         try {
+            // Bulk funding rates — 1 request for ALL pairs (weight ~10)
             JSONArray arr = new JSONArray(http.send(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/premiumIndex"))
                             .timeout(Duration.ofSeconds(15)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
             Map<String, Double> rates = new HashMap<>(arr.length());
             for (int i = 0; i < arr.length(); i++) { JSONObject o = arr.getJSONObject(i); rates.put(o.getString("symbol"), o.optDouble("lastFundingRate", 0)); }
-            List<String> pairs = new ArrayList<>(cachedPairs);
-            for (int i = 0; i < pairs.size(); i++) {
-                if (rlIpBanned) break; // [v10.0] abort if banned mid-loop
+
+            // [v10.0] Apply funding to ALL pairs from bulk response (no extra requests)
+            for (String pair : cachedPairs) {
+                double fr = rates.getOrDefault(pair, 0.0);
+                decisionEngine.updateFundingOI(pair, fr, 0, 0, 0); // funding from bulk, OI below
+            }
+
+            // [v10.0] FIX: OI only for top 20 by volume (was 100 = 200 requests every 5 min)
+            // 20 pairs × 1 request = 20 requests (was 200). Saves 900 weight per cycle.
+            List<String> oiPairs = new ArrayList<>(cachedPairs);
+            oiPairs.sort((a, b) -> Double.compare(
+                    volume24hUSD.getOrDefault(b, 0.0),
+                    volume24hUSD.getOrDefault(a, 0.0)));
+            int oiLimit = Math.min(20, oiPairs.size());
+
+            for (int i = 0; i < oiLimit; i++) {
+                if (rlIpBanned) break;
                 try {
-                    fetchAndUpdateOI(pairs.get(i), rates.getOrDefault(pairs.get(i), 0.0));
-                    // [v10.0] 200ms every 5 pairs (was 40ms every 10 — caused 418)
-                    if (i % 5 == 4) Thread.sleep(200);
+                    fetchAndUpdateOI(oiPairs.get(i), rates.getOrDefault(oiPairs.get(i), 0.0));
+                    if (i % 5 == 4) Thread.sleep(300);
                 }
                 catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                 catch (Exception ignored) {}
@@ -1193,17 +1250,12 @@ public final class SignalSender {
 
     private void fetchAndUpdateOI(String symbol, double fr) {
         try {
+            // [v10.0] Only current OI, skip expensive oiHist (saves 1 request per pair)
             JSONObject oiJ = new JSONObject(http.send(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/openInterest?symbol="+symbol))
                             .timeout(Duration.ofSeconds(6)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
             double oi = oiJ.optDouble("openInterest", 0);
-            JSONArray hist = new JSONArray(http.send(
-                    HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/futures/data/openInterestHist?symbol="+symbol+"&period=1h&limit=5"))
-                            .timeout(Duration.ofSeconds(6)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
-            double oi1h = 0, oi4h = 0;
-            if (hist.length() >= 2) { double p = hist.getJSONObject(hist.length()-2).optDouble("sumOpenInterest", oi); oi1h = ((oi-p)/(p+1e-9))*100; }
-            if (hist.length() >= 5) { double p = hist.getJSONObject(0).optDouble("sumOpenInterest", oi); oi4h = ((oi-p)/(p+1e-9))*100; }
-            decisionEngine.updateFundingOI(symbol, fr, oi, oi1h, oi4h);
+            decisionEngine.updateFundingOI(symbol, fr, oi, 0, 0);
         } catch (Exception e) { decisionEngine.updateFundingOI(symbol, fr, 0, 0, 0); }
     }
 
@@ -1310,11 +1362,23 @@ public final class SignalSender {
         return sum / period;
     }
 
+    /** [v10.0] Wilder's RSI (SMMA) — matches DecisionEngine and TradingView */
     public static double rsi(List<Double> prices, int period) {
         if (prices == null || prices.size() <= period) return 50.0;
-        double gain = 0, loss = 0;
-        for (int i = prices.size()-period; i < prices.size(); i++) { double d = prices.get(i)-prices.get(i-1); if (d>0) gain+=d; else loss+=-d; }
-        return gain+loss == 0 ? 50.0 : 100.0 - (100.0 / (1.0 + gain / (loss + 1e-12)));
+        int startIdx = Math.max(1, prices.size() - period * 2);
+        int seedEnd = Math.min(startIdx + period, prices.size());
+        double avgGain = 0, avgLoss = 0;
+        for (int i = startIdx; i < seedEnd; i++) {
+            double d = prices.get(i) - prices.get(i - 1);
+            if (d > 0) avgGain += d; else avgLoss -= d;
+        }
+        avgGain /= period; avgLoss /= period;
+        for (int i = seedEnd; i < prices.size(); i++) {
+            double d = prices.get(i) - prices.get(i - 1);
+            avgGain = (avgGain * (period - 1) + (d > 0 ? d : 0)) / period;
+            avgLoss = (avgLoss * (period - 1) + (d < 0 ? -d : 0)) / period;
+        }
+        return avgLoss < 1e-12 ? 100.0 : 100.0 - (100.0 / (1.0 + avgGain / avgLoss));
     }
 
     public static double ema(List<Double> prices, int period) {

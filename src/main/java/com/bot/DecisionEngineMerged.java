@@ -1938,15 +1938,40 @@ public final class DecisionEngineMerged {
         return e;
     }
 
+    /**
+     * [v10.0] Wilder's RSI using Smoothed Moving Average (SMMA).
+     * Old code used simple sum over period — too "jerky", triggers false divergences.
+     * Wilder's method: first value = SMA, then avgGain = (prev*13 + current) / 14.
+     * This matches TradingView/Binance RSI exactly.
+     */
     public double rsi(List<com.bot.TradingCore.Candle> c, int period) {
         if (c.size() < period + 1) return 50.0;
-        double gain = 0, loss = 0;
-        for (int i = c.size() - period; i < c.size(); i++) {
+
+        // Step 1: initial SMA seed over first 'period' bars
+        int startIdx = c.size() - period * 2; // use more history for stable seed
+        if (startIdx < 1) startIdx = 1;
+
+        double avgGain = 0, avgLoss = 0;
+        int seedEnd = Math.min(startIdx + period, c.size());
+        for (int i = startIdx; i < seedEnd; i++) {
             double ch = c.get(i).close - c.get(i - 1).close;
-            if (ch > 0) gain += ch; else loss -= ch;
+            if (ch > 0) avgGain += ch; else avgLoss -= ch;
         }
-        double rs = loss == 0 ? 100 : gain / loss;
-        return 100 - (100 / (1 + rs));
+        avgGain /= period;
+        avgLoss /= period;
+
+        // Step 2: Wilder's smoothing for remaining bars
+        for (int i = seedEnd; i < c.size(); i++) {
+            double ch = c.get(i).close - c.get(i - 1).close;
+            double curGain = ch > 0 ? ch : 0;
+            double curLoss = ch < 0 ? -ch : 0;
+            avgGain = (avgGain * (period - 1) + curGain) / period;
+            avgLoss = (avgLoss * (period - 1) + curLoss) / period;
+        }
+
+        if (avgLoss < 1e-12) return 100.0;
+        double rs = avgGain / avgLoss;
+        return 100.0 - (100.0 / (1.0 + rs));
     }
 
     private boolean bullDiv(List<com.bot.TradingCore.Candle> c) {

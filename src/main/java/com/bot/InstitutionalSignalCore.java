@@ -32,7 +32,11 @@ public final class InstitutionalSignalCore {
         this.maxPortfolioExposure = 0.50;
         this.minConfidence        = 56.0;
         this.minSignalDiff        = 0.0025;
-        this.signalTtlMs          = 15 * 60_000L;
+        // [v10.0] CRITICAL FIX: TTL was 15 min, TIME_STOP was 90 min.
+        // TTL killed signals after 15 min → TradeResolver couldn't find them
+        // when TP/SL hit at 30+ min → history/winRate never updated.
+        // Fix: TTL = TIME_STOP. Signal lives until resolved or timed out.
+        this.signalTtlMs          = TIME_STOP_MS;
     }
 
     public InstitutionalSignalCore(int maxGlobal, int maxPerSym, double maxExposure,
@@ -240,7 +244,7 @@ public final class InstitutionalSignalCore {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  CLEANUP — [v9.0] TIME_STOP = NEUTRAL
+    //  CLEANUP — [v10.0] TTL = TIME_STOP = 90 min
     // ══════════════════════════════════════════════════════════════
 
     private void cleanupExpiredSignals() {
@@ -251,27 +255,20 @@ public final class InstitutionalSignalCore {
             Map.Entry<String, List<ActiveSignal>> e = it.next();
             String sym = e.getKey();
             e.getValue().removeIf(s -> {
-                boolean ttl = now - s.timestamp > signalTtlMs;
-                boolean ts  = s.isTimeExpired();
-                if (ttl || ts) {
+                // [v10.0] TTL = TIME_STOP = 90 min. Signal lives until resolved or expired.
+                boolean expired = now - s.timestamp > signalTtlMs;
+                if (expired) {
                     currentExposure = clamp(currentExposure - estimateExposure(s.probability, s.category), 0, maxPortfolioExposure);
-                    if (ts && !ttl) {
-                        history.computeIfAbsent(sym, k -> new CopyOnWriteArrayList<>())
-                                .add(new ClosedTrade(sym, s.side, 0.0, now - s.timestamp));
-                        updateSymbolScore(sym, 0.0);
-                        // ╔════════════════════════════════════════════╗
-                        // ║ [v9.0 CRITICAL FIX]                        ║
-                        // ║ НЕ вызываем registerGlobalResult(false)    ║
-                        // ║ TIME_STOP = NEUTRAL, НЕ loss!              ║
-                        // ║ Это главная причина самоудушения бота.     ║
-                        // ╚════════════════════════════════════════════╝
-                        if (timeStopCallback != null) {
-                            try { timeStopCallback.accept(sym,
-                                    "⏱ *TIME STOP* " + sym + " " + s.side + " — neutral"); }
-                            catch (Exception ignored) {}
-                        }
-                        log("TIME STOP (neutral): " + sym + " " + s.side);
+                    history.computeIfAbsent(sym, k -> new CopyOnWriteArrayList<>())
+                            .add(new ClosedTrade(sym, s.side, 0.0, now - s.timestamp));
+                    updateSymbolScore(sym, 0.0);
+                    // NEUTRAL — не loss, не win. Streak guard НЕ трогаем.
+                    if (timeStopCallback != null) {
+                        try { timeStopCallback.accept(sym,
+                                "⏱ *TIME STOP* " + sym + " " + s.side + " — neutral"); }
+                        catch (Exception ignored) {}
                     }
+                    log("EXPIRED (neutral): " + sym + " " + s.side + " age=" + (now - s.timestamp)/60_000 + "min");
                     return true;
                 }
                 return false;
