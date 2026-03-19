@@ -86,10 +86,7 @@ public final class SignalSender {
 
     private final Map<String, Long> lastFetchTime = new ConcurrentHashMap<>();
 
-    // Orderbook
-    // [v10.0 NOTE] orderbookMap is NEVER populated (no @bookTicker WS subscription).
-    // All OBI checks in processPair/checkLiquidity are dead code — they read from empty map.
-    // TODO: Add @bookTicker WS to populate this for real OBI analysis.
+    // [v12.0] Orderbook — populated via @bookTicker WebSocket stream
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
 
     // Candle Cache
@@ -1103,49 +1100,36 @@ public final class SignalSender {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  WEBSOCKET (aggTrade)
+    //  WEBSOCKET (aggTrade + bookTicker)
     // ══════════════════════════════════════════════════════════════
 
     public void connectWs(String pair) { connectWsInternal(pair); }
 
     private void connectWsInternal(String pair) {
         try {
+            // [v12.0] Combined stream: aggTrade + bookTicker in ONE connection
+            // This populates orderbookMap for real OBI analysis (was dead code before!)
+            String streamUrl = "wss://fstream.binance.com/stream?streams="
+                    + pair.toLowerCase() + "@aggTrade/"
+                    + pair.toLowerCase() + "@bookTicker";
+
             HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
                     .newWebSocketBuilder()
-                    .buildAsync(URI.create("wss://fstream.binance.com/ws/" + pair.toLowerCase() + "@aggTrade"),
+                    .buildAsync(URI.create(streamUrl),
                             new WebSocket.Listener() {
                                 @Override
                                 public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
                                     try {
                                         wsMessageCount.incrementAndGet();
-                                        JSONObject j = new JSONObject(data.toString());
-                                        double price = Double.parseDouble(j.getString("p"));
-                                        double qty   = Double.parseDouble(j.getString("q"));
-                                        long   ts    = j.getLong("T");
-                                        double side  = !j.getBoolean("m") ? qty : -qty;
+                                        JSONObject wrapper = new JSONObject(data.toString());
+                                        String stream = wrapper.optString("stream", "");
+                                        JSONObject j = wrapper.optJSONObject("data");
+                                        if (j == null) return CompletableFuture.completedFuture(null);
 
-                                        deltaWindowStart.putIfAbsent(pair, ts);
-                                        long age = ts - deltaWindowStart.get(pair);
-                                        if (age > DELTA_WINDOW_MS) {
-                                            deltaHistory.put(pair, deltaBuffer.getOrDefault(pair, 0.0));
-                                            deltaBuffer.put(pair, side); deltaWindowStart.put(pair, ts);
-                                        } else { deltaBuffer.merge(pair, side, Double::sum); }
-
-                                        // [v10.0] FIX RACE CONDITION: use ConcurrentLinkedDeque
-                                        // WS thread writes here, SignalOptimizer reads with synchronized(dq).
-                                        // Old code: synchronized(wsLock) + ArrayDeque = different monitors = CME crash.
-                                        // New: ConcurrentLinkedDeque is thread-safe, no sync needed for add/poll.
-                                        Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-                                        dq.addLast(price); while (dq.size() > TICK_HISTORY) dq.pollFirst();
-                                        Deque<Double> vq = tickVolumeDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-                                        vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.pollFirst();
-                                        lastTickPrice.put(pair, price); lastTickTime.put(pair, ts);
-                                        microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(30_000)).addTick(ts, price, qty);
-
-                                        com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
-                                        if (et != null && filterEarlySignal(et)) {
-                                            bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
-                                            earlySignals.incrementAndGet(); isc.registerSignal(et);
+                                        if (stream.endsWith("@aggTrade")) {
+                                            processAggTrade(pair, j);
+                                        } else if (stream.endsWith("@bookTicker")) {
+                                            processBookTicker(pair, j);
                                         }
                                     } catch (Exception ignored) {}
                                     return CompletableFuture.completedFuture(null);
@@ -1160,6 +1144,43 @@ public final class SignalSender {
                         wsWatcher.schedule(() -> connectWsInternal(pair), delay, TimeUnit.MILLISECONDS);
                         wsReconnectDelay.put(pair, Math.min(delay * 2, WS_MAX_DELAY_MS)); return null; });
         } catch (Exception e) { reconnectWs(pair); }
+    }
+
+    /** [v12.0] Process aggTrade event — extracted from old inline handler */
+    private void processAggTrade(String pair, JSONObject j) {
+        double price = Double.parseDouble(j.getString("p"));
+        double qty   = Double.parseDouble(j.getString("q"));
+        long   ts    = j.getLong("T");
+        double side  = !j.getBoolean("m") ? qty : -qty;
+
+        deltaWindowStart.putIfAbsent(pair, ts);
+        long age = ts - deltaWindowStart.get(pair);
+        if (age > DELTA_WINDOW_MS) {
+            deltaHistory.put(pair, deltaBuffer.getOrDefault(pair, 0.0));
+            deltaBuffer.put(pair, side); deltaWindowStart.put(pair, ts);
+        } else { deltaBuffer.merge(pair, side, Double::sum); }
+
+        Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        dq.addLast(price); while (dq.size() > TICK_HISTORY) dq.pollFirst();
+        Deque<Double> vq = tickVolumeDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.pollFirst();
+        lastTickPrice.put(pair, price); lastTickTime.put(pair, ts);
+        microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(30_000)).addTick(ts, price, qty);
+
+        com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
+        if (et != null && filterEarlySignal(et)) {
+            bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
+            earlySignals.incrementAndGet(); isc.registerSignal(et);
+        }
+    }
+
+    /** [v12.0] Process bookTicker event — populates orderbookMap for OBI analysis */
+    private void processBookTicker(String pair, JSONObject j) {
+        double bidQty = j.optDouble("B", 0); // best bid quantity
+        double askQty = j.optDouble("A", 0); // best ask quantity
+        if (bidQty > 0 || askQty > 0) {
+            orderbookMap.put(pair, new OrderbookSnapshot(bidQty, askQty, System.currentTimeMillis()));
+        }
     }
 
     private void reconnectWs(String pair) {
