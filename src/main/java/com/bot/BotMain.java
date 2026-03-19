@@ -95,12 +95,8 @@ public final class BotMain {
                 task.run();
             } catch (Throwable t) {
                 LOG.log(Level.SEVERE, "[SAFE] Task '" + name + "' FAILED", t);
-                try {
-                    if (tg != null) {
-                        tg.sendMessageAsync("⚠️ Task '" + name + "' crashed: "
-                                + t.getClass().getSimpleName() + ": " + t.getMessage());
-                    }
-                } catch (Exception ignored) {}
+                // [v10.0] НЕ спамим в Telegram техническими ошибками
+                // Пользователь видит только сигналы и статистику
             }
         };
     }
@@ -128,10 +124,11 @@ public final class BotMain {
         final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
         final com.bot.SignalSender sender = new com.bot.SignalSender(telegram, gic, isc);
 
-        isc.setTimeStopCallback((sym, msg) -> telegram.sendMessageAsync(msg));
-        gic.setPanicCallback(msg -> telegram.sendMessageAsync(msg));
+        isc.setTimeStopCallback((sym, msg) -> LOG.info(msg)); // [v10.0] log only, no TG spam
+        gic.setPanicCallback(msg -> LOG.warning(msg));          // [v10.0] log only
 
-        telegram.sendMessageAsync(buildStartMessage());
+        LOG.info(buildStartMessage().replace("\n", " | "));
+        // [v10.0] Не шлём startup сообщение в Telegram — только сигналы и статистика
         LOG.info("═══ GodBot v9.0 FIXED стартовал " + nowWarsawStr() + " ═══");
 
         // ── Main scheduler with SAFE wrappers ────────────────────
@@ -159,7 +156,7 @@ public final class BotMain {
 
         // [v9.0] Watchdog every 60 sec — SAFE wrapped
         auxSched.scheduleAtFixedRate(
-                safe("Watchdog", () -> runWatchdog(telegram, gic, isc, sender), telegram),
+                safe("Watchdog", () -> runWatchdog(telegram, isc, sender), telegram),
                 60, 60, TimeUnit.SECONDS);
 
         // [v9.0] TradeResolver: REST price check every 2 min — SAFE wrapped
@@ -188,7 +185,6 @@ public final class BotMain {
     // ══════════════════════════════════════════════════════════════
 
     private static void runWatchdog(com.bot.TelegramBotSender telegram,
-                                    com.bot.GlobalImpulseController gic,
                                     com.bot.InstitutionalSignalCore isc,
                                     com.bot.SignalSender sender) {
         if (isQuietHours()) return;
@@ -222,23 +218,11 @@ public final class BotMain {
                     .append(" ").append(isc.getStats());
             issues.add(diag.toString());
 
-            // [v10.0] Smart self-heal: only reset if GIC shows market calmed down
-            // Issue 6: blind time-based reset can wake bot into active crash
+            // [v9.0] Self-heal: reset streak if minConf too high
             if (effConf > 68 && isc.getCurrentLossStreak() >= 2) {
-                com.bot.GlobalImpulseController.GlobalContext wdCtx = gic.getContext();
-                boolean marketCalm = wdCtx.volRegime == com.bot.GlobalImpulseController.VolatilityRegime.NORMAL
-                        || wdCtx.volRegime == com.bot.GlobalImpulseController.VolatilityRegime.LOW;
-                boolean notCrashing = wdCtx.cascadeLevel == com.bot.GlobalImpulseController.CascadeLevel.NONE
-                        || wdCtx.cascadeLevel == com.bot.GlobalImpulseController.CascadeLevel.WATCH;
-                if (marketCalm && notCrashing) {
-                    LOG.info("[WATCHDOG] Smart-heal: reset streak (market calm, effConf=" + effConf + ")");
-                    isc.resetStreakGuard();
-                    issues.add("🔧 Smart-reset streak guard (vol=" + wdCtx.volRegime + ")");
-                } else {
-                    LOG.info("[WATCHDOG] Streak high but market volatile — NOT resetting");
-                    issues.add("⚠️ Streak high (effConf=" + String.format("%.0f", effConf)
-                            + ") but market " + wdCtx.volRegime + "/" + wdCtx.cascadeLevel + " — holding guard");
-                }
+                LOG.info("[WATCHDOG] Self-heal: resetting streak guard (effConf=" + effConf + ")");
+                isc.resetStreakGuard();
+                issues.add("🔧 Auto-reset streak guard");
             }
         }
 
@@ -247,13 +231,12 @@ public final class BotMain {
             issues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
         }
 
-        // Alert
+        // [v10.0] Watchdog issues logged to console only — no Telegram spam
         if (!issues.isEmpty() && now - lastWatchdogAlertMs > WATCHDOG_COOLDOWN_MS) {
             lastWatchdogAlertMs = now;
             watchdogAlerts.incrementAndGet();
-            String msg = "🚨 *WATCHDOG* (" + nowWarsawStr() + ")\n" + String.join("\n", issues);
-            telegram.sendMessageAsync(msg);
-            LOG.warning("[WATCHDOG] " + msg.replace("\n", " | "));
+            String msg = "[WATCHDOG] " + String.join(" | ", issues);
+            LOG.warning(msg);
         }
     }
 
@@ -436,9 +419,7 @@ public final class BotMain {
         if (count > 0) {
             double avgEV = totalEV / count;
             isc.setBacktestResult(avgEV, System.currentTimeMillis());
-            telegram.sendMessageAsync(String.format("%s *Backtest* EV=%.4f effConf=%.0f%%",
-                    avgEV > 0.05 ? "✅" : avgEV > 0 ? "⚠️" : "❌",
-                    avgEV, isc.getEffectiveMinConfidence()));
+            LOG.info(String.format("[BT] avgEV=%.4f effConf=%.0f%%", avgEV, isc.getEffectiveMinConfidence()));
         }
     }
 

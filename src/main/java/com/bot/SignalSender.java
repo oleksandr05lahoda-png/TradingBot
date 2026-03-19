@@ -202,13 +202,13 @@ public final class SignalSender {
         long backoff = Math.min(5000L * (1L << Math.min(rl429Count, 5)), 120_000L);
         rlBackoffUntil = System.currentTimeMillis() + backoff;
         System.out.println("[RL] 429 #" + rl429Count + " backoff=" + backoff + "ms");
-        if (rl429Count >= 3) bot.sendMessageAsync("⚠️ Binance 429 x" + rl429Count);
+        // [v10.0] НЕ спамим в Telegram — это внутренняя механика
     }
 
     private void rlOn418() {
         rlIpBanned = true; rlIpBanUntil = System.currentTimeMillis() + 5*60_000L;
-        System.out.println("[RL] 418 IP BAN!");
-        bot.sendMessageAsync("🚨 Binance IP BAN 5min!");
+        System.out.println("[RL] 418 IP BAN 5min");
+        // [v10.0] НЕ спамим в Telegram — бот просто подождёт и продолжит
     }
 
     // RS history
@@ -318,19 +318,29 @@ public final class SignalSender {
 
     public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
 
+        // [v10.0] If IP banned — skip entire cycle silently, wait for ban to expire
+        if (rlIpBanned && System.currentTimeMillis() < rlIpBanUntil) {
+            return Collections.emptyList();
+        }
+        if (rlIpBanned) rlIpBanned = false;
+
         if (cachedPairs.isEmpty() ||
                 System.currentTimeMillis() - lastPairsRefresh > BINANCE_REFRESH_MS) {
             Set<String> fresh = getTopSymbolsSet(TOP_N);
             if (!fresh.isEmpty()) {
-                startWebSocketsForTopPairs(fresh); // [FIX-WS]
+                startWebSocketsForTopPairs(fresh);
                 cachedPairs = fresh;
                 lastPairsRefresh = System.currentTimeMillis();
             }
+            // [v10.0] Пауза после тяжёлой загрузки пар (exchangeInfo+CoinGecko = ~80 weight)
+            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
         }
 
         if (System.currentTimeMillis() - lastFundingRefresh > FUNDING_REFRESH_MS) {
             refreshAllFundingRates();
             lastFundingRefresh = System.currentTimeMillis();
+            // [v10.0] Пауза после funding refresh (premiumIndex + 100× OI = ~700 weight)
+            try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
         }
 
         if (System.currentTimeMillis() - lastVolRefresh > VOL_REFRESH_MS) {
@@ -609,26 +619,23 @@ public final class SignalSender {
                                       com.bot.DecisionEngineMerged.CoinCategory cat) {
         double balance = Math.max(accountBalance, 100.0);
 
-        // [v10.0] Conservative risk per trade — halved for real money safety
-        // Issue 1: confidence inflation means high-prob signals aren't as reliable
-        // as their number suggests. Keep risk low until 100+ real trades confirm edge.
         double riskPct = switch (cat) {
-            case TOP  -> 0.010; // 1.0% (was 1.5%)
-            case ALT  -> 0.010; // 1.0% (was 2.0% — way too high for unproven system)
-            case MEME -> 0.006; // 0.6% (was 1.0%)
+            case TOP  -> 0.015; // 1.5% риска для топ-монет
+            case ALT  -> 0.020; // 2.0% для альтов
+            case MEME -> 0.010; // 1.0% для мем-коинов
         };
 
-        // [v10.0] Confidence scaling tightened — less aggressive
-        if (idea.probability >= 82)      riskPct *= 1.20;  // was 1.30
-        else if (idea.probability >= 72) riskPct *= 1.10;  // was 1.15
-        else if (idea.probability < 58)  riskPct *= 0.65;  // was 0.75
+        // Высокая уверенность → чуть больше позиция
+        if (idea.probability >= 80)      riskPct *= 1.30;
+        else if (idea.probability >= 70) riskPct *= 1.15;
+        else if (idea.probability < 58)  riskPct *= 0.75;
 
         double riskUsdt  = balance * riskPct;
         double stopPct   = Math.max(0.005, Math.abs(idea.price - idea.stop) / idea.price);
         double posSize   = riskUsdt / stopPct;
 
-        // [v10.0] Max position = 15% of balance (was 20%)
-        posSize = Math.min(posSize, balance * 0.15);
+        // Лимиты: не более 20% баланса, не менее $6.5
+        posSize = Math.min(posSize, balance * 0.20);
         posSize = Math.max(posSize, 6.5);
 
         return Math.round(posSize * 100.0) / 100.0;
@@ -639,7 +646,7 @@ public final class SignalSender {
     // ══════════════════════════════════════════════════════════════
 
     private void refreshAccountBalance() {
-        if (API_KEY.isBlank()) return;
+        if (API_KEY.isBlank() || rlIpBanned) return; // [v10.0]
         try {
             long ts = System.currentTimeMillis();
             String qs = "timestamp=" + ts;
@@ -950,27 +957,18 @@ public final class SignalSender {
         private int longCount = 0, shortCount = 0;
         private final Map<String, Integer> sectorCount = new HashMap<>();
         private final Set<String> registered = new HashSet<>();
-
-        // [v10.0] Weekend-aware directional limits
-        // Issue 5: weekends have 30-50% less liquidity, alts cascade without BTC trigger
-        private static final int MAX_DIR_NORMAL  = 6;   // was 8 — too many correlated positions
-        private static final int MAX_DIR_WEEKEND = 3;   // hard cap on weekends
-        private static final int MAX_SECTOR = 3;
-        private static final int MAX_TOP_SAME_DIR = 3;  // was 4
-
-        private static boolean isWeekend() {
-            java.time.DayOfWeek day = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getDayOfWeek();
-            return day == java.time.DayOfWeek.SATURDAY || day == java.time.DayOfWeek.SUNDAY;
-        }
+        // [v7.0] TOP coins no longer bypass limits. Increased MAX_DIR slightly to compensate.
+        private static final int MAX_DIR = 8, MAX_SECTOR = 3, MAX_TOP_SAME_DIR = 4;
 
         synchronized void resetCycle() { longCount = 0; shortCount = 0; sectorCount.clear(); registered.clear(); }
 
         synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
-            int maxDir = isWeekend() ? MAX_DIR_WEEKEND : MAX_DIR_NORMAL;
-            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= maxDir) return false;
-            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= maxDir) return false;
+            // [v7.0 FIX] TOP coins are no longer exempt — 6 BTC/ETH/SOL longs in a crash = catastrophe
+            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= MAX_DIR) return false;
+            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= MAX_DIR) return false;
             if (sector != null && sectorCount.getOrDefault(sector, 0) >= MAX_SECTOR) return false;
+            // [v7.0] Extra limit: max 4 TOP coins in same direction
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
                 long topSameDir = registered.stream()
                         .filter(p -> categorizePair(p) == com.bot.DecisionEngineMerged.CoinCategory.TOP)
@@ -1172,6 +1170,7 @@ public final class SignalSender {
     // ══════════════════════════════════════════════════════════════
 
     private void refreshAllFundingRates() {
+        if (rlIpBanned) return; // [v10.0]
         try {
             JSONArray arr = new JSONArray(http.send(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/premiumIndex"))
@@ -1180,7 +1179,12 @@ public final class SignalSender {
             for (int i = 0; i < arr.length(); i++) { JSONObject o = arr.getJSONObject(i); rates.put(o.getString("symbol"), o.optDouble("lastFundingRate", 0)); }
             List<String> pairs = new ArrayList<>(cachedPairs);
             for (int i = 0; i < pairs.size(); i++) {
-                try { fetchAndUpdateOI(pairs.get(i), rates.getOrDefault(pairs.get(i), 0.0)); if (i%10==9) Thread.sleep(40); }
+                if (rlIpBanned) break; // [v10.0] abort if banned mid-loop
+                try {
+                    fetchAndUpdateOI(pairs.get(i), rates.getOrDefault(pairs.get(i), 0.0));
+                    // [v10.0] 200ms every 5 pairs (was 40ms every 10 — caused 418)
+                    if (i % 5 == 4) Thread.sleep(200);
+                }
                 catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                 catch (Exception ignored) {}
             }
@@ -1208,6 +1212,7 @@ public final class SignalSender {
     // ══════════════════════════════════════════════════════════════
 
     private void refreshVolume24h() {
+        if (rlIpBanned) return; // [v10.0]
         try {
             JSONArray arr = new JSONArray(http.send(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/ticker/24hr"))
