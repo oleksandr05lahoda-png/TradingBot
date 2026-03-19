@@ -430,6 +430,24 @@ public final class DecisionEngineMerged {
         // [v11.0] RANGE + weak ADX = no signal (raised from 18 to 20)
         if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 20) return null;
 
+        // ═══════════════════════════════════════════════════════════
+        // [v13.0] LATE ENTRY GUARD
+        // If last 4 bars moved > 2×ATR in one direction with 3+ consecutive
+        // same-color candles → the move is exhausted. Don't chase.
+        // ═══════════════════════════════════════════════════════════
+        int n15 = c15.size();
+        double move4bars = last(c15).close - c15.get(n15 - 5).close;
+        boolean lateEntryLong = false, lateEntryShort = false;
+        if (Math.abs(move4bars) > atr14 * 2.0) {
+            int consec = 0;
+            boolean up = move4bars > 0;
+            for (int i = n15 - 1; i >= Math.max(0, n15 - 6); i--) {
+                if ((c15.get(i).close > c15.get(i).open) == up) consec++; else break;
+            }
+            if (consec >= 3 && up) lateEntryLong = true;
+            if (consec >= 3 && !up) lateEntryShort = true;
+        }
+
         // ════════════════════════════════════════════════════════
         //  ИНИЦИАЛИЗАЦИЯ 5 КЛАСТЕРОВ
         // ════════════════════════════════════════════════════════
@@ -1007,29 +1025,28 @@ public final class DecisionEngineMerged {
 
         com.bot.TradingCore.Side side = candidateSide;
 
+        // [v13.0] LATE ENTRY BLOCK — don't chase exhausted moves
+        if (side == com.bot.TradingCore.Side.LONG && lateEntryLong && !aggressiveShort) {
+            return null; // 3+ green candles + 2×ATR move up → LONG is too late
+        }
+        if (side == com.bot.TradingCore.Side.SHORT && lateEntryShort && !aggressiveShort) {
+            return null; // 3+ red candles + 2×ATR move down → SHORT is too late
+        }
+
         // [v11.0] VOLUME CONFIRMATION GATE
         boolean volumeSupports = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsLong())
                 || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsShort());
         boolean volumeOpposes = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsShort())
                 || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsLong());
 
+        // [v13.0] Volume = HARD GATE. No volume = no trade. Period.
+        // This eliminates the #1 source of bad signals: entering moves that already happened.
         if (volumeOpposes && !aggressiveShort) {
-            if (side == com.bot.TradingCore.Side.LONG) scoreLong *= 0.55;
-            else scoreShort *= 0.55;
-            allFlags.add("VOL_OPPOSE");
-        } else if (!volumeSupports && !aggressiveShort) {
-            if (side == com.bot.TradingCore.Side.LONG) scoreLong *= 0.80;
-            else scoreShort *= 0.80;
-            allFlags.add("NO_VOL_CONF");
+            return null; // Volume actively against us → reject
         }
-
-        // [v12.0] Re-evaluate after volume penalty — side may have flipped
-        if (scoreLong > scoreShort) side = com.bot.TradingCore.Side.LONG;
-        else if (scoreShort > scoreLong) side = com.bot.TradingCore.Side.SHORT;
-        else return null; // tied after penalty = no edge
-
-        // [v12.0] Re-check score diff after penalty
-        scoreDiff = Math.abs(scoreLong - scoreShort);
+        if (!volumeSupports && !aggressiveShort) {
+            return null; // No volume confirmation → reject
+        }
         if (scoreDiff < minDiff) return null;
 
         // Cooldown

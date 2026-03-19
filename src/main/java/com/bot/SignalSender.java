@@ -446,6 +446,42 @@ public final class SignalSender {
 
             if (m15 == null || m15.size() < 160 || h1 == null || h1.size() < 160) return null;
 
+            // ═══════════════════════════════════════════════════════
+            // [v13.0] EVENT COIN FILTER
+            // If coin's daily move > 8% OR today's volume > 4× average
+            // → this is an EVENT (delisting, hack, whale dump), not a pattern.
+            // All indicators break on event coins. Skip entirely.
+            // Example: FRAX dropped 20% → volume spiked → bot picked it up
+            // → gave SHORT after 80% of the move was done → loss.
+            // ═══════════════════════════════════════════════════════
+            {
+                int n15 = m15.size();
+                // Daily price change: compare current price to price ~96 bars ago (24h on 15m)
+                int dayBarsAgo = Math.min(96, n15 - 1);
+                double dayOpen = m15.get(n15 - 1 - dayBarsAgo).close;
+                double dayCurrent = m15.get(n15 - 1).close;
+                double dailyChangePct = Math.abs(dayCurrent - dayOpen) / (dayOpen + 1e-9);
+
+                if (dailyChangePct > 0.08) { // > 8% daily move = event coin
+                    return null; // skip entirely, no log, no signal
+                }
+
+                // Volume anomaly: compare last 4 bars avg volume to 96-bar avg
+                if (n15 > 100) {
+                    double recentVol = 0;
+                    for (int vi = n15 - 4; vi < n15; vi++) recentVol += m15.get(vi).volume;
+                    recentVol /= 4;
+
+                    double histVol = 0;
+                    for (int vi = n15 - 100; vi < n15 - 4; vi++) histVol += m15.get(vi).volume;
+                    histVol /= 96;
+
+                    if (histVol > 0 && recentVol > histVol * 5.0) { // 5× volume spike = event
+                        return null;
+                    }
+                }
+            }
+
             com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
             String sector = detectSector(pair);
 
