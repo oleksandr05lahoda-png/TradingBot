@@ -9,11 +9,14 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v9.0 — ALL FIXES INTEGRATED                               ║
+ * ║       BotMain v12.0 — INSTITUTIONAL GRADE                               ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║                                                                          ║
+ * ║  [v11.0] Daily loss circuit breaker integration                          ║
+ * ║  [v11.0] Max drawdown pause (ISC-driven)                                ║
+ * ║  [v11.0] Balance tracking → ISC drawdown updates                        ║
  * ║  [FIX-THREAD-DEATH] SafeRunnable: catches ALL Throwable                 ║
- * ║  [FIX-WATCHDOG] Built-in subsystem monitoring + Telegram alerts          ║
+ * ║  [FIX-WATCHDOG] Built-in subsystem monitoring                            ║
  * ║  [FIX-TRADE-RESOLVER] REST-based trade monitoring when UDS ❌            ║
  * ║  [FIX-SIGNAL-DROUGHT] Auto-diagnosis when no signals > 30 min           ║
  * ║  [FIX-SELF-HEAL] Auto streak guard reset when bot self-strangulates     ║
@@ -75,6 +78,7 @@ public final class BotMain {
         final double entry, sl, tp1, tp2;
         final long createdAt;
         volatile boolean tp1Hit = false;
+        volatile double trailingStop = 0; // [v12.0] trailing stop after TP1
 
         TrackedSignal(String sym, com.bot.TradingCore.Side side,
                       double entry, double sl, double tp1, double tp2) {
@@ -277,36 +281,37 @@ public final class BotMain {
             if (ts.ageMs() > 90 * 60_000L) {
                 it.remove();
                 LOG.info("[TradeResolver] EXPIRED (neutral): " + ts.symbol + " " + ts.side);
-                // НЕ вызываем isc.registerConfirmedResult(false) !!!
                 continue;
             }
 
-            // Get current price — use HIGH and LOW, not just close!
-            // [v10.0] FIX: old code checked only close. If candle wicked through SL
-            // but closed above it, TradeResolver missed the SL hit.
-            // On the exchange, SL is triggered by ANY price touch, not close.
-            double priceLow = 0, priceHigh = 0, priceClose = 0;
+            // [v12.0] FIX: Check ALL recent candles, not just the last one.
+            // Old code fetched 2 candles and only checked the last.
+            // If SL was hit and price recovered within 2min, it was MISSED.
+            // On a real exchange, the SL trigger is irreversible.
+            double extremeLow = Double.MAX_VALUE, extremeHigh = Double.MIN_VALUE;
+            double priceClose = 0;
             try {
-                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(ts.symbol, "1m", 2);
-                if (c != null && !c.isEmpty()) {
-                    com.bot.TradingCore.Candle last = c.get(c.size() - 1);
-                    priceLow = last.low;
-                    priceHigh = last.high;
-                    priceClose = last.close;
+                // Fetch last 3 candles (~3 minutes of coverage)
+                List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 3);
+                if (candles == null || candles.isEmpty()) continue;
+                for (com.bot.TradingCore.Candle c : candles) {
+                    extremeLow = Math.min(extremeLow, c.low);
+                    extremeHigh = Math.max(extremeHigh, c.high);
                 }
+                priceClose = candles.get(candles.size() - 1).close;
             } catch (Exception ignored) { continue; }
 
             if (priceClose <= 0) continue;
 
             boolean isLong = ts.side == com.bot.TradingCore.Side.LONG;
 
-            // SL hit — check extremes (high/low), not close
-            boolean slHit = isLong ? priceLow <= ts.sl : priceHigh >= ts.sl;
+            // SL hit — check extremes across ALL recent candles
+            boolean slHit = isLong ? extremeLow <= ts.sl : extremeHigh >= ts.sl;
             if (slHit) {
                 double pnl = isLong ? (ts.sl - ts.entry) / ts.entry * 100
                         : (ts.entry - ts.sl) / ts.entry * 100;
                 it.remove();
-                isc.registerConfirmedResult(false);
+                isc.registerConfirmedResult(false, ts.side);
                 isc.closeTrade(ts.symbol, ts.side, pnl);
                 telegram.sendMessageAsync(String.format("❌ *SL HIT* %s %s PnL: %+.2f%%",
                         ts.symbol, ts.side, pnl));
@@ -315,35 +320,53 @@ public final class BotMain {
             }
 
             // TP1 hit — check extremes
-            boolean tp1Hit = isLong ? priceHigh >= ts.tp1 : priceLow <= ts.tp1;
+            boolean tp1Hit = isLong ? extremeHigh >= ts.tp1 : extremeLow <= ts.tp1;
             if (tp1Hit && !ts.tp1Hit) {
                 ts.tp1Hit = true;
-                telegram.sendMessageAsync(String.format("🎯 *TP1 HIT* %s %s → SL→BE", ts.symbol, ts.side));
+                // [v12.0] Initialize trailing stop at breakeven
+                ts.trailingStop = ts.entry;
+                telegram.sendMessageAsync(String.format("🎯 *TP1 HIT* %s %s → trailing stop active", ts.symbol, ts.side));
             }
 
-            // After TP1: check TP2 or BE
+            // After TP1: trailing stop + TP2 check
             if (ts.tp1Hit) {
-                boolean tp2Hit = isLong ? priceHigh >= ts.tp2 : priceLow <= ts.tp2;
+                // [v12.0] UPDATE TRAILING STOP — lock in 50% of max unrealized profit
+                if (isLong) {
+                    double maxFavorable = extremeHigh;
+                    double newTrail = ts.entry + (maxFavorable - ts.entry) * 0.50;
+                    ts.trailingStop = Math.max(ts.trailingStop, newTrail);
+                } else {
+                    double maxFavorable = extremeLow;
+                    double newTrail = ts.entry - (ts.entry - maxFavorable) * 0.50;
+                    ts.trailingStop = Math.min(ts.trailingStop, newTrail);
+                }
+
+                // TP2 hit
+                boolean tp2Hit = isLong ? extremeHigh >= ts.tp2 : extremeLow <= ts.tp2;
                 if (tp2Hit) {
                     double pnl = isLong ? (ts.tp2 - ts.entry) / ts.entry * 100
                             : (ts.entry - ts.tp2) / ts.entry * 100;
                     it.remove();
-                    isc.registerConfirmedResult(true);
+                    isc.registerConfirmedResult(true, ts.side);
                     isc.closeTrade(ts.symbol, ts.side, pnl);
                     telegram.sendMessageAsync(String.format("✅ *TP2 HIT* %s %s PnL: %+.2f%%",
                             ts.symbol, ts.side, pnl));
                     continue;
                 }
-                // BE exit after TP1 — use close for BE (not wick)
-                boolean beHit = isLong ? priceClose <= ts.entry * 1.001 : priceClose >= ts.entry * 0.999;
-                if (beHit) {
-                    double tp1Pnl = isLong ? (ts.tp1 - ts.entry) / ts.entry * 100 * 0.5
-                            : (ts.entry - ts.tp1) / ts.entry * 100 * 0.5;
+
+                // [v12.0] TRAILING STOP HIT — exit with locked profit
+                boolean trailHit = isLong
+                        ? priceClose <= ts.trailingStop
+                        : priceClose >= ts.trailingStop;
+                if (trailHit) {
+                    double pnl = isLong
+                            ? (ts.trailingStop - ts.entry) / ts.entry * 100
+                            : (ts.entry - ts.trailingStop) / ts.entry * 100;
                     it.remove();
-                    isc.registerConfirmedResult(true);
-                    isc.closeTrade(ts.symbol, ts.side, tp1Pnl);
-                    telegram.sendMessageAsync(String.format("➡️ *BE EXIT* %s %s (TP1 partial: %+.2f%%)",
-                            ts.symbol, ts.side, tp1Pnl));
+                    isc.registerConfirmedResult(pnl > 0, ts.side);
+                    isc.closeTrade(ts.symbol, ts.side, pnl);
+                    telegram.sendMessageAsync(String.format("🔒 *TRAIL STOP* %s %s PnL: %+.2f%%",
+                            ts.symbol, ts.side, pnl));
                 }
             }
         }
@@ -379,8 +402,19 @@ public final class BotMain {
         long cycle = totalCycles.incrementAndGet();
         LOG.info("══ ЦИКЛ #" + cycle + " ══ " + nowWarsawStr());
 
+        // [v11.0] Daily loss circuit breaker — skip signal generation entirely
+        if (isc.isDailyLossBreaker()) {
+            LOG.info("[DAILY-LIMIT] Дневной лимит потерь исчерпан: " + String.format("%.2f%%", isc.getDailyPnL())
+                    + " — пропуск цикла");
+            return;
+        }
+
         updateBtcContext(sender, gic);
         updateSectors(sender, gic);
+
+        // [v11.0] Update balance for drawdown tracking
+        double bal = sender.getAccountBalance();
+        if (bal > 0) isc.updateBalance(bal);
 
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         LOG.info("BTC: " + ctx.regime + " str=" + String.format("%.2f", ctx.impulseStrength)
@@ -417,7 +451,8 @@ public final class BotMain {
                                             com.bot.InstitutionalSignalCore isc,
                                             com.bot.TelegramBotSender telegram) {
         com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
-        String[] syms = {"BTCUSDT","ETHUSDT"};
+        // [v11.0] Test 6 symbols across different categories (was only BTC/ETH)
+        String[] syms = {"BTCUSDT","ETHUSDT","SOLUSDT","DOGEUSDT","LINKUSDT","XRPUSDT"};
         double totalEV = 0; int count = 0;
 
         for (String sym : syms) {
@@ -467,12 +502,12 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "🚀 *GodBot v9.0 FIXED*\n"
+        return "🚀 *GodBot v12.0 INSTITUTIONAL*\n"
                 + "15M | TOP-100 | UTC 02:00–05:30 quiet\n"
-                + "🆕 Safe tasks (no silent death)\n"
-                + "🆕 Watchdog (auto-alerts+self-heal)\n"
-                + "🆕 TradeResolver (REST when UDS ❌)\n"
-                + "🆕 ISC v9.0 (TIME_STOP≠loss, decay)\n"
+                + "🆕 Daily loss limit: -3%\n"
+                + "🆕 Max drawdown circuit breaker: -8%\n"
+                + "🆕 Bayesian streak guard\n"
+                + "🆕 Structural stop placement\n"
                 + "_" + nowWarsawStr() + "_";
     }
 
@@ -484,15 +519,18 @@ public final class BotMain {
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         String msg = String.format(
-                "📊 *GodBot v9.0*\n"
+                "📊 *GodBot v12.0*\n"
                         + "Up: %dm | Cyc: %d | Sig: %d | Tracked: %d\n"
                         + "BTC: %s (str=%.2f vol=%.2f)\n"
                         + "WS: %d | UDS: %s | Bal: $%.2f\n"
+                        + "Day: %+.2f%% | DD: %.1f%%\n"
                         + "Err: %d | WD_alerts: %d\n%s",
                 uptimeMin, totalCycles.get(), totalSignals.get(), trackedSignals.size(),
                 ctx.regime, ctx.impulseStrength, ctx.volatilityExpansion,
                 sender.getActiveWsCount(), sender.isUdsConnected() ? "✅" : "❌",
-                sender.getAccountBalance(), errorCount.get(), watchdogAlerts.get(),
+                sender.getAccountBalance(),
+                isc.getDailyPnL(), isc.getDrawdownFromPeak(),
+                errorCount.get(), watchdogAlerts.get(),
                 isc.getStats());
         telegram.sendMessageAsync(msg);
         LOG.info("[STATS] " + msg.replace("\n"," | "));

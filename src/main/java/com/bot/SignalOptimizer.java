@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * ║                                                                      ║
  * ║  [FIX-OPT] Улучшенный adjustConfidence:                             ║
  * ║    - Логарифмическая нормализация импульса (не линейная)             ║
- * ║    - Кап confidence оставлен на уровне 88.0 (ограничивает жадность) ║
+ * ║    - Кап confidence оставлен на уровне 85.0 (ограничивает жадность) ║
  * ║    - Штрафы за исхождение сохранены, но не дублируются              ║
  * ║                                                                      ║
  * ║  СОХРАНЕНО: MicroTrendResult / MicroAnalysis / PumpHunter hookup    ║
@@ -35,7 +35,7 @@ public final class SignalOptimizer {
     private static final double STRONG_IMPULSE = 0.0025;
     private static final double WEAK_IMPULSE   = 0.0002;
 
-    private static final double MAX_CONF = 88.0;
+    private static final double MAX_CONF = 85.0;  // [v11.0] was 88 — unrealistic
     private static final double MIN_CONF = 50.0;
 
     // [FIX-BUG-2] Убран хардкодный кап 0.010 (1%).
@@ -332,10 +332,10 @@ public final class SignalOptimizer {
     /**
      * [v7.0] TAMED adjustConfidence — уважает кластерную калибровку из DecisionEngine.
      *
-     * Принцип: DecisionEngine даёт калиброванную probability (50-88%).
+     * Принцип: DecisionEngine даёт калиброванную probability (50-85%).
      * Optimizer корректирует на основе микро-тренда, НО:
      * - Максимальное ОБЩЕЕ изменение: ±12 единиц (было ±30+)
-     * - Потолок: 88% (совпадает с DecisionEngine)
+     * - Потолок: 85% (совпадает с DecisionEngine)
      * - Нет стекинга бонусов — каждый блок дополняет, но не перезаписывает
      * - Exhaustion = единственный случай сильного штрафа (-15 max)
      */
@@ -458,14 +458,15 @@ public final class SignalOptimizer {
             confidence -= 6.0;
         }
 
-        // [v7.0] ЖЁСТКИЙ КАП: общее изменение не более ±12 от оригинала
+        // [v11.0] ЖЁСТКИЙ КАП: общее изменение не более ±8 от оригинала (was ±12/±15)
+        // Optimizer should REFINE, not OVERRIDE the DecisionEngine calibration
         double delta = confidence - originalConf;
-        if (delta > 12.0)  confidence = originalConf + 12.0;
-        if (delta < -15.0) confidence = originalConf - 15.0;
+        if (delta > 8.0)   confidence = originalConf + 8.0;
+        if (delta < -10.0) confidence = originalConf - 10.0;
 
-        // [v7.0] Компрессия выше 82% — совместимо с DecisionEngine cap 88%
-        if (confidence > 82.0) {
-            confidence = 82.0 + (confidence - 82.0) * 0.25;
+        // [v11.0] Компрессия выше 80% — hard diminishing returns
+        if (confidence > 80.0) {
+            confidence = 80.0 + (confidence - 80.0) * 0.20;
         }
 
         return clamp(confidence, MIN_CONF, MAX_CONF);

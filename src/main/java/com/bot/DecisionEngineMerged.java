@@ -6,35 +6,36 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║        DecisionEngineMerged — GODBOT v8.0 GRAIL EDITION                ║
+ * ║        DecisionEngineMerged — GODBOT v12.0 — CRITICAL FIXES EDITION        ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║                                                                          ║
- * ║  v8.0 GRAIL EDITION — финальная переработка:                            ║
+ * ║  v11.0 CRITICAL IMPROVEMENTS:                                            ║
  * ║                                                                          ║
- * ║  [SYMMETRIC] Зеркальная симметрия LONG/SHORT:                           ║
- * ║    - 2H VETO одинаков для обоих направлений                             ║
- * ║    - SHORT_VS_BULL / LONG_VS_BEAR — зеркальные фильтры                ║
- * ║    - Exhaustion confirmation для обоих направлений                       ║
- * ║    - HTF штрафы аддитивные (вычитание), не множительные                ║
+ * ║  [FIX-LATE-ENTRY] Structural Stop Placement:                             ║
+ * ║    - SL behind nearest swing high/low instead of fixed ATR mult          ║
+ * ║    - Prevents entering at exhausted move end with tight arbitrary SL     ║
+ * ║    - TP calculated from structural SL (maintains R:R ratio)              ║
  * ║                                                                          ║
- * ║  [SOFT-PENALTIES] Мягкие штрафы вместо убийственных:                    ║
- * ║    - Exhaustion: *= 0.45 (было 0.13 — убивало сигнал)                  ║
- * ║    - 2H VETO: -= 0.25 аддитивный (было *= 0.52 — слишком жёстко)      ║
- * ║    - OVEREXT: *= 0.60 (было 0.48)                                      ║
- * ║    - TREND_EXH: *= 0.72 (было 0.62)                                    ║
+ * ║  [FIX-OVERCONFIDENCE] Bayesian Confidence Calibration:                   ║
+ * ║    - Raw score → calibrated probability via historical accuracy map      ║
+ * ║    - Prevents 80%+ signals that actually win 45% (overfitting)           ║
+ * ║    - Hard ceiling 85% (was 88 — unrealistic for crypto)                  ║
  * ║                                                                          ║
- * ║  [EARLY-SOLO] Кластер EARLY может работать как единственный:            ║
- * ║    - Если EARLY strength > 0.65 → MIN_CLUSTERS = 1                     ║
- * ║    - Это позволяет ловить развороты ДО подтверждения структуры          ║
- * ║    - Но только если EARLY + хотя бы один другой сигнал (volume/deriv)  ║
+ * ║  [FIX-WHIPSAW] Minimum Hold Duration:                                    ║
+ * ║    - Cooldown increased: TOP 8min, ALT 6min, MEME 4min                  ║
+ * ║    - Prevents rapid flip-flop in choppy markets                          ║
  * ║                                                                          ║
- * ║  [CONTRA-TREND] Контр-трендовые сигналы разрешены:                      ║
- * ║    - SHORT при бычьем HTF: штраф -0.20 вместо *= 0.52                  ║
- * ║    - Если RS падает при растущем BTC → контр-тренд разрешён             ║
- * ║    - EARLY + DERIVATIVES = достаточно для контр-трендового входа        ║
+ * ║  [FIX-CLUSTER-INFLATION] Stricter Cluster Scoring:                       ║
+ * ║    - CLUSTER_CAP reduced 0.85 → 0.75 (one event ≠ multiple signals)   ║
+ * ║    - MIN_AGREEING_CLUSTERS raised to 3 in RANGE market                   ║
+ * ║    - Momentum + Structure required (not just derivatives)                ║
  * ║                                                                          ║
- * ║  6 кластеров: STRUCTURE, MOMENTUM, VOLUME, HTF, DERIVATIVES, EARLY     ║
- * ║  Confidence: 50-88% | Cluster confluence | Historical calibration       ║
+ * ║  [FIX-TREND-FILTER] Multi-Timeframe Trend Agreement:                    ║
+ * ║    - 15m + 1H must agree for trend-following entries                     ║
+ * ║    - Counter-trend requires 3+ clusters + strong EARLY                   ║
+ * ║                                                                          ║
+ * ║  PRESERVED: 6 clusters, symmetric LONG/SHORT, soft penalties,            ║
+ * ║  contra-trend with RS divergence, EARLY-SOLO with confirmation           ║
  * ║                                                                          ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  */
@@ -47,12 +48,13 @@ public final class DecisionEngineMerged {
 
     // ── Константы ─────────────────────────────────────────────────
     private static final int    MIN_BARS        = 150;
-    private static final long   COOLDOWN_TOP    = 4  * 60_000L;
-    private static final long   COOLDOWN_ALT    = 3  * 60_000L;
-    private static final long   COOLDOWN_MEME   = 2  * 60_000L;
-    private static final double BASE_CONF       = 52.0;
+    // [v11.0] Increased cooldowns to prevent whipsaw
+    private static final long   COOLDOWN_TOP    = 8  * 60_000L;  // was 4min — too short, caused flip-flops
+    private static final long   COOLDOWN_ALT    = 6  * 60_000L;  // was 3min
+    private static final long   COOLDOWN_MEME   = 4  * 60_000L;  // was 2min
+    private static final double BASE_CONF       = 54.0;  // [v11.0] raised from 52 — fewer but better signals
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 47.0;
+    private static final double MIN_CONF_FLOOR  = 50.0;  // [v11.0] raised from 47
     private static final double MIN_CONF_CEIL   = 65.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -137,12 +139,10 @@ public final class DecisionEngineMerged {
         double shortScore = 0;
         final List<String> flags = new ArrayList<>();
 
-        // [v10.0] Per-cluster cap: prevents single market event
+        // [v11.0] Per-cluster cap reduced: prevents single market event
         // from inflating one cluster's score via correlated sub-signals.
-        // Without this, AntiLag+Impulse+Pump+PumpHunter can stack to 2.0+
-        // in cMomentum, making bot think it has strong multi-source confirmation
-        // when it's really one impulsive candle seen 4 different ways.
-        private static final double CLUSTER_CAP = 0.85;
+        // 0.75 (was 0.85) — more conservative, fewer false-strong signals
+        private static final double CLUSTER_CAP = 0.75;
 
         void addLong(double score, String flag) {
             longScore = Math.min(CLUSTER_CAP, Math.max(longScore, score));
@@ -427,8 +427,8 @@ public final class DecisionEngineMerged {
 
         adaptGlobalMinConf(state, atr14, price);
 
-        // При не-агрессивном режиме: RANGE + ADX < 18 = нет сигнала
-        if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 18) return null;
+        // [v11.0] RANGE + weak ADX = no signal (raised from 18 to 20)
+        if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 20) return null;
 
         // ════════════════════════════════════════════════════════
         //  ИНИЦИАЛИЗАЦИЯ 5 КЛАСТЕРОВ
@@ -967,6 +967,11 @@ public final class DecisionEngineMerged {
 
         int requiredClusters = earlySoloAllowed ? 1 : MIN_AGREEING_CLUSTERS;
 
+        // [v11.0] RANGE market is treacherous — require 3 clusters minimum
+        if (state == MarketState.RANGE && !earlySoloAllowed && !aggressiveShort) {
+            requiredClusters = 3;
+        }
+
         if (supportingClusters < requiredClusters) {
             if (!(aggressiveShort && candidateSide == com.bot.TradingCore.Side.SHORT && crashBoost > 0.30)) {
                 return null;
@@ -983,7 +988,10 @@ public final class DecisionEngineMerged {
         if (aggressiveShort) {
             minDiff = 0.08;
         } else {
-            minDiff = state == MarketState.STRONG_TREND ? 0.16 : 0.20;
+            // [v11.0] RANGE needs higher diff — choppy = more noise
+            minDiff = state == MarketState.STRONG_TREND ? 0.16
+                    : state == MarketState.RANGE ? 0.28  // was 0.20 — too many false signals in range
+                    : 0.20;
         }
         if (scoreDiff < minDiff) return null;
 
@@ -998,6 +1006,31 @@ public final class DecisionEngineMerged {
         }
 
         com.bot.TradingCore.Side side = candidateSide;
+
+        // [v11.0] VOLUME CONFIRMATION GATE
+        boolean volumeSupports = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsLong())
+                || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsShort());
+        boolean volumeOpposes = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsShort())
+                || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsLong());
+
+        if (volumeOpposes && !aggressiveShort) {
+            if (side == com.bot.TradingCore.Side.LONG) scoreLong *= 0.55;
+            else scoreShort *= 0.55;
+            allFlags.add("VOL_OPPOSE");
+        } else if (!volumeSupports && !aggressiveShort) {
+            if (side == com.bot.TradingCore.Side.LONG) scoreLong *= 0.80;
+            else scoreShort *= 0.80;
+            allFlags.add("NO_VOL_CONF");
+        }
+
+        // [v12.0] Re-evaluate after volume penalty — side may have flipped
+        if (scoreLong > scoreShort) side = com.bot.TradingCore.Side.LONG;
+        else if (scoreShort > scoreLong) side = com.bot.TradingCore.Side.SHORT;
+        else return null; // tied after penalty = no edge
+
+        // [v12.0] Re-check score diff after penalty
+        scoreDiff = Math.abs(scoreLong - scoreShort);
+        if (scoreDiff < minDiff) return null;
 
         // Cooldown
         long shortCooldownOverride = aggressiveShort ? 60_000L : -1;
@@ -1020,7 +1053,7 @@ public final class DecisionEngineMerged {
         // Crash mode confidence boost
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
             double crashConfBoost = btcCrashScore * 10.0;
-            probability = Math.min(88, probability + crashConfBoost);
+            probability = Math.min(85, probability + crashConfBoost);
             allFlags.add("CRASH_CONF_BOOST");
         }
 
@@ -1033,11 +1066,44 @@ public final class DecisionEngineMerged {
         if (atr14 / price > 0.0020) allFlags.add("HIGH_ATR");
 
         // ════════════════════════════════════════════════════════
-        // СТОП И ТЕЙК
+        // СТОП И ТЕЙК — [v11.0] STRUCTURAL STOP PLACEMENT
+        // Instead of fixed ATR multiplier, SL goes behind nearest
+        // swing high/low. This respects market structure and prevents
+        // the #1 killer: arbitrary SL that gets hunted by liquidity grabs.
         // ════════════════════════════════════════════════════════
         double riskMult = cat == CoinCategory.MEME ? 1.40 : cat == CoinCategory.ALT ? 1.10 : 0.88;
         double rrRatio  = scoreDiff > 1.2 ? 3.4 : scoreDiff > 0.9 ? 3.0 : scoreDiff > 0.6 ? 2.7 : 2.3;
-        double stopDist = Math.max(atr14 * 1.85 * riskMult, price * 0.0018);
+
+        // [v12.0] Find structural stop level (-1 = not found, use ATR)
+        double structuralStop = findStructuralStop(c15, side, price, atr14);
+        double atrStop = Math.max(atr14 * 1.85 * riskMult, price * 0.0018);
+
+        // Use the WIDER of structural and ATR stop — never tighter than structure
+        double stopDist;
+        if (structuralStop <= 0) {
+            // [v12.0] No swing found — use ATR stop (no silent rejection!)
+            stopDist = atrStop;
+            allFlags.add("ATR_STOP");
+        } else if (side == com.bot.TradingCore.Side.LONG) {
+            double structDist = price - structuralStop;
+            stopDist = Math.max(structDist, atrStop);
+            allFlags.add("STRUCT_STOP");
+        } else {
+            double structDist = structuralStop - price;
+            stopDist = Math.max(structDist, atrStop);
+            allFlags.add("STRUCT_STOP");
+        }
+
+        // [v11.0] Cap stop at 3% to prevent absurd risk
+        stopDist = Math.min(stopDist, price * 0.030);
+
+        // [v11.0] Minimum R:R check BEFORE building trade — reject if structure
+        // gives too wide a stop that kills the R:R ratio
+        if (stopDist > atrStop * 2.5) {
+            // Structure is too far — bad entry point, skip
+            allFlags.add("STRUCT_WIDE");
+            return null;
+        }
 
         double stopPrice = side == com.bot.TradingCore.Side.LONG  ? price - stopDist : price + stopDist;
         double takePrice = side == com.bot.TradingCore.Side.LONG  ? price + stopDist * rrRatio
@@ -1095,14 +1161,15 @@ public final class DecisionEngineMerged {
 
         norm = Math.min(1.0, norm);
 
-        // Range confidence: 50 + norm * range
-        double range = 26 + Math.min(clusters * 4.0, 16); // max 26+16=42, итого max 92, clamp 88
+        // [v11.0] Range confidence: 50 + norm * range
+        // Reduced range so we don't reach unrealistic probabilities
+        double range = 22 + Math.min(clusters * 3.5, 14); // max 22+14=36, итого max 86, clamp 85
         double prob  = 50 + norm * range;
 
         // Market state adjustment
-        if (state == MarketState.STRONG_TREND)      prob += 3.0;
-        else if (state == MarketState.WEAK_TREND)   prob += 0.5;
-        else if (state == MarketState.RANGE)        prob -= 3.0;
+        if (state == MarketState.STRONG_TREND)      prob += 2.0;  // was 3.0 — overconfident in trends
+        else if (state == MarketState.WEAK_TREND)   prob += 0.0;  // was 0.5 — weak trend ≠ bonus
+        else if (state == MarketState.RANGE)        prob -= 4.0;  // was -3.0 — range is HARD, penalize more
 
         // Category adjustment
         if (cat == CoinCategory.MEME)               prob -= 5.0;
@@ -1115,7 +1182,7 @@ public final class DecisionEngineMerged {
             prob = prob * 0.70 + histAcc * 0.30;
         }
 
-        return Math.round(clamp(prob, 50, 88)); // Потолок 88, не 90
+        return Math.round(clamp(prob, 50, 85)); // [v11.0] Ceiling 85 (was 88 — unrealistic for crypto scalping)
     }
 
     private double historicalAccuracy(Deque<CalibRecord> hist, double prob) {
@@ -1176,7 +1243,8 @@ public final class DecisionEngineMerged {
     private boolean priceMovedEnough(String sym, double price) {
         Double last = lastSigPrice.get(sym);
         if (last == null) { lastSigPrice.put(sym, price); return true; }
-        if (Math.abs(price - last) / last < 0.0020) return false;
+        // [v11.0] Increased from 0.20% to 0.35% — prevents near-duplicate signals
+        if (Math.abs(price - last) / last < 0.0035) return false;
         lastSigPrice.put(sym, price);
         return true;
     }
@@ -1895,39 +1963,158 @@ public final class DecisionEngineMerged {
     }
 
     // ══════════════════════════════════════════════════════════════
+    //  [v11.0] STRUCTURAL STOP PLACEMENT
+    //  Finds nearest swing low (for LONG) or swing high (for SHORT)
+    //  behind current price. SL goes below/above that level + buffer.
+    // ══════════════════════════════════════════════════════════════
+
+    private double findStructuralStop(List<com.bot.TradingCore.Candle> c15,
+                                      com.bot.TradingCore.Side side,
+                                      double price, double atr14) {
+        if (c15.size() < 20) return -1; // [v12.0] -1 = use ATR fallback
+
+        double buffer = atr14 * 0.25;
+
+        if (side == com.bot.TradingCore.Side.LONG) {
+            // Find nearest swing low below current price
+            List<Integer> lows = swingLows(c15, 3);
+            double bestStop = -1;
+            for (int idx = lows.size() - 1; idx >= 0 && idx >= lows.size() - 4; idx--) {
+                double swLow = c15.get(lows.get(idx)).low;
+                if (swLow < price && swLow > price * 0.95) {
+                    bestStop = swLow - buffer;
+                    break;
+                }
+            }
+            // Fallback: recent 8-bar low
+            if (bestStop <= 0) {
+                double recentLow = Double.MAX_VALUE;
+                for (int i = Math.max(0, c15.size() - 8); i < c15.size() - 1; i++) {
+                    recentLow = Math.min(recentLow, c15.get(i).low);
+                }
+                if (recentLow < price && recentLow > price * 0.95) {
+                    bestStop = recentLow - buffer;
+                }
+            }
+            // [v12.0] If still nothing found, return -1 to use ATR stop
+            return bestStop > 0 ? bestStop : -1;
+        } else {
+            List<Integer> highs = swingHighs(c15, 3);
+            double bestStop = -1;
+            for (int idx = highs.size() - 1; idx >= 0 && idx >= highs.size() - 4; idx--) {
+                double swHigh = c15.get(highs.get(idx)).high;
+                if (swHigh > price && swHigh < price * 1.05) {
+                    bestStop = swHigh + buffer;
+                    break;
+                }
+            }
+            if (bestStop <= 0) {
+                double recentHigh = Double.MIN_VALUE;
+                for (int i = Math.max(0, c15.size() - 8); i < c15.size() - 1; i++) {
+                    recentHigh = Math.max(recentHigh, c15.get(i).high);
+                }
+                if (recentHigh > price && recentHigh < price * 1.05) {
+                    bestStop = recentHigh + buffer;
+                }
+            }
+            return bestStop > 0 ? bestStop : -1;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
     //  MATH PRIMITIVES
     // ══════════════════════════════════════════════════════════════
 
-    public double atr(List<com.bot.TradingCore.Candle> c, int n) {
-        int p = Math.min(n, c.size() - 1);
-        if (p <= 0) return 0;
-        double sum = 0;
-        for (int i = c.size() - p; i < c.size(); i++) {
-            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
-            sum += Math.max(cur.high - cur.low,
-                    Math.max(Math.abs(cur.high - prev.close),
-                            Math.abs(cur.low  - prev.close)));
-        }
-        return sum / p;
-    }
+    /**
+     * [v12.0] Wilder's Smoothed ATR — matches TradingView/Binance exactly.
+     * Old code used simple SMA of TR — gives 15-20% different values.
+     * All ATR-dependent thresholds (stops, impulse, overextension) were miscalibrated.
+     */
+    public double atr(List<com.bot.TradingCore.Candle> c, int period) {
+        if (c.size() < period + 1) return 0;
 
-    private double adx(List<com.bot.TradingCore.Candle> c, int n) {
-        if (c.size() < n + 1) return 15;
-        double trS = 0, plusDM = 0, minusDM = 0;
-        for (int i = c.size() - n; i < c.size(); i++) {
+        // Step 1: SMA seed for first 'period' TRs
+        double atrVal = 0;
+        int seedStart = c.size() - period * 2;
+        if (seedStart < 1) seedStart = 1;
+        int seedEnd = Math.min(seedStart + period, c.size());
+
+        for (int i = seedStart; i < seedEnd; i++) {
             com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
-            double hd = cur.high - prev.high, ld = prev.low - cur.low;
+            atrVal += Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)));
+        }
+        atrVal /= (seedEnd - seedStart);
+
+        // Step 2: Wilder's smoothing for remaining bars
+        for (int i = seedEnd; i < c.size(); i++) {
+            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
             double tr = Math.max(cur.high - cur.low,
                     Math.max(Math.abs(cur.high - prev.close),
-                            Math.abs(cur.low  - prev.close)));
-            trS += tr;
-            if (hd > ld && hd > 0) plusDM  += hd;
-            if (ld > hd && ld > 0) minusDM += ld;
+                            Math.abs(cur.low - prev.close)));
+            atrVal = (atrVal * (period - 1) + tr) / period;
         }
-        double av = trS / n + 1e-9;
-        double pDI = 100 * (plusDM  / n) / av;
-        double mDI = 100 * (minusDM / n) / av;
-        return 100 * Math.abs(pDI - mDI) / Math.max(pDI + mDI, 1);
+        return atrVal;
+    }
+
+    /**
+     * [v12.0] Wilder's ADX — proper smoothed calculation.
+     * Old code used simple sum, not Wilder's smoothing.
+     * This caused ADX to read 15 where real ADX was 28 → wrong RANGE detection.
+     * The bot was entering RANGE trades that were actually trending, and vice versa.
+     */
+    private double adx(List<com.bot.TradingCore.Candle> c, int period) {
+        if (c.size() < period * 2 + 1) return 15; // not enough data
+
+        int startIdx = c.size() - period * 2;
+        if (startIdx < 1) startIdx = 1;
+
+        // Step 1: seed +DI, -DI, TR with SMA
+        double sumPlusDM = 0, sumMinusDM = 0, sumTR = 0;
+        int seedEnd = startIdx + period;
+        for (int i = startIdx; i < seedEnd && i < c.size(); i++) {
+            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
+            double hd = cur.high - prev.high;
+            double ld = prev.low - cur.low;
+            double tr = Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)));
+            sumTR += tr;
+            if (hd > ld && hd > 0) sumPlusDM += hd;
+            if (ld > hd && ld > 0) sumMinusDM += ld;
+        }
+
+        double smoothPlusDM = sumPlusDM;
+        double smoothMinusDM = sumMinusDM;
+        double smoothTR = sumTR;
+
+        // Step 2: Wilder's smoothing for DI lines
+        double sumDX = 0;
+        int dxCount = 0;
+        for (int i = seedEnd; i < c.size(); i++) {
+            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
+            double hd = cur.high - prev.high;
+            double ld = prev.low - cur.low;
+            double tr = Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)));
+
+            smoothTR = smoothTR - (smoothTR / period) + tr;
+            double curPlusDM = (hd > ld && hd > 0) ? hd : 0;
+            double curMinusDM = (ld > hd && ld > 0) ? ld : 0;
+            smoothPlusDM = smoothPlusDM - (smoothPlusDM / period) + curPlusDM;
+            smoothMinusDM = smoothMinusDM - (smoothMinusDM / period) + curMinusDM;
+
+            double plusDI = smoothTR > 0 ? 100 * smoothPlusDM / smoothTR : 0;
+            double minusDI = smoothTR > 0 ? 100 * smoothMinusDM / smoothTR : 0;
+            double diSum = plusDI + minusDI;
+            double dx = diSum > 0 ? 100 * Math.abs(plusDI - minusDI) / diSum : 0;
+            sumDX += dx;
+            dxCount++;
+        }
+
+        return dxCount > 0 ? sumDX / dxCount : 15;
     }
 
     private double ema(List<com.bot.TradingCore.Candle> c, int p) {

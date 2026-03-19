@@ -483,7 +483,7 @@ public final class SignalSender {
                 idea = rebuildIdea(idea, penaltyProb, idea.flags);
             } else if (gicWeight > 1.0) {
                 // [v7.0 FIX] Cap at 88 (not 90) to respect DecisionEngine calibration
-                idea = rebuildIdea(idea, Math.min(88, idea.probability * gicWeight), idea.flags);
+                idea = rebuildIdea(idea, Math.min(85, idea.probability * gicWeight), idea.flags);
             }
 
             if (!correlationGuard.allow(pair, idea.side, cat, sector)) {
@@ -499,9 +499,9 @@ public final class SignalSender {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("PH_" + pump.type.name());
                     // [v7.0] Diminishing: бонус уменьшается чем выше текущая probability
-                    double headroom = 88.0 - idea.probability;
+                    double headroom = 85.0 - idea.probability;
                     double bonus = Math.min(pump.strength * 6, headroom * 0.5);
-                    idea = rebuildIdea(idea, Math.min(88, idea.probability + bonus), nf);
+                    idea = rebuildIdea(idea, Math.min(85, idea.probability + bonus), nf);
                 }
             }
 
@@ -519,9 +519,9 @@ public final class SignalSender {
                 if (obiAligned) {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("OBI" + String.format("%+.0f", obi * 100));
-                    double headroom = 88.0 - idea.probability;
+                    double headroom = 85.0 - idea.probability;
                     double bonus = Math.min(Math.abs(obi) * 4, headroom * 0.4);
-                    idea = rebuildIdea(idea, Math.min(88, idea.probability + bonus), nf);
+                    idea = rebuildIdea(idea, Math.min(85, idea.probability + bonus), nf);
                 }
             }
 
@@ -531,9 +531,9 @@ public final class SignalSender {
             if (Math.abs(normDelta) > 0.28) {
                 List<String> nf = new ArrayList<>(idea.flags);
                 nf.add("Δ" + (normDelta > 0 ? "BUY" : "SELL") + pct(Math.abs(normDelta)));
-                double headroom = 88.0 - idea.probability;
+                double headroom = 85.0 - idea.probability;
                 double bonus = Math.min(Math.abs(normDelta) * 3, headroom * 0.35);
-                idea = rebuildIdea(idea, Math.min(88, idea.probability + bonus), nf);
+                idea = rebuildIdea(idea, Math.min(85, idea.probability + bonus), nf);
             }
 
             if (sector != null && isLong) {
@@ -619,7 +619,7 @@ public final class SignalSender {
                 low    = Math.min(low, c.low);
                 close  = c.close;
                 volume += c.volume;
-                qvol   += c.qvol;
+                qvol   += c.quoteVolume;
                 count++;
             }
         }
