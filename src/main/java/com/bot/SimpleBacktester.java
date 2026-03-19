@@ -435,15 +435,6 @@ public final class SimpleBacktester {
     //  MONTE CARLO DRAWDOWN ESTIMATION
     // ══════════════════════════════════════════════════════════════
 
-    /**
-     * Estimate worst-case drawdown using Monte Carlo simulation.
-     * Shuffles trade results and measures max drawdown across N simulations.
-     *
-     * @param trades      list of trade PnL percentages
-     * @param simulations number of Monte Carlo runs
-     * @param confidence  percentile (e.g., 0.95 for 95th percentile worst DD)
-     * @return estimated max drawdown at given confidence level
-     */
     public static double monteCarloDrawdown(List<Double> trades, int simulations, double confidence) {
         if (trades.isEmpty()) return 0;
 

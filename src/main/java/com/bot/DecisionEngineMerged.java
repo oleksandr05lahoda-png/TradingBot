@@ -4,41 +4,6 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║        DecisionEngineMerged — GODBOT v12.0 — CRITICAL FIXES EDITION        ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║                                                                          ║
- * ║  v11.0 CRITICAL IMPROVEMENTS:                                            ║
- * ║                                                                          ║
- * ║  [FIX-LATE-ENTRY] Structural Stop Placement:                             ║
- * ║    - SL behind nearest swing high/low instead of fixed ATR mult          ║
- * ║    - Prevents entering at exhausted move end with tight arbitrary SL     ║
- * ║    - TP calculated from structural SL (maintains R:R ratio)              ║
- * ║                                                                          ║
- * ║  [FIX-OVERCONFIDENCE] Bayesian Confidence Calibration:                   ║
- * ║    - Raw score → calibrated probability via historical accuracy map      ║
- * ║    - Prevents 80%+ signals that actually win 45% (overfitting)           ║
- * ║    - Hard ceiling 85% (was 88 — unrealistic for crypto)                  ║
- * ║                                                                          ║
- * ║  [FIX-WHIPSAW] Minimum Hold Duration:                                    ║
- * ║    - Cooldown increased: TOP 8min, ALT 6min, MEME 4min                  ║
- * ║    - Prevents rapid flip-flop in choppy markets                          ║
- * ║                                                                          ║
- * ║  [FIX-CLUSTER-INFLATION] Stricter Cluster Scoring:                       ║
- * ║    - CLUSTER_CAP reduced 0.85 → 0.75 (one event ≠ multiple signals)   ║
- * ║    - MIN_AGREEING_CLUSTERS raised to 3 in RANGE market                   ║
- * ║    - Momentum + Structure required (not just derivatives)                ║
- * ║                                                                          ║
- * ║  [FIX-TREND-FILTER] Multi-Timeframe Trend Agreement:                    ║
- * ║    - 15m + 1H must agree for trend-following entries                     ║
- * ║    - Counter-trend requires 3+ clusters + strong EARLY                   ║
- * ║                                                                          ║
- * ║  PRESERVED: 6 clusters, symmetric LONG/SHORT, soft penalties,            ║
- * ║  contra-trend with RS divergence, EARLY-SOLO with confirmation           ║
- * ║                                                                          ║
- * ╚══════════════════════════════════════════════════════════════════════════╝
- */
 public final class DecisionEngineMerged {
 
     // ── Enums ──────────────────────────────────────────────────────
@@ -1169,7 +1134,7 @@ public final class DecisionEngineMerged {
         com.bot.TradingCore.ForecastEngine.ForecastResult forecastResult = null;
         if (forecastEngine != null) {
             try {
-                double vd = volumeDeltaMap.getOrDefault(symbol, 0.0);
+                vd = volumeDeltaMap.getOrDefault(symbol, 0.0);
                 forecastResult = forecastEngine.forecast(c5, c15, c1h, vd);
                 if (forecastResult != null) {
                     allFlags.add("FC_" + forecastResult.bias.name());
