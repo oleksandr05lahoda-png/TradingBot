@@ -86,12 +86,20 @@ public final class DecisionEngineMerged {
     // [v7.0] GIC reference
     private volatile com.bot.GlobalImpulseController gicRef = null;
     private com.bot.PumpHunter pumpHunter;
+    // [v14.0] ForecastEngine integration
+    private volatile com.bot.TradingCore.ForecastEngine forecastEngine = null;
 
     public DecisionEngineMerged() {}
 
     // ── Setters ───────────────────────────────────────────────────
     public void setPumpHunter(com.bot.PumpHunter ph) { this.pumpHunter = ph; }
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
+    public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
+
+    // [v14.0] Called by SignalSender AFTER ISC.allowSignal() confirms
+    public void confirmSignal(String symbol, com.bot.TradingCore.Side side, long now) {
+        registerSignal(symbol, side, now);
+    }
 
     public void setVolumeDelta(String sym, double delta) {
         volumeDeltaMap.put(sym, delta);
@@ -248,24 +256,40 @@ public final class DecisionEngineMerged {
         public final String           htfBias;
         public final double           rr;
         public final CoinCategory     category;
+        // [v14.0] ForecastEngine integration
+        public final com.bot.TradingCore.ForecastEngine.ForecastResult forecast;
+        public final String trendPhase;
 
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take, double rr,
                          double probability, List<String> flags,
                          double fundingRate, double fundingDelta,
-                         double oiChange, String htfBias, CoinCategory cat) {
+                         double oiChange, String htfBias, CoinCategory cat,
+                         com.bot.TradingCore.ForecastEngine.ForecastResult forecast) {
             this.symbol = symbol; this.side = side;
             this.price = price; this.stop = stop; this.take = take;
             this.rr = rr; this.probability = probability;
             this.flags = flags != null ? Collections.unmodifiableList(new ArrayList<>(flags)) : List.of();
             this.fundingRate = fundingRate; this.fundingDelta = fundingDelta;
             this.oiChange = oiChange; this.htfBias = htfBias; this.category = cat;
+            this.forecast = forecast;
+            this.trendPhase = forecast != null ? forecast.trendPhase.name() : "UNKNOWN";
 
             double risk = Math.abs(price - stop);
             boolean long_ = side == com.bot.TradingCore.Side.LONG;
             this.tp1 = long_ ? price + risk * 1.0 : price - risk * 1.0;
             this.tp2 = long_ ? price + risk * 2.0 : price - risk * 2.0;
             this.tp3 = long_ ? price + risk * 3.2 : price - risk * 3.2;
+        }
+
+        // backward-compatible (no forecast)
+        public TradeIdea(String symbol, com.bot.TradingCore.Side side,
+                         double price, double stop, double take, double rr,
+                         double probability, List<String> flags,
+                         double fundingRate, double fundingDelta,
+                         double oiChange, String htfBias, CoinCategory cat) {
+            this(symbol, side, price, stop, take, rr, probability, flags,
+                    fundingRate, fundingDelta, oiChange, htfBias, cat, null);
         }
 
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
@@ -790,7 +814,10 @@ public final class DecisionEngineMerged {
         // EXHAUSTION FILTERS
         // ════════════════════════════════════════════════════════
         double adxV = adx(c15, 14);
-        boolean adxFalling = c15.size() > 5 && adxV > adx(c15.subList(0, c15.size() - 1), 14) * 1.05;
+        // [v14.0 FIX] adxFalling: текущий ADX МЕНЬШЕ предыдущего = тренд ослабевает
+        // БЫЛО: adxV > prev * 1.05 — это РОСТ ADX, не падение! Инвертировало все exhaustion фильтры.
+        double adxPrev = c15.size() > 5 ? adx(c15.subList(0, c15.size() - 3), 14) : adxV;
+        boolean adxFalling = adxV < adxPrev * 0.95;
 
         if (scoreLong > scoreShort) {
             boolean ex = isLongExhausted(c15, c1h, rsi14, rsi7, price);
@@ -1039,13 +1066,21 @@ public final class DecisionEngineMerged {
         boolean volumeOpposes = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsShort())
                 || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsLong());
 
-        // [v13.0] Volume = HARD GATE. No volume = no trade. Period.
-        // This eliminates the #1 source of bad signals: entering moves that already happened.
+        // [v14.0 FIX] Volume = SOFT GATE, не HARD GATE
+        // Hard gate убивал 70%+ сигналов в нормальных рыночных условиях
+        // Volume ПРОТИВ нас — штраф, но не блок
         if (volumeOpposes && !aggressiveShort) {
-            return null; // Volume actively against us → reject
+            if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.55;
+            else scoreShort *= 0.55;
+            allFlags.add("VOL_OPPOSE");
+            scoreDiff = Math.abs(scoreLong - scoreShort);
+            if (scoreDiff < minDiff) return null;
         }
-        if (!volumeSupports && !aggressiveShort) {
-            return null; // No volume confirmation → reject
+        // Нет volume confirmation — мягкий штраф 15%
+        if (!volumeSupports && !volumeOpposes && !aggressiveShort) {
+            if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.85;
+            else scoreShort *= 0.85;
+            allFlags.add("VOL_NEUTRAL");
         }
         if (scoreDiff < minDiff) return null;
 
@@ -1127,11 +1162,42 @@ public final class DecisionEngineMerged {
                 : price - stopDist * rrRatio;
 
         if (!priceMovedEnough(symbol, price)) return null;
-        registerSignal(symbol, side, now);
+        // [v14.0 FIX] НЕ вызываем registerSignal() здесь — cooldown ставится
+        // только ПОСЛЕ ISC.allowSignal() в SignalSender через confirmSignal()
+
+        // [v14.0] ForecastEngine integration
+        com.bot.TradingCore.ForecastEngine.ForecastResult forecastResult = null;
+        if (forecastEngine != null) {
+            try {
+                double vd = volumeDeltaMap.getOrDefault(symbol, 0.0);
+                forecastResult = forecastEngine.forecast(c5, c15, c1h, vd);
+                if (forecastResult != null) {
+                    allFlags.add("FC_" + forecastResult.bias.name());
+                    allFlags.add("PH_" + forecastResult.trendPhase.name());
+                    boolean fcBull = forecastResult.directionScore > 0.2;
+                    boolean fcBear = forecastResult.directionScore < -0.2;
+                    boolean sigLong = side == com.bot.TradingCore.Side.LONG;
+                    if ((sigLong && fcBear) || (!sigLong && fcBull)) {
+                        probability = Math.max(50, probability - 4);
+                        allFlags.add("FC_DISAGREE");
+                    }
+                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
+                        probability = Math.max(50, probability - 3);
+                        allFlags.add("FC_EXHAUST");
+                    }
+                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
+                            && Math.abs(forecastResult.directionScore) > 0.3) {
+                        probability = Math.min(85, probability + 2);
+                        allFlags.add("FC_EARLY_BOOST");
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
 
         return new TradeIdea(symbol, side, price, stopPrice, takePrice, rrRatio,
                 probability, allFlags,
-                fundingRate, fundingDelta, oiChange, bias2h.name(), cat);
+                fundingRate, fundingDelta, oiChange, bias2h.name(), cat,
+                forecastResult);
     }
 
     // ══════════════════════════════════════════════════════════════

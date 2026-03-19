@@ -476,6 +476,10 @@ public final class SignalOptimizer {
     //  WITH ADJUSTED CONFIDENCE
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * [v14.0 FIX] Пересоздание TradeIdea с сохранением ВСЕХ полей.
+     * БЫЛО: 3-arg конструктор терял rr, fundingDelta, category, forecast.
+     */
     public com.bot.DecisionEngineMerged.TradeIdea withAdjustedConfidence(
             com.bot.DecisionEngineMerged.TradeIdea signal) {
 
@@ -487,11 +491,15 @@ public final class SignalOptimizer {
                 signal.price,
                 signal.stop,
                 signal.take,
+                signal.rr,
                 newConfidence,
-                signal.flags,
+                new java.util.ArrayList<>(signal.flags),
                 signal.fundingRate,
+                signal.fundingDelta,
                 signal.oiChange,
-                signal.htfBias
+                signal.htfBias,
+                signal.category,
+                signal.forecast
         );
     }
 
