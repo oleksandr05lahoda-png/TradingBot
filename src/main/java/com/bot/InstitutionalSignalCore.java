@@ -65,18 +65,20 @@ public final class InstitutionalSignalCore {
     private volatile double streakConfidenceBoost = 0.0;
     private volatile long   lastStreakUpdateMs    = System.currentTimeMillis();
 
-    // [v11.0] Daily loss limit
+    // [v12.1] Loss cooldown — NOT a 24h block!
+    // On 15m TF, market changes every hour. Blocking for 24h = missing recovery.
+    // Instead: 30min cooldown after consecutive losses, then resume with tighter thresholds.
     private volatile double dailyPnLPct        = 0.0;
     private volatile long   dailyPnLResetDay   = currentDay();
-    private static final double MAX_DAILY_LOSS = -3.0;  // -3% → block all signals
-    private volatile boolean dailyLossBreaker  = false;
+    private volatile long   lossCooldownUntil  = 0;
+    private static final long LOSS_COOLDOWN_MS = 30 * 60_000L; // 30 min pause, not 24h
 
-    // [v11.0] Max drawdown circuit breaker
+    // [v12.1] Drawdown circuit breaker — shorter pause for 15m TF
     private volatile double peakBalance          = 0.0;
     private volatile double drawdownFromPeak     = 0.0;
     private static final double MAX_DRAWDOWN_PCT = -8.0; // -8% from peak → pause
     private volatile long   drawdownPauseUntil   = 0;
-    private static final long DRAWDOWN_PAUSE_MS  = 2 * 3600_000L; // 2 hours
+    private static final long DRAWDOWN_PAUSE_MS  = 45 * 60_000L; // 45 min (was 2h)
 
     // [v11.0] Consecutive wins tracking for adaptive risk
     private volatile int currentWinStreak = 0;
@@ -204,10 +206,10 @@ public final class InstitutionalSignalCore {
         decayStreakBoost();
         resetDailyIfNeeded();
 
-        // [v11.0] Daily loss breaker — block everything
-        if (dailyLossBreaker) return 100.0; // impossible to pass
+        // [v12.1] Cooldown active — block temporarily (30min, not 24h)
+        if (System.currentTimeMillis() < lossCooldownUntil) return 100.0;
 
-        // [v11.0] Drawdown pause
+        // [v12.1] Drawdown pause
         if (System.currentTimeMillis() < drawdownPauseUntil) return 100.0;
 
         double base = baseMinConfidence + streakConfidenceBoost;
@@ -216,10 +218,11 @@ public final class InstitutionalSignalCore {
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L)
             base += 3.0;
 
-        // [v11.0] Daily PnL in loss territory → tighten proportionally
+        // [v12.1] Daily PnL in loss territory → tighten proportionally
+        // Worse day = higher threshold, but never blocks completely
         if (dailyPnLPct < -1.0) base += Math.min(5.0, Math.abs(dailyPnLPct));
 
-        return Math.min(base, 70.0); // [v11.0] cap at 70% (was 72% — still let marginal signals through)
+        return Math.min(base, 70.0);
     }
 
     public void setBacktestResult(double ev, long ts) {
@@ -234,10 +237,10 @@ public final class InstitutionalSignalCore {
         cleanupExpired();
         String sym = signal.symbol;
 
-        // [v11.0] Daily loss breaker
-        if (dailyLossBreaker) return false;
+        // [v12.1] Loss cooldown (30min, not 24h)
+        if (System.currentTimeMillis() < lossCooldownUntil) return false;
 
-        // [v11.0] Drawdown pause
+        // [v12.1] Drawdown pause (45min)
         if (System.currentTimeMillis() < drawdownPauseUntil) return false;
 
         // Confidence check
@@ -396,11 +399,13 @@ public final class InstitutionalSignalCore {
     public double getCurrentHeat()   { return currentHeat; }
 
     public String getStats() {
-        return String.format("ISC[act=%d/%d heat=%.1f%% cl=%d wr=%.0f%% str=%d+%.0f L%d/S%d ev=%.4f eff=%.0f%% day=%.2f%% dd=%.1f%%]",
+        String cooldownStr = isCooldownActive() ? "CD=" + getCooldownMinutesLeft() + "m " : "";
+        return String.format("ISC[act=%d/%d heat=%.1f%% cl=%d wr=%.0f%% str=%d+%.0f L%d/S%d %sev=%.4f eff=%.0f%% day=%.2f%% dd=%.1f%%]",
                 getActiveCount(), maxGlobalSignals, currentHeat * 100,
                 getTotalTradeCount(), getOverallWinRate() * 100,
                 currentLossStreak, streakConfidenceBoost,
                 consecutiveLongLosses, consecutiveShortLosses,
+                cooldownStr,
                 lastBacktestEV, getEffectiveMinConfidence(),
                 dailyPnLPct, drawdownFromPeak);
     }
@@ -444,10 +449,12 @@ public final class InstitutionalSignalCore {
         resetDailyIfNeeded();
         dailyPnLPct += pnlPct;
 
-        if (dailyPnLPct <= MAX_DAILY_LOSS && !dailyLossBreaker) {
-            dailyLossBreaker = true;
-            log("🛑 DAILY LOSS LIMIT HIT: " + String.format("%.2f%%", dailyPnLPct)
-                    + " — ALL SIGNALS BLOCKED until tomorrow");
+        // [v12.1] After each loss — set 30min cooldown
+        // NOT a 24h block! Bot resumes after cooldown with tighter streak thresholds.
+        if (pnlPct < -0.5 && currentLossStreak >= 2) {
+            lossCooldownUntil = System.currentTimeMillis() + LOSS_COOLDOWN_MS;
+            log("⏸ COOLDOWN 30min after " + currentLossStreak + " losses (day: "
+                    + String.format("%.2f%%", dailyPnLPct) + ")");
         }
     }
 
@@ -456,7 +463,6 @@ public final class InstitutionalSignalCore {
         if (today != dailyPnLResetDay) {
             dailyPnLResetDay = today;
             dailyPnLPct = 0.0;
-            dailyLossBreaker = false;
         }
     }
 
@@ -479,7 +485,16 @@ public final class InstitutionalSignalCore {
         }
     }
 
-    public boolean isDailyLossBreaker() { return dailyLossBreaker; }
+    public boolean isCooldownActive() {
+        return System.currentTimeMillis() < lossCooldownUntil;
+    }
+
+    /** Minutes remaining in cooldown, 0 if not active */
+    public long getCooldownMinutesLeft() {
+        long remaining = lossCooldownUntil - System.currentTimeMillis();
+        return remaining > 0 ? remaining / 60_000 : 0;
+    }
+
     public double getDailyPnL() { return dailyPnLPct; }
     public double getDrawdownFromPeak() { return drawdownFromPeak; }
 

@@ -402,10 +402,10 @@ public final class BotMain {
         long cycle = totalCycles.incrementAndGet();
         LOG.info("══ ЦИКЛ #" + cycle + " ══ " + nowWarsawStr());
 
-        // [v11.0] Daily loss circuit breaker — skip signal generation entirely
-        if (isc.isDailyLossBreaker()) {
-            LOG.info("[DAILY-LIMIT] Дневной лимит потерь исчерпан: " + String.format("%.2f%%", isc.getDailyPnL())
-                    + " — пропуск цикла");
+        // [v12.1] Loss cooldown — 30min pause, not 24h block
+        if (isc.isCooldownActive()) {
+            LOG.info("[COOLDOWN] Пауза " + isc.getCooldownMinutesLeft() + "мин после проигрышей (day: "
+                    + String.format("%.2f%%", isc.getDailyPnL()) + ") — пропуск цикла");
             return;
         }
 
