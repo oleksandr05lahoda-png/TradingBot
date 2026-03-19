@@ -17,9 +17,9 @@ public final class DecisionEngineMerged {
     private static final long   COOLDOWN_TOP    = 8  * 60_000L;  // was 4min — too short, caused flip-flops
     private static final long   COOLDOWN_ALT    = 6  * 60_000L;  // was 3min
     private static final long   COOLDOWN_MEME   = 4  * 60_000L;  // was 2min
-    private static final double BASE_CONF       = 54.0;  // [v11.0] raised from 52 — fewer but better signals
+    private static final double BASE_CONF       = 51.0;  // [v11.0] raised from 52 — fewer but better signals
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 50.0;  // [v11.0] raised from 47
+    private static final double MIN_CONF_FLOOR  = 48.0;  // [v11.0] raised from 47
     private static final double MIN_CONF_CEIL   = 65.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -416,14 +416,8 @@ public final class DecisionEngineMerged {
 
         adaptGlobalMinConf(state, atr14, price);
 
-        // [v11.0] RANGE + weak ADX = no signal (raised from 18 to 20)
-        if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 20) return null;
+        if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) return null;
 
-        // ═══════════════════════════════════════════════════════════
-        // [v13.0] LATE ENTRY GUARD
-        // If last 4 bars moved > 2×ATR in one direction with 3+ consecutive
-        // same-color candles → the move is exhausted. Don't chase.
-        // ═══════════════════════════════════════════════════════════
         int n15 = c15.size();
         double move4bars = last(c15).close - c15.get(n15 - 5).close;
         boolean lateEntryLong = false, lateEntryShort = false;
@@ -2239,8 +2233,8 @@ public final class DecisionEngineMerged {
     private boolean pullback(List<com.bot.TradingCore.Candle> c, boolean bull) {
         double e21 = ema(c, 21), p = last(c).close, r = rsi(c, 14);
         return bull
-                ? p <= e21 * 1.0012 && p >= e21 * 0.993 && r > 37 && r < 58
-                : p >= e21 * 0.9988 && p <= e21 * 1.007 && r < 63 && r > 42;
+                ? p <= e21 * 1.003 && p >= e21 * 0.990 && r > 30 && r < 65
+                : p >= e21 * 0.997 && p <= e21 * 1.010 && r < 70 && r > 35;
     }
 
     private boolean bullishStructure(List<com.bot.TradingCore.Candle> c) {

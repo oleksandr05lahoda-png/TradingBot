@@ -577,7 +577,6 @@ public final class TradingCore {
         if (candles == null || candles.size() < period + 2) return new FisherResult(0, 0, 0.5);
         int n = candles.size();
 
-        // Find highest high and lowest low over period
         double prevFisher = 0;
         double prevValue = 0;
         double fisher = 0;

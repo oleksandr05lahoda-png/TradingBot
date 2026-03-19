@@ -39,7 +39,7 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;   // per symbol, bounded
 
     public InstitutionalSignalCore() {
-        this(20, 2, 0.12, 56.0, 0.0025, 2);
+        this(20, 2, 0.12, 52.0, 0.0025, 2);
     }
 
     public InstitutionalSignalCore(int maxGlobal, int maxPerSym, double maxHeat,
@@ -211,7 +211,7 @@ public final class InstitutionalSignalCore {
         if (dailyPnLPct < -1.0) base += Math.min(5.0, Math.abs(dailyPnLPct));
 
         // [v12.2] Floor 60%, ceiling 70%. Bot always works, just gets pickier.
-        return Math.max(60.0, Math.min(base, 70.0));
+        return Math.max(52.0, Math.min(base, 70.0));
     }
 
     public void setBacktestResult(double ev, long ts) {
