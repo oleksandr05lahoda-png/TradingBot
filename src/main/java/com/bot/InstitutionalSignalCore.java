@@ -65,20 +65,14 @@ public final class InstitutionalSignalCore {
     private volatile double streakConfidenceBoost = 0.0;
     private volatile long   lastStreakUpdateMs    = System.currentTimeMillis();
 
-    // [v12.1] Loss cooldown — NOT a 24h block!
-    // On 15m TF, market changes every hour. Blocking for 24h = missing recovery.
-    // Instead: 30min cooldown after consecutive losses, then resume with tighter thresholds.
+    // [v12.2] NO timers, NO blocks. Streak guard raises threshold automatically.
+    // Bot NEVER stops — just gets pickier after losses.
     private volatile double dailyPnLPct        = 0.0;
     private volatile long   dailyPnLResetDay   = currentDay();
-    private volatile long   lossCooldownUntil  = 0;
-    private static final long LOSS_COOLDOWN_MS = 30 * 60_000L; // 30 min pause, not 24h
 
-    // [v12.1] Drawdown circuit breaker — shorter pause for 15m TF
+    // Drawdown tracking (stats only, no pause)
     private volatile double peakBalance          = 0.0;
     private volatile double drawdownFromPeak     = 0.0;
-    private static final double MAX_DRAWDOWN_PCT = -8.0; // -8% from peak → pause
-    private volatile long   drawdownPauseUntil   = 0;
-    private static final long DRAWDOWN_PAUSE_MS  = 45 * 60_000L; // 45 min (was 2h)
 
     // [v11.0] Consecutive wins tracking for adaptive risk
     private volatile int currentWinStreak = 0;
@@ -206,23 +200,18 @@ public final class InstitutionalSignalCore {
         decayStreakBoost();
         resetDailyIfNeeded();
 
-        // [v12.1] Cooldown active — block temporarily (30min, not 24h)
-        if (System.currentTimeMillis() < lossCooldownUntil) return 100.0;
-
-        // [v12.1] Drawdown pause
-        if (System.currentTimeMillis() < drawdownPauseUntil) return 100.0;
-
+        // [v12.2] NO timers. NO blocks. Just streak raising the bar.
         double base = baseMinConfidence + streakConfidenceBoost;
 
         // Backtest EV adjustment
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L)
             base += 3.0;
 
-        // [v12.1] Daily PnL in loss territory → tighten proportionally
-        // Worse day = higher threshold, but never blocks completely
+        // Daily PnL penalty — worse day = higher threshold, but NEVER blocks
         if (dailyPnLPct < -1.0) base += Math.min(5.0, Math.abs(dailyPnLPct));
 
-        return Math.min(base, 70.0);
+        // [v12.2] Floor 60%, ceiling 70%. Bot always works, just gets pickier.
+        return Math.max(60.0, Math.min(base, 70.0));
     }
 
     public void setBacktestResult(double ev, long ts) {
@@ -237,12 +226,7 @@ public final class InstitutionalSignalCore {
         cleanupExpired();
         String sym = signal.symbol;
 
-        // [v12.1] Loss cooldown (30min, not 24h)
-        if (System.currentTimeMillis() < lossCooldownUntil) return false;
-
-        // [v12.1] Drawdown pause (45min)
-        if (System.currentTimeMillis() < drawdownPauseUntil) return false;
-
+        // [v12.2] No timers. Confidence check does all the work via streak guard.
         // Confidence check
         if (signal.probability < getEffectiveMinConfidence()) return false;
 
@@ -399,15 +383,13 @@ public final class InstitutionalSignalCore {
     public double getCurrentHeat()   { return currentHeat; }
 
     public String getStats() {
-        String cooldownStr = isCooldownActive() ? "CD=" + getCooldownMinutesLeft() + "m " : "";
-        return String.format("ISC[act=%d/%d heat=%.1f%% cl=%d wr=%.0f%% str=%d+%.0f L%d/S%d %sev=%.4f eff=%.0f%% day=%.2f%% dd=%.1f%%]",
+        return String.format("ISC[act=%d/%d heat=%.1f%% cl=%d wr=%.0f%% str=%d+%.0f L%d/S%d eff=%.0f%% day=%.2f%%]",
                 getActiveCount(), maxGlobalSignals, currentHeat * 100,
                 getTotalTradeCount(), getOverallWinRate() * 100,
                 currentLossStreak, streakConfidenceBoost,
                 consecutiveLongLosses, consecutiveShortLosses,
-                cooldownStr,
-                lastBacktestEV, getEffectiveMinConfidence(),
-                dailyPnLPct, drawdownFromPeak);
+                getEffectiveMinConfidence(),
+                dailyPnLPct);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -448,14 +430,7 @@ public final class InstitutionalSignalCore {
     private void trackDailyPnL(double pnlPct) {
         resetDailyIfNeeded();
         dailyPnLPct += pnlPct;
-
-        // [v12.1] After each loss — set 30min cooldown
-        // NOT a 24h block! Bot resumes after cooldown with tighter streak thresholds.
-        if (pnlPct < -0.5 && currentLossStreak >= 2) {
-            lossCooldownUntil = System.currentTimeMillis() + LOSS_COOLDOWN_MS;
-            log("⏸ COOLDOWN 30min after " + currentLossStreak + " losses (day: "
-                    + String.format("%.2f%%", dailyPnLPct) + ")");
-        }
+        // [v12.2] No cooldown. Streak guard handles everything automatically.
     }
 
     private void resetDailyIfNeeded() {
@@ -470,29 +445,14 @@ public final class InstitutionalSignalCore {
         return System.currentTimeMillis() / 86_400_000L;
     }
 
-    /** Called by BotMain when balance is refreshed — tracks drawdown from peak */
+    /** Called by BotMain when balance is refreshed — tracks drawdown (stats only) */
     public void updateBalance(double currentBalance) {
         if (currentBalance > peakBalance) {
             peakBalance = currentBalance;
         }
         if (peakBalance > 0) {
             drawdownFromPeak = (currentBalance - peakBalance) / peakBalance * 100;
-            if (drawdownFromPeak <= MAX_DRAWDOWN_PCT && System.currentTimeMillis() > drawdownPauseUntil) {
-                drawdownPauseUntil = System.currentTimeMillis() + DRAWDOWN_PAUSE_MS;
-                log("🛑 MAX DRAWDOWN HIT: " + String.format("%.2f%%", drawdownFromPeak)
-                        + " — PAUSED for 2 hours");
-            }
         }
-    }
-
-    public boolean isCooldownActive() {
-        return System.currentTimeMillis() < lossCooldownUntil;
-    }
-
-    /** Minutes remaining in cooldown, 0 if not active */
-    public long getCooldownMinutesLeft() {
-        long remaining = lossCooldownUntil - System.currentTimeMillis();
-        return remaining > 0 ? remaining / 60_000 : 0;
     }
 
     public double getDailyPnL() { return dailyPnLPct; }

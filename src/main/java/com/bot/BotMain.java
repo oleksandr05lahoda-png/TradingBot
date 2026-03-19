@@ -174,10 +174,8 @@ public final class BotMain {
                 30, 120, TimeUnit.MINUTES);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOG.info("Завершение работы...");
+            LOG.info("Завершение работы... Циклов: " + totalCycles.get() + " | Сигналов: " + totalSignals.get());
             mainSched.shutdown(); auxSched.shutdown();
-            telegram.sendMessageAsync("🛑 GodBot v9.0 остановлен. Циклов: " + totalCycles.get()
-                    + " | Сигналов: " + totalSignals.get());
             telegram.shutdown();
             try { mainSched.awaitTermination(8, TimeUnit.SECONDS); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); mainSched.shutdownNow(); }
@@ -402,12 +400,7 @@ public final class BotMain {
         long cycle = totalCycles.incrementAndGet();
         LOG.info("══ ЦИКЛ #" + cycle + " ══ " + nowWarsawStr());
 
-        // [v12.1] Loss cooldown — 30min pause, not 24h block
-        if (isc.isCooldownActive()) {
-            LOG.info("[COOLDOWN] Пауза " + isc.getCooldownMinutesLeft() + "мин после проигрышей (day: "
-                    + String.format("%.2f%%", isc.getDailyPnL()) + ") — пропуск цикла");
-            return;
-        }
+        // [v12.2] No cooldown, no blocks. Bot always runs, streak guard handles filtering.
 
         updateBtcContext(sender, gic);
         updateSectors(sender, gic);
@@ -532,7 +525,7 @@ public final class BotMain {
                 isc.getDailyPnL(), isc.getDrawdownFromPeak(),
                 errorCount.get(), watchdogAlerts.get(),
                 isc.getStats());
-        telegram.sendMessageAsync(msg);
+        // [v12.2] Stats go to LOG only — not Telegram. User sees only signals.
         LOG.info("[STATS] " + msg.replace("\n"," | "));
     }
 
