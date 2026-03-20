@@ -288,6 +288,8 @@ public final class SignalSender {
 
         this.decisionEngine.setPumpHunter(this.pumpHunter);
         this.decisionEngine.setGIC(this.gic);
+        // [v14.0 FIX #Forecast] Wire ForecastEngine so TradeIdea.forecast is not always null.
+        this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
         this.optimizer.setPumpHunter(this.pumpHunter);
 
         int poolSize = Math.max(6, Math.min(TOP_N / 4, 25));

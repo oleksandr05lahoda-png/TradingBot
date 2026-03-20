@@ -32,6 +32,9 @@ public final class BotMain {
     private static final ZoneId ZONE      = ZoneId.of("Europe/Warsaw");
     private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 1);
     private static final int    KLINES    = envInt("KLINES_LIMIT", 220);
+    // Hard cap to avoid Telegram queue backlog (which can make the bot
+    // "silent" for hours/days under heavy signal load).
+    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 10);
 
     // [v14.0 FIX #8] Тихие часы расширены: 01:00–05:00 UTC (было 03:00–05:00)
     // Ликвидность падает уже с 01:00, спреды расширяются
@@ -329,8 +332,17 @@ public final class BotMain {
             return;
         }
 
+        // Keep only top signals per cycle to prevent Telegram queue backlog.
+        // Priority: probability desc, then forecast confidence, then abs(directionScore).
+        signals.sort(Comparator
+                .comparingDouble((DecisionEngineMerged.TradeIdea i) -> i.probability).reversed()
+                .thenComparingDouble(i -> i.forecast != null ? i.forecast.confidence : 0.0).reversed()
+                .thenComparingDouble(i -> i.forecast != null ? Math.abs(i.forecast.directionScore) : 0.0).reversed());
+        int limit = Math.min(signals.size(), MAX_SIGNALS_PER_CYCLE);
+
         int sent = 0;
-        for (DecisionEngineMerged.TradeIdea s : signals) {
+        for (int idx = 0; idx < limit; idx++) {
+            DecisionEngineMerged.TradeIdea s = signals.get(idx);
             telegram.sendMessageAsync(s.toTelegramString());
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
@@ -476,9 +488,7 @@ public final class BotMain {
             if (tp1Reached && !ts.tp1Hit) {
                 ts.tp1Hit = true;
                 ts.trailingStop = ts.entry; // trailing начинается с breakeven
-                telegram.sendMessageAsync(String.format(
-                        "🎯 *TP1 HIT* %s %s | Trailing stop активен @ %.4f",
-                        ts.symbol, ts.side, ts.trailingStop));
+                // Suppress intermediate TP1 notification to reduce Telegram spam.
             }
 
             // ── После TP1: trailing + TP2 + TP3 ────────────────
@@ -510,13 +520,7 @@ public final class BotMain {
 
                 if (tp2Reached && !ts.tp2Hit) {
                     ts.tp2Hit = true; // ← Устанавливаем флаг ПЕРЕД отправкой
-                    double pnlPart = isLong
-                            ? (ts.tp2 - ts.entry) / ts.entry * 100
-                            : (ts.entry - ts.tp2) / ts.entry * 100;
-                    telegram.sendMessageAsync(String.format(
-                            "🎯🎯 *TP2 HIT* %s %s | Partial PnL: %+.2f%%\n" +
-                                    "🔍 TP3 @ %.4f | Trailing active",
-                            ts.symbol, ts.side, pnlPart, ts.tp3));
+                    // Suppress intermediate TP2 notification to reduce Telegram spam.
                     // Перемещаем trailing до tp1 уровня
                     if (isLong) ts.trailingStop = Math.max(ts.trailingStop, ts.tp1);
                     else        ts.trailingStop = Math.min(ts.trailingStop, ts.tp1);
@@ -555,9 +559,7 @@ public final class BotMain {
                     isc.closeTrade(ts.symbol, ts.side, pnl);
                     markForecastRecord(ts.symbol + "_" + ts.side,
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
-                    telegram.sendMessageAsync(String.format(
-                            "🔒 *TRAIL STOP* %s %s | PnL: %+.2f%%",
-                            ts.symbol, ts.side, pnl));
+                    // Suppress intermediate trailing stop notification to reduce spam.
                 }
             }
         }

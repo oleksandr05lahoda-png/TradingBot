@@ -271,7 +271,7 @@ public final class DecisionEngineMerged {
             this(symbol, side, price, stop, take, 2.0, probability, flags,
                     fundingRate, 0, oiChange, htfBias, CoinCategory.ALT);
         }
-
+        // Внутри public static final class TradeIdea ...
         public String toTelegramString() {
             String emoji   = probability >= 83 ? "🔥" : probability >= 74 ? "✅"
                     : probability >= 65 ? "🟡" : "⚪";
@@ -300,6 +300,16 @@ public final class DecisionEngineMerged {
             if (rr > 0)
                 extra.append(String.format(" | R/R: 1:%.1f", rr));
 
+            // 🟢 ИСПРАВЛЕНИЕ: Добавляем данные ForecastEngine в вывод Telegram
+            if (forecast != null) {
+                extra.append(String.format("%n🔮 Forecast: *%s* (Score: %+.2f) | Conf: %.0f%% | Move: %+.2f%% | Phase: %s",
+                        forecast.bias.name(),
+                        forecast.directionScore,
+                        forecast.confidence * 100.0,
+                        forecast.projectedMovePct * 100.0,
+                        forecast.trendPhase));
+            }
+
             return String.format(
                     "%s *%s* → *%s* %s%n"
                             + "💰 Price:  `%.6f`%n"
@@ -311,14 +321,8 @@ public final class DecisionEngineMerged {
                             + "🏷 %s%s%n"
                             + "_⏰ %s_",
                     emoji, symbol, sideStr, catStr,
-                    price,
-                    probability,
-                    stop, riskPct,
-                    tp1, rp1Pct,
-                    tp2, rp2Pct,
-                    tp3, rp3Pct,
-                    flagStr, extra,
-                    time
+                    price, probability, stop, riskPct, tp1, rp1Pct,
+                    tp2, rp2Pct, tp3, rp3Pct, flagStr, extra.toString(), time
             );
         }
 
@@ -1148,6 +1152,55 @@ public final class DecisionEngineMerged {
                             && Math.abs(forecastResult.directionScore) > 0.3) {
                         probability = Math.min(85, probability + 2);
                         allFlags.add("FC_EARLY_BOOST");
+                    }
+
+                    // ---- Anti-range / anti-noise quality gate (use forecast strength) ----
+                    // Goal: avoid sending "directional noise" when MarketState says RANGE.
+                    double stopRetAbs = stopDist / (price + 1e-9); // risk as return fraction
+                    double fcMoveAbs = Math.abs(forecastResult.projectedMovePct); // return fraction
+                    double fcConf = forecastResult.confidence; // [0..1]
+                    double fcDirAbs = Math.abs(forecastResult.directionScore); // [-1..1] abs
+
+                    boolean isRange = state == MarketState.RANGE;
+
+                    // If expected move doesn't cover risk, it's mostly noise.
+                    boolean moveOk = fcMoveAbs >= stopRetAbs * (isRange ? 1.05 : 0.70);
+                    boolean confOk = fcConf >= (isRange ? 0.60 : 0.52);
+                    boolean dirOk = fcDirAbs >= (isRange ? 0.25 : 0.20);
+                    boolean neutralOk = forecastResult.bias != com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL;
+
+                    if (isRange) {
+                        if (!neutralOk) {
+                            probability = Math.max(50, probability - 5);
+                            allFlags.add("FC_NEUTRAL_RANGE");
+                        }
+                        // Bypass: если "кластерная" уверенность уже очень высокая,
+                        // то не рубим сигнал только из-за forecast-деталей.
+                        boolean highProbByClusters = probability >= 80;
+                        if (!highProbByClusters
+                                && (!moveOk || !confOk || !dirOk
+                                || forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION)) {
+                            allFlags.add("FC_RANGE_FILTER");
+                            return null;
+                        }
+                    } else {
+                        // In non-range modes we can be slightly more permissive.
+                        if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
+                            probability = Math.max(50, probability - 2);
+                            allFlags.add("FC_EXHAUST_SOFT");
+                        }
+                        if (!moveOk) {
+                            probability = Math.max(50, probability - 2);
+                            allFlags.add("FC_MOVE_WEAK");
+                        } else {
+                            allFlags.add("FC_MOVE_OK");
+                        }
+                        if (!confOk
+                                && forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL
+                                && probability < 80) {
+                            allFlags.add("FC_LOWCONF_NEUTRAL");
+                            return null;
+                        }
                     }
                 }
             } catch (Exception ignored) {}
