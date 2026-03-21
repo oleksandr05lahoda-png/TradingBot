@@ -432,36 +432,9 @@ public final class TradingCore {
         return new BollingerResult(upper, mid, lower, bw, pctB);
     }
 
-    /* ════════════════════════════════════════════════════════════════
-       MATH: CCI / MFI / OBV / CMF
-       ════════════════════════════════════════════════════════════════ */
 
-    public static double cci(List<Candle> candles, int period) {
-        if (candles == null || candles.size() < period) return 0;
-        int n = candles.size();
-        double[] tps = new double[period];
-        double sumTP = 0;
-        for (int i = 0; i < period; i++) { tps[i] = candles.get(n - period + i).typicalPrice(); sumTP += tps[i]; }
-        double avgTP = sumTP / period;
-        double meanDev = 0;
-        for (double tp : tps) meanDev += Math.abs(tp - avgTP);
-        meanDev /= period;
-        return meanDev > 0 ? (tps[period - 1] - avgTP) / (0.015 * meanDev) : 0;
-    }
 
-    public static double mfi(List<Candle> candles, int period) {
-        if (candles == null || candles.size() < period + 1) return 50;
-        int n = candles.size();
-        double posFlow = 0, negFlow = 0;
-        for (int i = n - period; i < n; i++) {
-            double tp = candles.get(i).typicalPrice();
-            double prevTp = candles.get(i - 1).typicalPrice();
-            double rawFlow = tp * candles.get(i).volume;
-            if (tp > prevTp)      posFlow += rawFlow;
-            else if (tp < prevTp) negFlow += rawFlow;
-        }
-        return negFlow > 0 ? 100.0 - 100.0 / (1.0 + posFlow / negFlow) : 100.0;
-    }
+
 
     public static double[] obvSeries(List<Candle> candles) {
         double[] obv = new double[candles.size()];
@@ -474,18 +447,7 @@ public final class TradingCore {
         return obv;
     }
 
-    public static double cmf(List<Candle> candles, int period) {
-        if (candles == null || candles.size() < period) return 0;
-        int n = candles.size();
-        double sumMFV = 0, sumVol = 0;
-        for (int i = n - period; i < n; i++) {
-            Candle c = candles.get(i);
-            double clv = c.range > 0 ? ((c.close - c.low) - (c.high - c.close)) / c.range : 0;
-            sumMFV += clv * c.volume;
-            sumVol += c.volume;
-        }
-        return sumVol > 0 ? sumMFV / sumVol : 0;
-    }
+
 
     /* ════════════════════════════════════════════════════════════════
        MATH: HURST EXPONENT — Trend persistence
@@ -528,187 +490,11 @@ public final class TradingCore {
         return clamp((pn * sumXY - sumX * sumY) / denom, 0.0, 1.0);
     }
 
-    /* ════════════════════════════════════════════════════════════════
-       MATH: SHANNON ENTROPY
-       ════════════════════════════════════════════════════════════════ */
 
-    public static double entropy(List<Candle> candles, int lookback, int bins) {
-        if (candles == null || candles.size() < lookback + 1) return 1.0;
-        int n = candles.size();
-        double[] returns = new double[lookback];
-        double minR = Double.MAX_VALUE, maxR = -Double.MAX_VALUE;
-        for (int i = 0; i < lookback; i++) {
-            returns[i] = (candles.get(n - lookback + i).close - candles.get(n - lookback + i - 1).close)
-                    / candles.get(n - lookback + i - 1).close;
-            minR = Math.min(minR, returns[i]); maxR = Math.max(maxR, returns[i]);
-        }
-        if (Math.abs(maxR - minR) < 1e-12) return 0;
-        double binWidth = (maxR - minR) / bins;
-        int[] counts = new int[bins];
-        for (double r : returns) {
-            int bin = (int) ((r - minR) / binWidth);
-            if (bin >= bins) bin = bins - 1;
-            counts[bin]++;
-        }
-        double h = 0;
-        for (int c : counts) {
-            if (c > 0) { double p = (double) c / lookback; h -= p * Math.log(p) / Math.log(2); }
-        }
-        return h / (Math.log(bins) / Math.log(2));
-    }
 
-    /* ════════════════════════════════════════════════════════════════
-       [v13.0 NEW] FISHER TRANSFORM — Lower-lag oscillator
-       Converts price distribution to approximately normal distribution.
-       Extreme readings (±2.5+) are much more reliable than RSI extremes.
-       ════════════════════════════════════════════════════════════════ */
 
-    public static final class FisherResult {
-        public final double fisher;
-        public final double signal;  // 1-bar lag of fisher
-        public final double value;   // normalized midpoint used
 
-        public FisherResult(double fisher, double signal, double value) {
-            this.fisher = fisher; this.signal = signal; this.value = value;
-        }
 
-        /** True reversal signal: crossed zero from extreme */
-        public boolean bullishReversal() { return fisher > 0 && signal < 0 && fisher > 1.5; }
-        public boolean bearishReversal() { return fisher < 0 && signal > 0 && fisher < -1.5; }
-        public boolean isOverbought()    { return fisher > 2.5; }
-        public boolean isOversold()      { return fisher < -2.5; }
-    }
-
-    public static FisherResult fisherTransform(List<Candle> candles, int period) {
-        if (candles == null || candles.size() < period + 2) return new FisherResult(0, 0, 0.5);
-        int n = candles.size();
-
-        double prevFisher = 0;
-        double prevValue = 0;
-        double fisher = 0;
-
-        for (int i = period - 1; i < n; i++) {
-            double highest = -Double.MAX_VALUE, lowest = Double.MAX_VALUE;
-            for (int j = i - period + 1; j <= i; j++) {
-                highest = Math.max(highest, candles.get(j).high);
-                lowest  = Math.min(lowest, candles.get(j).low);
-            }
-            double range = highest - lowest;
-            double value = range > 1e-10
-                    ? clamp(2.0 * ((candles.get(i).close - lowest) / range) - 1.0, -0.999, 0.999)
-                    : 0;
-            // Smooth the value
-            value = 0.33 * value + 0.67 * prevValue;
-            value = clamp(value, -0.999, 0.999);
-
-            // Fisher transform: arctanh approximation
-            prevFisher = fisher;
-            fisher = 0.5 * Math.log((1 + value) / (1 - value));
-            prevValue = value;
-        }
-
-        return new FisherResult(fisher, prevFisher, prevValue);
-    }
-
-    /* ════════════════════════════════════════════════════════════════
-       [v13.0 NEW] LINEAR REGRESSION CHANNEL
-       Core tool for 8-candle-ahead forecasting.
-       Slope tells you where price is headed; channel tells you extremes.
-       ════════════════════════════════════════════════════════════════ */
-
-    public static final class LinearRegressionResult {
-        public final double slope;        // price change per bar (positive = up)
-        public final double intercept;    // y-intercept
-        public final double rSquared;     // 0..1, fit quality
-        public final double stdDev;       // standard deviation of residuals
-        public final double midline;      // LR value at last bar
-        public final double upperChannel; // midline + 2*stdDev
-        public final double lowerChannel; // midline - 2*stdDev
-        public final double projectedPrice8; // projected price 8 bars ahead
-        public final double slopeAngleDeg;   // slope as angle in degrees (±90)
-        public final double normalizedSlope; // slope / ATR, regime-adjusted
-
-        public LinearRegressionResult(double slope, double intercept, double rSq, double stdDev,
-                                      double midline, double upperCh, double lowerCh,
-                                      double proj8, double angleDeg, double normSlope) {
-            this.slope = slope; this.intercept = intercept; this.rSquared = rSq; this.stdDev = stdDev;
-            this.midline = midline; this.upperChannel = upperCh; this.lowerChannel = lowerCh;
-            this.projectedPrice8 = proj8; this.slopeAngleDeg = angleDeg; this.normalizedSlope = normSlope;
-        }
-
-        /** Is price in upper half of channel (bearish pressure likely) */
-        public boolean inUpperHalf()  { return midline > 0 && upperChannel > lowerChannel; }
-
-        /** Trend is strong enough to follow */
-        public boolean isTrendingUp()   { return slope > 0 && rSquared > 0.55 && normalizedSlope > 0.15; }
-        public boolean isTrendingDown() { return slope < 0 && rSquared > 0.55 && normalizedSlope < -0.15; }
-
-        /** Price is near channel extremes — potential mean reversion */
-        public boolean nearUpperExtreme(double price) {
-            return upperChannel > lowerChannel && price > lowerChannel + (upperChannel - lowerChannel) * 0.80;
-        }
-        public boolean nearLowerExtreme(double price) {
-            return upperChannel > lowerChannel && price < lowerChannel + (upperChannel - lowerChannel) * 0.20;
-        }
-    }
-
-    public static LinearRegressionResult linearRegression(List<Candle> candles, int period) {
-        if (candles == null || candles.size() < period)
-            return new LinearRegressionResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-
-        int n = candles.size();
-        int start = n - period;
-        double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-
-        for (int i = 0; i < period; i++) {
-            double x = i;
-            double y = candles.get(start + i).close;
-            sumX  += x; sumY  += y; sumXY += x * y; sumX2 += x * x;
-        }
-
-        double denom = period * sumX2 - sumX * sumX;
-        if (Math.abs(denom) < 1e-12) {
-            double price = candles.get(n - 1).close;
-            return new LinearRegressionResult(0, price, 0, 0, price, price, price, price, 0, 0);
-        }
-
-        double slope     = (period * sumXY - sumX * sumY) / denom;
-        double intercept = (sumY - slope * sumX) / period;
-
-        // Residuals and R²
-        double meanY = sumY / period;
-        double ssTot = 0, ssRes = 0;
-        double sumResidSq = 0;
-        for (int i = 0; i < period; i++) {
-            double actual = candles.get(start + i).close;
-            double predicted = intercept + slope * i;
-            double resid = actual - predicted;
-            sumResidSq += resid * resid;
-            ssTot += Math.pow(actual - meanY, 2);
-            ssRes += Math.pow(resid, 2);
-        }
-
-        double rSquared = ssTot > 0 ? 1.0 - ssRes / ssTot : 0;
-        double stdDev = Math.sqrt(sumResidSq / period);
-
-        // Value at last bar
-        double midline = intercept + slope * (period - 1);
-        double upperCh = midline + 2 * stdDev;
-        double lowerCh = midline - 2 * stdDev;
-
-        // Project 8 bars ahead
-        double proj8 = intercept + slope * (period - 1 + 8);
-
-        // Slope angle in degrees
-        double angleDeg = Math.toDegrees(Math.atan(slope / Math.max(1e-10, candles.get(n - 1).close / period)));
-
-        // Normalized slope (slope per bar / current ATR)
-        double currentAtr = atr(candles, 14);
-        double normSlope = currentAtr > 0 ? slope / currentAtr : 0;
-
-        return new LinearRegressionResult(slope, intercept, clamp(rSquared, 0, 1), stdDev,
-                midline, upperCh, lowerCh, proj8, angleDeg, normSlope);
-    }
 
     /* ════════════════════════════════════════════════════════════════
        [v13.0 NEW] VOLUME PROFILE ENGINE
@@ -902,8 +688,7 @@ public final class TradingCore {
         MACDResult macdR = macd(candles, 12, 26, 9);
         ADXResult adxR   = adx(candles, 14);
         BollingerResult bbR = bollinger(candles, 20, 2.0);
-        FisherResult fishR = fisherTransform(candles, 9);
-        LinearRegressionResult lrr = linearRegression(candles, 34);
+
         double hurst = hurstExponent(candles, Math.min(60, n / 3));
         double[] atrArr = atrSeries(candles, 14);
 
@@ -986,7 +771,7 @@ public final class TradingCore {
             if (hurst < 0.45) evidence.add("MEAN_REVERTING_HURST");
         }
         // --- EXHAUSTION UP ---
-        else if (emaBullStack && rsiExtremeBull && (bbExtremeUpper || fishR.isOverbought())
+        else if (emaBullStack && rsiExtremeBull && bbExtremeUpper
                 && (volumeDecreasing || atrContracting)) {
             phase = TrendPhase.EXHAUSTION_UP;
             exhaustionScore = 0.75 + (rsiNow - 75) / 100 * 0.5;
@@ -994,10 +779,10 @@ public final class TradingCore {
             phaseConfidence = 0.70;
             evidence.add("RSI_EXTREME=" + String.format("%.0f", rsiNow));
             if (volumeDecreasing) evidence.add("VOL_DECLINING");
-            if (fishR.isOverbought()) evidence.add("FISHER_OB=" + String.format("%.2f", fishR.fisher));
+
         }
         // --- EXHAUSTION DOWN ---
-        else if (emaBearStack && rsiExtremeBear && (bbExtremeLower || fishR.isOversold())
+        else if (emaBearStack && rsiExtremeBear && bbExtremeLower
                 && (volumeDecreasing || atrContracting)) {
             phase = TrendPhase.EXHAUSTION_DOWN;
             exhaustionScore = 0.75 + (25 - rsiNow) / 100 * 0.5;
@@ -1005,7 +790,7 @@ public final class TradingCore {
             phaseConfidence = 0.70;
             evidence.add("RSI_EXTREME=" + String.format("%.0f", rsiNow));
             if (volumeDecreasing) evidence.add("VOL_DECLINING");
-            if (fishR.isOversold()) evidence.add("FISHER_OS=" + String.format("%.2f", fishR.fisher));
+
         }
         // --- EARLY BULL ---
         else if ((rsiFreshBull || emaJustCrossed) && emaBullStack && atrExpanding
