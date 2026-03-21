@@ -815,7 +815,10 @@ public final class TradingCore {
         double[] top5 = new double[Math.min(5, numBins)];
         for (int i = 0; i < top5.length; i++) top5[i] = binPrices[indices[i]];
         Arrays.sort(top5);
-        Collections.reverse(Arrays.asList());  // keep sorted
+        // top5 already sorted ascending — reverse for descending (highest volume first)
+        for (int i = 0, j = top5.length - 1; i < j; i++, j--) {
+            double tmp = top5[i]; top5[i] = top5[j]; top5[j] = tmp;
+        }
 
         double valueAreaWidth = vpoc > 0 ? (vah - val) / vpoc : 0;
 

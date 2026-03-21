@@ -160,33 +160,14 @@ public final class InstitutionalSignalCore {
         lastStreakUpdateMs = System.currentTimeMillis();
 
         if (win) {
-            // [v15.0 FIX Дыра 4] Aggressive streak reset on first win:
-            // Old: streakConfidenceBoost -= 1.5 (after 3 losses: 6.0 - 1.5 = 4.5 — still blocked!)
-            // New: halve the boost immediately, then apply additional decay
-            if (currentLossStreak >= 2) {
-                // First win after significant losing streak — aggressive recovery
-                streakConfidenceBoost = Math.max(0, streakConfidenceBoost * 0.35);
-                log("WIN after " + currentLossStreak + " losses → boost halved to " +
-                        String.format("%.1f", streakConfidenceBoost));
-            } else {
-                streakConfidenceBoost = Math.max(0, streakConfidenceBoost - 2.0);
-            }
+            streakConfidenceBoost = 0;
             currentLossStreak = 0;
             currentWinStreak++;
-            // [v12.0] Reset direction losses on any win
             if (side == TradingCore.Side.LONG) consecutiveLongLosses = 0;
             if (side == TradingCore.Side.SHORT) consecutiveShortLosses = 0;
         } else {
             currentLossStreak++;
             currentWinStreak = 0;
-            // [v15.0] Softer escalation — old values caused decision deadlock too fast
-            streakConfidenceBoost = switch (currentLossStreak) {
-                case 1 -> 1.0;
-                case 2 -> 2.5;
-                case 3 -> 4.5;
-                default -> Math.min(8.0, currentLossStreak * 1.8);
-            };
-            // [v12.0] Track direction-specific losses
             if (side == TradingCore.Side.LONG) {
                 consecutiveLongLosses++;
                 consecutiveShortLosses = 0;
@@ -219,18 +200,14 @@ public final class InstitutionalSignalCore {
     }
 
     public double getEffectiveMinConfidence() {
-        decayStreakBoost();
         resetDailyIfNeeded();
 
-        // [v12.2] NO timers. NO blocks. Just streak raising the bar.
-        double base = baseMinConfidence + streakConfidenceBoost;
+        // No timers. No blocks. No streak penalty. We rely on ForecastEngine.
+        double base = baseMinConfidence;
 
         // Backtest EV adjustment
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L)
             base += 3.0;
-
-        // Daily PnL penalty — worse day = higher threshold, but NEVER blocks
-        if (dailyPnLPct < -1.0) base += Math.min(5.0, Math.abs(dailyPnLPct));
 
         // Keep threshold strict but avoid decision deadlock with Forecast gatekeeper.
         return Math.max(52.0, Math.min(base, MAX_EFFECTIVE_MIN_CONF));
@@ -273,17 +250,6 @@ public final class InstitutionalSignalCore {
         // Symbol score check (poor performing symbols get blocked)
         double score = symbolScore.getOrDefault(sym, 0.0);
         if (score < -0.25 && getWinRate(sym) < 0.38 && getTradeCount(sym) >= 8) return false;
-
-        // [v12.0] Direction-specific loss check
-        // If we lost 3+ consecutive LONGs, require higher confidence for next LONG
-        if (signal.side == TradingCore.Side.LONG && consecutiveLongLosses >= (DIR_LOSS_PENALTY_THRESHOLD + 1)) {
-            double dirPenalty = Math.min(4.0, consecutiveLongLosses * 1.5);
-            if (signal.probability < getEffectiveMinConfidence() + dirPenalty) return false;
-        }
-        if (signal.side == TradingCore.Side.SHORT && consecutiveShortLosses >= (DIR_LOSS_PENALTY_THRESHOLD + 1)) {
-            double dirPenalty = Math.min(4.0, consecutiveShortLosses * 1.5);
-            if (signal.probability < getEffectiveMinConfidence() + dirPenalty) return false;
-        }
 
         return true;
     }
@@ -406,16 +372,10 @@ public final class InstitutionalSignalCore {
 
     /**
      * Risk multiplier for position sizing.
-     * After loss streaks we keep signal flow alive but reduce size.
+     * Streak guards and daily loss limiters removed. Kelly Criterion will dictate size.
      */
     public double getRiskSizeMultiplier() {
-        decayStreakBoost();
         double mult = 1.0;
-        if (currentLossStreak >= 2) mult *= 0.75;
-        if (currentLossStreak >= 3) mult *= 0.60;
-        if (currentLossStreak >= 4) mult *= 0.50;
-        if (dailyPnLPct < -1.5) mult *= 0.75;
-        if (dailyPnLPct < -3.0) mult *= 0.60;
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L) {
             mult *= 0.80;
         }

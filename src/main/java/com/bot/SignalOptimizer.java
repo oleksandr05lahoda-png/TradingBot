@@ -340,136 +340,10 @@ public final class SignalOptimizer {
      * - Exhaustion = единственный случай сильного штрафа (-15 max)
      */
     public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
-
-        MicroTrendResult mt = computeMicroTrend(signal.symbol);
-        double confidence = signal.probability;
-        double originalConf = confidence; // запоминаем для ограничения дельты
-
-        if (mt == null || mt.impulse < 1e-8) {
-            return confidence;
-        }
-
-        boolean isLong = signal.side == com.bot.TradingCore.Side.LONG;
-
-        // === 1. Trend Alignment ===
-        boolean trendUp = mt.speed > 0 || mt.smoothSpeed > 0;
-        double trendAlignment = (isLong && trendUp) || (!isLong && !trendUp) ? 1.0 : -1.0;
-
-        double range = STRONG_IMPULSE - WEAK_IMPULSE;
-        if (range <= 0) return confidence;
-
-        double adaptiveCap = computeAdaptiveImpulseCap(signal.symbol);
-        double impulseNorm;
-        if (mt.impulse <= WEAK_IMPULSE) {
-            impulseNorm = 0.0;
-        } else if (mt.impulse >= adaptiveCap) {
-            impulseNorm = 1.0;
-        } else {
-            double logMin = Math.log(WEAK_IMPULSE + 1e-9);
-            double logMax = Math.log(adaptiveCap + 1e-9);
-            double logVal = Math.log(mt.impulse + 1e-9);
-            impulseNorm = Math.max(0.0, Math.min(1.0, (logVal - logMin) / (logMax - logMin)));
-        }
-
-        // [v7.0] Мягкий множитель вместо агрессивного
-        double factor = 1.0 + trendAlignment * (0.03 + 0.08 * impulseNorm);
-        confidence *= factor;
-
-        // === 2. Momentum Strength (HALVED) ===
-        double momentumStrength = Math.abs(mt.momentum);
-        if (momentumStrength > MOMENTUM_THRESHOLD) {
-            boolean momAligned = (isLong && mt.momentum > 0) || (!isLong && mt.momentum < 0);
-            if (momAligned) {
-                confidence += 2.0 + Math.min(momentumStrength * 300, 3.0);
-            } else {
-                confidence -= 2.0;
-            }
-        }
-
-        // === 3. Direction Strength (HALVED) ===
-        double directionStrength = Math.abs(mt.smoothSpeed) / Math.max(Math.abs(mt.avg), 1e-9);
-        if (directionStrength > 0.0014) {
-            confidence += 2.0;
-        }
-
-        // === 4. MICRO REVERSAL FILTER ===
-        if (mt.speed * mt.accel < 0 && Math.abs(mt.accel) > Math.abs(mt.speed) * 0.7) {
-            confidence -= 3.0;
-        }
-
-        // === 5. EXHAUSTION FILTER (единственный сильный штраф) ===
-        if (mt.isExhausted) {
-            confidence -= 4.0;
-        }
-
-        // === 6. MOMENTUM CONFIRMATION (HALVED) ===
-        if (Math.abs(mt.smoothSpeed) > 0.0010 && trendAlignment > 0) {
-            confidence += 1.5;
-        }
-
-        // === 7. Tick Data Quality Bonus (HALVED) ===
-        if (mt.fromTicks && impulseNorm > 0.4) {
-            confidence += 1.5;
-        }
-
-        // === 8. PumpHunter Integration (HALVED + CAPPED) ===
-        if (pumpHunter != null) {
-            com.bot.PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(signal.symbol);
-            if (pump != null && pump.strength > 0.5) {
-                boolean pumpAligned = (isLong && pump.isBullish()) || (!isLong && pump.isBearish());
-                if (pumpAligned) {
-                    confidence += Math.min(3.0 + pump.strength * 3.0, 5.0);
-                } else {
-                    confidence -= 2.5;
-                }
-            }
-        }
-
-        // === 9. Strong impulse early detection (HALVED) ===
-        if (impulseNorm > 0.75 && trendAlignment > 0) {
-            confidence += 3.0;
-        }
-
-        // === 10. Momentum exhaustion warning ===
-        if (mt.isExhausted && Math.abs(mt.momentum) < momentumStrength * 0.5) {
-            confidence -= 4.0;
-        }
-        if (mt.isExhausted && trendAlignment < 0) {
-            confidence -= 15.0;  // Сильный штраф за сигнал против тренда на истощении
-        }
-
-        // === 11. Momentum fading check ===
-        Deque<Double> momHist = momentumHistory.get(signal.symbol);
-        if (mt.momentum != 0 && momHist != null && momHist.size() >= 5) {
-            List<Double> recentMom = new ArrayList<>(momHist);
-            double lastMom  = Math.abs(recentMom.get(recentMom.size() - 1));
-            double prevMom  = Math.abs(recentMom.get(recentMom.size() - 2));
-            double prev2Mom = Math.abs(recentMom.get(recentMom.size() - 3));
-
-            boolean momentumFalling = lastMom < prevMom * 0.70 && prevMom < prev2Mom * 0.70;
-            boolean speedAccelDiverge = mt.speed * mt.accel < 0 && Math.abs(mt.accel) > 0.00018;
-
-            if ((momentumFalling || speedAccelDiverge) && Math.abs(mt.smoothSpeed) > 0.0005) {
-                confidence -= 4.0;
-            }
-        }
-
-        if (trendAlignment < 0 && impulseNorm > 0.5 && mt.isExhausted) {
-            confidence -= 6.0;
-        }
-
-        // [v11.0] ЖЁСТКИЙ КАП: общее изменение не более ±8 от оригинала (was ±12/±15)
-        // Optimizer should REFINE, not OVERRIDE the DecisionEngine calibration
-        double delta = confidence - originalConf;
-        if (delta > 8.0)   confidence = originalConf + 8.0;
-        if (delta < -10.0) confidence = originalConf - 10.0;
-
-        // [v11.0] Компрессия выше 80% — hard diminishing returns
-        if (confidence > 80.0) {
-            confidence = 80.0 + (confidence - 80.0) * 0.20;
-        }
-
-        return clamp(confidence, MIN_CONF, MAX_CONF);
+        // [v18.0 REFACTOR] Bypassed arbitrary confidence scaling.
+        // The ForecastEngine and cluster models in DecisionEngineMerged now provide
+        // the final probability. SignalOptimizer is relegated to micro-trend tracking.
+        return signal.probability;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -482,25 +356,8 @@ public final class SignalOptimizer {
      */
     public com.bot.DecisionEngineMerged.TradeIdea withAdjustedConfidence(
             com.bot.DecisionEngineMerged.TradeIdea signal) {
-
-        double newConfidence = adjustConfidence(signal);
-
-        return new com.bot.DecisionEngineMerged.TradeIdea(
-                signal.symbol,
-                signal.side,
-                signal.price,
-                signal.stop,
-                signal.take,
-                signal.rr,
-                newConfidence,
-                new java.util.ArrayList<>(signal.flags),
-                signal.fundingRate,
-                signal.fundingDelta,
-                signal.oiChange,
-                signal.htfBias,
-                signal.category,
-                signal.forecast
-        );
+        // [v18.0] Return unchanged signal since scaling is removed
+        return signal;
     }
 
     // ══════════════════════════════════════════════════════════════

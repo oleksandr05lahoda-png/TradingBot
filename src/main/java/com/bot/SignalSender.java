@@ -561,20 +561,12 @@ public final class SignalSender {
             double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
 
             if (gicWeight <= 0.0) return null;
-            if (gicWeight < 1.0) {
-                double penaltyProb = idea.probability * gicWeight;
-                if (penaltyProb < MIN_CONF) return null;
-                idea = rebuildIdea(idea, penaltyProb, idea.flags);
-            } else if (gicWeight > 1.0) {
-                // [v7.0 FIX] Cap at 88 (not 90) to respect DecisionEngine calibration
-                idea = rebuildIdea(idea, Math.min(85, idea.probability * gicWeight), idea.flags);
-            }
 
             if (!correlationGuard.allow(pair, idea.side, cat, sector)) {
                 blockedCorr.incrementAndGet(); return null;
             }
 
-            // [v7.0] PumpHunter: diminishing boost, cap 88
+            // [v18.0 REFACTOR] PumpHunter: flag only, no arbitrary confidence scaling
             com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15);
             if (pump != null && pump.strength > 0.40) {
                 boolean aligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
@@ -582,52 +574,39 @@ public final class SignalSender {
                 if (aligned) {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("PH_" + pump.type.name());
-                    // [v7.0] Diminishing: бонус уменьшается чем выше текущая probability
-                    double headroom = 85.0 - idea.probability;
-                    double bonus = Math.min(pump.strength * 6, headroom * 0.5);
-                    idea = rebuildIdea(idea, Math.min(85, idea.probability + bonus), nf);
+                    idea = rebuildIdea(idea, idea.probability, nf);
                 }
             }
 
             idea = optimizer.withAdjustedConfidence(idea);
             if (idea.probability < MIN_CONF) return null;
 
-            // [v7.0] OBI: diminishing boost, cap 88
+            // [v18.0 REFACTOR] OBI: flag only, no probability scaling, no blocking
             OrderbookSnapshot obs = orderbookMap.get(pair);
             if (obs != null && obs.isFresh()) {
                 double obi = obs.obi();
-                boolean obiContra = (isLong && obi < -OBI_THRESHOLD * 1.5) ||
-                        (!isLong && obi > OBI_THRESHOLD * 1.5);
                 boolean obiAligned = (isLong && obi > OBI_THRESHOLD) || (!isLong && obi < -OBI_THRESHOLD);
-                if (obiContra && idea.probability < 77) return null;
                 if (obiAligned) {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("OBI" + String.format("%+.0f", obi * 100));
-                    double headroom = 85.0 - idea.probability;
-                    double bonus = Math.min(Math.abs(obi) * 4, headroom * 0.4);
-                    idea = rebuildIdea(idea, Math.min(85, idea.probability + bonus), nf);
+                    idea = rebuildIdea(idea, idea.probability, nf);
                 }
             }
 
-            // [v7.0] Delta: diminishing boost, cap 88
-            boolean deltaOk = (isLong && normDelta > 0.14) || (!isLong && normDelta < -0.14) || Math.abs(normDelta) < 0.07;
-            if (!deltaOk && idea.probability < DELTA_BLOCK_CONF) return null;
+            // [v18.0 REFACTOR] Delta: flag only, no blocking
             if (Math.abs(normDelta) > 0.28) {
                 List<String> nf = new ArrayList<>(idea.flags);
                 nf.add("Δ" + (normDelta > 0 ? "BUY" : "SELL") + pct(Math.abs(normDelta)));
-                double headroom = 85.0 - idea.probability;
-                double bonus = Math.min(Math.abs(normDelta) * 3, headroom * 0.35);
-                idea = rebuildIdea(idea, Math.min(85, idea.probability + bonus), nf);
+                idea = rebuildIdea(idea, idea.probability, nf);
             }
 
+            // [v18.0 REFACTOR] Sector Weakness: tag only, no confidence fading
             if (sector != null && isLong) {
                 double weakness = gic.getSectorWeakness(sector);
-                if (weakness > 0.5) {
-                    double penaltyProb = idea.probability * (1 - weakness * 0.3);
-                    if (penaltyProb < MIN_CONF) return null;
+                if (weakness > 0.7) {
                     List<String> nf = new ArrayList<>(idea.flags);
                     nf.add("WEAK_SECTOR");
-                    idea = rebuildIdea(idea, penaltyProb, nf);
+                    idea = rebuildIdea(idea, idea.probability, nf);
                 }
             }
 
@@ -950,12 +929,22 @@ public final class SignalSender {
     private void checkWsHealth() {
         long now = System.currentTimeMillis();
         long staleThreshold = 5 * 60_000L;
+        // [FIX-WS-STORM] Collect stale pairs first, THEN reconnect.
+        // Old code reconnected inside the iterator → ConcurrentModificationException risk
+        // AND didn't clear lastTickTime → same pair re-triggered every 30s.
+        List<String> stalePairs = new ArrayList<>();
         for (Map.Entry<String, WebSocket> e : wsMap.entrySet()) {
             Long last = lastTickTime.get(e.getKey());
             if (last != null && now - last > staleThreshold) {
-                System.out.printf("[WS-HEALTH] %s stale — reconnecting%n", e.getKey());
-                reconnectWs(e.getKey());
+                stalePairs.add(e.getKey());
             }
+        }
+        for (String pair : stalePairs) {
+            if (!wsMap.containsKey(pair)) continue; // already disconnected
+            System.out.printf("[WS-HEALTH] %s stale (no data for %ds) — reconnecting%n",
+                    pair, (now - lastTickTime.getOrDefault(pair, now)) / 1000);
+            lastTickTime.remove(pair); // [FIX] Prevent re-trigger next cycle
+            reconnectWs(pair);
         }
         if (!API_KEY.isBlank() && udsWebSocket == null) {
             scheduleUdsRetry(2);
@@ -1224,12 +1213,20 @@ public final class SignalSender {
                                     } catch (Exception ignored) {}
                                     return CompletableFuture.completedFuture(null);
                                 }
-                                @Override public void onError(WebSocket ws, Throwable error) { reconnectWs(pair); }
+                                @Override public void onError(WebSocket ws, Throwable error) {
+                                    System.out.printf("[WS] %s error: %s%n", pair, error.getMessage());
+                                    reconnectWs(pair);
+                                }
                                 @Override public CompletionStage<?> onClose(WebSocket ws, int code, String reason) {
+                                    System.out.printf("[WS] %s closed (code=%d)%n", pair, code);
                                     reconnectWs(pair); return CompletableFuture.completedFuture(null);
                                 }
                             })
-                    .thenAccept(ws -> { wsMap.put(pair, ws); wsReconnectDelay.put(pair, WS_INITIAL_DELAY_MS); })
+                    .thenAccept(ws -> {
+                        wsMap.put(pair, ws);
+                        wsReconnectDelay.put(pair, WS_INITIAL_DELAY_MS); // Reset backoff on success
+                        reconnectingPairs.remove(pair); // Allow future reconnects
+                    })
                     .exceptionally(ex -> { long delay = wsReconnectDelay.getOrDefault(pair, WS_INITIAL_DELAY_MS);
                         wsWatcher.schedule(() -> connectWsInternal(pair), delay, TimeUnit.MILLISECONDS);
                         wsReconnectDelay.put(pair, Math.min(delay * 2, WS_MAX_DELAY_MS)); return null; });
@@ -1275,8 +1272,18 @@ public final class SignalSender {
         }
     }
 
+    // [FIX-WS-STORM] Guard against concurrent reconnects for same pair
+    private final Set<String> reconnectingPairs = ConcurrentHashMap.newKeySet();
+
     private void reconnectWs(String pair) {
-        wsMap.remove(pair);
+        // Only one reconnect attempt per pair at a time
+        if (!reconnectingPairs.add(pair)) {
+            return; // another reconnect already in progress
+        }
+        WebSocket old = wsMap.remove(pair);
+        if (old != null) {
+            try { old.sendClose(WebSocket.NORMAL_CLOSURE, "reconnecting"); } catch (Exception ignored) {}
+        }
         long delay = wsReconnectDelay.getOrDefault(pair, WS_INITIAL_DELAY_MS);
         wsWatcher.schedule(() -> connectWsInternal(pair), delay, TimeUnit.MILLISECONDS);
         wsReconnectDelay.put(pair, Math.min(delay * 2, WS_MAX_DELAY_MS));
