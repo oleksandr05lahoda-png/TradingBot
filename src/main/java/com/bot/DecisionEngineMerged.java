@@ -1152,14 +1152,28 @@ public final class DecisionEngineMerged {
                     allFlags.add("FC_" + forecastResult.bias.name());
                     allFlags.add("PH_" + forecastResult.trendPhase.name());
 
-                    // [v15.0 FIX KITEUSDT] Volatility Squeeze Guard
-                    // If forecast detected squeeze zone → block ALL directional signals
-                    // The squeeze guard sets confidence < 0.5 and dirScore near 0
-                    if (forecastResult.confidence < 0.25
-                            && Math.abs(forecastResult.directionScore) < 0.10
-                            && forecastResult.factorScores.containsKey("LR_ACCEL")) {
+                    // [v16.0] Volatility Squeeze Guard
+                    // New engine sets SQUEEZE=1.0 when in compression zone
+                    Double squeezeFlag = forecastResult.factorScores.get("SQUEEZE");
+                    if (squeezeFlag != null && squeezeFlag > 0.5) {
                         allFlags.add("FC_VETO_SQUEEZE");
                         return null;
+                    }
+
+                    // [v16.0] EXHAUSTION OVERRIDE — the core innovation
+                    // If forecast says EXHAUSTION with high confidence, trust it
+                    Double exhaustionFlag = forecastResult.factorScores.get("EXHAUSTION");
+                    if (exhaustionFlag != null && exhaustionFlag > 0.55
+                            && forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
+                        // Forecast says the move is dying — check if signal agrees
+                        boolean sigLongX = side == com.bot.TradingCore.Side.LONG;
+                        Double moveDirFlag = forecastResult.factorScores.get("MOVE_DIR");
+                        int moveDir = moveDirFlag != null ? (int) Math.signum(moveDirFlag) : 0;
+                        // If signal is in SAME direction as dying move → VETO
+                        if ((sigLongX && moveDir > 0) || (!sigLongX && moveDir < 0)) {
+                            allFlags.add("FC_VETO_EXHAUST_V16");
+                            return null;
+                        }
                     }
 
                     boolean fcBull = forecastResult.directionScore > 0.2;

@@ -1593,10 +1593,36 @@ public final class TradingCore {
     public static boolean valid(List<?> c, int minBars)          { return c != null && c.size() >= minBars; }
 
     /* ════════════════════════════════════════════════════════════════
-       [v14.0] FORECAST ENGINE — 9-Factor Direction Forecaster
-       Прогнозирует направление на 4-8 свечей 15m вперёд.
-       Был отсутствующим классом — BotMain ссылался на forecast поля
-       которых не существовало. Встроен в TradingCore как inner class.
+       [v16.0] FORECAST ENGINE — REVERSAL-AWARE Direction Forecaster
+       ════════════════════════════════════════════════════════════════
+
+       PHILOSOPHY CHANGE (v16.0):
+       Old engine asked: "what is the trend?" → extrapolated it.
+       This is WHY it was always wrong — 5 bullish candles → "BULL" → instant reversal.
+
+       New engine asks: "HOW MUCH ENERGY remains in this move?"
+
+       Core concept: every move has FUEL. Fuel = volume × momentum × fresh structure.
+       When fuel runs out → reversal. When fuel is full → trend continues.
+
+       The engine now has TWO brains:
+       1. TREND BRAIN: Is there a trend? Which direction? (classic — kept but deprioritized)
+       2. EXHAUSTION BRAIN: Is the current move RUNNING OUT OF FUEL? (new — dominant)
+
+       The exhaustion brain OVERRIDES the trend brain.
+       5 green candles + exhaustion signals = BEAR forecast (not BULL!).
+
+       New factors:
+       · MoveAge — how many bars since last significant reversal
+       · MoveDepth — how far has price moved from move origin (% of ATR)
+       · VolumeFade — is volume declining during the move? (= running dry)
+       · MomentumDecay — is each bar smaller than the previous? (= deceleration)
+       · WickRejection — are wicks growing? (= opposition forming)
+       · RSI Extreme Zone — is RSI >70 or <30 with divergence?
+       · VPOC Magnet — is price far from high-volume node? (rubber band)
+       · Squeeze Detection — is ATR at historic lows? (= about to explode)
+       · HTF Alignment — does the higher timeframe agree?
+       · Orderflow — taker buy/sell ratio
        ════════════════════════════════════════════════════════════════ */
 
     public static final class ForecastEngine {
@@ -1622,104 +1648,375 @@ public final class TradingCore {
                 this.factorScores = factors != null ? Collections.unmodifiableMap(factors) : Map.of();
             }
             @Override public String toString() {
-                return String.format("Forecast[%s dir=%.3f conf=%.0f%% phase=%s]",
-                        bias, directionScore, confidence * 100, trendPhase);
+                return String.format("Forecast[%s dir=%.3f conf=%.0f%% phase=%s move=%.3f%%]",
+                        bias, directionScore, confidence * 100, trendPhase, projectedMovePct * 100);
             }
         }
-
-        // Weights (sum = 1.0)
-        private static final double W_LR=0.18, W_VP=0.12, W_TP=0.15, W_FI=0.10,
-                W_AR=0.05, W_SS=0.15, W_MA=0.10, W_OF=0.08, W_MT=0.07;
-
-        // [v15.0] Shortened regression windows + acceleration
-        // LR_SHORT: for direction forecast (fast reactions to V-reversals)
-        // LR_LONG: for projected move (smoother projection)
-        private static final int LR_SHORT = 10;  // [FIX Дыра 3] was 30 — missed V-reversals!
-        private static final int LR_LONG  = 20;  // for projected move only
 
         public ForecastResult forecast(List<Candle> c5, List<Candle> c15,
                                        List<Candle> c1h, double volumeDelta) {
             if (c15 == null || c15.size() < 100 || c1h == null || c1h.size() < 50) return null;
-            double price = c15.get(c15.size()-1).close;
+            int n = c15.size();
+            double price = c15.get(n - 1).close;
             double atr14 = fcAtr(c15, 14);
             if (atr14 <= 0 || price <= 0) return null;
 
-            // [v15.0 FIX KITEUSDT] Volatility Squeeze Guard
-            // If ATR has collapsed to anomalous lows → compression zone
-            // All directional signals become unreliable; force NEUTRAL
-            boolean squeezed = isVolatilitySqueeze(c15, atr14);
-
             Map<String, Double> f = new LinkedHashMap<>();
-            // [v15.0 FIX Дыра 3] Use LR_SHORT (10 bars = 2.5h) instead of 30 (7.5h)
-            double lrS = calcLR(c15, LR_SHORT, atr14); f.put("LR", lrS);
-            // [v15.0] Also compute acceleration: change in slope (2nd derivative)
-            double lrAccel = calcLRAccel(c15, LR_SHORT, atr14); f.put("LR_ACCEL", lrAccel);
-            double vpS = calcVP(c15, 50, price, atr14); f.put("VP", vpS);
-            TrendPhase phase = detectPhase(c15, c1h);
-            double tpS = calcPhaseScore(c15, phase); f.put("TP", tpS);
-            double fiS = calcFisher(c15, 10); f.put("FI", fiS);
-            double arS = calcAtrRegime(c15, atr14); f.put("AR", arS);
-            double ssS = calcSwing(c15); f.put("SS", ssS);
-            double maS = calcMomAccel(c15, atr14); f.put("MA", maS);
-            double ofS = calcOrderflow(c15, volumeDelta); f.put("OF", ofS);
-            double mtS = calcMTF(c5, c15, c1h); f.put("MT", mtS);
 
-            // [v15.0] LR acceleration gets small weight — helps catch V-reversals
-            double dir = lrS*W_LR + lrAccel*0.06 + vpS*W_VP + tpS*W_TP + fiS*W_FI + arS*W_AR
-                    + ssS*W_SS + maS*W_MA + ofS*W_OF + mtS*(W_MT - 0.06);
-            dir = clamp(dir, -1.0, 1.0);
+            // ═══════════════════════════════════════════════════════
+            // STEP 1: Identify the CURRENT MOVE (direction + age + depth)
+            // ═══════════════════════════════════════════════════════
+            MoveInfo move = identifyCurrentMove(c15, atr14);
+            f.put("MOVE_DIR", (double) move.direction);
+            f.put("MOVE_AGE", (double) move.ageBars);
+            f.put("MOVE_DEPTH", move.depthAtr);
 
-            // [v15.0 FIX KITEUSDT] In squeeze zone, clamp dir toward zero
+            // ═══════════════════════════════════════════════════════
+            // STEP 2: EXHAUSTION BRAIN — is this move dying?
+            // This is the KEY innovation. Each factor answers:
+            // "Is the fuel running out?" → positive = exhausted → reversal likely
+            // ═══════════════════════════════════════════════════════
+            double exhaustionScore = 0;
+            int exhaustionSignals = 0;
+
+            // Factor E1: Volume Fade — volume declining during the move
+            double volFade = calcVolumeFade(c15, move);
+            f.put("VOL_FADE", volFade);
+            if (volFade > 0.3) { exhaustionScore += volFade * 0.25; exhaustionSignals++; }
+
+            // Factor E2: Momentum Decay — each bar getting smaller
+            double momDecay = calcMomentumDecay(c15, move, atr14);
+            f.put("MOM_DECAY", momDecay);
+            if (momDecay > 0.3) { exhaustionScore += momDecay * 0.25; exhaustionSignals++; }
+
+            // Factor E3: Wick Rejection — opposition forming
+            double wickReject = calcWickRejection(c15, move);
+            f.put("WICK_REJ", wickReject);
+            if (wickReject > 0.3) { exhaustionScore += wickReject * 0.20; exhaustionSignals++; }
+
+            // Factor E4: RSI Extreme + Divergence
+            double rsiExhaust = calcRsiExhaustion(c15, move);
+            f.put("RSI_EXH", rsiExhaust);
+            if (rsiExhaust > 0.3) { exhaustionScore += rsiExhaust * 0.20; exhaustionSignals++; }
+
+            // Factor E5: Move overextended (moved too far too fast)
+            double overext = calcOverextension(move, atr14);
+            f.put("OVEREXT", overext);
+            if (overext > 0.3) { exhaustionScore += overext * 0.15; exhaustionSignals++; }
+
+            // Factor E6: VPOC Rubber Band — price far from volume magnet
+            double vpocPull = calcVpocPull(c15, price, atr14);
+            f.put("VPOC_PULL", vpocPull);
+
+            exhaustionScore = clamp(exhaustionScore, 0, 1);
+            f.put("EXHAUSTION", exhaustionScore);
+
+            // ═══════════════════════════════════════════════════════
+            // STEP 3: TREND BRAIN — but weaker voice now
+            // ═══════════════════════════════════════════════════════
+            double trendDir = 0;
+
+            // Short-term LR slope (fast, 8 bars)
+            double lr8 = linRegSlope(c15, 8);
+            double lrScore = clamp(lr8 * 6 / atr14 * 0.30, -0.6, 0.6);
+            f.put("LR_8", lrScore);
+            trendDir += lrScore * 0.20;
+
+            // Swing structure
+            double swingScore = com.bot.DecisionEngineMerged.marketStructure(c15) * 0.50;
+            f.put("SWING", swingScore);
+            trendDir += swingScore * 0.15;
+
+            // Orderflow
+            double ofScore = calcOrderflow(c15, volumeDelta);
+            f.put("OF", ofScore);
+            trendDir += ofScore * 0.15;
+
+            // HTF alignment (1h)
+            double htfScore = calcHTF(c15, c1h);
+            f.put("HTF", htfScore);
+            trendDir += htfScore * 0.15;
+
+            // Fisher cross
+            double fisherScore = calcFisher(c15, 10);
+            f.put("FISHER", fisherScore);
+            trendDir += fisherScore * 0.10;
+
+            trendDir = clamp(trendDir, -1.0, 1.0);
+
+            // ═══════════════════════════════════════════════════════
+            // STEP 4: SQUEEZE detection — block all direction in compression
+            // ═══════════════════════════════════════════════════════
+            boolean squeezed = isVolatilitySqueeze(c15, atr14);
+            f.put("SQUEEZE", squeezed ? 1.0 : 0.0);
+
+            // ═══════════════════════════════════════════════════════
+            // STEP 5: COMBINE — Exhaustion OVERRIDES Trend
+            // ═══════════════════════════════════════════════════════
+            TrendPhase phase = detectPhase(c15, c1h, move, exhaustionScore);
+
+            double dir;
             if (squeezed) {
-                dir *= 0.25; // Drastically reduce directional conviction in compression
+                // In squeeze: no directional conviction at all
+                dir = trendDir * 0.15;
+            } else if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
+                // STRONG exhaustion: forecast REVERSAL (opposite to current move)
+                dir = -move.direction * exhaustionScore * 0.70;
+                // Trend brain can barely whisper
+                dir += trendDir * 0.10;
+            } else if (exhaustionScore > 0.35 && exhaustionSignals >= 2) {
+                // Moderate exhaustion: heavily reduce trend conviction
+                dir = trendDir * 0.30 + vpocPull * 0.20;
+                // Slight counter-move bias
+                dir -= move.direction * exhaustionScore * 0.25;
+            } else if (phase == TrendPhase.EARLY) {
+                // Early in move: trend brain speaks louder
+                dir = trendDir * 0.70 + vpocPull * 0.10;
+            } else {
+                // Normal: balanced
+                dir = trendDir * 0.55 + vpocPull * 0.15;
+                // Mild exhaustion brake
+                if (exhaustionScore > 0.15) dir *= (1.0 - exhaustionScore * 0.3);
             }
 
-            int bull=0, bear=0;
-            for (double v : f.values()) { if (v>0.15) bull++; if (v<-0.15) bear++; }
-            double conf = clamp((double)Math.max(bull,bear)/f.size()*1.2 + Math.abs(dir)*0.3, 0.1, 0.95);
+            dir = clamp(dir, -1.0, 1.0);
 
-            // [v15.0] Squeeze reduces confidence too
-            if (squeezed) conf *= 0.5;
+            // ═══════════════════════════════════════════════════════
+            // STEP 6: Confidence = how many signals agree?
+            // ═══════════════════════════════════════════════════════
+            double conf;
+            if (squeezed) {
+                conf = 0.15; // Almost zero confidence in squeeze
+            } else if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
+                conf = clamp(0.50 + exhaustionScore * 0.30, 0.50, 0.85);
+            } else {
+                int agree = 0;
+                double dirSign = Math.signum(dir);
+                for (double v : f.values()) {
+                    if (Math.signum(v) == dirSign && Math.abs(v) > 0.10) agree++;
+                }
+                conf = clamp(0.25 + (double) agree / f.size() * 0.50 + Math.abs(dir) * 0.20, 0.10, 0.85);
+            }
 
-            ForecastBias bias = dir > 0.45 ? ForecastBias.STRONG_BULL
-                    : dir > 0.15 ? ForecastBias.BULL : dir < -0.45 ? ForecastBias.STRONG_BEAR
-                    : dir < -0.15 ? ForecastBias.BEAR : ForecastBias.NEUTRAL;
+            // ═══════════════════════════════════════════════════════
+            // STEP 7: Bias classification
+            // ═══════════════════════════════════════════════════════
+            ForecastBias bias;
+            if (dir > 0.40) bias = ForecastBias.STRONG_BULL;
+            else if (dir > 0.12) bias = ForecastBias.BULL;
+            else if (dir < -0.40) bias = ForecastBias.STRONG_BEAR;
+            else if (dir < -0.12) bias = ForecastBias.BEAR;
+            else bias = ForecastBias.NEUTRAL;
 
-            // [v15.0 FIX Дыра 3] Use LR_LONG (20) only for projection, not direction
-            double lrSlope = linRegSlope(c15, LR_LONG);
-            double projMove = lrSlope * 8 / price;
+            double projMove = lr8 * 6 / price;
             double vpoc = calcVPOC(c15, 50);
 
             return new ForecastResult(bias, dir, conf, phase, projMove, vpoc, f);
         }
 
-        // ── Factor 1: Linear Regression ──────────────────────
-        private double calcLR(List<Candle> c, int p, double atr) {
-            double slope = linRegSlope(c, p);
-            return clamp(slope * 8 / atr * 0.35, -1.0, 1.0);
+        // ═══════════════════════════════════════════════════════
+        //  MOVE IDENTIFICATION — find origin, direction, age, depth
+        // ═══════════════════════════════════════════════════════
+
+        private static final class MoveInfo {
+            final int direction;     // +1 = bullish move, -1 = bearish, 0 = flat
+            final int ageBars;       // how many bars since move started
+            final double depthAtr;   // how far moved in ATR units
+            final int originIdx;     // bar index where the move started
+            final double originPrice;
+            MoveInfo(int dir, int age, double depth, int origin, double originP) {
+                this.direction = dir; this.ageBars = age; this.depthAtr = depth;
+                this.originIdx = origin; this.originPrice = originP;
+            }
         }
 
-        /** [v15.0 FIX Дыра 3] LR Acceleration — 2nd derivative of slope.
-         *  Detects V-reversals: slope still negative, but acceleration positive = turning up. */
-        private double calcLRAccel(List<Candle> c, int p, double atr) {
+        private MoveInfo identifyCurrentMove(List<Candle> c, double atr) {
             int n = c.size();
-            if (n < p + 5) return 0;
-            // Slope over recent [p] bars
-            double slopeNow = linRegSlope(c, p);
-            // Slope over [p] bars shifted back by 5 bars
-            double slopePrev = linRegSlope(c.subList(0, n - 5), p);
-            // Acceleration = change in slope, normalized by ATR
-            return clamp((slopeNow - slopePrev) * 5 / atr * 0.30, -0.8, 0.8);
+            double price = c.get(n - 1).close;
+            // Walk backwards to find where the current directional move started
+            // A "reversal" = close crosses EMA5 in opposite direction with body > 0.3*ATR
+            double ema5 = fcEma(c, 5);
+            boolean currentBull = price > ema5;
+
+            int origin = n - 1;
+            for (int i = n - 2; i >= Math.max(0, n - 30); i--) {
+                boolean barBull = c.get(i).close > fcEma(c.subList(0, i + 1), 5);
+                if (barBull != currentBull) {
+                    origin = i + 1;
+                    break;
+                }
+                origin = i;
+            }
+
+            int age = n - 1 - origin;
+            double depth = Math.abs(price - c.get(origin).close) / (atr + 1e-12);
+            int dir = currentBull ? 1 : -1;
+            if (age <= 1 && depth < 0.3) dir = 0;
+
+            return new MoveInfo(dir, age, depth, origin, c.get(origin).close);
         }
 
-        /** [v15.0 FIX KITEUSDT] Volatility Squeeze Guard.
-         *  Detects when ATR collapses to anomalous lows = spring compression.
-         *  In this zone: any directional signal is unreliable (BOS_DN is noise).
-         *  Returns true if market is in volatility squeeze. */
+        // ═══════════════════════════════════════════════════════
+        //  EXHAUSTION FACTORS
+        // ═══════════════════════════════════════════════════════
+
+        /** Volume Fade: average volume of last 3 bars vs first 3 bars of move.
+         *  If later bars have less volume → move losing fuel. Returns [0..1]. */
+        private double calcVolumeFade(List<Candle> c, MoveInfo move) {
+            if (move.ageBars < 4) return 0;
+            int n = c.size();
+            int start = move.originIdx;
+            // Average volume of first 3 bars of move
+            double volStart = 0;
+            int cnt1 = 0;
+            for (int i = start; i < Math.min(start + 3, n); i++) {
+                volStart += c.get(i).volume; cnt1++;
+            }
+            volStart = cnt1 > 0 ? volStart / cnt1 : 1;
+            // Average volume of last 3 bars
+            double volEnd = 0;
+            int cnt2 = 0;
+            for (int i = n - 3; i < n; i++) {
+                volEnd += c.get(i).volume; cnt2++;
+            }
+            volEnd = cnt2 > 0 ? volEnd / cnt2 : 1;
+            if (volStart < 1e-12) return 0;
+            double ratio = volEnd / volStart;
+            // ratio < 1 = volume fading. Map: ratio 0.3→1.0, ratio 0.7→0.3, ratio 1.0→0
+            return clamp((1.0 - ratio) * 1.5, 0, 1);
+        }
+
+        /** Momentum Decay: body size of last 3 bars vs first 3 bars.
+         *  If each bar is smaller → momentum dying. Returns [0..1]. */
+        private double calcMomentumDecay(List<Candle> c, MoveInfo move, double atr) {
+            if (move.ageBars < 4) return 0;
+            int n = c.size();
+            int start = move.originIdx;
+            // Directional body size (in trend direction) of first 3
+            double bodyStart = 0;
+            int cnt = 0;
+            for (int i = start; i < Math.min(start + 3, n); i++) {
+                double body = (c.get(i).close - c.get(i).open) * move.direction;
+                bodyStart += Math.max(0, body);
+                cnt++;
+            }
+            bodyStart = cnt > 0 ? bodyStart / cnt : 0;
+            // Last 3
+            double bodyEnd = 0;
+            cnt = 0;
+            for (int i = n - 3; i < n; i++) {
+                double body = (c.get(i).close - c.get(i).open) * move.direction;
+                bodyEnd += Math.max(0, body);
+                cnt++;
+            }
+            bodyEnd = cnt > 0 ? bodyEnd / cnt : 0;
+            if (bodyStart < atr * 0.05) return 0;
+            double ratio = bodyEnd / (bodyStart + 1e-12);
+            // Also check: are recent bars going AGAINST the trend?
+            double lastBody = (c.get(n - 1).close - c.get(n - 1).open) * move.direction;
+            double counterPenalty = lastBody < 0 ? 0.3 : 0; // Last bar is counter-trend
+            return clamp((1.0 - ratio) * 1.3 + counterPenalty, 0, 1);
+        }
+
+        /** Wick Rejection: wicks against the move growing = opposition forming.
+         *  In bullish move: upper wicks growing = sellers pushing back. Returns [0..1]. */
+        private double calcWickRejection(List<Candle> c, MoveInfo move) {
+            int n = c.size();
+            if (move.ageBars < 3 || n < 5) return 0;
+            double wickScore = 0;
+            for (int i = n - 3; i < n; i++) {
+                Candle bar = c.get(i);
+                double body = Math.abs(bar.close - bar.open) + 1e-12;
+                if (move.direction > 0) {
+                    // Bullish move → upper wicks = rejection from above
+                    double uw = bar.high - Math.max(bar.close, bar.open);
+                    if (uw > body * 1.5) wickScore += 0.35;
+                    else if (uw > body) wickScore += 0.15;
+                } else {
+                    // Bearish move → lower wicks = rejection from below (buyers)
+                    double lw = Math.min(bar.close, bar.open) - bar.low;
+                    if (lw > body * 1.5) wickScore += 0.35;
+                    else if (lw > body) wickScore += 0.15;
+                }
+            }
+            return clamp(wickScore, 0, 1);
+        }
+
+        /** RSI Exhaustion: RSI in extreme zone + RSI deceleration.
+         *  Returns [0..1], higher = more exhausted. */
+        private double calcRsiExhaustion(List<Candle> c, MoveInfo move) {
+            int n = c.size();
+            if (n < 20) return 0;
+            double rsi14 = rsi(c, 14);
+            double rsi14_prev = rsi(c.subList(0, n - 3), 14);
+            double score = 0;
+            if (move.direction > 0) {
+                // Bullish move: RSI > 70 = overbought
+                if (rsi14 > 75) score += 0.40;
+                else if (rsi14 > 68) score += 0.20;
+                // RSI declining while price still up = bearish divergence
+                if (rsi14 < rsi14_prev - 2 && rsi14 > 55) score += 0.35;
+            } else if (move.direction < 0) {
+                // Bearish move: RSI < 30 = oversold
+                if (rsi14 < 25) score += 0.40;
+                else if (rsi14 < 32) score += 0.20;
+                // RSI rising while price still down = bullish divergence
+                if (rsi14 > rsi14_prev + 2 && rsi14 < 45) score += 0.35;
+            }
+            return clamp(score, 0, 1);
+        }
+
+        /** Overextension: has the move gone too far too fast?
+         *  Price > move_origin + 3*ATR in <6 bars = extended. Returns [0..1]. */
+        private double calcOverextension(MoveInfo move, double atr) {
+            if (move.ageBars < 2 || atr <= 0) return 0;
+            // depth per bar — how fast is price moving
+            double speedAtr = move.depthAtr / (move.ageBars + 1e-6);
+            // >0.6 ATR per bar over 3+ bars = extended
+            if (speedAtr > 0.6 && move.ageBars >= 3) return clamp(speedAtr * 0.8, 0, 1);
+            // Absolute depth: > 4 ATR moved = stretched rubber band
+            if (move.depthAtr > 4.0) return clamp((move.depthAtr - 3.0) * 0.3, 0, 1);
+            if (move.depthAtr > 2.5) return clamp((move.depthAtr - 2.0) * 0.2, 0, 0.5);
+            return 0;
+        }
+
+        /** VPOC Pull: distance from VPOC — price snaps back to high-volume node.
+         *  Returns [-1..+1]: positive = VPOC is above (pull up), negative = below (pull down). */
+        private double calcVpocPull(List<Candle> c, double price, double atr) {
+            double vpoc = calcVPOC(c, 50);
+            if (vpoc <= 0 || atr <= 0) return 0;
+            double dist = (vpoc - price) / atr;
+            // Only significant if > 0.5 ATR away
+            if (Math.abs(dist) < 0.5) return 0;
+            return clamp(dist * 0.20, -0.5, 0.5);
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  TREND PHASE — now uses exhaustion brain
+        // ═══════════════════════════════════════════════════════
+
+        public TrendPhase detectPhase(List<Candle> c15, List<Candle> c1h) {
+            return detectPhase(c15, c1h,
+                    identifyCurrentMove(c15, fcAtr(c15, 14)), 0);
+        }
+
+        private TrendPhase detectPhase(List<Candle> c15, List<Candle> c1h,
+                                       MoveInfo move, double exhaustion) {
+            if (exhaustion > 0.55) return TrendPhase.EXHAUSTION;
+            if (exhaustion > 0.35) return TrendPhase.LATE;
+            if (move.ageBars <= 3 && move.depthAtr < 1.5) return TrendPhase.EARLY;
+            if (move.ageBars <= 8 && move.depthAtr < 3.0) return TrendPhase.MID;
+            if (move.ageBars > 12 || move.depthAtr > 3.5) return TrendPhase.LATE;
+            return TrendPhase.MID;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  SQUEEZE detection
+        // ═══════════════════════════════════════════════════════
+
         private boolean isVolatilitySqueeze(List<Candle> c, double currentAtr) {
             int n = c.size();
             if (n < 50) return false;
-            // Compute ATR percentile over last 50 bars
             List<Double> atrHist = new ArrayList<>();
             for (int i = Math.max(15, n - 50); i < n - 1; i += 2) {
                 double a = fcAtr(c.subList(Math.max(0, i - 14), i + 1), Math.min(14, i));
@@ -1727,162 +2024,117 @@ public final class TradingCore {
             }
             if (atrHist.size() < 10) return false;
             Collections.sort(atrHist);
-            double p20 = atrHist.get(atrHist.size() / 5); // 20th percentile
-            // If current ATR is below 20th percentile of recent history → squeeze
+            double p20 = atrHist.get(atrHist.size() / 5);
             return currentAtr < p20 * 0.85;
         }
 
-        private double linRegSlope(List<Candle> c, int p) {
-            int n = c.size(); if (n < p) return 0;
-            double sX=0, sY=0, sXY=0, sX2=0;
-            for (int i=0; i<p; i++) {
-                double y = c.get(n-p+i).close;
-                sX+=i; sY+=y; sXY+=i*y; sX2+=i*i;
-            }
-            double d = p*sX2-sX*sX;
-            return Math.abs(d)<1e-12 ? 0 : (p*sXY-sX*sY)/d;
-        }
+        // ═══════════════════════════════════════════════════════
+        //  TREND BRAIN helpers (kept but secondary)
+        // ═══════════════════════════════════════════════════════
 
-        // ── Factor 2: Volume Profile (VPOC) ─────────────────
-        private double calcVP(List<Candle> c, int p, double price, double atr) {
-            double vpoc = calcVPOC(c, p);
-            return vpoc <= 0 ? 0 : clamp((vpoc-price)/atr*0.25, -0.6, 0.6);
-        }
-        private double calcVPOC(List<Candle> c, int p) {
-            int n=c.size(), start=Math.max(0,n-p);
-            double lo=Double.MAX_VALUE, hi=Double.MIN_VALUE;
-            for (int i=start;i<n;i++) { lo=Math.min(lo,c.get(i).low); hi=Math.max(hi,c.get(i).high); }
-            if (hi-lo<1e-12) return c.get(n-1).close;
-            int bins=50; double bs=(hi-lo)/bins; double[] vb=new double[bins];
-            for (int i=start;i<n;i++) {
-                double tp=(c.get(i).high+c.get(i).low+c.get(i).close)/3.0;
-                int b=Math.min(bins-1,Math.max(0,(int)((tp-lo)/bs)));
-                vb[b]+=c.get(i).volume;
-            }
-            int mx=0; for(int i=1;i<bins;i++) if(vb[i]>vb[mx]) mx=i;
-            return lo+(mx+0.5)*bs;
-        }
-
-        // ── Factor 3: Trend Phase ────────────────────────────
-        public TrendPhase detectPhase(List<Candle> c15, List<Candle> c1h) {
-            if (c15.size()<60) return TrendPhase.MID;
-            double adxV=fcAdx(c15,14), rsiV=rsi(c15,14);
-            double e9=fcEma(c15,9), e21=fcEma(c15,21), e50=fcEma(c15,50);
-            boolean ordered=(e9>e21&&e21>e50)||(e9<e21&&e21<e50);
-            double adxP=c15.size()>5?fcAdx(c15.subList(0,c15.size()-3),14):adxV;
-            boolean rising=adxV>adxP*1.02, falling=adxV<adxP*0.97;
-            // ADX<20 is compression/range. For forecasting, treat as EARLY setup zone
-            // so the engine can catch reversals out of accumulation/distribution.
-            if (adxV < 20) return TrendPhase.EARLY;
-            if (adxV>=20&&adxV<35&&rising&&ordered) return TrendPhase.MID;
-            if ((adxV>=40&&falling)||rsiV>78||rsiV<22) return TrendPhase.EXHAUSTION;
-            if (adxV>=35&&falling) return TrendPhase.LATE;
-            if (rising&&ordered) return TrendPhase.MID;
-            if (falling) return TrendPhase.LATE;
-            return TrendPhase.MID;
-        }
-        private double calcPhaseScore(List<Candle> c, TrendPhase ph) {
-            double close = c.get(c.size()-1).close;
-            double ema21 = fcEma(c,21);
-            double atr = Math.max(fcAtr(c, 14), close * 0.001);
-            // In flat/low-energy conditions avoid binary flip around EMA21.
-            boolean bull = (close - ema21) > atr * 0.12;
-            boolean bear = (ema21 - close) > atr * 0.12;
-            if (!bull && !bear) return 0.0;
-            return switch(ph) {
-                case EARLY -> bull?0.40:-0.40;
-                case MID -> bull?0.25:-0.25;
-                case LATE -> bull?0.05:-0.05;
-                case EXHAUSTION -> bull?-0.30:0.30;
-            };
-        }
-
-        // ── Factor 4: Fisher Transform ───────────────────────
-        private double calcFisher(List<Candle> c, int p) {
-            int n=c.size(); if(n<p+2) return 0;
-            double hi=Double.MIN_VALUE,lo=Double.MAX_VALUE;
-            for(int i=n-p;i<n;i++){hi=Math.max(hi,c.get(i).high);lo=Math.min(lo,c.get(i).low);}
-            if(hi-lo<1e-12) return 0;
-            double norm=clamp(2.0*((c.get(n-1).close-lo)/(hi-lo)-0.5)*0.999,-0.999,0.999);
-            double fish=0.5*Math.log((1+norm)/(1-norm));
-            double pNorm=clamp(2.0*((c.get(n-2).close-lo)/(hi-lo)-0.5)*0.999,-0.999,0.999);
-            double pFish=0.5*Math.log((1+pNorm)/(1-pNorm));
-            double s=0;
-            if(fish>0&&pFish<0) s=0.5; if(fish<0&&pFish>0) s=-0.5;
-            s+=clamp(fish*0.15,-0.3,0.3);
-            return clamp(s,-1.0,1.0);
-        }
-
-        // ── Factor 5: ATR Regime ─────────────────────────────
-        private double calcAtrRegime(List<Candle> c, double curAtr) {
-            int n=c.size(), lb=Math.min(96,n-15); if(lb<20) return 0;
-            List<Double> h=new ArrayList<>();
-            for(int i=n-lb;i<n-1;i+=3){double a=fcAtr(c.subList(Math.max(0,i-14),i+1),Math.min(14,i));if(a>0)h.add(a);}
-            if(h.size()<5) return 0;
-            Collections.sort(h); double med=h.get(h.size()/2);
-            if(med<=0) return 0; double r=curAtr/med;
-            if(r>2.5) return -0.15; if(r>1.8) return -0.08;
-            if(r<0.5) return 0.10; return 0;
-        }
-
-        // ── Factor 6: Swing Structure ────────────────────────
-        private double calcSwing(List<Candle> c) {
-            return com.bot.DecisionEngineMerged.marketStructure(c) * 0.55;
-        }
-
-        // ── Factor 7: Momentum Acceleration ──────────────────
-        private double calcMomAccel(List<Candle> c, double atr) {
-            int n=c.size(); if(n<20||atr<=0) return 0;
-            double m1=c.get(n-6).close-c.get(n-11).close;
-            double m2=c.get(n-1).close-c.get(n-6).close;
-            return clamp((m2-m1)/atr*0.30,-0.7,0.7);
-        }
-
-        // ── Factor 8: Orderflow ──────────────────────────────
         private double calcOrderflow(List<Candle> c, double vd) {
-            int n=c.size(); double s=0;
-            if(n>=5){double tb=0,tv=0;for(int i=n-5;i<n;i++){tb+=c.get(i).takerBuyBaseVolume;tv+=c.get(i).volume;}
-                if(tv>0)s+=(tb/tv-0.5)*2.0;}
-            if(Math.abs(vd)>0.001) s=s*0.6+clamp(Math.signum(vd)*Math.min(1,Math.abs(vd)*3),-1,1)*0.4;
-            return clamp(s*0.55,-0.7,0.7);
+            int n = c.size(); double s = 0;
+            if (n >= 5) {
+                double tb = 0, tv = 0;
+                for (int i = n - 5; i < n; i++) {
+                    tb += c.get(i).takerBuyBaseVolume;
+                    tv += c.get(i).volume;
+                }
+                if (tv > 0) s += (tb / tv - 0.5) * 2.0;
+            }
+            if (Math.abs(vd) > 0.001)
+                s = s * 0.6 + clamp(Math.signum(vd) * Math.min(1, Math.abs(vd) * 3), -1, 1) * 0.4;
+            return clamp(s * 0.50, -0.6, 0.6);
         }
 
-        // ── Factor 9: Multi-TF Alignment ─────────────────────
-        private double calcMTF(List<Candle> c5, List<Candle> c15, List<Candle> c1h) {
-            int v=0;
-            if(c15.size()>=25){if(fcEma(c15,9)>fcEma(c15,21))v++;else v--;}
-            if(c1h.size()>=25){if(fcEma(c1h,9)>fcEma(c1h,21))v++;else v--;}
-            if(c5!=null&&c5.size()>=8){if(c5.get(c5.size()-1).close>c5.get(c5.size()-7).close)v++;else v--;}
-            return switch(v){case 3->0.65;case 2->0.35;case -2->-0.35;case -3->-0.65;default->v*0.10;};
+        private double calcHTF(List<Candle> c15, List<Candle> c1h) {
+            int v = 0;
+            if (c1h.size() >= 25) {
+                if (fcEma(c1h, 9) > fcEma(c1h, 21)) v++; else v--;
+            }
+            if (c15.size() >= 50) {
+                // Use EMA50 on 15m as "HTF" context
+                double e21 = fcEma(c15, 21), e50 = fcEma(c15, 50);
+                if (e21 > e50) v++; else v--;
+            }
+            return switch (v) { case 2 -> 0.50; case -2 -> -0.50; default -> v * 0.15; };
         }
 
-        // ── Internal math ────────────────────────────────────
+        private double calcFisher(List<Candle> c, int p) {
+            int n = c.size();
+            if (n < p + 2) return 0;
+            double hi = Double.MIN_VALUE, lo = Double.MAX_VALUE;
+            for (int i = n - p; i < n; i++) {
+                hi = Math.max(hi, c.get(i).high);
+                lo = Math.min(lo, c.get(i).low);
+            }
+            if (hi - lo < 1e-12) return 0;
+            double norm = clamp(2.0 * ((c.get(n - 1).close - lo) / (hi - lo) - 0.5) * 0.999, -0.999, 0.999);
+            double fish = 0.5 * Math.log((1 + norm) / (1 - norm));
+            double pNorm = clamp(2.0 * ((c.get(n - 2).close - lo) / (hi - lo) - 0.5) * 0.999, -0.999, 0.999);
+            double pFish = 0.5 * Math.log((1 + pNorm) / (1 - pNorm));
+            double s = 0;
+            if (fish > 0 && pFish < 0) s = 0.4;
+            if (fish < 0 && pFish > 0) s = -0.4;
+            s += clamp(fish * 0.12, -0.25, 0.25);
+            return clamp(s, -0.8, 0.8);
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  MATH primitives
+        // ═══════════════════════════════════════════════════════
+
+        private double linRegSlope(List<Candle> c, int p) {
+            int n = c.size();
+            if (n < p) return 0;
+            double sX = 0, sY = 0, sXY = 0, sX2 = 0;
+            for (int i = 0; i < p; i++) {
+                double y = c.get(n - p + i).close;
+                sX += i; sY += y; sXY += i * y; sX2 += i * i;
+            }
+            double d = p * sX2 - sX * sX;
+            return Math.abs(d) < 1e-12 ? 0 : (p * sXY - sX * sY) / d;
+        }
+
+        private double calcVPOC(List<Candle> c, int p) {
+            int n = c.size(), start = Math.max(0, n - p);
+            double lo = Double.MAX_VALUE, hi = Double.MIN_VALUE;
+            for (int i = start; i < n; i++) {
+                lo = Math.min(lo, c.get(i).low);
+                hi = Math.max(hi, c.get(i).high);
+            }
+            if (hi - lo < 1e-12) return c.get(n - 1).close;
+            int bins = 50;
+            double bs = (hi - lo) / bins;
+            double[] vb = new double[bins];
+            for (int i = start; i < n; i++) {
+                double tp = (c.get(i).high + c.get(i).low + c.get(i).close) / 3.0;
+                int b = Math.min(bins - 1, Math.max(0, (int) ((tp - lo) / bs)));
+                vb[b] += c.get(i).volume;
+            }
+            int mx = 0;
+            for (int i = 1; i < bins; i++) if (vb[i] > vb[mx]) mx = i;
+            return lo + (mx + 0.5) * bs;
+        }
+
         private double fcAtr(List<Candle> c, int n) {
-            int p=Math.min(n,c.size()-1); if(p<=0)return 0; double s=0;
-            for(int i=c.size()-p;i<c.size();i++){Candle cu=c.get(i),pr=c.get(i-1);
-                s+=Math.max(cu.high-cu.low,Math.max(Math.abs(cu.high-pr.close),Math.abs(cu.low-pr.close)));}
-            return s/p;
+            int p = Math.min(n, c.size() - 1);
+            if (p <= 0) return 0;
+            double s = 0;
+            for (int i = c.size() - p; i < c.size(); i++) {
+                Candle cu = c.get(i), pr = c.get(i - 1);
+                s += Math.max(cu.high - cu.low,
+                        Math.max(Math.abs(cu.high - pr.close), Math.abs(cu.low - pr.close)));
+            }
+            return s / p;
         }
-        private double fcEma(List<Candle> c,int p){
-            if(c.size()<p)return c.get(c.size()-1).close;
-            double k=2.0/(p+1),e=c.get(c.size()-p).close;
-            for(int i=c.size()-p+1;i<c.size();i++)e=c.get(i).close*k+e*(1-k); return e;
-        }
-        private double fcAdx(List<Candle> c,int p){
-            if(c.size()<p*2+1)return 15; int si=Math.max(1,c.size()-p*2);
-            double sPDM=0,sMDM=0,sTR=0; int se=si+p;
-            for(int i=si;i<se&&i<c.size();i++){Candle cu=c.get(i),pr=c.get(i-1);
-                double hd=cu.high-pr.high,ld=pr.low-cu.low;
-                double tr=Math.max(cu.high-cu.low,Math.max(Math.abs(cu.high-pr.close),Math.abs(cu.low-pr.close)));
-                sTR+=tr;if(hd>ld&&hd>0)sPDM+=hd;if(ld>hd&&ld>0)sMDM+=ld;}
-            double sumDX=0;int dc=0;
-            for(int i=se;i<c.size();i++){Candle cu=c.get(i),pr=c.get(i-1);
-                double hd=cu.high-pr.high,ld=pr.low-cu.low;
-                double tr=Math.max(cu.high-cu.low,Math.max(Math.abs(cu.high-pr.close),Math.abs(cu.low-pr.close)));
-                sTR=sTR-sTR/p+tr;sPDM=sPDM-sPDM/p+((hd>ld&&hd>0)?hd:0);sMDM=sMDM-sMDM/p+((ld>hd&&ld>0)?ld:0);
-                double pDI=sTR>0?100*sPDM/sTR:0,mDI=sTR>0?100*sMDM/sTR:0,ds=pDI+mDI;
-                sumDX+=ds>0?100*Math.abs(pDI-mDI)/ds:0;dc++;}
-            return dc>0?sumDX/dc:15;
+
+        private double fcEma(List<Candle> c, int p) {
+            if (c.size() < p) return c.get(c.size() - 1).close;
+            double k = 2.0 / (p + 1), e = c.get(c.size() - p).close;
+            for (int i = c.size() - p + 1; i < c.size(); i++)
+                e = c.get(i).close * k + e * (1 - k);
+            return e;
         }
     } // end ForecastEngine
 }
