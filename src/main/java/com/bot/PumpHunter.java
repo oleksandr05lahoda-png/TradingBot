@@ -244,7 +244,7 @@ public final class PumpHunter {
         lastPumpTime.put(symbol, System.currentTimeMillis());
         recentPumps.put(symbol, event);
 
-        Deque<PumpEvent> history = pumpHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+        Deque<PumpEvent> history = pumpHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         history.addLast(event);
         while (history.size() > 50) history.removeFirst();
 

@@ -5,8 +5,14 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════════╗
- * ║       TradingCore v13.0 — INSTITUTIONAL QUANT + FORECASTING FOUNDATION      ║
+ * ║       TradingCore v15.0 — INSTITUTIONAL QUANT + FORECASTING FOUNDATION      ║
  * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  v15.0 CRITICAL FIXES:                                                       ║
+ * ║    · [FIX Дыра 3] LR window: 30→10 bars (catches V-reversals)              ║
+ * ║    · [FIX Дыра 3] LR Acceleration (2nd derivative) — detects slope change  ║
+ * ║    · [FIX KITEUSDT] VolatilitySqueezeGuard — blocks signals in squeeze     ║
+ * ║    · Squeeze zone: directionScore×0.25, confidence×0.5                      ║
  * ║                                                                              ║
  * ║  v13.0 NEW — FORECASTING PRIMITIVES (for 8-candle ahead prediction):        ║
  * ║    · LinearRegressionChannel — slope, std-channel, momentum projection      ║
@@ -1535,7 +1541,7 @@ public final class TradingCore {
         }
 
         public void registerResult(String symbol, TradeResult result) {
-            Deque<TradeResult> hist = symbolHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+            Deque<TradeResult> hist = symbolHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
             synchronized (hist) {
                 hist.addLast(result);
                 while (hist.size() > MAX_HISTORY) hist.removeFirst();
@@ -1625,6 +1631,12 @@ public final class TradingCore {
         private static final double W_LR=0.18, W_VP=0.12, W_TP=0.15, W_FI=0.10,
                 W_AR=0.05, W_SS=0.15, W_MA=0.10, W_OF=0.08, W_MT=0.07;
 
+        // [v15.0] Shortened regression windows + acceleration
+        // LR_SHORT: for direction forecast (fast reactions to V-reversals)
+        // LR_LONG: for projected move (smoother projection)
+        private static final int LR_SHORT = 10;  // [FIX Дыра 3] was 30 — missed V-reversals!
+        private static final int LR_LONG  = 20;  // for projected move only
+
         public ForecastResult forecast(List<Candle> c5, List<Candle> c15,
                                        List<Candle> c1h, double volumeDelta) {
             if (c15 == null || c15.size() < 100 || c1h == null || c1h.size() < 50) return null;
@@ -1632,8 +1644,16 @@ public final class TradingCore {
             double atr14 = fcAtr(c15, 14);
             if (atr14 <= 0 || price <= 0) return null;
 
+            // [v15.0 FIX KITEUSDT] Volatility Squeeze Guard
+            // If ATR has collapsed to anomalous lows → compression zone
+            // All directional signals become unreliable; force NEUTRAL
+            boolean squeezed = isVolatilitySqueeze(c15, atr14);
+
             Map<String, Double> f = new LinkedHashMap<>();
-            double lrS = calcLR(c15, 30, atr14); f.put("LR", lrS);
+            // [v15.0 FIX Дыра 3] Use LR_SHORT (10 bars = 2.5h) instead of 30 (7.5h)
+            double lrS = calcLR(c15, LR_SHORT, atr14); f.put("LR", lrS);
+            // [v15.0] Also compute acceleration: change in slope (2nd derivative)
+            double lrAccel = calcLRAccel(c15, LR_SHORT, atr14); f.put("LR_ACCEL", lrAccel);
             double vpS = calcVP(c15, 50, price, atr14); f.put("VP", vpS);
             TrendPhase phase = detectPhase(c15, c1h);
             double tpS = calcPhaseScore(c15, phase); f.put("TP", tpS);
@@ -1644,19 +1664,29 @@ public final class TradingCore {
             double ofS = calcOrderflow(c15, volumeDelta); f.put("OF", ofS);
             double mtS = calcMTF(c5, c15, c1h); f.put("MT", mtS);
 
-            double dir = lrS*W_LR + vpS*W_VP + tpS*W_TP + fiS*W_FI + arS*W_AR
-                    + ssS*W_SS + maS*W_MA + ofS*W_OF + mtS*W_MT;
+            // [v15.0] LR acceleration gets small weight — helps catch V-reversals
+            double dir = lrS*W_LR + lrAccel*0.06 + vpS*W_VP + tpS*W_TP + fiS*W_FI + arS*W_AR
+                    + ssS*W_SS + maS*W_MA + ofS*W_OF + mtS*(W_MT - 0.06);
             dir = clamp(dir, -1.0, 1.0);
+
+            // [v15.0 FIX KITEUSDT] In squeeze zone, clamp dir toward zero
+            if (squeezed) {
+                dir *= 0.25; // Drastically reduce directional conviction in compression
+            }
 
             int bull=0, bear=0;
             for (double v : f.values()) { if (v>0.15) bull++; if (v<-0.15) bear++; }
             double conf = clamp((double)Math.max(bull,bear)/f.size()*1.2 + Math.abs(dir)*0.3, 0.1, 0.95);
 
+            // [v15.0] Squeeze reduces confidence too
+            if (squeezed) conf *= 0.5;
+
             ForecastBias bias = dir > 0.45 ? ForecastBias.STRONG_BULL
                     : dir > 0.15 ? ForecastBias.BULL : dir < -0.45 ? ForecastBias.STRONG_BEAR
                     : dir < -0.15 ? ForecastBias.BEAR : ForecastBias.NEUTRAL;
 
-            double lrSlope = linRegSlope(c15, 30);
+            // [v15.0 FIX Дыра 3] Use LR_LONG (20) only for projection, not direction
+            double lrSlope = linRegSlope(c15, LR_LONG);
             double projMove = lrSlope * 8 / price;
             double vpoc = calcVPOC(c15, 50);
 
@@ -1668,6 +1698,40 @@ public final class TradingCore {
             double slope = linRegSlope(c, p);
             return clamp(slope * 8 / atr * 0.35, -1.0, 1.0);
         }
+
+        /** [v15.0 FIX Дыра 3] LR Acceleration — 2nd derivative of slope.
+         *  Detects V-reversals: slope still negative, but acceleration positive = turning up. */
+        private double calcLRAccel(List<Candle> c, int p, double atr) {
+            int n = c.size();
+            if (n < p + 5) return 0;
+            // Slope over recent [p] bars
+            double slopeNow = linRegSlope(c, p);
+            // Slope over [p] bars shifted back by 5 bars
+            double slopePrev = linRegSlope(c.subList(0, n - 5), p);
+            // Acceleration = change in slope, normalized by ATR
+            return clamp((slopeNow - slopePrev) * 5 / atr * 0.30, -0.8, 0.8);
+        }
+
+        /** [v15.0 FIX KITEUSDT] Volatility Squeeze Guard.
+         *  Detects when ATR collapses to anomalous lows = spring compression.
+         *  In this zone: any directional signal is unreliable (BOS_DN is noise).
+         *  Returns true if market is in volatility squeeze. */
+        private boolean isVolatilitySqueeze(List<Candle> c, double currentAtr) {
+            int n = c.size();
+            if (n < 50) return false;
+            // Compute ATR percentile over last 50 bars
+            List<Double> atrHist = new ArrayList<>();
+            for (int i = Math.max(15, n - 50); i < n - 1; i += 2) {
+                double a = fcAtr(c.subList(Math.max(0, i - 14), i + 1), Math.min(14, i));
+                if (a > 0) atrHist.add(a);
+            }
+            if (atrHist.size() < 10) return false;
+            Collections.sort(atrHist);
+            double p20 = atrHist.get(atrHist.size() / 5); // 20th percentile
+            // If current ATR is below 20th percentile of recent history → squeeze
+            return currentAtr < p20 * 0.85;
+        }
+
         private double linRegSlope(List<Candle> c, int p) {
             int n = c.size(); if (n < p) return 0;
             double sX=0, sY=0, sXY=0, sX2=0;

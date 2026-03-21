@@ -2,12 +2,21 @@ package com.bot;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       GlobalImpulseController — GODBOT PRO EDITION v6.0                ║
+ * ║       GlobalImpulseController — GODBOT PRO EDITION v7.0                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                          ║
+ * ║  КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.0:                                           ║
+ * ║                                                                          ║
+ * ║  [FIX Дыра 1] ArrayDeque → ConcurrentLinkedDeque ВЕЗДЕ                  ║
+ * ║    Проблема: ArrayDeque не потокобезопасна. WS поток пишет тики,         ║
+ * ║    runCycle читает — внутренние указатели разрушаются → бесконечный     ║
+ * ║    цикл в JVM → поток «умирает» → бот-зомби без ошибок в логах.       ║
+ * ║    Теперь: ConcurrentLinkedDeque с bounded trimming.                     ║
  * ║                                                                          ║
  * ║  КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v6.0:                                           ║
  * ║                                                                          ║
@@ -73,11 +82,11 @@ public final class GlobalImpulseController {
     private static final double SECTOR_CONTAGION_DROP = 0.040;  // -4%
 
     // ATR history для режима волатильности
-    private final Deque<Double> btcAtrHistory = new ArrayDeque<>();
+    private final Deque<Double> btcAtrHistory = new ConcurrentLinkedDeque<>();
     private static final int ATR_HISTORY_SIZE = 96; // 96 × 15m = 24h
 
     // BTC move history для каскадной детекции
-    private final Deque<Double> btcMoveHistory = new ArrayDeque<>();
+    private final Deque<Double> btcMoveHistory = new ConcurrentLinkedDeque<>();
     private static final int BTC_MOVE_WINDOW = 10;
 
     // BTC 5m данные для ранней детекции (обновляются отдельно)
@@ -270,12 +279,12 @@ public final class GlobalImpulseController {
     private final Map<String, Deque<Double>>  sectorPriceHist= new ConcurrentHashMap<>(); // для drop8bars
 
     // Multi-window BTC return history для RS calculation
-    private final Deque<Double> btcReturnHistory5  = new ArrayDeque<>();
-    private final Deque<Double> btcReturnHistory10 = new ArrayDeque<>();
-    private final Deque<Double> btcReturnHistory20 = new ArrayDeque<>();
+    private final Deque<Double> btcReturnHistory5  = new ConcurrentLinkedDeque<>();
+    private final Deque<Double> btcReturnHistory10 = new ConcurrentLinkedDeque<>();
+    private final Deque<Double> btcReturnHistory20 = new ConcurrentLinkedDeque<>();
 
     // История crash scores для обнаружения нарастания паники
-    private final Deque<Double> crashScoreHistory = new ArrayDeque<>();
+    private final Deque<Double> crashScoreHistory = new ConcurrentLinkedDeque<>();
     private static final int CRASH_SCORE_WINDOW = 5;
 
     // ══════════════════════════════════════════════════════════════
@@ -523,7 +532,7 @@ public final class GlobalImpulseController {
         double moveBias = move5 / 0.01;
         double rawBias  = clamp((emaBias + moveBias) / 2, -1.0, 1.0);
 
-        Deque<Double> hist = sectorBiasHist.computeIfAbsent(sector, k -> new ArrayDeque<>());
+        Deque<Double> hist = sectorBiasHist.computeIfAbsent(sector, k -> new ConcurrentLinkedDeque<>());
         hist.addLast(rawBias);
         if (hist.size() > 20) hist.removeFirst();
 

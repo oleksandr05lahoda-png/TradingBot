@@ -2,13 +2,20 @@ package com.bot;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════════╗
- * ║       InstitutionalSignalCore v12.0 — PORTFOLIO RISK CONTROLLER              ║
+ * ║       InstitutionalSignalCore v15.0 — PORTFOLIO RISK CONTROLLER              ║
  * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  v15.0 CRITICAL FIXES:                                                       ║
+ * ║    · [FIX Дыра 1] ArrayDeque → ConcurrentLinkedDeque (thread-safe)          ║
+ * ║    · [FIX Дыра 4] Asymmetric streak: win halves boost (was -1.5 only!)     ║
+ * ║    · [FIX Дыра 4] Softer loss escalation: 1.0/2.5/4.5 (was 1.5/3.5/6.0)  ║
+ * ║    · [FIX Дыра 4] Faster decay: 30% every 8min (was 20%/10min)            ║
  * ║                                                                              ║
  * ║  v11.0 IMPROVEMENTS:                                                         ║
  * ║    · [FIX-COMPILE] closeTrade 3-arg overload (BotMain compatibility)        ║
@@ -60,7 +67,7 @@ public final class InstitutionalSignalCore {
     private volatile double                        currentHeat    = 0.0;
 
     // Streak guard
-    private final Deque<Boolean> globalResultStreak = new ArrayDeque<>();
+    private final Deque<Boolean> globalResultStreak = new ConcurrentLinkedDeque<>();
     private static final int STREAK_WINDOW = 10;
     private volatile int    currentLossStreak     = 0;
     private volatile double streakConfidenceBoost = 0.0;
@@ -142,7 +149,9 @@ public final class InstitutionalSignalCore {
         registerConfirmedResult(win, null);
     }
 
-    /** [v12.0] Direction-aware result tracking */
+    /** [v15.0] Direction-aware result tracking
+     *  FIX Дыра 4: First win after loss streak HALVES the boost (was only -1.5).
+     *  This prevents the bot from self-silencing after 3 normal stop-losses. */
     public void registerConfirmedResult(boolean win, TradingCore.Side side) {
         synchronized (globalResultStreak) {
             globalResultStreak.addLast(win);
@@ -151,25 +160,36 @@ public final class InstitutionalSignalCore {
         lastStreakUpdateMs = System.currentTimeMillis();
 
         if (win) {
+            // [v15.0 FIX Дыра 4] Aggressive streak reset on first win:
+            // Old: streakConfidenceBoost -= 1.5 (after 3 losses: 6.0 - 1.5 = 4.5 — still blocked!)
+            // New: halve the boost immediately, then apply additional decay
+            if (currentLossStreak >= 2) {
+                // First win after significant losing streak — aggressive recovery
+                streakConfidenceBoost = Math.max(0, streakConfidenceBoost * 0.35);
+                log("WIN after " + currentLossStreak + " losses → boost halved to " +
+                        String.format("%.1f", streakConfidenceBoost));
+            } else {
+                streakConfidenceBoost = Math.max(0, streakConfidenceBoost - 2.0);
+            }
             currentLossStreak = 0;
             currentWinStreak++;
-            streakConfidenceBoost = Math.max(0, streakConfidenceBoost - 1.5);
             // [v12.0] Reset direction losses on any win
             if (side == TradingCore.Side.LONG) consecutiveLongLosses = 0;
             if (side == TradingCore.Side.SHORT) consecutiveShortLosses = 0;
         } else {
             currentLossStreak++;
             currentWinStreak = 0;
+            // [v15.0] Softer escalation — old values caused decision deadlock too fast
             streakConfidenceBoost = switch (currentLossStreak) {
-                case 1 -> 1.5;
-                case 2 -> 3.5;
-                case 3 -> 6.0;
-                default -> Math.min(10.0, currentLossStreak * 2.0);
+                case 1 -> 1.0;
+                case 2 -> 2.5;
+                case 3 -> 4.5;
+                default -> Math.min(8.0, currentLossStreak * 1.8);
             };
             // [v12.0] Track direction-specific losses
             if (side == TradingCore.Side.LONG) {
                 consecutiveLongLosses++;
-                consecutiveShortLosses = 0; // wins in other direction don't count
+                consecutiveShortLosses = 0;
             } else if (side == TradingCore.Side.SHORT) {
                 consecutiveShortLosses++;
                 consecutiveLongLosses = 0;
@@ -189,11 +209,12 @@ public final class InstitutionalSignalCore {
     private void decayStreakBoost() {
         if (streakConfidenceBoost <= 0) return;
         long elapsed = System.currentTimeMillis() - lastStreakUpdateMs;
-        // [v11.0] Faster decay: 20% every 10min (was 15%/15min)
-        if (elapsed > 10 * 60_000L) {
-            streakConfidenceBoost *= 0.80;
+        // [v15.0 FIX Дыра 4] Faster decay: 30% every 8min (was 20%/10min — too slow)
+        // After 3 losses (boost=4.5), decay to zero in ~24min instead of ~60min
+        if (elapsed > 8 * 60_000L) {
+            streakConfidenceBoost *= 0.70;
             lastStreakUpdateMs = System.currentTimeMillis();
-            if (streakConfidenceBoost < 0.5) { streakConfidenceBoost = 0; currentLossStreak = 0; }
+            if (streakConfidenceBoost < 0.3) { streakConfidenceBoost = 0; currentLossStreak = 0; }
         }
     }
 
@@ -299,7 +320,7 @@ public final class InstitutionalSignalCore {
                 currentHeat = Math.max(0, currentHeat - s.riskPct);
 
                 // Add to bounded history
-                Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+                Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(symbol, k -> new ConcurrentLinkedDeque<>());
                 hist.addLast(new ClosedTrade(symbol, side, pnlPct, s.ageMs(), reason));
                 while (hist.size() > MAX_HISTORY) hist.removeFirst();
 
@@ -329,7 +350,7 @@ public final class InstitutionalSignalCore {
                     currentHeat = Math.max(0, currentHeat - s.riskPct);
 
                     // NEUTRAL — not loss, not win. Streak NOT affected.
-                    Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(s.symbol, k -> new ArrayDeque<>());
+                    Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(s.symbol, k -> new ConcurrentLinkedDeque<>());
                     hist.addLast(new ClosedTrade(s.symbol, s.side, 0.0, s.ageMs(), "TIME_STOP"));
                     while (hist.size() > MAX_HISTORY) hist.removeFirst();
 

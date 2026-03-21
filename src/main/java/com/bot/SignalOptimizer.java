@@ -246,7 +246,7 @@ public final class SignalOptimizer {
         boolean isExhausted = detectExhaustion(symbol, speed, accel, momentum);
 
         // Сохраняем momentum историю
-        Deque<Double> momHistory = momentumHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+        Deque<Double> momHistory = momentumHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         momHistory.addLast(momentum);
         while (momHistory.size() > 100) momHistory.removeFirst();
 
@@ -299,7 +299,7 @@ public final class SignalOptimizer {
         if (candles.size() >= 15) {
             double atrPct = computeAtrPct(candles);
             if (atrPct > 0) {
-                Deque<Double> atrHist = symbolAtrHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+                Deque<Double> atrHist = symbolAtrHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
                 atrHist.addLast(atrPct);
                 if (atrHist.size() > ATR_HISTORY_SIZE) atrHist.removeFirst();
             }

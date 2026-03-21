@@ -68,7 +68,7 @@ public final class DecisionEngineMerged {
 
     public void setVolumeDelta(String sym, double delta) {
         volumeDeltaMap.put(sym, delta);
-        Deque<Double> hist = vdHistory.computeIfAbsent(sym, k -> new ArrayDeque<>());
+        Deque<Double> hist = vdHistory.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         hist.addLast(Math.abs(delta));
         if (hist.size() > 50) hist.removeFirst();
     }
@@ -91,7 +91,7 @@ public final class DecisionEngineMerged {
         } else {
             rs = clamp(0.5 + (symbolReturn15m - btcReturn15m) / (Math.abs(btcReturn15m) * 2), 0.0, 1.0);
         }
-        Deque<Double> h = relStrengthHistory.computeIfAbsent(symbol, k -> new ArrayDeque<>());
+        Deque<Double> h = relStrengthHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         h.addLast(rs);
         if (h.size() > 20) h.removeFirst();
     }
@@ -345,7 +345,7 @@ public final class DecisionEngineMerged {
     }
 
     public void recordSignalResult(String sym, double prob, boolean correct) {
-        Deque<CalibRecord> h = calibHist.computeIfAbsent(sym, k -> new ArrayDeque<>());
+        Deque<CalibRecord> h = calibHist.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         h.addLast(new CalibRecord(prob, correct));
         while (h.size() > CALIBRATION_WIN) h.removeFirst();
         updateSymbolThreshold(sym);
@@ -515,11 +515,25 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
 
         // Anti-Lag (1m+5m+15m)
+        // [v15.0 FIX KITEUSDT] Block ANTI_LAG in volatility squeeze (ATR < 60% of 50-bar avg)
+        double atrAvg50 = 0;
+        if (c15.size() >= 65) {
+            for (int i = c15.size() - 50; i < c15.size(); i++) {
+                int pi = Math.max(1, i - 1);
+                atrAvg50 += Math.max(c15.get(i).high - c15.get(i).low,
+                        Math.max(Math.abs(c15.get(i).high - c15.get(pi).close),
+                                Math.abs(c15.get(i).low - c15.get(pi).close)));
+            }
+            atrAvg50 /= 50;
+        }
+        boolean atrSqueeze = atrAvg50 > 0 && atr14 < atrAvg50 * 0.60;
         AntiLagResult antiLag = detectAntiLag(c1, c5, c15);
-        if (antiLag != null && antiLag.strength > 0.38) {
+        if (antiLag != null && antiLag.strength > 0.38 && !atrSqueeze) {
             double bonus = mctx.s(antiLag.strength * 1.30);
             if (antiLag.direction > 0) cMomentum.addLong(bonus, "ANTI_LAG_UP");
             else                       cMomentum.addShort(bonus, "ANTI_LAG_DN");
+        } else if (atrSqueeze && antiLag != null && antiLag.strength > 0.38) {
+            allFlags.add("ANTI_LAG_SQUEEZE_BLOCKED");
         }
 
         // Impulse (>0.55 ATR за 5 баров)
@@ -1137,6 +1151,17 @@ public final class DecisionEngineMerged {
                 if (forecastResult != null) {
                     allFlags.add("FC_" + forecastResult.bias.name());
                     allFlags.add("PH_" + forecastResult.trendPhase.name());
+
+                    // [v15.0 FIX KITEUSDT] Volatility Squeeze Guard
+                    // If forecast detected squeeze zone → block ALL directional signals
+                    // The squeeze guard sets confidence < 0.5 and dirScore near 0
+                    if (forecastResult.confidence < 0.25
+                            && Math.abs(forecastResult.directionScore) < 0.10
+                            && forecastResult.factorScores.containsKey("LR_ACCEL")) {
+                        allFlags.add("FC_VETO_SQUEEZE");
+                        return null;
+                    }
+
                     boolean fcBull = forecastResult.directionScore > 0.2;
                     boolean fcBear = forecastResult.directionScore < -0.2;
                     boolean sigLong = side == com.bot.TradingCore.Side.LONG;
@@ -1373,7 +1398,7 @@ public final class DecisionEngineMerged {
     }
 
     private boolean flipAllowed(String sym, com.bot.TradingCore.Side newSide) {
-        Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new ArrayDeque<>());
+        Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         if (h.size() < 2) return true;
         Iterator<String> it = h.descendingIterator();
         String last = it.next(), prev = it.next();
@@ -1382,7 +1407,7 @@ public final class DecisionEngineMerged {
 
     private void registerSignal(String sym, com.bot.TradingCore.Side side, long now) {
         cooldownMap.put(sym + "_" + side, now);
-        Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new ArrayDeque<>());
+        Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         h.addLast(side.name());
         if (h.size() > 3) h.removeFirst();
         signalCountBySymbol.computeIfAbsent(sym, k -> new AtomicInteger(0)).incrementAndGet();

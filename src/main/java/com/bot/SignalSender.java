@@ -996,7 +996,7 @@ public final class SignalSender {
         if (Math.abs(btcRet) < 0.001) rs = symRet > 0 ? 0.65 : 0.35;
         else if (btcRet < 0 && symRet > 0) rs = Math.min(0.98, 0.78 + symRet * 5);
         else rs = clamp(0.5 + (symRet - btcRet) / (Math.abs(btcRet) + 0.001) * 0.15, 0.0, 1.0);
-        Deque<Double> h = relStrengthHistory.computeIfAbsent(pair, k -> new ArrayDeque<>());
+        Deque<Double> h = relStrengthHistory.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         h.addLast(rs); if (h.size() > RS_HISTORY) h.removeFirst();
         return h.stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
     }
@@ -1314,7 +1314,7 @@ public final class SignalSender {
 
     private boolean filterEarlySignal(com.bot.DecisionEngineMerged.TradeIdea sig) {
         boolean isLong = sig.side == com.bot.TradingCore.Side.LONG;
-        double rs = relStrengthHistory.getOrDefault(sig.symbol, new ArrayDeque<>())
+        double rs = relStrengthHistory.getOrDefault(sig.symbol, new java.util.concurrent.ConcurrentLinkedDeque<>())
                 .stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
         if (gic.getFilterWeight(sig.symbol, isLong, rs, detectSector(sig.symbol)) < 0.60) return false;
         if (!isc.allowSignal(sig)) return false;

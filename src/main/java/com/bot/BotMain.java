@@ -9,8 +9,12 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v14.0 — CRITICAL FIXES EDITION                           ║
+ * ║       BotMain v15.0 — CRITICAL ARCHITECTURE FIX EDITION                  ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  [v15.0] FIX Дыра 1: ConcurrentLinkedDeque everywhere (thread safety)  ║
+ * ║  [v15.0] FIX Дыра 3: LR window 30→10, acceleration detection          ║
+ * ║  [v15.0] FIX Дыра 4: Asymmetric streak reset (win halves boost)        ║
+ * ║  [v15.0] FIX KITEUSDT: VolatilitySqueezeGuard blocks squeeze signals   ║
  * ║  [v14.0] FIX #1: tp2Hit флаг — убрал бесконечные TP2 уведомления      ║
  * ║  [v14.0] FIX #2: Circuit breaker — убрал Thread.sleep из scheduler     ║
  * ║  [v14.0] FIX #3: Trailing stop SHORT — исправлена инверсия логики      ║
@@ -274,7 +278,7 @@ public final class BotMain {
 
         // ── Startup ping ─────────────────────────────────────────
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ GodBot v14.0 FIXED стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ GodBot v15.0 ARCHITECTURE FIX стартовал " + nowWarsawStr() + " ═══");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -709,7 +713,7 @@ public final class BotMain {
         double fcAcc   = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
 
         String msg = String.format(
-                "📊 *GodBot v14.0 — Daily Report*\n"
+                "📊 *GodBot v15.0 — Daily Report*\n"
                         + "🕙 %s (Warsaw)\n"
                         + "───────────────────────\n"
                         + "Up: %dm | Cycles: %d | Signals: %d\n"
@@ -859,16 +863,18 @@ public final class BotMain {
 
     private static String buildStartMessage() {
         return String.format(
-                "🚀 *GodBot v14.0 FIXED EDITION*\n"
+                "🚀 *GodBot v15.0 ARCHITECTURE FIX*\n"
                         + "15M Futures | 9-Factor Forecast | TOP-100\n"
                         + "───────────────────────────────\n"
-                        + "✅ ForecastEngine 9 факторов активен\n"
+                        + "✅ [Дыра 1] ConcurrentLinkedDeque everywhere\n"
+                        + "✅ [Дыра 3] LR window 30→10 + acceleration\n"
+                        + "✅ [Дыра 4] Streak: win halves boost aggressively\n"
+                        + "✅ [KITE] VolatilitySqueezeGuard active\n"
+                        + "✅ ForecastEngine 9+1 факторов активен\n"
                         + "✅ TrendPhase: EARLY/MID/LATE/EXHAUST\n"
                         + "✅ Structural stops за swing high/low\n"
                         + "✅ ISC с exponential streak decay\n"
                         + "✅ Trailing stop FIXED (SHORT logic)\n"
-                        + "✅ TradeResolver: tp2Hit flag, safe extremes\n"
-                        + "✅ Circuit breaker без Thread.sleep\n"
                         + "⏰ Тихие часы: UTC 01:00–05:00\n"
                         + "📅 Daily report в 09:00 UTC\n"
                         + "───────────────────────────────\n"
