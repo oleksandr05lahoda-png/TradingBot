@@ -40,6 +40,7 @@ public final class BotMain {
     // Ликвидность падает уже с 01:00, спреды расширяются
     private static final int QUIET_START_H = 1;
     private static final int QUIET_END_H   = 5;
+    private static final boolean QUIET_HOURS_ENABLED = envInt("QUIET_HOURS_ENABLED", 0) == 1;
 
     // ── Секторальные лидеры для GIC ───────────────────────────────────────
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
@@ -165,6 +166,7 @@ public final class BotMain {
                 task.run();
             } catch (Throwable t) {
                 errorCount.incrementAndGet();
+                errorsInWindow++;
                 LOG.log(Level.SEVERE, "[SAFE] Task '" + name + "' FAILED: " + t.getMessage(), t);
             }
         };
@@ -675,6 +677,10 @@ public final class BotMain {
         if (sender.getActiveWsCount() < 3)
             issues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
 
+        if (sender.getActiveWsCount() < 3 || now - lastCycleSuccessMs > 5 * 60_000L) {
+            sender.forceResubscribeTopPairs();
+        }
+
         if (!issues.isEmpty() && now - lastWatchdogAlertMs > WATCHDOG_COOLDOWN_MS) {
             lastWatchdogAlertMs = now;
             watchdogAlerts.incrementAndGet();
@@ -829,6 +835,7 @@ public final class BotMain {
     }
 
     private static boolean isQuietHours() {
+        if (!QUIET_HOURS_ENABLED) return false;
         ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
         int h = utc.getHour();
         return h >= QUIET_START_H && h < QUIET_END_H;

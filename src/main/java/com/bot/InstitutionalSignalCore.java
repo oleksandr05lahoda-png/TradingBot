@@ -24,6 +24,7 @@ import java.util.stream.Collectors;
  * ╚══════════════════════════════════════════════════════════════════════════════╝
  */
 public final class InstitutionalSignalCore {
+    private static final double MAX_EFFECTIVE_MIN_CONF = 64.0;
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
@@ -210,8 +211,8 @@ public final class InstitutionalSignalCore {
         // Daily PnL penalty — worse day = higher threshold, but NEVER blocks
         if (dailyPnLPct < -1.0) base += Math.min(5.0, Math.abs(dailyPnLPct));
 
-        // [v12.2] Floor 60%, ceiling 70%. Bot always works, just gets pickier.
-        return Math.max(52.0, Math.min(base, 70.0));
+        // Keep threshold strict but avoid decision deadlock with Forecast gatekeeper.
+        return Math.max(52.0, Math.min(base, MAX_EFFECTIVE_MIN_CONF));
     }
 
     public void setBacktestResult(double ev, long ts) {
@@ -254,12 +255,12 @@ public final class InstitutionalSignalCore {
 
         // [v12.0] Direction-specific loss check
         // If we lost 3+ consecutive LONGs, require higher confidence for next LONG
-        if (signal.side == TradingCore.Side.LONG && consecutiveLongLosses >= DIR_LOSS_PENALTY_THRESHOLD) {
-            double dirPenalty = Math.min(8.0, consecutiveLongLosses * 2.5);
+        if (signal.side == TradingCore.Side.LONG && consecutiveLongLosses >= (DIR_LOSS_PENALTY_THRESHOLD + 1)) {
+            double dirPenalty = Math.min(4.0, consecutiveLongLosses * 1.5);
             if (signal.probability < getEffectiveMinConfidence() + dirPenalty) return false;
         }
-        if (signal.side == TradingCore.Side.SHORT && consecutiveShortLosses >= DIR_LOSS_PENALTY_THRESHOLD) {
-            double dirPenalty = Math.min(8.0, consecutiveShortLosses * 2.5);
+        if (signal.side == TradingCore.Side.SHORT && consecutiveShortLosses >= (DIR_LOSS_PENALTY_THRESHOLD + 1)) {
+            double dirPenalty = Math.min(4.0, consecutiveShortLosses * 1.5);
             if (signal.probability < getEffectiveMinConfidence() + dirPenalty) return false;
         }
 
@@ -381,6 +382,24 @@ public final class InstitutionalSignalCore {
     public int getCurrentLossStreak() { return currentLossStreak; }
     public double getStreakBoost()    { return streakConfidenceBoost; }
     public double getCurrentHeat()   { return currentHeat; }
+
+    /**
+     * Risk multiplier for position sizing.
+     * After loss streaks we keep signal flow alive but reduce size.
+     */
+    public double getRiskSizeMultiplier() {
+        decayStreakBoost();
+        double mult = 1.0;
+        if (currentLossStreak >= 2) mult *= 0.75;
+        if (currentLossStreak >= 3) mult *= 0.60;
+        if (currentLossStreak >= 4) mult *= 0.50;
+        if (dailyPnLPct < -1.5) mult *= 0.75;
+        if (dailyPnLPct < -3.0) mult *= 0.60;
+        if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L) {
+            mult *= 0.80;
+        }
+        return Math.max(0.20, Math.min(mult, 1.0));
+    }
 
     public String getStats() {
         return String.format("ISC[act=%d/%d heat=%.1f%% cl=%d wr=%.0f%% str=%d+%.0f L%d/S%d eff=%.0f%% day=%.2f%%]",

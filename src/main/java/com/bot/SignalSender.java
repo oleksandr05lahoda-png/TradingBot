@@ -23,6 +23,7 @@ public final class SignalSender {
 
     private final com.bot.TelegramBotSender bot;
     private final HttpClient              http;
+    private final ExecutorService         httpIoExecutor;
     private final com.bot.GlobalImpulseController gic;
     private final com.bot.InstitutionalSignalCore isc;
     private final Object wsLock = new Object();
@@ -34,6 +35,7 @@ public final class SignalSender {
     private final int    TICK_HISTORY;
     private final double OBI_THRESHOLD;
     private final double DELTA_BLOCK_CONF;
+    private final boolean ENABLE_EARLY_TICK;
 
     // API ключи — нужны для UDS и размера позиции
     private final String API_KEY;
@@ -141,6 +143,7 @@ public final class SignalSender {
     private volatile boolean    rlIpBanned      = false;
     private volatile long       rlIpBanUntil    = 0;
     private volatile int        rl429Count      = 0;
+    private volatile long       rlRampUntil     = 0;
     private final AtomicLong    rlTotalWaits    = new AtomicLong(0);
 
     /**
@@ -201,12 +204,16 @@ public final class SignalSender {
         rl429Count++;
         long backoff = Math.min(5000L * (1L << Math.min(rl429Count, 5)), 120_000L);
         rlBackoffUntil = System.currentTimeMillis() + backoff;
+        if (rl429Count >= 3) {
+            rlRampUntil = System.currentTimeMillis() + 5 * 60_000L;
+        }
         System.out.println("[RL] 429 #" + rl429Count + " backoff=" + backoff + "ms");
         // [v10.0] НЕ спамим в Telegram — это внутренняя механика
     }
 
     private void rlOn418() {
         rlIpBanned = true; rlIpBanUntil = System.currentTimeMillis() + 5*60_000L;
+        rlRampUntil = rlIpBanUntil + 10 * 60_000L;
         System.out.println("[RL] 418 IP BAN 5min");
         // [v10.0] НЕ спамим в Telegram — бот просто подождёт и продолжит
     }
@@ -264,9 +271,15 @@ public final class SignalSender {
         this.bot = bot;
         this.gic = sharedGIC;
         this.isc = sharedISC;
+        this.httpIoExecutor = Executors.newFixedThreadPool(8, r -> {
+            Thread t = new Thread(r, "http-io-" + r.hashCode());
+            t.setDaemon(true);
+            return t;
+        });
         this.http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(12))
                 .version(HttpClient.Version.HTTP_2)
+                .executor(httpIoExecutor)
                 .build();
 
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
@@ -279,6 +292,7 @@ public final class SignalSender {
         this.TICK_HISTORY     = envInt("TICK_HISTORY", 120);
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
+        this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 0) == 1;
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();
@@ -357,8 +371,10 @@ public final class SignalSender {
             if (btc5m != null && btc5m.size() >= 10) gic.updateFast(btc5m);
         } catch (Exception ignored) {}
 
+        int pairBudget = computePairBudget();
+        List<String> scanPairs = selectPairsForScan(pairBudget);
         List<CompletableFuture<com.bot.DecisionEngineMerged.TradeIdea>> futures = new ArrayList<>();
-        for (String pair : cachedPairs) {
+        for (String pair : scanPairs) {
             futures.add(CompletableFuture.supplyAsync(() -> processPair(pair), fetchPool));
         }
 
@@ -375,6 +391,27 @@ public final class SignalSender {
 
         logCycleStats();
         return result;
+    }
+
+    private int computePairBudget() {
+        int base = Math.min(TOP_N, 80);
+        long now = System.currentTimeMillis();
+        if (rlIpBanned && now < rlIpBanUntil) return Math.min(12, base);
+        if (now < rlRampUntil) return Math.min(20, base);
+        if (rl429Count >= 2) return Math.min(30, base);
+        int eff = Math.max(rlCurrentWeight.get(), rlServerWeight);
+        if (eff > RL_SAFE_WEIGHT) return Math.min(35, base);
+        return base;
+    }
+
+    private List<String> selectPairsForScan(int budget) {
+        if (cachedPairs.isEmpty()) return List.of();
+        List<String> sorted = new ArrayList<>(cachedPairs);
+        sorted.sort((a, b) -> Double.compare(
+                volume24hUSD.getOrDefault(b, 0.0),
+                volume24hUSD.getOrDefault(a, 0.0)));
+        if (sorted.size() <= budget) return sorted;
+        return new ArrayList<>(sorted.subList(0, budget));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -430,6 +467,18 @@ public final class SignalSender {
             }
         }
         System.out.printf("[WS] Active: %d/%d (pairs: %d)%n", wsMap.size(), MAX_WS_CONNECTIONS, pairs.size());
+    }
+
+    public void forceResubscribeTopPairs() {
+        try {
+            Set<String> fresh = getTopSymbolsSet(TOP_N);
+            if (fresh == null || fresh.isEmpty()) return;
+            startWebSocketsForTopPairs(fresh);
+            cachedPairs = fresh;
+            lastPairsRefresh = System.currentTimeMillis();
+        } catch (Exception e) {
+            System.out.println("[WS-RECOVER] " + e.getMessage());
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -701,6 +750,7 @@ public final class SignalSender {
         else if (idea.probability < 58)  riskPct *= 0.75;
 
         double riskUsdt  = balance * riskPct;
+        riskUsdt *= isc.getRiskSizeMultiplier();
         double stopPct   = Math.max(0.005, Math.abs(idea.price - idea.stop) / idea.price);
         double posSize   = riskUsdt / stopPct;
 
@@ -783,8 +833,11 @@ public final class SignalSender {
     }
 
     private void connectUserDataStream(String listenKey) {
-        HttpClient udsClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
-        udsClient.newWebSocketBuilder()
+        WebSocket old = udsWebSocket;
+        if (old != null) {
+            try { old.sendClose(WebSocket.NORMAL_CLOSURE, "uds reconnect"); } catch (Exception ignored) {}
+        }
+        http.newWebSocketBuilder()
                 .buildAsync(URI.create("wss://fstream.binance.com/ws/" + listenKey), new WebSocket.Listener() {
 
                     @Override
@@ -1151,8 +1204,7 @@ public final class SignalSender {
                     + pair.toLowerCase() + "@aggTrade/"
                     + pair.toLowerCase() + "@bookTicker";
 
-            HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
-                    .newWebSocketBuilder()
+            http.newWebSocketBuilder()
                     .buildAsync(URI.create(streamUrl),
                             new WebSocket.Listener() {
                                 @Override
@@ -1205,10 +1257,12 @@ public final class SignalSender {
         lastTickPrice.put(pair, price); lastTickTime.put(pair, ts);
         microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(30_000)).addTick(ts, price, qty);
 
-        com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
-        if (et != null && filterEarlySignal(et)) {
-            bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
-            earlySignals.incrementAndGet(); isc.registerSignal(et);
+        if (ENABLE_EARLY_TICK) {
+            com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
+            if (et != null && filterEarlySignal(et)) {
+                bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
+                earlySignals.incrementAndGet(); isc.registerSignal(et);
+            }
         }
     }
 

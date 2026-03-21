@@ -1140,13 +1140,56 @@ public final class DecisionEngineMerged {
                     boolean fcBull = forecastResult.directionScore > 0.2;
                     boolean fcBear = forecastResult.directionScore < -0.2;
                     boolean sigLong = side == com.bot.TradingCore.Side.LONG;
+                    double fcDirAbs = Math.abs(forecastResult.directionScore);
+
+                    // ForecastEngine acts as gatekeeper: block trades that go against
+                    // 1.5-2h direction projection or are already in exhaustion phase.
+                    boolean exhaustionOverride = forecastResult.confidence >= 0.76
+                            && fcDirAbs >= 0.34
+                            && Math.abs(forecastResult.projectedMovePct) >= stopDist / (price + 1e-9) * 1.25
+                            && ((sigLong && forecastResult.directionScore > 0)
+                            || (!sigLong && forecastResult.directionScore < 0));
+                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION
+                            && !exhaustionOverride) {
+                        allFlags.add("FC_VETO_EXHAUST");
+                        return null;
+                    }
+                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION
+                            && exhaustionOverride) {
+                        allFlags.add("FC_EXHAUST_OVERRIDE");
+                    }
+                    if (sigLong
+                            && (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.BEAR || fcBear)
+                            && fcDirAbs >= 0.18) {
+                        allFlags.add("FC_VETO_BEAR");
+                        return null;
+                    }
+                    if (!sigLong
+                            && (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.BULL || fcBull)
+                            && fcDirAbs >= 0.18) {
+                        allFlags.add("FC_VETO_BULL");
+                        return null;
+                    }
+                    if (sigLong && forecastResult.projectedMovePct <= 0) {
+                        if (forecastResult.trendPhase != com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY) {
+                            allFlags.add("FC_VETO_PROJ_DN");
+                            return null;
+                        }
+                        probability = Math.max(50, probability - 2);
+                        allFlags.add("FC_PROJ_DN_EARLY_OK");
+                    }
+                    if (!sigLong && forecastResult.projectedMovePct >= 0) {
+                        if (forecastResult.trendPhase != com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY) {
+                            allFlags.add("FC_VETO_PROJ_UP");
+                            return null;
+                        }
+                        probability = Math.max(50, probability - 2);
+                        allFlags.add("FC_PROJ_UP_EARLY_OK");
+                    }
+
                     if ((sigLong && fcBear) || (!sigLong && fcBull)) {
                         probability = Math.max(50, probability - 4);
                         allFlags.add("FC_DISAGREE");
-                    }
-                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
-                        probability = Math.max(50, probability - 3);
-                        allFlags.add("FC_EXHAUST");
                     }
                     if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
                             && Math.abs(forecastResult.directionScore) > 0.3) {
@@ -1159,13 +1202,12 @@ public final class DecisionEngineMerged {
                     double stopRetAbs = stopDist / (price + 1e-9); // risk as return fraction
                     double fcMoveAbs = Math.abs(forecastResult.projectedMovePct); // return fraction
                     double fcConf = forecastResult.confidence; // [0..1]
-                    double fcDirAbs = Math.abs(forecastResult.directionScore); // [-1..1] abs
 
                     boolean isRange = state == MarketState.RANGE;
 
                     // If expected move doesn't cover risk, it's mostly noise.
-                    boolean moveOk = fcMoveAbs >= stopRetAbs * (isRange ? 1.05 : 0.70);
-                    boolean confOk = fcConf >= (isRange ? 0.60 : 0.52);
+                    boolean moveOk = fcMoveAbs >= stopRetAbs * (isRange ? 1.05 : 0.95);
+                    boolean confOk = fcConf >= (isRange ? 0.60 : 0.56);
                     boolean dirOk = fcDirAbs >= (isRange ? 0.25 : 0.20);
                     boolean neutralOk = forecastResult.bias != com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL;
 
@@ -1174,14 +1216,25 @@ public final class DecisionEngineMerged {
                             probability = Math.max(50, probability - 5);
                             allFlags.add("FC_NEUTRAL_RANGE");
                         }
-                        // Bypass: если "кластерная" уверенность уже очень высокая,
-                        // то не рубим сигнал только из-за forecast-деталей.
-                        boolean highProbByClusters = probability >= 80;
-                        if (!highProbByClusters
+                        // Mode 2: allow RANGE when ForecastEngine is genuinely strong.
+                        // Here we use stricter forecast thresholds than the default anti-range gate.
+                        boolean rangeStrongForecast =
+                                fcConf >= 0.74
+                                        && fcDirAbs >= 0.30
+                                        && fcMoveAbs >= stopRetAbs * 0.98
+                                        && forecastResult.trendPhase != com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION
+                                        && forecastResult.bias != com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL;
+
+                        boolean bypassRangeGate = rangeStrongForecast;
+
+                        if (!bypassRangeGate
                                 && (!moveOk || !confOk || !dirOk
                                 || forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION)) {
                             allFlags.add("FC_RANGE_FILTER");
                             return null;
+                        }
+                        if (rangeStrongForecast) {
+                            allFlags.add("FC_RANGE_STRONG_BYPASS");
                         }
                     } else {
                         // In non-range modes we can be slightly more permissive.

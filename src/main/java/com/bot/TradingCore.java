@@ -1707,7 +1707,9 @@ public final class TradingCore {
             boolean ordered=(e9>e21&&e21>e50)||(e9<e21&&e21<e50);
             double adxP=c15.size()>5?fcAdx(c15.subList(0,c15.size()-3),14):adxV;
             boolean rising=adxV>adxP*1.02, falling=adxV<adxP*0.97;
-            if (adxV<20) return TrendPhase.EARLY;
+            // ADX<20 is compression/range. For forecasting, treat as EARLY setup zone
+            // so the engine can catch reversals out of accumulation/distribution.
+            if (adxV < 20) return TrendPhase.EARLY;
             if (adxV>=20&&adxV<35&&rising&&ordered) return TrendPhase.MID;
             if ((adxV>=40&&falling)||rsiV>78||rsiV<22) return TrendPhase.EXHAUSTION;
             if (adxV>=35&&falling) return TrendPhase.LATE;
@@ -1716,7 +1718,13 @@ public final class TradingCore {
             return TrendPhase.MID;
         }
         private double calcPhaseScore(List<Candle> c, TrendPhase ph) {
-            boolean bull=c.get(c.size()-1).close>fcEma(c,21);
+            double close = c.get(c.size()-1).close;
+            double ema21 = fcEma(c,21);
+            double atr = Math.max(fcAtr(c, 14), close * 0.001);
+            // In flat/low-energy conditions avoid binary flip around EMA21.
+            boolean bull = (close - ema21) > atr * 0.12;
+            boolean bear = (ema21 - close) > atr * 0.12;
+            if (!bull && !bear) return 0.0;
             return switch(ph) {
                 case EARLY -> bull?0.40:-0.40;
                 case MID -> bull?0.25:-0.25;
