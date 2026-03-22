@@ -6,7 +6,11 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -557,7 +561,18 @@
       <workItem from="1774101366352" duration="6000" />
       <workItem from="1774101380926" duration="13000" />
       <workItem from="1774101713234" duration="2607000" />
-      <workItem from="1774136072570" duration="980000" />
+      <workItem from="1774136072570" duration="1981000" />
+      <workItem from="1774171079796" duration="14000" />
+      <workItem from="1774171101451" duration="1494000" />
+      <workItem from="1774174134774" duration="13000" />
+      <workItem from="1774174154253" duration="6000" />
+      <workItem from="1774174170919" duration="7000" />
+      <workItem from="1774174185891" duration="4000" />
+      <workItem from="1774174197044" duration="6000" />
+      <workItem from="1774174209776" duration="4000" />
+      <workItem from="1774174223279" duration="7000" />
+      <workItem from="1774174238793" duration="6000" />
+      <workItem from="1774174252329" duration="9000" />
     </task>
     <servers />
   </component>

@@ -34,10 +34,10 @@ public final class SimpleBacktester {
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
-    private static final Map<DecisionEngineMerged.CoinCategory, Double> SLIPPAGE = Map.of(
-            DecisionEngineMerged.CoinCategory.TOP,  0.0008,
-            DecisionEngineMerged.CoinCategory.ALT,  0.0025,
-            DecisionEngineMerged.CoinCategory.MEME, 0.0060
+    private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE = Map.of(
+            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0008,
+            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0025,
+            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0060
     );
 
     // ── Setters ──────────────────────────────────────────────────
@@ -161,7 +161,7 @@ public final class SimpleBacktester {
 
     public static final class TradeRecord {
         public final String symbol;
-        public final TradingCore.Side side;
+        public final com.bot.TradingCore.Side side;
         public final double entry, exit, sl, tp;
         public final double pnlPct;
         public final double confidence;
@@ -170,7 +170,7 @@ public final class SimpleBacktester {
         public final long entryTime;
         public final double fees, slippage, funding;
 
-        public TradeRecord(String sym, TradingCore.Side side, double entry, double exit,
+        public TradeRecord(String sym, com.bot.TradingCore.Side side, double entry, double exit,
                            double sl, double tp, double pnlPct, double conf, int bars,
                            String reason, long entryTime, double fees, double slip, double fund) {
             this.symbol = sym; this.side = side; this.entry = entry; this.exit = exit;
@@ -249,20 +249,20 @@ public final class SimpleBacktester {
     // ══════════════════════════════════════════════════════════════
 
     public BacktestResult run(String symbol,
-                              List<TradingCore.Candle> m1,
-                              List<TradingCore.Candle> m5,
-                              List<TradingCore.Candle> m15,
-                              List<TradingCore.Candle> h1,
-                              DecisionEngineMerged.CoinCategory category) {
+                              List<com.bot.TradingCore.Candle> m1,
+                              List<com.bot.TradingCore.Candle> m5,
+                              List<com.bot.TradingCore.Candle> m15,
+                              List<com.bot.TradingCore.Candle> h1,
+                              com.bot.DecisionEngineMerged.CoinCategory category) {
         BacktestResult result = new BacktestResult(symbol);
         if (m15 == null || m15.size() < 200) return result;
 
-        DecisionEngineMerged engine = new DecisionEngineMerged();
+        com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
         double slippage = SLIPPAGE.getOrDefault(category, 0.0025);
         double balance = initialBalance;
 
         // Build m1 index for intra-candle resolution
-        Map<Long, List<TradingCore.Candle>> m1Index = buildM1Index(m1);
+        Map<Long, List<com.bot.TradingCore.Candle>> m1Index = buildM1Index(m1);
 
         // Track daily returns
         Map<Long, Double> dailyPnL = new TreeMap<>();
@@ -274,7 +274,7 @@ public final class SimpleBacktester {
         ActivePosition currentPos = null;
 
         while (i < m15.size()) {
-            TradingCore.Candle bar = m15.get(i);
+            com.bot.TradingCore.Candle bar = m15.get(i);
             long barDay = bar.openTime / 86400_000L;
 
             // Check existing position
@@ -320,20 +320,20 @@ public final class SimpleBacktester {
             // Generate signal if no position
             if (currentPos == null) {
                 int fromBar = Math.max(0, i - 200);
-                List<TradingCore.Candle> slice15 = m15.subList(fromBar, i + 1);
-                List<TradingCore.Candle> sliceH1 = getTimeframeSlice(h1, m15.get(fromBar).openTime, bar.openTime);
+                List<com.bot.TradingCore.Candle> slice15 = m15.subList(fromBar, i + 1);
+                List<com.bot.TradingCore.Candle> sliceH1 = getTimeframeSlice(h1, m15.get(fromBar).openTime, bar.openTime);
 
-                List<TradingCore.Candle> sliceM1 = null, sliceM5 = null;
+                List<com.bot.TradingCore.Candle> sliceM1 = null, sliceM5 = null;
                 if (m1 != null && !m1.isEmpty()) sliceM1 = getTimeframeSlice(m1, m15.get(Math.max(0, i - 20)).openTime, bar.openTime);
                 if (m5 != null && !m5.isEmpty()) sliceM5 = getTimeframeSlice(m5, m15.get(Math.max(0, i - 40)).openTime, bar.openTime);
 
-                DecisionEngineMerged.TradeIdea idea = engine.analyze(
+                com.bot.DecisionEngineMerged.TradeIdea idea = engine.analyze(
                         symbol, sliceM1, sliceM5, slice15, sliceH1, category);
 
                 if (idea != null) {
                     double entryPrice = idea.price;
                     // Apply slippage to entry
-                    if (idea.side == TradingCore.Side.LONG) entryPrice *= (1 + slippage);
+                    if (idea.side == com.bot.TradingCore.Side.LONG) entryPrice *= (1 + slippage);
                     else entryPrice *= (1 - slippage);
 
                     currentPos = new ActivePosition(
@@ -374,12 +374,12 @@ public final class SimpleBacktester {
 
     /** Data container for all timeframes of a symbol */
     public static final class SymbolData {
-        public final List<TradingCore.Candle> m1, m5, m15, h1;
-        public final DecisionEngineMerged.CoinCategory category;
+        public final List<com.bot.TradingCore.Candle> m1, m5, m15, h1;
+        public final com.bot.DecisionEngineMerged.CoinCategory category;
 
-        public SymbolData(List<TradingCore.Candle> m1, List<TradingCore.Candle> m5,
-                          List<TradingCore.Candle> m15, List<TradingCore.Candle> h1,
-                          DecisionEngineMerged.CoinCategory category) {
+        public SymbolData(List<com.bot.TradingCore.Candle> m1, List<com.bot.TradingCore.Candle> m5,
+                          List<com.bot.TradingCore.Candle> m15, List<com.bot.TradingCore.Candle> h1,
+                          com.bot.DecisionEngineMerged.CoinCategory category) {
             this.m1 = m1; this.m5 = m5; this.m15 = m15; this.h1 = h1; this.category = category;
         }
     }
@@ -403,9 +403,9 @@ public final class SimpleBacktester {
      * @return list of out-of-sample results for each window
      */
     public List<BacktestResult> walkForward(String symbol,
-                                            List<TradingCore.Candle> m15,
-                                            List<TradingCore.Candle> h1,
-                                            DecisionEngineMerged.CoinCategory category,
+                                            List<com.bot.TradingCore.Candle> m15,
+                                            List<com.bot.TradingCore.Candle> h1,
+                                            com.bot.DecisionEngineMerged.CoinCategory category,
                                             int trainBars, int testBars) {
         List<BacktestResult> oosResults = new ArrayList<>();
         if (m15 == null || m15.size() < trainBars + testBars) return oosResults;
@@ -416,8 +416,8 @@ public final class SimpleBacktester {
             int testStart = cursor + trainBars;
             int testEnd   = Math.min(testStart + testBars, m15.size());
 
-            List<TradingCore.Candle> testM15 = m15.subList(Math.max(0, testStart - 200), testEnd);
-            List<TradingCore.Candle> testH1  = getTimeframeSlice(h1,
+            List<com.bot.TradingCore.Candle> testM15 = m15.subList(Math.max(0, testStart - 200), testEnd);
+            List<com.bot.TradingCore.Candle> testH1  = getTimeframeSlice(h1,
                     m15.get(testStart).openTime - 200 * 3600_000L,
                     m15.get(testEnd - 1).openTime);
 
@@ -471,14 +471,14 @@ public final class SimpleBacktester {
     // ══════════════════════════════════════════════════════════════
 
     private static final class ActivePosition {
-        final TradingCore.Side side;
+        final com.bot.TradingCore.Side side;
         final double entry, sl, tp1, tp2, confidence;
         final long entryTime;
         final int entryBar;
         boolean tp1Hit = false;
         double currentSL;
 
-        ActivePosition(TradingCore.Side side, double entry, double sl, double tp1, double tp2,
+        ActivePosition(com.bot.TradingCore.Side side, double entry, double sl, double tp1, double tp2,
                        double conf, long time, int bar) {
             this.side = side; this.entry = entry; this.sl = sl;
             this.tp1 = tp1; this.tp2 = tp2; this.confidence = conf;
@@ -497,10 +497,10 @@ public final class SimpleBacktester {
         }
     }
 
-    private PositionOutcome resolvePosition(ActivePosition pos, List<TradingCore.Candle> m15,
-                                            int currentBar, Map<Long, List<TradingCore.Candle>> m1Index,
+    private PositionOutcome resolvePosition(ActivePosition pos, List<com.bot.TradingCore.Candle> m15,
+                                            int currentBar, Map<Long, List<com.bot.TradingCore.Candle>> m1Index,
                                             double slippage) {
-        boolean isLong = pos.side == TradingCore.Side.LONG;
+        boolean isLong = pos.side == com.bot.TradingCore.Side.LONG;
         int barsHeld = currentBar - pos.entryBar;
 
         // Time stop
@@ -511,7 +511,7 @@ public final class SimpleBacktester {
             return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, "TIME_STOP");
         }
 
-        TradingCore.Candle bar = m15.get(currentBar);
+        com.bot.TradingCore.Candle bar = m15.get(currentBar);
         double sl = pos.currentSL;
         double tp = pos.tp1Hit ? pos.tp2 : pos.tp1;
 
@@ -548,7 +548,7 @@ public final class SimpleBacktester {
 
         // Both SL and TP could be hit — use 1m data to resolve
         if (useM1Resolution) {
-            List<TradingCore.Candle> m1Candles = m1Index.get(bar.openTime);
+            List<com.bot.TradingCore.Candle> m1Candles = m1Index.get(bar.openTime);
             if (m1Candles != null && m1Candles.size() >= 3) {
                 return resolveWithM1(pos, m1Candles, isLong, sl, tp, barsHeld, currentBar, slippage);
             }
@@ -558,10 +558,10 @@ public final class SimpleBacktester {
         return resolveHeuristic(pos, bar, isLong, sl, tp, barsHeld, currentBar, slippage);
     }
 
-    private PositionOutcome resolveWithM1(ActivePosition pos, List<TradingCore.Candle> m1,
+    private PositionOutcome resolveWithM1(ActivePosition pos, List<com.bot.TradingCore.Candle> m1,
                                           boolean isLong, double sl, double tp,
                                           int barsHeld, int currentBar, double slippage) {
-        for (TradingCore.Candle m1Bar : m1) {
+        for (com.bot.TradingCore.Candle m1Bar : m1) {
             boolean slHit = isLong ? m1Bar.low <= sl : m1Bar.high >= sl;
             boolean tpHit = isLong ? m1Bar.high >= tp : m1Bar.low <= tp;
 
@@ -587,7 +587,7 @@ public final class SimpleBacktester {
         return null;
     }
 
-    private PositionOutcome resolveHeuristic(ActivePosition pos, TradingCore.Candle bar,
+    private PositionOutcome resolveHeuristic(ActivePosition pos, com.bot.TradingCore.Candle bar,
                                              boolean isLong, double sl, double tp,
                                              int barsHeld, int currentBar, double slippage) {
         // Conservative bias: default to SL first (prevents backtest optimism)
@@ -630,21 +630,21 @@ public final class SimpleBacktester {
     //  UTILITY
     // ══════════════════════════════════════════════════════════════
 
-    private Map<Long, List<TradingCore.Candle>> buildM1Index(List<TradingCore.Candle> m1) {
-        Map<Long, List<TradingCore.Candle>> index = new HashMap<>();
+    private Map<Long, List<com.bot.TradingCore.Candle>> buildM1Index(List<com.bot.TradingCore.Candle> m1) {
+        Map<Long, List<com.bot.TradingCore.Candle>> index = new HashMap<>();
         if (m1 == null) return index;
-        for (TradingCore.Candle c : m1) {
+        for (com.bot.TradingCore.Candle c : m1) {
             long period15m = (c.openTime / (15 * 60_000L)) * (15 * 60_000L);
             index.computeIfAbsent(period15m, k -> new ArrayList<>()).add(c);
         }
         return index;
     }
 
-    private List<TradingCore.Candle> getTimeframeSlice(List<TradingCore.Candle> candles,
-                                                       long fromMs, long toMs) {
+    private List<com.bot.TradingCore.Candle> getTimeframeSlice(List<com.bot.TradingCore.Candle> candles,
+                                                               long fromMs, long toMs) {
         if (candles == null || candles.isEmpty()) return List.of();
-        List<TradingCore.Candle> result = new ArrayList<>();
-        for (TradingCore.Candle c : candles) {
+        List<com.bot.TradingCore.Candle> result = new ArrayList<>();
+        for (com.bot.TradingCore.Candle c : candles) {
             if (c.openTime >= fromMs && c.openTime <= toMs) result.add(c);
         }
         return result;
