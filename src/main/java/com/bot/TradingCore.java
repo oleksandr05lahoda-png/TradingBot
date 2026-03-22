@@ -1547,16 +1547,17 @@ public final class TradingCore {
             if (squeezed) {
                 // In squeeze: no directional conviction at all
                 dir = trendDir * 0.15;
-            } else if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
-                // STRONG exhaustion: forecast REVERSAL (opposite to current move)
-                dir = -move.direction * exhaustionScore * 0.70;
+            } else if (exhaustionScore > 0.50 && exhaustionSignals >= 2) {
+                // [v19.0] STRONG exhaustion: forecast REVERSAL (opposite to current move)
+                // Lowered from 0.55 / 3 signals to make it catch bottoms/tops faster
+                dir = -move.direction * exhaustionScore * 0.85;
                 // Trend brain can barely whisper
-                dir += trendDir * 0.10;
-            } else if (exhaustionScore > 0.35 && exhaustionSignals >= 2) {
-                // Moderate exhaustion: heavily reduce trend conviction
-                dir = trendDir * 0.30 + vpocPull * 0.20;
-                // Slight counter-move bias
-                dir -= move.direction * exhaustionScore * 0.25;
+                dir += trendDir * 0.05;
+            } else if (exhaustionScore > 0.30 && exhaustionSignals >= 1) {
+                // [v19.0] Moderate exhaustion: heavily reduce trend conviction
+                dir = trendDir * 0.25 + vpocPull * 0.25;
+                // Stronger counter-move bias
+                dir -= move.direction * exhaustionScore * 0.35;
             } else if (phase == TrendPhase.EARLY) {
                 // Early in move: trend brain speaks louder
                 dir = trendDir * 0.70 + vpocPull * 0.10;
@@ -1564,7 +1565,7 @@ public final class TradingCore {
                 // Normal: balanced
                 dir = trendDir * 0.55 + vpocPull * 0.15;
                 // Mild exhaustion brake
-                if (exhaustionScore > 0.15) dir *= (1.0 - exhaustionScore * 0.3);
+                if (exhaustionScore > 0.15) dir *= (1.0 - exhaustionScore * 0.4);
             }
 
             dir = clamp(dir, -1.0, 1.0);

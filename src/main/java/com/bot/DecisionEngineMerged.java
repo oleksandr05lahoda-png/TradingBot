@@ -502,6 +502,22 @@ public final class DecisionEngineMerged {
             else         cStructure.addShort(mctx.s(0.58), "LIQ_SWEEP_S");
         }
 
+        // [v19.0] TRAPPED TRADERS (Judas Swing)
+        // Retail buys breakouts. Smart money traps them.
+        com.bot.TradingCore.SwingStructureResult swingSt = com.bot.TradingCore.analyzeSwingStructure(c15, 5);
+        if (swingSt != null) {
+            com.bot.TradingCore.Candle lc = last(c15);
+            com.bot.TradingCore.Candle prev = c15.get(c15.size() - 2);
+            // Trap Buyers: price poked above recent Swing High but closed back below
+            if (lc.high > swingSt.lastSwingHigh && swingSt.lastSwingHigh > 0 && lc.close < swingSt.lastSwingHigh && (lc.open >= swingSt.lastSwingHigh || prev.close > swingSt.lastSwingHigh)) {
+                cStructure.addShort(mctx.s(0.85), "TRAP_BUYERS");
+            }
+            // Trap Sellers: price poked below recent Swing Low but closed back above
+            if (lc.low < swingSt.lastSwingLow && swingSt.lastSwingLow > 0 && lc.close > swingSt.lastSwingLow && (lc.open <= swingSt.lastSwingLow || prev.close < swingSt.lastSwingLow)) {
+                cStructure.addLong(mctx.s(0.85), "TRAP_SELLERS");
+            }
+        }
+
         // Bullish/Bearish structure
         if (bullishStructure(c15)) cStructure.boostLong(mctx.s(0.18), null);
         if (bearishStructure(c15)) cStructure.boostShort(mctx.s(0.18), null);
@@ -792,6 +808,44 @@ public final class DecisionEngineMerged {
                 ? com.bot.TradingCore.Side.LONG
                 : com.bot.TradingCore.Side.SHORT;
 
+        // [v19.0] HARD VETO: Если очень мощный разворотный сигнал идет ПРОТИВ тренда,
+        // который набрал баллы на отстающих индикаторах (как 1H EMA), убиваем трендовый сигнал.
+        if (earlyRev.detected && earlyRev.strength > 0.35) {
+            com.bot.TradingCore.Side earlySide = earlyRev.direction > 0 ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+            
+            boolean rsiSupportsEarly = (earlySide == com.bot.TradingCore.Side.LONG && rsi14 < 45) ||
+                                       (earlySide == com.bot.TradingCore.Side.SHORT && rsi14 > 55);
+            boolean antiLagSupportsEarly = (earlySide == com.bot.TradingCore.Side.LONG && allFlags.contains("ANTI_LAG_UP")) ||
+                                           (earlySide == com.bot.TradingCore.Side.SHORT && allFlags.contains("ANTI_LAG_DN"));
+            boolean rsiShiftSupportsEarly = (earlySide == com.bot.TradingCore.Side.LONG && allFlags.contains("RSI_SHIFT_UP")) ||
+                                            (earlySide == com.bot.TradingCore.Side.SHORT && allFlags.contains("RSI_SHIFT_DN"));
+            boolean strongOverride = rsiSupportsEarly || antiLagSupportsEarly || rsiShiftSupportsEarly || earlyRev.strength > 0.55;
+
+            if (earlySide != candidateSide) {
+                // Прямой конфликт: сильный ранний разворот ПРОТИВ кандидата
+                if (strongOverride) {
+                    if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.15;
+                    else scoreShort *= 0.15;
+                    allFlags.add("EARLY_VETO_OPPOSITE");
+                    // Пересчитаем кандидата после штрафа
+                    candidateSide = scoreLong > scoreShort ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+                }
+            } else {
+                // Прямое совпадение: ранний разворот ВЕДЕТ кандидата.
+                // Отстающие индикаторы на противоположной стороне просто "съедают" scoreDiff, мешая поймать разворот мгновенно.
+                // Штрафуем противоположную сторону, чтобы пробить мин. scoreDiff барьер!
+                if (strongOverride && earlyRev.strength > 0.45) {
+                    if (candidateSide == com.bot.TradingCore.Side.LONG) {
+                        scoreShort *= 0.30;
+                        allFlags.add("EARLY_CLEAR_S");
+                    } else {
+                        scoreLong *= 0.30;
+                        allFlags.add("EARLY_CLEAR_L");
+                    }
+                }
+            }
+        }
+
         int supportingClusters = candidateSide == com.bot.TradingCore.Side.LONG
                 ? longClusters : shortClusters;
 
@@ -953,8 +1007,47 @@ public final class DecisionEngineMerged {
         }
 
         double stopPrice = side == com.bot.TradingCore.Side.LONG  ? price - stopDist : price + stopDist;
-        double takePrice = side == com.bot.TradingCore.Side.LONG  ? price + stopDist * rrRatio
+        
+        // [v19.0] DYNAMIC LIQUIDITY TARGETS (Order Blocks & Swings)
+        // Millionaire-level feature: Snap Take Profit to where liquidity rests
+        double classicTakePrice = side == com.bot.TradingCore.Side.LONG ? price + stopDist * rrRatio
                 : price - stopDist * rrRatio;
+        
+        double smartTarget = -1;
+        List<com.bot.TradingCore.OrderBlock> obs = com.bot.TradingCore.detectOrderBlocks(c15, 60);
+        if (side == com.bot.TradingCore.Side.LONG) {
+            // Looking for unmitigated BEARISH order blocks above us to target
+            for (int i = obs.size() - 1; i >= 0; i--) {
+                com.bot.TradingCore.OrderBlock obTarg = obs.get(i);
+                if (!obTarg.isBullish && obTarg.bottom > price) {
+                    double potentialRR = (obTarg.bottom - price) / stopDist;
+                    if (potentialRR >= 1.5) { // Needs to be worth it
+                        smartTarget = obTarg.bottom;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Looking for unmitigated BULLISH order blocks below us to target
+            for (int i = obs.size() - 1; i >= 0; i--) {
+                com.bot.TradingCore.OrderBlock obTarg = obs.get(i);
+                if (obTarg.isBullish && obTarg.top < price) {
+                    double potentialRR = (price - obTarg.top) / stopDist;
+                    if (potentialRR >= 1.5) {
+                        smartTarget = obTarg.top;
+                        break;
+                    }
+                }
+            }
+        }
+
+        double takePrice = classicTakePrice;
+        if (smartTarget > 0) {
+            takePrice = smartTarget;
+            // Update rrRatio for correct logging and sizing based on actual dynamic TP
+            rrRatio = Math.abs(price - takePrice) / stopDist;
+            allFlags.add("SMART_TP");
+        }
 
         if (!priceMovedEnough(symbol, price)) return null;
         // [v14.0 FIX] НЕ вызываем registerSignal() здесь — cooldown ставится
@@ -1047,6 +1140,18 @@ public final class DecisionEngineMerged {
                         probability = Math.max(50, probability - 3);
                         allFlags.add(forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
                                 ? "FC_PROJ_UP_EARLY_OK" : "FC_PROJ_UP_PENALTY");
+                    }
+
+                    // [v19.0] HARD VETO: Early Counter-Trend
+                    // Если Forecast утверждает, что начался РАННИЙ тренд ПРОТИВ нашей позиции,
+                    // и у него есть уверенность — мы ОБЯЗАНЫ отменить вход в старый умирающий тренд.
+                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY) {
+                        boolean earlyOpposed = (sigLong && forecastResult.directionScore < -0.15)
+                                || (!sigLong && forecastResult.directionScore > 0.15);
+                        if (earlyOpposed && forecastResult.confidence > 0.40) {
+                            allFlags.add("FC_VETO_EARLY_REV");
+                            return null;
+                        }
                     }
 
                     // ── BOOST: Early trend phase with strong direction ──
