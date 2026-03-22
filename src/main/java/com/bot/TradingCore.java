@@ -1547,16 +1547,14 @@ public final class TradingCore {
             if (squeezed) {
                 // In squeeze: no directional conviction at all
                 dir = trendDir * 0.15;
-            } else if (exhaustionScore > 0.60 && exhaustionSignals >= 2) {
-                // [v20.0 SNIPER] EXTREME exhaustion: Decisive REVERSAL prediction.
-                // Complete override of trend brain, guaranteeing STRONG_BULL/STRONG_BEAR
-                dir = -move.direction * Math.max(0.65, exhaustionScore);
-            } else if (exhaustionScore > 0.45 && exhaustionSignals >= 2) {
-                // STRONG exhaustion: forecast REVERSAL (opposite to current move)
+            } else if (exhaustionScore > 0.50 && exhaustionSignals >= 2) {
+                // [v19.0] STRONG exhaustion: forecast REVERSAL (opposite to current move)
+                // Lowered from 0.55 / 3 signals to make it catch bottoms/tops faster
                 dir = -move.direction * exhaustionScore * 0.85;
-                dir += trendDir * 0.05; // Trend brain can barely whisper
-            } else if (exhaustionScore > 0.25 && exhaustionSignals >= 1) {
-                // Moderate exhaustion: heavily reduce trend conviction
+                // Trend brain can barely whisper
+                dir += trendDir * 0.05;
+            } else if (exhaustionScore > 0.30 && exhaustionSignals >= 1) {
+                // [v19.0] Moderate exhaustion: heavily reduce trend conviction
                 dir = trendDir * 0.25 + vpocPull * 0.25;
                 // Stronger counter-move bias
                 dir -= move.direction * exhaustionScore * 0.35;

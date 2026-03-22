@@ -105,14 +105,14 @@ public final class InstitutionalSignalCore {
 
     public static final class ActiveSignal {
         public final String symbol;
-        public final com.bot.TradingCore.Side side;
+        public final TradingCore.Side side;
         public final double entry, sl, tp1, probability;
         public final double riskPct; // % of balance at risk
         public final long   timestamp;
         public final String category;
         public final String sector;
 
-        public ActiveSignal(String sym, com.bot.TradingCore.Side side, double entry, double sl,
+        public ActiveSignal(String sym, TradingCore.Side side, double entry, double sl,
                             double tp1, double prob, double riskPct, String cat, String sector) {
             this.symbol = sym; this.side = side; this.entry = entry; this.sl = sl;
             this.tp1 = tp1; this.probability = prob; this.riskPct = riskPct;
@@ -126,13 +126,13 @@ public final class InstitutionalSignalCore {
 
     public static final class ClosedTrade {
         public final String symbol;
-        public final com.bot.TradingCore.Side side;
+        public final TradingCore.Side side;
         public final double pnlPct;
         public final long   duration;
         public final String exitReason;
         public final long   closedAt;
 
-        public ClosedTrade(String sym, com.bot.TradingCore.Side side, double pnl, long dur, String reason) {
+        public ClosedTrade(String sym, TradingCore.Side side, double pnl, long dur, String reason) {
             this.symbol = sym; this.side = side; this.pnlPct = pnl;
             this.duration = dur; this.exitReason = reason;
             this.closedAt = System.currentTimeMillis();
@@ -152,7 +152,7 @@ public final class InstitutionalSignalCore {
     /** [v15.0] Direction-aware result tracking
      *  FIX Дыра 4: First win after loss streak HALVES the boost (was only -1.5).
      *  This prevents the bot from self-silencing after 3 normal stop-losses. */
-    public void registerConfirmedResult(boolean win, com.bot.TradingCore.Side side) {
+    public void registerConfirmedResult(boolean win, TradingCore.Side side) {
         synchronized (globalResultStreak) {
             globalResultStreak.addLast(win);
             while (globalResultStreak.size() > STREAK_WINDOW) globalResultStreak.removeFirst();
@@ -163,15 +163,15 @@ public final class InstitutionalSignalCore {
             streakConfidenceBoost = 0;
             currentLossStreak = 0;
             currentWinStreak++;
-            if (side == com.bot.TradingCore.Side.LONG) consecutiveLongLosses = 0;
-            if (side == com.bot.TradingCore.Side.SHORT) consecutiveShortLosses = 0;
+            if (side == TradingCore.Side.LONG) consecutiveLongLosses = 0;
+            if (side == TradingCore.Side.SHORT) consecutiveShortLosses = 0;
         } else {
             currentLossStreak++;
             currentWinStreak = 0;
-            if (side == com.bot.TradingCore.Side.LONG) {
+            if (side == TradingCore.Side.LONG) {
                 consecutiveLongLosses++;
                 consecutiveShortLosses = 0;
-            } else if (side == com.bot.TradingCore.Side.SHORT) {
+            } else if (side == TradingCore.Side.SHORT) {
                 consecutiveShortLosses++;
                 consecutiveLongLosses = 0;
             }
@@ -221,7 +221,7 @@ public final class InstitutionalSignalCore {
     //  SIGNAL FILTERING
     // ══════════════════════════════════════════════════════════════
 
-    public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
+    public synchronized boolean allowSignal(DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
         String sym = signal.symbol;
 
@@ -254,7 +254,7 @@ public final class InstitutionalSignalCore {
         return true;
     }
 
-    public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
+    public synchronized void registerSignal(DecisionEngineMerged.TradeIdea signal) {
         String cat = signal.category != null ? signal.category.name() : "ALT";
         double risk = estimateRisk(signal.probability, signal.category);
 
@@ -271,11 +271,11 @@ public final class InstitutionalSignalCore {
     // ══════════════════════════════════════════════════════════════
 
     /** [v11.0 FIX-COMPILE] 3-arg overload for BotMain/TradeResolver compatibility */
-    public synchronized void closeTrade(String symbol, com.bot.TradingCore.Side side, double pnlPct) {
+    public synchronized void closeTrade(String symbol, TradingCore.Side side, double pnlPct) {
         closeTrade(symbol, side, pnlPct, pnlPct > 0 ? "TP" : "SL");
     }
 
-    public synchronized void closeTrade(String symbol, com.bot.TradingCore.Side side, double pnlPct, String reason) {
+    public synchronized void closeTrade(String symbol, TradingCore.Side side, double pnlPct, String reason) {
         List<ActiveSignal> list = activeSignals.get(symbol);
         if (list == null) return;
 
@@ -396,7 +396,7 @@ public final class InstitutionalSignalCore {
     //  INTERNAL
     // ══════════════════════════════════════════════════════════════
 
-    private double estimateRisk(double confidence, com.bot.DecisionEngineMerged.CoinCategory cat) {
+    private double estimateRisk(double confidence, DecisionEngineMerged.CoinCategory cat) {
         // [v12.0] Flat risk until we have 50+ trades proving the edge
         // Old code gave 2× position to 80%+ signals — but those 80% were self-assessed,
         // not validated. This caused outsized losses on overconfident signals.
@@ -412,15 +412,15 @@ public final class InstitutionalSignalCore {
             base = confidence >= 78 ? 0.015 : confidence >= 68 ? 0.012 : confidence >= 58 ? 0.010 : 0.008;
         }
 
-        double mult = cat == com.bot.DecisionEngineMerged.CoinCategory.MEME ? 0.5 :
-                cat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.0 : 0.75;
+        double mult = cat == DecisionEngineMerged.CoinCategory.MEME ? 0.5 :
+                cat == DecisionEngineMerged.CoinCategory.TOP ? 1.0 : 0.75;
         return base * mult;
     }
 
     private void updateSymbolScore(String symbol, double pnl) {
         double delta = pnl > 0.5 ? 0.015 : pnl < -0.5 ? -0.018 : -0.003;
         symbolScore.merge(symbol, delta, Double::sum);
-        symbolScore.compute(symbol, (k, v) -> com.bot.TradingCore.clamp(v == null ? 0 : v, -0.40, 0.40));
+        symbolScore.compute(symbol, (k, v) -> TradingCore.clamp(v == null ? 0 : v, -0.40, 0.40));
     }
 
     // ══════════════════════════════════════════════════════════════
