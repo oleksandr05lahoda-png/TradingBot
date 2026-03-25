@@ -6,11 +6,14 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -592,7 +595,8 @@
       <workItem from="1774345083762" duration="8000" />
       <workItem from="1774345115416" duration="529000" />
       <workItem from="1774345659335" duration="1646000" />
-      <workItem from="1774378541569" duration="4233000" />
+      <workItem from="1774378541569" duration="6008000" />
+      <workItem from="1774446032703" duration="3897000" />
     </task>
     <servers />
   </component>

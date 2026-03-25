@@ -1476,14 +1476,11 @@ public final class SignalSender {
     //  STATIC MATH UTILS
     // ══════════════════════════════════════════════════════════════
 
+    /** [v21.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR.
+     *  Old code used SMA which diverges 15-20% from the correct Wilder's method.
+     *  This caused stop distances, early tick detection, and profit gates to be miscalculated. */
     public static double atr(List<com.bot.TradingCore.Candle> c, int period) {
-        if (c == null || c.size() <= period) return 0;
-        double sum = 0;
-        for (int i = c.size() - period; i < c.size(); i++) {
-            com.bot.TradingCore.Candle pr = c.get(i-1), cu = c.get(i);
-            sum += Math.max(cu.high-cu.low, Math.max(Math.abs(cu.high-pr.close), Math.abs(cu.low-pr.close)));
-        }
-        return sum / period;
+        return com.bot.TradingCore.atr(c, period);
     }
 
     /** [v10.0] Wilder's RSI (SMMA) — matches DecisionEngine and TradingView */

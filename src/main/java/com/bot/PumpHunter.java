@@ -563,23 +563,104 @@ public final class PumpHunter {
 
     // ======================= UTILITY =======================
 
+    /** [v21.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR */
     private double calculateATR(List<com.bot.TradingCore.Candle> candles, int period) {
-        if (candles == null || candles.size() < period + 1) return 0;
+        return com.bot.TradingCore.atr(candles, period);
+    }
 
-        double sum = 0;
-        int n = candles.size();
+    // ======================= [v21.0 NEW] OI + FUNDING EARLY DETECTION =======================
 
-        for (int i = n - period; i < n; i++) {
-            com.bot.TradingCore.Candle cur = candles.get(i);
-            com.bot.TradingCore.Candle prev = candles.get(i - 1);
+    /** Data holder for OI + funding analysis */
+    private final Map<String, FundingOISnapshot> fundingOICache = new ConcurrentHashMap<>();
 
-            double tr = Math.max(cur.high - cur.low,
-                    Math.max(Math.abs(cur.high - prev.close),
-                            Math.abs(cur.low - prev.close)));
-            sum += tr;
+    public static final class FundingOISnapshot {
+        public final double fundingRate;
+        public final double oiChangePct;
+        public final long timestamp;
+        public FundingOISnapshot(double fr, double oiChange) {
+            this.fundingRate = fr; this.oiChangePct = oiChange;
+            this.timestamp = System.currentTimeMillis();
+        }
+        public boolean isValid() { return System.currentTimeMillis() - timestamp < 10 * 60_000; }
+    }
+
+    /** Called by SignalSender to update OI+funding for early pump/dump detection */
+    public void updateFundingOI(String symbol, double fundingRate, double oiChangePct) {
+        fundingOICache.put(symbol, new FundingOISnapshot(fundingRate, oiChangePct));
+    }
+
+    /**
+     * [v21.0] EARLY WARNING: Detects pre-pump/dump conditions 10-15 min before they happen.
+     * Signals:
+     *   - Extreme funding rate + OI surge = leveraged positions building → squeeze imminent
+     *   - OI dropping + price dropping = longs liquidating → cascade dump
+     *   - OI rising + price stable = positions accumulating → breakout imminent
+     * Returns a PumpEvent with type NONE if no early warning, or a weaker pump event if detected.
+     */
+    public PumpEvent detectEarlyWarning(String symbol, List<com.bot.TradingCore.Candle> c15m) {
+        FundingOISnapshot snapshot = fundingOICache.get(symbol);
+        if (snapshot == null || !snapshot.isValid()) return null;
+        if (c15m == null || c15m.size() < 30) return null;
+
+        double price = c15m.get(c15m.size() - 1).close;
+        double atr14 = com.bot.TradingCore.atr(c15m, 14);
+        List<String> flags = new ArrayList<>();
+
+        // === EXTREME FUNDING: > 0.05% or < -0.03% (annualized ~180%+ / ~110%+) ===
+        // When funding is extreme, the crowded side will get squeezed.
+        boolean extremePositiveFunding = snapshot.fundingRate > 0.0005;  // Many longs paying shorts
+        boolean extremeNegativeFunding = snapshot.fundingRate < -0.0003; // Many shorts paying longs
+
+        // === OI SURGE: > 5% change in 1h ===
+        boolean oiSurge = snapshot.oiChangePct > 5.0;
+        boolean oiDrop = snapshot.oiChangePct < -5.0;
+
+        // === PRICE vs OI DIVERGENCE ===
+        double priceMoveLastH = 0;
+        if (c15m.size() >= 5) {
+            priceMoveLastH = (price - c15m.get(c15m.size() - 5).close) / c15m.get(c15m.size() - 5).close;
         }
 
-        return sum / period;
+        PumpType earlyType = PumpType.NONE;
+        double earlyStrength = 0;
+
+        // Pattern 1: Extreme positive funding + OI surge = SHORT SQUEEZE imminent
+        // All these longs are paying hefty funding → if price dips, they close → cascade
+        if (extremePositiveFunding && oiSurge) {
+            earlyType = PumpType.PUMP_DOWN; // Expect dump (long squeeze)
+            earlyStrength = 0.45;
+            flags.add("EARLY_LONG_SQUEEZE");
+            flags.add("FR=" + String.format("%.4f", snapshot.fundingRate));
+            flags.add("OI=" + String.format("%.1f%%", snapshot.oiChangePct));
+        }
+
+        // Pattern 2: Extreme negative funding + OI surge = LONG SQUEEZE imminent
+        if (extremeNegativeFunding && oiSurge) {
+            earlyType = PumpType.PUMP_UP; // Expect pump (short squeeze)
+            earlyStrength = 0.45;
+            flags.add("EARLY_SHORT_SQUEEZE");
+            flags.add("FR=" + String.format("%.4f", snapshot.fundingRate));
+        }
+
+        // Pattern 3: OI dropping + price dropping = longs being liquidated → more drops
+        if (oiDrop && priceMoveLastH < -0.01) {
+            earlyType = PumpType.PUMP_DOWN;
+            earlyStrength = 0.40;
+            flags.add("EARLY_LIQ_CASCADE");
+            flags.add("OI_DROP=" + String.format("%.1f%%", snapshot.oiChangePct));
+        }
+
+        // Pattern 4: OI dropping + price rising = shorts being liquidated → more pump
+        if (oiDrop && priceMoveLastH > 0.01) {
+            earlyType = PumpType.PUMP_UP;
+            earlyStrength = 0.40;
+            flags.add("EARLY_SHORT_LIQ");
+        }
+
+        if (earlyType == PumpType.NONE) return null;
+
+        return new PumpEvent(symbol, earlyType, earlyStrength, priceMoveLastH,
+                1.0, 0, false, flags);
     }
 
     private double averageVolume(List<com.bot.TradingCore.Candle> candles, int lookback) {

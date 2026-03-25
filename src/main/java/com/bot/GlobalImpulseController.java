@@ -643,6 +643,9 @@ public final class GlobalImpulseController {
 
     /**
      * Вычисляет SHORT boost — насколько сильно усиливать шорты при краше.
+     * [v21.0 FIX] Added deceleration detection: when the crash is SLOWING DOWN
+     * (each bar's drop is smaller than previous), reduce the boost aggressively.
+     * This prevents the bot from shorting at the bottom of V-shaped reversals.
      */
     private double computeShortBoost(CascadeLevel level, double crashScore,
                                      double velocity, double accel) {
@@ -656,12 +659,42 @@ public final class GlobalImpulseController {
             case NONE   -> boost = 1.00;
         }
 
-        // Дополнительный boost за acceleration
-        if (accel > 0.008) boost = Math.min(boost * 1.20, 1.90);
-        else if (accel > 0.003) boost = Math.min(boost * 1.10, 1.90);
+        // [v21.0] DECELERATION DETECTION — the key fix
+        // If crash is DECELERATING (each bar's move is smaller than previous),
+        // the dump is running out of steam → reduce SHORT boost significantly.
+        // This is the #1 reason the old bot shorted at bottoms.
+        boolean decelerating = false;
+        if (btcMoveHistory.size() >= 3) {
+            List<Double> moves = new ArrayList<>(btcMoveHistory);
+            int sz = moves.size();
+            // Last 3 bars: are the negative moves getting smaller?
+            double m1 = Math.abs(moves.get(sz - 1));
+            double m2 = Math.abs(moves.get(sz - 2));
+            double m3 = Math.abs(moves.get(sz - 3));
+            // All negative (crash), but each smaller = decelerating
+            if (moves.get(sz - 1) < 0 && moves.get(sz - 2) < 0 && moves.get(sz - 3) < 0) {
+                if (m1 < m2 && m2 < m3) {
+                    decelerating = true;
+                }
+                // Also check: if current bar is much smaller than the peak bar
+                if (m1 < m3 * 0.40) {
+                    decelerating = true;
+                }
+            }
+        }
 
-        // Быстрые данные подтверждают
-        if (!isFastDataStale() && btcFastMomentum < -0.015) {
+        if (decelerating) {
+            // Crash is slowing down — halve the boost, minimum 1.0
+            boost = Math.max(1.0, boost * 0.55);
+            // Don't add acceleration bonus when decelerating
+        } else {
+            // Дополнительный boost за acceleration (only when NOT decelerating)
+            if (accel > 0.008) boost = Math.min(boost * 1.20, 1.90);
+            else if (accel > 0.003) boost = Math.min(boost * 1.10, 1.90);
+        }
+
+        // Быстрые данные подтверждают (but NOT if decelerating)
+        if (!decelerating && !isFastDataStale() && btcFastMomentum < -0.015) {
             boost = Math.min(boost * 1.10, 1.90);
         }
 

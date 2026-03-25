@@ -327,6 +327,25 @@ public final class SimpleBacktester {
                 if (m1 != null && !m1.isEmpty()) sliceM1 = getTimeframeSlice(m1, m15.get(Math.max(0, i - 20)).openTime, bar.openTime);
                 if (m5 != null && !m5.isEmpty()) sliceM5 = getTimeframeSlice(m5, m15.get(Math.max(0, i - 40)).openTime, bar.openTime);
 
+                // [v21.0 FIX] Simulate volume delta from taker buy/sell data.
+                // In live mode, volumeDelta comes from WebSocket aggTrade stream.
+                // In backtest, it was always 0.0, making ForecastEngine work COMPLETELY
+                // differently (orderflow factor = 0 always). Now we estimate from candle data.
+                double simVolumeDelta = 0;
+                if (sliceM1 != null && sliceM1.size() >= 3) {
+                    for (int vi = Math.max(0, sliceM1.size() - 5); vi < sliceM1.size(); vi++) {
+                        TradingCore.Candle vc = sliceM1.get(vi);
+                        // takerBuyBaseVolume = volume bought at ask (aggressive buys)
+                        // delta = buys - sells = 2*takerBuy - totalVolume
+                        simVolumeDelta += (2 * vc.takerBuyBaseVolume - vc.volume);
+                    }
+                } else if (slice15.size() >= 3) {
+                    // Fallback: use 15m candle taker buy ratio
+                    TradingCore.Candle lastBar = slice15.get(slice15.size() - 1);
+                    simVolumeDelta = (2 * lastBar.takerBuyBaseVolume - lastBar.volume) * 0.5;
+                }
+                engine.setVolumeDelta(symbol, simVolumeDelta);
+
                 DecisionEngineMerged.TradeIdea idea = engine.analyze(
                         symbol, sliceM1, sliceM5, slice15, sliceH1, category);
 
@@ -640,12 +659,18 @@ public final class SimpleBacktester {
         return index;
     }
 
+    /** [v21.0 FIX] Look-ahead bias prevention.
+     *  Old code: openTime <= toMs — could include a candle that OPENED before toMs
+     *  but CLOSED after it (e.g., a 1H candle opening at 14:00 included at 14:15).
+     *  Fix: use closeTime < toMs to ensure the candle is FULLY FORMED before we use it.
+     *  This is the #1 backtest integrity issue — without it, results are inflated. */
     private List<TradingCore.Candle> getTimeframeSlice(List<TradingCore.Candle> candles,
                                                        long fromMs, long toMs) {
         if (candles == null || candles.isEmpty()) return List.of();
         List<TradingCore.Candle> result = new ArrayList<>();
         for (TradingCore.Candle c : candles) {
-            if (c.openTime >= fromMs && c.openTime <= toMs) result.add(c);
+            // Only include candles that are FULLY CLOSED before the current bar's open time
+            if (c.openTime >= fromMs && c.closeTime < toMs) result.add(c);
         }
         return result;
     }

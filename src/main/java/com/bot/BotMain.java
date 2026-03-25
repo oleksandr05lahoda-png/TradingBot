@@ -9,7 +9,7 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v15.0 — CRITICAL ARCHITECTURE FIX EDITION                  ║
+ * ║       BotMain v21.0 — WORLD-CLASS EDITION                                  ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  [v15.0] FIX Дыра 1: ConcurrentLinkedDeque everywhere (thread safety)  ║
  * ║  [v15.0] FIX Дыра 3: LR window 30→10, acceleration detection          ║
@@ -278,7 +278,7 @@ public final class BotMain {
 
         // ── Startup ping ─────────────────────────────────────────
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ GodBot v15.0 ARCHITECTURE FIX стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ GodBot v21.0 WORLD-CLASS стартовал " + nowWarsawStr() + " ═══");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -316,6 +316,11 @@ public final class BotMain {
 
         long cycle = totalCycles.incrementAndGet();
         LOG.info("══ ЦИКЛ #" + cycle + " ══ " + nowWarsawStr());
+
+        // [v21.0] Session-aware logging
+        com.bot.TradingCore.TradingSession session = com.bot.TradingCore.detectCurrentSession();
+        LOG.info("Session: " + session.name() + " (" + session.description + ") mult="
+                + String.format("%.2f", session.confidenceMultiplier));
 
         // BTC контекст + секторальные лидеры
         updateBtcContext(sender, gic);
@@ -840,9 +845,10 @@ public final class BotMain {
 
     private static boolean isQuietHours() {
         if (!QUIET_HOURS_ENABLED) return false;
-        ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
-        int h = utc.getHour();
-        return h >= QUIET_START_H && h < QUIET_END_H;
+        // [v21.0] Use session detection instead of hardcoded UTC hours.
+        // This properly handles Asia deadzone and NY close.
+        TradingCore.TradingSession session = TradingCore.detectCurrentSession();
+        return session == TradingCore.TradingSession.DEAD_ZONE;
     }
 
     private static void markForecastRecord(String key, String outcome) {
@@ -862,23 +868,29 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
+        TradingCore.TradingSession session = TradingCore.detectCurrentSession();
         return String.format(
-                "🚀 *GodBot v15.0 ARCHITECTURE FIX*\n"
-                        + "15M Futures | 9-Factor Forecast | TOP-100\n"
+                "🚀 *GodBot v21.0 WORLD-CLASS EDITION*\n"
+                        + "15M Futures | Weighted Factor Scoring | TOP-100\n"
                         + "───────────────────────────────\n"
-                        + "✅ [Дыра 1] ConcurrentLinkedDeque everywhere\n"
-                        + "✅ [Дыра 3] LR window 30→10 + acceleration\n"
-                        + "✅ [Дыра 4] Streak: win halves boost aggressively\n"
-                        + "✅ [KITE] VolatilitySqueezeGuard active\n"
+                        + "✅ [v21.0] Unified Wilder's ATR everywhere\n"
+                        + "✅ [v21.0] Session-aware signals (Asia/London/NY)\n"
+                        + "✅ [v21.0] Entry timing (candle confirmation)\n"
+                        + "✅ [v21.0] Weighted factor scoring (no micro-adjust)\n"
+                        + "✅ [v21.0] Smart Money: CHoCH + FVG + Order Blocks\n"
+                        + "✅ [v21.0] Squeeze breakout detection\n"
+                        + "✅ [v21.0] HTF exhaustion context\n"
+                        + "✅ [v21.0] Correlation-aware risk management\n"
+                        + "✅ [v21.0] Backtester: no look-ahead + volume delta\n"
+                        + "✅ [v21.0] Improved swing-based move identification\n"
                         + "✅ ForecastEngine 9+1 факторов активен\n"
-                        + "✅ TrendPhase: EARLY/MID/LATE/EXHAUST\n"
                         + "✅ Structural stops за swing high/low\n"
                         + "✅ ISC с exponential streak decay\n"
-                        + "✅ Trailing stop FIXED (SHORT logic)\n"
-                        + "⏰ Тихие часы: UTC 01:00–05:00\n"
+                        + "⏰ Session: %s\n"
                         + "📅 Daily report в 09:00 UTC\n"
                         + "───────────────────────────────\n"
                         + "🕐 %s (Warsaw)",
+                session.name(),
                 nowWarsawStr());
     }
 

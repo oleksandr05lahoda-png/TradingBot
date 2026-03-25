@@ -247,9 +247,43 @@ public final class InstitutionalSignalCore {
         double newRisk = estimateRisk(signal.probability, signal.category);
         if (currentHeat + newRisk > maxPortfolioHeat) return false;
 
+        // [v21.0 NEW] CORRELATION-AWARE RISK CHECK
+        // If we already have positions in the same direction on correlated assets,
+        // treat them as ONE combined position and limit total correlated exposure.
+        // ETH + SOL + AVAX all LONG = effectively 3x BTC LONG exposure.
+        int sameDirPositions = 0;
+        double sameDirHeat = 0;
+        for (Map.Entry<String, List<ActiveSignal>> entry : activeSignals.entrySet()) {
+            for (ActiveSignal a : entry.getValue()) {
+                if (a.side == signal.side) {
+                    sameDirPositions++;
+                    sameDirHeat += a.riskPct;
+                }
+            }
+        }
+        // Max 3 correlated same-direction positions (adjustable via constructor)
+        if (sameDirPositions >= maxSameSectorSameDir + 1) {
+            // Only allow if this signal is significantly stronger than the weakest existing one
+            double weakestProb = activeSignals.values().stream()
+                    .flatMap(List::stream)
+                    .filter(a -> a.side == signal.side)
+                    .mapToDouble(a -> a.probability)
+                    .min().orElse(100);
+            if (signal.probability <= weakestProb + 5) return false;
+        }
+        // If total same-direction heat exceeds 60% of max heat, block
+        if (sameDirHeat + newRisk > maxPortfolioHeat * 0.60 && sameDirPositions >= 2) return false;
+
         // Symbol score check (poor performing symbols get blocked)
         double score = symbolScore.getOrDefault(sym, 0.0);
         if (score < -0.25 && getWinRate(sym) < 0.38 && getTradeCount(sym) >= 8) return false;
+
+        // [v21.0 NEW] Session-aware confidence boost
+        // In active trading sessions, slightly lower the effective threshold
+        TradingCore.TradingSession session = TradingCore.detectCurrentSession();
+        if (!session.isActiveTradingSession && signal.probability < getEffectiveMinConfidence() + 3) {
+            return false; // Require extra confidence in low-quality sessions
+        }
 
         return true;
     }
