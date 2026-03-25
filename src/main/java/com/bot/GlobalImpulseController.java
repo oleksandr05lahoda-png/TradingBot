@@ -1121,6 +1121,60 @@ public final class GlobalImpulseController {
      */
     public double getBtcMomentumAccel() { return btcMomentumAccel; }
 
+    /**
+     * [v20.0] Returns true if BTC drop momentum is DECELERATING.
+     * When crash velocity is slowing down, we should NOT aggressively short —
+     * the dump is running out of fuel.
+     * Used by DecisionEngineMerged to respect exhaustion signals during crashes.
+     */
+    public boolean isCrashDecelerating() {
+        GlobalContext ctx = currentContext;
+        // If BTC was dropping but velocity is now declining = deceleration
+        boolean velocityDeclining = ctx.btcDropVelocity < VELOCITY_WATCH;
+        boolean bearBarsNotExtending = ctx.btcConsecutiveBearBars <= 2;
+        boolean crashScoreNotExtreme = ctx.btcCrashScore < 0.80;
+        // Deceleration = at least 2 out of 3 conditions
+        int decelerationSignals = 0;
+        if (velocityDeclining) decelerationSignals++;
+        if (bearBarsNotExtending) decelerationSignals++;
+        if (crashScoreNotExtreme) decelerationSignals++;
+        return decelerationSignals >= 2;
+    }
+
+
+    /**
+     * [v20.0] Adjusted filter weight that considers how far price is from EMA.
+     * If price is deeply overextended in the direction we want to trade,
+     * we dampen the boost to prevent shorting bottoms / buying tops.
+     *
+     * @param distFromEmaPct (price - ema21) / ema21. Negative = price below EMA.
+     */
+    public double getFilterWeightWithOverextension(String symbol, boolean isLong,
+                                                   double relStrength, String sectorName, double distFromEmaPct) {
+        double baseWeight = getFilterWeight(symbol, isLong, relStrength, sectorName);
+
+        // Only dampen when trend-following into overextension
+        if (!isLong && distFromEmaPct < -0.015) {
+            // SHORT when price is far below EMA — dampen the boost
+            double overextension = Math.abs(distFromEmaPct) - 0.015;
+            double dampFactor = Math.max(0.20, 1.0 - overextension * 15.0);
+            // At 2% below EMA: dampFactor = 1 - 0.005*15 = 0.925 (mild)
+            // At 3% below EMA: dampFactor = 1 - 0.015*15 = 0.775 (moderate)
+            // At 5% below EMA: dampFactor = 1 - 0.035*15 = 0.475 (strong)
+            baseWeight *= dampFactor;
+            if (baseWeight < 0.20) baseWeight = 0.20;
+        }
+        if (isLong && distFromEmaPct > 0.015) {
+            // LONG when price is far above EMA — dampen the boost
+            double overextension = distFromEmaPct - 0.015;
+            double dampFactor = Math.max(0.20, 1.0 - overextension * 15.0);
+            baseWeight *= dampFactor;
+            if (baseWeight < 0.20) baseWeight = 0.20;
+        }
+
+        return clamp(baseWeight, 0.0, 1.90);
+    }
+
     public String getStats() {
         GlobalContext ctx = currentContext;
         StringBuilder sb = new StringBuilder();

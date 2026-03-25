@@ -30,6 +30,17 @@ public final class PumpHunter {
     private final Map<String, PumpEvent> recentPumps = new ConcurrentHashMap<>();
     private final Map<String, Deque<PumpEvent>> pumpHistory = new ConcurrentHashMap<>();
 
+    // [v20.0] SELL CLIMAX DETECTION
+    // When a huge dump candle has extreme volume (= panic selling / capitulation),
+    // we block SHORT signals and only allow LONG / WAIT for a cooldown period.
+    // This prevents the bot from shorting the exact bottom of V-shaped reversals.
+    private static final long SELL_CLIMAX_BLOCK_MS = 15 * 60_000; // 15 min block on shorts after sell climax
+    private static final double SELL_CLIMAX_VOL_MULT = 3.0;       // Volume must be 3x average
+    private static final double SELL_CLIMAX_MOVE_PCT = -0.020;    // At least -2% move down
+    private static final double BUY_CLIMAX_MOVE_PCT  =  0.020;    // At least +2% move up
+    private final Map<String, Long> sellClimaxTime = new ConcurrentHashMap<>();
+    private final Map<String, Long> buyClimaxTime  = new ConcurrentHashMap<>();
+
     // ======================= MODELS =======================
 
     public boolean isDump(List<com.bot.TradingCore.Candle> candles) {
@@ -231,6 +242,29 @@ public final class PumpHunter {
             flags.add("VOL_CLIMAX");
         }
 
+        // [v20.0] SELL CLIMAX DETECTION
+        // Huge red candle + extreme volume = capitulation / panic selling
+        // → Block SHORT signals for this symbol for 15 minutes
+        if (type == PumpType.PUMP_DOWN || type == PumpType.MEGA_PUMP_DOWN) {
+            if (volumeRatio >= SELL_CLIMAX_VOL_MULT && movePct <= SELL_CLIMAX_MOVE_PCT) {
+                sellClimaxTime.put(symbol, System.currentTimeMillis());
+                flags.add("SELL_CLIMAX");
+                System.out.println("[PumpHunter] ⚡ SELL CLIMAX detected on " + symbol
+                        + " — SHORT blocked for 15min. vol=" + String.format("%.1fx", volumeRatio)
+                        + " move=" + String.format("%.2f%%", movePct * 100));
+            }
+        }
+        // [v20.0] BUY CLIMAX — mirror logic for blocking LONGs after parabolic pumps
+        if (type == PumpType.PUMP_UP || type == PumpType.MEGA_PUMP_UP) {
+            if (volumeRatio >= SELL_CLIMAX_VOL_MULT && movePct >= BUY_CLIMAX_MOVE_PCT) {
+                buyClimaxTime.put(symbol, System.currentTimeMillis());
+                flags.add("BUY_CLIMAX");
+                System.out.println("[PumpHunter] ⚡ BUY CLIMAX detected on " + symbol
+                        + " — LONG blocked for 15min. vol=" + String.format("%.1fx", volumeRatio)
+                        + " move=" + String.format("%.2f%%", movePct * 100));
+            }
+        }
+
         boolean confirmed = checkConfirmation(c1m, type);
         if (confirmed) {
             strength = Math.min(1.0, strength + 0.05);
@@ -264,11 +298,21 @@ public final class PumpHunter {
 
         switch (event.type) {
             case PUMP_UP, MEGA_PUMP_UP, BREAKOUT_UP -> {
+                // [v20.0] If buy climax is active, do NOT generate LONG continuation
+                if (isBuyClimaxActive(event.symbol)) {
+                    System.out.println("[PumpHunter] Blocked PUMP_CONTINUATION for " + event.symbol + " — buy climax active");
+                    return null;
+                }
                 side = com.bot.TradingCore.Side.LONG;
                 strategy = "PUMP_CONTINUATION";
                 confidence = 55 + event.strength * 25;
             }
             case PUMP_DOWN, MEGA_PUMP_DOWN, BREAKOUT_DOWN -> {
+                // [v20.0] If sell climax is active, do NOT generate SHORT continuation
+                if (isSellClimaxActive(event.symbol)) {
+                    System.out.println("[PumpHunter] Blocked DUMP_CONTINUATION for " + event.symbol + " — sell climax active");
+                    return null;
+                }
                 side = com.bot.TradingCore.Side.SHORT;
                 strategy = "DUMP_CONTINUATION";
                 confidence = 55 + event.strength * 25;
@@ -569,15 +613,52 @@ public final class PumpHunter {
         return history != null ? new ArrayList<>(history) : List.of();
     }
 
+    /**
+     * [v20.0] Returns true if a sell climax was recently detected on this symbol.
+     * When active, SHORT signals should be blocked — the dump has likely exhausted
+     * and a reversal (bounce) is expected.
+     */
+    public boolean isSellClimaxActive(String symbol) {
+        Long climaxTime = sellClimaxTime.get(symbol);
+        if (climaxTime == null) return false;
+        return System.currentTimeMillis() - climaxTime < SELL_CLIMAX_BLOCK_MS;
+    }
+
+    /**
+     * [v20.0] Returns true if a buy climax was recently detected on this symbol.
+     * When active, LONG signals should be blocked.
+     */
+    public boolean isBuyClimaxActive(String symbol) {
+        Long climaxTime = buyClimaxTime.get(symbol);
+        if (climaxTime == null) return false;
+        return System.currentTimeMillis() - climaxTime < SELL_CLIMAX_BLOCK_MS;
+    }
+
+    /**
+     * [v20.0] Returns the mode for a symbol based on climax detection.
+     * "LONG_ONLY" = sell climax active (SHORT blocked)
+     * "SHORT_ONLY" = buy climax active (LONG blocked)
+     * "NORMAL" = no climax active
+     */
+    public String getClimaxMode(String symbol) {
+        if (isSellClimaxActive(symbol)) return "LONG_ONLY";
+        if (isBuyClimaxActive(symbol)) return "SHORT_ONLY";
+        return "NORMAL";
+    }
+
     public void clearSymbol(String symbol) {
         lastPumpTime.remove(symbol);
         recentPumps.remove(symbol);
         pumpHistory.remove(symbol);
+        sellClimaxTime.remove(symbol);
+        buyClimaxTime.remove(symbol);
     }
 
     public void clearAll() {
         lastPumpTime.clear();
         recentPumps.clear();
         pumpHistory.clear();
+        sellClimaxTime.clear();
+        buyClimaxTime.clear();
     }
 }

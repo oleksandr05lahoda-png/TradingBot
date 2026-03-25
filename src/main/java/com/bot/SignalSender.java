@@ -304,6 +304,8 @@ public final class SignalSender {
         this.decisionEngine.setGIC(this.gic);
         // [v14.0 FIX #Forecast] Wire ForecastEngine so TradeIdea.forecast is not always null.
         this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
+        // [v20.0] Wire SignalOptimizer for early BOS reversal detection
+        this.decisionEngine.setSignalOptimizer(this.optimizer);
         this.optimizer.setPumpHunter(this.pumpHunter);
 
         int poolSize = Math.max(6, Math.min(TOP_N / 4, 25));
@@ -1043,10 +1045,11 @@ public final class SignalSender {
         if (newStop == oldStop) return idea;
         List<String> nf = new ArrayList<>(idea.flags);
         nf.add("SL_ADJ");
+        // [v20.1 FIX] Preserve forecast data when adjusting stop
         return new com.bot.DecisionEngineMerged.TradeIdea(
                 idea.symbol, idea.side, idea.price, newStop, idea.take, idea.rr,
                 idea.probability, nf, idea.fundingRate, idea.fundingDelta,
-                idea.oiChange, idea.htfBias, idea.category);
+                idea.oiChange, idea.htfBias, idea.category, idea.forecast);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1435,8 +1438,9 @@ public final class SignalSender {
         };
     }
 
+    // [v20.1 FIX] Preserve forecast data when rebuilding TradeIdea
     private com.bot.DecisionEngineMerged.TradeIdea rebuildIdea(com.bot.DecisionEngineMerged.TradeIdea src, double p, List<String> f) {
-        return new com.bot.DecisionEngineMerged.TradeIdea(src.symbol, src.side, src.price, src.stop, src.take, src.rr, p, f, src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category);
+        return new com.bot.DecisionEngineMerged.TradeIdea(src.symbol, src.side, src.price, src.stop, src.take, src.rr, p, f, src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category, src.forecast);
     }
 
     private void logCycleStats() {

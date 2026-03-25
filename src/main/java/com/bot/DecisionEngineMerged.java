@@ -53,6 +53,8 @@ public final class DecisionEngineMerged {
     private com.bot.PumpHunter pumpHunter;
     // [v14.0] ForecastEngine integration
     private volatile com.bot.TradingCore.ForecastEngine forecastEngine = null;
+    // [v20.0] SignalOptimizer reference for early BOS reversal detection
+    private volatile com.bot.SignalOptimizer signalOptimizer = null;
 
     public DecisionEngineMerged() {}
 
@@ -60,8 +62,16 @@ public final class DecisionEngineMerged {
     public void setPumpHunter(com.bot.PumpHunter ph) { this.pumpHunter = ph; }
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
+    public void setSignalOptimizer(com.bot.SignalOptimizer so) { this.signalOptimizer = so; }
 
     // [v14.0] Called by SignalSender AFTER ISC.allowSignal() confirms
+    // [v20.1 FIX] Now also commits cooldown and priceMovedEnough state
+    public void confirmSignal(String symbol, com.bot.TradingCore.Side side, double price, long now) {
+        registerSignal(symbol, side, now);
+        commitPriceMoved(symbol, price);
+    }
+
+    // Backward-compatible overload (no price)
     public void confirmSignal(String symbol, com.bot.TradingCore.Side side, long now) {
         registerSignal(symbol, side, now);
     }
@@ -436,6 +446,27 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
+        // [v20.0] RUBBER BAND FILTER — block trend-following entries
+        // when price is too far from EMA21. After big dumps/pumps,
+        // price is stretched like a rubber band and will snap back.
+        // Entering SHORT at the bottom of a dump = selling the bounce.
+        // ════════════════════════════════════════════════════════
+        double ema21 = ema(c15, 21);
+        double distFromEma = (price - ema21) / (ema21 + 1e-9);
+        // Dynamic threshold based on ATR-normalized volatility
+        double atrPct = atr14 / (price + 1e-9);
+        // Base: 1.5% for normal coins, scale up for volatile ones
+        double rubberBandThreshold = Math.max(0.015, atrPct * 2.5);
+        // Cap at 4% — beyond that, any continuation entry is suicidal
+        rubberBandThreshold = Math.min(rubberBandThreshold, 0.040);
+
+        boolean rubberBandBlockShort = distFromEma < -rubberBandThreshold;
+        boolean rubberBandBlockLong  = distFromEma >  rubberBandThreshold;
+
+        if (rubberBandBlockShort) lateEntryShort = true;  // reinforce late-entry block
+        if (rubberBandBlockLong)  lateEntryLong  = true;
+
+        // ════════════════════════════════════════════════════════
         //  ИНИЦИАЛИЗАЦИЯ 5 КЛАСТЕРОВ
         // ════════════════════════════════════════════════════════
         ClusterScores cStructure   = new ClusterScores(); // BOS, HH/HL, FVG, OB, LiqSweep
@@ -445,6 +476,10 @@ public final class DecisionEngineMerged {
         ClusterScores cDerivatives = new ClusterScores(); // Funding, OI, Divergences
         ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
         List<String> allFlags = new ArrayList<>();
+
+        // [v20.0] Rubber band flag for diagnostics
+        if (rubberBandBlockShort) allFlags.add("RUBBER_BAND_S" + String.format("%.1f", distFromEma * 100));
+        if (rubberBandBlockLong)  allFlags.add("RUBBER_BAND_L" + String.format("%.1f", distFromEma * 100));
 
         // ════════════════════════════════════════════════════════
         // [CLUSTER 0] BTC CRASH — прямой override, ДО кластеров
@@ -555,6 +590,20 @@ public final class DecisionEngineMerged {
                     cMomentum.addLong(mctx.s(pump.strength * 0.55), "PUMP_HUNT_B");
                 if (pump.isBearish())
                     cMomentum.addShort(mctx.s(pump.strength * 0.55), "PUMP_HUNT_S");
+            }
+
+            // [v20.0] SELL CLIMAX → Block SHORT continuation signals
+            // When PumpHunter detects a sell climax (huge red candle + extreme volume),
+            // it means big players dumped and the move is likely done → expect bounce.
+            String climaxMode = pumpHunter.getClimaxMode(symbol);
+            if ("LONG_ONLY".equals(climaxMode)) {
+                // Sell climax active — crush SHORT score, boost LONG reversal
+                cMomentum.addLong(mctx.s(0.65), "SELL_CLIMAX_REV");
+                allFlags.add("PH_SELL_CLIMAX");
+            } else if ("SHORT_ONLY".equals(climaxMode)) {
+                // Buy climax active — crush LONG score, boost SHORT reversal
+                cMomentum.addShort(mctx.s(0.65), "BUY_CLIMAX_REV");
+                allFlags.add("PH_BUY_CLIMAX");
             }
         }
 
@@ -696,6 +745,33 @@ public final class DecisionEngineMerged {
             allFlags.addAll(earlyRev.flags);
         }
 
+        // [v20.1 FIX] BOS penalty multipliers — applied AFTER aggregation
+        // (scoreShort/scoreLong are not yet declared here, they come after cluster aggregation)
+        double bosShortPenalty = 1.0;
+        double bosLongPenalty  = 1.0;
+
+        // [v20.0] EARLY BOS REVERSAL from SignalOptimizer (1m structure)
+        // When PumpHunter detects a dump, SignalOptimizer scans 1m candles
+        // for Break of Structure (higher low after lower lows) = early reversal.
+        // This fires BEFORE the 15m candle closes, giving us an earlier signal.
+        if (signalOptimizer != null) {
+            com.bot.SignalOptimizer.EarlyReversalResult bosResult =
+                    signalOptimizer.detectEarlyReversalAfterDump(symbol, c1, c5);
+            if (bosResult.detected && bosResult.confidence > 0.50) {
+                double bosScore = mctx.s(bosResult.confidence * 0.75);
+                if ("LONG".equals(bosResult.side)) {
+                    cEarly.addLong(bosScore, "BOS_EARLY_LONG");
+                    // Also penalize SHORT score — BOS detected, dump is reversing
+                    bosShortPenalty = 0.50;
+                } else if ("SHORT".equals(bosResult.side)) {
+                    cEarly.addShort(bosScore, "BOS_EARLY_SHORT");
+                    bosLongPenalty = 0.50;
+                }
+                allFlags.addAll(bosResult.flags);
+                allFlags.add("BOS_1M_ACTIVE");
+            }
+        }
+
         // ════════════════════════════════════════════════════════
         //  АГРЕГАЦИЯ КЛАСТЕРОВ
         // ════════════════════════════════════════════════════════
@@ -738,6 +814,10 @@ public final class DecisionEngineMerged {
         double scoreLong  = totalLong;
         double scoreShort = totalShort;
 
+        // [v20.1 FIX] Apply deferred BOS penalties (from pre-aggregation BOS detection)
+        scoreLong  *= bosLongPenalty;
+        scoreShort *= bosShortPenalty;
+
         if (longClusters >= 3)  scoreLong  += CLUSTER_CONFLUENCE_BONUS * longClusters;
         if (shortClusters >= 3) scoreShort += CLUSTER_CONFLUENCE_BONUS * shortClusters;
 
@@ -761,8 +841,25 @@ public final class DecisionEngineMerged {
                     allFlags.add("LEXH_CONFIRMED_1M");
                 }
             } else if ("SHORT_EXHAUSTION".equals(rw.type)) {
+                // [v20.0 FIX] SHORT_EXHAUSTION is now a HARD VETO on SHORT signals
+                // even during aggressive crash mode. The old code ignored exhaustion
+                // when aggressiveShort was true (tag: REV_IGNORED_CRASH), causing the
+                // bot to short the exact bottom of large dumps.
+                // Rationale: If the move is exhausted, shorting = selling the bottom.
                 if (aggressiveShort) {
-                    allFlags.add("REV_IGNORED_CRASH");
+                    // [v20.0] Was: allFlags.add("REV_IGNORED_CRASH") and proceed.
+                    // Now: SHORT_EXHAUSTION vetoes SHORT even in crash mode.
+                    // Allow only if crash score is extreme (> 0.85) AND exhaustion is weak
+                    if (btcCrashScore > 0.85 && rw.confidence < 0.60) {
+                        // Extreme crash overrides weak exhaustion only
+                        scoreShort *= 0.50;
+                        allFlags.add("REV_CRASH_OVERRIDE_WEAK");
+                    } else {
+                        // Hard veto: exhaustion wins over crash pressure
+                        scoreShort *= 0.12;
+                        allFlags.add("REV_EXHAUST_VETO_CRASH");
+                        if (scoreShort < 0.20) return null;
+                    }
                 } else {
                     boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.LONG);
                     if (!confirmed) {
@@ -889,8 +986,31 @@ public final class DecisionEngineMerged {
         if (side == com.bot.TradingCore.Side.LONG && lateEntryLong && !aggressiveShort) {
             return null; // 3+ green candles + 2×ATR move up → LONG is too late
         }
-        if (side == com.bot.TradingCore.Side.SHORT && lateEntryShort && !aggressiveShort) {
-            return null; // 3+ red candles + 2×ATR move down → SHORT is too late
+        // [v20.0 FIX] Rubber Band blocks SHORT even in aggressiveShort mode.
+        // Old code: `&& !aggressiveShort` — this let the bot short the bottom of huge dumps.
+        // New: if rubberBandBlockShort triggered, lateEntryShort is true and we ALWAYS block.
+        if (side == com.bot.TradingCore.Side.SHORT && lateEntryShort) {
+            if (rubberBandBlockShort) {
+                allFlags.add("RUBBER_BAND_BLOCK");
+                return null; // Price too far below EMA — mean reversion imminent, no SHORT
+            }
+            if (!aggressiveShort) {
+                return null; // 3+ red candles + 2×ATR move down → SHORT is too late
+            }
+        }
+
+        // [v20.0] SELL CLIMAX HARD BLOCK
+        // If PumpHunter detected a sell climax (panic selling / capitulation),
+        // block SHORT signals regardless of everything else.
+        if (pumpHunter != null && side == com.bot.TradingCore.Side.SHORT
+                && pumpHunter.isSellClimaxActive(symbol)) {
+            allFlags.add("SELL_CLIMAX_BLOCK");
+            return null;
+        }
+        if (pumpHunter != null && side == com.bot.TradingCore.Side.LONG
+                && pumpHunter.isBuyClimaxActive(symbol)) {
+            allFlags.add("BUY_CLIMAX_BLOCK");
+            return null;
         }
 
         // [v11.0] VOLUME CONFIRMATION GATE
@@ -914,6 +1034,8 @@ public final class DecisionEngineMerged {
             if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.85;
             else scoreShort *= 0.85;
             allFlags.add("VOL_NEUTRAL");
+            // [v20.1 FIX] Recalculate scoreDiff after penalty (was missing — used stale value)
+            scoreDiff = Math.abs(scoreLong - scoreShort);
         }
         if (scoreDiff < minDiff) return null;
 
@@ -1074,6 +1196,15 @@ public final class DecisionEngineMerged {
                         allFlags.add("FC_DISAGREE");
                     }
 
+                    // [v20.0] FC_BULL + SHORT_EXHAUSTION combo: HARD VETO on SHORT
+                    // If ForecastEngine says BULL and exhaustion was detected,
+                    // going SHORT is fighting both the forecast AND the exhaustion.
+                    // This is the exact pattern that caused the "short the bottom" bug.
+                    if (!sigLong && fcBull && rw != null && "SHORT_EXHAUSTION".equals(rw.type)) {
+                        allFlags.add("FC_BULL_EXHAUST_VETO");
+                        return null;
+                    }
+
                     // ── SOFT PENALTY: Projected move against signal direction ──
                     // [v17.0] Was hard veto → now penalty (–3) unless EARLY phase
                     if (sigLong && forecastResult.projectedMovePct <= 0) {
@@ -1148,6 +1279,11 @@ public final class DecisionEngineMerged {
                 System.out.printf("[FC] %s forecast error: %s%n", symbol, e.getMessage());
             }
         }
+
+        // [v20.1 FIX] Claim cooldown and price state ONLY here — after ALL filters passed.
+        // Previously claimed in cooldownAllowedEx (too early), wasting cooldown on vetoed signals.
+        cooldownMap.put(symbol + "_" + side, now);
+        commitPriceMoved(symbol, price);
 
         return new TradeIdea(symbol, side, price, stopPrice, takePrice, rrRatio,
                 probability, allFlags,
@@ -1242,6 +1378,10 @@ public final class DecisionEngineMerged {
     //  COOLDOWN
     // ══════════════════════════════════════════════════════════════
 
+    // [v20.1 FIX] Split cooldown into CHECK (no side effects) and CLAIM (sets cooldown).
+    // Old code: cooldownAllowedEx set cooldown immediately, wasting it if the signal
+    // was later vetoed by ForecastEngine/flipAllowed/priceMovedEnough. This caused
+    // missed signals — the #1 reason for bot "silence" during valid setups.
     private boolean cooldownAllowedEx(String sym, com.bot.TradingCore.Side side,
                                       CoinCategory cat, long now, long shortOverrideMs) {
         String key  = sym + "_" + side;
@@ -1253,9 +1393,8 @@ public final class DecisionEngineMerged {
                     cat == CoinCategory.ALT  ? COOLDOWN_ALT : COOLDOWN_MEME;
         }
         Long last = cooldownMap.get(key);
-        if (last != null && now - last < base) return false;
-        cooldownMap.put(key, now);
-        return true;
+        return last == null || now - last >= base;
+        // NOTE: cooldown is now claimed ONLY in confirmSignal() → registerSignal()
     }
 
     private boolean cooldownAllowed(String sym, com.bot.TradingCore.Side side, CoinCategory cat, long now) {
@@ -1278,13 +1417,18 @@ public final class DecisionEngineMerged {
         signalCountBySymbol.computeIfAbsent(sym, k -> new AtomicInteger(0)).incrementAndGet();
     }
 
+    // [v20.1 FIX] Split into CHECK (no side effects) and COMMIT.
+    // Old code set lastSigPrice even when the signal was later vetoed by ForecastEngine.
     private boolean priceMovedEnough(String sym, double price) {
         Double last = lastSigPrice.get(sym);
-        if (last == null) { lastSigPrice.put(sym, price); return true; }
+        if (last == null) return true;
         // [v11.0] Increased from 0.20% to 0.35% — prevents near-duplicate signals
-        if (Math.abs(price - last) / last < 0.0035) return false;
+        return Math.abs(price - last) / last >= 0.0035;
+        // NOTE: lastSigPrice is now committed ONLY in confirmSignal()
+    }
+
+    private void commitPriceMoved(String sym, double price) {
         lastSigPrice.put(sym, price);
-        return true;
     }
 
     // ══════════════════════════════════════════════════════════════
