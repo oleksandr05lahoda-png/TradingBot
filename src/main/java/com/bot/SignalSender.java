@@ -164,10 +164,15 @@ public final class SignalSender {
             catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
         }
 
-        // Rotate window
-        if (System.currentTimeMillis() - rlWindowStart.get() > RL_WINDOW_MS) {
-            rlWindowStart.set(System.currentTimeMillis());
-            rlCurrentWeight.set(0); rlServerWeight = 0;
+        // [v24.0 FIX BUG-6] Atomic window rotation.
+        // Old code: rlWindowStart.set() + rlCurrentWeight.set(0) = two separate ops.
+        // Between them another thread could add weight to the already-zeroed counter
+        // with the new timestamp → weight lost, silent over-requesting → potential IP ban.
+        synchronized (rlWindowStart) {
+            if (System.currentTimeMillis() - rlWindowStart.get() > RL_WINDOW_MS) {
+                rlWindowStart.set(System.currentTimeMillis());
+                rlCurrentWeight.set(0); rlServerWeight = 0;
+            }
         }
 
         // Weight check
@@ -1051,12 +1056,12 @@ public final class SignalSender {
                 newStop = Math.max(swingLow * (1 - STOP_CLUSTER_SHIFT), price - atr(m15, 14) * 2.2);
             }
         } else {
-            double swingHigh = Double.MIN_VALUE;
+            double swingHigh = Double.NEGATIVE_INFINITY;
             for (int i = n - lookback; i < n - 1; i++) {
                 double high = m15.get(i).high;
                 if (high >= oldStop * 0.995 && high <= oldStop * 1.02) swingHigh = Math.max(swingHigh, high);
             }
-            if (swingHigh != Double.MIN_VALUE) {
+            if (swingHigh != Double.NEGATIVE_INFINITY) {
                 newStop = Math.min(swingHigh * (1 + STOP_CLUSTER_SHIFT), price + atr(m15, 14) * 2.2);
             }
         }
@@ -1140,7 +1145,15 @@ public final class SignalSender {
         }
         List<com.bot.TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
         if (!fresh.isEmpty()) { candleCache.put(key, new CachedCandles(fresh)); lastFetchTime.put(key, System.currentTimeMillis()); }
-        else if (cached != null) return cached.candles;
+        // [v24.0 FIX WEAK-5] Hard staleness guard: if cache > 3x TTL and fetch failed,
+        // return EMPTY instead of ancient data. Old code returned stale cache silently →
+        // bot traded on 30-minute-old prices when WebSocket was down.
+        else if (cached != null && !cached.isStale(ttl * 3)) return cached.candles;
+        else if (cached != null) {
+            System.out.printf("[STALE] %s cache too old (%ds), skipping%n",
+                    key, (System.currentTimeMillis() - cached.fetchedAt) / 1000);
+            return Collections.emptyList();
+        }
         return fresh;
     }
 

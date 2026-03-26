@@ -457,7 +457,7 @@ public final class PumpHunter {
         int n = c15m.size();
         com.bot.TradingCore.Candle last = c15m.get(n - 1);
 
-        double recentHigh = Double.MIN_VALUE;
+        double recentHigh = Double.NEGATIVE_INFINITY;
         double recentLow = Double.MAX_VALUE;
 
         for (int i = n - 23; i < n - 3; i++) {

@@ -1852,7 +1852,9 @@ public final class TradingCore {
         private double calcFisher(List<Candle> c, int p) {
             int n = c.size();
             if (n < p + 2) return 0;
-            double hi = Double.MIN_VALUE, lo = Double.MAX_VALUE;
+            // [v24.0 FIX BUG-5] Double.MIN_VALUE = 4.9E-324 (POSITIVE!) → always < any price.
+            // Must use NEGATIVE_INFINITY for maximum search initialization.
+            double hi = Double.NEGATIVE_INFINITY, lo = Double.MAX_VALUE;
             for (int i = n - p; i < n; i++) {
                 hi = Math.max(hi, c.get(i).high);
                 lo = Math.min(lo, c.get(i).low);
@@ -1887,7 +1889,8 @@ public final class TradingCore {
 
         private double calcVPOC(List<Candle> c, int p) {
             int n = c.size(), start = Math.max(0, n - p);
-            double lo = Double.MAX_VALUE, hi = Double.MIN_VALUE;
+            // [v24.0 FIX BUG-5] Same bug as Fisher — NEGATIVE_INFINITY for max search
+            double lo = Double.MAX_VALUE, hi = Double.NEGATIVE_INFINITY;
             for (int i = start; i < n; i++) {
                 lo = Math.min(lo, c.get(i).low);
                 hi = Math.max(hi, c.get(i).high);

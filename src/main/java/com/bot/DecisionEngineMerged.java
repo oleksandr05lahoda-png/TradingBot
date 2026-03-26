@@ -830,8 +830,10 @@ public final class DecisionEngineMerged {
             if (earlySide != candidateSide) {
                 // Прямой конфликт: сильный ранний разворот ПРОТИВ кандидата
                 if (strongOverride) {
-                    if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.15;
-                    else scoreShort *= 0.15;
+                    // [v24.0 FIX WEAK-4] Cap at 0.30 (was 0.15 = 85% crush, destroyed valid trends).
+                    // One wick rejection + deceleration was killing 5-cluster trend setups.
+                    if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.30;
+                    else scoreShort *= 0.30;
                     allFlags.add("EARLY_VETO_OPPOSITE");
                     // Пересчитаем кандидата после штрафа
                     candidateSide = scoreLong > scoreShort ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
@@ -1044,6 +1046,8 @@ public final class DecisionEngineMerged {
         // let the cluster-based signal through with a penalty.
         // ════════════════════════════════════════════════════════
         com.bot.TradingCore.ForecastEngine.ForecastResult forecastResult = null;
+        // [v24.0 FIX WEAK-3] Save probability before FC for penalty cap
+        final double probBeforeFC = probability;
         if (forecastEngine != null) {
             try {
                 vd = volumeDeltaMap.getOrDefault(symbol, 0.0);
@@ -1176,6 +1180,15 @@ public final class DecisionEngineMerged {
                     }
                     // [v17.0] REMOVED: FC_LOWCONF_NEUTRAL veto — NEUTRAL means "I don't know",
                     // not "block everything". Let the cluster signal decide.
+
+                    // [v24.0 FIX WEAK-3] FC PENALTY CAP — max -25 total from ForecastEngine.
+                    // Old code stacked 7+ penalties totalling -51 points, always killing signals
+                    // even when 5/6 clusters agreed. Cap prevents FC from being a dictator.
+                    double fcTotalPenalty = probability - probBeforeFC;
+                    if (fcTotalPenalty < -25.0) {
+                        probability = Math.max(50, probBeforeFC - 25.0);
+                        allFlags.add("FC_PENALTY_CAPPED_" + String.format("%.0f", fcTotalPenalty));
+                    }
                 }
             } catch (Exception e) {
                 System.out.printf("[FC] %s forecast error: %s%n", symbol, e.getMessage());
@@ -1280,6 +1293,12 @@ public final class DecisionEngineMerged {
     //  COOLDOWN
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * [v24.0 FIX BUG-2] CHECK ONLY — does NOT set cooldown anymore.
+     * Old code set cooldown here (line 1295), so rejected signals burned the cooldown window.
+     * Valid signals coming 30s later were blocked because the rejected signal consumed the cooldown.
+     * Now cooldown is set ONLY through confirmSignal() after ISC approves.
+     */
     private boolean cooldownAllowedEx(String sym, com.bot.TradingCore.Side side,
                                       CoinCategory cat, long now, long shortOverrideMs) {
         String key  = sym + "_" + side;
@@ -1291,9 +1310,8 @@ public final class DecisionEngineMerged {
                     cat == CoinCategory.ALT  ? COOLDOWN_ALT : COOLDOWN_MEME;
         }
         Long last = cooldownMap.get(key);
-        if (last != null && now - last < base) return false;
-        cooldownMap.put(key, now);
-        return true;
+        // [v24.0] CHECK ONLY — removed: cooldownMap.put(key, now)
+        return last == null || now - last >= base;
     }
 
     private boolean cooldownAllowed(String sym, com.bot.TradingCore.Side side, CoinCategory cat, long now) {
@@ -1316,13 +1334,17 @@ public final class DecisionEngineMerged {
         signalCountBySymbol.computeIfAbsent(sym, k -> new AtomicInteger(0)).incrementAndGet();
     }
 
+    /**
+     * [v24.0 FIX BUG-3] CHECK ONLY — does NOT update lastSigPrice.
+     * Old code updated price here, so rejected signals blocked future valid ones.
+     * A signal rejected by FC/ISC would still update lastSigPrice → next valid signal
+     * 2 minutes later was blocked as "price not moved enough". Now lastSigPrice
+     * is updated ONLY in confirmSignal() after ISC approves.
+     */
     private boolean priceMovedEnough(String sym, double price) {
         Double last = lastSigPrice.get(sym);
-        if (last == null) { lastSigPrice.put(sym, price); return true; }
-        // [v11.0] Increased from 0.20% to 0.35% — prevents near-duplicate signals
-        if (Math.abs(price - last) / last < 0.0035) return false;
-        lastSigPrice.put(sym, price);
-        return true;
+        if (last == null) return true;
+        return Math.abs(price - last) / last >= 0.0035;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -2026,7 +2048,7 @@ public final class DecisionEngineMerged {
                 }
             }
             if (bestStop <= 0) {
-                double recentHigh = Double.MIN_VALUE;
+                double recentHigh = Double.NEGATIVE_INFINITY;
                 for (int i = Math.max(0, c15.size() - 8); i < c15.size() - 1; i++) {
                     recentHigh = Math.max(recentHigh, c15.get(i).high);
                 }
@@ -2143,39 +2165,13 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [v10.0] Wilder's RSI using Smoothed Moving Average (SMMA).
-     * Old code used simple sum over period — too "jerky", triggers false divergences.
-     * Wilder's method: first value = SMA, then avgGain = (prev*13 + current) / 14.
-     * This matches TradingView/Binance RSI exactly.
+     * [v24.0 FIX BUG-1] Delegates to TradingCore.rsi() — SINGLE source of truth.
+     * Old code had its own seed window (c.size() - period*2) which diverged 3-8 points
+     * from TradingCore.rsi() seed (starting at index 1). Clusters and ForecastEngine
+     * saw DIFFERENT RSI for identical data → flipped signals, false divergences.
      */
     public double rsi(List<com.bot.TradingCore.Candle> c, int period) {
-        if (c.size() < period + 1) return 50.0;
-
-        // Step 1: initial SMA seed over first 'period' bars
-        int startIdx = c.size() - period * 2; // use more history for stable seed
-        if (startIdx < 1) startIdx = 1;
-
-        double avgGain = 0, avgLoss = 0;
-        int seedEnd = Math.min(startIdx + period, c.size());
-        for (int i = startIdx; i < seedEnd; i++) {
-            double ch = c.get(i).close - c.get(i - 1).close;
-            if (ch > 0) avgGain += ch; else avgLoss -= ch;
-        }
-        avgGain /= period;
-        avgLoss /= period;
-
-        // Step 2: Wilder's smoothing for remaining bars
-        for (int i = seedEnd; i < c.size(); i++) {
-            double ch = c.get(i).close - c.get(i - 1).close;
-            double curGain = ch > 0 ? ch : 0;
-            double curLoss = ch < 0 ? -ch : 0;
-            avgGain = (avgGain * (period - 1) + curGain) / period;
-            avgLoss = (avgLoss * (period - 1) + curLoss) / period;
-        }
-
-        if (avgLoss < 1e-12) return 100.0;
-        double rs = avgGain / avgLoss;
-        return 100.0 - (100.0 / (1.0 + rs));
+        return com.bot.TradingCore.rsi(c, period);
     }
 
     private boolean bullDiv(List<com.bot.TradingCore.Candle> c) {

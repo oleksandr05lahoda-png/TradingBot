@@ -72,7 +72,8 @@ public final class BotMain {
     private static final long CB_WINDOW_MS = 5 * 60_000L;
     private static final long CB_PAUSE_MS  = 2 * 60_000L;
     private static volatile long lastErrorWindowStart = 0;
-    private static volatile int  errorsInWindow       = 0;
+    // [v24.0 FIX BUG-4] AtomicInteger (was volatile int — race on ++ and >= check)
+    private static final AtomicInteger errorsInWindow = new AtomicInteger(0);
     private static volatile long cbPauseUntil         = 0; // [FIX #2] время окончания паузы
 
     // ── Watchdog ──────────────────────────────────────────────────────────
@@ -134,9 +135,9 @@ public final class BotMain {
         volatile boolean tp2Hit        = false; // ← NEW: предотвращает дубли TP2 сообщений
         volatile double  trailingStop  = 0;
 
-        // [v14.0 FIX #6] synchronized доступ к extremes через getter/setter
+        // [v24.0 FIX] NEGATIVE_INFINITY for max search (Double.MIN_VALUE = tiny positive number)
         private double  extremeLow    = Double.MAX_VALUE;
-        private double  extremeHigh   = Double.MIN_VALUE;
+        private double  extremeHigh   = Double.NEGATIVE_INFINITY;
         private final Object extremeLock = new Object();
 
         TrackedSignal(String sym, com.bot.TradingCore.Side side,
@@ -170,7 +171,7 @@ public final class BotMain {
                 task.run();
             } catch (Throwable t) {
                 errorCount.incrementAndGet();
-                errorsInWindow++;
+                errorsInWindow.incrementAndGet();
                 LOG.log(Level.SEVERE, "[SAFE] Task '" + name + "' FAILED: " + t.getMessage(), t);
             }
         };
@@ -305,11 +306,11 @@ public final class BotMain {
         }
         if (now - lastErrorWindowStart > CB_WINDOW_MS) {
             lastErrorWindowStart = now;
-            errorsInWindow = 0;
+            errorsInWindow.set(0);
         }
-        if (errorsInWindow >= CB_THRESHOLD) {
+        if (errorsInWindow.get() >= CB_THRESHOLD) {
             cbPauseUntil = now + CB_PAUSE_MS;
-            errorsInWindow = 0;
+            errorsInWindow.set(0);
             LOG.warning("[CB] Слишком много ошибок, пауза до " + formatLocalTime(cbPauseUntil));
             return;
         }
@@ -450,7 +451,7 @@ public final class BotMain {
                 List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 4);
                 if (candles == null || candles.isEmpty()) continue;
 
-                double newLow = Double.MAX_VALUE, newHigh = Double.MIN_VALUE;
+                double newLow = Double.MAX_VALUE, newHigh = Double.NEGATIVE_INFINITY;
                 for (com.bot.TradingCore.Candle c : candles) {
                     newLow  = Math.min(newLow,  c.low);
                     newHigh = Math.max(newHigh, c.high);

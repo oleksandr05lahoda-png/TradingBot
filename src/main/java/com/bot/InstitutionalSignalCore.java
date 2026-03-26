@@ -221,6 +221,9 @@ public final class InstitutionalSignalCore {
     //  SIGNAL FILTERING
     // ══════════════════════════════════════════════════════════════
 
+    // [v24.0] Max positions per direction — prevents one-sided portfolio blow-up
+    private static final int MAX_SAME_DIRECTION = 4;
+
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
         String sym = signal.symbol;
@@ -231,6 +234,16 @@ public final class InstitutionalSignalCore {
 
         // Global limit
         if (getActiveCount() >= maxGlobalSignals) return false;
+
+        // [v24.0 FIX WEAK-7] Max directional exposure — max 4 LONG or 4 SHORT at once.
+        // Without this, a bullish market could stack 10+ LONGs → one crash wipes all.
+        int sameDirectionCount = 0;
+        for (List<ActiveSignal> signals : activeSignals.values()) {
+            for (ActiveSignal a : signals) {
+                if (a.side == signal.side) sameDirectionCount++;
+            }
+        }
+        if (sameDirectionCount >= MAX_SAME_DIRECTION) return false;
 
         // Per-symbol limit
         List<ActiveSignal> symList = activeSignals.getOrDefault(sym, List.of());
