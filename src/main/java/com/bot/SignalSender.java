@@ -560,7 +560,26 @@ public final class SignalSender {
             boolean isLong   = idea.side == com.bot.TradingCore.Side.LONG;
             double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
 
-            if (gicWeight <= 0.0) return null;
+            // [v23.0] GIC weight → probability penalty, NOT hard veto
+            // Old: gicWeight <= 0 → return null (killed ALL longs during BTC dip)
+            // New: gicWeight → scaled penalty. Panic = -25, Danger = -15, Watch = -8
+            if (gicWeight <= 0.05) {
+                // Effectively blocked — apply massive penalty but let probability gate decide
+                List<String> gicFlags = new ArrayList<>(idea.flags);
+                gicFlags.add("GIC_BLOCK");
+                idea = rebuildIdea(idea, Math.max(40, idea.probability - 25), gicFlags);
+            } else if (gicWeight < 0.50) {
+                List<String> gicFlags = new ArrayList<>(idea.flags);
+                gicFlags.add("GIC_WEAK" + String.format("%.0f", gicWeight * 100));
+                double penalty = (0.50 - gicWeight) * 30; // 0.05 → -13.5, 0.30 → -6, 0.49 → -0.3
+                idea = rebuildIdea(idea, Math.max(50, idea.probability - penalty), gicFlags);
+            } else if (gicWeight > 1.10) {
+                // GIC boost — slightly increase probability
+                double boost = Math.min(5, (gicWeight - 1.0) * 8);
+                List<String> gicFlags = new ArrayList<>(idea.flags);
+                gicFlags.add("GIC_BOOST" + String.format("%.0f", gicWeight * 100));
+                idea = rebuildIdea(idea, Math.min(85, idea.probability + boost), gicFlags);
+            }
 
             if (!correlationGuard.allow(pair, idea.side, cat, sector)) {
                 blockedCorr.incrementAndGet(); return null;
@@ -622,6 +641,8 @@ public final class SignalSender {
 
             if (!isc.allowSignal(idea)) return null;
             isc.registerSignal(idea);
+            // [v23.0] Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
+            decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, System.currentTimeMillis());
             correlationGuard.register(pair, idea.side, cat, sector);
 
             return idea;
@@ -1472,14 +1493,9 @@ public final class SignalSender {
     //  STATIC MATH UTILS
     // ══════════════════════════════════════════════════════════════
 
+    /** [v23.0] Delegates to TradingCore.atr() — Wilder's smoothed ATR everywhere */
     public static double atr(List<com.bot.TradingCore.Candle> c, int period) {
-        if (c == null || c.size() <= period) return 0;
-        double sum = 0;
-        for (int i = c.size() - period; i < c.size(); i++) {
-            com.bot.TradingCore.Candle pr = c.get(i-1), cu = c.get(i);
-            sum += Math.max(cu.high-cu.low, Math.max(Math.abs(cu.high-pr.close), Math.abs(cu.low-pr.close)));
-        }
-        return sum / period;
+        return com.bot.TradingCore.atr(c, period);
     }
 
     /** [v10.0] Wilder's RSI (SMMA) — matches DecisionEngine and TradingView */

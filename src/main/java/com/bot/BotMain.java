@@ -324,6 +324,12 @@ public final class BotMain {
         double bal = sender.getAccountBalance();
         if (bal > 0) isc.updateBalance(bal);
 
+        // [v23.0] Update Bayesian prior from ISC real win rate
+        // This ensures probability estimates reflect ACTUAL trading performance
+        if (isc.getTotalTradeCount() >= 20) {
+            sender.getDecisionEngine().updateBayesPrior(isc.getOverallWinRate());
+        }
+
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         LOG.info("BTC: " + ctx.regime
                 + " str=" + String.format("%.2f", ctx.impulseStrength)

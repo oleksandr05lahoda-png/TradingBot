@@ -306,19 +306,11 @@ public final class SignalOptimizer {
         }
     }
 
+    /** [v23.0] Uses Wilder's ATR for consistency */
     private double computeAtrPct(List<com.bot.TradingCore.Candle> candles) {
         int n = candles.size();
-        int period = Math.min(14, n - 1);
-        if (period <= 0) return 0;
-        double sum = 0;
-        for (int i = n - period; i < n; i++) {
-            com.bot.TradingCore.Candle cur  = candles.get(i);
-            com.bot.TradingCore.Candle prev = candles.get(i - 1);
-            sum += Math.max(cur.high - cur.low,
-                    Math.max(Math.abs(cur.high - prev.close),
-                            Math.abs(cur.low  - prev.close)));
-        }
-        double atr = sum / period;
+        if (n < 15) return 0;
+        double atr = com.bot.TradingCore.atr(candles, 14);
         double price = candles.get(n - 1).close;
         return price > 0 ? atr / price : 0;
     }
@@ -330,20 +322,40 @@ public final class SignalOptimizer {
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * [v7.0] TAMED adjustConfidence — уважает кластерную калибровку из DecisionEngine.
-     *
-     * Принцип: DecisionEngine даёт калиброванную probability (50-85%).
-     * Optimizer корректирует на основе микро-тренда, НО:
-     * - Максимальное ОБЩЕЕ изменение: ±12 единиц (было ±30+)
-     * - Потолок: 85% (совпадает с DecisionEngine)
-     * - Нет стекинга бонусов — каждый блок дополняет, но не перезаписывает
-     * - Exhaustion = единственный случай сильного штрафа (-15 max)
+     * [v23.0] RESTORED micro-momentum adjustConfidence.
+     * v18.0 killed this method → bot stopped reacting to tick-level acceleration.
+     * Now restored with TAMED influence: ±8 max (was ±30+).
+     * This lets the bot "feel" the market moving in real-time.
      */
     public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
-        // [v18.0 REFACTOR] Bypassed arbitrary confidence scaling.
-        // The ForecastEngine and cluster models in DecisionEngineMerged now provide
-        // the final probability. SignalOptimizer is relegated to micro-trend tracking.
-        return signal.probability;
+        MicroTrendResult mt = computeMicroTrend(signal.symbol);
+        if (mt == null || mt.impulse < WEAK_IMPULSE) return signal.probability;
+
+        double conf = signal.probability;
+        boolean isLong = signal.side == com.bot.TradingCore.Side.LONG;
+        boolean impulseAligned = (isLong && mt.smoothSpeed > 0) || (!isLong && mt.smoothSpeed < 0);
+        boolean impulseOpposed = (isLong && mt.smoothSpeed < 0) || (!isLong && mt.smoothSpeed > 0);
+
+        // Aligned micro-momentum → small boost (max +5)
+        if (impulseAligned && mt.impulse > STRONG_IMPULSE) {
+            double boost = Math.min(5.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 3.0);
+            conf += boost;
+        }
+        // Opposed micro-momentum → penalty (max -8)
+        if (impulseOpposed && mt.impulse > STRONG_IMPULSE) {
+            double penalty = Math.min(8.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 4.0);
+            conf -= penalty;
+        }
+        // Acceleration bonus: price accelerating in our direction
+        if (impulseAligned && Math.abs(mt.accel) > ACCELERATION_THRESHOLD) {
+            conf += Math.min(3.0, Math.abs(mt.accel) / ACCELERATION_THRESHOLD * 1.5);
+        }
+        // Exhaustion penalty: micro-trend is exhausted
+        if (mt.isExhausted && impulseAligned) {
+            conf -= 4.0;
+        }
+
+        return Math.max(MIN_CONF, Math.min(MAX_CONF, conf));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -351,13 +363,18 @@ public final class SignalOptimizer {
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * [v14.0 FIX] Пересоздание TradeIdea с сохранением ВСЕХ полей.
-     * БЫЛО: 3-arg конструктор терял rr, fundingDelta, category, forecast.
+     * [v23.0] Rebuild TradeIdea with micro-momentum adjusted confidence.
      */
     public com.bot.DecisionEngineMerged.TradeIdea withAdjustedConfidence(
             com.bot.DecisionEngineMerged.TradeIdea signal) {
-        // [v18.0] Return unchanged signal since scaling is removed
-        return signal;
+        double adjusted = adjustConfidence(signal);
+        if (Math.abs(adjusted - signal.probability) < 0.5) return signal;
+        List<String> nf = new java.util.ArrayList<>(signal.flags);
+        nf.add("μ" + String.format("%+.0f", adjusted - signal.probability));
+        return new com.bot.DecisionEngineMerged.TradeIdea(
+                signal.symbol, signal.side, signal.price, signal.stop, signal.take,
+                signal.rr, adjusted, nf, signal.fundingRate, signal.fundingDelta,
+                signal.oiChange, signal.htfBias, signal.category);
     }
 
     // ══════════════════════════════════════════════════════════════

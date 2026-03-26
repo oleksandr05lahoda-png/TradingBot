@@ -1184,17 +1184,11 @@ public final class GlobalImpulseController {
         return System.currentTimeMillis() - lastFastUpdateMs > FAST_DATA_STALE;
     }
 
+    /** [v23.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR.
+     *  Old code used simple SMA which diverges 15-20% from Wilder's method.
+     *  This caused crash score to compute on wrong ATR values. */
     private double atr(List<com.bot.TradingCore.Candle> c, int n) {
-        int p = Math.min(n, c.size() - 1);
-        if (p <= 0) return 0;
-        double sum = 0;
-        for (int i = c.size() - p; i < c.size(); i++) {
-            com.bot.TradingCore.Candle cur = c.get(i), prev = c.get(i - 1);
-            sum += Math.max(cur.high - cur.low,
-                    Math.max(Math.abs(cur.high - prev.close),
-                            Math.abs(cur.low  - prev.close)));
-        }
-        return sum / p;
+        return com.bot.TradingCore.atr(c, n);
     }
 
     private double ema(List<com.bot.TradingCore.Candle> c, int p) {

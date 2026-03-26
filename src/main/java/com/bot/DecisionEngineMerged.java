@@ -56,12 +56,29 @@ public final class DecisionEngineMerged {
 
     public DecisionEngineMerged() {}
 
+    // [v23.0] Bayesian prior — updated from ISC real win rate
+    private volatile double bayesPrior = 0.50;
+
+    /** Update Bayesian prior from ISC historical win rate */
+    public void updateBayesPrior(double winRate) {
+        this.bayesPrior = Math.max(0.35, Math.min(0.70, winRate));
+    }
+
+    public double getBayesPrior() { return bayesPrior; }
+
     // ── Setters ───────────────────────────────────────────────────
     public void setPumpHunter(com.bot.PumpHunter ph) { this.pumpHunter = ph; }
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
 
-    // [v14.0] Called by SignalSender AFTER ISC.allowSignal() confirms
+    // [v23.0] Called by SignalSender AFTER ISC.allowSignal() confirms.
+    // Now accepts price to properly track lastSigPrice.
+    public void confirmSignal(String symbol, com.bot.TradingCore.Side side, double price, long now) {
+        registerSignal(symbol, side, now);
+        lastSigPrice.put(symbol, price);
+    }
+
+    // Backward-compatible overload
     public void confirmSignal(String symbol, com.bot.TradingCore.Side side, long now) {
         registerSignal(symbol, side, now);
     }
@@ -420,7 +437,11 @@ public final class DecisionEngineMerged {
 
         adaptGlobalMinConf(state, atr14, price);
 
-        if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) return null;
+        // [v23.0] ADX low in RANGE: penalty, not veto
+        boolean adxRangePenalty = false;
+        if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) {
+            adxRangePenalty = true;
+        }
 
         int n15 = c15.size();
         double move4bars = last(c15).close - c15.get(n15 - 5).close;
@@ -445,6 +466,7 @@ public final class DecisionEngineMerged {
         ClusterScores cDerivatives = new ClusterScores(); // Funding, OI, Divergences
         ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
         List<String> allFlags = new ArrayList<>();
+        if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
 
         // ════════════════════════════════════════════════════════
         // [CLUSTER 0] BTC CRASH — прямой override, ДО кластеров
@@ -752,11 +774,11 @@ public final class DecisionEngineMerged {
         if (rw != null && rw.confidence > 0.48) {
             allFlags.add("⚠REV_" + rw.type);
             if ("LONG_EXHAUSTION".equals(rw.type)) {
-                // [v8.0 SYMMETRIC] LONG exhaustion gets confirmation chance too
                 boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.SHORT);
                 if (!confirmed) {
-                    scoreLong *= 0.35; // [v8.0] Было 0.16 — убийственно. Теперь 0.35
-                    if (scoreLong < 0.20) return null;
+                    scoreLong *= 0.35;
+                    // [v23.0] Flag for penalty, not veto
+                    if (scoreLong < 0.20) allFlags.add("LEXH_SCORE_CRUSHED");
                 } else {
                     allFlags.add("LEXH_CONFIRMED_1M");
                 }
@@ -766,8 +788,8 @@ public final class DecisionEngineMerged {
                 } else {
                     boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.LONG);
                     if (!confirmed) {
-                        scoreShort *= 0.35; // [v8.0] Было 0.16
-                        if (scoreShort < 0.20) return null;
+                        scoreShort *= 0.35;
+                        if (scoreShort < 0.20) allFlags.add("SEXH_SCORE_CRUSHED");
                     } else {
                         allFlags.add("REV_CONFIRMED_1M");
                     }
@@ -850,9 +872,12 @@ public final class DecisionEngineMerged {
             requiredClusters = 3;
         }
 
+        // [v23.0] Insufficient clusters → penalty flag (was return null)
+        boolean clusterPenalty = false;
         if (supportingClusters < requiredClusters) {
             if (!(aggressiveShort && candidateSide == com.bot.TradingCore.Side.SHORT && crashBoost > 0.30)) {
-                return null;
+                clusterPenalty = true;
+                allFlags.add("LOW_CLUSTERS_" + supportingClusters + "/" + requiredClusters);
             }
         }
 
@@ -866,13 +891,13 @@ public final class DecisionEngineMerged {
         if (aggressiveShort) {
             minDiff = 0.08;
         } else {
-            // [v11.0] RANGE needs higher diff — choppy = more noise
             minDiff = state == MarketState.STRONG_TREND ? 0.16
-                    : state == MarketState.RANGE ? 0.28  // was 0.20 — too many false signals in range
+                    : state == MarketState.RANGE ? 0.28
                     : 0.20;
         }
-        if (scoreDiff < minDiff) return null;
-
+        // [v23.0] scoreDiff/dynThresh → penalty flags (was return null)
+        boolean scoreDiffPenalty = scoreDiff < minDiff;
+        boolean dynThreshPenalty = false;
         double dynThresh;
         if (aggressiveShort) {
             dynThresh = 0.40;
@@ -880,17 +905,23 @@ public final class DecisionEngineMerged {
             dynThresh = state == MarketState.STRONG_TREND ? 0.68 : 0.58;
         }
         if (scoreLong < dynThresh && scoreShort < dynThresh) {
-            if (!bullDiv && !bearDiv && !hasFR && !aggressiveShort) return null;
+            if (!bullDiv && !bearDiv && !hasFR && !aggressiveShort) {
+                dynThreshPenalty = true;
+                allFlags.add("DYN_THRESH_LOW");
+            }
         }
 
         com.bot.TradingCore.Side side = candidateSide;
 
-        // [v13.0] LATE ENTRY BLOCK — don't chase exhausted moves
+        // [v23.0] LATE ENTRY: penalty, not veto — signals still checked by probability gate
+        boolean lateEntryPenalty = false;
         if (side == com.bot.TradingCore.Side.LONG && lateEntryLong && !aggressiveShort) {
-            return null; // 3+ green candles + 2×ATR move up → LONG is too late
+            lateEntryPenalty = true;
+            allFlags.add("LATE_ENTRY_L");
         }
         if (side == com.bot.TradingCore.Side.SHORT && lateEntryShort && !aggressiveShort) {
-            return null; // 3+ red candles + 2×ATR move down → SHORT is too late
+            lateEntryPenalty = true;
+            allFlags.add("LATE_ENTRY_S");
         }
 
         // [v11.0] VOLUME CONFIRMATION GATE
@@ -899,15 +930,12 @@ public final class DecisionEngineMerged {
         boolean volumeOpposes = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsShort())
                 || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsLong());
 
-        // [v14.0 FIX] Volume = SOFT GATE, не HARD GATE
-        // Hard gate убивал 70%+ сигналов в нормальных рыночных условиях
-        // Volume ПРОТИВ нас — штраф, но не блок
+        // [v14.0 FIX] Volume = SOFT GATE
         if (volumeOpposes && !aggressiveShort) {
             if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.55;
             else scoreShort *= 0.55;
             allFlags.add("VOL_OPPOSE");
             scoreDiff = Math.abs(scoreLong - scoreShort);
-            if (scoreDiff < minDiff) return null;
         }
         // Нет volume confirmation — мягкий штраф 15%
         if (!volumeSupports && !volumeOpposes && !aggressiveShort) {
@@ -915,7 +943,6 @@ public final class DecisionEngineMerged {
             else scoreShort *= 0.85;
             allFlags.add("VOL_NEUTRAL");
         }
-        if (scoreDiff < minDiff) return null;
 
         // Cooldown
         long shortCooldownOverride = aggressiveShort ? 60_000L : -1;
@@ -941,6 +968,19 @@ public final class DecisionEngineMerged {
             probability = Math.min(85, probability + crashConfBoost);
             allFlags.add("CRASH_CONF_BOOST");
         }
+
+        // ════════════════════════════════════════════════════════
+        // [v23.0] PENALTY APPLICATION — all collected flags → probability adjustments
+        // This replaces 7+ scattered `return null` with ONE probability gate.
+        // ════════════════════════════════════════════════════════
+        if (adxRangePenalty) probability = Math.max(50, probability - 8);
+        if (lateEntryPenalty) probability = Math.max(50, probability - 10);
+        if (volumeOpposes && !aggressiveShort) probability = Math.max(50, probability - 6);
+        if (clusterPenalty) probability = Math.max(50, probability - 12);
+        if (scoreDiffPenalty) probability = Math.max(50, probability - 15);
+        if (dynThreshPenalty) probability = Math.max(50, probability - 10);
+        if (allFlags.contains("LEXH_SCORE_CRUSHED") || allFlags.contains("SEXH_SCORE_CRUSHED"))
+            probability = Math.max(50, probability - 12);
 
         double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf);
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
@@ -982,12 +1022,11 @@ public final class DecisionEngineMerged {
         // [v11.0] Cap stop at 3% to prevent absurd risk
         stopDist = Math.min(stopDist, price * 0.030);
 
-        // [v11.0] Minimum R:R check BEFORE building trade — reject if structure
-        // gives too wide a stop that kills the R:R ratio
+        // [v23.0] Wide structure → penalty, not veto
         if (stopDist > atrStop * 2.5) {
-            // Structure is too far — bad entry point, skip
             allFlags.add("STRUCT_WIDE");
-            return null;
+            probability = Math.max(50, probability - 7);
+            if (probability < minConf) return null; // re-check after penalty
         }
 
         double stopPrice = side == com.bot.TradingCore.Side.LONG  ? price - stopDist : price + stopDist;
@@ -1018,88 +1057,82 @@ public final class DecisionEngineMerged {
                     boolean fcBull = forecastResult.directionScore > 0.2;
                     boolean fcBear = forecastResult.directionScore < -0.2;
 
-                    // ── HARD VETO 1: Volatility Squeeze — no directional edge ──
+                    // ══════════════════════════════════════════════════
+                    // [v23.0] ALL VETOES → PENALTIES
+                    // ForecastEngine is an ADVISOR, not a DICTATOR.
+                    // Squeeze = OPPORTUNITY (penalty reduced, breakout boosted).
+                    // ══════════════════════════════════════════════════
+
+                    // SQUEEZE: reduced penalty, NOT veto (was return null)
                     Double squeezeFlag = forecastResult.factorScores.get("SQUEEZE");
                     if (squeezeFlag != null && squeezeFlag > 0.5) {
-                        allFlags.add("FC_VETO_SQUEEZE");
-                        return null;
+                        probability = Math.max(50, probability - 5);
+                        allFlags.add("FC_SQUEEZE_PENALTY");
                     }
 
-                    // ── HARD VETO 2: Strong exhaustion — signal follows dying move ──
-                    // [v17.0] Raised threshold from 0.55 → 0.70 (only VERY strong exhaustion)
+                    // EXHAUSTION: penalty -8 (was return null)
                     Double exhaustionFlag = forecastResult.factorScores.get("EXHAUSTION");
                     if (exhaustionFlag != null && exhaustionFlag > 0.70
                             && forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
                         Double moveDirFlag = forecastResult.factorScores.get("MOVE_DIR");
                         int moveDir = moveDirFlag != null ? (int) Math.signum(moveDirFlag) : 0;
                         if ((sigLong && moveDir > 0) || (!sigLong && moveDir < 0)) {
-                            allFlags.add("FC_VETO_EXHAUST_V17");
-                            return null;
+                            probability = Math.max(50, probability - 8);
+                            allFlags.add("FC_EXHAUST_PENALTY");
                         }
                     }
 
-                    // ── HARD VETO 3: Exhaustion phase (with override) ──
-                    boolean exhaustionOverride = forecastResult.confidence >= 0.76
-                            && fcDirAbs >= 0.34
-                            && Math.abs(forecastResult.projectedMovePct) >= stopDist / (price + 1e-9) * 1.25
-                            && ((sigLong && forecastResult.directionScore > 0)
-                            || (!sigLong && forecastResult.directionScore < 0));
-                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION
-                            && !exhaustionOverride) {
-                        allFlags.add("FC_VETO_EXHAUST");
-                        return null;
-                    }
-                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION
-                            && exhaustionOverride) {
-                        allFlags.add("FC_EXHAUST_OVERRIDE");
+                    // EXHAUSTION phase: penalty -6 unless overridden (was return null)
+                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
+                        boolean exhaustionOverride = forecastResult.confidence >= 0.76
+                                && fcDirAbs >= 0.34
+                                && ((sigLong && forecastResult.directionScore > 0)
+                                || (!sigLong && forecastResult.directionScore < 0));
+                        if (!exhaustionOverride) {
+                            probability = Math.max(50, probability - 6);
+                            allFlags.add("FC_EXHAUST_PHASE");
+                        } else {
+                            allFlags.add("FC_EXHAUST_OVERRIDE");
+                        }
                     }
 
-                    // ── SOFT PENALTY: Direction disagreement ──
-                    // [v17.0] Was hard veto at 0.18 → now penalty unless STRONGLY against (0.35)
-                    if (sigLong
-                            && (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BEAR)
-                            && fcDirAbs >= 0.35) {
-                        allFlags.add("FC_VETO_BEAR");
-                        return null; // Only STRONG_BEAR with high dirAbs = veto
+                    // STRONG disagreement: heavy penalty -15 (was return null)
+                    if (sigLong && forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BEAR && fcDirAbs >= 0.35) {
+                        probability = Math.max(50, probability - 15);
+                        allFlags.add("FC_STRONG_BEAR_PENALTY");
                     }
-                    if (!sigLong
-                            && (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BULL)
-                            && fcDirAbs >= 0.35) {
-                        allFlags.add("FC_VETO_BULL");
-                        return null; // Only STRONG_BULL with high dirAbs = veto
+                    if (!sigLong && forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BULL && fcDirAbs >= 0.35) {
+                        probability = Math.max(50, probability - 15);
+                        allFlags.add("FC_STRONG_BULL_PENALTY");
                     }
-                    // Mild disagreement → penalty, not veto
+
+                    // Mild disagreement → penalty -4
                     if ((sigLong && fcBear) || (!sigLong && fcBull)) {
                         probability = Math.max(50, probability - 4);
                         allFlags.add("FC_DISAGREE");
                     }
 
-                    // ── SOFT PENALTY: Projected move against signal direction ──
-                    // [v17.0] Was hard veto → now penalty (–3) unless EARLY phase
+                    // Projected move against direction → penalty -3
                     if (sigLong && forecastResult.projectedMovePct <= 0) {
                         probability = Math.max(50, probability - 3);
-                        allFlags.add(forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
-                                ? "FC_PROJ_DN_EARLY_OK" : "FC_PROJ_DN_PENALTY");
+                        allFlags.add("FC_PROJ_DN");
                     }
                     if (!sigLong && forecastResult.projectedMovePct >= 0) {
                         probability = Math.max(50, probability - 3);
-                        allFlags.add(forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
-                                ? "FC_PROJ_UP_EARLY_OK" : "FC_PROJ_UP_PENALTY");
+                        allFlags.add("FC_PROJ_UP");
                     }
 
-                    // [v19.0] HARD VETO: Early Counter-Trend
-                    // Если Forecast утверждает, что начался РАННИЙ тренд ПРОТИВ нашей позиции,
-                    // и у него есть уверенность — мы ОБЯЗАНЫ отменить вход в старый умирающий тренд.
+                    // Early Counter-Trend: penalty -10 (was return null)
                     if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY) {
                         boolean earlyOpposed = (sigLong && forecastResult.directionScore < -0.15)
                                 || (!sigLong && forecastResult.directionScore > 0.15);
                         if (earlyOpposed && forecastResult.confidence > 0.40) {
-                            allFlags.add("FC_VETO_EARLY_REV");
-                            return null;
+                            probability = Math.max(50, probability - 10);
+                            allFlags.add("FC_EARLY_REV_PENALTY");
                         }
                     }
 
-                    // ── BOOST: Early trend phase with strong direction ──
+                    // BOOST: Early trend aligned
                     if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
                             && Math.abs(forecastResult.directionScore) > 0.25) {
                         boolean earlyAligned = (sigLong && forecastResult.directionScore > 0)
@@ -1148,6 +1181,11 @@ public final class DecisionEngineMerged {
                 System.out.printf("[FC] %s forecast error: %s%n", symbol, e.getMessage());
             }
         }
+
+        // [v23.0] FINAL GATE — after ALL penalties (FC, structural, volume)
+        // This is the ONE place that decides if a signal lives or dies.
+        probability = Math.max(50, Math.min(85, probability));
+        if (probability < minConf) return null;
 
         return new TradeIdea(symbol, side, price, stopPrice, takePrice, rrRatio,
                 probability, allFlags,

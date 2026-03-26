@@ -1906,16 +1906,10 @@ public final class TradingCore {
             return lo + (mx + 0.5) * bs;
         }
 
+        /** [v23.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR.
+         *  Old SMA diverges 15-20% from Wilder's → miscalculated exhaustion thresholds. */
         private double fcAtr(List<Candle> c, int n) {
-            int p = Math.min(n, c.size() - 1);
-            if (p <= 0) return 0;
-            double s = 0;
-            for (int i = c.size() - p; i < c.size(); i++) {
-                Candle cu = c.get(i), pr = c.get(i - 1);
-                s += Math.max(cu.high - cu.low,
-                        Math.max(Math.abs(cu.high - pr.close), Math.abs(cu.low - pr.close)));
-            }
-            return s / p;
+            return TradingCore.atr(c, n);
         }
 
         private double fcEma(List<Candle> c, int p) {

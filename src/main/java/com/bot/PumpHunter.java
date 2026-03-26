@@ -519,23 +519,9 @@ public final class PumpHunter {
 
     // ======================= UTILITY =======================
 
+    /** [v23.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR */
     private double calculateATR(List<com.bot.TradingCore.Candle> candles, int period) {
-        if (candles == null || candles.size() < period + 1) return 0;
-
-        double sum = 0;
-        int n = candles.size();
-
-        for (int i = n - period; i < n; i++) {
-            com.bot.TradingCore.Candle cur = candles.get(i);
-            com.bot.TradingCore.Candle prev = candles.get(i - 1);
-
-            double tr = Math.max(cur.high - cur.low,
-                    Math.max(Math.abs(cur.high - prev.close),
-                            Math.abs(cur.low - prev.close)));
-            sum += tr;
-        }
-
-        return sum / period;
+        return com.bot.TradingCore.atr(candles, period);
     }
 
     private double averageVolume(List<com.bot.TradingCore.Candle> candles, int lookback) {
