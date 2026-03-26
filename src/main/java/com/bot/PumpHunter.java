@@ -30,17 +30,6 @@ public final class PumpHunter {
     private final Map<String, PumpEvent> recentPumps = new ConcurrentHashMap<>();
     private final Map<String, Deque<PumpEvent>> pumpHistory = new ConcurrentHashMap<>();
 
-    // [v20.0] SELL CLIMAX DETECTION
-    // When a huge dump candle has extreme volume (= panic selling / capitulation),
-    // we block SHORT signals and only allow LONG / WAIT for a cooldown period.
-    // This prevents the bot from shorting the exact bottom of V-shaped reversals.
-    private static final long SELL_CLIMAX_BLOCK_MS = 15 * 60_000; // 15 min block on shorts after sell climax
-    private static final double SELL_CLIMAX_VOL_MULT = 3.0;       // Volume must be 3x average
-    private static final double SELL_CLIMAX_MOVE_PCT = -0.020;    // At least -2% move down
-    private static final double BUY_CLIMAX_MOVE_PCT  =  0.020;    // At least +2% move up
-    private final Map<String, Long> sellClimaxTime = new ConcurrentHashMap<>();
-    private final Map<String, Long> buyClimaxTime  = new ConcurrentHashMap<>();
-
     // ======================= MODELS =======================
 
     public boolean isDump(List<com.bot.TradingCore.Candle> candles) {
@@ -242,29 +231,6 @@ public final class PumpHunter {
             flags.add("VOL_CLIMAX");
         }
 
-        // [v20.0] SELL CLIMAX DETECTION
-        // Huge red candle + extreme volume = capitulation / panic selling
-        // → Block SHORT signals for this symbol for 15 minutes
-        if (type == PumpType.PUMP_DOWN || type == PumpType.MEGA_PUMP_DOWN) {
-            if (volumeRatio >= SELL_CLIMAX_VOL_MULT && movePct <= SELL_CLIMAX_MOVE_PCT) {
-                sellClimaxTime.put(symbol, System.currentTimeMillis());
-                flags.add("SELL_CLIMAX");
-                System.out.println("[PumpHunter] ⚡ SELL CLIMAX detected on " + symbol
-                        + " — SHORT blocked for 15min. vol=" + String.format("%.1fx", volumeRatio)
-                        + " move=" + String.format("%.2f%%", movePct * 100));
-            }
-        }
-        // [v20.0] BUY CLIMAX — mirror logic for blocking LONGs after parabolic pumps
-        if (type == PumpType.PUMP_UP || type == PumpType.MEGA_PUMP_UP) {
-            if (volumeRatio >= SELL_CLIMAX_VOL_MULT && movePct >= BUY_CLIMAX_MOVE_PCT) {
-                buyClimaxTime.put(symbol, System.currentTimeMillis());
-                flags.add("BUY_CLIMAX");
-                System.out.println("[PumpHunter] ⚡ BUY CLIMAX detected on " + symbol
-                        + " — LONG blocked for 15min. vol=" + String.format("%.1fx", volumeRatio)
-                        + " move=" + String.format("%.2f%%", movePct * 100));
-            }
-        }
-
         boolean confirmed = checkConfirmation(c1m, type);
         if (confirmed) {
             strength = Math.min(1.0, strength + 0.05);
@@ -298,21 +264,11 @@ public final class PumpHunter {
 
         switch (event.type) {
             case PUMP_UP, MEGA_PUMP_UP, BREAKOUT_UP -> {
-                // [v20.0] If buy climax is active, do NOT generate LONG continuation
-                if (isBuyClimaxActive(event.symbol)) {
-                    System.out.println("[PumpHunter] Blocked PUMP_CONTINUATION for " + event.symbol + " — buy climax active");
-                    return null;
-                }
                 side = com.bot.TradingCore.Side.LONG;
                 strategy = "PUMP_CONTINUATION";
                 confidence = 55 + event.strength * 25;
             }
             case PUMP_DOWN, MEGA_PUMP_DOWN, BREAKOUT_DOWN -> {
-                // [v20.0] If sell climax is active, do NOT generate SHORT continuation
-                if (isSellClimaxActive(event.symbol)) {
-                    System.out.println("[PumpHunter] Blocked DUMP_CONTINUATION for " + event.symbol + " — sell climax active");
-                    return null;
-                }
                 side = com.bot.TradingCore.Side.SHORT;
                 strategy = "DUMP_CONTINUATION";
                 confidence = 55 + event.strength * 25;
@@ -563,104 +519,23 @@ public final class PumpHunter {
 
     // ======================= UTILITY =======================
 
-    /** [v21.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR */
     private double calculateATR(List<com.bot.TradingCore.Candle> candles, int period) {
-        return com.bot.TradingCore.atr(candles, period);
-    }
+        if (candles == null || candles.size() < period + 1) return 0;
 
-    // ======================= [v21.0 NEW] OI + FUNDING EARLY DETECTION =======================
+        double sum = 0;
+        int n = candles.size();
 
-    /** Data holder for OI + funding analysis */
-    private final Map<String, FundingOISnapshot> fundingOICache = new ConcurrentHashMap<>();
+        for (int i = n - period; i < n; i++) {
+            com.bot.TradingCore.Candle cur = candles.get(i);
+            com.bot.TradingCore.Candle prev = candles.get(i - 1);
 
-    public static final class FundingOISnapshot {
-        public final double fundingRate;
-        public final double oiChangePct;
-        public final long timestamp;
-        public FundingOISnapshot(double fr, double oiChange) {
-            this.fundingRate = fr; this.oiChangePct = oiChange;
-            this.timestamp = System.currentTimeMillis();
-        }
-        public boolean isValid() { return System.currentTimeMillis() - timestamp < 10 * 60_000; }
-    }
-
-    /** Called by SignalSender to update OI+funding for early pump/dump detection */
-    public void updateFundingOI(String symbol, double fundingRate, double oiChangePct) {
-        fundingOICache.put(symbol, new FundingOISnapshot(fundingRate, oiChangePct));
-    }
-
-    /**
-     * [v21.0] EARLY WARNING: Detects pre-pump/dump conditions 10-15 min before they happen.
-     * Signals:
-     *   - Extreme funding rate + OI surge = leveraged positions building → squeeze imminent
-     *   - OI dropping + price dropping = longs liquidating → cascade dump
-     *   - OI rising + price stable = positions accumulating → breakout imminent
-     * Returns a PumpEvent with type NONE if no early warning, or a weaker pump event if detected.
-     */
-    public PumpEvent detectEarlyWarning(String symbol, List<com.bot.TradingCore.Candle> c15m) {
-        FundingOISnapshot snapshot = fundingOICache.get(symbol);
-        if (snapshot == null || !snapshot.isValid()) return null;
-        if (c15m == null || c15m.size() < 30) return null;
-
-        double price = c15m.get(c15m.size() - 1).close;
-        double atr14 = com.bot.TradingCore.atr(c15m, 14);
-        List<String> flags = new ArrayList<>();
-
-        // === EXTREME FUNDING: > 0.05% or < -0.03% (annualized ~180%+ / ~110%+) ===
-        // When funding is extreme, the crowded side will get squeezed.
-        boolean extremePositiveFunding = snapshot.fundingRate > 0.0005;  // Many longs paying shorts
-        boolean extremeNegativeFunding = snapshot.fundingRate < -0.0003; // Many shorts paying longs
-
-        // === OI SURGE: > 5% change in 1h ===
-        boolean oiSurge = snapshot.oiChangePct > 5.0;
-        boolean oiDrop = snapshot.oiChangePct < -5.0;
-
-        // === PRICE vs OI DIVERGENCE ===
-        double priceMoveLastH = 0;
-        if (c15m.size() >= 5) {
-            priceMoveLastH = (price - c15m.get(c15m.size() - 5).close) / c15m.get(c15m.size() - 5).close;
+            double tr = Math.max(cur.high - cur.low,
+                    Math.max(Math.abs(cur.high - prev.close),
+                            Math.abs(cur.low - prev.close)));
+            sum += tr;
         }
 
-        PumpType earlyType = PumpType.NONE;
-        double earlyStrength = 0;
-
-        // Pattern 1: Extreme positive funding + OI surge = SHORT SQUEEZE imminent
-        // All these longs are paying hefty funding → if price dips, they close → cascade
-        if (extremePositiveFunding && oiSurge) {
-            earlyType = PumpType.PUMP_DOWN; // Expect dump (long squeeze)
-            earlyStrength = 0.45;
-            flags.add("EARLY_LONG_SQUEEZE");
-            flags.add("FR=" + String.format("%.4f", snapshot.fundingRate));
-            flags.add("OI=" + String.format("%.1f%%", snapshot.oiChangePct));
-        }
-
-        // Pattern 2: Extreme negative funding + OI surge = LONG SQUEEZE imminent
-        if (extremeNegativeFunding && oiSurge) {
-            earlyType = PumpType.PUMP_UP; // Expect pump (short squeeze)
-            earlyStrength = 0.45;
-            flags.add("EARLY_SHORT_SQUEEZE");
-            flags.add("FR=" + String.format("%.4f", snapshot.fundingRate));
-        }
-
-        // Pattern 3: OI dropping + price dropping = longs being liquidated → more drops
-        if (oiDrop && priceMoveLastH < -0.01) {
-            earlyType = PumpType.PUMP_DOWN;
-            earlyStrength = 0.40;
-            flags.add("EARLY_LIQ_CASCADE");
-            flags.add("OI_DROP=" + String.format("%.1f%%", snapshot.oiChangePct));
-        }
-
-        // Pattern 4: OI dropping + price rising = shorts being liquidated → more pump
-        if (oiDrop && priceMoveLastH > 0.01) {
-            earlyType = PumpType.PUMP_UP;
-            earlyStrength = 0.40;
-            flags.add("EARLY_SHORT_LIQ");
-        }
-
-        if (earlyType == PumpType.NONE) return null;
-
-        return new PumpEvent(symbol, earlyType, earlyStrength, priceMoveLastH,
-                1.0, 0, false, flags);
+        return sum / period;
     }
 
     private double averageVolume(List<com.bot.TradingCore.Candle> candles, int lookback) {
@@ -694,52 +569,15 @@ public final class PumpHunter {
         return history != null ? new ArrayList<>(history) : List.of();
     }
 
-    /**
-     * [v20.0] Returns true if a sell climax was recently detected on this symbol.
-     * When active, SHORT signals should be blocked — the dump has likely exhausted
-     * and a reversal (bounce) is expected.
-     */
-    public boolean isSellClimaxActive(String symbol) {
-        Long climaxTime = sellClimaxTime.get(symbol);
-        if (climaxTime == null) return false;
-        return System.currentTimeMillis() - climaxTime < SELL_CLIMAX_BLOCK_MS;
-    }
-
-    /**
-     * [v20.0] Returns true if a buy climax was recently detected on this symbol.
-     * When active, LONG signals should be blocked.
-     */
-    public boolean isBuyClimaxActive(String symbol) {
-        Long climaxTime = buyClimaxTime.get(symbol);
-        if (climaxTime == null) return false;
-        return System.currentTimeMillis() - climaxTime < SELL_CLIMAX_BLOCK_MS;
-    }
-
-    /**
-     * [v20.0] Returns the mode for a symbol based on climax detection.
-     * "LONG_ONLY" = sell climax active (SHORT blocked)
-     * "SHORT_ONLY" = buy climax active (LONG blocked)
-     * "NORMAL" = no climax active
-     */
-    public String getClimaxMode(String symbol) {
-        if (isSellClimaxActive(symbol)) return "LONG_ONLY";
-        if (isBuyClimaxActive(symbol)) return "SHORT_ONLY";
-        return "NORMAL";
-    }
-
     public void clearSymbol(String symbol) {
         lastPumpTime.remove(symbol);
         recentPumps.remove(symbol);
         pumpHistory.remove(symbol);
-        sellClimaxTime.remove(symbol);
-        buyClimaxTime.remove(symbol);
     }
 
     public void clearAll() {
         lastPumpTime.clear();
         recentPumps.clear();
         pumpHistory.clear();
-        sellClimaxTime.clear();
-        buyClimaxTime.clear();
     }
 }

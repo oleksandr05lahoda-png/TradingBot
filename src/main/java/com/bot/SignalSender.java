@@ -304,8 +304,6 @@ public final class SignalSender {
         this.decisionEngine.setGIC(this.gic);
         // [v14.0 FIX #Forecast] Wire ForecastEngine so TradeIdea.forecast is not always null.
         this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
-        // [v20.0] Wire SignalOptimizer for early BOS reversal detection
-        this.decisionEngine.setSignalOptimizer(this.optimizer);
         this.optimizer.setPumpHunter(this.pumpHunter);
 
         int poolSize = Math.max(6, Math.min(TOP_N / 4, 25));
@@ -1045,11 +1043,10 @@ public final class SignalSender {
         if (newStop == oldStop) return idea;
         List<String> nf = new ArrayList<>(idea.flags);
         nf.add("SL_ADJ");
-        // [v20.1 FIX] Preserve forecast data when adjusting stop
         return new com.bot.DecisionEngineMerged.TradeIdea(
                 idea.symbol, idea.side, idea.price, newStop, idea.take, idea.rr,
                 idea.probability, nf, idea.fundingRate, idea.fundingDelta,
-                idea.oiChange, idea.htfBias, idea.category, idea.forecast);
+                idea.oiChange, idea.htfBias, idea.category);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1438,9 +1435,8 @@ public final class SignalSender {
         };
     }
 
-    // [v20.1 FIX] Preserve forecast data when rebuilding TradeIdea
     private com.bot.DecisionEngineMerged.TradeIdea rebuildIdea(com.bot.DecisionEngineMerged.TradeIdea src, double p, List<String> f) {
-        return new com.bot.DecisionEngineMerged.TradeIdea(src.symbol, src.side, src.price, src.stop, src.take, src.rr, p, f, src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category, src.forecast);
+        return new com.bot.DecisionEngineMerged.TradeIdea(src.symbol, src.side, src.price, src.stop, src.take, src.rr, p, f, src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category);
     }
 
     private void logCycleStats() {
@@ -1476,11 +1472,14 @@ public final class SignalSender {
     //  STATIC MATH UTILS
     // ══════════════════════════════════════════════════════════════
 
-    /** [v21.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR.
-     *  Old code used SMA which diverges 15-20% from the correct Wilder's method.
-     *  This caused stop distances, early tick detection, and profit gates to be miscalculated. */
     public static double atr(List<com.bot.TradingCore.Candle> c, int period) {
-        return com.bot.TradingCore.atr(c, period);
+        if (c == null || c.size() <= period) return 0;
+        double sum = 0;
+        for (int i = c.size() - period; i < c.size(); i++) {
+            com.bot.TradingCore.Candle pr = c.get(i-1), cu = c.get(i);
+            sum += Math.max(cu.high-cu.low, Math.max(Math.abs(cu.high-pr.close), Math.abs(cu.low-pr.close)));
+        }
+        return sum / period;
     }
 
     /** [v10.0] Wilder's RSI (SMMA) — matches DecisionEngine and TradingView */

@@ -643,9 +643,6 @@ public final class GlobalImpulseController {
 
     /**
      * Вычисляет SHORT boost — насколько сильно усиливать шорты при краше.
-     * [v21.0 FIX] Added deceleration detection: when the crash is SLOWING DOWN
-     * (each bar's drop is smaller than previous), reduce the boost aggressively.
-     * This prevents the bot from shorting at the bottom of V-shaped reversals.
      */
     private double computeShortBoost(CascadeLevel level, double crashScore,
                                      double velocity, double accel) {
@@ -659,42 +656,12 @@ public final class GlobalImpulseController {
             case NONE   -> boost = 1.00;
         }
 
-        // [v21.0] DECELERATION DETECTION — the key fix
-        // If crash is DECELERATING (each bar's move is smaller than previous),
-        // the dump is running out of steam → reduce SHORT boost significantly.
-        // This is the #1 reason the old bot shorted at bottoms.
-        boolean decelerating = false;
-        if (btcMoveHistory.size() >= 3) {
-            List<Double> moves = new ArrayList<>(btcMoveHistory);
-            int sz = moves.size();
-            // Last 3 bars: are the negative moves getting smaller?
-            double m1 = Math.abs(moves.get(sz - 1));
-            double m2 = Math.abs(moves.get(sz - 2));
-            double m3 = Math.abs(moves.get(sz - 3));
-            // All negative (crash), but each smaller = decelerating
-            if (moves.get(sz - 1) < 0 && moves.get(sz - 2) < 0 && moves.get(sz - 3) < 0) {
-                if (m1 < m2 && m2 < m3) {
-                    decelerating = true;
-                }
-                // Also check: if current bar is much smaller than the peak bar
-                if (m1 < m3 * 0.40) {
-                    decelerating = true;
-                }
-            }
-        }
+        // Дополнительный boost за acceleration
+        if (accel > 0.008) boost = Math.min(boost * 1.20, 1.90);
+        else if (accel > 0.003) boost = Math.min(boost * 1.10, 1.90);
 
-        if (decelerating) {
-            // Crash is slowing down — halve the boost, minimum 1.0
-            boost = Math.max(1.0, boost * 0.55);
-            // Don't add acceleration bonus when decelerating
-        } else {
-            // Дополнительный boost за acceleration (only when NOT decelerating)
-            if (accel > 0.008) boost = Math.min(boost * 1.20, 1.90);
-            else if (accel > 0.003) boost = Math.min(boost * 1.10, 1.90);
-        }
-
-        // Быстрые данные подтверждают (but NOT if decelerating)
-        if (!decelerating && !isFastDataStale() && btcFastMomentum < -0.015) {
+        // Быстрые данные подтверждают
+        if (!isFastDataStale() && btcFastMomentum < -0.015) {
             boost = Math.min(boost * 1.10, 1.90);
         }
 
@@ -1153,60 +1120,6 @@ public final class GlobalImpulseController {
      * для boost SHORT score РАНЬШЕ, чем истощение покажут осцилляторы.
      */
     public double getBtcMomentumAccel() { return btcMomentumAccel; }
-
-    /**
-     * [v20.0] Returns true if BTC drop momentum is DECELERATING.
-     * When crash velocity is slowing down, we should NOT aggressively short —
-     * the dump is running out of fuel.
-     * Used by DecisionEngineMerged to respect exhaustion signals during crashes.
-     */
-    public boolean isCrashDecelerating() {
-        GlobalContext ctx = currentContext;
-        // If BTC was dropping but velocity is now declining = deceleration
-        boolean velocityDeclining = ctx.btcDropVelocity < VELOCITY_WATCH;
-        boolean bearBarsNotExtending = ctx.btcConsecutiveBearBars <= 2;
-        boolean crashScoreNotExtreme = ctx.btcCrashScore < 0.80;
-        // Deceleration = at least 2 out of 3 conditions
-        int decelerationSignals = 0;
-        if (velocityDeclining) decelerationSignals++;
-        if (bearBarsNotExtending) decelerationSignals++;
-        if (crashScoreNotExtreme) decelerationSignals++;
-        return decelerationSignals >= 2;
-    }
-
-
-    /**
-     * [v20.0] Adjusted filter weight that considers how far price is from EMA.
-     * If price is deeply overextended in the direction we want to trade,
-     * we dampen the boost to prevent shorting bottoms / buying tops.
-     *
-     * @param distFromEmaPct (price - ema21) / ema21. Negative = price below EMA.
-     */
-    public double getFilterWeightWithOverextension(String symbol, boolean isLong,
-                                                   double relStrength, String sectorName, double distFromEmaPct) {
-        double baseWeight = getFilterWeight(symbol, isLong, relStrength, sectorName);
-
-        // Only dampen when trend-following into overextension
-        if (!isLong && distFromEmaPct < -0.015) {
-            // SHORT when price is far below EMA — dampen the boost
-            double overextension = Math.abs(distFromEmaPct) - 0.015;
-            double dampFactor = Math.max(0.20, 1.0 - overextension * 15.0);
-            // At 2% below EMA: dampFactor = 1 - 0.005*15 = 0.925 (mild)
-            // At 3% below EMA: dampFactor = 1 - 0.015*15 = 0.775 (moderate)
-            // At 5% below EMA: dampFactor = 1 - 0.035*15 = 0.475 (strong)
-            baseWeight *= dampFactor;
-            if (baseWeight < 0.20) baseWeight = 0.20;
-        }
-        if (isLong && distFromEmaPct > 0.015) {
-            // LONG when price is far above EMA — dampen the boost
-            double overextension = distFromEmaPct - 0.015;
-            double dampFactor = Math.max(0.20, 1.0 - overextension * 15.0);
-            baseWeight *= dampFactor;
-            if (baseWeight < 0.20) baseWeight = 0.20;
-        }
-
-        return clamp(baseWeight, 0.0, 1.90);
-    }
 
     public String getStats() {
         GlobalContext ctx = currentContext;

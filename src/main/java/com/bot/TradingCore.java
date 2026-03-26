@@ -5,7 +5,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════════╗
- * ║       TradingCore v22.0 — ADAPTIVE QUANT FOUNDATION                      ║
+ * ║       TradingCore v15.0 — INSTITUTIONAL QUANT + FORECASTING FOUNDATION      ║
  * ╠══════════════════════════════════════════════════════════════════════════════╣
  * ║                                                                              ║
  * ║  v15.0 CRITICAL FIXES:                                                       ║
@@ -35,235 +35,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class TradingCore {
 
     private TradingCore() {}
-
-    /* ════════════════════════════════════════════════════════════════
-       [v22.0 NEW] ADAPTIVE CONFIG — Self-Tuning Threshold System
-
-       PROBLEM (Gemini critique): 200+ hardcoded magic numbers (0.55, 1.80, 0.35...)
-       perfectly describe past data but break when market microstructure changes.
-
-       SOLUTION: Centralized config with Bayesian self-tuning.
-       Every threshold starts at a reasonable default and adjusts based on
-       actual signal accuracy over time. This replaces brittle overfitting
-       with continuous online learning.
-
-       Usage: Instead of hardcoded `mctx.s(0.55)`, use
-       `config.getScore("STRUCTURE_HH_HL")` which returns a value that
-       ADAPTS based on how often that signal led to winning trades.
-       ════════════════════════════════════════════════════════════════ */
-
-    public static final class AdaptiveConfig {
-
-        // Threshold registry: name → [value, wins, total, lastUpdate]
-        private final java.util.concurrent.ConcurrentHashMap<String, double[]> thresholds
-                = new java.util.concurrent.ConcurrentHashMap<>();
-
-        // Global regime multiplier (set by market volatility)
-        private volatile double regimeMultiplier = 1.0;
-
-        // Learning rate — how fast thresholds adapt (lower = more stable)
-        private static final double LEARNING_RATE = 0.05;
-        private static final int MIN_SAMPLES_FOR_ADAPTATION = 15;
-        private static final double MIN_THRESHOLD = 0.10;
-        private static final double MAX_THRESHOLD = 0.90;
-
-        public AdaptiveConfig() {
-            initDefaults();
-        }
-
-        private void initDefaults() {
-            // Structure cluster scores
-            reg("STRUCTURE_HH_HL",     0.55);
-            reg("STRUCTURE_FVG",       0.50);
-            reg("STRUCTURE_OB",        0.52);
-            reg("STRUCTURE_LIQ_SWEEP", 0.58);
-            reg("STRUCTURE_BOOST",     0.18);
-
-            // Momentum cluster scores
-            reg("MOMENTUM_ANTI_LAG",   0.65);
-            reg("MOMENTUM_IMPULSE",    0.50);
-            reg("MOMENTUM_PULLBACK",   0.55);
-            reg("MOMENTUM_PUMP",       0.55);
-            reg("MOMENTUM_COMPRESSION",0.58);
-            reg("MOMENTUM_CLIMAX_REV", 0.65);
-
-            // Volume cluster scores
-            reg("VOLUME_DELTA",        0.55);
-            reg("VOLUME_SPIKE",        0.22);
-
-            // HTF cluster scores
-            reg("HTF_1H",             0.60);
-            reg("HTF_2H",             0.55);
-            reg("HTF_AGREE_BONUS",    0.30);
-            reg("HTF_VWAP",           0.18);
-
-            // Derivatives cluster scores
-            reg("DERIV_FR_NEG",       0.45);
-            reg("DERIV_FR_POS",       0.40);
-            reg("DERIV_OI",           0.25);
-            reg("DERIV_DIV",          0.60);
-
-            // Early reversal
-            reg("EARLY_REVERSAL",     0.70);
-
-            // Decision thresholds
-            reg("MIN_SCORE_DIFF_TREND",  0.16);
-            reg("MIN_SCORE_DIFF_RANGE",  0.28);
-            reg("MIN_SCORE_DIFF_WEAK",   0.20);
-            reg("DYN_THRESH_TREND",      0.68);
-            reg("DYN_THRESH_NORMAL",     0.58);
-
-            // Exhaustion multipliers
-            reg("EXHAUST_PENALTY",     0.35);
-            reg("EXHAUST_HARD_PENALTY",0.12);
-
-            // Confidence parameters
-            reg("CONF_CLUSTER_BONUS_6", 0.14);
-            reg("CONF_CLUSTER_BONUS_5", 0.12);
-            reg("CONF_CLUSTER_BONUS_4", 0.08);
-            reg("CONF_CLUSTER_BONUS_3", 0.04);
-            reg("CONF_RANGE_BASE",     22.0);
-            reg("CONF_CLUSTER_MULT",    3.5);
-
-            // Risk management
-            reg("RUBBER_BAND_THR",     0.015);
-            reg("STOP_CAP_PCT",        0.030);
-        }
-
-        private void reg(String name, double defaultValue) {
-            // [value, wins, total, lastUpdateMs]
-            thresholds.put(name, new double[]{ defaultValue, 0, 0, System.currentTimeMillis() });
-        }
-
-        /** Get current (possibly adapted) value for a threshold */
-        public double get(String name) {
-            double[] data = thresholds.get(name);
-            if (data == null) return 0.5; // safe fallback
-            return data[0] * regimeMultiplier;
-        }
-
-        /** Get raw value without regime multiplier (for non-score thresholds) */
-        public double getRaw(String name) {
-            double[] data = thresholds.get(name);
-            return data != null ? data[0] : 0.5;
-        }
-
-        /** Get score for cluster analysis, scaled by market context */
-        public double getScore(String name, double marketScaleFactor) {
-            return get(name) * marketScaleFactor;
-        }
-
-        /**
-         * BAYESIAN UPDATE: After a trade closes, report whether this signal
-         * pattern was correct. The threshold adapts towards more accurate values.
-         *
-         * If a signal with STRUCTURE_HH_HL = 0.55 keeps winning,
-         * the score INCREASES (we trust it more).
-         * If it keeps losing, the score DECREASES.
-         *
-         * This is how we escape the "magic number" trap — numbers evolve.
-         */
-        public void reportOutcome(String name, boolean win) {
-            double[] data = thresholds.get(name);
-            if (data == null) return;
-
-            synchronized (data) {
-                data[1] += win ? 1 : 0; // wins
-                data[2] += 1;            // total
-                data[3] = System.currentTimeMillis();
-
-                // Only adapt after enough samples
-                if (data[2] >= MIN_SAMPLES_FOR_ADAPTATION) {
-                    double winRate = data[1] / data[2];
-                    double currentValue = data[0];
-
-                    // Bayesian-style update:
-                    // If winRate > 0.55 (profitable), INCREASE the score (trust this signal more)
-                    // If winRate < 0.45 (unprofitable), DECREASE the score
-                    // In between: no change (insufficient evidence)
-                    double adjustment = 0;
-                    if (winRate > 0.55) {
-                        adjustment = LEARNING_RATE * (winRate - 0.50);
-                    } else if (winRate < 0.45) {
-                        adjustment = LEARNING_RATE * (winRate - 0.50); // negative
-                    }
-
-                    data[0] = clamp(currentValue + adjustment, MIN_THRESHOLD, MAX_THRESHOLD);
-                }
-
-                // Decay old data (forget samples > 500 trades ago)
-                if (data[2] > 500) {
-                    data[1] *= 0.95;
-                    data[2] *= 0.95;
-                }
-            }
-        }
-
-        /** Update regime multiplier based on current market volatility.
-         *  Called by DecisionEngineMerged when building MarketContext. */
-        public void updateRegime(double atrMultiplier) {
-            // In low-vol: scores should be lower (less confident signals)
-            // In high-vol: scores should be higher (clearer signals)
-            regimeMultiplier = clamp(1.0 / Math.sqrt(Math.max(0.3, atrMultiplier)), 0.65, 1.45);
-        }
-
-        /** Get stats string for logging */
-        public String getAdaptationStats() {
-            int adapted = 0;
-            for (double[] d : thresholds.values()) {
-                if (d[2] >= MIN_SAMPLES_FOR_ADAPTATION) adapted++;
-            }
-            return String.format("Adapted: %d/%d thresholds", adapted, thresholds.size());
-        }
-
-        /** Reset all adaptations (e.g., after major code change) */
-        public void resetAdaptations() {
-            for (double[] d : thresholds.values()) {
-                d[1] = 0; d[2] = 0;
-            }
-        }
-
-        // ── Session/regime-aware fields (used by DecisionEngineMerged) ──
-        private volatile double sessionMult = 1.0;
-        private volatile double recentAccuracy = 0.55;
-        private volatile double volPercentile = 0.5;
-
-        /** Constructor used by DecisionEngineMerged for per-cycle config */
-        public AdaptiveConfig(double volPercentile, MarketRegime regime,
-                              double recentAccuracy, TradingSession session) {
-            initDefaults();
-            this.volPercentile = clamp(volPercentile, 0, 1);
-            this.recentAccuracy = clamp(recentAccuracy, 0.3, 0.8);
-            this.sessionMult = session != null ? session.confidenceMultiplier : 1.0;
-            if (regime != null) updateRegimeFromEnum(regime);
-        }
-
-        private void updateRegimeFromEnum(MarketRegime regime) {
-            double mult = switch (regime) {
-                case STRONG_TREND_UP, STRONG_TREND_DOWN -> 0.92;
-                case WEAK_TREND_UP, WEAK_TREND_DOWN -> 1.0;
-                case RANGE_BOUND -> 1.08;
-                case VOLATILE_CHOP -> 1.18;
-                default -> 1.0;
-            };
-            regimeMultiplier = mult;
-        }
-
-        public double getSessionMult() { return sessionMult; }
-        public double getRecentAccuracy() { return recentAccuracy; }
-        public double getVolPercentile() { return volPercentile; }
-        public MarketRegime getRegime() { return null; } // not stored, use updateRegime()
-
-        /** Called each cycle to update session and accuracy context on the singleton */
-        public void updatePerCycle(double volPct, double accuracy, TradingSession session) {
-            this.volPercentile = clamp(volPct, 0, 1);
-            this.recentAccuracy = clamp(accuracy, 0.3, 0.8);
-            this.sessionMult = session != null ? session.confidenceMultiplier : 1.0;
-        }
-    }
-
-    // Global singleton config — shared across all components
-    public static final AdaptiveConfig CONFIG = new AdaptiveConfig();
 
     /* ════════════════════════════════════════════════════════════════
        CANDLE — immutable price bar
@@ -1434,104 +1205,6 @@ public final class TradingCore {
         return new RegimeResult(regime, clamp(confidence, 0.1, 0.95), trendDir, volPercentile, hurstVal);
     }
 
-
-    /* ════════════════════════════════════════════════════════════════
-       [v22.0] BAYESIAN EVIDENCE SCORER
-
-       PROBLEM (Gemini critique): Linear score addition (0.50 + 0.18 + 0.22)
-       doesn't model non-linear markets. 3 weak signals ≠ 1 strong signal.
-
-       SOLUTION: Each cluster provides a LIKELIHOOD RATIO, not a score.
-       LR > 1 = evidence FOR direction. LR < 1 = evidence AGAINST.
-
-       P(signal correct | evidence) = P(prior) * LR1 * LR2 * ... / Z
-
-       This gives a PROPER posterior probability, not an arbitrary sum.
-       A single strong confirmation (LR=3.0) is worth more than
-       five weak ones (LR=1.1^5 = 1.6).
-       ════════════════════════════════════════════════════════════════ */
-
-    public static final class BayesianScorer {
-        private final double priorWinRate;
-
-        public BayesianScorer(double priorWinRate) {
-            this.priorWinRate = clamp(priorWinRate, 0.35, 0.70);
-        }
-
-        /** Default: assume 50% base rate (no edge) */
-        public BayesianScorer() { this(0.50); }
-
-        /**
-         * Convert a cluster score [0..1] into a likelihood ratio.
-         * score=0 → LR=0.5 (evidence against), score=0.5 → LR=1.0 (neutral),
-         * score=0.75 → LR=2.0 (moderate evidence for), score=1.0 → LR=4.0 (strong)
-         */
-        public double scoreToLR(double score) {
-            if (score <= 0) return 0.5;
-            // Exponential mapping: avoids the linear trap
-            // score 0.3 → LR 0.8, score 0.5 → LR 1.3, score 0.7 → LR 2.2, score 0.9 → LR 3.5
-            return Math.exp((score - 0.35) * 2.5);
-        }
-
-        /**
-         * Combine multiple likelihood ratios into a posterior probability.
-         * Uses log-odds for numerical stability.
-         *
-         * @param longLRs likelihood ratios for LONG from each cluster
-         * @param shortLRs likelihood ratios for SHORT from each cluster
-         * @return [posteriorLong, posteriorShort, confidence] in [0,1]
-         */
-        public double[] computePosterior(double[] longLRs, double[] shortLRs) {
-            // Convert prior to log-odds
-            double logOddsPrior = Math.log(priorWinRate / (1 - priorWinRate));
-
-            // Accumulate evidence for LONG
-            double logOddsLong = logOddsPrior;
-            for (double lr : longLRs) {
-                if (lr > 0.01) logOddsLong += Math.log(lr);
-            }
-            // Cap to prevent overflow (max ~95% probability)
-            logOddsLong = clamp(logOddsLong, -3.0, 3.0);
-
-            // Same for SHORT
-            double logOddsShort = logOddsPrior;
-            for (double lr : shortLRs) {
-                if (lr > 0.01) logOddsShort += Math.log(lr);
-            }
-            logOddsShort = clamp(logOddsShort, -3.0, 3.0);
-
-            // Convert back to probabilities
-            double pLong  = 1.0 / (1.0 + Math.exp(-logOddsLong));
-            double pShort = 1.0 / (1.0 + Math.exp(-logOddsShort));
-
-            // Confidence = how far the stronger side is from 50%
-            double maxP = Math.max(pLong, pShort);
-            double confidence = (maxP - 0.5) * 2.0; // 0..1
-
-            return new double[]{ pLong, pShort, confidence };
-        }
-
-        /**
-         * Calibrate a raw probability using historical accuracy.
-         * Uses Platt scaling: calibrated = 1 / (1 + exp(A*raw + B))
-         * where A and B are fit from historical predictions vs outcomes.
-         *
-         * Simplified version: if historical accuracy < predicted, scale down.
-         */
-        public double calibrate(double rawProbability, double historicalAccuracy, int sampleSize) {
-            if (sampleSize < 15) return rawProbability; // Not enough data
-
-            // Platt scaling simplified: blend raw with historical accuracy
-            // Weight of historical data increases with sample size
-            double weight = Math.min(0.5, sampleSize / 100.0);
-            double calibrated = rawProbability * (1 - weight) + historicalAccuracy * 100 * weight;
-
-            // Never claim more than 82% (markets are too uncertain)
-            // Never claim less than 50% (otherwise why signal?)
-            return clamp(calibrated, 50, 82);
-        }
-    }
-
     /* ════════════════════════════════════════════════════════════════
        RISK ENGINE
        ════════════════════════════════════════════════════════════════ */
@@ -1708,301 +1381,6 @@ public final class TradingCore {
     public static boolean valid(List<?> c, int minBars)          { return c != null && c.size() >= minBars; }
 
     /* ════════════════════════════════════════════════════════════════
-       [v21.0 NEW] SESSION DETECTION
-       Markets have distinct sessions with different characteristics.
-       Asia:  00:00-08:00 UTC — low liquidity, false breakouts, tight ranges
-       London: 08:00-12:00 UTC — real moves begin, liquidity sweeps, volatility
-       NY:    13:00-21:00 UTC — max volatility, trends, institutional flow
-       LondonClose: 15:00-17:00 UTC — reversals, profit taking
-       DeadZone: 21:00-00:00 UTC — low volume, avoid
-       ════════════════════════════════════════════════════════════════ */
-
-    public enum TradingSession {
-        ASIA(0.65, false, "Asia — low liquidity, false breakouts common"),
-        LONDON_OPEN(1.15, true, "London Open — sweeps & real moves begin"),
-        LONDON(1.05, true, "London — trending, good liquidity"),
-        NY_OPEN(1.20, true, "NY Open — max volatility, best entries"),
-        NY(1.10, true, "NY — strong trends, institutional flow"),
-        LONDON_CLOSE(0.85, true, "London Close — reversals, profit taking"),
-        NY_CLOSE(0.80, false, "NY Close — winding down"),
-        DEAD_ZONE(0.50, false, "Dead Zone — avoid trading");
-
-        public final double confidenceMultiplier;
-        public final boolean isActiveTradingSession;
-        public final String description;
-
-        TradingSession(double confMult, boolean active, String desc) {
-            this.confidenceMultiplier = confMult;
-            this.isActiveTradingSession = active;
-            this.description = desc;
-        }
-    }
-
-    public static TradingSession detectSession(long utcMillis) {
-        java.time.ZonedDateTime utc = java.time.Instant.ofEpochMilli(utcMillis)
-                .atZone(java.time.ZoneId.of("UTC"));
-        int h = utc.getHour();
-        int m = utc.getMinute();
-        double hm = h + m / 60.0;
-
-        if (hm >= 0 && hm < 7.5)    return TradingSession.ASIA;
-        if (hm >= 7.5 && hm < 9.5)  return TradingSession.LONDON_OPEN;
-        if (hm >= 9.5 && hm < 13)   return TradingSession.LONDON;
-        if (hm >= 13 && hm < 14.5)  return TradingSession.NY_OPEN;
-        if (hm >= 14.5 && hm < 15)  return TradingSession.NY;
-        if (hm >= 15 && hm < 17)    return TradingSession.LONDON_CLOSE;
-        if (hm >= 17 && hm < 21)    return TradingSession.NY_CLOSE;
-        return TradingSession.DEAD_ZONE; // 21:00-00:00
-    }
-
-    public static TradingSession detectCurrentSession() {
-        return detectSession(System.currentTimeMillis());
-    }
-
-    /** Should this session be treated as low-quality for signal generation? */
-    public static boolean isLowQualitySession() {
-        TradingSession s = detectCurrentSession();
-        return s == TradingSession.ASIA || s == TradingSession.DEAD_ZONE;
-    }
-
-    /* ════════════════════════════════════════════════════════════════
-       [v21.0 NEW] FAIR VALUE GAP (FVG) DETECTOR — institutional footprints
-       FVG = gap between candle[i-2].high and candle[i].low (bullish)
-       or candle[i-2].low and candle[i].high (bearish).
-       Price tends to fill FVGs, making them magnets.
-       ════════════════════════════════════════════════════════════════ */
-
-    public static final class FairValueGap {
-        public final double top, bottom;
-        public final boolean isBullish;
-        public final int formationBar;
-        public final double gapSize;
-
-        public FairValueGap(double top, double bottom, boolean bullish, int bar) {
-            this.top = top; this.bottom = bottom;
-            this.isBullish = bullish; this.formationBar = bar;
-            this.gapSize = top - bottom;
-        }
-
-        public boolean isFilled(double price) {
-            return isBullish ? price <= bottom : price >= top;
-        }
-
-        public boolean isPriceInGap(double price) {
-            return price >= bottom && price <= top;
-        }
-
-        public double midpoint() { return (top + bottom) / 2.0; }
-    }
-
-    public static List<FairValueGap> detectFairValueGaps(List<Candle> candles, int lookback) {
-        List<FairValueGap> gaps = new ArrayList<>();
-        if (candles == null || candles.size() < lookback + 3) return gaps;
-        int n = candles.size();
-        int start = Math.max(2, n - lookback);
-        double currentPrice = candles.get(n - 1).close;
-
-        for (int i = start; i < n; i++) {
-            Candle c0 = candles.get(i - 2);
-            Candle c2 = candles.get(i);
-
-            // Bullish FVG: c0.high < c2.low → gap up
-            if (c0.high < c2.low) {
-                FairValueGap fvg = new FairValueGap(c2.low, c0.high, true, i);
-                // Only include unfilled gaps
-                boolean filled = false;
-                for (int j = i + 1; j < n; j++) {
-                    if (candles.get(j).low <= c0.high) { filled = true; break; }
-                }
-                if (!filled) gaps.add(fvg);
-            }
-
-            // Bearish FVG: c0.low > c2.high → gap down
-            if (c0.low > c2.high) {
-                FairValueGap fvg = new FairValueGap(c0.low, c2.high, false, i);
-                boolean filled = false;
-                for (int j = i + 1; j < n; j++) {
-                    if (candles.get(j).high >= c0.low) { filled = true; break; }
-                }
-                if (!filled) gaps.add(fvg);
-            }
-        }
-        return gaps;
-    }
-
-    /* ════════════════════════════════════════════════════════════════
-       [v21.0 NEW] CHANGE OF CHARACTER (CHoCH) DETECTOR
-       CHoCH = first sign of trend reversal.
-       In uptrend: price makes a lower low (breaks the last higher low)
-       In downtrend: price makes a higher high (breaks the last lower high)
-       This is THE earliest structural reversal signal.
-       ════════════════════════════════════════════════════════════════ */
-
-    public static final class CHoCHResult {
-        public final boolean detected;
-        public final boolean bullishReversal; // true = bearish→bullish, false = bullish→bearish
-        public final double level; // price level where CHoCH occurred
-        public final int barIndex;
-        public final double strength; // 0..1
-
-        public CHoCHResult(boolean detected, boolean bullish, double level, int bar, double strength) {
-            this.detected = detected; this.bullishReversal = bullish;
-            this.level = level; this.barIndex = bar; this.strength = strength;
-        }
-    }
-
-    public static CHoCHResult detectCHoCH(List<Candle> candles, int lookback) {
-        if (candles == null || candles.size() < lookback + 5)
-            return new CHoCHResult(false, false, 0, -1, 0);
-
-        int n = candles.size();
-        double atr14 = atr(candles, 14);
-
-        // Find last 3 swing highs and lows using pivot detection
-        int pivotStr = 3;
-        List<double[]> highs = new ArrayList<>();
-        List<double[]> lows = new ArrayList<>();
-
-        for (int i = pivotStr; i < n - pivotStr; i++) {
-            boolean isHigh = true, isLow = true;
-            for (int j = 1; j <= pivotStr; j++) {
-                if (candles.get(i).high <= candles.get(i - j).high || candles.get(i).high <= candles.get(i + j).high) isHigh = false;
-                if (candles.get(i).low >= candles.get(i - j).low || candles.get(i).low >= candles.get(i + j).low) isLow = false;
-            }
-            if (isHigh) highs.add(new double[]{candles.get(i).high, i});
-            if (isLow) lows.add(new double[]{candles.get(i).low, i});
-        }
-
-        if (highs.size() < 3 || lows.size() < 3)
-            return new CHoCHResult(false, false, 0, -1, 0);
-
-        double price = candles.get(n - 1).close;
-
-        // Check for bullish CHoCH: was in downtrend (LH/LL), now making HH
-        double lastHigh = highs.get(highs.size() - 1)[0];
-        double prevHigh = highs.get(highs.size() - 2)[0];
-        double prevPrevHigh = highs.get(highs.size() - 3)[0];
-
-        double lastLow = lows.get(lows.size() - 1)[0];
-        double prevLow = lows.get(lows.size() - 2)[0];
-
-        // Was bearish (LH pattern): prevPrevHigh > prevHigh
-        // Now bullish break: lastHigh > prevHigh OR current price > prevHigh
-        boolean wasBearish = prevPrevHigh > prevHigh;
-        boolean bullishBreak = wasBearish && (lastHigh > prevHigh || price > prevHigh);
-
-        if (bullishBreak) {
-            double strength = clamp(Math.abs(price - prevHigh) / (atr14 + 1e-10) * 0.5, 0.2, 0.95);
-            return new CHoCHResult(true, true, prevHigh, (int) highs.get(highs.size() - 1)[1], strength);
-        }
-
-        // Check for bearish CHoCH: was in uptrend (HH/HL), now making LL
-        boolean wasBullish = prevLow > lows.get(lows.size() - 3)[0];
-        boolean bearishBreak = wasBullish && (lastLow < prevLow || price < prevLow);
-
-        if (bearishBreak) {
-            double strength = clamp(Math.abs(price - prevLow) / (atr14 + 1e-10) * 0.5, 0.2, 0.95);
-            return new CHoCHResult(true, false, prevLow, (int) lows.get(lows.size() - 1)[1], strength);
-        }
-
-        return new CHoCHResult(false, false, 0, -1, 0);
-    }
-
-    /* ════════════════════════════════════════════════════════════════
-       [v21.0 NEW] LIQUIDATION LEVEL ESTIMATOR
-       On futures, clusters of liquidations act as price magnets.
-       This estimates where liquidation clusters likely are based on
-       recent swing highs/lows + common leverage levels (5x, 10x, 20x, 25x).
-       ════════════════════════════════════════════════════════════════ */
-
-    public static final class LiquidationCluster {
-        public final double priceLevel;
-        public final String description;
-        public final double magnetStrength; // 0..1 — how strong the pull
-
-        public LiquidationCluster(double price, String desc, double strength) {
-            this.priceLevel = price; this.description = desc; this.magnetStrength = strength;
-        }
-    }
-
-    public static List<LiquidationCluster> estimateLiquidationLevels(
-            List<Candle> candles, double currentPrice) {
-        List<LiquidationCluster> clusters = new ArrayList<>();
-        if (candles == null || candles.size() < 50) return clusters;
-
-        // Find recent swing highs and lows
-        SwingStructureResult ss = analyzeSwingStructure(candles, 3);
-        double swHigh = ss.lastSwingHigh;
-        double swLow = ss.lastSwingLow;
-
-        // Common leverage levels and their liquidation distances
-        int[] leverages = {5, 10, 20, 25};
-        double mmr = 0.004; // maintenance margin rate
-
-        // Longs opened near swing low — their liquidation is below
-        for (int lev : leverages) {
-            double liqBelow = swLow * (1.0 - (1.0 / lev) + mmr);
-            if (liqBelow > 0 && liqBelow < currentPrice) {
-                double dist = Math.abs(currentPrice - liqBelow) / currentPrice;
-                double strength = dist < 0.03 ? 0.8 : dist < 0.05 ? 0.5 : 0.3;
-                clusters.add(new LiquidationCluster(liqBelow,
-                        "Long liq " + lev + "x from swing low", strength));
-            }
-        }
-
-        // Shorts opened near swing high — their liquidation is above
-        for (int lev : leverages) {
-            double liqAbove = swHigh * (1.0 + (1.0 / lev) - mmr);
-            if (liqAbove > currentPrice) {
-                double dist = Math.abs(liqAbove - currentPrice) / currentPrice;
-                double strength = dist < 0.03 ? 0.8 : dist < 0.05 ? 0.5 : 0.3;
-                clusters.add(new LiquidationCluster(liqAbove,
-                        "Short liq " + lev + "x from swing high", strength));
-            }
-        }
-
-        // Sort by proximity to current price
-        clusters.sort(Comparator.comparingDouble(c ->
-                Math.abs(c.priceLevel - currentPrice)));
-
-        return clusters;
-    }
-
-    /* ════════════════════════════════════════════════════════════════
-       [v21.0 NEW] CORRELATION CHECKER
-       Tracks if multiple coins are moving in same direction = correlated risk.
-       ════════════════════════════════════════════════════════════════ */
-
-    public static double estimateCorrelation(List<Candle> c1, List<Candle> c2, int period) {
-        if (c1 == null || c2 == null || c1.size() < period + 1 || c2.size() < period + 1)
-            return 0.85; // Default high correlation for safety
-
-        int n1 = c1.size(), n2 = c2.size();
-        int len = Math.min(period, Math.min(n1 - 1, n2 - 1));
-
-        double[] r1 = new double[len];
-        double[] r2 = new double[len];
-        for (int i = 0; i < len; i++) {
-            r1[i] = Math.log(c1.get(n1 - len + i).close / c1.get(n1 - len + i - 1).close);
-            r2[i] = Math.log(c2.get(n2 - len + i).close / c2.get(n2 - len + i - 1).close);
-        }
-
-        double m1 = 0, m2 = 0;
-        for (int i = 0; i < len; i++) { m1 += r1[i]; m2 += r2[i]; }
-        m1 /= len; m2 /= len;
-
-        double cov = 0, v1 = 0, v2 = 0;
-        for (int i = 0; i < len; i++) {
-            cov += (r1[i] - m1) * (r2[i] - m2);
-            v1 += (r1[i] - m1) * (r1[i] - m1);
-            v2 += (r2[i] - m2) * (r2[i] - m2);
-        }
-
-        double denom = Math.sqrt(v1 * v2);
-        return denom > 1e-12 ? clamp(cov / denom, -1.0, 1.0) : 0.85;
-    }
-
-    /* ════════════════════════════════════════════════════════════════
        [v16.0] FORECAST ENGINE — REVERSAL-AWARE Direction Forecaster
        ════════════════════════════════════════════════════════════════
 
@@ -2121,38 +1499,6 @@ public final class TradingCore {
             exhaustionScore = clamp(exhaustionScore, 0, 1);
             f.put("EXHAUSTION", exhaustionScore);
 
-            // [v21.0] HTF EXHAUSTION CONTEXT — critical fix
-            // Exhaustion on 15m does NOT mean reversal if 1H trend just started.
-            // If 1H is in EARLY phase and aligned with the move → reduce exhaustion weight.
-            if (c1h != null && c1h.size() >= 50 && exhaustionScore > 0.3) {
-                double rsi1h = rsi(c1h, 14);
-                double ema9_1h = fcEma(c1h, 9);
-                double ema21_1h = fcEma(c1h, 21);
-                double ema50_1h = fcEma(c1h, 50);
-                double price1h = c1h.get(c1h.size() - 1).close;
-                MACDResult macd1h = macd(c1h, 12, 26, 9);
-
-                boolean htf1hBullEarly = price1h > ema9_1h && ema9_1h > ema21_1h
-                        && Math.abs(ema9_1h - ema21_1h) < atr(c1h, 14) * 0.5
-                        && rsi1h > 50 && rsi1h < 70
-                        && macd1h.histogram > 0;
-                boolean htf1hBearEarly = price1h < ema9_1h && ema9_1h < ema21_1h
-                        && Math.abs(ema9_1h - ema21_1h) < atr(c1h, 14) * 0.5
-                        && rsi1h < 50 && rsi1h > 30
-                        && macd1h.histogram < 0;
-
-                // If 1H is in early trend AND aligned with the current move → reduce exhaustion
-                if ((move.direction > 0 && htf1hBullEarly) || (move.direction < 0 && htf1hBearEarly)) {
-                    exhaustionScore *= 0.50; // Halve exhaustion — HTF says "still fresh"
-                    f.put("HTF_EXHAUST_OVERRIDE", 1.0);
-                }
-                // If 1H is AGAINST the move → amplify exhaustion
-                if ((move.direction > 0 && htf1hBearEarly) || (move.direction < 0 && htf1hBullEarly)) {
-                    exhaustionScore = Math.min(1.0, exhaustionScore * 1.30);
-                    f.put("HTF_EXHAUST_AMPLIFY", 1.0);
-                }
-            }
-
             // ═══════════════════════════════════════════════════════
             // STEP 3: TREND BRAIN — but weaker voice now
             // ═══════════════════════════════════════════════════════
@@ -2187,27 +1533,10 @@ public final class TradingCore {
             trendDir = clamp(trendDir, -1.0, 1.0);
 
             // ═══════════════════════════════════════════════════════
-            // STEP 4: SQUEEZE detection — [v21.0] IMPROVED: don't block,
-            // instead WAIT for direction and give breakout signal.
-            // Squeeze = lowest volatility → BIGGEST moves come after.
-            // Old code blocked ALL signals during squeeze — wrong!
-            // New: reduce confidence but watch for breakout candle.
+            // STEP 4: SQUEEZE detection — block all direction in compression
             // ═══════════════════════════════════════════════════════
             boolean squeezed = isVolatilitySqueeze(c15, atr14);
             f.put("SQUEEZE", squeezed ? 1.0 : 0.0);
-
-            // [v21.0] Detect breakout FROM squeeze
-            boolean squeezeBreakout = false;
-            if (squeezed && n >= 3) {
-                Candle last = c15.get(n - 1);
-                Candle prev = c15.get(n - 2);
-                // Breakout = current bar body > 1.5x previous bar range
-                double breakoutThreshold = prev.range * 1.5;
-                if (last.body > breakoutThreshold && last.volume > prev.volume * 1.3) {
-                    squeezeBreakout = true;
-                    f.put("SQUEEZE_BREAK", last.isBullish ? 1.0 : -1.0);
-                }
-            }
 
             // ═══════════════════════════════════════════════════════
             // STEP 5: COMBINE — Exhaustion OVERRIDES Trend
@@ -2215,17 +1544,9 @@ public final class TradingCore {
             TrendPhase phase = detectPhase(c15, c1h, move, exhaustionScore);
 
             double dir;
-            if (squeezed && !squeezeBreakout) {
-                // In squeeze WITHOUT breakout: minimal directional conviction
+            if (squeezed) {
+                // In squeeze: no directional conviction at all
                 dir = trendDir * 0.15;
-            } else if (squeezed && squeezeBreakout) {
-                // [v21.0] Squeeze BREAKOUT: strong directional signal!
-                // The breakout candle direction determines the forecast
-                Candle last = c15.get(n - 1);
-                double breakDir = last.isBullish ? 0.65 : -0.65;
-                dir = breakDir * 0.70 + trendDir * 0.30;
-                // Override exhaustion during breakout — fresh energy
-                exhaustionScore = Math.min(exhaustionScore, 0.2);
             } else if (exhaustionScore > 0.50 && exhaustionSignals >= 2) {
                 // [v19.0] STRONG exhaustion: forecast REVERSAL (opposite to current move)
                 // Lowered from 0.55 / 3 signals to make it catch bottoms/tops faster
@@ -2253,11 +1574,8 @@ public final class TradingCore {
             // STEP 6: Confidence = how many signals agree?
             // ═══════════════════════════════════════════════════════
             double conf;
-            if (squeezed && !squeezeBreakout) {
-                conf = 0.18; // Low confidence in unbroken squeeze
-            } else if (squeezed && squeezeBreakout) {
-                // [v21.0] Squeeze breakout = high conviction — energy was coiled
-                conf = clamp(0.55 + Math.abs(dir) * 0.25, 0.50, 0.82);
+            if (squeezed) {
+                conf = 0.15; // Almost zero confidence in squeeze
             } else if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
                 conf = clamp(0.50 + exhaustionScore * 0.30, 0.50, 0.85);
             } else {
@@ -2304,84 +1622,27 @@ public final class TradingCore {
         private MoveInfo identifyCurrentMove(List<Candle> c, double atr) {
             int n = c.size();
             double price = c.get(n - 1).close;
-
-            // [v21.0] IMPROVED: Multi-factor move identification
-            // Old: simple EMA5 crossover — missed Order Blocks, FVG, CHoCH
-            // New: combines EMA cross + swing structure + momentum shift
-
-            // 1) EMA-based direction (kept as baseline)
+            // Walk backwards to find where the current directional move started
+            // A "reversal" = close crosses EMA5 in opposite direction with body > 0.3*ATR
             double ema5 = fcEma(c, 5);
-            double ema13 = fcEma(c, 13);
-            boolean currentBull = price > ema5 && ema5 > ema13;
-            boolean currentBear = price < ema5 && ema5 < ema13;
-            if (!currentBull && !currentBear) {
-                currentBull = price > ema5;
+            boolean currentBull = price > ema5;
+
+            int origin = n - 1;
+            for (int i = n - 2; i >= Math.max(0, n - 30); i--) {
+                boolean barBull = c.get(i).close > fcEma(c.subList(0, i + 1), 5);
+                if (barBull != currentBull) {
+                    origin = i + 1;
+                    break;
+                }
+                origin = i;
             }
 
-            // 2) Find swing points for structural move origin
-            int swingOrigin = -1;
-            double swingPrice = price;
-            // Walk back looking for the most recent significant swing (reversal point)
-            int lookback = Math.min(40, n - 5);
-            if (currentBull) {
-                // In bullish move: find the lowest low (origin)
-                double lowestLow = price;
-                for (int i = n - 2; i >= Math.max(0, n - 1 - lookback); i--) {
-                    if (c.get(i).low < lowestLow) {
-                        lowestLow = c.get(i).low;
-                        swingOrigin = i;
-                        swingPrice = lowestLow;
-                    }
-                    // Stop if we hit a bar that was significantly above current range
-                    // (meaning the move started later)
-                    if (c.get(i).close > price + atr * 0.5) break;
-                    // Stop if we find a gap down followed by reversal (CHoCH)
-                    if (i < n - 3 && c.get(i).close < c.get(i + 1).close
-                            && c.get(i + 1).close < c.get(i + 2).close
-                            && c.get(i + 2).close > c.get(i + 1).close) {
-                        if (swingOrigin < 0) swingOrigin = i;
-                        break;
-                    }
-                }
-            } else {
-                // In bearish move: find the highest high (origin)
-                double highestHigh = price;
-                for (int i = n - 2; i >= Math.max(0, n - 1 - lookback); i--) {
-                    if (c.get(i).high > highestHigh) {
-                        highestHigh = c.get(i).high;
-                        swingOrigin = i;
-                        swingPrice = highestHigh;
-                    }
-                    if (c.get(i).close < price - atr * 0.5) break;
-                    if (i < n - 3 && c.get(i).close > c.get(i + 1).close
-                            && c.get(i + 1).close > c.get(i + 2).close
-                            && c.get(i + 2).close < c.get(i + 1).close) {
-                        if (swingOrigin < 0) swingOrigin = i;
-                        break;
-                    }
-                }
-            }
-
-            // 3) Fallback to EMA-based origin if swing search failed
-            if (swingOrigin < 0) {
-                swingOrigin = n - 1;
-                for (int i = n - 2; i >= Math.max(0, n - 30); i--) {
-                    boolean barBull = c.get(i).close > fcEma(c.subList(0, i + 1), 5);
-                    if (barBull != (price > ema5)) {
-                        swingOrigin = i + 1;
-                        break;
-                    }
-                    swingOrigin = i;
-                }
-                swingPrice = c.get(swingOrigin).close;
-            }
-
-            int age = n - 1 - swingOrigin;
-            double depth = Math.abs(price - swingPrice) / (atr + 1e-12);
+            int age = n - 1 - origin;
+            double depth = Math.abs(price - c.get(origin).close) / (atr + 1e-12);
             int dir = currentBull ? 1 : -1;
             if (age <= 1 && depth < 0.3) dir = 0;
 
-            return new MoveInfo(dir, age, depth, swingOrigin, swingPrice);
+            return new MoveInfo(dir, age, depth, origin, c.get(origin).close);
         }
 
         // ═══════════════════════════════════════════════════════
@@ -2645,12 +1906,16 @@ public final class TradingCore {
             return lo + (mx + 0.5) * bs;
         }
 
-        /** [v21.0 FIX] Wilder's smoothed ATR — matches TradingCore.atr() exactly.
-         *  Old code used SMA which diverges 15-20% from Wilder's method.
-         *  This caused ForecastEngine to miscalculate exhaustion thresholds,
-         *  stop distances, and squeeze detection. */
-        private double fcAtr(List<Candle> c, int period) {
-            return TradingCore.atr(c, period);
+        private double fcAtr(List<Candle> c, int n) {
+            int p = Math.min(n, c.size() - 1);
+            if (p <= 0) return 0;
+            double s = 0;
+            for (int i = c.size() - p; i < c.size(); i++) {
+                Candle cu = c.get(i), pr = c.get(i - 1);
+                s += Math.max(cu.high - cu.low,
+                        Math.max(Math.abs(cu.high - pr.close), Math.abs(cu.low - pr.close)));
+            }
+            return s / p;
         }
 
         private double fcEma(List<Candle> c, int p) {

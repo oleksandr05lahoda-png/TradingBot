@@ -53,30 +53,15 @@ public final class DecisionEngineMerged {
     private com.bot.PumpHunter pumpHunter;
     // [v14.0] ForecastEngine integration
     private volatile com.bot.TradingCore.ForecastEngine forecastEngine = null;
-    // [v20.0] SignalOptimizer reference for early BOS reversal detection
-    private volatile com.bot.SignalOptimizer signalOptimizer = null;
 
     public DecisionEngineMerged() {}
-
-    // [v22.0] Adaptive config and Bayesian scorer — replaces hardcoded magic numbers
-    // [v22.0] Use global CONFIG singleton — accumulates learning data across cycles
-    private volatile com.bot.TradingCore.AdaptiveConfig cfg = com.bot.TradingCore.CONFIG;
-    private final com.bot.TradingCore.BayesianScorer bayesScorer = new com.bot.TradingCore.BayesianScorer(0.52);
 
     // ── Setters ───────────────────────────────────────────────────
     public void setPumpHunter(com.bot.PumpHunter ph) { this.pumpHunter = ph; }
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
-    public void setSignalOptimizer(com.bot.SignalOptimizer so) { this.signalOptimizer = so; }
 
     // [v14.0] Called by SignalSender AFTER ISC.allowSignal() confirms
-    // [v20.1 FIX] Now also commits cooldown and priceMovedEnough state
-    public void confirmSignal(String symbol, com.bot.TradingCore.Side side, double price, long now) {
-        registerSignal(symbol, side, now);
-        commitPriceMoved(symbol, price);
-    }
-
-    // Backward-compatible overload (no price)
     public void confirmSignal(String symbol, com.bot.TradingCore.Side side, long now) {
         registerSignal(symbol, side, now);
     }
@@ -366,49 +351,6 @@ public final class DecisionEngineMerged {
         updateSymbolThreshold(sym);
     }
 
-    /**
-     * [v22.0] Record signal result with PATTERN-SPECIFIC tracking.
-     * This feeds AdaptiveConfig so individual scores self-tune.
-     *
-     * @param flags the signal's flags — tells us which patterns were active
-     */
-    public void recordSignalResultDetailed(String sym, double prob, boolean correct, List<String> flags) {
-        recordSignalResult(sym, prob, correct);
-
-        if (flags == null || flags.isEmpty()) return;
-        com.bot.TradingCore.AdaptiveConfig cfg = com.bot.TradingCore.CONFIG;
-
-        // Map flag names to config keys and report outcomes
-        for (String flag : flags) {
-            if (flag.startsWith("HH_HL") || flag.startsWith("LL_LH"))
-                cfg.reportOutcome("STRUCTURE_HH_HL", correct);
-            else if (flag.startsWith("FVG_"))
-                cfg.reportOutcome("STRUCTURE_FVG", correct);
-            else if (flag.startsWith("OB_"))
-                cfg.reportOutcome("STRUCTURE_OB", correct);
-            else if (flag.startsWith("LIQ_SWEEP"))
-                cfg.reportOutcome("STRUCTURE_LIQ_SWEEP", correct);
-            else if (flag.startsWith("ANTI_LAG"))
-                cfg.reportOutcome("MOMENTUM_ANTI_LAG", correct);
-            else if (flag.startsWith("IMP_"))
-                cfg.reportOutcome("MOMENTUM_IMPULSE", correct);
-            else if (flag.startsWith("PULL_"))
-                cfg.reportOutcome("MOMENTUM_PULLBACK", correct);
-            else if (flag.startsWith("VD_"))
-                cfg.reportOutcome("VOLUME_DELTA", correct);
-            else if (flag.startsWith("1H_"))
-                cfg.reportOutcome("HTF_1H", correct);
-            else if (flag.startsWith("2H_"))
-                cfg.reportOutcome("HTF_2H", correct);
-            else if (flag.startsWith("FR_") || flag.startsWith("OI_"))
-                cfg.reportOutcome("DERIV_FR_NEG", correct);
-            else if (flag.contains("DIV"))
-                cfg.reportOutcome("DERIV_DIV", correct);
-            else if (flag.startsWith("EARLY_"))
-                cfg.reportOutcome("EARLY_REVERSAL", correct);
-        }
-    }
-
     private void updateSymbolThreshold(String sym) {
         Deque<CalibRecord> hist = calibHist.get(sym);
         if (hist == null || hist.size() < 20) return;
@@ -476,35 +418,6 @@ public final class DecisionEngineMerged {
         HTFBias     bias1h = detectBias1H(c1h);
         HTFBias     bias2h = (c2h != null && c2h.size() >= 50) ? detectBias2H(c2h) : HTFBias.NONE;
 
-        // ════════════════════════════════════════════════════════
-        // [v22.0] BUILD ADAPTIVE CONFIG — all thresholds scale with market
-        // Instead of hardcoded 0.55, 0.35 etc, we compute from:
-        //   1. ATR percentile (current vol vs history)
-        //   2. Market regime (trending/range/chop)
-        //   3. Recent accuracy of this symbol's signals
-        //   4. Current trading session quality
-        // ════════════════════════════════════════════════════════
-        double volPercentile = mctx.atrPct > 0 ? com.bot.TradingCore.clamp(
-                (mctx.volMultiplier - 0.5) / 2.0, 0, 1) : 0.5;
-
-        com.bot.TradingCore.MarketRegime mkRegime = com.bot.TradingCore.MarketRegime.RANGE_BOUND;
-        if (state == MarketState.STRONG_TREND) mkRegime = com.bot.TradingCore.MarketRegime.STRONG_TREND_UP;
-        else if (state == MarketState.WEAK_TREND) mkRegime = com.bot.TradingCore.MarketRegime.WEAK_TREND_UP;
-
-        Deque<CalibRecord> symCalib = calibHist.get(symbol);
-        double symAccuracy = 0.55;
-        if (symCalib != null && symCalib.size() >= 15) {
-            long correct = symCalib.stream().filter(r -> r.correct).count();
-            symAccuracy = (double) correct / symCalib.size();
-        }
-
-        com.bot.TradingCore.TradingSession currentSession = com.bot.TradingCore.detectCurrentSession();
-        // [v22.0 FIX] Use the global CONFIG singleton (which accumulates reportOutcome data)
-        // instead of creating a new instance (which would lose all learned adaptations).
-        cfg = com.bot.TradingCore.CONFIG;
-        cfg.updateRegime(mctx.volMultiplier);
-        cfg.updatePerCycle(volPercentile, symAccuracy, currentSession);
-
         adaptGlobalMinConf(state, atr14, price);
 
         if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) return null;
@@ -523,27 +436,6 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // [v20.0] RUBBER BAND FILTER — block trend-following entries
-        // when price is too far from EMA21. After big dumps/pumps,
-        // price is stretched like a rubber band and will snap back.
-        // Entering SHORT at the bottom of a dump = selling the bounce.
-        // ════════════════════════════════════════════════════════
-        double ema21 = ema(c15, 21);
-        double distFromEma = (price - ema21) / (ema21 + 1e-9);
-        // Dynamic threshold based on ATR-normalized volatility
-        double atrPct = atr14 / (price + 1e-9);
-        // Base: 1.5% for normal coins, scale up for volatile ones
-        double rubberBandThreshold = Math.max(cfg.getRaw("RUBBER_BAND_THR"), atrPct * 2.5);
-        // Cap at 4% — beyond that, any continuation entry is suicidal
-        rubberBandThreshold = Math.min(rubberBandThreshold, 0.040);
-
-        boolean rubberBandBlockShort = distFromEma < -rubberBandThreshold;
-        boolean rubberBandBlockLong  = distFromEma >  rubberBandThreshold;
-
-        if (rubberBandBlockShort) lateEntryShort = true;  // reinforce late-entry block
-        if (rubberBandBlockLong)  lateEntryLong  = true;
-
-        // ════════════════════════════════════════════════════════
         //  ИНИЦИАЛИЗАЦИЯ 5 КЛАСТЕРОВ
         // ════════════════════════════════════════════════════════
         ClusterScores cStructure   = new ClusterScores(); // BOS, HH/HL, FVG, OB, LiqSweep
@@ -553,10 +445,6 @@ public final class DecisionEngineMerged {
         ClusterScores cDerivatives = new ClusterScores(); // Funding, OI, Divergences
         ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
         List<String> allFlags = new ArrayList<>();
-
-        // [v20.0] Rubber band flag for diagnostics
-        if (rubberBandBlockShort) allFlags.add("RUBBER_BAND_S" + String.format("%.1f", distFromEma * 100));
-        if (rubberBandBlockLong)  allFlags.add("RUBBER_BAND_L" + String.format("%.1f", distFromEma * 100));
 
         // ════════════════════════════════════════════════════════
         // [CLUSTER 0] BTC CRASH — прямой override, ДО кластеров
@@ -579,33 +467,29 @@ public final class DecisionEngineMerged {
 
         // ════════════════════════════════════════════════════════
         // КЛАСТЕР 1: STRUCTURE
-        // [v22.0] All scores now use AdaptiveConfig — they self-tune
-        // based on actual trade results, escaping the "magic number" trap.
         // ════════════════════════════════════════════════════════
-
-        // cfg already set to CONFIG singleton above (line ~503)
 
         // Market Structure (HH/HL vs LL/LH)
         int structure = marketStructure(c15);
-        if (structure ==  1) cStructure.addLong(mctx.s(cfg.getRaw("STRUCTURE_HH_HL")), "HH_HL");
-        if (structure == -1) cStructure.addShort(mctx.s(cfg.getRaw("STRUCTURE_HH_HL")), "LL_LH");
+        if (structure ==  1) cStructure.addLong(mctx.s(0.55), "HH_HL");
+        if (structure == -1) cStructure.addShort(mctx.s(0.55), "LL_LH");
 
         // BOS functionality deferred to ForecastEngine analysis
 
         // FVG
         FVGResult fvg = detectFVG(c15);
         if (fvg.detected) {
-            if (fvg.isBullish) cStructure.addLong(mctx.s(cfg.getRaw("STRUCTURE_FVG")), "FVG_BULL");
-            else               cStructure.addShort(mctx.s(cfg.getRaw("STRUCTURE_FVG")), "FVG_BEAR");
+            if (fvg.isBullish) cStructure.addLong(mctx.s(0.50), "FVG_BULL");
+            else               cStructure.addShort(mctx.s(0.50), "FVG_BEAR");
         }
 
         // Order Block
         OrderBlockResult ob = detectOrderBlock(c15);
         if (ob.detected) {
             if (ob.isBullish && price <= ob.zone * 1.008)
-                cStructure.addLong(mctx.s(cfg.getRaw("STRUCTURE_OB")), "OB_BULL");
+                cStructure.addLong(mctx.s(0.52), "OB_BULL");
             if (!ob.isBullish && price >= ob.zone * 0.992)
-                cStructure.addShort(mctx.s(cfg.getRaw("STRUCTURE_OB")), "OB_BEAR");
+                cStructure.addShort(mctx.s(0.52), "OB_BEAR");
         }
 
         // Liquidity Sweep
@@ -614,13 +498,13 @@ public final class DecisionEngineMerged {
             com.bot.TradingCore.Candle lc = last(c15);
             double uw = lc.high - Math.max(lc.open, lc.close);
             double lw = Math.min(lc.open, lc.close) - lc.low;
-            if (lw > uw) cStructure.addLong(mctx.s(cfg.getRaw("STRUCTURE_LIQ_SWEEP")), "LIQ_SWEEP_L");
-            else         cStructure.addShort(mctx.s(cfg.getRaw("STRUCTURE_LIQ_SWEEP")), "LIQ_SWEEP_S");
+            if (lw > uw) cStructure.addLong(mctx.s(0.58), "LIQ_SWEEP_L");
+            else         cStructure.addShort(mctx.s(0.58), "LIQ_SWEEP_S");
         }
 
         // Bullish/Bearish structure
-        if (bullishStructure(c15)) cStructure.boostLong(mctx.s(cfg.getRaw("STRUCTURE_BOOST")), null);
-        if (bearishStructure(c15)) cStructure.boostShort(mctx.s(cfg.getRaw("STRUCTURE_BOOST")), null);
+        if (bullishStructure(c15)) cStructure.boostLong(mctx.s(0.18), null);
+        if (bearishStructure(c15)) cStructure.boostShort(mctx.s(0.18), null);
 
         // ════════════════════════════════════════════════════════
         // КЛАСТЕР 2: MOMENTUM
@@ -659,8 +543,8 @@ public final class DecisionEngineMerged {
         // Pullback к EMA21
         boolean pullUp   = pullback(c15, true);
         boolean pullDown = pullback(c15, false);
-        if (pullUp)   cMomentum.addLong(mctx.s(cfg.getRaw("STRUCTURE_HH_HL")), "PULL_UP");
-        if (pullDown) cMomentum.addShort(mctx.s(cfg.getRaw("STRUCTURE_HH_HL")), "PULL_DN");
+        if (pullUp)   cMomentum.addLong(mctx.s(0.55), "PULL_UP");
+        if (pullDown) cMomentum.addShort(mctx.s(0.55), "PULL_DN");
 
         // Old Pump functionality replaced by ForecastEngine/PumpHunter
         // PumpHunter
@@ -671,20 +555,6 @@ public final class DecisionEngineMerged {
                     cMomentum.addLong(mctx.s(pump.strength * 0.55), "PUMP_HUNT_B");
                 if (pump.isBearish())
                     cMomentum.addShort(mctx.s(pump.strength * 0.55), "PUMP_HUNT_S");
-            }
-
-            // [v20.0] SELL CLIMAX → Block SHORT continuation signals
-            // When PumpHunter detects a sell climax (huge red candle + extreme volume),
-            // it means big players dumped and the move is likely done → expect bounce.
-            String climaxMode = pumpHunter.getClimaxMode(symbol);
-            if ("LONG_ONLY".equals(climaxMode)) {
-                // Sell climax active — crush SHORT score, boost LONG reversal
-                cMomentum.addLong(mctx.s(0.65), "SELL_CLIMAX_REV");
-                allFlags.add("PH_SELL_CLIMAX");
-            } else if ("SHORT_ONLY".equals(climaxMode)) {
-                // Buy climax active — crush LONG score, boost SHORT reversal
-                cMomentum.addShort(mctx.s(0.65), "BUY_CLIMAX_REV");
-                allFlags.add("PH_BUY_CLIMAX");
             }
         }
 
@@ -826,57 +696,20 @@ public final class DecisionEngineMerged {
             allFlags.addAll(earlyRev.flags);
         }
 
-        // [v20.1 FIX] BOS penalty multipliers — applied AFTER aggregation
-        // (scoreShort/scoreLong are not yet declared here, they come after cluster aggregation)
-        double bosShortPenalty = 1.0;
-        double bosLongPenalty  = 1.0;
-
-        // [v20.0] EARLY BOS REVERSAL from SignalOptimizer (1m structure)
-        // When PumpHunter detects a dump, SignalOptimizer scans 1m candles
-        // for Break of Structure (higher low after lower lows) = early reversal.
-        // This fires BEFORE the 15m candle closes, giving us an earlier signal.
-        if (signalOptimizer != null) {
-            com.bot.SignalOptimizer.EarlyReversalResult bosResult =
-                    signalOptimizer.detectEarlyReversalAfterDump(symbol, c1, c5);
-            if (bosResult.detected && bosResult.confidence > 0.50) {
-                double bosScore = mctx.s(bosResult.confidence * 0.75);
-                if ("LONG".equals(bosResult.side)) {
-                    cEarly.addLong(bosScore, "BOS_EARLY_LONG");
-                    // Also penalize SHORT score — BOS detected, dump is reversing
-                    bosShortPenalty = 0.50;
-                } else if ("SHORT".equals(bosResult.side)) {
-                    cEarly.addShort(bosScore, "BOS_EARLY_SHORT");
-                    bosLongPenalty = 0.50;
-                }
-                allFlags.addAll(bosResult.flags);
-                allFlags.add("BOS_1M_ACTIVE");
-            }
-        }
-
         // ════════════════════════════════════════════════════════
-        //  [v22.0] BAYESIAN CLUSTER AGGREGATION
-        //  Replaces linear score addition (0.50 + 0.18 + 0.22 = 0.90)
-        //  with likelihood ratios: each cluster is EVIDENCE, not a vote.
-        //  3 weak signals ≠ 1 strong signal (the old system said they were equal).
+        //  АГРЕГАЦИЯ КЛАСТЕРОВ
         // ════════════════════════════════════════════════════════
 
         ClusterScores[] clusters = { cStructure, cMomentum, cVolume, cHTF, cDerivatives, cEarly };
         String[] clusterNames = { "STR", "MOM", "VOL", "HTF", "DRV", "EARLY" };
 
-        // Convert cluster scores to likelihood ratios
-        double[] longLRs  = new double[clusters.length];
-        double[] shortLRs = new double[clusters.length];
+        double totalLong  = 0;
+        double totalShort = 0;
         int longClusters  = 0;
         int shortClusters = 0;
 
-        // Also keep linear scores for backward compatibility with vetoes
-        double totalLong  = 0;
-        double totalShort = 0;
-
         for (int i = 0; i < clusters.length; i++) {
             ClusterScores cl = clusters[i];
-            longLRs[i]  = bayesScorer.scoreToLR(cl.longScore);
-            shortLRs[i] = bayesScorer.scoreToLR(cl.shortScore);
             totalLong  += cl.longScore;
             totalShort += cl.shortScore;
             if (cl.favorsLong())  longClusters++;
@@ -884,99 +717,62 @@ public final class DecisionEngineMerged {
             allFlags.addAll(cl.flags);
         }
 
-        // Crash boost — applied as additional likelihood ratio, not linear add
+        // Crash boost добавляется поверх кластеров
         if (crashBoost > 0) {
-            // Convert crash boost to an extra SHORT LR
-            double crashLR = 1.0 + crashBoost * 2.0; // e.g. 0.5 crash → LR 2.0
-            shortLRs = java.util.Arrays.copyOf(shortLRs, shortLRs.length + 1);
-            shortLRs[shortLRs.length - 1] = crashLR;
             totalShort += crashBoost;
             if (btcCrashScore >= 0.65) {
-                totalLong *= 0.40;
+                totalLong -= crashBoost * 0.60;
                 allFlags.add("LONG_CRASH_PENALTY");
             }
         }
 
-        // GIC SHORT boost при краше — as LR multiplier
-        if (aggressiveShort && gicShortBoost > 1.0) {
-            double boostLR = Math.min(gicShortBoost, 1.8);
-            shortLRs = java.util.Arrays.copyOf(shortLRs, shortLRs.length + 1);
-            shortLRs[shortLRs.length - 1] = boostLR;
+        // GIC SHORT boost при краше
+        if (aggressiveShort && gicShortBoost > 1.0 && totalShort > 0) {
             totalShort *= gicShortBoost;
             allFlags.add("GIC_BOOST" + String.format("%.0f", gicShortBoost * 100));
         }
 
-        // Compute Bayesian posterior probabilities
-        double[] posterior = bayesScorer.computePosterior(longLRs, shortLRs);
-        double pLong  = posterior[0];  // P(LONG correct | all evidence)
-        double pShort = posterior[1];  // P(SHORT correct | all evidence)
-        double bayesConfidence = posterior[2]; // 0..1 agreement
-
         // ════════════════════════════════════════════════════════
-        // CONFLUENCE BONUS — [v22.0] Now based on Bayesian confidence,
-        // not arbitrary score addition
+        // CONFLUENCE BONUS
         // ════════════════════════════════════════════════════════
         double scoreLong  = totalLong;
         double scoreShort = totalShort;
 
-        // [v20.1 FIX] Apply deferred BOS penalties
-        scoreLong  *= bosLongPenalty;
-        scoreShort *= bosShortPenalty;
+        if (longClusters >= 3)  scoreLong  += CLUSTER_CONFLUENCE_BONUS * longClusters;
+        if (shortClusters >= 3) scoreShort += CLUSTER_CONFLUENCE_BONUS * shortClusters;
 
+        // Confluence flag
         if (longClusters >= 3) allFlags.add("CONFL_L" + longClusters);
         if (shortClusters >= 3) allFlags.add("CONFL_S" + shortClusters);
 
         // ════════════════════════════════════════════════════════
         // REVERSE EXHAUSTION CHECK
-        // [v22.0] CONSOLIDATED: Was 3 separate exhaustion checks that conflicted.
-        // Now ONE unified exhaustion gate with clear priority rules:
-        //   1. If exhaustion confirmed on 1m → strong penalty
-        //   2. If exhaustion NOT confirmed → mild penalty
-        //   3. If crash mode AND exhaustion → crash wins ONLY if extreme
-        // This reduces "analysis paralysis" by eliminating redundant vetoes.
         // ════════════════════════════════════════════════════════
         ReverseWarning rw = detectReversePattern(c15, c1h, state);
         if (rw != null && rw.confidence > 0.48) {
             allFlags.add("⚠REV_" + rw.type);
-
-            boolean isExhaustionForCandidate =
-                    ("LONG_EXHAUSTION".equals(rw.type) && scoreLong > scoreShort) ||
-                            ("SHORT_EXHAUSTION".equals(rw.type) && scoreShort > scoreLong);
-
-            if (isExhaustionForCandidate) {
-                // Exhaustion AGAINST our candidate direction
-                com.bot.TradingCore.Side confirmSide = "LONG_EXHAUSTION".equals(rw.type)
-                        ? com.bot.TradingCore.Side.SHORT : com.bot.TradingCore.Side.LONG;
-                boolean confirmed = confirmReversalStructure(c1, c5, confirmSide);
-
-                if (confirmed) {
-                    // 1m confirms exhaustion → reversal likely, but don't hard-veto
-                    allFlags.add("EXHAUST_CONFIRMED_1M");
-                    // Penalty but NOT return null — let the system decide
-                    if ("LONG_EXHAUSTION".equals(rw.type)) scoreLong *= cfg.getRaw("EXHAUST_PENALTY");
-                    else scoreShort *= cfg.getRaw("EXHAUST_PENALTY");
-                } else if (aggressiveShort && "SHORT_EXHAUSTION".equals(rw.type)) {
-                    // Crash mode + exhaustion = tricky
-                    if (btcCrashScore > 0.85 && rw.confidence < 0.60) {
-                        scoreShort *= 0.50;
-                        allFlags.add("REV_CRASH_OVERRIDE_WEAK");
-                    } else {
-                        scoreShort *= cfg.getRaw("EXHAUST_HARD_PENALTY");
-                        allFlags.add("REV_EXHAUST_VETO_CRASH");
-                        if (scoreShort < 0.15) return null;
-                    }
+            if ("LONG_EXHAUSTION".equals(rw.type)) {
+                // [v8.0 SYMMETRIC] LONG exhaustion gets confirmation chance too
+                boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.SHORT);
+                if (!confirmed) {
+                    scoreLong *= 0.35; // [v8.0] Было 0.16 — убийственно. Теперь 0.35
+                    if (scoreLong < 0.20) return null;
                 } else {
-                    // Unconfirmed exhaustion — moderate penalty
-                    if ("LONG_EXHAUSTION".equals(rw.type)) {
-                        scoreLong *= cfg.getRaw("EXHAUST_PENALTY");
-                        if (scoreLong < 0.15) return null;
+                    allFlags.add("LEXH_CONFIRMED_1M");
+                }
+            } else if ("SHORT_EXHAUSTION".equals(rw.type)) {
+                if (aggressiveShort) {
+                    allFlags.add("REV_IGNORED_CRASH");
+                } else {
+                    boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.LONG);
+                    if (!confirmed) {
+                        scoreShort *= 0.35; // [v8.0] Было 0.16
+                        if (scoreShort < 0.20) return null;
                     } else {
-                        scoreShort *= cfg.getRaw("EXHAUST_PENALTY");
-                        if (scoreShort < 0.15) return null;
+                        allFlags.add("REV_CONFIRMED_1M");
                     }
                 }
             }
-            // If exhaustion is for the OPPOSITE side (confirming our direction), ignore it
         }
 
         // ════════════════════════════════════════════════════════
@@ -1070,31 +866,21 @@ public final class DecisionEngineMerged {
         if (aggressiveShort) {
             minDiff = 0.08;
         } else {
-            // [v22.0] Adaptive thresholds — self-tune based on signal accuracy
-            minDiff = state == MarketState.STRONG_TREND ? cfg.getRaw("MIN_SCORE_DIFF_TREND")
-                    : state == MarketState.RANGE ? cfg.getRaw("MIN_SCORE_DIFF_RANGE")
-                    : cfg.getRaw("MIN_SCORE_DIFF_WEAK");
+            // [v11.0] RANGE needs higher diff — choppy = more noise
+            minDiff = state == MarketState.STRONG_TREND ? 0.16
+                    : state == MarketState.RANGE ? 0.28  // was 0.20 — too many false signals in range
+                    : 0.20;
         }
         if (scoreDiff < minDiff) return null;
 
-        // [v22.0] Dynamic threshold — uses adaptive config
-        // Old: hardcoded 0.40/0.68/0.58
-        // New: adaptive based on volatility regime + Bayesian confidence as backup
         double dynThresh;
         if (aggressiveShort) {
             dynThresh = 0.40;
         } else {
-            dynThresh = state == MarketState.STRONG_TREND
-                    ? cfg.getRaw("DYN_THRESH_TREND")
-                    : cfg.getRaw("DYN_THRESH_NORMAL");
+            dynThresh = state == MarketState.STRONG_TREND ? 0.68 : 0.58;
         }
         if (scoreLong < dynThresh && scoreShort < dynThresh) {
-            // [v22.0] Also check Bayesian confidence — if strong evidence, let it through
-            if (bayesConfidence > 0.25) {
-                allFlags.add("BAYES_OVERRIDE");
-            } else if (!bullDiv && !bearDiv && !hasFR && !aggressiveShort) {
-                return null;
-            }
+            if (!bullDiv && !bearDiv && !hasFR && !aggressiveShort) return null;
         }
 
         com.bot.TradingCore.Side side = candidateSide;
@@ -1103,31 +889,8 @@ public final class DecisionEngineMerged {
         if (side == com.bot.TradingCore.Side.LONG && lateEntryLong && !aggressiveShort) {
             return null; // 3+ green candles + 2×ATR move up → LONG is too late
         }
-        // [v20.0 FIX] Rubber Band blocks SHORT even in aggressiveShort mode.
-        // Old code: `&& !aggressiveShort` — this let the bot short the bottom of huge dumps.
-        // New: if rubberBandBlockShort triggered, lateEntryShort is true and we ALWAYS block.
-        if (side == com.bot.TradingCore.Side.SHORT && lateEntryShort) {
-            if (rubberBandBlockShort) {
-                allFlags.add("RUBBER_BAND_BLOCK");
-                return null; // Price too far below EMA — mean reversion imminent, no SHORT
-            }
-            if (!aggressiveShort) {
-                return null; // 3+ red candles + 2×ATR move down → SHORT is too late
-            }
-        }
-
-        // [v20.0] SELL CLIMAX HARD BLOCK
-        // If PumpHunter detected a sell climax (panic selling / capitulation),
-        // block SHORT signals regardless of everything else.
-        if (pumpHunter != null && side == com.bot.TradingCore.Side.SHORT
-                && pumpHunter.isSellClimaxActive(symbol)) {
-            allFlags.add("SELL_CLIMAX_BLOCK");
-            return null;
-        }
-        if (pumpHunter != null && side == com.bot.TradingCore.Side.LONG
-                && pumpHunter.isBuyClimaxActive(symbol)) {
-            allFlags.add("BUY_CLIMAX_BLOCK");
-            return null;
+        if (side == com.bot.TradingCore.Side.SHORT && lateEntryShort && !aggressiveShort) {
+            return null; // 3+ red candles + 2×ATR move down → SHORT is too late
         }
 
         // [v11.0] VOLUME CONFIRMATION GATE
@@ -1137,11 +900,14 @@ public final class DecisionEngineMerged {
                 || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsLong());
 
         // [v14.0 FIX] Volume = SOFT GATE, не HARD GATE
-        // [v22.0] Consolidated: single scoreDiff check AFTER all volume adjustments
+        // Hard gate убивал 70%+ сигналов в нормальных рыночных условиях
+        // Volume ПРОТИВ нас — штраф, но не блок
         if (volumeOpposes && !aggressiveShort) {
             if (candidateSide == com.bot.TradingCore.Side.LONG) scoreLong *= 0.55;
             else scoreShort *= 0.55;
             allFlags.add("VOL_OPPOSE");
+            scoreDiff = Math.abs(scoreLong - scoreShort);
+            if (scoreDiff < minDiff) return null;
         }
         // Нет volume confirmation — мягкий штраф 15%
         if (!volumeSupports && !volumeOpposes && !aggressiveShort) {
@@ -1149,8 +915,6 @@ public final class DecisionEngineMerged {
             else scoreShort *= 0.85;
             allFlags.add("VOL_NEUTRAL");
         }
-        // [v22.0] Single consolidated scoreDiff gate after ALL volume adjustments
-        scoreDiff = Math.abs(scoreLong - scoreShort);
         if (scoreDiff < minDiff) return null;
 
         // Cooldown
@@ -1159,44 +923,22 @@ public final class DecisionEngineMerged {
         if (!flipAllowed(symbol, side)) return null;
 
         // ════════════════════════════════════════════════════════
-        // [v22.0] BAYESIAN-CALIBRATED PROBABILITY
-        // Old: computeClusterConfidence() — linear norm + arbitrary range = fake probability
-        // New: Start with Bayesian posterior, then calibrate against history
-        // The number now has STATISTICAL MEANING: it's the calibrated
-        // posterior P(signal correct | all evidence + historical accuracy)
+        // [v7.0] КАЛИБРОВАННАЯ УВЕРЕННОСТЬ — на кластерах
         // ════════════════════════════════════════════════════════
-
-        // Step 1: Use Bayesian posterior as base (already computed above)
-        boolean isLong = side == com.bot.TradingCore.Side.LONG;
-        double bayesPosterior = isLong ? pLong : pShort;
-
-        // Step 2: Convert to percentage and apply category adjustment
-        double rawProbability = bayesPosterior * 100.0;
-
-        // Category adjustment (MEME/ALT are inherently noisier)
-        if (cat == CoinCategory.MEME) rawProbability -= 4.0;
-        else if (cat == CoinCategory.ALT) rawProbability -= 1.5;
-
-        // Market state adjustment (Range is harder to predict)
-        if (state == MarketState.STRONG_TREND) rawProbability += 1.5;
-        else if (state == MarketState.RANGE) rawProbability -= 3.0;
-
-        // Step 3: Calibrate against historical accuracy of this symbol
-        Deque<CalibRecord> hist = calibHist.get(symbol);
-        int sampleSize = hist != null ? hist.size() : 0;
-        double probability = bayesScorer.calibrate(rawProbability, symAccuracy, sampleSize);
-
-        // Step 4: Session quality adjustment
-        probability *= cfg.getSessionMult();
-        probability = com.bot.TradingCore.clamp(probability, 50, 82); // [v22.0] Cap at 82, not 85
-
-        allFlags.add(String.format("BAYES=%.0f%%", bayesPosterior * 100));
-        allFlags.add(String.format("CALIB=%.0f%%", probability));
+        double probability = computeClusterConfidence(
+                symbol, scoreLong, scoreShort, scoreDiff,
+                longClusters, shortClusters,
+                state, cat, atr14, price,
+                bullDiv, bearDiv, pullUp, pullDown,
+                impulseFlag, false, hasFR,
+                fvg.detected, ob.detected, false, liqSweep,
+                bias2h, vwapVal
+        );
 
         // Crash mode confidence boost
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
-            double crashConfBoost = btcCrashScore * 8.0;
-            probability = Math.min(82, probability + crashConfBoost);
+            double crashConfBoost = btcCrashScore * 10.0;
+            probability = Math.min(85, probability + crashConfBoost);
             allFlags.add("CRASH_CONF_BOOST");
         }
 
@@ -1238,7 +980,7 @@ public final class DecisionEngineMerged {
         }
 
         // [v11.0] Cap stop at 3% to prevent absurd risk
-        stopDist = Math.min(stopDist, price * cfg.getRaw("STOP_CAP_PCT"));
+        stopDist = Math.min(stopDist, price * 0.030);
 
         // [v11.0] Minimum R:R check BEFORE building trade — reject if structure
         // gives too wide a stop that kills the R:R ratio
@@ -1255,87 +997,6 @@ public final class DecisionEngineMerged {
         if (!priceMovedEnough(symbol, price)) return null;
         // [v14.0 FIX] НЕ вызываем registerSignal() здесь — cooldown ставится
         // только ПОСЛЕ ISC.allowSignal() в SignalSender через confirmSignal()
-
-        // ════════════════════════════════════════════════════════
-        // [v21.0 NEW] SESSION-AWARE CONFIDENCE ADJUSTMENT
-        // Different sessions have different reliability.
-        // Asia = false breakouts, London/NY = real moves.
-        // ════════════════════════════════════════════════════════
-        com.bot.TradingCore.TradingSession session = com.bot.TradingCore.detectCurrentSession();
-        double sessionMult = session.confidenceMultiplier;
-
-        // In low-quality sessions, require higher base confidence
-        if (!session.isActiveTradingSession) {
-            probability = Math.max(50, probability - 5);
-            allFlags.add("LOW_SESSION_" + session.name());
-        }
-
-        // London Open and NY Open get a small boost (best entry windows)
-        if (session == com.bot.TradingCore.TradingSession.LONDON_OPEN
-                || session == com.bot.TradingCore.TradingSession.NY_OPEN) {
-            probability = Math.min(82, probability + 2);
-            allFlags.add("PRIME_SESSION");
-        }
-
-        // ════════════════════════════════════════════════════════
-        // [v21.0 NEW] ENTRY TIMING MODULE
-        // Don't enter on OPEN of a candle — wait for confirmation.
-        // Check if current 15m candle has closed in our direction
-        // (confirming the signal) or is still forming.
-        // ════════════════════════════════════════════════════════
-        long now15m = last(c15).openTime;
-        long elapsed15m = System.currentTimeMillis() - now15m;
-        long candleDuration15m = 15 * 60_000L;
-        double candleProgress = (double) elapsed15m / candleDuration15m;
-
-        // If candle just opened (< 20% complete), we're guessing — reduce confidence
-        if (candleProgress < 0.20) {
-            probability = Math.max(50, probability - 3);
-            allFlags.add("CANDLE_EARLY");
-        }
-        // If candle > 80% complete AND confirms direction, small boost
-        if (candleProgress > 0.80) {
-            com.bot.TradingCore.Candle forming = last(c15);
-            boolean candleConfirms = (side == com.bot.TradingCore.Side.LONG && forming.close > forming.open)
-                    || (side == com.bot.TradingCore.Side.SHORT && forming.close < forming.open);
-            if (candleConfirms) {
-                probability = Math.min(82, probability + 2);
-                allFlags.add("CANDLE_CONFIRM");
-            } else {
-                probability = Math.max(50, probability - 4);
-                allFlags.add("CANDLE_REJECT");
-            }
-        }
-
-        // ════════════════════════════════════════════════════════
-        // [v21.0 NEW] CHoCH / FVG DETECTION — Smart Money Concepts
-        // CHoCH gives earliest reversal signal; FVG = price magnet
-        // ════════════════════════════════════════════════════════
-        com.bot.TradingCore.CHoCHResult choch = com.bot.TradingCore.detectCHoCH(c15, 30);
-        if (choch.detected && choch.strength > 0.3) {
-            boolean chochAligned = (side == com.bot.TradingCore.Side.LONG && choch.bullishReversal)
-                    || (side == com.bot.TradingCore.Side.SHORT && !choch.bullishReversal);
-            if (chochAligned) {
-                probability = Math.min(82, probability + 3);
-                allFlags.add("CHoCH_ALIGNED");
-            } else {
-                probability = Math.max(50, probability - 5);
-                allFlags.add("CHoCH_OPPOSED");
-            }
-        }
-
-        List<com.bot.TradingCore.FairValueGap> fvgs = com.bot.TradingCore.detectFairValueGaps(c15, 30);
-        for (com.bot.TradingCore.FairValueGap fvgItem : fvgs) {
-            if (fvgItem.isPriceInGap(price)) {
-                // Price is in a FVG — likely to bounce
-                if ((side == com.bot.TradingCore.Side.LONG && fvgItem.isBullish)
-                        || (side == com.bot.TradingCore.Side.SHORT && !fvgItem.isBullish)) {
-                    probability = Math.min(82, probability + 2);
-                    allFlags.add("IN_FVG_ALIGNED");
-                }
-                break;
-            }
-        }
 
         // ════════════════════════════════════════════════════════
         // [v17.0] ForecastEngine Integration — RELAXED GATING
@@ -1393,38 +1054,42 @@ public final class DecisionEngineMerged {
                         allFlags.add("FC_EXHAUST_OVERRIDE");
                     }
 
-                    // ═══════════════════════════════════════════════════
-                    // [v21.0] WEIGHTED FACTOR SCORING — replaces 25+ micro-adjustments
-                    // Old system: +2 here, -3 there, -5 somewhere = all cancel out → useless
-                    // New system: 5 factors with clear weights → single meaningful adjustment
-                    // ═══════════════════════════════════════════════════
-
-                    // Factor 1: DIRECTION ALIGNMENT (weight: 0.35)
-                    // Is FC's direction aligned with our signal?
-                    double fcDirectionFactor = 0; // [-1..+1]
-                    boolean fcAligned = (sigLong && forecastResult.directionScore > 0)
-                            || (!sigLong && forecastResult.directionScore < 0);
-                    if (fcAligned) {
-                        fcDirectionFactor = Math.min(1.0, fcDirAbs * 2.0); // 0..1
-                    } else {
-                        fcDirectionFactor = -Math.min(1.0, fcDirAbs * 2.0); // -1..0
+                    // ── SOFT PENALTY: Direction disagreement ──
+                    // [v17.0] Was hard veto at 0.18 → now penalty unless STRONGLY against (0.35)
+                    if (sigLong
+                            && (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BEAR)
+                            && fcDirAbs >= 0.35) {
+                        allFlags.add("FC_VETO_BEAR");
+                        return null; // Only STRONG_BEAR with high dirAbs = veto
+                    }
+                    if (!sigLong
+                            && (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BULL)
+                            && fcDirAbs >= 0.35) {
+                        allFlags.add("FC_VETO_BULL");
+                        return null; // Only STRONG_BULL with high dirAbs = veto
+                    }
+                    // Mild disagreement → penalty, not veto
+                    if ((sigLong && fcBear) || (!sigLong && fcBull)) {
+                        probability = Math.max(50, probability - 4);
+                        allFlags.add("FC_DISAGREE");
                     }
 
-                    // HARD VETO: Strong disagreement
-                    if (!fcAligned && fcDirAbs >= 0.35
-                            && (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BEAR
-                            || forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BULL)) {
-                        allFlags.add("FC_VETO_STRONG");
-                        return null;
+                    // ── SOFT PENALTY: Projected move against signal direction ──
+                    // [v17.0] Was hard veto → now penalty (–3) unless EARLY phase
+                    if (sigLong && forecastResult.projectedMovePct <= 0) {
+                        probability = Math.max(50, probability - 3);
+                        allFlags.add(forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
+                                ? "FC_PROJ_DN_EARLY_OK" : "FC_PROJ_DN_PENALTY");
+                    }
+                    if (!sigLong && forecastResult.projectedMovePct >= 0) {
+                        probability = Math.max(50, probability - 3);
+                        allFlags.add(forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
+                                ? "FC_PROJ_UP_EARLY_OK" : "FC_PROJ_UP_PENALTY");
                     }
 
-                    // [v20.0] FC_BULL + SHORT_EXHAUSTION combo: HARD VETO on SHORT
-                    if (!sigLong && fcBull && rw != null && "SHORT_EXHAUSTION".equals(rw.type)) {
-                        allFlags.add("FC_BULL_EXHAUST_VETO");
-                        return null;
-                    }
-
-                    // HARD VETO: Early Counter-Trend
+                    // [v19.0] HARD VETO: Early Counter-Trend
+                    // Если Forecast утверждает, что начался РАННИЙ тренд ПРОТИВ нашей позиции,
+                    // и у него есть уверенность — мы ОБЯЗАНЫ отменить вход в старый умирающий тренд.
                     if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY) {
                         boolean earlyOpposed = (sigLong && forecastResult.directionScore < -0.15)
                                 || (!sigLong && forecastResult.directionScore > 0.15);
@@ -1434,62 +1099,55 @@ public final class DecisionEngineMerged {
                         }
                     }
 
-                    // Factor 2: PHASE QUALITY (weight: 0.25)
-                    // EARLY = best, MID = good, LATE = bad, EXHAUSTION = worst
-                    double fcPhaseFactor = switch (forecastResult.trendPhase) {
-                        case EARLY -> fcAligned ? 0.8 : -0.3;
-                        case MID -> fcAligned ? 0.4 : -0.2;
-                        case LATE -> fcAligned ? -0.1 : -0.5;
-                        case EXHAUSTION -> fcAligned ? -0.4 : -0.8;
-                    };
-
-                    // Factor 3: PROJECTED MOVE (weight: 0.20)
-                    // Does FC project enough move to cover our stop?
-                    double stopRetAbs = stopDist / (price + 1e-9);
-                    double fcMoveAbs = Math.abs(forecastResult.projectedMovePct);
-                    boolean moveAligned = (sigLong && forecastResult.projectedMovePct > 0)
-                            || (!sigLong && forecastResult.projectedMovePct < 0);
-                    double fcMoveFactor;
-                    if (moveAligned && fcMoveAbs >= stopRetAbs * 1.5) fcMoveFactor = 0.8;
-                    else if (moveAligned && fcMoveAbs >= stopRetAbs * 0.9) fcMoveFactor = 0.4;
-                    else if (!moveAligned) fcMoveFactor = -0.5;
-                    else fcMoveFactor = -0.2;
-
-                    // Factor 4: CONFIDENCE (weight: 0.10)
-                    double fcConfFactor = (forecastResult.confidence - 0.40) * 2.0; // maps 0.4→0, 0.8→0.8
-
-                    // Factor 5: MARKET STATE PENALTY (weight: 0.10)
-                    double fcStateFactor = 0;
-                    if (state == MarketState.RANGE) {
-                        if (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL)
-                            fcStateFactor = -0.6;
-                        else if (!moveAligned || fcMoveAbs < stopRetAbs * 0.9)
-                            fcStateFactor = -0.4;
+                    // ── BOOST: Early trend phase with strong direction ──
+                    if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
+                            && Math.abs(forecastResult.directionScore) > 0.25) {
+                        boolean earlyAligned = (sigLong && forecastResult.directionScore > 0)
+                                || (!sigLong && forecastResult.directionScore < 0);
+                        if (earlyAligned) {
+                            probability = Math.min(85, probability + 3);
+                            allFlags.add("FC_EARLY_BOOST");
+                        }
                     }
 
-                    // COMBINE: weighted average → single adjustment in range [-10, +8]
-                    double fcWeightedScore = fcDirectionFactor * 0.35
-                            + fcPhaseFactor * 0.25
-                            + fcMoveFactor * 0.20
-                            + fcConfFactor * 0.10
-                            + fcStateFactor * 0.10;
+                    // ── RANGE quality gate — penalty, NOT veto ──
+                    // [v17.0] Was hard veto → now soft penalty (-5)
+                    double stopRetAbs = stopDist / (price + 1e-9);
+                    double fcMoveAbs = Math.abs(forecastResult.projectedMovePct);
+                    double fcConf = forecastResult.confidence;
+                    boolean isRange = state == MarketState.RANGE;
 
-                    // Map to probability adjustment: [-10, +8]
-                    double fcAdjustment = fcWeightedScore * 12.0; // ±12 max
-                    fcAdjustment = com.bot.TradingCore.clamp(fcAdjustment, -10.0, 8.0);
-
-                    probability = com.bot.TradingCore.clamp(probability + fcAdjustment, 50, 82);
-                    allFlags.add(String.format("FC_SCORE=%.1f", fcAdjustment));
+                    if (isRange) {
+                        boolean moveOk = fcMoveAbs >= stopRetAbs * 0.90;
+                        boolean confOk = fcConf >= 0.50;
+                        if (!moveOk || !confOk) {
+                            probability = Math.max(50, probability - 5);
+                            allFlags.add("FC_RANGE_PENALTY");
+                        }
+                        if (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL) {
+                            probability = Math.max(50, probability - 3);
+                            allFlags.add("FC_NEUTRAL_RANGE");
+                        }
+                    } else {
+                        // Non-range: mild adjustments
+                        if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
+                            probability = Math.max(50, probability - 2);
+                            allFlags.add("FC_EXHAUST_SOFT");
+                        }
+                        if (fcMoveAbs < stopRetAbs * 0.80) {
+                            probability = Math.max(50, probability - 2);
+                            allFlags.add("FC_MOVE_WEAK");
+                        } else {
+                            allFlags.add("FC_MOVE_OK");
+                        }
+                    }
+                    // [v17.0] REMOVED: FC_LOWCONF_NEUTRAL veto — NEUTRAL means "I don't know",
+                    // not "block everything". Let the cluster signal decide.
                 }
             } catch (Exception e) {
                 System.out.printf("[FC] %s forecast error: %s%n", symbol, e.getMessage());
             }
         }
-
-        // [v20.1 FIX] Claim cooldown and price state ONLY here — after ALL filters passed.
-        // Previously claimed in cooldownAllowedEx (too early), wasting cooldown on vetoed signals.
-        cooldownMap.put(symbol + "_" + side, now);
-        commitPriceMoved(symbol, price);
 
         return new TradeIdea(symbol, side, price, stopPrice, takePrice, rrRatio,
                 probability, allFlags,
@@ -1513,139 +1171,77 @@ public final class DecisionEngineMerged {
             boolean hasFR, boolean hasFVG, boolean hasOB, boolean hasBOS, boolean liqSweep,
             HTFBias bias2h, double vwap) {
 
-        // ═══════════════════════════════════════════════════════════
-        // [v22.0] BAYESIAN CALIBRATED PROBABILITY
-        //
-        // Old system: prob = 50 + norm * magicRange → fake number
-        // New system: probability is calibrated against ACTUAL historical
-        // accuracy using isotonic regression principle.
-        //
-        // BASE = 50% (no edge, coin flip)
-        // Each confirming factor adds REAL statistical edge, not magic.
-        // Final probability is clamped and then Bayesian-adjusted
-        // using the symbol's own historical accuracy.
-        // ═══════════════════════════════════════════════════════════
-
         boolean isLong = scoreLong > scoreShort;
         int clusters = isLong ? longClusters : shortClusters;
-        double dominantScore = isLong ? scoreLong : scoreShort;
-        double oppositeScore = isLong ? scoreShort : scoreLong;
 
-        // ── STEP 1: Score Ratio (how dominant is the winning side?) ──
-        // This replaces the arbitrary `norm = scoreDiff / 5.0`
-        // Score ratio is naturally bounded and meaningful:
-        // 1.0 = equal (no edge), 2.0 = 2x stronger, 5.0+ = very strong
-        double scoreRatio = (dominantScore + 0.01) / (oppositeScore + 0.01);
-        scoreRatio = Math.min(scoreRatio, 8.0); // cap extreme ratios
+        // Базовая нормализация score difference
+        double norm = Math.min(1.0, scoreDiff / 5.0); // было 6.5, теперь 5.0 (кластеры дают меньше)
 
-        // Convert to edge: ratio 1.0 → 0%, ratio 2.0 → ~10%, ratio 4.0 → ~20%
-        // Uses logarithmic scaling — diminishing returns above 3x
-        double scoreEdge = Math.log(scoreRatio) / Math.log(8.0) * 20.0;
-
-        // ── STEP 2: Cluster Confluence Edge ──
-        // Each agreeing cluster adds statistical edge.
-        // Based on empirical testing: 2 clusters ≈ noise, 4+ ≈ real signal.
-        // Edge per cluster: ~2.5% (empirically calibrated, but ADAPTIVE via config)
-        double clusterEdge = 0;
-        if (clusters >= 6) clusterEdge = com.bot.TradingCore.CONFIG.getRaw("CONF_CLUSTER_BONUS_6") * 100;
-        else if (clusters >= 5) clusterEdge = com.bot.TradingCore.CONFIG.getRaw("CONF_CLUSTER_BONUS_5") * 100;
-        else if (clusters >= 4) clusterEdge = com.bot.TradingCore.CONFIG.getRaw("CONF_CLUSTER_BONUS_4") * 100;
-        else if (clusters >= 3) clusterEdge = com.bot.TradingCore.CONFIG.getRaw("CONF_CLUSTER_BONUS_3") * 100;
-
-        // ── STEP 3: Alignment Edge ──
-        // HTF alignment adds real edge (confirmed by backtesting across markets)
-        double alignmentEdge = 0;
-        if ((bias2h == HTFBias.BULL && isLong) || (bias2h == HTFBias.BEAR && !isLong))
-            alignmentEdge += 3.0;
-        if ((isLong && price > vwap * 1.001) || (!isLong && price < vwap * 0.999))
-            alignmentEdge += 1.5;
-
-        // ── STEP 4: Market State Edge ──
-        // Strong trends are statistically easier to trade
-        double stateEdge = switch (state) {
-            case STRONG_TREND -> 3.0;
-            case WEAK_TREND   -> 0.0;
-            case RANGE        -> -5.0; // Range is hardest — penalize
+        // [v7.1] Бонус за количество согласных КЛАСТЕРОВ (теперь из 6)
+        double clusterBonus = switch (clusters) {
+            case 6 -> 0.14;  // все 6 согласны = очень сильный сигнал
+            case 5 -> 0.12;
+            case 4 -> 0.08;
+            case 3 -> 0.04;
+            default -> 0.0;
         };
+        norm += clusterBonus;
 
-        // ── STEP 5: Category Edge ──
-        // TOP coins are more predictable than MEME
-        double catEdge = switch (cat) {
-            case TOP  -> 0.0;
-            case ALT  -> -2.0;
-            case MEME -> -5.0;
-        };
-
-        // ── STEP 6: Combine (additive, bounded) ──
-        double rawProb = 50.0 + scoreEdge + clusterEdge + alignmentEdge + stateEdge + catEdge;
-
-        // ── STEP 7: Historical Bayesian Calibration ──
-        // This is the KEY anti-overfitting mechanism.
-        // Instead of trusting our formula, we CHECK against actual results.
-        // If this symbol historically wins 60% when we say 70%,
-        // the output gets pulled DOWN to reflect reality.
-        Deque<CalibRecord> hist = calibHist.get(symbol);
-        if (hist != null && hist.size() >= 20) {
-            double calibrated = bayesianCalibrate(hist, rawProb);
-            // Blend: 60% calibrated (reality), 40% raw (formula)
-            // More history → more weight on calibrated
-            double histWeight = Math.min(0.70, hist.size() / 150.0);
-            rawProb = rawProb * (1.0 - histWeight) + calibrated * histWeight;
+        // Бонус за HTF alignment
+        if ((bias2h == HTFBias.BULL && isLong) || (bias2h == HTFBias.BEAR && !isLong)) {
+            norm += 0.05;
         }
 
-        return Math.round(clamp(rawProb, 50, 82));
-        // [v22.0] Ceiling 82 (was 85). No crypto scalping system HONESTLY
-        // has >80% accuracy. Claiming 85% is self-deception.
+        // Бонус за VWAP alignment
+        if ((isLong && price > vwap * 1.0005) || (!isLong && price < vwap * 0.9995)) {
+            norm += 0.025;
+        }
+
+        norm = Math.min(1.0, norm);
+
+        // [v11.0] Range confidence: 50 + norm * range
+        // Reduced range so we don't reach unrealistic probabilities
+        double range = 22 + Math.min(clusters * 3.5, 14); // max 22+14=36, итого max 86, clamp 85
+        double prob  = 50 + norm * range;
+
+        // Market state adjustment
+        if (state == MarketState.STRONG_TREND)      prob += 2.0;  // was 3.0 — overconfident in trends
+        else if (state == MarketState.WEAK_TREND)   prob += 0.0;  // was 0.5 — weak trend ≠ bonus
+        else if (state == MarketState.RANGE)        prob -= 4.0;  // was -3.0 — range is HARD, penalize more
+
+        // Category adjustment
+        if (cat == CoinCategory.MEME)               prob -= 5.0;
+        else if (cat == CoinCategory.ALT)           prob -= 2.0;
+
+        // Historical calibration
+        Deque<CalibRecord> hist = calibHist.get(symbol);
+        if (hist != null && hist.size() >= 30) {
+            double histAcc = historicalAccuracy(hist, prob);
+            prob = prob * 0.70 + histAcc * 0.30;
+        }
+
+        return Math.round(clamp(prob, 50, 85)); // [v11.0] Ceiling 85 (was 88 — unrealistic for crypto scalping)
     }
 
-    /**
-     * [v22.0] Bayesian probability calibration.
-     * Groups historical predictions into bins and computes ACTUAL accuracy per bin.
-     * This is a simplified isotonic regression — the gold standard for
-     * probability calibration in ML/statistics.
-     *
-     * Example: if we predicted 70% 40 times and won 25 → actual accuracy = 62.5%
-     * Next time we predict 70%, output 62.5% instead.
-     */
-    private double bayesianCalibrate(Deque<CalibRecord> hist, double rawProb) {
-        // Bin width: ±7 points
-        double binWidth = 7.0;
+    private double historicalAccuracy(Deque<CalibRecord> hist, double prob) {
+        double sum = 0, cnt = 0;
         List<CalibRecord> list = new ArrayList<>(hist);
-
-        double weightedWins = 0, weightedTotal = 0;
         int size = list.size();
-
         for (int i = 0; i < size; i++) {
             CalibRecord r = list.get(i);
-            // Only consider records in a similar probability range
-            if (Math.abs(r.predicted - rawProb) <= binWidth) {
-                // Recency weighting: newer results matter more
-                double recencyWeight = 0.3 + 0.7 * ((double) i / size);
-                weightedTotal += recencyWeight;
-                if (r.correct) weightedWins += recencyWeight;
+            if (Math.abs(r.predicted - prob) < 12) {
+                double weight = 0.5 + 0.5 * ((double) i / size);
+                cnt += weight;
+                if (r.correct) sum += weight;
             }
         }
-
-        // Not enough data in this bin → return raw
-        if (weightedTotal < 3.0) return rawProb;
-
-        // Actual calibrated accuracy
-        double actualRate = (weightedWins / weightedTotal) * 100.0;
-
-        // Shrinkage towards 50% for small samples (regularization)
-        // With 3 samples, shrink a lot. With 30+, trust the data.
-        double sampleStrength = Math.min(1.0, weightedTotal / 15.0);
-        return 50.0 * (1.0 - sampleStrength) + actualRate * sampleStrength;
+        return cnt < 4 ? prob : (sum / cnt) * 100;
     }
 
     // ══════════════════════════════════════════════════════════════
     //  COOLDOWN
     // ══════════════════════════════════════════════════════════════
 
-    // [v20.1 FIX] Split cooldown into CHECK (no side effects) and CLAIM (sets cooldown).
-    // Old code: cooldownAllowedEx set cooldown immediately, wasting it if the signal
-    // was later vetoed by ForecastEngine/flipAllowed/priceMovedEnough. This caused
-    // missed signals — the #1 reason for bot "silence" during valid setups.
     private boolean cooldownAllowedEx(String sym, com.bot.TradingCore.Side side,
                                       CoinCategory cat, long now, long shortOverrideMs) {
         String key  = sym + "_" + side;
@@ -1657,8 +1253,9 @@ public final class DecisionEngineMerged {
                     cat == CoinCategory.ALT  ? COOLDOWN_ALT : COOLDOWN_MEME;
         }
         Long last = cooldownMap.get(key);
-        return last == null || now - last >= base;
-        // NOTE: cooldown is now claimed ONLY in confirmSignal() → registerSignal()
+        if (last != null && now - last < base) return false;
+        cooldownMap.put(key, now);
+        return true;
     }
 
     private boolean cooldownAllowed(String sym, com.bot.TradingCore.Side side, CoinCategory cat, long now) {
@@ -1681,18 +1278,13 @@ public final class DecisionEngineMerged {
         signalCountBySymbol.computeIfAbsent(sym, k -> new AtomicInteger(0)).incrementAndGet();
     }
 
-    // [v20.1 FIX] Split into CHECK (no side effects) and COMMIT.
-    // Old code set lastSigPrice even when the signal was later vetoed by ForecastEngine.
     private boolean priceMovedEnough(String sym, double price) {
         Double last = lastSigPrice.get(sym);
-        if (last == null) return true;
+        if (last == null) { lastSigPrice.put(sym, price); return true; }
         // [v11.0] Increased from 0.20% to 0.35% — prevents near-duplicate signals
-        return Math.abs(price - last) / last >= 0.0035;
-        // NOTE: lastSigPrice is now committed ONLY in confirmSignal()
-    }
-
-    private void commitPriceMoved(String sym, double price) {
+        if (Math.abs(price - last) / last < 0.0035) return false;
         lastSigPrice.put(sym, price);
+        return true;
     }
 
     // ══════════════════════════════════════════════════════════════

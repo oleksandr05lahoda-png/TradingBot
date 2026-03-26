@@ -9,7 +9,7 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v21.0 — WORLD-CLASS EDITION                                  ║
+ * ║       BotMain v15.0 — CRITICAL ARCHITECTURE FIX EDITION                  ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  [v15.0] FIX Дыра 1: ConcurrentLinkedDeque everywhere (thread safety)  ║
  * ║  [v15.0] FIX Дыра 3: LR window 30→10, acceleration detection          ║
@@ -94,7 +94,7 @@ public final class BotMain {
 
     static final class ForecastRecord {
         final String symbol;
-        final TradingCore.Side side;
+        final com.bot.TradingCore.Side side;
         final double entryPrice;
         final String forecastBias;
         final double forecastScore;
@@ -102,7 +102,7 @@ public final class BotMain {
         volatile boolean resolved = false;
         volatile String  actualOutcome = null;
 
-        ForecastRecord(String sym, TradingCore.Side side, double price,
+        ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
                        String bias, double score) {
             this.symbol = sym; this.side = side; this.entryPrice = price;
             this.forecastBias = bias; this.forecastScore = score;
@@ -123,7 +123,7 @@ public final class BotMain {
 
     static final class TrackedSignal {
         final String          symbol;
-        final TradingCore.Side side;
+        final com.bot.TradingCore.Side side;
         final double          entry, sl, tp1, tp2, tp3;
         final long            createdAt;
         final String          forecastBias;
@@ -139,7 +139,7 @@ public final class BotMain {
         private double  extremeHigh   = Double.MIN_VALUE;
         private final Object extremeLock = new Object();
 
-        TrackedSignal(String sym, TradingCore.Side side,
+        TrackedSignal(String sym, com.bot.TradingCore.Side side,
                       double entry, double sl, double tp1, double tp2, double tp3,
                       String forecastBias, double forecastScore) {
             this.symbol = sym; this.side = side; this.entry = entry;
@@ -194,10 +194,10 @@ public final class BotMain {
         lastCycleSuccessMs       = startTimeMs;
         lastStatsSuccessMs       = startTimeMs;
 
-        final TelegramBotSender telegram = new TelegramBotSender(TG_TOKEN, CHAT_ID);
-        final GlobalImpulseController gic = new GlobalImpulseController();
-        final InstitutionalSignalCore isc = new InstitutionalSignalCore();
-        final SignalSender sender         = new SignalSender(telegram, gic, isc);
+        final com.bot.TelegramBotSender telegram = new com.bot.TelegramBotSender(TG_TOKEN, CHAT_ID);
+        final com.bot.GlobalImpulseController gic = new com.bot.GlobalImpulseController();
+        final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
+        final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram, gic, isc);
 
         // Callbacks — только в лог, не в Telegram
         isc.setTimeStopCallback((sym, msg) -> LOG.info("[ISC time-stop] " + sym + ": " + msg));
@@ -278,17 +278,17 @@ public final class BotMain {
 
         // ── Startup ping ─────────────────────────────────────────
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ GodBot v21.0 WORLD-CLASS стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ GodBot v15.0 ARCHITECTURE FIX стартовал " + nowWarsawStr() + " ═══");
     }
 
     // ══════════════════════════════════════════════════════════════
     //  MAIN CYCLE
     // ══════════════════════════════════════════════════════════════
 
-    private static void runCycle(TelegramBotSender telegram,
-                                 GlobalImpulseController gic,
-                                 InstitutionalSignalCore isc,
-                                 SignalSender sender) {
+    private static void runCycle(com.bot.TelegramBotSender telegram,
+                                 com.bot.GlobalImpulseController gic,
+                                 com.bot.InstitutionalSignalCore isc,
+                                 com.bot.SignalSender sender) {
         long cycleStart = System.currentTimeMillis();
 
         if (isQuietHours()) {
@@ -317,11 +317,6 @@ public final class BotMain {
         long cycle = totalCycles.incrementAndGet();
         LOG.info("══ ЦИКЛ #" + cycle + " ══ " + nowWarsawStr());
 
-        // [v21.0] Session-aware logging
-        com.bot.TradingCore.TradingSession session = com.bot.TradingCore.detectCurrentSession();
-        LOG.info("Session: " + session.name() + " (" + session.description + ") mult="
-                + String.format("%.2f", session.confidenceMultiplier));
-
         // BTC контекст + секторальные лидеры
         updateBtcContext(sender, gic);
         updateSectors(sender, gic);
@@ -329,13 +324,13 @@ public final class BotMain {
         double bal = sender.getAccountBalance();
         if (bal > 0) isc.updateBalance(bal);
 
-        GlobalImpulseController.GlobalContext ctx = gic.getContext();
+        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         LOG.info("BTC: " + ctx.regime
                 + " str=" + String.format("%.2f", ctx.impulseStrength)
                 + " vol=" + String.format("%.2f", ctx.volatilityExpansion)
                 + " | " + isc.getStats());
 
-        List<DecisionEngineMerged.TradeIdea> signals = sender.generateSignals();
+        List<com.bot.DecisionEngineMerged.TradeIdea> signals = sender.generateSignals();
         lastCycleSuccessMs = System.currentTimeMillis();
 
         if (signals == null || signals.isEmpty()) {
@@ -346,14 +341,14 @@ public final class BotMain {
         // Keep only top signals per cycle to prevent Telegram queue backlog.
         // Priority: probability desc, then forecast confidence, then abs(directionScore).
         signals.sort(Comparator
-                .comparingDouble((DecisionEngineMerged.TradeIdea i) -> i.probability).reversed()
+                .comparingDouble((com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed()
                 .thenComparingDouble(i -> i.forecast != null ? i.forecast.confidence : 0.0).reversed()
                 .thenComparingDouble(i -> i.forecast != null ? Math.abs(i.forecast.directionScore) : 0.0).reversed());
         int limit = Math.min(signals.size(), MAX_SIGNALS_PER_CYCLE);
 
         int sent = 0;
         for (int idx = 0; idx < limit; idx++) {
-            DecisionEngineMerged.TradeIdea s = signals.get(idx);
+            com.bot.DecisionEngineMerged.TradeIdea s = signals.get(idx);
             telegram.sendMessageAsync(s.toTelegramString());
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
@@ -382,7 +377,7 @@ public final class BotMain {
     //  TRACK SIGNAL
     // ══════════════════════════════════════════════════════════════
 
-    static void trackSignal(DecisionEngineMerged.TradeIdea idea) {
+    static void trackSignal(com.bot.DecisionEngineMerged.TradeIdea idea) {
         if (idea == null) return;
         String key = idea.symbol + "_" + idea.side;
 
@@ -425,9 +420,9 @@ public final class BotMain {
     //  TRADE RESOLVER — v14: tp2Hit + fixed trailing + safe extremes
     // ══════════════════════════════════════════════════════════════
 
-    private static void runTradeResolver(SignalSender sender,
-                                         InstitutionalSignalCore isc,
-                                         TelegramBotSender telegram) {
+    private static void runTradeResolver(com.bot.SignalSender sender,
+                                         com.bot.InstitutionalSignalCore isc,
+                                         com.bot.TelegramBotSender telegram) {
         if (trackedSignals.isEmpty()) return;
 
         for (Iterator<Map.Entry<String, TrackedSignal>> it =
@@ -446,11 +441,11 @@ public final class BotMain {
             // ── Получаем свежие 1m candles ──────────────────────
             double priceClose;
             try {
-                List<TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 4);
+                List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 4);
                 if (candles == null || candles.isEmpty()) continue;
 
                 double newLow = Double.MAX_VALUE, newHigh = Double.MIN_VALUE;
-                for (TradingCore.Candle c : candles) {
+                for (com.bot.TradingCore.Candle c : candles) {
                     newLow  = Math.min(newLow,  c.low);
                     newHigh = Math.max(newHigh, c.high);
                 }
@@ -465,7 +460,7 @@ public final class BotMain {
 
             if (priceClose <= 0) continue;
 
-            boolean isLong = ts.side == TradingCore.Side.LONG;
+            boolean isLong = ts.side == com.bot.TradingCore.Side.LONG;
             double extremeLow  = ts.getExtremeLow();
             double extremeHigh = ts.getExtremeHigh();
 
@@ -580,8 +575,8 @@ public final class BotMain {
     //  FORECAST ACCURACY CHECKER
     // ══════════════════════════════════════════════════════════════
 
-    private static void checkForecastAccuracy(SignalSender sender,
-                                              TelegramBotSender telegram) {
+    private static void checkForecastAccuracy(com.bot.SignalSender sender,
+                                              com.bot.TelegramBotSender telegram) {
         long now = System.currentTimeMillis();
         long minAgeMs = 120 * 60_000L;
 
@@ -605,7 +600,7 @@ public final class BotMain {
             }
 
             try {
-                List<TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", 2);
+                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", 2);
                 if (c == null || c.isEmpty()) continue;
                 double currentPrice = c.get(c.size() - 1).close;
 
@@ -660,10 +655,10 @@ public final class BotMain {
     //  WATCHDOG
     // ══════════════════════════════════════════════════════════════
 
-    private static void runWatchdog(TelegramBotSender telegram,
-                                    GlobalImpulseController gic,
-                                    InstitutionalSignalCore isc,
-                                    SignalSender sender) {
+    private static void runWatchdog(com.bot.TelegramBotSender telegram,
+                                    com.bot.GlobalImpulseController gic,
+                                    com.bot.InstitutionalSignalCore isc,
+                                    com.bot.SignalSender sender) {
         if (isQuietHours()) return;
         long now = System.currentTimeMillis();
         List<String> issues = new ArrayList<>();
@@ -701,17 +696,17 @@ public final class BotMain {
     //  DAILY SUMMARY
     // ══════════════════════════════════════════════════════════════
 
-    private static void maybeSendDailySummary(TelegramBotSender telegram,
-                                              GlobalImpulseController gic,
-                                              InstitutionalSignalCore isc,
-                                              SignalSender sender) {
+    private static void maybeSendDailySummary(com.bot.TelegramBotSender telegram,
+                                              com.bot.GlobalImpulseController gic,
+                                              com.bot.InstitutionalSignalCore isc,
+                                              com.bot.SignalSender sender) {
         ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
         int h = utc.getHour(), m = utc.getMinute(), day = utc.getDayOfYear();
 
         if (h != 9 || m > 2 || day == lastSummaryDay) return;
         lastSummaryDay = day;
 
-        GlobalImpulseController.GlobalContext ctx = gic.getContext();
+        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
         int fcTotal    = forecastTotal.get();
         int fcCorrect  = forecastCorrect.get();
@@ -747,11 +742,11 @@ public final class BotMain {
     //  BACKTEST
     // ══════════════════════════════════════════════════════════════
 
-    private static void runPeriodicBacktest(SignalSender sender,
-                                            InstitutionalSignalCore isc,
-                                            TelegramBotSender telegram) {
+    private static void runPeriodicBacktest(com.bot.SignalSender sender,
+                                            com.bot.InstitutionalSignalCore isc,
+                                            com.bot.TelegramBotSender telegram) {
         LOG.info("[BT] Начало периодического бэктеста...");
-        SimpleBacktester bt = new SimpleBacktester();
+        com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
         String[] syms = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "LINKUSDT", "XRPUSDT"};
         double totalEV = 0;
         int    count   = 0;
@@ -759,15 +754,15 @@ public final class BotMain {
 
         for (String sym : syms) {
             try {
-                List<TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 500);
-                List<TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  200);
-                List<TradingCore.Candle> m1  = sender.fetchKlines(sym, "1m",  500);
-                List<TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m",  300);
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 500);
+                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  200);
+                List<com.bot.TradingCore.Candle> m1  = sender.fetchKlines(sym, "1m",  500);
+                List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m",  300);
 
                 if (m15 == null || m15.size() < 250) continue;
 
-                SimpleBacktester.BacktestResult r = bt.run(
-                        sym, m1, m5, m15, h1, DecisionEngineMerged.CoinCategory.TOP);
+                com.bot.SimpleBacktester.BacktestResult r = bt.run(
+                        sym, m1, m5, m15, h1, com.bot.DecisionEngineMerged.CoinCategory.TOP);
 
                 if (r.total >= 5) {
                     totalEV += r.ev;
@@ -793,13 +788,13 @@ public final class BotMain {
     //  STATS
     // ══════════════════════════════════════════════════════════════
 
-    private static void logStats(TelegramBotSender telegram,
-                                 GlobalImpulseController gic,
-                                 InstitutionalSignalCore isc,
-                                 SignalSender sender) {
+    private static void logStats(com.bot.TelegramBotSender telegram,
+                                 com.bot.GlobalImpulseController gic,
+                                 com.bot.InstitutionalSignalCore isc,
+                                 com.bot.SignalSender sender) {
         lastStatsSuccessMs = System.currentTimeMillis();
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
-        GlobalImpulseController.GlobalContext ctx = gic.getContext();
+        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
 
         String msg = String.format(
                 "[STATS] Up:%dm Cyc:%d Sig:%d Trk:%d FR:%d | "
@@ -825,19 +820,19 @@ public final class BotMain {
     //  HELPERS
     // ══════════════════════════════════════════════════════════════
 
-    private static void updateBtcContext(SignalSender sender, GlobalImpulseController gic) {
+    private static void updateBtcContext(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         try {
-            List<TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", "15m", KLINES);
+            List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", "15m", KLINES);
             if (btc != null && btc.size() > 30) gic.update(btc);
         } catch (Exception e) {
             LOG.warning("[BTC ctx] " + e.getMessage());
         }
     }
 
-    private static void updateSectors(SignalSender sender, GlobalImpulseController gic) {
+    private static void updateSectors(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         for (Map.Entry<String, String> e : SECTOR_LEADERS.entrySet()) {
             try {
-                List<TradingCore.Candle> sc = sender.fetchKlines(e.getKey(), "15m", 80);
+                List<com.bot.TradingCore.Candle> sc = sender.fetchKlines(e.getKey(), "15m", 80);
                 if (sc != null && sc.size() > 25) gic.updateSector(e.getValue(), sc);
             } catch (Exception ignored) {}
         }
@@ -845,10 +840,9 @@ public final class BotMain {
 
     private static boolean isQuietHours() {
         if (!QUIET_HOURS_ENABLED) return false;
-        // [v21.0] Use session detection instead of hardcoded UTC hours.
-        // This properly handles Asia deadzone and NY close.
-        TradingCore.TradingSession session = TradingCore.detectCurrentSession();
-        return session == TradingCore.TradingSession.DEAD_ZONE;
+        ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
+        int h = utc.getHour();
+        return h >= QUIET_START_H && h < QUIET_END_H;
     }
 
     private static void markForecastRecord(String key, String outcome) {
@@ -868,29 +862,23 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        TradingCore.TradingSession session = TradingCore.detectCurrentSession();
         return String.format(
-                "🚀 *GodBot v21.0 WORLD-CLASS EDITION*\n"
-                        + "15M Futures | Weighted Factor Scoring | TOP-100\n"
+                "🚀 *GodBot v15.0 ARCHITECTURE FIX*\n"
+                        + "15M Futures | 9-Factor Forecast | TOP-100\n"
                         + "───────────────────────────────\n"
-                        + "✅ [v21.0] Unified Wilder's ATR everywhere\n"
-                        + "✅ [v21.0] Session-aware signals (Asia/London/NY)\n"
-                        + "✅ [v21.0] Entry timing (candle confirmation)\n"
-                        + "✅ [v21.0] Weighted factor scoring (no micro-adjust)\n"
-                        + "✅ [v21.0] Smart Money: CHoCH + FVG + Order Blocks\n"
-                        + "✅ [v21.0] Squeeze breakout detection\n"
-                        + "✅ [v21.0] HTF exhaustion context\n"
-                        + "✅ [v21.0] Correlation-aware risk management\n"
-                        + "✅ [v21.0] Backtester: no look-ahead + volume delta\n"
-                        + "✅ [v21.0] Improved swing-based move identification\n"
+                        + "✅ [Дыра 1] ConcurrentLinkedDeque everywhere\n"
+                        + "✅ [Дыра 3] LR window 30→10 + acceleration\n"
+                        + "✅ [Дыра 4] Streak: win halves boost aggressively\n"
+                        + "✅ [KITE] VolatilitySqueezeGuard active\n"
                         + "✅ ForecastEngine 9+1 факторов активен\n"
+                        + "✅ TrendPhase: EARLY/MID/LATE/EXHAUST\n"
                         + "✅ Structural stops за swing high/low\n"
                         + "✅ ISC с exponential streak decay\n"
-                        + "⏰ Session: %s\n"
+                        + "✅ Trailing stop FIXED (SHORT logic)\n"
+                        + "⏰ Тихие часы: UTC 01:00–05:00\n"
                         + "📅 Daily report в 09:00 UTC\n"
                         + "───────────────────────────────\n"
                         + "🕐 %s (Warsaw)",
-                session.name(),
                 nowWarsawStr());
     }
 

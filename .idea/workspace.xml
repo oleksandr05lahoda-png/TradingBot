@@ -11,9 +11,9 @@
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -596,7 +596,17 @@
       <workItem from="1774345115416" duration="529000" />
       <workItem from="1774345659335" duration="1646000" />
       <workItem from="1774378541569" duration="6008000" />
-      <workItem from="1774446032703" duration="3897000" />
+      <workItem from="1774446032703" duration="4122000" />
+      <workItem from="1774481440670" duration="1108000" />
+      <workItem from="1774485050528" duration="11000" />
+      <workItem from="1774485071262" duration="10000" />
+      <workItem from="1774485091584" duration="9000" />
+      <workItem from="1774485111448" duration="6000" />
+      <workItem from="1774485128960" duration="10000" />
+      <workItem from="1774485153140" duration="8000" />
+      <workItem from="1774485174678" duration="9000" />
+      <workItem from="1774485194987" duration="20000" />
+      <workItem from="1774485237215" duration="4000" />
     </task>
     <servers />
   </component>
