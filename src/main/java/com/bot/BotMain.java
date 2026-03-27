@@ -500,8 +500,16 @@ public final class BotMain {
 
             if (tp1Reached && !ts.tp1Hit) {
                 ts.tp1Hit = true;
-                ts.trailingStop = ts.entry; // trailing начинается с breakeven
-                // Suppress intermediate TP1 notification to reduce Telegram spam.
+                ts.trailingStop = ts.entry; // trailing переходит на breakeven
+                double tp1PnlPct = isLong
+                        ? (ts.tp1 - ts.entry) / ts.entry * 100
+                        : (ts.entry - ts.tp1) / ts.entry * 100;
+                telegram.sendMessageAsync(String.format(
+                        "🟢 *TP1 ✓* %s %s | +%.2f%%\n"
+                                + "💰 50%% позиции — фиксируй прибыль\n"
+                                + "🛡 Стоп → безубыток `%.6f`",
+                        ts.symbol, ts.side, tp1PnlPct, ts.entry));
+                LOG.info("[TR] TP1 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp1PnlPct));
             }
 
             // ── После TP1: trailing + TP2 + TP3 ────────────────
@@ -532,8 +540,16 @@ public final class BotMain {
                         : extremeLow  <= ts.tp2;
 
                 if (tp2Reached && !ts.tp2Hit) {
-                    ts.tp2Hit = true; // ← Устанавливаем флаг ПЕРЕД отправкой
-                    // Suppress intermediate TP2 notification to reduce Telegram spam.
+                    ts.tp2Hit = true; // ← флаг ПЕРЕД отправкой — предотвращает дубли
+                    double tp2PnlPct = isLong
+                            ? (ts.tp2 - ts.entry) / ts.entry * 100
+                            : (ts.entry - ts.tp2) / ts.entry * 100;
+                    telegram.sendMessageAsync(String.format(
+                            "🔵 *TP2 ✓* %s %s | +%.2f%%\n"
+                                    + "💰 30%% позиции — фиксируй прибыль\n"
+                                    + "🛡 Трейлинг поднят → TP1 `%.6f`",
+                            ts.symbol, ts.side, tp2PnlPct, ts.tp1));
+                    LOG.info("[TR] TP2 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp2PnlPct));
                     // Перемещаем trailing до tp1 уровня
                     if (isLong) ts.trailingStop = Math.max(ts.trailingStop, ts.tp1);
                     else        ts.trailingStop = Math.min(ts.trailingStop, ts.tp1);
@@ -572,7 +588,12 @@ public final class BotMain {
                     isc.closeTrade(ts.symbol, ts.side, pnl);
                     markForecastRecord(ts.symbol + "_" + ts.side,
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
-                    // Suppress intermediate trailing stop notification to reduce spam.
+                    String trailEmoji = pnl > 0 ? "✅" : "⚠️";
+                    telegram.sendMessageAsync(String.format(
+                            "%s *TRAILING STOP* %s %s | PnL: %+.2f%%\n"
+                                    + "📌 Закрыто трейлингом на `%.6f`",
+                            trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                    LOG.info("[TR] TRAIL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 }
             }
         }
@@ -870,20 +891,19 @@ public final class BotMain {
 
     private static String buildStartMessage() {
         return String.format(
-                "🚀 *GodBot v15.0 ARCHITECTURE FIX*\n"
-                        + "15M Futures | 9-Factor Forecast | TOP-100\n"
+                "🚀 *GodBot PRO — Запущен*\n"
+                        + "📊 Фьючерсы 15M | TOP-100 пар | 9-факторный анализ\n"
                         + "───────────────────────────────\n"
-                        + "✅ [Дыра 1] ConcurrentLinkedDeque everywhere\n"
-                        + "✅ [Дыра 3] LR window 30→10 + acceleration\n"
-                        + "✅ [Дыра 4] Streak: win halves boost aggressively\n"
-                        + "✅ [KITE] VolatilitySqueezeGuard active\n"
-                        + "✅ ForecastEngine 9+1 факторов активен\n"
-                        + "✅ TrendPhase: EARLY/MID/LATE/EXHAUST\n"
-                        + "✅ Structural stops за swing high/low\n"
-                        + "✅ ISC с exponential streak decay\n"
-                        + "✅ Trailing stop FIXED (SHORT logic)\n"
-                        + "⏰ Тихие часы: UTC 01:00–05:00\n"
-                        + "📅 Daily report в 09:00 UTC\n"
+                        + "🔮 ForecastEngine — прогноз направления движения\n"
+                        + "📈 TrendPhase — определение фазы тренда (EARLY/MID/LATE/EXHAUST)\n"
+                        + "🛡 Структурные стопы — за swing high/low рынка\n"
+                        + "🎯 TP1 → TP2 → TP3 с трейлингом\n"
+                        + "⚡ WebSocket LiveFeed — сигналы без 14-минутной слепоты\n"
+                        + "🏦 ISC — контроль риска портфеля в реальном времени\n"
+                        + "🌐 GIC — глобальный контекст BTC + секторальные лидеры\n"
+                        + "───────────────────────────────\n"
+                        + "⏰ Тихие часы: UTC 01:00–05:00 (низкая ликвидность)\n"
+                        + "📅 Daily отчёт каждый день в 09:00 UTC\n"
                         + "───────────────────────────────\n"
                         + "🕐 %s (Warsaw)",
                 nowWarsawStr());

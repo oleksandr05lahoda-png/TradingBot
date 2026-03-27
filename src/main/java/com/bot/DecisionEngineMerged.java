@@ -288,7 +288,56 @@ public final class DecisionEngineMerged {
             this(symbol, side, price, stop, take, 2.0, probability, flags,
                     fundingRate, 0, oiChange, htfBias, CoinCategory.ALT);
         }
-        // Внутри public static final class TradeIdea ...
+        // ── Префиксы внутренних флагов движка — не показываем трейдеру ──────────
+        // Всё что начинается с этих префиксов — внутренняя механика анализатора.
+        // Трейдеру важны только: размер позиции, OBI, дельта объёма, конфлюэнция.
+        private static final java.util.Set<String> INTERNAL_FLAG_PREFIXES = java.util.Set.of(
+                "GIC_", "FC_", "PH_", "STRUCT_", "ATR_", "ADX_", "LATE_", "CRASH_CONF_",
+                "CONFL_", "HIGH_ATR", "BULL_DIV", "BEAR_DIV", "BULL_DIV_PENALTY",
+                "BEAR_DIV_PENALTY", "BULL_DIV_VOL_OVERRIDE", "BEAR_DIV_VOL_OVERRIDE",
+                "DIV_", "LONG_CRASH_PENALTY", "CLUST_", "LEXH_", "SEXH_", "REV_",
+                "ANTI_LAG_", "RSI_SHIFT_", "EARLY_VETO_", "EARLY_BULL", "EARLY_BEAR",
+                "BTC_CRASH", "BTC_ACCEL", "IMP_UP", "IMP_DN", "PULL_UP", "PULL_DN",
+                "COMP_BREAK_", "HH_HL", "LL_LH", "FVG_", "OB_", "LIQ_SWEEP_",
+                "VD_BUY", "VD_SELL", "VOL_SPIKE", "1H_BULL", "1H_BEAR", "2H_BULL",
+                "2H_BEAR", "1H2H_BULL", "1H2H_BEAR", "HTF_CONFLICT", "VWAP_BULL",
+                "VWAP_BEAR", "FR_NEG", "FR_POS", "FR_FALL", "FR_RISE", "OI_UP", "OI_DN",
+                "PUMP_HUNT_"
+        );
+
+        /** Флаги видимые трейдеру — размер, OBI, дельта, конфлюэнция, фаза */
+        private List<String> traderFlags() {
+            List<String> result = new java.util.ArrayList<>();
+            for (String f : flags) {
+                boolean internal = false;
+                for (String prefix : INTERNAL_FLAG_PREFIXES) {
+                    if (f.startsWith(prefix) || f.equals(prefix.replace("_",""))) {
+                        internal = true; break;
+                    }
+                }
+                // Показываем: SIZE=, OBI±, ΔBUY/ΔSELL, CONFL_L/S, HIGH_ATR, WEAK_SECTOR,
+                //             GIC_BOOST (как "BOOST"), EARLY_REV_PENALTY → "REV_WARN"
+                if (!internal) {
+                    result.add(f);
+                } else if (f.startsWith("SIZE=")) {
+                    result.add(f); // всегда показываем размер
+                } else if (f.startsWith("GIC_BOOST")) {
+                    result.add("📡 BTC_SYNC"); // BTC подтверждает направление
+                } else if (f.startsWith("GIC_WEAK")) {
+                    result.add("⚠️ BTC_WEAK"); // BTC под давлением
+                } else if (f.equals("GIC_BLOCK")) {
+                    result.add("🔴 BTC_BLOCK"); // BTC в crash режиме
+                } else if (f.equals("HIGH_ATR")) {
+                    result.add("⚡ VOLATILE"); // высокая волатильность — стоп шире
+                } else if (f.equals("WEAK_SECTOR")) {
+                    result.add("📉 СЕКТ_СЛАБ"); // сектор под давлением
+                } else if (f.startsWith("CONFL_L") || f.startsWith("CONFL_S")) {
+                    result.add("🔥 " + f); // конфлюэнция — много факторов согласны
+                }
+            }
+            return result;
+        }
+
         public String toTelegramString() {
             String emoji   = probability >= 83 ? "🔥" : probability >= 74 ? "✅"
                     : probability >= 65 ? "🟡" : "⚪";
@@ -301,45 +350,72 @@ public final class DecisionEngineMerged {
             double rp2Pct  = Math.abs(tp2 - price) / price * 100;
             double rp3Pct  = Math.abs(tp3 - price) / price * 100;
 
-            String flagStr = flags.isEmpty() ? "-" : String.join(", ", flags);
-            String time    = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
+            // Только флаги значимые для трейдера
+            List<String> tf = traderFlags();
+            String flagStr  = tf.isEmpty() ? "-" : String.join(", ", tf);
+
+            String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
                     .toLocalTime().withNano(0).toString();
 
+            // ── Блок дополнительной информации ───────────────────────────────────
             StringBuilder extra = new StringBuilder();
+
+            // Фандинг — только если значимый (>0.08%/8h)
             if (Math.abs(fundingRate) > 0.0008)
                 extra.append(String.format("%n💸 FR: %+.3f%%", fundingRate * 100));
             if (Math.abs(fundingDelta) > 0.0003)
                 extra.append(String.format(" Δ%+.3f%%", fundingDelta * 100));
+
+            // Открытый интерес
             if (Math.abs(oiChange) > 0.5)
                 extra.append(String.format(" | OI: %+.1f%%", oiChange));
+
+            // 2H bias + R/R
             if (!"NONE".equals(htfBias) && !htfBias.isEmpty())
-                extra.append(String.format("%n📊 2H Bias: %s", htfBias));
+                extra.append(String.format("%n📊 2H: %s", htfBias));
             if (rr > 0)
                 extra.append(String.format(" | R/R: 1:%.1f", rr));
 
-            // 🟢 ИСПРАВЛЕНИЕ: Добавляем данные ForecastEngine в вывод Telegram
+            // ── ForecastEngine — понятное описание для трейдера ──────────────────
             if (forecast != null) {
-                extra.append(String.format("%n🔮 Forecast: *%s* (Score: %+.2f) | Conf: %.0f%% | Move: %+.2f%% | Phase: %s",
-                        forecast.bias.name(),
-                        forecast.directionScore,
+                // Перевод bias в читаемый текст
+                String biasRu = switch (forecast.bias) {
+                    case STRONG_BULL -> "🟢 Сильный РОСТ";
+                    case BULL        -> "🟩 Рост";
+                    case NEUTRAL     -> "⬜ Нейтраль";
+                    case BEAR        -> "🟥 Падение";
+                    case STRONG_BEAR -> "🔴 Сильное ПАДЕНИЕ";
+                };
+                // Перевод фазы
+                String phaseRu = switch (forecast.trendPhase) {
+                    case EARLY      -> "🌱 Начало тренда";
+                    case MID        -> "📈 Середина тренда";
+                    case LATE       -> "⏳ Конец тренда";
+                    case EXHAUSTION -> "⛽ Истощение";
+                };
+                extra.append(String.format(
+                        "%n🔮 Прогноз: %s | %.0f%% уверенность | %+.2f%% ход%n"
+                                + "📍 Фаза: %s",
+                        biasRu,
                         forecast.confidence * 100.0,
                         forecast.projectedMovePct * 100.0,
-                        forecast.trendPhase));
+                        phaseRu));
             }
 
             return String.format(
                     "%s *%s* → *%s* %s%n"
-                            + "💰 Price:  `%.6f`%n"
-                            + "🎯 Prob:   *%.0f%%*%n"
-                            + "🛡 SL:     `%.6f`  (%.2f%% риска)%n"
-                            + "🟢 TP1:    `%.6f`  (+%.2f%%)  50%% → BE%n"
-                            + "🔵 TP2:    `%.6f`  (+%.2f%%)  30%%%n"
-                            + "💎 TP3:    `%.6f`  (+%.2f%%)  20%% трейл%n"
+                            + "💰 Цена:   `%.6f`%n"
+                            + "🎯 Вер-ть: *%.0f%%*%n"
+                            + "🛑 SL:     `%.6f`  (риск %.2f%%)%n"
+                            + "🟢 TP1:    `%.6f`  (+%.2f%%)  ← 50%% позиции%n"
+                            + "🔵 TP2:    `%.6f`  (+%.2f%%)  ← 30%% позиции%n"
+                            + "💎 TP3:    `%.6f`  (+%.2f%%)  ← 20%% трейл%n"
                             + "🏷 %s%s%n"
                             + "_⏰ %s_",
                     emoji, symbol, sideStr, catStr,
-                    price, probability, stop, riskPct, tp1, rp1Pct,
-                    tp2, rp2Pct, tp3, rp3Pct, flagStr, extra.toString(), time
+                    price, probability, stop, riskPct,
+                    tp1, rp1Pct, tp2, rp2Pct, tp3, rp3Pct,
+                    flagStr, extra.toString(), time
             );
         }
 
