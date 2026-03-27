@@ -384,15 +384,61 @@ public final class InstitutionalSignalCore {
     public double getCurrentHeat()   { return currentHeat; }
 
     /**
-     * Risk multiplier for position sizing.
-     * Streak guards and daily loss limiters removed. Kelly Criterion will dictate size.
+     * [ДЫРА №5] Адаптивный размер позиции на основе реальных последних 10 сделок.
+     *
+     * Было: бэктест влиял на 3% порога → практически бесполезно.
+     * Стало: смотрим на РЕАЛЬНЫЕ последние 10 сделок.
+     *   • 8-10 из 10 прибыльных → рынок на нашей стороне → ×1.20 (чуть агрессивнее)
+     *   • 5-7 из 10 прибыльных → норма → ×1.00
+     *   • 3-4 из 10 прибыльных → плохо → ×0.60 (сокращаем вдвое)
+     *   • 0-2 из 10 прибыльных → стоп → ×0.30 (минимальный риск, ждём восстановления)
+     *
+     * Это и есть то что делают профессиональные трейдеры: когда система
+     * не работает — уменьшай размер, не жди пока всё не сольёшь.
      */
     public double getRiskSizeMultiplier() {
-        double mult = 1.0;
+        // Собираем последние 10 РЕАЛЬНЫХ закрытых сделок (не ISC internal, а трейд-история)
+        List<ClosedTrade> recent = new ArrayList<>();
+        for (Deque<ClosedTrade> hist : tradeHistory.values()) {
+            recent.addAll(hist);
+        }
+        // Сортируем по времени закрытия, берём последние 10
+        recent.sort(Comparator.comparingLong(t -> t.closedAt));
+        int n = recent.size();
+        if (n < 3) {
+            // Недостаточно данных — осторожный старт
+            return lastBacktestEV < -0.02 ? 0.70 : 0.90;
+        }
+        int window = Math.min(10, n);
+        List<ClosedTrade> last10 = recent.subList(n - window, n);
+        long wins   = last10.stream().filter(ClosedTrade::isWin).count();
+        long losses = window - wins;
+
+        double mult;
+        if (wins >= (long)(window * 0.80)) {
+            mult = 1.20; // 8/10+ побед → рынок на нашей стороне
+        } else if (wins >= (long)(window * 0.55)) {
+            mult = 1.00; // норма
+        } else if (wins >= (long)(window * 0.35)) {
+            mult = 0.60; // плохая полоса → сокращаем вдвое
+        } else {
+            mult = 0.30; // стоп-режим → минимальный риск
+        }
+
+        // Дополнительный штраф если бэктест тоже говорит "плохо"
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L) {
             mult *= 0.80;
         }
-        return Math.max(0.20, Math.min(mult, 1.0));
+
+        // Консервативный лог для понимания режима
+        if (mult <= 0.30) {
+            log("⚠️ СТОП-РЕЖИМ: последние " + window + " сделок: " + wins + " побед/" + losses
+                    + " потерь. Позиции сокращены до 30%.");
+        } else if (mult <= 0.60) {
+            log("⚠️ ОСТОРОЖНЫЙ РЕЖИМ: " + wins + "/" + window + " побед. Позиции: 60%.");
+        }
+
+        return Math.max(0.20, Math.min(mult, 1.20));
     }
 
     public String getStats() {

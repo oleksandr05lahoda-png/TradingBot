@@ -48,6 +48,9 @@ public final class DecisionEngineMerged {
     private final Map<String, Deque<Double>>    relStrengthHistory = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger>    signalCountBySymbol = new ConcurrentHashMap<>();
 
+    // [ДЫРА №1] CVD — накопленная дельта объёма, устанавливается из SignalSender
+    private final Map<String, Double>           cvdMap           = new ConcurrentHashMap<>();
+
     // [v7.0] GIC reference
     private volatile com.bot.GlobalImpulseController gicRef = null;
     private com.bot.PumpHunter pumpHunter;
@@ -88,6 +91,11 @@ public final class DecisionEngineMerged {
         Deque<Double> hist = vdHistory.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         hist.addLast(Math.abs(delta));
         if (hist.size() > 50) hist.removeFirst();
+    }
+
+    /** [ДЫРА №1] CVD — устанавливается из SignalSender после вычисления накопленной дельты */
+    public void setCVD(String sym, double cvdNormalized) {
+        cvdMap.put(sym, cvdNormalized);
     }
 
     private double getVolumeDeltaRatio(String sym) {
@@ -241,13 +249,17 @@ public final class DecisionEngineMerged {
         // [v14.0] ForecastEngine integration
         public final com.bot.TradingCore.ForecastEngine.ForecastResult forecast;
         public final String trendPhase;
+        // [ДЫРА №6] Адаптивные множители TP по режиму рынка
+        public final double tp1Mult, tp2Mult, tp3Mult;
 
+        /** Главный конструктор — с адаптивными TP множителями */
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take, double rr,
                          double probability, List<String> flags,
                          double fundingRate, double fundingDelta,
                          double oiChange, String htfBias, CoinCategory cat,
-                         com.bot.TradingCore.ForecastEngine.ForecastResult forecast) {
+                         com.bot.TradingCore.ForecastEngine.ForecastResult forecast,
+                         double tp1Mult, double tp2Mult, double tp3Mult) {
             this.symbol = symbol; this.side = side;
             this.price = price; this.stop = stop; this.take = take;
             this.rr = rr; this.probability = probability;
@@ -256,37 +268,42 @@ public final class DecisionEngineMerged {
             this.oiChange = oiChange; this.htfBias = htfBias; this.category = cat;
             this.forecast = forecast;
             this.trendPhase = forecast != null ? forecast.trendPhase.name() : "UNKNOWN";
+            this.tp1Mult = tp1Mult; this.tp2Mult = tp2Mult; this.tp3Mult = tp3Mult;
 
             double risk = Math.abs(price - stop);
             boolean long_ = side == com.bot.TradingCore.Side.LONG;
-            this.tp1 = long_ ? price + risk * 1.0 : price - risk * 1.0;
-            this.tp2 = long_ ? price + risk * 2.0 : price - risk * 2.0;
-            this.tp3 = long_ ? price + risk * 3.2 : price - risk * 3.2;
+            this.tp1 = long_ ? price + risk * tp1Mult : price - risk * tp1Mult;
+            this.tp2 = long_ ? price + risk * tp2Mult : price - risk * tp2Mult;
+            this.tp3 = long_ ? price + risk * tp3Mult : price - risk * tp3Mult;
         }
 
-        // backward-compatible (no forecast)
+        /** Обратная совместимость — без адаптивных TP (стандартные 1.0/2.0/3.2) */
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take, double rr,
                          double probability, List<String> flags,
                          double fundingRate, double fundingDelta,
-                         double oiChange, String htfBias, CoinCategory cat) {
+                         double oiChange, String htfBias, CoinCategory cat,
+                         com.bot.TradingCore.ForecastEngine.ForecastResult forecast) {
             this(symbol, side, price, stop, take, rr, probability, flags,
-                    fundingRate, fundingDelta, oiChange, htfBias, cat, null);
+                    fundingRate, fundingDelta, oiChange, htfBias, cat, forecast,
+                    1.0, 2.0, 3.2);
         }
 
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take,
                          double probability, List<String> flags) {
+            // Цепочка: 7-arg → 14-arg (forecast=null) → 16-arg (tp mults=1.0/2.0/3.2)
             this(symbol, side, price, stop, take, 2.0, probability, flags,
-                    0, 0, 0, "NONE", CoinCategory.ALT);
+                    0, 0, 0, "NONE", CoinCategory.ALT, null);
         }
 
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
                          double price, double stop, double take,
                          double probability, List<String> flags,
                          double fundingRate, double oiChange, String htfBias) {
+            // Цепочка: 10-arg → 14-arg (forecast=null) → 16-arg (tp mults=1.0/2.0/3.2)
             this(symbol, side, price, stop, take, 2.0, probability, flags,
-                    fundingRate, 0, oiChange, htfBias, CoinCategory.ALT);
+                    fundingRate, 0, oiChange, htfBias, CoinCategory.ALT, null);
         }
         // ── Префиксы внутренних флагов движка — не показываем трейдеру ──────────
         // Всё что начинается с этих префиксов — внутренняя механика анализатора.
@@ -321,6 +338,20 @@ public final class DecisionEngineMerged {
                     result.add(f);
                 } else if (f.startsWith("SIZE=")) {
                     result.add(f); // всегда показываем размер
+                } else if (f.startsWith("LIQ_MAGNET")) {
+                    result.add("🧲 " + f); // магнит ликвидаций — важно трейдеру
+                } else if (f.equals("CVD_DIV⚠")) {
+                    result.add("⚠️ CVD_DIV"); // CVD дивергенция — предупреждение
+                } else if (f.startsWith("TP_TREND")) {
+                    result.add("📈 TP×TREND"); // расширенные TP в тренде
+                } else if (f.equals("TP_RANGE")) {
+                    result.add("↔️ TP×RANGE"); // укороченные TP в боковике
+                } else if (f.equals("TP_EXHAUST")) {
+                    result.add("⛽ TP×СКАЛЬП"); // скальп при истощении
+                } else if (f.equals("SESS_NY")) {
+                    result.add("🗽 NY_SESSION"); // сигнал в NY — лучшее качество
+                } else if (f.equals("SESS_LOW")) {
+                    result.add("🌙 LOW_SESSION"); // сигнал ночью — осторожно
                 } else if (f.startsWith("GIC_BOOST")) {
                     result.add("📡 BTC_SYNC"); // BTC подтверждает направление
                 } else if (f.startsWith("GIC_WEAK")) {
@@ -667,7 +698,7 @@ public final class DecisionEngineMerged {
         // КЛАСТЕР 3: VOLUME
         // ════════════════════════════════════════════════════════
 
-        // Volume Delta
+        // Volume Delta (мгновенная)
         Double vd = volumeDeltaMap.get(symbol);
         double vdRatio = getVolumeDeltaRatio(symbol);
         if (vd != null && vdRatio > 1.5) {
@@ -676,9 +707,28 @@ public final class DecisionEngineMerged {
             else        cVolume.addShort(vdScore, "VD_SELL");
         }
 
+        // [ДЫРА №1] CVD — Cumulative Volume Delta (90×1m накопленная)
+        // Вес 0.65 vs 0.14 у мгновенной дельты — CVD показывает реальные намерения.
+        // Если цена растёт, а CVD падает — институционалы ПРОДАЮТ в рост → ЛОВУШКА.
+        double cvdVal = cvdMap.getOrDefault(symbol, 0.0);
+        if (Math.abs(cvdVal) > 0.10) {
+            double cvdScore = mctx.s(Math.min(0.65, Math.abs(cvdVal) * 0.70));
+            if (cvdVal > 0) cVolume.addLong(cvdScore, "CVD_BUY");
+            else            cVolume.addShort(cvdScore, "CVD_SELL");
+            // Дивергенции проверяем СНАРУЖИ if-блоков — иначе мёртвый код
+            // Цена растёт (+) но CVD отрицательный → институционалы продают в рост → ЛОВУШКА
+            if (move5 > 0.002 && cvdVal < -0.10) cVolume.penalizeLong(0.60);
+            // Цена падает (−) но CVD положительный → ложный дамп, накопление → ВОЗМОЖНЫЙ РАЗВОРОТ
+            if (move5 < -0.002 && cvdVal > 0.10) cVolume.penalizeShort(0.60);
+        }
+        // CVD-дивергенция высокой уверенности (порог -0.15/+0.15) → добавляем в кластер
+        boolean cvdDivBear = move5 > 0.003 && cvdVal < -0.15;
+        boolean cvdDivBull = move5 < -0.003 && cvdVal > 0.15;
+        if (cvdDivBear) { cVolume.addShort(mctx.s(0.55), "CVD_DIV_BEAR"); allFlags.add("CVD_DIV⚠"); }
+        if (cvdDivBull) { cVolume.addLong(mctx.s(0.55),  "CVD_DIV_BULL"); allFlags.add("CVD_DIV⚠"); }
+
         // Volume Spike
         if (volumeSpike(c15, cat)) {
-            // Spike усиливает доминирующее направление движения
             if (move5 > 0) cVolume.boostLong(mctx.s(0.22), "VOL_SPIKE");
             else           cVolume.boostShort(mctx.s(0.22), "VOL_SPIKE");
         }
@@ -1276,10 +1326,52 @@ public final class DecisionEngineMerged {
         probability = Math.max(50, Math.min(85, probability));
         if (probability < minConf) return null;
 
-        return new TradeIdea(symbol, side, price, stopPrice, takePrice, rrRatio,
+        // ════════════════════════════════════════════════════════
+        // [ДЫРА №6] АДАПТИВНЫЕ TP ПО РЕЖИМУ РЫНКА
+        // Одни и те же множители TP для всех режимов — главная причина
+        // "недобора" в тренде и "перелёта" в боковике.
+        //
+        // RANGE:  цена ходит в канале → короткие TP, быстро фиксируем
+        // TREND:  цена идёт далеко → длинные TP, не закрываем рано
+        // EXHAUST: движение умирает → очень короткие TP, скальп
+        // ════════════════════════════════════════════════════════
+        double tp1Mult, tp2Mult, tp3Mult;
+        boolean isTrendState  = state == MarketState.STRONG_TREND;
+        boolean isRangeState  = state == MarketState.RANGE;
+        boolean isExhaustPhase = forecastResult != null
+                && forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
+        boolean isEarlyPhase  = forecastResult != null
+                && forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
+
+        if (isExhaustPhase) {
+            // Истощение — скальп, быстро берём что дают
+            tp1Mult = 0.70; tp2Mult = 1.20; tp3Mult = 1.80;
+            allFlags.add("TP_EXHAUST");
+        } else if (isRangeState) {
+            // Боковик — умеренные TP, TP3 часто не достигается
+            tp1Mult = 0.80; tp2Mult = 1.40; tp3Mult = 2.20;
+            allFlags.add("TP_RANGE");
+        } else if (isTrendState && isEarlyPhase) {
+            // Сильный тренд + начало движения — максимальные TP
+            tp1Mult = 1.30; tp2Mult = 2.60; tp3Mult = 4.20;
+            allFlags.add("TP_TREND_EARLY");
+        } else if (isTrendState) {
+            // Сильный тренд — расширяем TP
+            tp1Mult = 1.15; tp2Mult = 2.30; tp3Mult = 3.60;
+            allFlags.add("TP_TREND");
+        } else {
+            // Слабый тренд — стандарт
+            tp1Mult = 1.00; tp2Mult = 2.00; tp3Mult = 3.20;
+        }
+
+        // Пересчитываем rrRatio на основе выбранного tp3
+        double adaptiveRR = tp3Mult;
+
+        return new TradeIdea(symbol, side, price, stopPrice, takePrice, adaptiveRR,
                 probability, allFlags,
                 fundingRate, fundingDelta, oiChange, bias2h.name(), cat,
-                forecastResult);
+                forecastResult,
+                tp1Mult, tp2Mult, tp3Mult);
     }
 
     // ══════════════════════════════════════════════════════════════

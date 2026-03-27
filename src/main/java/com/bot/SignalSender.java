@@ -62,6 +62,22 @@ public final class SignalSender {
     private final Map<String, Long>   deltaWindowStart = new ConcurrentHashMap<>();
     private final Map<String, Double> deltaHistory     = new ConcurrentHashMap<>();
 
+    // ══ ДЫРА №1: CVD — Cumulative Volume Delta (покупки - продажи накопленные за 90×1m) ══
+    // Обычная дельта = мгновенный снимок. CVD = вся история намерений рынка.
+    // Если цена растёт, а CVD падает → ИНСТИТУЦИОНАЛЫ ПРОДАЮТ в рост → ЛОВУШКА.
+    private final Map<String, Double>        cvdMap     = new ConcurrentHashMap<>();
+    private static final int CVD_LOOKBACK_1M = 90; // 90×1m = 1.5h накопленной дельты
+
+    // ══ ДЫРА №2: Liquidation Heatmap — уровни принудительных ликвидаций ══
+    // Цена ВСЕГДА идёт туда где лежат ликвидации. Это физика фьючерсного рынка.
+    // Мы подписываемся на глобальный поток ликвидаций Binance (публичный, без ключей).
+    private final Map<String, java.util.NavigableMap<Double, Double>> liqHeatmap
+            = new ConcurrentHashMap<>();
+    private volatile WebSocket liqWebSocket = null;
+    private static final double LIQ_MIN_NOTIONAL = 50_000.0;  // игнорируем < $50k
+    private static final long   LIQ_DECAY_MS     = 30 * 60_000L; // ликвидации "протухают" за 30 мин
+    private final Map<String, Long> liqTimestamps = new ConcurrentHashMap<>();
+
     // Tick / WebSocket
     private final Map<String, Deque<Double>>      tickPriceDeque  = new ConcurrentHashMap<>();
     private final Map<String, Deque<Double>>      tickVolumeDeque = new ConcurrentHashMap<>();
@@ -324,6 +340,9 @@ public final class SignalSender {
             wsWatcher.scheduleAtFixedRate(this::refreshAccountBalance, 10, 120, TimeUnit.SECONDS);
         }
 
+        // [ДЫРА №2] Liquidation WebSocket — глобальный поток, без API ключа
+        udsExecutor.schedule(this::connectLiquidationStream, 8, TimeUnit.SECONDS);
+
         // WS health check
         wsWatcher.scheduleAtFixedRate(this::checkWsHealth, 30, 30, TimeUnit.SECONDS);
 
@@ -445,6 +464,9 @@ public final class SignalSender {
             microBuilders.remove(zombie);
             orderbookMap.remove(zombie);
             wsReconnectDelay.remove(zombie);
+            // [ДЫРА №1/№2] Очищаем CVD и ликвидации для ротированных пар
+            cvdMap.remove(zombie);
+            liqHeatmap.remove(zombie);
             // Clean candle caches for all timeframes
             for (String tf : List.of("1m","5m","15m","1h","2h")) {
                 candleCache.remove(zombie + "_" + tf);
@@ -499,6 +521,10 @@ public final class SignalSender {
             List<com.bot.TradingCore.Candle> h2  = getCached(pair, "2h",  120);
 
             if (m1 != null && !m1.isEmpty()) updateLiveM1Buffer(pair, m1);
+
+            // [ДЫРА №1] CVD — считаем накопленную дельту из 1m свечей
+            double cvdNormalized = computeAndStoreCVD(pair, m1);
+            decisionEngine.setCVD(pair, cvdNormalized);
 
             if (m15 == null || m15.size() < 160 || h1 == null || h1.size() < 160) return null;
 
@@ -643,6 +669,31 @@ public final class SignalSender {
             List<String> nf = new ArrayList<>(idea.flags);
             nf.add(String.format("SIZE=%.1f$", posSize));
             idea = rebuildIdea(idea, idea.probability, nf);
+
+            // [ДЫРА №4] SESSION WEIGHT — корректируем вероятность по рыночной сессии
+            double sessionW = getSessionWeight();
+            if (sessionW != 1.0) {
+                List<String> sf = new ArrayList<>(idea.flags);
+                if (sessionW < 1.0) {
+                    double penalty = (1.0 - sessionW) * 18; // до -5.4 в Азию
+                    sf.add("SESS_LOW");
+                    idea = rebuildIdea(idea, Math.max(50, idea.probability - penalty), sf);
+                } else {
+                    double boost = (sessionW - 1.0) * 10; // до +2 в NY
+                    sf.add("SESS_NY");
+                    idea = rebuildIdea(idea, Math.min(85, idea.probability + boost), sf);
+                }
+            }
+
+            // [ДЫРА №2] LIQUIDATION SCORE — усиливаем сигнал если рядом крупные ликвидации
+            double atrForLiq = com.bot.TradingCore.atr(m15, 14);
+            double liqScore  = getLiquidationScore(pair, idea.price, atrForLiq, idea.side);
+            if (liqScore > 0.25) {
+                List<String> lf = new ArrayList<>(idea.flags);
+                lf.add(String.format("LIQ_MAGNET+%.0f%%", liqScore * 100));
+                double liqBoost = liqScore * 8; // max +8 к вероятности
+                idea = rebuildIdea(idea, Math.min(85, idea.probability + liqBoost), lf);
+            }
 
             if (!isc.allowSignal(idea)) return null;
             isc.registerSignal(idea);
@@ -1072,7 +1123,9 @@ public final class SignalSender {
         return new com.bot.DecisionEngineMerged.TradeIdea(
                 idea.symbol, idea.side, idea.price, newStop, idea.take, idea.rr,
                 idea.probability, nf, idea.fundingRate, idea.fundingDelta,
-                idea.oiChange, idea.htfBias, idea.category);
+                idea.oiChange, idea.htfBias, idea.category,
+                idea.forecast,
+                idea.tp1Mult, idea.tp2Mult, idea.tp3Mult);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1470,7 +1523,162 @@ public final class SignalSender {
     }
 
     private com.bot.DecisionEngineMerged.TradeIdea rebuildIdea(com.bot.DecisionEngineMerged.TradeIdea src, double p, List<String> f) {
-        return new com.bot.DecisionEngineMerged.TradeIdea(src.symbol, src.side, src.price, src.stop, src.take, src.rr, p, f, src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category);
+        // Передаём адаптивные TP-множители из оригинала — они не должны теряться при перестройке
+        return new com.bot.DecisionEngineMerged.TradeIdea(
+                src.symbol, src.side, src.price, src.stop, src.take, src.rr, p, f,
+                src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category,
+                src.forecast,
+                src.tp1Mult, src.tp2Mult, src.tp3Mult);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [ДЫРА №1] CVD — Cumulative Volume Delta
+    //  takerBuyBaseVolume приходит в каждом kline — уже в Candle.
+    //  Накапливаем за CVD_LOOKBACK_1M свечей (по умолчанию 90×1m).
+    //  Нормализуем: [-1..+1], где +1 = 100% объём — покупки, -1 = 100% продажи.
+    // ══════════════════════════════════════════════════════════════
+
+    public double computeAndStoreCVD(String pair, List<com.bot.TradingCore.Candle> m1) {
+        if (m1 == null || m1.size() < 5) return 0.0;
+        int start = Math.max(0, m1.size() - CVD_LOOKBACK_1M);
+        double cvd = 0, totalVol = 0;
+        for (int i = start; i < m1.size(); i++) {
+            com.bot.TradingCore.Candle c = m1.get(i);
+            double buyVol  = c.takerBuyBaseVolume;
+            double sellVol = c.volume - buyVol;
+            cvd      += (buyVol - sellVol);
+            totalVol += c.volume;
+        }
+        // Нормализуем на суммарный объём → [-1..+1]
+        double normalized = totalVol > 0 ? clamp(cvd / totalVol, -1.0, 1.0) : 0.0;
+        cvdMap.put(pair, normalized);
+        return normalized;
+    }
+
+    public double getCVD(String pair) {
+        return cvdMap.getOrDefault(pair, 0.0);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [ДЫРА №4] SESSION WEIGHT — рыночные сессии по UTC
+    //  Сигналы в NY/London несут в 1.5× больше веса чем сигналы
+    //  в 3 ночи UTC (азиатская сессия с ложными пробоями).
+    // ══════════════════════════════════════════════════════════════
+
+    private static double getSessionWeight() {
+        int h = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getHour();
+        // NY открытие + London/NY overlap — лучшее качество сигналов
+        if (h >= 13 && h <= 16) return 1.20; // NY open (13-16 UTC) — максимальный объём
+        if (h >= 7  && h <= 10) return 1.10; // London open (07-10 UTC) — strong moves
+        if (h >= 10 && h <= 13) return 1.00; // London/NY overlap — норма
+        if (h >= 17 && h <= 22) return 0.90; // NY afternoon — затихает
+        // Азия / ночь — ложные пробои, низкая ликвидность
+        return 0.70;                          // 00-07, 22-24 UTC
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [ДЫРА №2] LIQUIDATION HEATMAP
+    //  Подписка на публичный WebSocket поток Binance: !forceOrder@arr
+    //  Собираем ликвидации в ценовые уровни (bucket = 0.1% от цены).
+    //  getLiquidationScore() возвращает 0..1 — насколько сильный
+    //  магнит ликвидаций находится вблизи текущей цены.
+    // ══════════════════════════════════════════════════════════════
+
+    private void connectLiquidationStream() {
+        try {
+            http.newWebSocketBuilder()
+                    .buildAsync(URI.create("wss://fstream.binance.com/ws/!forceOrder@arr"),
+                            new WebSocket.Listener() {
+                                private final StringBuilder buf = new StringBuilder();
+
+                                @Override
+                                public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
+                                    buf.append(data);
+                                    if (last) {
+                                        try { processLiquidationEvent(new org.json.JSONObject(buf.toString())); }
+                                        catch (Exception ignored) {}
+                                        buf.setLength(0);
+                                    }
+                                    ws.request(1);
+                                    return CompletableFuture.completedFuture(null);
+                                }
+
+                                @Override
+                                public void onError(WebSocket ws, Throwable err) {
+                                    liqWebSocket = null;
+                                    udsExecutor.schedule(SignalSender.this::connectLiquidationStream, 15, TimeUnit.SECONDS);
+                                }
+
+                                @Override
+                                public CompletionStage<?> onClose(WebSocket ws, int code, String reason) {
+                                    liqWebSocket = null;
+                                    udsExecutor.schedule(SignalSender.this::connectLiquidationStream, 5, TimeUnit.SECONDS);
+                                    return CompletableFuture.completedFuture(null);
+                                }
+                            })
+                    .thenAccept(ws -> {
+                        liqWebSocket = ws;
+                        System.out.println("[LIQ] ✅ Liquidation stream connected");
+                    })
+                    .exceptionally(ex -> {
+                        System.out.println("[LIQ] Connect failed: " + ex.getMessage());
+                        udsExecutor.schedule(this::connectLiquidationStream, 30, TimeUnit.SECONDS);
+                        return null;
+                    });
+        } catch (Exception e) {
+            System.out.println("[LIQ] Error: " + e.getMessage());
+        }
+    }
+
+    private void processLiquidationEvent(org.json.JSONObject event) {
+        try {
+            org.json.JSONObject o = event.optJSONObject("o");
+            if (o == null) return;
+            String symbol   = o.optString("s");
+            double avgPrice = o.optDouble("ap", 0);
+            double qty      = o.optDouble("q", 0);
+            String side     = o.optString("S"); // BUY = short был ликвидирован, SELL = long был
+            if (avgPrice <= 0 || qty <= 0) return;
+
+            double notional = avgPrice * qty;
+            if (notional < LIQ_MIN_NOTIONAL) return; // игнорируем мелкие
+
+            // Ценовой bucket: округляем до 0.1% от цены
+            double bucketSize = avgPrice * 0.001;
+            double bucket = Math.round(avgPrice / bucketSize) * bucketSize;
+
+            java.util.NavigableMap<Double, Double> heatmap = liqHeatmap
+                    .computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentSkipListMap<>());
+            heatmap.merge(bucket, notional, Double::sum);
+            liqTimestamps.put(symbol + "_" + bucket, System.currentTimeMillis());
+
+            // Удаляем протухшие уровни (> 30 минут)
+            long now = System.currentTimeMillis();
+            heatmap.entrySet().removeIf(e ->
+                    now - liqTimestamps.getOrDefault(symbol + "_" + e.getKey(), 0L) > LIQ_DECAY_MS);
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Возвращает "магнетизм" ликвидаций около текущей цены.
+     * 0.0 = нет значимых ликвидаций рядом.
+     * 1.0 = крупный скопившийся пул (>$5M) в пределах 1×ATR.
+     * Если цена движется К этому уровню → усиливает сигнал.
+     * Если цена движется ОТ него → ослабляет.
+     */
+    public double getLiquidationScore(String pair, double price, double atr,
+                                      com.bot.TradingCore.Side side) {
+        java.util.NavigableMap<Double, Double> heatmap = liqHeatmap.get(pair);
+        if (heatmap == null || heatmap.isEmpty()) return 0.0;
+        double range = atr * 1.5;
+        double liqAbove = heatmap.subMap(price, price + range)
+                .values().stream().mapToDouble(Double::doubleValue).sum();
+        double liqBelow = heatmap.subMap(price - range, price)
+                .values().stream().mapToDouble(Double::doubleValue).sum();
+        // LONG сигнал усиливается если ликвидации SHORT выше (цена пойдёт их собирать)
+        // SHORT сигнал усиливается если ликвидации LONG ниже
+        double relevant = (side == com.bot.TradingCore.Side.LONG) ? liqAbove : liqBelow;
+        return clamp(relevant / 5_000_000.0, 0.0, 1.0); // нормализуем на $5M
     }
 
     private void logCycleStats() {

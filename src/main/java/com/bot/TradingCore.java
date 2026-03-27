@@ -1571,20 +1571,43 @@ public final class TradingCore {
             dir = clamp(dir, -1.0, 1.0);
 
             // ═══════════════════════════════════════════════════════
-            // STEP 6: Confidence = how many signals agree?
+            // STEP 6: Confidence = взвешенное согласие факторов
+            // [ДЫРА №3] Раньше все факторы имели одинаковый вес.
+            // HTF (часовой тренд) и OF (orderflow/CVD) = фундаментальные.
+            // LR_8 и FISHER = быстрые осцилляторы, менее надёжны.
+            // Веса: HTF×3, OF×3, SWING×2, EXHAUST×2, LR×1, FISHER×1
             // ═══════════════════════════════════════════════════════
             double conf;
             if (squeezed) {
-                conf = 0.15; // Almost zero confidence in squeeze
+                conf = 0.15;
             } else if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
                 conf = clamp(0.50 + exhaustionScore * 0.30, 0.50, 0.85);
             } else {
-                int agree = 0;
-                double dirSign = Math.signum(dir);
-                for (double v : f.values()) {
-                    if (Math.signum(v) == dirSign && Math.abs(v) > 0.10) agree++;
+                // Взвешенные веса по классу фактора
+                final Map<String, Double> FACTOR_WEIGHTS = Map.of(
+                        "HTF",      3.0,   // часовой тренд — самый надёжный
+                        "OF",       3.0,   // orderflow/CVD — институциональный след
+                        "SWING",    2.0,   // рыночная структура HH/HL
+                        "EXHAUSTION", 2.0, // истощение движения
+                        "LR_8",     1.0,   // быстрый slope — шумный
+                        "FISHER",   1.0,   // осциллятор — вторичный
+                        "VPOC_PULL",1.5,   // объёмный профиль — хорошо
+                        "SQUEEZE",  0.5    // сжатие — низкая информативность
+                );
+                double dirSign      = Math.signum(dir);
+                double weightedAgree = 0, totalWeight = 0;
+                for (Map.Entry<String, Double> fe : f.entrySet()) {
+                    double w = FACTOR_WEIGHTS.getOrDefault(fe.getKey(), 1.0);
+                    totalWeight += w;
+                    if (Math.signum(fe.getValue()) == dirSign && Math.abs(fe.getValue()) > 0.10)
+                        weightedAgree += w;
                 }
-                conf = clamp(0.25 + (double) agree / f.size() * 0.50 + Math.abs(dir) * 0.20, 0.10, 0.85);
+                double agreeRatio = totalWeight > 0 ? weightedAgree / totalWeight : 0;
+                conf = clamp(0.20 + agreeRatio * 0.55 + Math.abs(dir) * 0.20, 0.10, 0.85);
+                // Бонус если HTF И OF оба согласны — это самый надёжный паттерн
+                boolean htfAgrees = Math.signum(f.getOrDefault("HTF", 0.0)) == dirSign;
+                boolean ofAgrees  = Math.signum(f.getOrDefault("OF",  0.0)) == dirSign;
+                if (htfAgrees && ofAgrees) conf = clamp(conf + 0.08, 0, 0.85);
             }
 
             // ═══════════════════════════════════════════════════════

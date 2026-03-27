@@ -374,7 +374,7 @@ public final class SignalOptimizer {
         return new com.bot.DecisionEngineMerged.TradeIdea(
                 signal.symbol, signal.side, signal.price, signal.stop, signal.take,
                 signal.rr, adjusted, nf, signal.fundingRate, signal.fundingDelta,
-                signal.oiChange, signal.htfBias, signal.category);
+                signal.oiChange, signal.htfBias, signal.category, signal.forecast);
     }
 
     // ══════════════════════════════════════════════════════════════
