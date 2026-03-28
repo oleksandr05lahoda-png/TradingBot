@@ -670,20 +670,21 @@ public final class SignalSender {
             nf.add(String.format("SIZE=%.1f$", posSize));
             idea = rebuildIdea(idea, idea.probability, nf);
 
-            // [ДЫРА №4] SESSION WEIGHT — корректируем вероятность по рыночной сессии
+            // [v25.0] SESSION WEIGHT → FLAG + SIZE REDUCTION ONLY.
+            // Session context predicts LIQUIDITY, not signal direction.
+            // Low liquidity = smaller position. Signal validity is unchanged.
+            // Probability modification removed — it was incorrectly killing valid setups at 03:00 UTC.
             double sessionW = getSessionWeight();
-            if (sessionW != 1.0) {
-                List<String> sf = new ArrayList<>(idea.flags);
-                if (sessionW < 1.0) {
-                    double penalty = (1.0 - sessionW) * 18; // до -5.4 в Азию
-                    sf.add("SESS_LOW");
-                    idea = rebuildIdea(idea, Math.max(50, idea.probability - penalty), sf);
-                } else {
-                    double boost = (sessionW - 1.0) * 10; // до +2 в NY
-                    sf.add("SESS_NY");
-                    idea = rebuildIdea(idea, Math.min(85, idea.probability + boost), sf);
-                }
+            List<String> sf = new ArrayList<>(idea.flags);
+            if (sessionW < 0.85) {
+                sf.add("SESS_LOW");    // carried to SignalSender for size reduction
+            } else if (sessionW >= 1.20) {
+                sf.add("SESS_NY");     // London/NY overlap — max liquidity
+            } else if (sessionW >= 1.10) {
+                sf.add("SESS_LONDON"); // London open
             }
+            // NO probability modification. Size is adjusted in getPositionSizeUsdt() via sessionW.
+            idea = rebuildIdea(idea, idea.probability, sf);
 
             // [ДЫРА №2] LIQUIDATION SCORE — усиливаем сигнал если рядом крупные ликвидации
             double atrForLiq = com.bot.TradingCore.atr(m15, 14);
@@ -807,6 +808,22 @@ public final class SignalSender {
 
         double riskUsdt  = balance * riskPct;
         riskUsdt *= isc.getRiskSizeMultiplier();
+
+        // [v25.0] SESSION LIQUIDITY → size multiplier (was probability penalty — wrong approach).
+        // Low liquidity session = smaller position to compensate wider spreads & slippage.
+        // Probability is NOT modified — the SIGNAL is valid; only execution risk changes.
+        double sessionW = getSessionWeight();
+        if (sessionW < 0.85) {
+            riskUsdt *= Math.max(0.50, sessionW); // Asia/night: max 50% of normal size
+        } else if (sessionW >= 1.20) {
+            riskUsdt *= 1.10; // NY open: slight size boost — highest liquidity
+        }
+
+        // [v25.0] LATE_ENTRY flag → reduce size 20% (signal is valid but half the move is done)
+        if (idea.flags.contains("LATE_ENTRY_SIZE_CUT")) {
+            riskUsdt *= 0.80;
+        }
+
         double stopPct   = Math.max(0.005, Math.abs(idea.price - idea.stop) / idea.price);
         double posSize   = riskUsdt / stopPct;
 

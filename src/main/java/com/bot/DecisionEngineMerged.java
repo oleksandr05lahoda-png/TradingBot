@@ -508,6 +508,78 @@ public final class DecisionEngineMerged {
     }
 
     // ══════════════════════════════════════════════════════════════
+    //  [v25.0] 5m BREAK OF STRUCTURE / CHANGE OF CHARACTER
+    //  Primary entry trigger: fires 1-3 bars BEFORE 15m structure confirms.
+    //  BoS  = breakout WITH the HTF trend  → strong signal (score 0.62)
+    //  ChoCh = breakout AGAINST HTF trend  → counter-trend caution (score 0.42)
+    // ══════════════════════════════════════════════════════════════
+
+    private static final class BosResult {
+        final boolean detected;
+        final boolean isBullish;  // true = BoS up (buy break), false = BoS down (sell break)
+        final boolean isChoch;    // true = Change of Character (counter-trend)
+        final double  swingLevel; // the level that was broken
+        BosResult(boolean d, boolean b, boolean c, double l) {
+            detected = d; isBullish = b; isChoch = c; swingLevel = l;
+        }
+        static BosResult none() { return new BosResult(false, false, false, 0); }
+    }
+
+    /**
+     * Detect a Break of Structure on 5m candles.
+     * Algorithm:
+     *   1. Find the most recent confirmed pivot high and pivot low
+     *      (a bar whose high/low exceeds both 2 neighbours on each side).
+     *   2. If the last closed 5m candle's close is ABOVE the pivot high → BoS Bullish.
+     *   3. If the last closed 5m candle's close is BELOW the pivot low  → BoS Bearish.
+     *   4. If BoS direction is OPPOSITE to htfStructure (±1) → label as ChoCh.
+     *
+     * @param c5          List of 5-minute candles (at least 20 required)
+     * @param htfStructure 15m market structure: +1=bullish, -1=bearish, 0=neutral
+     */
+    private static BosResult detectBoS(List<com.bot.TradingCore.Candle> c5, int htfStructure) {
+        if (c5 == null || c5.size() < 20) return BosResult.none();
+        int n = c5.size();
+
+        double lastSwingHigh = 0;
+        double lastSwingLow  = Double.MAX_VALUE;
+
+        // Scan for pivot points in [2, n-3] — need 2 bars on each side confirmed
+        for (int i = 2; i < n - 2; i++) {
+            double hi = c5.get(i).high;
+            double lo = c5.get(i).low;
+
+            boolean pivotHigh = hi > c5.get(i - 1).high && hi > c5.get(i - 2).high
+                    && hi > c5.get(i + 1).high && hi > c5.get(i + 2).high;
+            boolean pivotLow  = lo < c5.get(i - 1).low  && lo < c5.get(i - 2).low
+                    && lo < c5.get(i + 1).low  && lo < c5.get(i + 2).low;
+
+            if (pivotHigh) lastSwingHigh = Math.max(lastSwingHigh, hi);
+            if (pivotLow)  lastSwingLow  = Math.min(lastSwingLow,  lo);
+        }
+
+        double lastClose = c5.get(n - 1).close;
+
+        // Require a confirmed close BEYOND the swing level (not just wick)
+        boolean bosBull = lastSwingHigh > 0
+                && lastClose > lastSwingHigh * 1.00025; // +0.025% buffer vs noise
+        boolean bosBear = lastSwingLow < Double.MAX_VALUE
+                && lastClose < lastSwingLow  * 0.99975; // -0.025% buffer
+
+        if (!bosBull && !bosBear) return BosResult.none();
+
+        // ChoCh = BoS direction is AGAINST the higher-timeframe structure
+        boolean choch = (bosBull && htfStructure == -1) || (bosBear && htfStructure == 1);
+
+        return new BosResult(
+                true,
+                bosBull,
+                choch,
+                bosBull ? lastSwingHigh : lastSwingLow
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════
     //  CORE GENERATE — v7.0 CLUSTER ARCHITECTURE
     // ══════════════════════════════════════════════════════════════
 
@@ -574,6 +646,27 @@ public final class DecisionEngineMerged {
         ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
         List<String> allFlags = new ArrayList<>();
         if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
+
+        // ════════════════════════════════════════════════════════
+        // [v25.0] 5m BREAK OF STRUCTURE — PRIMARY ENTRY TRIGGER
+        // Fires 1-3 bars before 15m structure confirms.
+        // BoS aligned with HTF → high-conviction structural entry.
+        // ChoCh against HTF → early reversal caution (lower score).
+        // ════════════════════════════════════════════════════════
+        int htfStructure15 = marketStructure(c15); // reuse: +1 bull, -1 bear, 0 neutral
+        BosResult bos5 = detectBoS(c5, htfStructure15);
+        if (bos5.detected) {
+            // BoS confirmed with HTF trend = strong confluence entry
+            // ChoCh against HTF = possible reversal but weaker conviction
+            double bosBaseScore = bos5.isChoch ? 0.42 : 0.62;
+            double bosScore = mctx.s(bosBaseScore);
+            if (bos5.isBullish) {
+                cStructure.addLong(bosScore, bos5.isChoch ? "CHOCH_UP_5M" : "BOS_UP_5M");
+            } else {
+                cStructure.addShort(bosScore, bos5.isChoch ? "CHOCH_DN_5M" : "BOS_DN_5M");
+            }
+            allFlags.add(String.format("BOS5_LVL=%.4f", bos5.swingLevel));
+        }
 
         // ════════════════════════════════════════════════════════
         // [CLUSTER 0] BTC CRASH — прямой override, ДО кластеров
@@ -1098,17 +1191,55 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // [v23.0] PENALTY APPLICATION — all collected flags → probability adjustments
-        // This replaces 7+ scattered `return null` with ONE probability gate.
+        // [v25.0] WEIGHTED ENSEMBLE — replaces additive penalty hell.
+        // Each factor VOTES with a weight [-1..+1].
+        // Total adjustment is capped at [-14, +8] — no single factor
+        // can kill a signal with 5/6 agreeing clusters.
+        //
+        // RATIONALE: Old code applied flat -8, -10, -12, -15 subtractions
+        // independently. A valid 4-cluster TREND setup with a slightly late
+        // entry could lose -41 points and die at 50. That was a bug, not logic.
         // ════════════════════════════════════════════════════════
-        if (adxRangePenalty) probability = Math.max(50, probability - 8);
-        if (lateEntryPenalty) probability = Math.max(50, probability - 10);
-        if (volumeOpposes && !aggressiveShort) probability = Math.max(50, probability - 6);
-        if (clusterPenalty) probability = Math.max(50, probability - 12);
-        if (scoreDiffPenalty) probability = Math.max(50, probability - 15);
-        if (dynThreshPenalty) probability = Math.max(50, probability - 10);
+
+        // Factor 1: Structure/cluster agreement  [weight 35%]
+        double activeScore = (side == com.bot.TradingCore.Side.LONG) ? scoreLong : scoreShort;
+        double structVote  = Math.min(1.0, activeScore / 2.5);               // 0..+1
+        double ensAdj      = structVote * 0.35 * 14.0;
+
+        // Factor 2: Volume alignment             [weight 25%]
+        double volVote = volumeOpposes ? -0.8 : (volumeSupports ? 0.6 : 0.0);
+        ensAdj += volVote * 0.25 * 14.0;
+
+        // Factor 3: ADX context                  [weight 15%]
+        double adxVal25 = adx(c15, 14);
+        double adxVote  = adxRangePenalty ? -0.5 : (adxVal25 > 25 ? 0.7 : 0.2);
+        ensAdj += adxVote * 0.15 * 14.0;
+
+        // Factor 4: Entry timing                 [weight 15%]
+        // LATE = signal still valid, but size should shrink downstream.
+        // We give only a mild probability dip — NOT a kill.
+        double lateVote = lateEntryPenalty ? -0.35 : 0.0;
+        ensAdj += lateVote * 0.15 * 14.0;
+
+        // Factor 5: Cluster count adequacy       [weight 10%]
+        int activeClCount = (side == com.bot.TradingCore.Side.LONG) ? longClusters : shortClusters;
+        double clVote = clusterPenalty ? -0.65 : (activeClCount >= 4 ? 0.55 : 0.0);
+        ensAdj += clVote * 0.10 * 14.0;
+
+        // Cap: ensemble cannot exceed these bounds.
+        // scoreDiffPenalty and dynThreshPenalty are represented
+        // by their contributing factors above — no extra flat deduction.
+        ensAdj = Math.max(-14.0, Math.min(+8.0, ensAdj));
+        probability = Math.max(50.0, Math.min(88.0, probability + ensAdj));
+
+        // Exhaustion score crush: score already penalized upstream via cluster multiply.
+        // Apply only a capped -7 here (was -12 flat).
         if (allFlags.contains("LEXH_SCORE_CRUSHED") || allFlags.contains("SEXH_SCORE_CRUSHED"))
-            probability = Math.max(50, probability - 12);
+            probability = Math.max(50, probability - 7);
+
+        // LATE_ENTRY → carry flag for position-size reduction in SignalSender.
+        // Probability already mildly dipped above. No further deduction needed.
+        if (lateEntryPenalty) allFlags.add("LATE_ENTRY_SIZE_CUT");
 
         double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf);
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {

@@ -131,9 +131,14 @@ public final class BotMain {
         final double          forecastScore;
 
         // [v14.0 FIX #1] Добавлен tp2Hit флаг
-        volatile boolean tp1Hit        = false;
-        volatile boolean tp2Hit        = false; // ← NEW: предотвращает дубли TP2 сообщений
-        volatile double  trailingStop  = 0;
+        volatile boolean tp1Hit          = false;
+        volatile boolean tp2Hit          = false; // ← NEW: предотвращает дубли TP2 сообщений
+        volatile double  trailingStop    = 0;
+
+        // [v25.0] Chandelier Exit — активируется при +0.8% от entry, до TP1.
+        // Позволяет закрыть позицию с прибылью если цена разворачивается
+        // не дойдя до TP1. ATR-based trailing на 1m свечах.
+        volatile boolean chandelierActive = false;
 
         // [v24.0 FIX] NEGATIVE_INFINITY for max search (Double.MIN_VALUE = tiny positive number)
         private double  extremeLow    = Double.MAX_VALUE;
@@ -447,8 +452,10 @@ public final class BotMain {
 
             // ── Получаем свежие 1m candles ──────────────────────
             double priceClose;
+            double atr14Trail = 0; // [v25.0] 1m ATR for Chandelier Exit
             try {
-                List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 4);
+                // [v25.0] Fetch 20 bars (was 4) — needed for 14-bar ATR calculation
+                List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 20);
                 if (candles == null || candles.isEmpty()) continue;
 
                 double newLow = Double.MAX_VALUE, newHigh = Double.NEGATIVE_INFINITY;
@@ -460,6 +467,20 @@ public final class BotMain {
 
                 // [v14.0 FIX #6] Thread-safe extreme update
                 ts.updateExtremes(newLow, newHigh);
+
+                // [v25.0] Compute 1m ATR(14) for Chandelier Exit
+                int atrN = Math.min(14, candles.size() - 1);
+                if (atrN >= 3) {
+                    double trSum = 0;
+                    for (int ci = candles.size() - atrN; ci < candles.size(); ci++) {
+                        com.bot.TradingCore.Candle cc = candles.get(ci);
+                        double prevClose = candles.get(ci - 1).close;
+                        trSum += Math.max(cc.high - cc.low,
+                                Math.max(Math.abs(cc.high - prevClose),
+                                        Math.abs(cc.low  - prevClose)));
+                    }
+                    atr14Trail = trSum / atrN;
+                }
             } catch (Exception e) {
                 LOG.fine("[TR] Fetch fail for " + ts.symbol + ": " + e.getMessage());
                 continue;
@@ -470,6 +491,75 @@ public final class BotMain {
             boolean isLong = ts.side == com.bot.TradingCore.Side.LONG;
             double extremeLow  = ts.getExtremeLow();
             double extremeHigh = ts.getExtremeHigh();
+
+            // ════════════════════════════════════════════════════
+            // [v25.0] CHANDELIER EXIT — activates at +0.8% profit,
+            // BEFORE TP1. Prevents giving back open profit when the
+            // trade reverses without hitting TP1.
+            //
+            // Formula (LONG):  chandelier = extremeHigh - ATR(1m,14) * 2.2
+            // Formula (SHORT): chandelier = extremeLow  + ATR(1m,14) * 2.2
+            //
+            // Activation threshold: +0.8% favourable move from entry.
+            // Once active: trailing floor is NEVER moved against the trade.
+            // ════════════════════════════════════════════════════
+            if (!ts.tp1Hit && atr14Trail > 0) {
+                double activationPct = isLong
+                        ? (extremeHigh - ts.entry) / ts.entry
+                        : (ts.entry - extremeLow)  / ts.entry;
+
+                if (activationPct >= 0.008 && !ts.chandelierActive) {
+                    ts.chandelierActive = true;
+                    // Initialise trailing at breakeven (entry) — never below that
+                    ts.trailingStop = ts.entry;
+                    LOG.info("[TR] CHANDELIER ACTIVATED: " + ts.symbol
+                            + " " + ts.side + " move=" + String.format("%.2f%%", activationPct * 100));
+                }
+
+                if (ts.chandelierActive) {
+                    double chandelierMult = 2.2; // ATR multiplier — tighter than TP1 trail (0.50)
+                    if (isLong) {
+                        double level = extremeHigh - atr14Trail * chandelierMult;
+                        // Never trail BELOW entry (breakeven floor)
+                        level = Math.max(level, ts.entry);
+                        // Only move trailing UP (ratchet)
+                        if (ts.trailingStop == 0 || level > ts.trailingStop)
+                            ts.trailingStop = level;
+                    } else {
+                        double level = extremeLow + atr14Trail * chandelierMult;
+                        // Never trail ABOVE entry (breakeven floor for SHORT)
+                        level = Math.min(level, ts.entry);
+                        // Only move trailing DOWN (ratchet)
+                        if (ts.trailingStop == 0 || level < ts.trailingStop)
+                            ts.trailingStop = level;
+                    }
+
+                    // Check if chandelier stop was hit
+                    boolean chandelierHit = isLong
+                            ? priceClose <= ts.trailingStop
+                            : priceClose >= ts.trailingStop;
+
+                    if (chandelierHit) {
+                        double pnl = isLong
+                                ? (ts.trailingStop - ts.entry) / ts.entry * 100
+                                : (ts.entry - ts.trailingStop) / ts.entry * 100;
+                        it.remove();
+                        isc.registerConfirmedResult(pnl > 0, ts.side);
+                        isc.closeTrade(ts.symbol, ts.side, pnl);
+                        markForecastRecord(ts.symbol + "_" + ts.side,
+                                pnl > 0 ? "CHANDELIER_PROFIT" : "CHANDELIER_FLAT");
+                        String emoji = pnl >= 0.3 ? "✅" : "⚠️";
+                        telegram.sendMessageAsync(String.format(
+                                "%s *CHANDELIER EXIT* %s %s | PnL: %+.2f%%\n"
+                                        + "📌 ATR trail закрыл до TP1 на `%.6f`\n"
+                                        + "💡 Причина: разворот до TP1, прибыль сохранена",
+                                emoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                        LOG.info("[TR] CHANDELIER EXIT: " + ts.symbol
+                                + " pnl=" + String.format("%.2f%%", pnl));
+                        continue;
+                    }
+                }
+            }
 
             // ── SL hit ──────────────────────────────────────────
             boolean slHit = isLong
@@ -500,7 +590,11 @@ public final class BotMain {
 
             if (tp1Reached && !ts.tp1Hit) {
                 ts.tp1Hit = true;
-                ts.trailingStop = ts.entry; // trailing переходит на breakeven
+                // [v25.0] If Chandelier already raised the trail above entry, keep it.
+                // Otherwise set to breakeven (entry) as before.
+                if (ts.trailingStop < ts.entry || ts.trailingStop == 0) {
+                    ts.trailingStop = ts.entry;
+                }
                 double tp1PnlPct = isLong
                         ? (ts.tp1 - ts.entry) / ts.entry * 100
                         : (ts.entry - ts.tp1) / ts.entry * 100;
