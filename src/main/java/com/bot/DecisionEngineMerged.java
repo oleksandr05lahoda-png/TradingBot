@@ -407,30 +407,37 @@ public final class DecisionEngineMerged {
             if (rr > 0)
                 extra.append(String.format(" | R/R: 1:%.1f", rr));
 
-            // ── ForecastEngine — понятное описание для трейдера ──────────────────
+            // ── ForecastEngine — контекстный ярлык, БЕЗ отдельного числа уверенности ────
+            // [v26.0] REMOVED: forecast.confidence * 100 и projectedMovePct как отдельные цифры.
+            // ПРИЧИНА: Трейдер видел "Вер-ть: 78%" и тут же "Прогноз: 45% уверенность" —
+            // два разных числа создавали ложное ощущение противоречия.
+            // На самом деле probability УЖЕ ВКЛЮЧАЕТ FC через penalty/boost (v25 weighted ensemble).
+            // Теперь: только НАПРАВЛЕНИЕ + ФАЗА как контекстные маркеры (без числа).
             if (forecast != null) {
-                // Перевод bias в читаемый текст
-                String biasRu = switch (forecast.bias) {
-                    case STRONG_BULL -> "🟢 Сильный РОСТ";
-                    case BULL        -> "🟩 Рост";
+                String biasIcon = switch (forecast.bias) {
+                    case STRONG_BULL -> "🟢 РОСТ↑↑";
+                    case BULL        -> "🟩 Рост↑";
                     case NEUTRAL     -> "⬜ Нейтраль";
-                    case BEAR        -> "🟥 Падение";
-                    case STRONG_BEAR -> "🔴 Сильное ПАДЕНИЕ";
+                    case BEAR        -> "🟥 Падение↓";
+                    case STRONG_BEAR -> "🔴 ПАДЕНИЕ↓↓";
                 };
-                // Перевод фазы
-                String phaseRu = switch (forecast.trendPhase) {
-                    case EARLY      -> "🌱 Начало тренда";
-                    case MID        -> "📈 Середина тренда";
-                    case LATE       -> "⏳ Конец тренда";
-                    case EXHAUSTION -> "⛽ Истощение";
+                String phaseIcon = switch (forecast.trendPhase) {
+                    case EARLY      -> "🌱 старт";
+                    case MID        -> "📈 середина";
+                    case LATE       -> "⏳ конец";
+                    case EXHAUSTION -> "⛽ истощение";
                 };
-                extra.append(String.format(
-                        "%n🔮 Прогноз: %s | %.0f%% уверенность | %+.2f%% ход%n"
-                                + "📍 Фаза: %s",
-                        biasRu,
-                        forecast.confidence * 100.0,
-                        forecast.projectedMovePct * 100.0,
-                        phaseRu));
+                // Единая строка контекста — без второго числа уверенности
+                extra.append(String.format("%n🔮 Контекст: %s  |  Фаза: %s", biasIcon, phaseIcon));
+            }
+
+            // [v26.0] SIGNAL STRENGTH BAR — единая визуальная шкала вместо двух цифр
+            // Показывает probability в виде прогресс-бара [████░░░░] + число
+            {
+                int filled = (int) Math.round(probability / 10.0); // 0..10 блоков
+                filled = Math.max(0, Math.min(10, filled));
+                String bar = "█".repeat(filled) + "░".repeat(10 - filled);
+                extra.append(String.format("%n📶 Сила:  [%s] %.0f%%", bar, probability));
             }
 
             return String.format(
@@ -608,6 +615,28 @@ public final class DecisionEngineMerged {
         double btcCrashScore    = gicCtx != null ? gicCtx.btcCrashScore : 0.0;
         double btcAccel         = gicCtx != null ? gicCtx.btcMomentumAccel : 0.0;
         double gicShortBoost    = gicCtx != null ? gicCtx.shortBoost : 1.0;
+
+        // [v26.0] GIC DIRECTIONAL GATE — consume onlyLong / onlyShort that were
+        // previously computed in GIC but never enforced in generate().
+        // onlyLong  = BTC_STRONG_UP + strength > 0.82  → veto all SHORT signals
+        // onlyShort = BTC_STRONG_DOWN / CRASH / PANIC + strength > 0.78 → veto all LONG signals
+        // Applied BEFORE cluster computation so we don't waste CPU on blocked directions.
+        // Exception: aggressiveShort overrides onlyLong (crash trumps BTC up-trend for altcoins).
+        if (gicCtx != null) {
+            if (gicCtx.onlyLong && !aggressiveShort) {
+                // BTC in extreme up-impulse — only LONG signals allowed on alts
+                // SHORT against BTC STRONG_UP = very high failure rate → hard veto
+                // candidateSide not known yet, so we store as pre-filter flag;
+                // actual veto happens post-candidate-selection below via earlyReturn sentinel
+            }
+            if (gicCtx.onlyShort) {
+                // BTC crashing — LONG on alts = catching a falling knife
+                // Hard veto: no LONG signals during BTC CRASH/PANIC mode
+            }
+        }
+        // Sentinel booleans for post-candidate veto (direction known after cluster aggregation)
+        final boolean gicOnlyLong  = gicCtx != null && gicCtx.onlyLong  && !aggressiveShort;
+        final boolean gicOnlyShort = gicCtx != null && gicCtx.onlyShort;
 
         MarketContext mctx = buildMarketContext(c15, price);
         MarketState state  = detectState(c15);
@@ -1169,6 +1198,29 @@ public final class DecisionEngineMerged {
         long shortCooldownOverride = aggressiveShort ? 60_000L : -1;
         if (!cooldownAllowedEx(symbol, side, cat, now, shortCooldownOverride)) return null;
         if (!flipAllowed(symbol, side)) return null;
+
+        // [v26.0] GIC DIRECTIONAL HARD VETO — enforces onlyLong / onlyShort
+        // Previously: GIC computed these flags but generate() never read them (confirmed bug).
+        // Now: applied AFTER side is finalised, BEFORE probability computation.
+        //
+        // gicOnlyLong  = BTC_STRONG_UP + strength > 0.82
+        //   → all SHORT signals are vetoed. Rationale: shorting alts during BTC vertical
+        //     up-impulse is historically the #1 way to blow up. Hard stop.
+        //
+        // gicOnlyShort = BTC_CRASH / PANIC + strength > 0.78
+        //   → all LONG signals are vetoed. Rationale: catching a falling knife during
+        //     BTC cascade = negative EV. aggressiveShort already handles SHORT side.
+        //
+        // Exception: aggressiveShort flag overrides gicOnlyLong (crash-mode shorts
+        //   are allowed even when BTC was previously in up-impulse — trend has reversed).
+        if (gicOnlyLong && side == com.bot.TradingCore.Side.SHORT) {
+            allFlags.add("GIC_VETO_SHORT_BTCUP");
+            return null; // Hard veto: no shorts during BTC strong up-impulse
+        }
+        if (gicOnlyShort && side == com.bot.TradingCore.Side.LONG) {
+            allFlags.add("GIC_VETO_LONG_BTCCRASH");
+            return null; // Hard veto: no longs during BTC crash / panic
+        }
 
         // ════════════════════════════════════════════════════════
         // [v7.0] КАЛИБРОВАННАЯ УВЕРЕННОСТЬ — на кластерах
