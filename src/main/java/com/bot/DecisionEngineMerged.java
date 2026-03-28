@@ -324,48 +324,89 @@ public final class DecisionEngineMerged {
 
         /** Флаги видимые трейдеру — размер, OBI, дельта, конфлюэнция, фаза */
         private List<String> traderFlags() {
-            List<String> result = new java.util.ArrayList<>();
+            // [v27.0] Priority-ranked flag rendering.
+            // PROBLEM: old code showed CVD_DIV⚠ + CVD_SELL + CVD_DIV_BEAR — 3 flags for 1 fact.
+            // FIX: deduplicate by semantic group, cap at 5 visible flags, priority order:
+            //   1. Risk warnings (VOLATILE, BTC_BLOCK, LOW_SESSION)
+            //   2. Execution quality (SIZE, LIQ_MAGNET, BTC_SYNC)
+            //   3. Volume context (CVD, VOL_OPPOSE)
+            //   4. Confluence (CONFL)
+            //   5. TP mode (TP×TREND/RANGE/СКАЛЬП)
+            //   6. Session (NY)
+
+            List<String> result  = new java.util.ArrayList<>();
+            boolean cvdShown     = false; // deduplicate: CVD_DIV⚠ + CVD_SELL + CVD_DIV_BEAR → 1 flag
+            boolean volShown     = false; // deduplicate: VOL_OPPOSE + VOL_NEUTRAL → 1 flag
+            boolean tpShown      = false; // only one TP mode flag
+
+            // ── PASS 1: always-show flags (risk-critical) ─────────────────────
             for (String f : flags) {
-                boolean internal = false;
-                for (String prefix : INTERNAL_FLAG_PREFIXES) {
-                    if (f.startsWith(prefix) || f.equals(prefix.replace("_",""))) {
-                        internal = true; break;
-                    }
+                if (f.equals("HIGH_ATR"))          { result.add("⚡ VOLATILE");    continue; }
+                if (f.equals("GIC_BLOCK"))         { result.add("🔴 BTC_BLOCK");   continue; }
+                if (f.equals("SESS_LOW"))          { result.add("🌙 НОЧЬ");        continue; }
+                if (f.startsWith("LIQ_MAGNET"))    { result.add("🧲 " + f);        continue; }
+            }
+
+            // ── PASS 2: execution & context flags ─────────────────────────────
+            for (String f : flags) {
+                if (f.startsWith("SIZE="))         { result.add(f);                continue; }
+                if (f.startsWith("GIC_BOOST"))     { result.add("📡 BTC_SYNC");    continue; }
+                if (f.startsWith("GIC_WEAK"))      { result.add("⚠️ BTC_WEAK");    continue; }
+                if (f.equals("SESS_NY"))           { result.add("🗽 NY");           continue; }
+            }
+
+            // ── PASS 3: volume — deduplicated (show only strongest CVD signal) ─
+            for (String f : flags) {
+                // CVD group: CVD_DIV_BEAR, CVD_DIV_BULL, CVD_DIV⚠, CVD_SELL, CVD_BUY → 1 flag
+                if (!cvdShown && (f.startsWith("CVD_DIV_BEAR") || f.startsWith("CVD_DIV_BULL"))) {
+                    String dir = f.contains("BEAR") ? "↓" : "↑";
+                    result.add("⚠️ CVD_DIV" + dir);
+                    cvdShown = true;
+                    continue;
                 }
-                // Показываем: SIZE=, OBI±, ΔBUY/ΔSELL, CONFL_L/S, HIGH_ATR, WEAK_SECTOR,
-                //             GIC_BOOST (как "BOOST"), EARLY_REV_PENALTY → "REV_WARN"
-                if (!internal) {
-                    result.add(f);
-                } else if (f.startsWith("SIZE=")) {
-                    result.add(f); // всегда показываем размер
-                } else if (f.startsWith("LIQ_MAGNET")) {
-                    result.add("🧲 " + f); // магнит ликвидаций — важно трейдеру
-                } else if (f.equals("CVD_DIV⚠")) {
-                    result.add("⚠️ CVD_DIV"); // CVD дивергенция — предупреждение
-                } else if (f.startsWith("TP_TREND")) {
-                    result.add("📈 TP×TREND"); // расширенные TP в тренде
-                } else if (f.equals("TP_RANGE")) {
-                    result.add("↔️ TP×RANGE"); // укороченные TP в боковике
-                } else if (f.equals("TP_EXHAUST")) {
-                    result.add("⛽ TP×СКАЛЬП"); // скальп при истощении
-                } else if (f.equals("SESS_NY")) {
-                    result.add("🗽 NY_SESSION"); // сигнал в NY — лучшее качество
-                } else if (f.equals("SESS_LOW")) {
-                    result.add("🌙 LOW_SESSION"); // сигнал ночью — осторожно
-                } else if (f.startsWith("GIC_BOOST")) {
-                    result.add("📡 BTC_SYNC"); // BTC подтверждает направление
-                } else if (f.startsWith("GIC_WEAK")) {
-                    result.add("⚠️ BTC_WEAK"); // BTC под давлением
-                } else if (f.equals("GIC_BLOCK")) {
-                    result.add("🔴 BTC_BLOCK"); // BTC в crash режиме
-                } else if (f.equals("HIGH_ATR")) {
-                    result.add("⚡ VOLATILE"); // высокая волатильность — стоп шире
-                } else if (f.equals("WEAK_SECTOR")) {
-                    result.add("📉 СЕКТ_СЛАБ"); // сектор под давлением
-                } else if (f.startsWith("CONFL_L") || f.startsWith("CONFL_S")) {
-                    result.add("🔥 " + f); // конфлюэнция — много факторов согласны
+                if (!cvdShown && f.equals("CVD_DIV⚠")) {
+                    result.add("⚠️ CVD_DIV");
+                    cvdShown = true;
+                    continue;
+                }
+                // VOL_OPPOSE — show once
+                if (!volShown && f.equals("VOL_OPPOSE")) {
+                    result.add("🔻 VOL_OPP");
+                    volShown = true;
+                    continue;
                 }
             }
+
+            // ── PASS 4: confluence + TP mode ──────────────────────────────────
+            for (String f : flags) {
+                if (f.startsWith("CONFL_L") || f.startsWith("CONFL_S")) {
+                    result.add("🔥 " + f);
+                    continue;
+                }
+                if (!tpShown) {
+                    if (f.startsWith("TP_TREND_EARLY")) { result.add("🚀 TP×TREND+"); tpShown = true; continue; }
+                    if (f.startsWith("TP_TREND"))       { result.add("📈 TP×TREND");  tpShown = true; continue; }
+                    if (f.equals("TP_RANGE"))            { result.add("↔️ TP×RANGE");  tpShown = true; continue; }
+                    if (f.equals("TP_EXHAUST"))          { result.add("⛽ TP×СКАЛЬП"); tpShown = true; continue; }
+                }
+            }
+
+            // ── PASS 5: μ micro-momentum adjustment ───────────────────────────
+            for (String f : flags) {
+                if (f.startsWith("μ")) { result.add(f); break; }
+            }
+
+            // ── PASS 6: SL adjustment flag (important for trader) ─────────────
+            for (String f : flags) {
+                if (f.equals("SL_ADJ")) { result.add("📐 SL_ADJ"); break; }
+            }
+
+            // [v27.0] Cap at 6 flags max — cognitive load limit.
+            // A trader needs to act in <3 seconds. More than 6 flags = ignored.
+            if (result.size() > 6) {
+                return result.subList(0, 6);
+            }
+
             return result;
         }
 
@@ -431,14 +472,8 @@ public final class DecisionEngineMerged {
                 extra.append(String.format("%n🔮 Контекст: %s  |  Фаза: %s", biasIcon, phaseIcon));
             }
 
-            // [v26.0] SIGNAL STRENGTH BAR — единая визуальная шкала вместо двух цифр
-            // Показывает probability в виде прогресс-бара [████░░░░] + число
-            {
-                int filled = (int) Math.round(probability / 10.0); // 0..10 блоков
-                filled = Math.max(0, Math.min(10, filled));
-                String bar = "█".repeat(filled) + "░".repeat(10 - filled);
-                extra.append(String.format("%n📶 Сила:  [%s] %.0f%%", bar, probability));
-            }
+            // [v27.0] SIGNAL STRENGTH BAR REMOVED — duplicated 🎯 Вер-ть line.
+            // Probability appears once in the main format string. No repeat needed.
 
             return String.format(
                     "%s *%s* → *%s* %s%n"
