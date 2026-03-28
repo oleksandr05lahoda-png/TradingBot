@@ -13,14 +13,19 @@ public final class DecisionEngineMerged {
 
     // ── Константы ─────────────────────────────────────────────────
     private static final int    MIN_BARS        = 150;
-    // [v11.0] Increased cooldowns to prevent whipsaw
-    private static final long   COOLDOWN_TOP    = 8  * 60_000L;  // was 4min — too short, caused flip-flops
-    private static final long   COOLDOWN_ALT    = 6  * 60_000L;  // was 3min
-    private static final long   COOLDOWN_MEME   = 4  * 60_000L;  // was 2min
-    private static final double BASE_CONF       = 51.0;  // [v11.0] raised from 52 — fewer but better signals
+    // [v28.0 FIX] Cooldowns unchanged
+    private static final long   COOLDOWN_TOP    = 8  * 60_000L;
+    private static final long   COOLDOWN_ALT    = 6  * 60_000L;
+    private static final long   COOLDOWN_MEME   = 4  * 60_000L;
+    // [v28.0 FIX] BASE_CONF and MIN_CONF_FLOOR raised to 62.
+    // At 48-51% the bot generates signals in pure statistical noise zone.
+    // Fees (0.08%×2) + slippage (0.15%) = -0.31% cost per trade.
+    // Break-even winrate at avg win=1.5% / avg loss=1.2%: needs ~60% real WR.
+    // Floor 62 = minimum to have positive EV after costs on unverified edge.
+    private static final double BASE_CONF       = 62.0;  // was 51.0
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 48.0;  // [v11.0] raised from 47
-    private static final double MIN_CONF_CEIL   = 65.0;
+    private static final double MIN_CONF_FLOOR  = 62.0;  // was 48.0 — was generating noise signals
+    private static final double MIN_CONF_CEIL   = 78.0;  // was 65.0 — raised proportionally
 
     // Дивергенции — штраф вместо хард-лока
     private static final double DIV_PENALTY_SCORE  = 0.55;
@@ -37,7 +42,12 @@ public final class DecisionEngineMerged {
 
     // ── State ─────────────────────────────────────────────────────
     private final Map<String, Double>           symbolMinConf    = new ConcurrentHashMap<>();
-    private volatile double                     globalMinConf    = BASE_CONF;
+    // [v28.0 FIX] AtomicReference replaces volatile double.
+    // volatile guarantees visibility but NOT atomicity of read-modify-write.
+    // With 25 parallel fetchPool threads calling adaptGlobalMinConf(), concurrent
+    // reads of globalMinConf.get() are now always consistent with the last write.
+    private final java.util.concurrent.atomic.AtomicReference<Double> globalMinConf
+            = new java.util.concurrent.atomic.AtomicReference<>(BASE_CONF);
     private final Map<String, Long>             cooldownMap      = new ConcurrentHashMap<>();
     private final Map<String, Deque<String>>    recentDirs       = new ConcurrentHashMap<>();
     private final Map<String, Double>           lastSigPrice     = new ConcurrentHashMap<>();
@@ -319,7 +329,17 @@ public final class DecisionEngineMerged {
                 "VD_BUY", "VD_SELL", "VOL_SPIKE", "1H_BULL", "1H_BEAR", "2H_BULL",
                 "2H_BEAR", "1H2H_BULL", "1H2H_BEAR", "HTF_CONFLICT", "VWAP_BULL",
                 "VWAP_BEAR", "FR_NEG", "FR_POS", "FR_FALL", "FR_RISE", "OI_UP", "OI_DN",
-                "PUMP_HUNT_"
+                "PUMP_HUNT_",
+                // [v28.0] PATCH #20: Added missing internal prefixes that could leak to Telegram
+                "BOS5_",      // e.g. BOS5_LVL=219.3400 — internal swing level number
+                "CHOCH_",     // internal BoS direction flags
+                "LOW_CLUSTERS_", // internal cluster count debug info
+                "DYN_THRESH_",   // internal threshold debug
+                "LATE_ENTRY_SIZE_CUT", // internal size flag (shown via SIZE= already)
+                "ATR_STOP", "STRUCT_STOP", "STRUCT_WIDE", // internal stop-type debug
+                "VOL_NEUTRAL",   // internal volume state
+                "CVD_BUY", "CVD_SELL", // base CVD — shown via ⚠️CVD_DIV in traderFlags
+                "GIC_VETO_"      // internal GIC veto log
         );
 
         /** Флаги видимые трейдеру — размер, OBI, дельта, конфлюэнция, фаза */
@@ -522,7 +542,7 @@ public final class DecisionEngineMerged {
         if (hist == null || hist.size() < 20) return;
         long correct = hist.stream().filter(r -> r.correct).count();
         double accuracy = (double) correct / hist.size();
-        double base = globalMinConf;
+        double base = globalMinConf.get();
         if (accuracy < 0.45)      base += 5.0;
         else if (accuracy < 0.50) base += 2.5;
         else if (accuracy > 0.65) base -= 3.0;
@@ -852,39 +872,49 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
+        // ════════════════════════════════════════════════════════
         // КЛАСТЕР 3: VOLUME
         // ════════════════════════════════════════════════════════
 
-        // Volume Delta (мгновенная)
+        // [v28.0] PATCH #4: CVD triple-count fix.
+        // OLD: VD_BUY(0.14) + CVD_BUY(0.65) + CVD_DIV_BULL(0.55) = 1.34 pts for ONE fact.
+        // NEW: VD and CVD are the same underlying fact (volume delta) at different windows.
+        //      Use the STRONGER signal via addLong/addShort (which takes MAX, not sum).
+        //      Divergence (CVD_DIV) is structurally different — it stays as addShort/addLong,
+        //      but only fires when divergence condition is met (not redundant with base CVD).
+
         Double vd = volumeDeltaMap.get(symbol);
         double vdRatio = getVolumeDeltaRatio(symbol);
-        if (vd != null && vdRatio > 1.5) {
-            double vdScore = mctx.s(Math.min(0.55, vdRatio * 0.14));
-            if (vd > 0) cVolume.addLong(vdScore, "VD_BUY");
-            else        cVolume.addShort(vdScore, "VD_SELL");
-        }
-
-        // [ДЫРА №1] CVD — Cumulative Volume Delta (90×1m накопленная)
-        // Вес 0.65 vs 0.14 у мгновенной дельты — CVD показывает реальные намерения.
-        // Если цена растёт, а CVD падает — институционалы ПРОДАЮТ в рост → ЛОВУШКА.
         double cvdVal = cvdMap.getOrDefault(symbol, 0.0);
-        if (Math.abs(cvdVal) > 0.10) {
-            double cvdScore = mctx.s(Math.min(0.65, Math.abs(cvdVal) * 0.70));
-            if (cvdVal > 0) cVolume.addLong(cvdScore, "CVD_BUY");
-            else            cVolume.addShort(cvdScore, "CVD_SELL");
-            // Дивергенции проверяем СНАРУЖИ if-блоков — иначе мёртвый код
-            // Цена растёт (+) но CVD отрицательный → институционалы продают в рост → ЛОВУШКА
+
+        // Compute best single volume-delta score (VD instant vs CVD accumulated — take max)
+        if (vd != null || Math.abs(cvdVal) > 0.10) {
+            // Instant VD score (only if volume spike)
+            double vdScore = (vd != null && vdRatio > 1.5)
+                    ? mctx.s(Math.min(0.55, vdRatio * 0.14)) : 0.0;
+            // CVD accumulated score (higher weight — shows real intent over 90×1m)
+            double cvdScore = Math.abs(cvdVal) > 0.10
+                    ? mctx.s(Math.min(0.65, Math.abs(cvdVal) * 0.70)) : 0.0;
+            // Use the stronger of the two — addLong/addShort already takes MAX
+            double bestScore = Math.max(vdScore, cvdScore);
+            boolean volBull = (vd != null && vd > 0 && vdRatio > 1.5) || cvdVal > 0.10;
+            boolean volBear = (vd != null && vd < 0 && vdRatio > 1.5) || cvdVal < -0.10;
+            if (volBull && bestScore > 0) cVolume.addLong(bestScore,  cvdScore >= vdScore ? "CVD_BUY" : "VD_BUY");
+            if (volBear && bestScore > 0) cVolume.addShort(bestScore, cvdScore >= vdScore ? "CVD_SELL" : "VD_SELL");
+
+            // Divergence penalties (price direction vs CVD direction — structurally distinct)
             if (move5 > 0.002 && cvdVal < -0.10) cVolume.penalizeLong(0.60);
-            // Цена падает (−) но CVD положительный → ложный дамп, накопление → ВОЗМОЖНЫЙ РАЗВОРОТ
             if (move5 < -0.002 && cvdVal > 0.10) cVolume.penalizeShort(0.60);
         }
-        // CVD-дивергенция высокой уверенности (порог -0.15/+0.15) → добавляем в кластер
+
+        // CVD-divergence (high-confidence threshold: price strongly disagrees with CVD)
+        // These ARE structurally separate from base CVD — price vs CVD opposition = trap signal
         boolean cvdDivBear = move5 > 0.003 && cvdVal < -0.15;
         boolean cvdDivBull = move5 < -0.003 && cvdVal > 0.15;
         if (cvdDivBear) { cVolume.addShort(mctx.s(0.55), "CVD_DIV_BEAR"); allFlags.add("CVD_DIV⚠"); }
         if (cvdDivBull) { cVolume.addLong(mctx.s(0.55),  "CVD_DIV_BULL"); allFlags.add("CVD_DIV⚠"); }
 
-        // Volume Spike
+        // Volume Spike (independent signal — price-volume acceleration, not delta direction)
         if (volumeSpike(c15, cat)) {
             if (move5 > 0) cVolume.boostLong(mctx.s(0.22), "VOL_SPIKE");
             else           cVolume.boostShort(mctx.s(0.22), "VOL_SPIKE");
@@ -1328,7 +1358,7 @@ public final class DecisionEngineMerged {
         // Probability already mildly dipped above. No further deduction needed.
         if (lateEntryPenalty) allFlags.add("LATE_ENTRY_SIZE_CUT");
 
-        double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf);
+        double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
             minConf = Math.max(45.0, minConf - 8.0);
         }
@@ -1379,7 +1409,7 @@ public final class DecisionEngineMerged {
         double takePrice = side == com.bot.TradingCore.Side.LONG  ? price + stopDist * rrRatio
                 : price - stopDist * rrRatio;
 
-        if (!priceMovedEnough(symbol, price)) return null;
+        if (!priceMovedEnough(symbol, price, atr14 / price)) return null;
         // [v14.0 FIX] НЕ вызываем registerSignal() здесь — cooldown ставится
         // только ПОСЛЕ ISC.allowSignal() в SignalSender через confirmSignal()
 
@@ -1510,6 +1540,13 @@ public final class DecisionEngineMerged {
                             allFlags.add("FC_NEUTRAL_RANGE");
                         }
                     } else {
+                        // [v28.0] PATCH #6: FC NEUTRAL in TREND was 0 penalty — fixed to -4.
+                        // If ForecastEngine sees no direction in a trending market, that IS a signal:
+                        // the trend may be exhausting or the data is ambiguous. Require more conviction.
+                        if (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL) {
+                            probability = Math.max(50, probability - 4);
+                            allFlags.add("FC_NEUTRAL_TREND");
+                        }
                         // Non-range: mild adjustments
                         if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
                             probability = Math.max(50, probability - 2);
@@ -1727,10 +1764,20 @@ public final class DecisionEngineMerged {
      * 2 minutes later was blocked as "price not moved enough". Now lastSigPrice
      * is updated ONLY in confirmSignal() after ISC approves.
      */
-    private boolean priceMovedEnough(String sym, double price) {
+    // [v28.0] PATCH #13: Dynamic price-moved threshold.
+    // OLD: static 0.35% regardless of volatility — in 2% ATR market, 0.35% is one candle's noise.
+    // NEW: max(0.35%, ATR * 0.15) — scales with current volatility.
+    // atr14Pct is passed in from generate() where atr14 is already computed.
+    private boolean priceMovedEnough(String sym, double price, double atr14Pct) {
         Double last = lastSigPrice.get(sym);
         if (last == null) return true;
-        return Math.abs(price - last) / last >= 0.0035;
+        double dynThreshold = Math.max(0.0035, atr14Pct * 0.15);
+        return Math.abs(price - last) / last >= dynThreshold;
+    }
+
+    // Backward-compatible overload (uses static threshold when ATR not available)
+    private boolean priceMovedEnough(String sym, double price) {
+        return priceMovedEnough(sym, price, 0.0);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -2373,7 +2420,10 @@ public final class DecisionEngineMerged {
         return h2 < h1 && l2 < l1;
     }
 
-    private void adaptGlobalMinConf(MarketState state, double atr, double price) {
+    // [v28.0] PATCH #5: synchronized to fix race condition.
+    // volatile double does NOT make read-modify-write atomic.
+    // fetchPool has up to 25 threads — concurrent clamp(base,...) writes corrupt globalMinConf.
+    private synchronized void adaptGlobalMinConf(MarketState state, double atr, double price) {
         double vol  = atr / (price + 1e-9);
         double base = BASE_CONF;
         if (state == MarketState.STRONG_TREND) base -= 2.0;
@@ -2384,7 +2434,7 @@ public final class DecisionEngineMerged {
         int utcHour = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getHour();
         if (utcHour >= 8 && utcHour <= 12)       base -= 1.0;
         else if (utcHour >= 13 && utcHour <= 21)  base -= 1.5;
-        globalMinConf = clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL);
+        globalMinConf.set(clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL));
     }
 
     // ══════════════════════════════════════════════════════════════

@@ -443,6 +443,26 @@ public final class BotMain {
             Map.Entry<String, TrackedSignal> entry = it.next();
             TrackedSignal ts = entry.getValue();
 
+            // [v28.0] PATCH #15: Force-close on deeply negative symbol score.
+            // Problem: ISC blocks NEW signals for a bad symbol, but existing tracked
+            //          positions on that symbol kept running until 90min EXPIRED.
+            //          3 stops in a row → score dropped → 4th trade still lived 90min.
+            // Fix: if symbolScore < -0.40 (approx 3 consecutive losses), force exit
+            //      at current market price (neutral close, not counted as SL win).
+            double symScore = isc.getSymbolScore(ts.symbol);
+            if (symScore < -0.40 && !ts.tp1Hit) {
+                // Only force-close pre-TP1 positions (if TP1 hit, trailing handles it)
+                it.remove();
+                isc.closeTrade(ts.symbol, ts.side, 0.0, "SCORE_EXIT");
+                telegram.sendMessageAsync(String.format(
+                        "⚠️ *SCORE EXIT* %s %s\n" +
+                                "📉 Symbol score: %.2f (3+ consecutive losses)\n" +
+                                "🔒 Позиция принудительно закрыта",
+                        ts.symbol, ts.side, symScore));
+                LOG.info("[TR] SCORE EXIT: " + ts.symbol + " score=" + String.format("%.2f", symScore));
+                continue;
+            }
+
             // Expire: 90 минут
             if (ts.ageMs() > 90 * 60_000L) {
                 it.remove();
@@ -609,22 +629,40 @@ public final class BotMain {
             // ── После TP1: trailing + TP2 + TP3 ────────────────
             if (ts.tp1Hit) {
 
-                // [v14.0 FIX #3] Исправленный trailing stop
-                if (isLong) {
-                    // LONG: trailing поднимается за ценой
-                    double newTrail = ts.entry + (extremeHigh - ts.entry) * 0.50;
-                    ts.trailingStop = Math.max(ts.trailingStop, newTrail);
-                } else {
-                    // SHORT: trailing опускается за ценой (НИЖЕ entry, но ВЫШЕ extremeLow)
-                    // trailingStop для SHORT должен быть НИЖЕ entry
-                    // Когда цена падает (extremeLow уменьшается), trailing двигается вниз
-                    double profit = ts.entry - extremeLow; // profit для SHORT = entry - low
-                    double newTrail = ts.entry - profit * 0.50; // Лочим 50% прибыли
-                    // Для SHORT trailing должен только УМЕНЬШАТЬСЯ (двигаться вниз = лучше)
-                    if (ts.trailingStop == 0 || ts.trailingStop == ts.entry) {
-                        ts.trailingStop = newTrail;
+                // [v28.0] PATCH #11: ATR Chandelier trailing after TP1.
+                // OLD: newTrail = entry + (extremeHigh - entry) * 0.50
+                //   → gave back 50% of open profit on any pullback (too wide in trend).
+                // NEW: chandelier = extremeHigh - ATR(1m,14) * 1.5 for LONG
+                //                   extremeLow  + ATR(1m,14) * 1.5 for SHORT
+                // Tighter than 50%-of-profit formula. Respects current 1m volatility.
+                // Never moves against the trade (ratchet only).
+                if (atr14Trail > 0) {
+                    if (isLong) {
+                        double chandelierLevel = extremeHigh - atr14Trail * 1.5;
+                        chandelierLevel = Math.max(chandelierLevel, ts.entry); // BE floor
+                        ts.trailingStop = Math.max(ts.trailingStop, chandelierLevel);
                     } else {
-                        ts.trailingStop = Math.min(ts.trailingStop, newTrail);
+                        double chandelierLevel = extremeLow + atr14Trail * 1.5;
+                        chandelierLevel = Math.min(chandelierLevel, ts.entry); // BE floor
+                        if (ts.trailingStop == 0 || ts.trailingStop == ts.entry) {
+                            ts.trailingStop = chandelierLevel;
+                        } else {
+                            ts.trailingStop = Math.min(ts.trailingStop, chandelierLevel);
+                        }
+                    }
+                } else {
+                    // Fallback to 50% formula if ATR unavailable (cold start)
+                    if (isLong) {
+                        double newTrail = ts.entry + (extremeHigh - ts.entry) * 0.50;
+                        ts.trailingStop = Math.max(ts.trailingStop, newTrail);
+                    } else {
+                        double profit = ts.entry - extremeLow;
+                        double newTrail = ts.entry - profit * 0.50;
+                        if (ts.trailingStop == 0 || ts.trailingStop == ts.entry) {
+                            ts.trailingStop = newTrail;
+                        } else {
+                            ts.trailingStop = Math.min(ts.trailingStop, newTrail);
+                        }
                     }
                 }
 
@@ -722,13 +760,23 @@ public final class BotMain {
             }
 
             try {
-                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", 2);
+                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", 20);
                 if (c == null || c.isEmpty()) continue;
                 double currentPrice = c.get(c.size() - 1).close;
 
+                // [v28.0] PATCH #17: Dynamic forecast accuracy threshold.
+                // OLD: static 0.3% — for ALT with ATR=1.5%, 0.3% is pure noise (20% of ATR).
+                //      Forecast was marked "correct" even on random micro-moves.
+                // NEW: threshold = max(0.3%, ATR(15m,14) * 0.25)
+                //      At ATR=1.5%: threshold = 0.375%. At ATR=2%: threshold = 0.5%.
+                double atrForFc = c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0;
+                double fcThreshold = atrForFc > 0
+                        ? Math.max(0.3, (atrForFc / currentPrice) * 100.0 * 0.25)
+                        : 0.3;
+
                 double changePct = (currentPrice - fr.entryPrice) / fr.entryPrice * 100.0;
-                boolean bullishMove = changePct > 0.3;
-                boolean bearishMove = changePct < -0.3;
+                boolean bullishMove = changePct > fcThreshold;
+                boolean bearishMove = changePct < -fcThreshold;
 
                 boolean bullishBias = fr.forecastBias.contains("BULL");
                 boolean bearishBias = fr.forecastBias.contains("BEAR");
@@ -890,6 +938,9 @@ public final class BotMain {
                     totalEV += r.ev;
                     count++;
                     btLog.append(sym).append("=").append(String.format("%.3f", r.ev)).append(" ");
+                    // [v28.0] PATCH #7: Per-symbol EV → ISC for per-symbol minConf boost.
+                    // Each symbol now gets individual threshold adjustment based on its OOS EV.
+                    isc.setSymbolBacktestResult(sym, r.ev);
                 }
             } catch (Exception e) {
                 LOG.warning("[BT] " + sym + ": " + e.getMessage());

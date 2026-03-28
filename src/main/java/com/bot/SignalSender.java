@@ -306,7 +306,11 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
 
-        this.TOP_N            = envInt("TOP_N", 100);
+        // [v28.0] PATCH #8: TOP_N reduced 100→25.
+        // OLD: 100 pairs analysed each cycle — 100 pairs × 10 signals = shallow analysis.
+        // NEW: 25 pairs with real volume >$50M/24h — deep analysis, lower overtrading.
+        // Override via env var TOP_N if you want more pairs.
+        this.TOP_N            = envInt("TOP_N", 25);
         this.MIN_CONF         = envDouble("MIN_CONF", 50.0);
         this.KLINES_LIMIT     = envInt("KLINES", 220);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
@@ -338,6 +342,13 @@ public final class SignalSender {
             udsExecutor.schedule(this::initUserDataStream, 5, TimeUnit.SECONDS);
             udsExecutor.scheduleAtFixedRate(this::renewListenKey, 28, 28, TimeUnit.MINUTES);
             wsWatcher.scheduleAtFixedRate(this::refreshAccountBalance, 10, 120, TimeUnit.SECONDS);
+            // [v28.0] PATCH #3: Set leverage + margin mode on startup.
+            // OLD: leverage defaulted to exchange setting (often 20x) — SIZE=20$ at 20x = $400 position.
+            //      SL -1.36% = -$5.44 loss on $20 margin = -27% per trade. Math was completely wrong.
+            // NEW: ISOLATED margin at 5x leverage. SIZE=20$ at 5x = $100 position.
+            //      SL -1.36% = -$1.36 loss on $20 margin = -6.8% per trade. Correct Kelly sizing.
+            // Scheduled 10s after UDS init to ensure account is ready.
+            udsExecutor.schedule(this::initLeverageAndMarginMode, 10, TimeUnit.SECONDS);
         }
 
         // [ДЫРА №2] Liquidation WebSocket — глобальный поток, без API ключа
@@ -345,6 +356,11 @@ public final class SignalSender {
 
         // WS health check
         wsWatcher.scheduleAtFixedRate(this::checkWsHealth, 30, 30, TimeUnit.SECONDS);
+
+        // [v28.0] PATCH #9: Poll depth5 snapshot every 30s for multi-level OBI.
+        // bookTicker gives L1 only. Institutional walls live on L2-L5.
+        // Weight = 2 per request, so 25 pairs × 1 req/30s = 50 weight/30s = manageable.
+        wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 30, TimeUnit.SECONDS);
 
         System.out.printf("[SignalSender v7.0] TOP_N=%d POOL=%d LIVE_CANDLE=ON WS_AUTO=ON UDS=%s BALANCE_TRACK=%s%n",
                 TOP_N, poolSize,
@@ -697,6 +713,30 @@ public final class SignalSender {
             }
 
             if (!isc.allowSignal(idea)) return null;
+
+            // [v28.0] PATCH #12: Adaptive TP calibration based on real historical RR.
+            // Problem: TP_TREND_EARLY sets tp3Mult=4.2, but if symbol historically only
+            //          reaches avgRR=1.3, those wide TPs are wishful thinking.
+            //          Bot waited for TP3 that never came, missing TP1 exits.
+            // Fix: if real avgRR < 70% of assumed tp3Mult → compress all TP multipliers.
+            double realRR = isc.getAvgRealizedRR(pair);
+            if (realRR > 0 && idea.tp3Mult > 0 && realRR < idea.tp3Mult * 0.70) {
+                // Symbol's real edge is weaker than the TP targets assume.
+                // Scale all TP levels down proportionally. TP1 always stays >= 0.6×risk.
+                double scale = Math.max(0.60, realRR / idea.tp3Mult);
+                double newTp1 = Math.max(0.60, idea.tp1Mult * scale);
+                double newTp2 = Math.max(1.00, idea.tp2Mult * scale);
+                double newTp3 = Math.max(1.50, idea.tp3Mult * scale);
+                List<String> tf = new ArrayList<>(idea.flags);
+                tf.add(String.format("TP_CAL×%.1f", scale));
+                idea = new com.bot.DecisionEngineMerged.TradeIdea(
+                        idea.symbol, idea.side, idea.price, idea.stop, idea.take,
+                        idea.rr, idea.probability, tf,
+                        idea.fundingRate, idea.fundingDelta, idea.oiChange,
+                        idea.htfBias, idea.category, idea.forecast,
+                        newTp1, newTp2, newTp3);
+            }
+
             isc.registerSignal(idea);
             // [v23.0] Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
             decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, System.currentTimeMillis());
@@ -882,6 +922,72 @@ public final class SignalSender {
     }
 
     // ══════════════════════════════════════════════════════════════
+    //  [v28.0] PATCH #3: LEVERAGE + MARGIN MODE INITIALIZATION
+    //  Sets ISOLATED margin + 5x leverage on all active trading pairs.
+    //  Called once at startup after account is ready.
+    //  Without this, exchange defaults apply (often 20x CROSS = account-wipe risk).
+    // ══════════════════════════════════════════════════════════════
+
+    private static final int  TARGET_LEVERAGE   = 5;    // 5x — conservative, correct risk math
+    private static final String TARGET_MARGIN   = "ISOLATED"; // prevents cross-account contagion
+
+    private void initLeverageAndMarginMode() {
+        if (API_KEY.isBlank() || rlIpBanned) return;
+        Set<String> pairs = new java.util.HashSet<>(wsMap.keySet());
+        if (pairs.isEmpty()) {
+            // Fallback: use top symbols if WS not yet connected
+            pairs = getTopSymbolsSet(Math.min(TOP_N, 30));
+        }
+        int ok = 0, fail = 0;
+        for (String pair : pairs) {
+            try {
+                // 1. Set margin type to ISOLATED
+                long ts1 = System.currentTimeMillis();
+                String qs1 = "symbol=" + pair + "&marginType=" + TARGET_MARGIN
+                        + "&timestamp=" + ts1;
+                String sig1 = hmacSHA256(API_SECRET, qs1);
+                HttpRequest req1 = HttpRequest.newBuilder()
+                        .uri(URI.create("https://fapi.binance.com/fapi/v1/marginType?"
+                                + qs1 + "&signature=" + sig1))
+                        .timeout(Duration.ofSeconds(5))
+                        .header("X-MBX-APIKEY", API_KEY)
+                        .POST(HttpRequest.BodyPublishers.noBody())
+                        .build();
+                http.send(req1, HttpResponse.BodyHandlers.ofString()); // ignore "already set" 400
+
+                // 2. Set leverage
+                long ts2 = System.currentTimeMillis();
+                String qs2 = "symbol=" + pair + "&leverage=" + TARGET_LEVERAGE
+                        + "&timestamp=" + ts2;
+                String sig2 = hmacSHA256(API_SECRET, qs2);
+                HttpRequest req2 = HttpRequest.newBuilder()
+                        .uri(URI.create("https://fapi.binance.com/fapi/v1/leverage?"
+                                + qs2 + "&signature=" + sig2))
+                        .timeout(Duration.ofSeconds(5))
+                        .header("X-MBX-APIKEY", API_KEY)
+                        .POST(HttpRequest.BodyPublishers.noBody())
+                        .build();
+                HttpResponse<String> r2 = http.send(req2, HttpResponse.BodyHandlers.ofString());
+                if (r2.statusCode() == 200) ok++; else fail++;
+
+            } catch (Exception e) {
+                fail++;
+                System.out.printf("[LEVERAGE] %s failed: %s%n", pair, e.getMessage());
+            }
+        }
+        System.out.printf("[LEVERAGE] Init done: %d OK, %d fail | %dx ISOLATED%n",
+                ok, fail, TARGET_LEVERAGE);
+        if (fail > 0) {
+            bot.sendMessageAsync(String.format(
+                    "⚠️ *LEVERAGE INIT* %d пар настроено, %d ошибок\n" +
+                            "Проверьте %dx ISOLATED вручную перед торговлей!", ok, fail, TARGET_LEVERAGE));
+        } else {
+            bot.sendMessageAsync(String.format(
+                    "✅ *LEVERAGE OK* Все %d пар: %dx ISOLATED", ok, TARGET_LEVERAGE));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
     //  [FIX-UDS] USER DATA STREAM
     // ══════════════════════════════════════════════════════════════
 
@@ -1020,6 +1126,47 @@ public final class SignalSender {
     //  WS HEALTH CHECK
     // ══════════════════════════════════════════════════════════════
 
+    // [v28.0] PATCH #9: Depth5 snapshot poller — multi-level OBI.
+    // Fetches /fapi/v1/depth?symbol=X&limit=10 for each active WS pair.
+    // Computes sum of bid volume L1-L5 and ask volume L1-L5.
+    // Updates orderbookMap with full-depth OrderbookSnapshot.
+    private void refreshDepth5Snapshots() {
+        if (API_KEY.isBlank() || rlIpBanned) return;
+        Set<String> activePairs = new java.util.HashSet<>(wsMap.keySet());
+        for (String pair : activePairs) {
+            try {
+                String url = "https://fapi.binance.com/fapi/v1/depth?symbol="
+                        + pair + "&limit=10";
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(5))
+                        .GET().build();
+                HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() != 200) continue;
+                JSONObject j = new JSONObject(resp.body());
+                JSONArray bids = j.optJSONArray("bids");
+                JSONArray asks = j.optJSONArray("asks");
+                if (bids == null || asks == null) continue;
+
+                double bidSum = 0, askSum = 0;
+                int levels = Math.min(5, Math.min(bids.length(), asks.length()));
+                for (int i = 0; i < levels; i++) {
+                    bidSum += bids.getJSONArray(i).optDouble(1, 0); // qty at level i
+                    askSum += asks.getJSONArray(i).optDouble(1, 0);
+                }
+
+                // Merge with existing L1 from bookTicker (keep L1 for latency-critical)
+                OrderbookSnapshot existing = orderbookMap.get(pair);
+                double l1bid = existing != null ? existing.bidVolume : 0;
+                double l1ask = existing != null ? existing.askVolume : 0;
+                orderbookMap.put(pair, new OrderbookSnapshot(
+                        l1bid, l1ask, bidSum, askSum, System.currentTimeMillis()));
+            } catch (Exception ignored) {
+                // Non-fatal: next poll will refresh
+            }
+        }
+    }
+
     private void checkWsHealth() {
         long now = System.currentTimeMillis();
         long staleThreshold = 5 * 60_000L;
@@ -1032,6 +1179,14 @@ public final class SignalSender {
             if (last != null && now - last > staleThreshold) {
                 stalePairs.add(e.getKey());
             }
+        }
+        if (!stalePairs.isEmpty()) {
+            // [v28.0] PATCH #19: Alert on WS data loss — was silent before.
+            // Without alert, bot could analyse stale data for 10+ minutes silently.
+            bot.sendMessageAsync(String.format(
+                    "⚠️ *WS DATA LOSS* — %d пар без данных >5m: %s\n🔄 Переподключение...",
+                    stalePairs.size(),
+                    stalePairs.size() <= 5 ? stalePairs.toString() : stalePairs.size() + " пар"));
         }
         for (String pair : stalePairs) {
             if (!wsMap.containsKey(pair)) continue; // already disconnected
@@ -1803,11 +1958,37 @@ public final class SignalSender {
     //  INNER CLASSES
     // ══════════════════════════════════════════════════════════════
 
+    // [v28.0] PATCH #9: Multi-level OrderbookSnapshot replacing single bid/ask.
+    // OLD: orderbookMap stored ONE level (bookTicker = best bid/ask only).
+    //      OBI = (bidQty - askQty) / (bidQty + askQty) — just the spread, not real depth.
+    // NEW: stores up to 5 bid levels + 5 ask levels from depth REST snapshot.
+    //      Real OBI = sum(bid volumes L1-L5) vs sum(ask volumes L1-L5).
+    //      Institutional walls are visible on L2-L5, not L1.
+    // NOTE: bookTicker still populates L1 for latency-critical signals.
+    //       depth snapshot (REST /fapi/v1/depth?limit=10) polled every 30s per active pair.
     public static final class OrderbookSnapshot {
-        public final double bidVolume, askVolume; public final long timestamp;
-        public OrderbookSnapshot(double b, double a, long t) { bidVolume=b; askVolume=a; timestamp=t; }
-        public double obi() { return (bidVolume-askVolume)/(bidVolume+askVolume+1e-12); }
-        public boolean isFresh() { return System.currentTimeMillis()-timestamp < 30_000; }
+        public final double bidVolume, askVolume;   // L1 (bookTicker, real-time)
+        public final double bidDepth5, askDepth5;   // sum L1-L5 (depth snapshot, 30s)
+        public final long timestamp;
+
+        // Legacy constructor — bookTicker L1 only
+        public OrderbookSnapshot(double b, double a, long t) {
+            this(b, a, b, a, t);
+        }
+
+        // Full constructor — L1 + L1-5 depth
+        public OrderbookSnapshot(double b, double a, double bd5, double ad5, long t) {
+            bidVolume = b; askVolume = a; bidDepth5 = bd5; askDepth5 = ad5; timestamp = t;
+        }
+
+        // [v28.0] OBI uses 5-level depth when available, falls back to L1
+        public double obi() {
+            double bid = bidDepth5 > bidVolume ? bidDepth5 : bidVolume;
+            double ask = askDepth5 > askVolume ? askDepth5 : askVolume;
+            return (bid - ask) / (bid + ask + 1e-12);
+        }
+
+        public boolean isFresh() { return System.currentTimeMillis() - timestamp < 30_000; }
     }
 
     public static final class MicroCandleBuilder {

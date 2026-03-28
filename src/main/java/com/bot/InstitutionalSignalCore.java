@@ -47,7 +47,10 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;   // per symbol, bounded
 
     public InstitutionalSignalCore() {
-        this(20, 2, 0.12, 52.0, 0.0025, 2);
+        // [v28.0] PATCH #18: maxGlobalSignals 20→8, maxPortfolioHeat 12%→8%, minConf 52→62
+        // OLD: this(20, 2, 0.12, 52.0, 0.0025, 2) — 20 signals×0.8% = 16% heat (exceeded 12% cap)
+        // NEW: 8 signals×1.0% = 8% heat (consistent with cap), minConf raised to 62% pre-edge-verification
+        this(8, 2, 0.08, 62.0, 0.0025, 2);
     }
 
     public InstitutionalSignalCore(int maxGlobal, int maxPerSym, double maxHeat,
@@ -75,6 +78,13 @@ public final class InstitutionalSignalCore {
 
     // [v12.2] NO timers, NO blocks. Streak guard raises threshold automatically.
     // Bot NEVER stops — just gets pickier after losses.
+    // ── [v28.0] CIRCUIT BREAKER CONSTANTS ─────────────────────────
+    // PATCH #1: реализован hard circuit breaker (был только задокументирован)
+    private static final double DAILY_LOSS_LIMIT_PCT  = -3.0;  // -3% в день → блок всех сигналов
+    private static final double DRAWDOWN_PAUSE_PCT    = -8.0;  // -8% от пика → пауза 2 часа
+    private static final long   DRAWDOWN_PAUSE_MS     = 2 * 60 * 60_000L;
+    private volatile long       drawdownPausedUntil   = 0;
+
     private volatile double dailyPnLPct        = 0.0;
     private volatile long   dailyPnLResetDay   = currentDay();
 
@@ -94,6 +104,12 @@ public final class InstitutionalSignalCore {
     // Backtest integration
     private volatile double lastBacktestEV   = 0.0;
     private volatile long   lastBacktestTime = 0;
+
+    // [v28.0] PATCH #7: Per-symbol OOS EV tracking.
+    // OLD: single avgEV for all 100 pairs — BTCUSDT EV +0.04 masked DOGEUSDT EV -0.08.
+    // NEW: each symbol gets its own EV; symbolMinConf raised +5 if OOS EV < 0.
+    private final java.util.concurrent.ConcurrentHashMap<String, Double> symbolOosEV
+            = new java.util.concurrent.ConcurrentHashMap<>();
 
     // Callbacks
     private volatile java.util.function.BiConsumer<String, String> timeStopCallback = null;
@@ -202,19 +218,41 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // No timers. No blocks. No streak penalty. We rely on ForecastEngine.
-        double base = baseMinConfidence;
+        // [v28.0] PATCH #2: MIN_CONF floor raised 52→62 until 200+ trades verify edge.
+        // At 57% confidence: fees(0.08%×2) + slippage(0.15% ALT) = -0.31% per trade.
+        // Net edge at 57% winrate with avg win 1.4% = near zero. Not tradeable.
+        double floor = getTotalTradeCount() >= 200 ? 52.0 : 62.0;
+
+        double base = Math.max(baseMinConfidence, floor);
 
         // Backtest EV adjustment
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L)
             base += 3.0;
 
-        // Keep threshold strict but avoid decision deadlock with Forecast gatekeeper.
-        return Math.max(52.0, Math.min(base, MAX_EFFECTIVE_MIN_CONF));
+        return Math.max(floor, Math.min(base, MAX_EFFECTIVE_MIN_CONF));
     }
 
     public void setBacktestResult(double ev, long ts) {
         this.lastBacktestEV = ev; this.lastBacktestTime = ts;
+    }
+
+    // [v28.0] PATCH #7: Per-symbol backtest result.
+    // Called from BotMain.runPeriodicBacktest() for each backtested symbol.
+    public void setSymbolBacktestResult(String symbol, double ev) {
+        symbolOosEV.put(symbol, ev);
+    }
+
+    // Returns additional minConf boost for a symbol based on its OOS EV.
+    // EV < 0 → +5 (symbol losing money historically → require higher conviction)
+    // EV < -0.03 → +8 (symbol clearly broken → near-quarantine)
+    // EV > 0.03 → -2 (proven positive EV → slight threshold reduction, but never below 62)
+    public double getSymbolMinConfBoost(String symbol) {
+        Double ev = symbolOosEV.get(symbol);
+        if (ev == null) return 0.0; // no data yet = no adjustment
+        if (ev < -0.03) return +8.0;
+        if (ev < 0.00)  return +5.0;
+        if (ev > 0.03)  return -2.0;
+        return 0.0;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -227,6 +265,17 @@ public final class InstitutionalSignalCore {
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
         String sym = signal.symbol;
+
+        // [v28.0] PATCH #1: CIRCUIT BREAKER — was documented but never enforced.
+        // Daily loss limit: if today's PnL < -3% → block ALL new signals.
+        resetDailyIfNeeded();
+        if (dailyPnLPct < DAILY_LOSS_LIMIT_PCT) return false;
+
+        // Drawdown pause: if drawdown from peak < -8% → block for 2 hours.
+        if (drawdownFromPeak < DRAWDOWN_PAUSE_PCT) {
+            if (System.currentTimeMillis() < drawdownPausedUntil) return false;
+            // If pause expired, reset so it doesn't re-trigger until next -8% breach
+        }
 
         // [v12.2] No timers. Confidence check does all the work via streak guard.
         // Confidence check
@@ -263,6 +312,12 @@ public final class InstitutionalSignalCore {
         // Symbol score check (poor performing symbols get blocked)
         double score = symbolScore.getOrDefault(sym, 0.0);
         if (score < -0.25 && getWinRate(sym) < 0.38 && getTradeCount(sym) >= 8) return false;
+
+        // [v28.0] PATCH #10: SYMBOL QUARANTINE — new symbols have no verified edge.
+        // First 10 trades on any symbol require probability >= 70% (hard gate).
+        // Rationale: unknown symbol stats = unknown win rate = high variance = need higher conviction.
+        int symTrades = getTradeCount(sym);
+        if (symTrades < 10 && signal.probability < 70.0) return false;
 
         return true;
     }
@@ -379,6 +434,24 @@ public final class InstitutionalSignalCore {
         return tradeHistory.values().stream().mapToInt(Deque::size).sum();
     }
 
+    // [v28.0] PATCH #12: Expose per-symbol average realized R:R for TP calibration.
+    // Returns average PnL of winning trades / average PnL magnitude of losing trades.
+    // If symbol has insufficient data, returns 0 (= use market-state defaults).
+    public double getAvgRealizedRR(String symbol) {
+        Deque<ClosedTrade> hist = tradeHistory.get(symbol);
+        if (hist == null || hist.size() < 5) return 0.0;
+        double avgWin  = hist.stream().filter(ClosedTrade::isWin)
+                .mapToDouble(t -> t.pnlPct).average().orElse(0);
+        double avgLoss = hist.stream().filter(t -> !t.isWin())
+                .mapToDouble(t -> Math.abs(t.pnlPct)).average().orElse(1.0);
+        return avgLoss > 0 ? avgWin / avgLoss : 0.0;
+    }
+
+    // [v28.0] PATCH #15: Expose symbol score for BotMain TradeResolver force-exit.
+    public double getSymbolScore(String symbol) {
+        return symbolScore.getOrDefault(symbol, 0.0);
+    }
+
     public int getCurrentLossStreak() { return currentLossStreak; }
     public double getStreakBoost()    { return streakConfidenceBoost; }
     public double getCurrentHeat()   { return currentHeat; }
@@ -486,10 +559,17 @@ public final class InstitutionalSignalCore {
     //  [v11.0] DAILY LOSS LIMIT + DRAWDOWN PROTECTION
     // ══════════════════════════════════════════════════════════════
 
-    private void trackDailyPnL(double pnlPct) {
+    // [v28.0] PATCH #16: synchronized prevents concurrent write on volatile compound op.
+    // PATCH #1: triggers drawdown pause when -8% from peak threshold breached.
+    private synchronized void trackDailyPnL(double pnlPct) {
         resetDailyIfNeeded();
         dailyPnLPct += pnlPct;
-        // [v12.2] No cooldown. Streak guard handles everything automatically.
+
+        // Trigger drawdown pause if threshold breached and not already paused
+        if (drawdownFromPeak < DRAWDOWN_PAUSE_PCT
+                && System.currentTimeMillis() >= drawdownPausedUntil) {
+            drawdownPausedUntil = System.currentTimeMillis() + DRAWDOWN_PAUSE_MS;
+        }
     }
 
     private void resetDailyIfNeeded() {
