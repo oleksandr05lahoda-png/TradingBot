@@ -44,7 +44,7 @@ public final class BotMain {
     // Ликвидность падает уже с 01:00, спреды расширяются
     private static final int QUIET_START_H = 1;
     private static final int QUIET_END_H   = 5;
-    private static final boolean QUIET_HOURS_ENABLED = envInt("QUIET_HOURS_ENABLED", 0) == 1;
+    private static final boolean QUIET_HOURS_ENABLED = envInt("QUIET_HOURS_ENABLED", 1) == 1;
 
     // ── Секторальные лидеры для GIC ───────────────────────────────────────
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
@@ -497,14 +497,17 @@ public final class BotMain {
             double priceClose;
             double atr14Trail = 0; // [v25.0] 1m ATR for Chandelier Exit
             try {
-                // [v25.0] Fetch 20 bars (was 4) — needed for 14-bar ATR calculation
-                List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 20);
+                // [v25.0] Fetch 60 bars (was 20) — needed for 14-bar ATR calculation and stabilizing
+                List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 60);
                 if (candles == null || candles.isEmpty()) continue;
 
                 double newLow = Double.MAX_VALUE, newHigh = Double.NEGATIVE_INFINITY;
                 for (com.bot.TradingCore.Candle c : candles) {
-                    newLow  = Math.min(newLow,  c.low);
-                    newHigh = Math.max(newHigh, c.high);
+                    // [Hole 1 FIX] Only take extremes from candles that opened AT or AFTER the trade entry time
+                    if (c.openTime >= ts.createdAt) {
+                        newLow  = Math.min(newLow,  c.low);
+                        newHigh = Math.max(newHigh, c.high);
+                    }
                 }
                 priceClose = candles.get(candles.size() - 1).close;
 

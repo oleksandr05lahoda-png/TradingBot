@@ -31,7 +31,7 @@ import java.util.stream.Collectors;
  * ╚══════════════════════════════════════════════════════════════════════════════╝
  */
 public final class InstitutionalSignalCore {
-    private static final double MAX_EFFECTIVE_MIN_CONF = 64.0;
+    private static final double MAX_EFFECTIVE_MIN_CONF = 75.0; // [Hole 11 FIX] Raised from 64 to 75 to allow streak guard properly
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
@@ -266,20 +266,64 @@ public final class InstitutionalSignalCore {
     private static final int MAX_SAME_DIRECTION = 6;
 
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
-        // [SCANNER MODE v1.0] Bot runs as a pure signal scanner.
-        // All portfolio-level blockers (heat cap, active count, direction limit, daily PnL,
-        // drawdown, symbol quarantine) are DISABLED. DecisionEngine quality gates remain active.
-        // SignalSender still requires probability >= MIN_CONF_FLOOR via its own threshold.
-        cleanupExpired(); // still run cleanup so stats stay current
-        cautiousMode = false;
+        // [Hole 10 FIX] Restored scanner mode to actually apply portfolio limits.
+        cleanupExpired();
+
+        // 1. Daily Loss Check
+        if (dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT) {
+            cautiousMode = true;
+        } else {
+            cautiousMode = false;
+        }
+        if (dailyPnLPct <= DAILY_LOSS_SURVIVAL_PCT) {
+            log("🛑 BLOCK: Daily loss survival limit reached: " + dailyPnLPct + "%");
+            return false;
+        }
+
+        // 2. Heat Check
+        double estRisk = estimateRisk(signal.probability, signal.category);
+        if (currentHeat + estRisk > maxPortfolioHeat) {
+            log("🛑 BLOCK: Portfolio heat cap reached (" + (currentHeat * 100) + "%)");
+            return false;
+        }
+
+        // 3. Global count check
+        if (getActiveCount() >= maxGlobalSignals) {
+            log("🛑 BLOCK: Max global signals limit reached (" + maxGlobalSignals + ")");
+            return false;
+        }
+
+        // 4. Same Symbol check
+        List<ActiveSignal> symSignals = activeSignals.get(signal.symbol);
+        if (symSignals != null && symSignals.size() >= maxSignalsPerSymbol) {
+            return false;
+        }
+
+        // 5. Direction limit
+        int sameDirCount = 0;
+        for (List<ActiveSignal> list : activeSignals.values()) {
+            for (ActiveSignal s : list) {
+                if (s.side == signal.side) {
+                    sameDirCount++;
+                }
+            }
+        }
+        if (sameDirCount >= MAX_SAME_DIRECTION) {
+            log("🛑 BLOCK: Max same direction limit reached (" + MAX_SAME_DIRECTION + ")");
+            return false;
+        }
+
         return true;
     }
 
     public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
-        // [SCANNER MODE v1.0] Do NOT add to activeTrades or increment heat.
-        // Bot is a signal generator — it does not track open positions.
-        // act=N/N counter stays at 0 so it can never block subsequent signals.
-        // Stats (tradeHistory, symbolScore) are still updated via closeTrade() if UDS fires.
+        // [Hole 10 FIX] Actually register the signal to track open positions and heat
+        double estRisk = estimateRisk(signal.probability, signal.category);
+        ActiveSignal act = new ActiveSignal(signal.symbol, signal.side, signal.price, signal.stop,
+                signal.tp1, signal.probability, estRisk, signal.category.name(), "");
+
+        activeSignals.computeIfAbsent(signal.symbol, k -> new CopyOnWriteArrayList<>()).add(act);
+        currentHeat += estRisk;
     }
 
     // ══════════════════════════════════════════════════════════════

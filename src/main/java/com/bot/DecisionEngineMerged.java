@@ -85,7 +85,7 @@ public final class DecisionEngineMerged {
 
     // [FIX v32+] Post-exit directional cooldown: after close, block same direction N minutes
     private final Map<String, Long> postExitCooldown = new ConcurrentHashMap<>();
-    private static final long POST_EXIT_COOLDOWN_MS = 10 * 60_000L; // 10 min after close
+    private static final long POST_EXIT_COOLDOWN_MS = 30 * 60_000L; // [Hole 14 FIX] 30 min after close (was 10)
 
     // [v7.0] GIC reference
     private volatile com.bot.GlobalImpulseController gicRef = null;
@@ -1228,6 +1228,17 @@ public final class DecisionEngineMerged {
             allFlags.add("GIC_LONG_SUPPRESS" + String.format("%.0f", gicLongSuppression * 100));
         }
 
+        // [Hole 2 FIX] Symmetric GIC LONG boost / SHORT SUPPRESSION during extreme bull runs
+        boolean aggressiveLong = gicCtx != null && gicCtx.onlyLong && !aggressiveShort;
+        if (aggressiveLong && totalLong > 0) {
+            totalLong *= 1.25; // Synthesize a crash boost for pumps
+            allFlags.add("GIC_BULL_BOOST125");
+            if (totalShort > 0) {
+                totalShort *= 0.50; // Hard crush short score during vertical pumps
+                allFlags.add("GIC_SHORT_SUPPRESS50");
+            }
+        }
+
         // ════════════════════════════════════════════════════════
         // [FIX v32+] DUAL HTF DIRECTIONAL GATE
         // When BOTH 1H and 2H agree on direction, the counter-direction
@@ -1250,8 +1261,8 @@ public final class DecisionEngineMerged {
         }
         if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
-            // Both timeframes are bullish — SHORT against strong trend
-            totalShort *= 0.40;
+            // [Hole 2 FIX] Both timeframes are bullish — balanced from 0.40 to 0.35 to match bear side
+            totalShort *= 0.35;
             allFlags.add("DUAL_HTF_BULL_PENALTY");
         }
 

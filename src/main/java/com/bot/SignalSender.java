@@ -384,6 +384,11 @@ public final class SignalSender {
                 TOP_N, poolSize,
                 !API_KEY.isBlank() ? "ON" : "OFF",
                 !API_KEY.isBlank() ? "ON" : "MANUAL");
+
+        // [Hole 13 FIX] Make default $1000 balance loudly transparent
+        if (API_KEY.isBlank()) {
+            System.out.println("⚠️ Внимание: API не подключен, использую виртуальный фикс. баланс $1000");
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
