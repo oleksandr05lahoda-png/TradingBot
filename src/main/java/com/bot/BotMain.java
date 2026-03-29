@@ -589,6 +589,10 @@ public final class BotMain {
                         it.remove();
                         isc.registerConfirmedResult(pnl > 0, ts.side);
                         isc.closeTrade(ts.symbol, ts.side, pnl);
+                        // [FIX v32+] Update DecisionEngine streak + post-exit cooldown
+                        if (pnl > 0) sender.getDecisionEngine().recordWin(ts.symbol, ts.side);
+                        else         sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
+                        sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                         markForecastRecord(ts.symbol + "_" + ts.side,
                                 pnl > 0 ? "CHANDELIER_PROFIT" : "CHANDELIER_FLAT");
                         String emoji = pnl >= 0.3 ? "✅" : "⚠️";
@@ -616,6 +620,9 @@ public final class BotMain {
                 it.remove();
                 isc.registerConfirmedResult(false, ts.side);
                 isc.closeTrade(ts.symbol, ts.side, pnl);
+                // [FIX v32+] Notify DecisionEngine for dynamic confidence penalty + post-exit cooldown
+                sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
+                sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                 markForecastRecord(ts.symbol + "_" + ts.side, "HIT_SL");
                 telegram.sendMessageAsync(String.format(
                         "❌ *SL HIT* %s %s | PnL: %+.2f%%\n"
@@ -722,6 +729,9 @@ public final class BotMain {
                     it.remove();
                     isc.registerConfirmedResult(true, ts.side);
                     isc.closeTrade(ts.symbol, ts.side, pnl);
+                    // [FIX v32+] Record win, post-exit cooldown
+                    sender.getDecisionEngine().recordWin(ts.symbol, ts.side);
+                    sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side, "HIT_TP3");
                     telegram.sendMessageAsync(String.format(
                             "✅✅ *TP3 HIT* %s %s | PnL: %+.2f%% 🚀",
@@ -741,6 +751,10 @@ public final class BotMain {
                     it.remove();
                     isc.registerConfirmedResult(pnl > 0, ts.side);
                     isc.closeTrade(ts.symbol, ts.side, pnl);
+                    // [FIX v32+] Update DecisionEngine streak tracking + post-exit cooldown
+                    if (pnl > 0) sender.getDecisionEngine().recordWin(ts.symbol, ts.side);
+                    else         sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
+                    sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side,
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
                     String trailEmoji = pnl > 0 ? "✅" : "⚠️";
@@ -757,6 +771,13 @@ public final class BotMain {
     // ══════════════════════════════════════════════════════════════
     //  FORECAST ACCURACY CHECKER
     // ══════════════════════════════════════════════════════════════
+
+    // [FIX v32+] Deduplication: Forecast Accuracy Report was firing 3x per minute.
+    // Root cause: checkForecastAccuracy() ran every 15m and called sendMessageAsync
+    // for EVERY resolved record when total % 20 == 0, which could match multiple
+    // records in the same run. Added lastForecastReportMs gate: max 1 report/hour.
+    private static volatile long lastForecastReportMs = 0;
+    private static final long FORECAST_REPORT_INTERVAL_MS = 60 * 60_000L; // once per hour max
 
     private static void checkForecastAccuracy(com.bot.SignalSender sender,
                                               com.bot.TelegramBotSender telegram) {
@@ -829,14 +850,19 @@ public final class BotMain {
                         acc, correct2, total));
 
                 if (total > 0 && total % 20 == 0) {
-                    telegram.sendMessageAsync(String.format(
-                            "📈 *Forecast Accuracy Report*\n"
-                                    + "Total: %d | Correct: %d | Accuracy: %.1f%%\n"
-                                    + "%s",
-                            total, correct2, acc,
-                            acc >= 58 ? "✅ Edge confirmed — модель работает"
-                                    : acc >= 50 ? "⚠️ Edge слабый — наблюдаем"
-                                    : "🔴 Edge отрицательный — нужна перекалибровка"));
+                    // [FIX v32+] Rate-gate: max 1 Forecast report per hour
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastForecastReportMs >= FORECAST_REPORT_INTERVAL_MS) {
+                        lastForecastReportMs = nowMs;
+                        telegram.sendMessageAsync(String.format(
+                                "📈 *Forecast Accuracy Report*\n"
+                                        + "Total: %d | Correct: %d | Accuracy: %.1f%%\n"
+                                        + "%s",
+                                total, correct2, acc,
+                                acc >= 58 ? "✅ Edge confirmed — модель работает"
+                                        : acc >= 50 ? "⚠️ Edge слабый — наблюдаем"
+                                        : "🔴 Edge отрицательный — нужна перекалибровка"));
+                    }
                 }
             } catch (Exception ex) {
                 LOG.fine("[FC] Fetch fail: " + fr.symbol + " " + ex.getMessage());

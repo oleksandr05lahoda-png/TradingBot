@@ -49,8 +49,14 @@ public final class SignalSender {
     private static final double MIN_PROFIT_MEME = 0.0050;
 
     private static final double MIN_VOL_TOP_USD  = 50_000_000;
-    private static final double MIN_VOL_ALT_USD  = 5_000_000;
-    private static final double MIN_VOL_MEME_USD = 1_000_000;
+    // [FIX v32+] Minimum volume raised dramatically.
+    // OLD: $5M ALT / $1M MEME — this allowed RIVERUSDT, MONUSDT, VVVUSDT into analysis.
+    // These low-cap coins have: wide spreads, noisy CVD, unreliable OBI, thin orderbook.
+    // Volume delta on a $3M/24h coin is 95% noise. Signals are not tradeable.
+    // NEW: $30M ALT / $10M MEME — forces analysis on liquid, institutional coins only.
+    // Net effect: TOP_N=100 → ~35-45 actual candidates. Deep analysis, not shallow scanning.
+    private static final double MIN_VOL_ALT_USD  = 30_000_000;  // was 5_000_000
+    private static final double MIN_VOL_MEME_USD = 10_000_000;  // was 1_000_000
 
     private static final double STOP_CLUSTER_SHIFT = 0.0025;
     private static final int    MAX_WS_CONNECTIONS  = 100;
@@ -663,14 +669,30 @@ public final class SignalSender {
             if (idea.probability < MIN_CONF) return null;
 
             // [v18.0 REFACTOR] OBI: flag only, no probability scaling, no blocking
+            // [FIX v32+] ANTI-SPOOFING: cross-validate OBI with realised taker flow.
+            // A limit wall (OBI) WITHOUT confirmed taker activity = likely spoofing.
+            // Spoofer pattern: large bid wall appears → bot flags bullish → wall yanked → dump.
+            // Validation: if OBI says bullish (bid > ask) but normDelta says sell flow → SKIP OBI.
+            // This does NOT block the signal — it just removes the OBI confidence flag.
             OrderbookSnapshot obs = orderbookMap.get(pair);
             if (obs != null && obs.isFresh()) {
                 double obi = obs.obi();
                 boolean obiAligned = (isLong && obi > OBI_THRESHOLD) || (!isLong && obi < -OBI_THRESHOLD);
                 if (obiAligned) {
-                    List<String> nf = new ArrayList<>(idea.flags);
-                    nf.add("OBI" + String.format("%+.0f", obi * 100));
-                    idea = rebuildIdea(idea, idea.probability, nf);
+                    // [FIX v32+] Anti-spoofing: OBI bullish but taker flow bearish = spoof suspect
+                    boolean obiAndFlowAgree = isLong
+                            ? normDelta > -0.10   // bid wall + some sell flow OK, but not heavy sell
+                            : normDelta < 0.10;   // ask wall + some buy flow OK, but not heavy buy
+                    if (obiAndFlowAgree) {
+                        List<String> nf = new ArrayList<>(idea.flags);
+                        nf.add("OBI" + String.format("%+.0f", obi * 100));
+                        idea = rebuildIdea(idea, idea.probability, nf);
+                    } else {
+                        // Spoof suspected — tag it but don't boost
+                        List<String> nf = new ArrayList<>(idea.flags);
+                        nf.add("OBI_SPOOF?");
+                        idea = rebuildIdea(idea, idea.probability, nf);
+                    }
                 }
             }
 

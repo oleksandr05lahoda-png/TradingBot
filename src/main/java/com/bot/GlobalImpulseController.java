@@ -443,12 +443,67 @@ public final class GlobalImpulseController {
         }
 
         boolean strongPressure = rawStrength > 0.70 && volExpansion > 1.4;
-        boolean onlyLong  = regime == GlobalRegime.BTC_STRONG_UP  && rawStrength > 0.82;
-        boolean onlyShort = (regime == GlobalRegime.BTC_STRONG_DOWN || regime == GlobalRegime.BTC_CRASH
-                || regime == GlobalRegime.BTC_PANIC) && rawStrength > 0.78;
+
+        // [FIX v32+] EXTENDED LONG SUPPRESSION LADDER.
+        //
+        // OLD: onlyShort only triggered at BTC_STRONG_DOWN (move3 < -1%) + rawStrength > 0.78.
+        //      BTC_IMPULSE_DOWN (move3 < -0.4%) was NOT covered → alts could go LONG while
+        //      BTC was actively selling off -0.5% per 15m candle. This is a reliable loser.
+        //
+        // NEW: Gradient suppression ladder based on regime severity:
+        //
+        //   BTC_PANIC / BTC_CRASH               → onlyShort = true  (HARD veto on all LONG)
+        //   BTC_STRONG_DOWN (rawStr > 0.78)     → onlyShort = true  (was already here)
+        //   BTC_STRONG_DOWN (rawStr 0.60-0.78)  → longSuppression = 0.30 (soft 70% crush)
+        //   BTC_IMPULSE_DOWN (rawStr > 0.65,    → onlyShort = true  (NEW: added)
+        //                     velocity > WATCH)
+        //   BTC_IMPULSE_DOWN (rawStr 0.50-0.65) → longSuppression = 0.55 (soft 45% crush)
+        //
+        // Symmetric LONG guard: BTC_STRONG_UP + BTC_IMPULSE_UP → veto SHORT
+        //
+        boolean onlyLong  = (regime == GlobalRegime.BTC_STRONG_UP  && rawStrength > 0.82)
+                || (regime == GlobalRegime.BTC_IMPULSE_UP  && rawStrength > 0.72);
+
+        boolean onlyShort = (regime == GlobalRegime.BTC_STRONG_DOWN && rawStrength > 0.78)
+                || (regime == GlobalRegime.BTC_CRASH)
+                || (regime == GlobalRegime.BTC_PANIC)
+                // [FIX v32+] NEW: IMPULSE_DOWN with velocity also blocks all LONG
+                || (regime == GlobalRegime.BTC_IMPULSE_DOWN
+                && rawStrength > 0.65
+                && btcDropVelocity > VELOCITY_WATCH);
+
+        // Expose gradient suppression multipliers via shortBoost/confidenceAdj fields
+        // so DecisionEngine can apply proportional penalty instead of binary block.
+        // longSuppressionMult stored in confidenceAdjustment (negative = suppress LONG).
+        // Values: 1.0 = no effect, 0.30 = crush LONG score to 30%, etc.
+        double longSuppressionMult = 1.0;
+        if (!onlyShort) {
+            if (regime == GlobalRegime.BTC_STRONG_DOWN && rawStrength >= 0.60) {
+                longSuppressionMult = 0.30;
+            } else if (regime == GlobalRegime.BTC_IMPULSE_DOWN && rawStrength >= 0.50) {
+                longSuppressionMult = 0.55;
+            } else if (cascadeLevel == CascadeLevel.DANGER) {
+                longSuppressionMult = 0.45;
+            } else if (cascadeLevel == CascadeLevel.WATCH) {
+                longSuppressionMult = 0.75;
+            }
+        }
 
         // ── SHORT Boost — усиление шортов при краше ──────────────
         double shortBoost = computeShortBoost(cascadeLevel, btcCrashScore, btcDropVelocity, btcMomentumAccel);
+
+        // [FIX v32+] Store longSuppressionMult in confAdj as negative sentinel.
+        // DecisionEngine reads confidenceAdjustment — negative values < -1.0 signal
+        // gradient suppression rather than a flat confidence delta.
+        // Convention: confAdj < -10 → longSuppressionMult = (confAdj + 100) / 100
+        // Example: longSuppressionMult=0.30 → confAdj = -70.0
+        // This avoids adding a new field to GlobalContext for backward compatibility.
+        double finalConfAdj = confAdj;
+        if (longSuppressionMult < 1.0) {
+            finalConfAdj = -(100.0 - longSuppressionMult * 100.0) - 50.0;
+            // range: mult=0.30 → -120, mult=0.55 → -95, mult=0.75 → -75
+            // DecisionEngine checks: if (confAdj < -50) longSuppressionMult = (confAdj+150)/100
+        }
 
         // ── Обновляем multi-window BTC return history ─────────────
         btcReturnHistory5.addLast(move1);
@@ -461,7 +516,7 @@ public final class GlobalImpulseController {
         currentContext = new GlobalContext(
                 regime, rawStrength, volExpansion, strongPressure,
                 onlyLong, onlyShort, clamp(btcTrend, -1, 1),
-                volRegime, confAdj,
+                volRegime, finalConfAdj,
                 btcDropVelocity, btcConsecutiveBearBars,
                 btcMomentumAccel, btcCrashScore,
                 cascadeLevel, panicMode.get(),

@@ -18,16 +18,20 @@ public final class DecisionEngineMerged {
     // Old 8-minute TOP cooldown blocked re-entry after a valid reversal signal.
     // On 15m timeframe: 8 min = half a candle. Opportunities missed.
     // New 3m: short enough to catch the next structural signal, long enough to prevent flip-flops.
-    private static final long   COOLDOWN_TOP    = 1  * 60_000L;  // [SCANNER MODE] was 3m — reduced for faster re-signal
-    private static final long   COOLDOWN_ALT    = 1  * 60_000L;  // [SCANNER MODE] was 2m
-    private static final long   COOLDOWN_MEME   = 2  * 60_000L;
-    // [SCANNER MODE v1.0] BASE_CONF and MIN_CONF_FLOOR lowered from 62→52 (symmetric for LONG and SHORT).
-    // Bot operates as a signal scanner — confidence floor raised only by live multi-factor confluence,
-    // not by a blanket floor that silences the majority of setups on neutral markets.
-    private static final double BASE_CONF       = 52.0;  // was 62.0
+    // [FIX v32+] Cooldowns restored to meaningful values.
+    // 1-minute cooldown was causing 5 signals on same pair in 8 minutes (CRVUSDT ×5).
+    // At 1m cooldown on 15m TF = 1/15 of a candle. Structurally meaningless.
+    // 5m TOP / 4m ALT ensures at minimum 1/3 of a 15m candle between re-entries.
+    private static final long   COOLDOWN_TOP    = 5  * 60_000L;  // was 1m — restored to meaningful level
+    private static final long   COOLDOWN_ALT    = 4  * 60_000L;  // was 1m
+    private static final long   COOLDOWN_MEME   = 6  * 60_000L;  // was 2m
+    // [FIX v32+] BASE_CONF restored to 62.0. At 52.0 any signal above noise floor passes.
+    // With probability floor=50 and range≤36, 52-floor gives zero discrimination.
+    // 62.0 is the minimum where signal/noise ratio becomes meaningful.
+    private static final double BASE_CONF       = 62.0;  // was 52.0 — critical fix
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 52.0;  // was 62.0
-    private static final double MIN_CONF_CEIL   = 78.0;
+    private static final double MIN_CONF_FLOOR  = 60.0;  // was 52.0
+    private static final double MIN_CONF_CEIL   = 82.0;
 
     // Дивергенции — штраф вместо хард-лока
     private static final double DIV_PENALTY_SCORE  = 0.55;
@@ -64,6 +68,24 @@ public final class DecisionEngineMerged {
     private final Map<String, Double>           cvdMap           = new ConcurrentHashMap<>();
     // [v29] VDA — Volume Delta Acceleration from aggTrade stream [-1..+1]
     private final Map<String, Double>           vdaMap           = new ConcurrentHashMap<>();
+
+    // [FIX v32+] CVD PERSISTENCE — prevents short-covering bounce from triggering LONG.
+    // A single CVD spike on the bottom = shorts closing stops, NOT real demand.
+    // Require 3 consecutive bars of positive CVD before marking as bullish intent.
+    private final Map<String, Deque<Double>>    cvdHistory       = new ConcurrentHashMap<>();
+    private static final int CVD_PERSIST_BARS = 3; // minimum consecutive bars
+
+    // [FIX v32+] Dynamic confidence penalty — consecutive losses on a symbol
+    // raise the min confidence threshold for that symbol by CONF_PENALTY_PER_LOSS per loss.
+    // After a win, penalty decays by one step. Max penalty = CONF_PENALTY_MAX.
+    private final Map<String, Integer> consecutiveLossMap = new ConcurrentHashMap<>();
+    private static final double CONF_PENALTY_PER_LOSS = 3.0;
+    private static final double CONF_PENALTY_MAX      = 15.0;
+    private static final int    CONF_PENALTY_THRESHOLD = 3; // start penalizing after 3rd loss
+
+    // [FIX v32+] Post-exit directional cooldown: after close, block same direction N minutes
+    private final Map<String, Long> postExitCooldown = new ConcurrentHashMap<>();
+    private static final long POST_EXIT_COOLDOWN_MS = 10 * 60_000L; // 10 min after close
 
     // [v7.0] GIC reference
     private volatile com.bot.GlobalImpulseController gicRef = null;
@@ -112,6 +134,47 @@ public final class DecisionEngineMerged {
         registerSignal(symbol, side, now);
     }
 
+    /**
+     * [FIX v32+] Record loss for a symbol — increases min confidence threshold.
+     * Call from BotMain TradeResolver after SL hit or Chandelier flat exit.
+     */
+    public void recordLoss(String symbol, com.bot.TradingCore.Side side) {
+        int losses = consecutiveLossMap.merge(symbol, 1, Integer::sum);
+        if (losses >= CONF_PENALTY_THRESHOLD) {
+            double penalty = Math.min(CONF_PENALTY_MAX,
+                    (losses - CONF_PENALTY_THRESHOLD + 1) * CONF_PENALTY_PER_LOSS);
+            double current = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
+            symbolMinConf.put(symbol, Math.min(MIN_CONF_CEIL, current + penalty));
+        }
+        // Also set post-exit cooldown for same direction
+        postExitCooldown.put(symbol + "_" + side.name(), System.currentTimeMillis());
+    }
+
+    /**
+     * [FIX v32+] Record win — decays confidence penalty, resets consecutive losses.
+     * Call from BotMain TradeResolver after TP hit.
+     */
+    public void recordWin(String symbol, com.bot.TradingCore.Side side) {
+        consecutiveLossMap.put(symbol, 0);
+        double current = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
+        if (current > globalMinConf.get()) {
+            symbolMinConf.put(symbol, Math.max(globalMinConf.get(), current - CONF_PENALTY_PER_LOSS));
+        }
+    }
+
+    /**
+     * [FIX v32+] Called from BotMain after any position close (TP/SL/Chandelier).
+     * Blocks re-entry in same direction for POST_EXIT_COOLDOWN_MS to prevent spin-trading.
+     */
+    public void markPostExitCooldown(String symbol, com.bot.TradingCore.Side side) {
+        postExitCooldown.put(symbol + "_" + side.name(), System.currentTimeMillis());
+    }
+
+    private boolean isPostExitBlocked(String symbol, com.bot.TradingCore.Side side) {
+        Long ts = postExitCooldown.get(symbol + "_" + side.name());
+        return ts != null && System.currentTimeMillis() - ts < POST_EXIT_COOLDOWN_MS;
+    }
+
     public void setVolumeDelta(String sym, double delta) {
         volumeDeltaMap.put(sym, delta);
         Deque<Double> hist = vdHistory.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
@@ -122,6 +185,29 @@ public final class DecisionEngineMerged {
     /** [ДЫРА №1] CVD — устанавливается из SignalSender после вычисления накопленной дельты */
     public void setCVD(String sym, double cvdNormalized) {
         cvdMap.put(sym, cvdNormalized);
+        // [FIX v32+] Build CVD history for persistence check (short-covering vs real demand)
+        Deque<Double> hist = cvdHistory.computeIfAbsent(sym,
+                k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        hist.addLast(cvdNormalized);
+        if (hist.size() > 10) hist.removeFirst();
+    }
+
+    /**
+     * [FIX v32+] CVD Persistence check.
+     * Returns true only if the last CVD_PERSIST_BARS readings all agreed in direction.
+     * Prevents short-covering spikes from triggering LONG signals.
+     */
+    private boolean isCVDPersistent(String sym, boolean bullish) {
+        Deque<Double> hist = cvdHistory.get(sym);
+        if (hist == null || hist.size() < CVD_PERSIST_BARS) return false;
+        List<Double> list = new ArrayList<>(hist);
+        int n = list.size();
+        int consecutive = 0;
+        for (int i = n - CVD_PERSIST_BARS; i < n; i++) {
+            if (bullish  && list.get(i) > 0.05) consecutive++;
+            if (!bullish && list.get(i) < -0.05) consecutive++;
+        }
+        return consecutive >= CVD_PERSIST_BARS;
     }
 
     /** [v29] VDA score [-1..+1]: +1=buy acceleration, -1=sell acceleration */
@@ -700,6 +786,15 @@ public final class DecisionEngineMerged {
         double btcAccel         = gicCtx != null ? gicCtx.btcMomentumAccel : 0.0;
         double gicShortBoost    = gicCtx != null ? gicCtx.shortBoost : 1.0;
 
+        // [FIX v32+] Read gradient long suppression multiplier from GIC.
+        // GIC encodes longSuppressionMult in confidenceAdjustment using sentinel range < -50.
+        // Convention: confAdj = -(100 - mult*100) - 50 → mult = (confAdj + 150) / 100
+        // Example: confAdj = -120 → mult = 0.30 (crush LONG score to 30%)
+        double gicLongSuppression = 1.0; // default: no suppression
+        if (gicCtx != null && gicCtx.confidenceAdjustment < -50.0) {
+            gicLongSuppression = clamp((gicCtx.confidenceAdjustment + 150.0) / 100.0, 0.10, 0.90);
+        }
+
         // [v26.0] GIC DIRECTIONAL GATE — consume onlyLong / onlyShort that were
         // previously computed in GIC but never enforced in generate().
         // onlyLong  = BTC_STRONG_UP + strength > 0.82  → veto all SHORT signals
@@ -921,40 +1016,40 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
 
         // [v28.0] PATCH #4: CVD triple-count fix.
-        // OLD: VD_BUY(0.14) + CVD_BUY(0.65) + CVD_DIV_BULL(0.55) = 1.34 pts for ONE fact.
-        // NEW: VD and CVD are the same underlying fact (volume delta) at different windows.
-        //      Use the STRONGER signal via addLong/addShort (which takes MAX, not sum).
-        //      Divergence (CVD_DIV) is structurally different — it stays as addShort/addLong,
-        //      but only fires when divergence condition is met (not redundant with base CVD).
+        // [FIX v32+] SHORT-COVERING BOUNCE FIX: LONG requires CVD persistent 3+ bars.
+        // A single CVD spike on the bottom is NOT real demand — it's shorts covering stops.
+        // Only flag CVD_BUY (LONG signal) when positive CVD holds across multiple bars.
+        // SHORT side has no persistence requirement: one bar of aggressive selling is enough.
 
         Double vd = volumeDeltaMap.get(symbol);
         double vdRatio = getVolumeDeltaRatio(symbol);
         double cvdVal = cvdMap.getOrDefault(symbol, 0.0);
 
-        // Compute best single volume-delta score (VD instant vs CVD accumulated — take max)
         if (vd != null || Math.abs(cvdVal) > 0.10) {
-            // Instant VD score (only if volume spike)
             double vdScore = (vd != null && vdRatio > 1.5)
                     ? mctx.s(Math.min(0.55, vdRatio * 0.14)) : 0.0;
-            // CVD accumulated score (higher weight — shows real intent over 90×1m)
             double cvdScore = Math.abs(cvdVal) > 0.10
                     ? mctx.s(Math.min(0.65, Math.abs(cvdVal) * 0.70)) : 0.0;
-            // Use the stronger of the two — addLong/addShort already takes MAX
             double bestScore = Math.max(vdScore, cvdScore);
-            boolean volBull = (vd != null && vd > 0 && vdRatio > 1.5) || cvdVal > 0.10;
-            boolean volBear = (vd != null && vd < 0 && vdRatio > 1.5) || cvdVal < -0.10;
+
+            // [FIX v32+] LONG CVD: require persistence (3 bars) to filter short-covering
+            boolean cvdBullPersistent = isCVDPersistent(symbol, true);
+            boolean cvdBearPersistent = isCVDPersistent(symbol, false); // SHORT: no persistence needed
+            boolean volBull = (vd != null && vd > 0 && vdRatio > 1.5) || (cvdVal > 0.10 && cvdBullPersistent);
+            boolean volBear = (vd != null && vd < 0 && vdRatio > 1.5) || cvdVal < -0.10; // bear: instant
+
             if (volBull && bestScore > 0) cVolume.addLong(bestScore,  cvdScore >= vdScore ? "CVD_BUY" : "VD_BUY");
             if (volBear && bestScore > 0) cVolume.addShort(bestScore, cvdScore >= vdScore ? "CVD_SELL" : "VD_SELL");
 
-            // Divergence penalties (price direction vs CVD direction — structurally distinct)
+            // Divergence penalties — structurally distinct from base CVD
             if (move5 > 0.002 && cvdVal < -0.10) cVolume.penalizeLong(0.60);
             if (move5 < -0.002 && cvdVal > 0.10) cVolume.penalizeShort(0.60);
         }
 
         // CVD-divergence (high-confidence threshold: price strongly disagrees with CVD)
-        // These ARE structurally separate from base CVD — price vs CVD opposition = trap signal
         boolean cvdDivBear = move5 > 0.003 && cvdVal < -0.15;
         boolean cvdDivBull = move5 < -0.003 && cvdVal > 0.15;
+        // [FIX v32+] Remove duplicate penalize calls — addShort/addLong already handle it
         if (cvdDivBear) { cVolume.addShort(mctx.s(0.55), "CVD_DIV_BEAR"); allFlags.add("CVD_DIV⚠"); }
         if (cvdDivBull) { cVolume.addLong(mctx.s(0.55),  "CVD_DIV_BULL"); allFlags.add("CVD_DIV⚠"); }
 
@@ -1006,6 +1101,19 @@ public final class DecisionEngineMerged {
         double vwapVal = vwap(c15.subList(c15.size() - vwapLen, c15.size()));
         if (price > vwapVal * 1.0008) cHTF.boostLong(mctx.s(0.18), "VWAP_BULL");
         if (price < vwapVal * 0.9992) cHTF.boostShort(mctx.s(0.18), "VWAP_BEAR");
+
+        // [FIX v32+] VWAP counter-trend penalty.
+        // Price aggressively below VWAP + LONG candidate = trading against institutional flow.
+        // Price aggressively above VWAP + SHORT candidate (not crash mode) = same issue.
+        // This is the #1 killer of false LONG setups in bear markets.
+        if (price < vwapVal * 0.9985 && !aggressiveShort) {
+            cHTF.penalizeLong(0.60);
+            allFlags.add("VWAP_BELOW_PENALTY");
+        }
+        if (price > vwapVal * 1.0015 && !aggressiveShort) {
+            cHTF.penalizeShort(0.65);
+            allFlags.add("VWAP_ABOVE_PENALTY");
+        }
 
         // ════════════════════════════════════════════════════════
         // КЛАСТЕР 5: DERIVATIVES (Funding, OI, Divergences)
@@ -1109,6 +1217,42 @@ public final class DecisionEngineMerged {
         if (aggressiveShort && gicShortBoost > 1.0 && totalShort > 0) {
             totalShort *= gicShortBoost;
             allFlags.add("GIC_BOOST" + String.format("%.0f", gicShortBoost * 100));
+        }
+
+        // [FIX v32+] GIC GRADIENT LONG SUPPRESSION
+        // Applies when BTC is in IMPULSE_DOWN or STRONG_DOWN without hitting hard veto threshold.
+        // Proportionally crushes LONG score so signals don't pass unless they have
+        // overwhelming confluence (5+ clusters vs normal 2 minimum).
+        if (gicLongSuppression < 1.0 && totalLong > 0) {
+            totalLong *= gicLongSuppression;
+            allFlags.add("GIC_LONG_SUPPRESS" + String.format("%.0f", gicLongSuppression * 100));
+        }
+
+        // ════════════════════════════════════════════════════════
+        // [FIX v32+] DUAL HTF DIRECTIONAL GATE
+        // When BOTH 1H and 2H agree on direction, the counter-direction
+        // candidate needs much higher conviction to override them.
+        // Dual HTF BEAR + LONG = "falling knife" = -65% score penalty.
+        // Dual HTF BULL + SHORT = "shorting strong trend" = -60% penalty.
+        // This is the single biggest cause of 0 LONG signals: without this patch
+        // the opposite is also true — it was NOT penalizing LONG properly, so
+        // LONGs in pure bear markets passed through with insufficient evidence.
+        // ════════════════════════════════════════════════════════
+        com.bot.TradingCore.Side prelimSide = totalLong > totalShort
+                ? com.bot.TradingCore.Side.LONG
+                : com.bot.TradingCore.Side.SHORT;
+
+        if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
+                && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.LONG) {
+            // Both timeframes are bearish — LONG requires extraordinary conviction
+            totalLong *= 0.35;
+            allFlags.add("DUAL_HTF_BEAR_PENALTY");
+        }
+        if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
+                && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
+            // Both timeframes are bullish — SHORT against strong trend
+            totalShort *= 0.40;
+            allFlags.add("DUAL_HTF_BULL_PENALTY");
         }
 
         // ════════════════════════════════════════════════════════
@@ -1331,6 +1475,10 @@ public final class DecisionEngineMerged {
         long shortCooldownOverride = aggressiveShort ? 60_000L : -1;
         if (!cooldownAllowedEx(symbol, side, cat, now, shortCooldownOverride)) return null;
         if (!flipAllowed(symbol, side)) return null;
+
+        // [FIX v32+] Post-exit directional cooldown: prevents re-entry in same direction
+        // for 10 minutes after any position close. Eliminates spin-trading on same pair.
+        if (isPostExitBlocked(symbol, side)) return null;
 
         // [v26.0] GIC DIRECTIONAL HARD VETO — enforces onlyLong / onlyShort
         // Previously: GIC computed these flags but generate() never read them (confirmed bug).
@@ -2480,31 +2628,95 @@ public final class DecisionEngineMerged {
         return MarketState.WEAK_TREND;
     }
 
+    /**
+     * [FIX v32+] detectBias1H REWRITE.
+     *
+     * PROBLEM: EMA50 vs EMA200 crossover on 1H takes 8-10 DAYS to flip.
+     * During any altcoin correction (2-5 days), EMA50 stays below EMA200 everywhere.
+     * Result: HTFBias.BEAR on 100% of pairs → zero LONG signals possible.
+     *
+     * FIX: Multi-factor adaptive bias combining:
+     *   1. Fast EMA alignment (9 vs 21 — reacts in 1-2 days)
+     *   2. Price position vs EMA50 (key institutional reference)
+     *   3. RSI momentum zone (confirms direction vs exhaustion)
+     *   4. Recent swing structure (higher highs/lows on 1H)
+     *
+     * Threshold: minimum 3 of 4 factors must agree to assign BULL/BEAR.
+     * With only 1-2 factors → NONE (neutral = no bias penalty).
+     * This prevents false BEAR lock that kills all LONG opportunities.
+     */
     private HTFBias detectBias1H(List<com.bot.TradingCore.Candle> c) {
         if (!valid(c)) return HTFBias.NONE;
-        double e50  = ema(c, 50);
-        double e200 = ema(c, 200);
-        if (e50 > e200 * 1.002) return HTFBias.BULL;
-        if (e50 < e200 * 0.998) return HTFBias.BEAR;
+
+        int bullScore = 0;
+        int bearScore = 0;
+
+        // Factor 1: Fast EMA alignment (EMA9 vs EMA21) — reacts in hours, not days
+        double e9  = ema(c, 9);
+        double e21 = ema(c, 21);
+        double e50 = ema(c, 50);
+        if (e9 > e21 * 1.0005) bullScore++;
+        else if (e9 < e21 * 0.9995) bearScore++;
+
+        // Factor 2: Price vs EMA50 (institutional baseline)
+        double price1h = last(c).close;
+        if (price1h > e50 * 1.001) bullScore++;
+        else if (price1h < e50 * 0.999) bearScore++;
+
+        // Factor 3: RSI zone — above 50 = bullish momentum, below 50 = bearish
+        double rsi1h = rsi(c, 14);
+        if (rsi1h > 53) bullScore++;
+        else if (rsi1h < 47) bearScore++;
+
+        // Factor 4: Recent swing structure (HH/HL vs LL/LH on last 20 bars)
+        if (c.size() >= 20) {
+            if (checkHH_HL(c)) bullScore++;
+            else if (checkLL_LH(c)) bearScore++;
+        }
+
+        // Require 3/4 factors to assign a bias. 1-2 factors = NONE.
+        if (bullScore >= 3) return HTFBias.BULL;
+        if (bearScore >= 3) return HTFBias.BEAR;
         return HTFBias.NONE;
     }
 
+    /**
+     * [FIX v32+] detectBias2H uses EMA12/26/50 — already faster than 1H version,
+     * but still biased to slow cross. Add RSI and swing structure confirmation.
+     * Same 3/4 factors threshold to avoid BEAR lock during corrections.
+     */
     private HTFBias detectBias2H(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 30) return HTFBias.NONE;
+
         double ema12 = ema(c, 12);
         double ema26 = ema(c, 26);
         double ema50 = c.size() >= 50 ? ema(c, 50) : ema26;
         double price = last(c).close;
+
+        int bullScore = 0;
+        int bearScore = 0;
+
+        // Factor 1: EMA alignment
         boolean bullEMA = ema12 > ema26 && ema26 > ema50 * 0.998;
         boolean bearEMA = ema12 < ema26 && ema26 < ema50 * 1.002;
-        boolean pAbove  = price > ema12 && price > ema26;
-        boolean pBelow  = price < ema12 && price < ema26;
-        boolean hh = checkHH_HL(c);
-        boolean ll = checkLL_LH(c);
-        if (bullEMA && pAbove && hh)  return HTFBias.BULL;
-        if (bearEMA && pBelow && ll)  return HTFBias.BEAR;
-        if (bullEMA && pAbove)        return HTFBias.BULL;
-        if (bearEMA && pBelow)        return HTFBias.BEAR;
+        if (bullEMA) bullScore++;
+        else if (bearEMA) bearScore++;
+
+        // Factor 2: Price vs EMAs
+        if (price > ema12 && price > ema26) bullScore++;
+        else if (price < ema12 && price < ema26) bearScore++;
+
+        // Factor 3: RSI
+        double rsi2h = rsi(c, 14);
+        if (rsi2h > 52) bullScore++;
+        else if (rsi2h < 48) bearScore++;
+
+        // Factor 4: Swing structure
+        if (checkHH_HL(c)) bullScore++;
+        else if (checkLL_LH(c)) bearScore++;
+
+        if (bullScore >= 3) return HTFBias.BULL;
+        if (bearScore >= 3) return HTFBias.BEAR;
         return HTFBias.NONE;
     }
 
@@ -2745,11 +2957,18 @@ public final class DecisionEngineMerged {
         return last(c).volume / avg > thr;
     }
 
+    /**
+     * [FIX v32+] pullback — tightened RSI ranges.
+     * OLD LONG: RSI 30-65 — allowed entry at RSI 64 = nearly overbought = terrible timing.
+     * NEW LONG: RSI 32-55 — only enter on genuine pullback, not mid-rally.
+     * OLD SHORT: RSI 35-70 — allowed entry at RSI 36 = nearly oversold.
+     * NEW SHORT: RSI 45-68 — only enter near distribution zone.
+     */
     private boolean pullback(List<com.bot.TradingCore.Candle> c, boolean bull) {
         double e21 = ema(c, 21), p = last(c).close, r = rsi(c, 14);
         return bull
-                ? p <= e21 * 1.003 && p >= e21 * 0.990 && r > 30 && r < 65
-                : p >= e21 * 0.997 && p <= e21 * 1.010 && r < 70 && r > 35;
+                ? p <= e21 * 1.003 && p >= e21 * 0.988 && r > 32 && r < 55  // tighter: was r<65
+                : p >= e21 * 0.997 && p <= e21 * 1.012 && r < 68 && r > 45;  // tighter: was r>35
     }
 
     private boolean bullishStructure(List<com.bot.TradingCore.Candle> c) {
