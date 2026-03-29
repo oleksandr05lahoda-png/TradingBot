@@ -149,7 +149,7 @@ public final class SignalSender {
     private static final long     VOL_REFRESH_MS   = 30 * 60_000L;
 
     // [FIX-COMP] Баланс для компаундинга
-    private volatile double accountBalance    = 100.0;
+    private volatile double accountBalance    = 1000.0; // [SCANNER MODE] fixed fallback — no API key needed for signal display
     private volatile long   lastBalanceRefresh = 0;
 
     // ══════════════════════════════════════════════════════════════
@@ -1190,10 +1190,10 @@ public final class SignalSender {
 
     private void checkWsHealth() {
         long now = System.currentTimeMillis();
-        long staleThreshold = 5 * 60_000L;
+        // [SCANNER MODE v1.0] Stale threshold reduced 5m→60s for faster data recovery.
+        // At 5m the bot could be analysing completely stale candles for 300 seconds silently.
+        long staleThreshold = 60_000L;
         // [FIX-WS-STORM] Collect stale pairs first, THEN reconnect.
-        // Old code reconnected inside the iterator → ConcurrentModificationException risk
-        // AND didn't clear lastTickTime → same pair re-triggered every 30s.
         List<String> stalePairs = new ArrayList<>();
         for (Map.Entry<String, WebSocket> e : wsMap.entrySet()) {
             Long last = lastTickTime.get(e.getKey());
@@ -1202,24 +1202,39 @@ public final class SignalSender {
             }
         }
         if (!stalePairs.isEmpty()) {
-            // [v28.0] PATCH #19: Alert on WS data loss — was silent before.
-            // Without alert, bot could analyse stale data for 10+ minutes silently.
-            bot.sendMessageAsync(String.format(
-                    "⚠️ *WS DATA LOSS* — %d пар без данных >5m: %s\n🔄 Переподключение...",
-                    stalePairs.size(),
-                    stalePairs.size() <= 5 ? stalePairs.toString() : stalePairs.size() + " пар"));
+            // [v28.0] PATCH #19 + [SCANNER] alert if >20% of pairs are stale (not just any pair)
+            if (stalePairs.size() > wsMap.size() * 0.20) {
+                bot.sendMessageAsync(String.format(
+                        "⚠️ *WS DATA LOSS* — %d пар без данных >60s: %s\n🔄 Переподключение...",
+                        stalePairs.size(),
+                        stalePairs.size() <= 5 ? stalePairs.toString() : stalePairs.size() + " пар"));
+            }
         }
-        for (String pair : stalePairs) {
-            if (!wsMap.containsKey(pair)) continue; // already disconnected
-            System.out.printf("[WS-HEALTH] %s stale (no data for %ds) — reconnecting%n",
-                    pair, (now - lastTickTime.getOrDefault(pair, now)) / 1000);
-            lastTickTime.remove(pair); // [FIX] Prevent re-trigger next cycle
-            reconnectWs(pair);
+        // [SCANNER MODE] Force-reconnect ALL WS channels if wsMessageCount hasn't moved in 60s.
+        // This catches the case where the TCP connection is open but Binance stopped sending frames.
+        long totalMessages = wsMessageCount.get();
+        if (lastWsHealthCheckMessages == totalMessages && !wsMap.isEmpty()
+                && now - lastWsHealthCheckMs > 60_000L) {
+            System.out.println("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
+            bot.sendMessageAsync("⚠️ *WS SILENT 60s* — форс-переподключение всех каналов...");
+            new ArrayList<>(wsMap.keySet()).forEach(this::reconnectWs);
+        } else {
+            for (String pair : stalePairs) {
+                if (!wsMap.containsKey(pair)) continue;
+                System.out.printf("[WS-HEALTH] %s stale (no data for %ds) — reconnecting%n",
+                        pair, (now - lastTickTime.getOrDefault(pair, now)) / 1000);
+                lastTickTime.remove(pair);
+                reconnectWs(pair);
+            }
         }
+        lastWsHealthCheckMessages = totalMessages;
+        lastWsHealthCheckMs = now;
         if (!API_KEY.isBlank() && udsWebSocket == null) {
             scheduleUdsRetry(2);
         }
     }
+    private volatile long lastWsHealthCheckMessages = -1;
+    private volatile long lastWsHealthCheckMs       = System.currentTimeMillis();
 
     // ══════════════════════════════════════════════════════════════
     //  LIQUIDITY GUARD

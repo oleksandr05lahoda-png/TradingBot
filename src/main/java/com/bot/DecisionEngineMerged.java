@@ -18,18 +18,16 @@ public final class DecisionEngineMerged {
     // Old 8-minute TOP cooldown blocked re-entry after a valid reversal signal.
     // On 15m timeframe: 8 min = half a candle. Opportunities missed.
     // New 3m: short enough to catch the next structural signal, long enough to prevent flip-flops.
-    private static final long   COOLDOWN_TOP    = 3  * 60_000L;
-    private static final long   COOLDOWN_ALT    = 2  * 60_000L;
+    private static final long   COOLDOWN_TOP    = 1  * 60_000L;  // [SCANNER MODE] was 3m — reduced for faster re-signal
+    private static final long   COOLDOWN_ALT    = 1  * 60_000L;  // [SCANNER MODE] was 2m
     private static final long   COOLDOWN_MEME   = 2  * 60_000L;
-    // [v28.0 FIX] BASE_CONF and MIN_CONF_FLOOR raised to 62.
-    // At 48-51% the bot generates signals in pure statistical noise zone.
-    // Fees (0.08%×2) + slippage (0.15%) = -0.31% cost per trade.
-    // Break-even winrate at avg win=1.5% / avg loss=1.2%: needs ~60% real WR.
-    // Floor 62 = minimum to have positive EV after costs on unverified edge.
-    private static final double BASE_CONF       = 62.0;  // was 51.0
+    // [SCANNER MODE v1.0] BASE_CONF and MIN_CONF_FLOOR lowered from 62→52 (symmetric for LONG and SHORT).
+    // Bot operates as a signal scanner — confidence floor raised only by live multi-factor confluence,
+    // not by a blanket floor that silences the majority of setups on neutral markets.
+    private static final double BASE_CONF       = 52.0;  // was 62.0
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 62.0;  // was 48.0 — was generating noise signals
-    private static final double MIN_CONF_CEIL   = 78.0;  // was 65.0 — raised proportionally
+    private static final double MIN_CONF_FLOOR  = 52.0;  // was 62.0
+    private static final double MIN_CONF_CEIL   = 78.0;
 
     // Дивергенции — штраф вместо хард-лока
     private static final double DIV_PENALTY_SCORE  = 0.55;

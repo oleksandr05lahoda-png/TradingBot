@@ -266,80 +266,20 @@ public final class InstitutionalSignalCore {
     private static final int MAX_SAME_DIRECTION = 6;
 
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
-        cleanupExpired();
-        String sym = signal.symbol;
-
-        // [v32] The Pause Paradox resolved: NO TIME BLOCKS. Only risk mitigation.
-        // If an extreme drop occurs, we become extreme snipers, but we never go completely blind.
-        resetDailyIfNeeded();
-
-        if (dailyPnLPct < DAILY_LOSS_SURVIVAL_PCT || drawdownFromPeak < -8.0) {
-            cautiousMode = true; // Flag for SignalSender (cuts size)
-            // Require ironclad signal (+12 to conf)
-            if (signal.probability < getEffectiveMinConfidence() + 12.0) return false;
-        } else if (dailyPnLPct < DAILY_LOSS_CAUTIOUS_PCT || drawdownFromPeak < -5.0) {
-            cautiousMode = true; // Flag for SignalSender (cuts size)
-            // Require confident signal (+6 to conf)
-            if (signal.probability < getEffectiveMinConfidence() + 6.0) return false;
-        } else {
-            cautiousMode = false;
-        }
-
-        // [v12.2] No timers. Confidence check does all the work via streak guard.
-        // Confidence check
-        if (signal.probability < getEffectiveMinConfidence()) return false;
-
-        // Global limit
-        if (getActiveCount() >= maxGlobalSignals) return false;
-
-        // [v24.0 FIX WEAK-7] Max directional exposure — max 4 LONG or 4 SHORT at once.
-        // Without this, a bullish market could stack 10+ LONGs → one crash wipes all.
-        int sameDirectionCount = 0;
-        for (List<ActiveSignal> signals : activeSignals.values()) {
-            for (ActiveSignal a : signals) {
-                if (a.side == signal.side) sameDirectionCount++;
-            }
-        }
-        if (sameDirectionCount >= MAX_SAME_DIRECTION) return false;
-
-        // Per-symbol limit
-        List<ActiveSignal> symList = activeSignals.getOrDefault(sym, List.of());
-        if (symList.size() >= maxSignalsPerSymbol) return false;
-
-        // Duplicate check
-        for (ActiveSignal a : symList) {
-            double priceDiff = Math.abs(a.entry - signal.price) / (a.entry + 1e-9);
-            if (a.side == signal.side && priceDiff < minSignalPriceDiff) return false;
-            if (a.side != signal.side && priceDiff < minSignalPriceDiff * 2) return false;
-        }
-
-        // Portfolio heat check
-        double newRisk = estimateRisk(signal.probability, signal.category);
-        if (currentHeat + newRisk > maxPortfolioHeat) return false;
-
-        // Symbol score check (poor performing symbols get blocked)
-        double score = symbolScore.getOrDefault(sym, 0.0);
-        if (score < -0.25 && getWinRate(sym) < 0.38 && getTradeCount(sym) >= 8) return false;
-
-        // [v28.0] PATCH #10: SYMBOL QUARANTINE — new symbols have no verified edge.
-        // First 10 trades on any symbol require probability >= 70% (hard gate).
-        // Rationale: unknown symbol stats = unknown win rate = high variance = need higher conviction.
-        int symTrades = getTradeCount(sym);
-        if (symTrades < 10 && signal.probability < 70.0) return false;
-
+        // [SCANNER MODE v1.0] Bot runs as a pure signal scanner.
+        // All portfolio-level blockers (heat cap, active count, direction limit, daily PnL,
+        // drawdown, symbol quarantine) are DISABLED. DecisionEngine quality gates remain active.
+        // SignalSender still requires probability >= MIN_CONF_FLOOR via its own threshold.
+        cleanupExpired(); // still run cleanup so stats stay current
+        cautiousMode = false;
         return true;
     }
 
     public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
-        String cat = signal.category != null ? signal.category.name() : "ALT";
-        double risk = estimateRisk(signal.probability, signal.category);
-
-        ActiveSignal active = new ActiveSignal(
-                signal.symbol, signal.side, signal.price, signal.stop, signal.tp1,
-                signal.probability, risk, cat, null);
-
-        activeSignals.computeIfAbsent(signal.symbol, k -> new CopyOnWriteArrayList<>()).add(active);
-        currentHeat = Math.min(maxPortfolioHeat, currentHeat + risk);
+        // [SCANNER MODE v1.0] Do NOT add to activeTrades or increment heat.
+        // Bot is a signal generator — it does not track open positions.
+        // act=N/N counter stays at 0 so it can never block subsequent signals.
+        // Stats (tradeHistory, symbolScore) are still updated via closeTrade() if UDS fires.
     }
 
     // ══════════════════════════════════════════════════════════════

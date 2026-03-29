@@ -180,19 +180,19 @@ public final class BotMain {
                 task.run();
             } catch (Throwable t) {
                 errorCount.incrementAndGet();
-                
+
                 // [v32] Fix Circuit Breaker Over-sensitivity:
                 // Only trigger CB for internal logic crashes or critical order errors.
                 // Ignore transient API/network/JSON parsing glitches.
                 boolean isTransient = t instanceof java.io.IOException ||
-                                      t instanceof java.net.http.HttpTimeoutException ||
-                                      t.getClass().getSimpleName().toLowerCase().contains("json") ||
-                                      (t.getMessage() != null && (t.getMessage().contains("502") || t.getMessage().contains("timeout")));
-                
+                        t instanceof java.net.http.HttpTimeoutException ||
+                        t.getClass().getSimpleName().toLowerCase().contains("json") ||
+                        (t.getMessage() != null && (t.getMessage().contains("502") || t.getMessage().contains("timeout")));
+
                 if (!isTransient) {
                     errorsInWindow.incrementAndGet();
                 }
-                
+
                 LOG.log(Level.SEVERE, "[SAFE] Task '" + name + "' FAILED: " + t.getMessage(), t);
             }
         };
@@ -203,6 +203,13 @@ public final class BotMain {
     // ══════════════════════════════════════════════════════════════
 
     public static void main(String[] args) {
+        // [SCANNER MODE v1.0] Force UTF-8 on stdout/stderr so Cyrillic log lines are readable on Railway.
+        // Without this, JVM uses the container's default charset (often ASCII/Latin-1) → ??? ????????
+        try {
+            System.setOut(new java.io.PrintStream(System.out, true, "UTF-8"));
+            System.setErr(new java.io.PrintStream(System.err, true, "UTF-8"));
+        } catch (java.io.UnsupportedEncodingException ignored) {}
+
         configureLogger();
 
         if (TG_TOKEN == null || TG_TOKEN.isBlank()) {
@@ -867,7 +874,12 @@ public final class BotMain {
         if (sender.getActiveWsCount() < 3)
             issues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
 
-        if (sender.getActiveWsCount() < 3 || now - lastCycleSuccessMs > 5 * 60_000L) {
+        // [SCANNER MODE v1.0] Aggressive WS recovery:
+        // forceResubscribeTopPairs only refreshes the subscription list.
+        // If main cycle is silent >3min or WS count is critically low, do a full force-reconnect.
+        if (sender.getActiveWsCount() < 3 || now - lastCycleSuccessMs > 3 * 60_000L) {
+            System.out.println("[WD] Triggering force-reconnect: WS=" + sender.getActiveWsCount()
+                    + " cycleAge=" + (now - lastCycleSuccessMs) / 1000 + "s");
             sender.forceResubscribeTopPairs();
         }
 
@@ -875,6 +887,9 @@ public final class BotMain {
             lastWatchdogAlertMs = now;
             watchdogAlerts.incrementAndGet();
             LOG.warning("[WD #" + watchdogAlerts.get() + "] " + String.join(" | ", issues));
+            // [SCANNER MODE] Also send watchdog alerts to Telegram so issues are visible.
+            telegram.sendMessageAsync("🔧 *Watchdog #" + watchdogAlerts.get() + "*\n"
+                    + String.join("\n", issues));
         }
     }
 

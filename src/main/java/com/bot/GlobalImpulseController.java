@@ -922,17 +922,19 @@ public final class GlobalImpulseController {
 
                     case BTC_STRONG_DOWN -> {
                         if (isLong) {
+                            // [SCANNER MODE v1.0] LONG weights raised: local reversals / RS leaders still viable.
+                            // was: cr>=0.55→0.12, cr>=0.35→0.15/0.35, else→0.10/0.28/0.40
                             double cr = getCascadeDumpRisk(relStrength);
                             if (cr >= 0.55) {
-                                weight = 0.12;
+                                weight = 0.40; // was 0.12 — still penalised but not zero
                             } else if (cr >= 0.35) {
-                                weight = relStrength > 0.80 ? 0.35 : 0.15;
+                                weight = relStrength > 0.80 ? 0.65 : 0.50; // was 0.35/0.15
                             } else {
                                 SectorContext sc = sectorName != null ? sectorMap.get(sectorName) : null;
                                 boolean leading = sc != null && sc.bias > 0.4 && sc.leading;
-                                weight = relStrength > 0.80 ? (leading ? 0.60 : 0.40)
-                                        : relStrength > 0.65 ? 0.28
-                                        : 0.10;
+                                weight = relStrength > 0.80 ? (leading ? 0.90 : 0.75)
+                                        : relStrength > 0.65 ? 0.65  // was 0.28
+                                        : 0.45;                        // was 0.10
                             }
                         } else {
                             // SHORT при BTC_STRONG_DOWN — буст
@@ -946,8 +948,10 @@ public final class GlobalImpulseController {
 
                     case BTC_IMPULSE_DOWN -> {
                         if (isLong) {
+                            // [SCANNER MODE v1.0] was: cr>=0.45→0.28, rs>0.65→0.75, else→0.50
+                            // Now: still penalised but visible — local bounces allowed on RS leaders
                             double cr = getCascadeDumpRisk(relStrength);
-                            weight = cr >= 0.45 ? 0.28 : relStrength > 0.65 ? 0.75 : 0.50;
+                            weight = cr >= 0.45 ? 0.55 : relStrength > 0.65 ? 0.90 : 0.70;
                         } else {
                             // [v8.0] Чуть сильнее SHORT boost при импульсном падении
                             weight = Math.min(1.25, ctx.shortBoost * 0.90);
@@ -977,10 +981,10 @@ public final class GlobalImpulseController {
 
         // ── Корректировка по волатильностному режиму ─────────────
         if (ctx.volRegime == VolatilityRegime.EXTREME) {
-            if (isLong) weight *= 0.55;
+            if (isLong) weight *= 0.80; // [SCANNER MODE] was 0.55 — EXTREME vol kills LONGs unfairly
             // SHORT при extreme vol — не штрафуем (волатильность в нашу пользу)
         } else if (ctx.volRegime == VolatilityRegime.HIGH) {
-            if (isLong) weight *= 0.80;
+            if (isLong) weight *= 0.90; // [SCANNER MODE] was 0.80
         }
 
         return clamp(weight, 0.0, 1.90);
