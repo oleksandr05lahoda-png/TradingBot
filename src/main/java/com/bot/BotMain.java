@@ -68,9 +68,13 @@ public final class BotMain {
     // ── Circuit breaker ─────────────────────────────────────────────────
     // [v14.0 FIX #2] Убран Thread.sleep. Вместо паузы — пропускаем циклы.
     // [v14.0 FIX #4] volatile на errorsInWindow
-    private static final int  CB_THRESHOLD = 5;
-    private static final long CB_WINDOW_MS = 5 * 60_000L;
-    private static final long CB_PAUSE_MS  = 2 * 60_000L;
+    // [v30] CB_THRESHOLD raised 5→10, window raised 5→10m, pause reduced 2→1m.
+    // Old thresholds: 5 errors in 5 minutes → 2 min pause. Too aggressive.
+    // A brief Binance API slowdown (common) would trigger 5 errors and pause the bot,
+    // causing it to miss entire signal cycles. Now requires 10 errors in 10 min.
+    private static final int  CB_THRESHOLD = 10;
+    private static final long CB_WINDOW_MS = 10 * 60_000L;
+    private static final long CB_PAUSE_MS  = 60_000L; // 1 min (was 2)
     private static volatile long lastErrorWindowStart = 0;
     // [v24.0 FIX BUG-4] AtomicInteger (was volatile int — race on ++ and >= check)
     private static final AtomicInteger errorsInWindow = new AtomicInteger(0);
@@ -176,7 +180,19 @@ public final class BotMain {
                 task.run();
             } catch (Throwable t) {
                 errorCount.incrementAndGet();
-                errorsInWindow.incrementAndGet();
+                
+                // [v32] Fix Circuit Breaker Over-sensitivity:
+                // Only trigger CB for internal logic crashes or critical order errors.
+                // Ignore transient API/network/JSON parsing glitches.
+                boolean isTransient = t instanceof java.io.IOException ||
+                                      t instanceof java.net.http.HttpTimeoutException ||
+                                      t.getClass().getSimpleName().toLowerCase().contains("json") ||
+                                      (t.getMessage() != null && (t.getMessage().contains("502") || t.getMessage().contains("timeout")));
+                
+                if (!isTransient) {
+                    errorsInWindow.incrementAndGet();
+                }
+                
                 LOG.log(Level.SEVERE, "[SAFE] Task '" + name + "' FAILED: " + t.getMessage(), t);
             }
         };
@@ -297,13 +313,13 @@ public final class BotMain {
                                  com.bot.SignalSender sender) {
         long cycleStart = System.currentTimeMillis();
 
-        if (isQuietHours()) {
-            skippedQuiet.incrementAndGet();
-            return;
-        }
+        // [v30] QUIET HOURS REMOVED — 24/7 operation.
+        // Crypto markets do not close. Removing the Asia-session blackout that was
+        // causing the bot to "sleep" between 01:00-05:00 UTC.
+        // Session weight still reduces POSITION SIZE during low-liquidity hours
+        // via getPositionSizeUsdt() — this is the correct approach.
 
-        // [v14.0 FIX #2] Circuit breaker БЕЗ Thread.sleep
-        // Вместо блокировки потока — просто пропускаем цикл до окончания паузы
+        // [v14.0 FIX #2] Circuit breaker — skip cycle instead of sleeping
         long now = System.currentTimeMillis();
         if (now < cbPauseUntil) {
             LOG.fine("[CB] Пауза активна, осталось " + (cbPauseUntil - now) / 1000 + "s");
@@ -829,7 +845,7 @@ public final class BotMain {
                                     com.bot.GlobalImpulseController gic,
                                     com.bot.InstitutionalSignalCore isc,
                                     com.bot.SignalSender sender) {
-        if (isQuietHours()) return;
+        // [v30] Quiet hours removed — logStats runs 24/7
         long now = System.currentTimeMillis();
         List<String> issues = new ArrayList<>();
 

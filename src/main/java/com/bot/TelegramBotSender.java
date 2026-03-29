@@ -18,7 +18,7 @@ public final class TelegramBotSender {
     private final String token;
     private final String chatId;
     private final HttpClient client;
-    private final BlockingQueue<String> queue = new LinkedBlockingQueue<>(1000);
+    private final LinkedBlockingDeque<String> queue = new LinkedBlockingDeque<>(1000);
     private final ScheduledExecutorService sender;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
@@ -50,17 +50,20 @@ public final class TelegramBotSender {
     /** Асинхронная отправка сообщения через очередь */
     public void sendMessageAsync(String message) {
         if (!running.get()) return;
-        if (!queue.offer(message)) {
-            // If queue is full, drop one *oldest pending* message and enqueue the new one.
-            // This prevents "silent missing signals" when the bot is busy.
-            String dropped = queue.poll();
-            log("[WARN] Очередь переполнена. dropOldestLen="
-                    + (dropped != null ? dropped.length() : -1)
-                    + " msgLen=" + (message != null ? message.length() : -1));
-            if (!queue.offer(message)) {
-                log("[WARN] Очередь переполнена снова. Сообщение отброшено msgLen="
-                        + (message != null ? message.length() : -1));
-            }
+
+        // [v32] Priority Queueing
+        boolean isHighPriority = message.contains("UDS CLOSED") || message.contains("TP")
+                || message.contains("SL") || message.contains("🚨");
+
+        boolean added = isHighPriority ? queue.offerFirst(message) : queue.offerLast(message);
+
+        if (!added) {
+            // Queue full. Drop the newest low-priority message (at the tail) to make room.
+            String dropped = queue.pollLast();
+            log("[WARN] Очередь переполнена. Удалили сообщение. msgLen="
+                    + (dropped != null ? dropped.length() : -1));
+            if (isHighPriority) queue.offerFirst(message);
+            else queue.offerLast(message);
         }
     }
 

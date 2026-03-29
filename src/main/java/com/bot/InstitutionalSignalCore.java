@@ -78,12 +78,11 @@ public final class InstitutionalSignalCore {
 
     // [v12.2] NO timers, NO blocks. Streak guard raises threshold automatically.
     // Bot NEVER stops — just gets pickier after losses.
-    // ── [v28.0] CIRCUIT BREAKER CONSTANTS ─────────────────────────
-    // PATCH #1: реализован hard circuit breaker (был только задокументирован)
-    private static final double DAILY_LOSS_LIMIT_PCT  = -3.0;  // -3% в день → блок всех сигналов
-    private static final double DRAWDOWN_PAUSE_PCT    = -8.0;  // -8% от пика → пауза 2 часа
-    private static final long   DRAWDOWN_PAUSE_MS     = 2 * 60 * 60_000L;
-    private volatile long       drawdownPausedUntil   = 0;
+// [v32] ADAPTIVE LOSS: Removed all time-based hard pauses to fix the "pause paradox" and "dead zones".
+    // 100% risk mitigation via Confidence Thresholds and Position Size halving.
+    private static final double DAILY_LOSS_CAUTIOUS_PCT  = -3.0; // -3% -> cautious mode (size/2, conf+6)
+    private static final double DAILY_LOSS_SURVIVAL_PCT  = -6.0; // -6% -> survival mode (size/2, conf+12)
+    private volatile boolean    cautiousMode          = false; // [v31/32] raised threshold + half size
 
     private volatile double dailyPnLPct        = 0.0;
     private volatile long   dailyPnLResetDay   = currentDay();
@@ -260,21 +259,30 @@ public final class InstitutionalSignalCore {
     // ══════════════════════════════════════════════════════════════
 
     // [v24.0] Max positions per direction — prevents one-sided portfolio blow-up
-    private static final int MAX_SAME_DIRECTION = 4;
+    // [v30] MAX_SAME_DIRECTION raised 4→6.
+    // Was: max 4 concurrent LONGs or 4 SHORTs. On trending days this blocked
+    // the 5th valid signal completely. With 25 pairs and TOP_N filtering,
+    // 6 concurrent same-direction positions is still well within risk limits.
+    private static final int MAX_SAME_DIRECTION = 6;
 
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
         String sym = signal.symbol;
 
-        // [v28.0] PATCH #1: CIRCUIT BREAKER — was documented but never enforced.
-        // Daily loss limit: if today's PnL < -3% → block ALL new signals.
+        // [v32] The Pause Paradox resolved: NO TIME BLOCKS. Only risk mitigation.
+        // If an extreme drop occurs, we become extreme snipers, but we never go completely blind.
         resetDailyIfNeeded();
-        if (dailyPnLPct < DAILY_LOSS_LIMIT_PCT) return false;
 
-        // Drawdown pause: if drawdown from peak < -8% → block for 2 hours.
-        if (drawdownFromPeak < DRAWDOWN_PAUSE_PCT) {
-            if (System.currentTimeMillis() < drawdownPausedUntil) return false;
-            // If pause expired, reset so it doesn't re-trigger until next -8% breach
+        if (dailyPnLPct < DAILY_LOSS_SURVIVAL_PCT || drawdownFromPeak < -8.0) {
+            cautiousMode = true; // Flag for SignalSender (cuts size)
+            // Require ironclad signal (+12 to conf)
+            if (signal.probability < getEffectiveMinConfidence() + 12.0) return false;
+        } else if (dailyPnLPct < DAILY_LOSS_CAUTIOUS_PCT || drawdownFromPeak < -5.0) {
+            cautiousMode = true; // Flag for SignalSender (cuts size)
+            // Require confident signal (+6 to conf)
+            if (signal.probability < getEffectiveMinConfidence() + 6.0) return false;
+        } else {
+            cautiousMode = false;
         }
 
         // [v12.2] No timers. Confidence check does all the work via streak guard.
@@ -452,6 +460,9 @@ public final class InstitutionalSignalCore {
         return symbolScore.getOrDefault(symbol, 0.0);
     }
 
+    /** [v31] True when daily loss exceeds -6% — SignalSender should halve position size. */
+    public boolean isCautiousMode() { return cautiousMode; }
+
     public int getCurrentLossStreak() { return currentLossStreak; }
     public double getStreakBoost()    { return streakConfidenceBoost; }
     public double getCurrentHeat()   { return currentHeat; }
@@ -565,11 +576,7 @@ public final class InstitutionalSignalCore {
         resetDailyIfNeeded();
         dailyPnLPct += pnlPct;
 
-        // Trigger drawdown pause if threshold breached and not already paused
-        if (drawdownFromPeak < DRAWDOWN_PAUSE_PCT
-                && System.currentTimeMillis() >= drawdownPausedUntil) {
-            drawdownPausedUntil = System.currentTimeMillis() + DRAWDOWN_PAUSE_MS;
-        }
+        // [v32] Time-based pauses removed entirely. Track stats only.
     }
 
     private void resetDailyIfNeeded() {

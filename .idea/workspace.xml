@@ -10,6 +10,8 @@
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TelegramBotSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TelegramBotSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TradingCore.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -608,7 +610,7 @@
       <workItem from="1774516106546" duration="6873000" />
       <workItem from="1774525977925" duration="6789000" />
       <workItem from="1774608348835" duration="11926000" />
-      <workItem from="1774691883399" duration="10657000" />
+      <workItem from="1774691883399" duration="15947000" />
     </task>
     <servers />
   </component>

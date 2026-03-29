@@ -1578,13 +1578,11 @@ public final class TradingCore {
             // Веса: HTF×3, OF×3, SWING×2, EXHAUST×2, LR×1, FISHER×1
             // ═══════════════════════════════════════════════════════
             double conf;
-            if (squeezed) {
-                conf = 0.15;
-            } else if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
+            if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
                 conf = clamp(0.50 + exhaustionScore * 0.30, 0.50, 0.85);
             } else {
                 // Взвешенные веса по классу фактора
-                final Map<String, Double> FACTOR_WEIGHTS = Map.of(
+                Map<String, Double> FACTOR_WEIGHTS = new HashMap<>(Map.of(
                         "HTF",      3.0,   // часовой тренд — самый надёжный
                         "OF",       3.0,   // orderflow/CVD — институциональный след
                         "SWING",    2.0,   // рыночная структура HH/HL
@@ -1593,7 +1591,15 @@ public final class TradingCore {
                         "FISHER",   1.0,   // осциллятор — вторичный
                         "VPOC_PULL",1.5,   // объёмный профиль — хорошо
                         "SQUEEZE",  0.5    // сжатие — низкая информативность
-                );
+                ));
+
+                // [v32] Fix Squeeze Blindness: no hard block!
+                // During squeeze, lagging trend indicators matter less, breakout structure (SWING/BOS) matters more.
+                if (squeezed) {
+                    FACTOR_WEIGHTS.put("HTF", 1.0);
+                    FACTOR_WEIGHTS.put("OF", 1.5);
+                    FACTOR_WEIGHTS.put("SWING", 4.0);
+                }
                 double dirSign      = Math.signum(dir);
                 double weightedAgree = 0, totalWeight = 0;
                 for (Map.Entry<String, Double> fe : f.entrySet()) {

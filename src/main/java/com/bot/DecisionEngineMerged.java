@@ -14,9 +14,13 @@ public final class DecisionEngineMerged {
     // ── Константы ─────────────────────────────────────────────────
     private static final int    MIN_BARS        = 150;
     // [v28.0 FIX] Cooldowns unchanged
-    private static final long   COOLDOWN_TOP    = 8  * 60_000L;
-    private static final long   COOLDOWN_ALT    = 6  * 60_000L;
-    private static final long   COOLDOWN_MEME   = 4  * 60_000L;
+    // [v30] Cooldowns reduced: TOP 8→3m, ALT 6→2m, MEME 4→2m.
+    // Old 8-minute TOP cooldown blocked re-entry after a valid reversal signal.
+    // On 15m timeframe: 8 min = half a candle. Opportunities missed.
+    // New 3m: short enough to catch the next structural signal, long enough to prevent flip-flops.
+    private static final long   COOLDOWN_TOP    = 3  * 60_000L;
+    private static final long   COOLDOWN_ALT    = 2  * 60_000L;
+    private static final long   COOLDOWN_MEME   = 2  * 60_000L;
     // [v28.0 FIX] BASE_CONF and MIN_CONF_FLOOR raised to 62.
     // At 48-51% the bot generates signals in pure statistical noise zone.
     // Fees (0.08%×2) + slippage (0.15%) = -0.31% cost per trade.
@@ -60,6 +64,8 @@ public final class DecisionEngineMerged {
 
     // [ДЫРА №1] CVD — накопленная дельта объёма, устанавливается из SignalSender
     private final Map<String, Double>           cvdMap           = new ConcurrentHashMap<>();
+    // [v29] VDA — Volume Delta Acceleration from aggTrade stream [-1..+1]
+    private final Map<String, Double>           vdaMap           = new ConcurrentHashMap<>();
 
     // [v7.0] GIC reference
     private volatile com.bot.GlobalImpulseController gicRef = null;
@@ -73,8 +79,20 @@ public final class DecisionEngineMerged {
     private volatile double bayesPrior = 0.50;
 
     /** Update Bayesian prior from ISC historical win rate */
+    // [v31] bayesPrior stabilized: only update from real win rate after 50+ confirmed trades.
+    // Before 50 trades the win rate is statistical noise. A run of 5 losses on 15 trades
+    // could push bayesPrior to 0.35 and suppress every valid signal — "Bayesian depression".
+    // Fix: anchor to 0.55 (slightly above neutral) until the system has proven sample size.
+    // After 50 trades we allow winRate to influence within [0.50, 0.70].
+    private volatile int bayesUpdateCount = 0;
     public void updateBayesPrior(double winRate) {
-        this.bayesPrior = Math.max(0.35, Math.min(0.70, winRate));
+        bayesUpdateCount++;
+        if (bayesUpdateCount < 50) {
+            // Insufficient sample — hold at stable neutral-optimistic prior
+            this.bayesPrior = 0.55;
+        } else {
+            this.bayesPrior = Math.max(0.50, Math.min(0.70, winRate));
+        }
     }
 
     public double getBayesPrior() { return bayesPrior; }
@@ -106,6 +124,11 @@ public final class DecisionEngineMerged {
     /** [ДЫРА №1] CVD — устанавливается из SignalSender после вычисления накопленной дельты */
     public void setCVD(String sym, double cvdNormalized) {
         cvdMap.put(sym, cvdNormalized);
+    }
+
+    /** [v29] VDA score [-1..+1]: +1=buy acceleration, -1=sell acceleration */
+    public void setVDA(String sym, double score) {
+        vdaMap.put(sym, score);
     }
 
     private double getVolumeDeltaRatio(String sym) {
@@ -339,7 +362,10 @@ public final class DecisionEngineMerged {
                 "ATR_STOP", "STRUCT_STOP", "STRUCT_WIDE", // internal stop-type debug
                 "VOL_NEUTRAL",   // internal volume state
                 "CVD_BUY", "CVD_SELL", // base CVD — shown via ⚠️CVD_DIV in traderFlags
-                "GIC_VETO_"      // internal GIC veto log
+                "GIC_VETO_",     // internal GIC veto log
+                "VDA_DIV_",      // VDA divergence — internal
+                "EXHAUST_PENALTY_", // exhaustion penalty debug
+                "EXHAUST_VETO_"  // exhaustion hard veto debug
         );
 
         /** Флаги видимые трейдеру — размер, OBI, дельта, конфлюэнция, фаза */
@@ -393,6 +419,11 @@ public final class DecisionEngineMerged {
                 if (!volShown && f.equals("VOL_OPPOSE")) {
                     result.add("🔻 VOL_OPP");
                     volShown = true;
+                    continue;
+                }
+                // [v29] VDA: VDA+0.75 → "⚡VDA↑", VDA-0.80 → "⚡VDA↓"
+                if (f.startsWith("VDA+") || f.startsWith("VDA-")) {
+                    result.add("⚡VDA" + (f.startsWith("VDA+") ? "↑" : "↓"));
                     continue;
                 }
             }
@@ -742,7 +773,10 @@ public final class DecisionEngineMerged {
         if (bos5.detected) {
             // BoS confirmed with HTF trend = strong confluence entry
             // ChoCh against HTF = possible reversal but weaker conviction
-            double bosBaseScore = bos5.isChoch ? 0.42 : 0.62;
+            // [v30] BoS5m score raised: BoS 0.62→0.72, ChoCh 0.42→0.52.
+            // 5m BoS is the EARLIEST reliable structural signal before 15m candle closes.
+            // It was underweighted vs FVG (0.50) and OB (0.52). Fixed.
+            double bosBaseScore = bos5.isChoch ? 0.52 : 0.72;
             double bosScore = mctx.s(bosBaseScore);
             if (bos5.isBullish) {
                 cStructure.addLong(bosScore, bos5.isChoch ? "CHOCH_UP_5M" : "BOS_UP_5M");
@@ -870,6 +904,18 @@ public final class DecisionEngineMerged {
             if (comp.direction > 0) cMomentum.addLong(mctx.s(0.58), "COMP_BREAK_UP");
             else                    cMomentum.addShort(mctx.s(0.58), "COMP_BREAK_DN");
         }
+
+        // [v29] VDA — Volume Delta Acceleration. Leading indicator: fires on first ticks
+        // of a real impulse before the candle shows it. Weight 0.60 = highest in cMomentum.
+        double vdaVal = vdaMap.getOrDefault(symbol, 0.0);
+        if (Math.abs(vdaVal) >= 0.20) {
+            double vdaScore = mctx.s(Math.min(0.60, Math.abs(vdaVal) * 0.70));
+            if (vdaVal > 0) cMomentum.addLong(vdaScore,  "VDA_BUY_ACCEL");
+            else            cMomentum.addShort(vdaScore, "VDA_SELL_ACCEL");
+            allFlags.add(String.format("VDA%+.2f", vdaVal));
+        }
+        if (move5 > 0.002 && vdaVal < -0.25) { cMomentum.penalizeLong(0.55);  allFlags.add("VDA_DIV_BEAR"); }
+        if (move5 < -0.002 && vdaVal > 0.25) { cMomentum.penalizeShort(0.55); allFlags.add("VDA_DIV_BULL"); }
 
         // ════════════════════════════════════════════════════════
         // ════════════════════════════════════════════════════════
@@ -1079,6 +1125,28 @@ public final class DecisionEngineMerged {
         // Confluence flag
         if (longClusters >= 3) allFlags.add("CONFL_L" + longClusters);
         if (shortClusters >= 3) allFlags.add("CONFL_S" + shortClusters);
+
+        // [v29] HARD EXHAUSTION VETO — prevents ADA/ENA type lag signals.
+        // If price already moved > 3×ATR from recent base in signal direction → HARD VETO.
+        // If moved > 2×ATR → heavy score penalty (score *= 0.20).
+        {
+            int lb = Math.min(10, c15.size() - 1);
+            double rHigh = Double.NEGATIVE_INFINITY, rLow = Double.MAX_VALUE;
+            for (int i = c15.size() - 1 - lb; i < c15.size() - 1; i++) {
+                rHigh = Math.max(rHigh, c15.get(i).high);
+                rLow  = Math.min(rLow,  c15.get(i).low);
+            }
+            boolean candLong = scoreLong > scoreShort;
+            double extDir = candLong ? (price - rLow) : (rHigh - price);
+            if (extDir > atr14 * 3.0) {
+                allFlags.add("EXHAUST_VETO_" + String.format("%.1fx", extDir / atr14));
+                return null;
+            } else if (extDir > atr14 * 2.0) {
+                if (candLong) scoreLong *= 0.20; else scoreShort *= 0.20;
+                allFlags.add("EXHAUST_PENALTY_" + String.format("%.1fx", extDir / atr14));
+                scoreDiff = Math.abs(scoreLong - scoreShort);
+            }
+        }
 
         // ════════════════════════════════════════════════════════
         // REVERSE EXHAUSTION CHECK
@@ -1510,13 +1578,16 @@ public final class DecisionEngineMerged {
                         }
                     }
 
-                    // BOOST: Early trend aligned
+                    // [v30] BOOST: EARLY phase aligned — raised +3→+7.
+                    // EARLY_BULL/BEAR = fresh EMA cross + ATR expanding + MACD positive.
+                    // This is the BEST entry phase. Under-rewarding it (only +3) caused
+                    // the bot to rank exhaustion-phase signals equally with early signals.
                     if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY
-                            && Math.abs(forecastResult.directionScore) > 0.25) {
+                            && Math.abs(forecastResult.directionScore) > 0.20) {
                         boolean earlyAligned = (sigLong && forecastResult.directionScore > 0)
                                 || (!sigLong && forecastResult.directionScore < 0);
                         if (earlyAligned) {
-                            probability = Math.min(85, probability + 3);
+                            probability = Math.min(88, probability + 7);
                             allFlags.add("FC_EARLY_BOOST");
                         }
                     }
@@ -1576,7 +1647,44 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // [v23.0] FINAL GATE — after ALL penalties (FC, structural, volume)
+        // ════════════════════════════════════════════════════════
+        // [v31] VDA VOLUME DECELERATION EXHAUSTION VETO
+        // Problem: bot shorts into the BOTTOM of a move because bearish
+        // trend is confirmed, but the SPEED of selling is already dying.
+        // Fix: if last 3×1m candles show BOTH price deceleration AND
+        // volume shrinkage in the signal direction → soft penalty -10.
+        // This is NOT a hard veto — it just pushes borderline signals
+        // below the confidence floor. Strong signals survive.
+        // ════════════════════════════════════════════════════════
+        if (c1 != null && c1.size() >= 5) {
+            int n1v = c1.size();
+            com.bot.TradingCore.Candle cv1 = c1.get(n1v - 1);
+            com.bot.TradingCore.Candle cv2 = c1.get(n1v - 2);
+            com.bot.TradingCore.Candle cv3 = c1.get(n1v - 3);
+
+            // Volume shrinking across last 3 bars
+            boolean vShrinking = cv1.volume < cv2.volume * 0.88
+                    && cv2.volume < cv3.volume * 0.88;
+
+            if (vShrinking) {
+                // Check if price momentum is slowing in signal direction
+                double move1 = Math.abs(cv1.close - cv1.open);
+                double move2 = Math.abs(cv2.close - cv2.open);
+                double move3 = Math.abs(cv3.close - cv3.open);
+                boolean momentumSlowing = move1 < move2 * 0.80 && move2 < move3 * 0.80;
+
+                // Only apply for continuation signals (not early-reversal entries)
+                boolean continuationSignal = (side == com.bot.TradingCore.Side.SHORT && cv3.close < cv3.open)
+                        || (side == com.bot.TradingCore.Side.LONG && cv3.close > cv3.open);
+
+                if (momentumSlowing && continuationSignal) {
+                    probability = Math.max(50, probability - 10);
+                    allFlags.add("VDA_DIV_" + side.name());
+                }
+            }
+        }
+
+        // [v23.0] FINAL GATE — after ALL penalties (FC, structural, volume, VDA)
         // This is the ONE place that decides if a signal lives or dies.
         probability = Math.max(50, Math.min(85, probability));
         if (probability < minConf) return null;

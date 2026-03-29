@@ -53,7 +53,7 @@ public final class SignalSender {
     private static final double MIN_VOL_MEME_USD = 1_000_000;
 
     private static final double STOP_CLUSTER_SHIFT = 0.0025;
-    private static final int    MAX_WS_CONNECTIONS  = 30;
+    private static final int    MAX_WS_CONNECTIONS  = 100;
     private static final long   WS_INITIAL_DELAY_MS = 3_000L;
     private static final long   WS_MAX_DELAY_MS     = 120_000L;
 
@@ -61,6 +61,18 @@ public final class SignalSender {
     private final Map<String, Double> deltaBuffer      = new ConcurrentHashMap<>();
     private final Map<String, Long>   deltaWindowStart = new ConcurrentHashMap<>();
     private final Map<String, Double> deltaHistory     = new ConcurrentHashMap<>();
+
+    // [v29] VDA — Volume Delta Acceleration (10s micro-windows)
+    private static final long   VDA_WINDOW_MS  = 10_000L;
+    private final Map<String, Double> vdaCurrentBuf = new ConcurrentHashMap<>();
+    private final Map<String, Double> vdaPrevBuf    = new ConcurrentHashMap<>();
+    private final Map<String, Long>   vdaWindowStart= new ConcurrentHashMap<>();
+    private final Map<String, Double> vdaScoreMap   = new ConcurrentHashMap<>();
+
+    // [v29] RT-CVD — real-time CVD from aggTrade (resets each 15m candle)
+    private final Map<String, Double> rtCvdBuy   = new ConcurrentHashMap<>();
+    private final Map<String, Double> rtCvdTotal = new ConcurrentHashMap<>();
+    private final Map<String, Long>   rtCvdReset = new ConcurrentHashMap<>();
 
     // ══ ДЫРА №1: CVD — Cumulative Volume Delta (покупки - продажи накопленные за 90×1m) ══
     // Обычная дельта = мгновенный снимок. CVD = вся история намерений рынка.
@@ -310,14 +322,14 @@ public final class SignalSender {
         // OLD: 100 pairs analysed each cycle — 100 pairs × 10 signals = shallow analysis.
         // NEW: 25 pairs with real volume >$50M/24h — deep analysis, lower overtrading.
         // Override via env var TOP_N if you want more pairs.
-        this.TOP_N            = envInt("TOP_N", 25);
+        this.TOP_N            = envInt("TOP_N", 100);
         this.MIN_CONF         = envDouble("MIN_CONF", 50.0);
         this.KLINES_LIMIT     = envInt("KLINES", 220);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
         this.TICK_HISTORY     = envInt("TICK_HISTORY", 120);
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
-        this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 0) == 1;
+        this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1; // [v29] ON by default
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();
@@ -475,6 +487,9 @@ public final class SignalSender {
             deltaBuffer.remove(zombie);
             deltaWindowStart.remove(zombie);
             deltaHistory.remove(zombie);
+            vdaCurrentBuf.remove(zombie); vdaPrevBuf.remove(zombie);
+            vdaWindowStart.remove(zombie); vdaScoreMap.remove(zombie);
+            rtCvdBuy.remove(zombie); rtCvdTotal.remove(zombie); rtCvdReset.remove(zombie);
             lastTickTime.remove(zombie);
             lastTickPrice.remove(zombie);
             microBuilders.remove(zombie);
@@ -682,8 +697,14 @@ public final class SignalSender {
 
             // [FIX-COMP] Добавляем рекомендованный размер позиции
             double posSize = getPositionSizeUsdt(idea, cat);
+            // [v31] CAUTIOUS MODE: daily loss > -6% — halve position size.
+            // The signal still passed the higher confidence gate (+8 pts) in ISC,
+            // but we trade with half size to limit exposure during losing streaks.
+            if (isc.isCautiousMode()) {
+                posSize = posSize * 0.5;
+            }
             List<String> nf = new ArrayList<>(idea.flags);
-            nf.add(String.format("SIZE=%.1f$", posSize));
+            nf.add(String.format("SIZE=%.1f$%s", posSize, isc.isCautiousMode() ? " ⚠️CAUTIOUS" : ""));
             idea = rebuildIdea(idea, idea.probability, nf);
 
             // [v25.0] SESSION WEIGHT → FLAG + SIZE REDUCTION ONLY.
@@ -1492,53 +1513,11 @@ public final class SignalSender {
         } catch (Exception e) { reconnectWs(pair); }
     }
 
-    /** [v12.0] Process aggTrade event — extracted from old inline handler */
-    private void processAggTrade(String pair, JSONObject j) {
-        double price = Double.parseDouble(j.getString("p"));
-        double qty   = Double.parseDouble(j.getString("q"));
-        long   ts    = j.getLong("T");
-        double side  = !j.getBoolean("m") ? qty : -qty;
-
-        deltaWindowStart.putIfAbsent(pair, ts);
-        long age = ts - deltaWindowStart.get(pair);
-        if (age > DELTA_WINDOW_MS) {
-            deltaHistory.put(pair, deltaBuffer.getOrDefault(pair, 0.0));
-            deltaBuffer.put(pair, side); deltaWindowStart.put(pair, ts);
-        } else { deltaBuffer.merge(pair, side, Double::sum); }
-
-        Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-        dq.addLast(price); while (dq.size() > TICK_HISTORY) dq.pollFirst();
-        Deque<Double> vq = tickVolumeDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-        vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.pollFirst();
-        lastTickPrice.put(pair, price); lastTickTime.put(pair, ts);
-        microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(30_000)).addTick(ts, price, qty);
-
-        if (ENABLE_EARLY_TICK) {
-            com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
-            if (et != null && filterEarlySignal(et)) {
-                bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
-                earlySignals.incrementAndGet(); isc.registerSignal(et);
-            }
-        }
-    }
-
-    /** [v12.0] Process bookTicker event — populates orderbookMap for OBI analysis */
-    private void processBookTicker(String pair, JSONObject j) {
-        double bidQty = j.optDouble("B", 0); // best bid quantity
-        double askQty = j.optDouble("A", 0); // best ask quantity
-        if (bidQty > 0 || askQty > 0) {
-            orderbookMap.put(pair, new OrderbookSnapshot(bidQty, askQty, System.currentTimeMillis()));
-        }
-    }
-
-    // [FIX-WS-STORM] Guard against concurrent reconnects for same pair
+    // [v30] Guard against concurrent reconnects for the same pair
     private final Set<String> reconnectingPairs = ConcurrentHashMap.newKeySet();
 
     private void reconnectWs(String pair) {
-        // Only one reconnect attempt per pair at a time
-        if (!reconnectingPairs.add(pair)) {
-            return; // another reconnect already in progress
-        }
+        if (!reconnectingPairs.add(pair)) return; // already reconnecting
         WebSocket old = wsMap.remove(pair);
         if (old != null) {
             try { old.sendClose(WebSocket.NORMAL_CLOSURE, "reconnecting"); } catch (Exception ignored) {}
@@ -1548,43 +1527,173 @@ public final class SignalSender {
         wsReconnectDelay.put(pair, Math.min(delay * 2, WS_MAX_DELAY_MS));
     }
 
-    private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(String symbol, double price, long ts) {
-        Deque<Double> dq = tickPriceDeque.get(symbol); Deque<Double> vq = tickVolumeDeque.get(symbol);
-        if (dq == null || dq.size() < 30 || vq == null || vq.size() < 30) return null;
-        List<Double> buf = new ArrayList<>(dq), volBuf = new ArrayList<>(vq);
-        int n = buf.size();
-        double move = buf.get(n-1) - buf.get(n-22), avg = buf.stream().mapToDouble(Double::doubleValue).average().orElse(price);
-        double vel = Math.abs(move) / (avg + 1e-9);
-        if (vel < 0.0022) return null;
-        double m1 = buf.get(n/2-1) - buf.get(0), m2 = buf.get(n-1) - buf.get(n/2);
-        if (!(Math.abs(m2) > Math.abs(m1) * 1.60)) return null;
-        int vw = Math.min(30, volBuf.size());
-        double avgVol = volBuf.subList(0, vw-5).stream().mapToDouble(Double::doubleValue).average().orElse(0.001);
-        double recVol = volBuf.subList(vw-5, vw).stream().mapToDouble(Double::doubleValue).average().orElse(0);
-        if (recVol < avgVol * 1.6) return null;
-        boolean up = move > 0; int streak = 0;
-        for (int i = n-1; i >= Math.max(0, n-5); i--) {
-            if (i == 0) break;
-            if ((buf.get(i) >= buf.get(i-1)) == up) streak++; else break;
+    /** Process bookTicker event — populates orderbookMap for OBI analysis */
+    private void processBookTicker(String pair, JSONObject j) {
+        double bidQty = j.optDouble("B", 0);
+        double askQty = j.optDouble("A", 0);
+        if (bidQty > 0 || askQty > 0) {
+            // Try to merge with existing depth5 snapshot if available
+            OrderbookSnapshot existing = orderbookMap.get(pair);
+            double bd5 = existing != null ? existing.bidDepth5 : bidQty;
+            double ad5 = existing != null ? existing.askDepth5 : askQty;
+            orderbookMap.put(pair, new OrderbookSnapshot(bidQty, askQty, bd5, ad5, System.currentTimeMillis()));
         }
-        if (streak < 3) return null;
-        if (n >= 3) { double last3 = buf.get(n-1) - buf.get(n-3); if (up && last3 < 0) return null; if (!up && last3 > 0) return null; }
-        double atrV = getAtr(symbol); if (atrV <= 0) atrV = price * 0.005;
-        double conf = Math.min(68, 50 + vel * 4500);
+    }
+
+    private void processAggTrade(String pair, JSONObject j) {
+        double price         = Double.parseDouble(j.getString("p"));
+        double qty           = Double.parseDouble(j.getString("q"));
+        long   ts            = j.getLong("T");
+        boolean isBuyerMaker = j.getBoolean("m");
+        double side          = !isBuyerMaker ? qty : -qty;
+
+        // Standard 60s delta window
+        deltaWindowStart.putIfAbsent(pair, ts);
+        long age = ts - deltaWindowStart.get(pair);
+        if (age > DELTA_WINDOW_MS) {
+            deltaHistory.put(pair, deltaBuffer.getOrDefault(pair, 0.0));
+            deltaBuffer.put(pair, side);
+            deltaWindowStart.put(pair, ts);
+        } else {
+            deltaBuffer.merge(pair, side, Double::sum);
+        }
+
+        // [v29] VDA: 10s micro-window acceleration
+        vdaWindowStart.putIfAbsent(pair, ts);
+        long vdaAge = ts - vdaWindowStart.get(pair);
+        if (vdaAge > VDA_WINDOW_MS) {
+            double prevW = vdaCurrentBuf.getOrDefault(pair, 0.0);
+            vdaPrevBuf.put(pair, prevW);
+            vdaCurrentBuf.put(pair, side);
+            vdaWindowStart.put(pair, ts);
+            double cur = vdaCurrentBuf.getOrDefault(pair, 0.0);
+            double prev = vdaPrevBuf.getOrDefault(pair, 0.0);
+            if (Math.abs(cur) > 0 || Math.abs(prev) > 0) {
+                double dir   = Math.signum(cur);
+                double accel = Math.abs(prev) > 1e-9
+                        ? Math.min(3.0, Math.abs(cur) / Math.abs(prev))
+                        : (Math.abs(cur) > 0 ? 2.5 : 0.0);
+                double score = dir * Math.min(1.0, (accel - 1.0) / 2.0);
+                vdaScoreMap.put(pair, score);
+                decisionEngine.setVDA(pair, score);
+            }
+        } else {
+            vdaCurrentBuf.merge(pair, side, Double::sum);
+        }
+
+        // [v29] RT-CVD: real-time from aggTrade, resets on 15m boundary
+        long candleBoundary = (ts / 900_000L) * 900_000L;
+        if (candleBoundary > rtCvdReset.getOrDefault(pair, 0L)) {
+            rtCvdBuy.put(pair, 0.0);
+            rtCvdTotal.put(pair, 0.0);
+            rtCvdReset.put(pair, candleBoundary);
+        }
+        rtCvdBuy.merge(pair, !isBuyerMaker ? qty : 0.0, Double::sum);
+        rtCvdTotal.merge(pair, qty, Double::sum);
+        double rtTotal = rtCvdTotal.getOrDefault(pair, 0.0);
+        if (rtTotal > 0) {
+            double rtBuys = rtCvdBuy.getOrDefault(pair, 0.0);
+            double rtNorm = clamp((rtBuys - (rtTotal - rtBuys)) / rtTotal, -1.0, 1.0);
+            decisionEngine.setCVD(pair, rtNorm);
+        }
+
+        // Tick history
+        Deque<Double> dq = tickPriceDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        dq.addLast(price); while (dq.size() > TICK_HISTORY) dq.pollFirst();
+        Deque<Double> vq = tickVolumeDeque.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.pollFirst();
+        lastTickPrice.put(pair, price);
+        lastTickTime.put(pair, ts);
+        microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(30_000)).addTick(ts, price, qty);
+
+        if (ENABLE_EARLY_TICK) {
+            com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
+            if (et != null && filterEarlySignal(et)) {
+                bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
+                earlySignals.incrementAndGet();
+                isc.registerSignal(et);
+            }
+        }
+    }
+
+    // [v29+v30] EARLY TICK — rewritten with exhaustion guard + VDA + correct conf floor
+    private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(String symbol, double price, long ts) {
+        Deque<Double> dq = tickPriceDeque.get(symbol);
+        Deque<Double> vq = tickVolumeDeque.get(symbol);
+        if (dq == null || dq.size() < 30 || vq == null || vq.size() < 30) return null;
+        List<Double> buf    = new ArrayList<>(dq);
+        List<Double> volBuf = new ArrayList<>(vq);
+        int n = buf.size();
+
+        double move = buf.get(n - 1) - buf.get(n - 22);
+        double avg  = buf.stream().mapToDouble(Double::doubleValue).average().orElse(price);
+        double vel  = Math.abs(move) / (avg + 1e-9);
+        if (vel < 0.0018) return null;
+        boolean up = move > 0;
+
+        double atrV = getAtr(symbol);
+        if (atrV <= 0) atrV = price * 0.005;
+
+        // EXHAUSTION GUARD: if already > 2.5×ATR from base → tail, not start
+        double recentBase = up
+                ? buf.subList(Math.max(0, n - 40), n - 1).stream().mapToDouble(Double::doubleValue).min().orElse(price)
+                : buf.subList(Math.max(0, n - 40), n - 1).stream().mapToDouble(Double::doubleValue).max().orElse(price);
+        double moveFromBase  = Math.abs(price - recentBase);
+        double tickRangeHigh = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).max().orElse(price);
+        double tickRangeLow  = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).min().orElse(price);
+        double exhaustThresh = Math.max(atrV, (tickRangeHigh - tickRangeLow) * 0.60);
+        if (moveFromBase > exhaustThresh * 2.5) return null;
+
+        // Acceleration check
+        double m1 = buf.get(n / 2 - 1) - buf.get(0);
+        double m2 = buf.get(n - 1) - buf.get(n / 2);
+        if (!(Math.abs(m2) > Math.abs(m1) * 1.35)) return null;
+
+        // VDA: must not actively disagree
+        double vda = vdaScoreMap.getOrDefault(symbol, 0.0);
+        if (Math.abs(vda) > 0.30 && ((up && vda < 0) || (!up && vda > 0))) return null;
+
+        // Volume spike
+        int vw = Math.min(30, volBuf.size());
+        double avgVol = volBuf.subList(0, vw - 5).stream().mapToDouble(Double::doubleValue).average().orElse(0.001);
+        double recVol = volBuf.subList(vw - 5, vw).stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        if (recVol < avgVol * 1.35) return null;
+
+        // Tick streak
+        int streak = 0;
+        for (int i = n - 1; i >= Math.max(1, n - 5); i--) {
+            if ((buf.get(i) >= buf.get(i - 1)) == up) streak++; else break;
+        }
+        if (streak < 2) return null;
+
+        // Confidence: starts at 62 (ISC floor), +velocity, +VDA
+        double conf = 62.0
+                + Math.min(8.0,  vel * 3500)
+                + Math.min(5.0,  Math.abs(vda) * 15)
+                + (((up && vda > 0.15) || (!up && vda < -0.15)) ? 3.0 : 0.0);
+        conf = Math.min(84.0, conf);
+
         return new com.bot.DecisionEngineMerged.TradeIdea(
-                symbol, up ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
-                price, up ? price - atrV*1.5 : price + atrV*1.5,
-                up ? price + atrV*3.2 : price - atrV*3.2, conf,
-                List.of("EARLY_TICK", up?"UP":"DN", "v="+String.format("%.2e",vel), "stk="+streak));
+                symbol,
+                up ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
+                price,
+                up ? price - atrV * 1.4 : price + atrV * 1.4,
+                up ? price + atrV * 3.0 : price - atrV * 3.0,
+                conf,
+                new java.util.ArrayList<>(java.util.List.of(
+                        "EARLY_TICK", up ? "UP" : "DN",
+                        String.format("vel=%.2e", vel),
+                        String.format("vda=%+.2f", vda),
+                        "stk=" + streak)));
     }
 
     private boolean filterEarlySignal(com.bot.DecisionEngineMerged.TradeIdea sig) {
         boolean isLong = sig.side == com.bot.TradingCore.Side.LONG;
         double rs = relStrengthHistory.getOrDefault(sig.symbol, new java.util.concurrent.ConcurrentLinkedDeque<>())
                 .stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
-        if (gic.getFilterWeight(sig.symbol, isLong, rs, detectSector(sig.symbol)) < 0.60) return false;
+        if (gic.getFilterWeight(sig.symbol, isLong, rs, detectSector(sig.symbol)) < 0.55) return false;
         if (!isc.allowSignal(sig)) return false;
-        return optimizer.adjustConfidence(sig) >= 56;
+        return sig.probability >= isc.getEffectiveMinConfidence();
     }
 
     // ══════════════════════════════════════════════════════════════
