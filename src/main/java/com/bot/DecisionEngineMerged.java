@@ -1126,6 +1126,8 @@ public final class DecisionEngineMerged {
         if (longClusters >= 3) allFlags.add("CONFL_L" + longClusters);
         if (shortClusters >= 3) allFlags.add("CONFL_S" + shortClusters);
 
+        double scoreDiff = Math.abs(scoreLong - scoreShort);
+
         // [v29] HARD EXHAUSTION VETO — prevents ADA/ENA type lag signals.
         // If price already moved > 3×ATR from recent base in signal direction → HARD VETO.
         // If moved > 2×ATR → heavy score penalty (score *= 0.20).
@@ -1269,7 +1271,7 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
         // MINIMUM SCORE DIFFERENCE
         // ════════════════════════════════════════════════════════
-        double scoreDiff = Math.abs(scoreLong - scoreShort);
+        scoreDiff = Math.abs(scoreLong - scoreShort);
         double minDiff;
         if (aggressiveShort) {
             minDiff = 0.08;
