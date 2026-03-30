@@ -358,25 +358,27 @@ public final class InstitutionalSignalCore {
         List<ActiveSignal> list = activeSignals.get(symbol);
         if (list == null) return;
 
-        Iterator<ActiveSignal> it = list.iterator();
-        while (it.hasNext()) {
-            ActiveSignal s = it.next();
+        ActiveSignal matched = null;
+        for (ActiveSignal s : list) {
             if (s.side == side) {
-                currentHeat = Math.max(0, currentHeat - s.riskPct);
-
-                // Add to bounded history
-                Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(symbol, k -> new ConcurrentLinkedDeque<>());
-                hist.addLast(new ClosedTrade(symbol, side, pnlPct, s.ageMs(), reason));
-                while (hist.size() > MAX_HISTORY) hist.removeFirst();
-
-                updateSymbolScore(symbol, pnlPct);
-
-                // [v11.0] Daily PnL tracking
-                trackDailyPnL(pnlPct);
-
-                it.remove();
+                matched = s;
                 break;
             }
+        }
+        if (matched != null) {
+            currentHeat = Math.max(0, currentHeat - matched.riskPct);
+
+            // Add to bounded history
+            Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(symbol, k -> new ConcurrentLinkedDeque<>());
+            hist.addLast(new ClosedTrade(symbol, side, pnlPct, matched.ageMs(), reason));
+            while (hist.size() > MAX_HISTORY) hist.removeFirst();
+
+            updateSymbolScore(symbol, pnlPct);
+
+            // [v11.0] Daily PnL tracking
+            trackDailyPnL(pnlPct);
+
+            list.remove(matched);
         }
         if (list.isEmpty()) activeSignals.remove(symbol);
     }
