@@ -97,6 +97,11 @@ public final class SignalSender {
     private final Map<String, Long> liqTimestamps = new ConcurrentHashMap<>();
 
     // Tick / WebSocket
+    private static final long REALTIME_STALE_SKIP_MS = 75_000L;
+    private static final double VPOC_NEAR_ATR_MULT   = 0.35;
+    private static final double VPOC_NEAR_STOP_MULT  = 0.85;
+    private static final double VPOC_SOFT_PENALTY    = 3.5;
+    private static final double MAX_QUALITY_PENALTY  = 8.0;
     private final Map<String, Deque<Double>>      tickPriceDeque  = new ConcurrentHashMap<>();
     private final Map<String, Deque<Double>>      tickVolumeDeque = new ConcurrentHashMap<>();
     private final Map<String, Long>               lastTickTime    = new ConcurrentHashMap<>();
@@ -275,9 +280,21 @@ public final class SignalSender {
     private final AtomicLong earlySignals   = new AtomicLong(0);
     private final AtomicLong blockedLiq     = new AtomicLong(0);
     private final AtomicLong blockedCorr    = new AtomicLong(0);
+    private final AtomicLong blockedStaleRt = new AtomicLong(0);
     private final AtomicLong blockedProfit  = new AtomicLong(0);
+    private final AtomicLong blockedEarlyConf = new AtomicLong(0);
+    private final AtomicLong blockedOptConf   = new AtomicLong(0);
+    private final AtomicLong blockedVpoc      = new AtomicLong(0);
+    private final AtomicLong blockedFinalConf = new AtomicLong(0);
+    private final AtomicLong blockedIsc       = new AtomicLong(0);
+    private final AtomicLong gicHardHeadwind  = new AtomicLong(0);
     private final AtomicLong wsMessageCount = new AtomicLong(0);
     private final AtomicLong udsEventsCount = new AtomicLong(0);
+    private final AtomicInteger cyclePairsSeen = new AtomicInteger(0);
+    private final AtomicInteger cyclePairsStale = new AtomicInteger(0);
+    private volatile double cycleQualityPenalty = 0.0;
+    private volatile double lastCycleStaleRatio = 0.0;
+    private volatile double lastCycleWsCoverage = 1.0;
 
     private static final Set<String> STABLE = Set.of("USDT","USDC","BUSD","TUSD","USDP","DAI");
 
@@ -428,6 +445,8 @@ public final class SignalSender {
         }
 
         correlationGuard.resetCycle();
+        cyclePairsSeen.set(0);
+        cyclePairsStale.set(0);
 
         try {
             List<com.bot.TradingCore.Candle> btc5m = getCached("BTCUSDT", "5m", 30);
@@ -452,8 +471,39 @@ public final class SignalSender {
         result.sort(Comparator.comparingDouble(
                 (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
 
+        refreshCycleQuality(scanPairs.size());
         logCycleStats();
         return result;
+    }
+
+    private void refreshCycleQuality(int requestedPairs) {
+        int seen = cyclePairsSeen.get();
+        int stale = cyclePairsStale.get();
+        lastCycleStaleRatio = seen > 0 ? (double) stale / seen : 0.0;
+
+        int universe = cachedPairs.size();
+        lastCycleWsCoverage = universe > 0 ? Math.min(1.0, (double) wsMap.size() / universe) : 1.0;
+
+        double penalty = 0.0;
+        if (lastCycleStaleRatio >= 0.55 || lastCycleWsCoverage < 0.45) {
+            penalty = 7.0;
+        } else if (lastCycleStaleRatio >= 0.35 || lastCycleWsCoverage < 0.60) {
+            penalty = 4.0;
+        } else if (lastCycleStaleRatio >= 0.20 || lastCycleWsCoverage < 0.75) {
+            penalty = 2.0;
+        }
+
+        if (!API_KEY.isBlank() && udsWebSocket == null) {
+            penalty += 1.0;
+        }
+
+        cycleQualityPenalty = Math.min(MAX_QUALITY_PENALTY, penalty);
+
+        if (cycleQualityPenalty >= 4.0 && seen > 0) {
+            System.out.printf("[DATA] penalty=+%.0f stale=%.0f%% ws=%.0f%% seen=%d req=%d%n",
+                    cycleQualityPenalty, lastCycleStaleRatio * 100.0, lastCycleWsCoverage * 100.0,
+                    seen, requestedPairs);
+        }
     }
 
     private int computePairBudget() {
@@ -610,6 +660,16 @@ public final class SignalSender {
             String sector = detectSector(pair);
 
             if (!checkLiquidity(pair, cat)) { blockedLiq.incrementAndGet(); return null; }
+            cyclePairsSeen.incrementAndGet();
+
+            Long lastRealtimeTick = lastTickTime.get(pair);
+            if (lastRealtimeTick == null || System.currentTimeMillis() - lastRealtimeTick > REALTIME_STALE_SKIP_MS) {
+                decisionEngine.setVolumeDelta(pair, 0.0);
+                decisionEngine.setVDA(pair, 0.0);
+                cyclePairsStale.incrementAndGet();
+                blockedStaleRt.incrementAndGet();
+                return null;
+            }
 
             optimizer.updateFromCandles(pair, m15);
 
@@ -627,11 +687,17 @@ public final class SignalSender {
             // [v7.0 FIX] Используем ISC effective min confidence (с учётом streak guard)
             // вместо хардкодного MIN_CONF=50. Это предотвращает бесполезную работу
             // GIC/PumpHunter/OBI/Optimizer на сигналах которые ISC потом отклонит.
-            double earlyMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence());
-            if (idea.probability < earlyMinConf) return null;
+            double symbolConfBoost = isc.getSymbolMinConfBoost(pair);
+            double qualityPenalty = cycleQualityPenalty;
+            double earlyMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost + qualityPenalty);
+            if (idea.probability < earlyMinConf) {
+                blockedEarlyConf.incrementAndGet();
+                return null;
+            }
 
             boolean isLong   = idea.side == com.bot.TradingCore.Side.LONG;
             double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
+            if (gicWeight <= 0.05) gicHardHeadwind.incrementAndGet();
 
             // [v23.0] GIC weight → probability penalty, NOT hard veto
             // Old: gicWeight <= 0 → return null (killed ALL longs during BTC dip)
@@ -671,7 +737,10 @@ public final class SignalSender {
             }
 
             idea = optimizer.withAdjustedConfidence(idea);
-            if (idea.probability < MIN_CONF) return null;
+            if (idea.probability < MIN_CONF) {
+                blockedOptConf.incrementAndGet();
+                return null;
+            }
 
             // [v18.0 REFACTOR] OBI: flag only, no probability scaling, no blocking
             // [FIX v32+] ANTI-SPOOFING: cross-validate OBI with realised taker flow.
@@ -719,6 +788,8 @@ public final class SignalSender {
             }
 
             idea = adjustStopForClusters(idea, m15);
+            idea = applyVpocBarrierGuard(idea, m15);
+            if (idea == null) { blockedVpoc.incrementAndGet(); return null; }
 
             if (!checkMinProfit(idea, cat)) { blockedProfit.incrementAndGet(); return null; }
 
@@ -730,8 +801,13 @@ public final class SignalSender {
             if (isc.isCautiousMode()) {
                 posSize = posSize * 0.5;
             }
+            if (qualityPenalty > 0.0) {
+                posSize *= Math.max(0.55, 1.0 - qualityPenalty * 0.06);
+            }
             List<String> nf = new ArrayList<>(idea.flags);
-            nf.add(String.format("SIZE=%.1f$%s", posSize, isc.isCautiousMode() ? " ⚠️CAUTIOUS" : ""));
+            String sizeMode = isc.isCautiousMode() ? " ⚠️CAUTIOUS" : "";
+            if (qualityPenalty > 0.0) sizeMode += String.format(" Q+%.0f", qualityPenalty);
+            nf.add(String.format("SIZE=%.1f$%s", posSize, sizeMode));
             idea = rebuildIdea(idea, idea.probability, nf);
 
             // [v25.0] SESSION WEIGHT → FLAG + SIZE REDUCTION ONLY.
@@ -760,7 +836,15 @@ public final class SignalSender {
                 idea = rebuildIdea(idea, Math.min(85, idea.probability + liqBoost), lf);
             }
 
-            if (!isc.allowSignal(idea)) return null;
+            double finalMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost + qualityPenalty);
+            if (idea.probability < finalMinConf) {
+                blockedFinalConf.incrementAndGet();
+                return null;
+            }
+            if (!isc.allowSignal(idea)) {
+                blockedIsc.incrementAndGet();
+                return null;
+            }
 
             // [v28.0] PATCH #12: Adaptive TP calibration based on real historical RR.
             // Problem: TP_TREND_EARLY sets tp3Mult=4.2, but if symbol historically only
@@ -1112,10 +1196,19 @@ public final class SignalSender {
                     com.bot.TradingCore.Side closedSide = isBuy
                             ? com.bot.TradingCore.Side.SHORT
                             : com.bot.TradingCore.Side.LONG;
-                    double pnlPct = avgPrice > 0 ? realizedPnl / (avgPrice * qty) * 100 : 0;
+                    double pnlPct = (avgPrice > 0 && qty > 0) ? realizedPnl / (avgPrice * qty) * 100 : 0;
                     // [v9.0] UDS confirmed result → register in ISC properly
-                    isc.registerConfirmedResult(realizedPnl >= 0);
-                    isc.closeTrade(symbol, closedSide, pnlPct);
+                    if (realizedPnl > 0) {
+                        isc.registerConfirmedResult(true, closedSide);
+                        decisionEngine.recordWin(symbol, closedSide);
+                    } else if (realizedPnl < 0) {
+                        isc.registerConfirmedResult(false, closedSide);
+                        decisionEngine.recordLoss(symbol, closedSide);
+                    }
+                    decisionEngine.markPostExitCooldown(symbol, closedSide);
+                    String closeReason = realizedPnl > 0 ? "UDS_TP"
+                            : realizedPnl < 0 ? "UDS_SL" : "UDS_CLOSE";
+                    isc.closeTrade(symbol, closedSide, pnlPct, closeReason);
                     // [v9.0] Remove from BotMain TradeResolver tracking
                     com.bot.BotMain.trackedSignals.remove(symbol + "_" + closedSide);
                     String emoji = realizedPnl >= 0 ? "✅" : "❌";
@@ -1375,13 +1468,73 @@ public final class SignalSender {
         return (gross - 0.0008 - slip) >= min;
     }
 
+    private com.bot.DecisionEngineMerged.TradeIdea applyVpocBarrierGuard(
+            com.bot.DecisionEngineMerged.TradeIdea idea,
+            List<com.bot.TradingCore.Candle> m15) {
+        if (idea == null || idea.forecast == null || m15 == null || m15.size() < 20) return idea;
+
+        double vpoc = idea.forecast.magnetLevel;
+        if (!(vpoc > 0.0) || !Double.isFinite(vpoc)) return idea;
+
+        double price = idea.price;
+        double tp1 = idea.tp1;
+        double stopDist = Math.abs(price - idea.stop);
+        double tp1Dist = Math.abs(tp1 - price);
+        if (stopDist <= 0.0 || tp1Dist <= 0.0) return idea;
+
+        boolean inPath = idea.side == com.bot.TradingCore.Side.LONG
+                ? (vpoc > price && vpoc < tp1)
+                : (vpoc < price && vpoc > tp1);
+        if (!inPath) return idea;
+
+        double barrierDist = Math.abs(vpoc - price);
+        double atr14 = atr(m15, 14);
+        boolean leadBreakout = hasLeadBreakout(idea);
+        boolean strongForecast = idea.forecast.confidence >= 0.64
+                && ((idea.side == com.bot.TradingCore.Side.LONG && idea.forecast.directionScore > 0.20)
+                || (idea.side == com.bot.TradingCore.Side.SHORT && idea.forecast.directionScore < -0.20));
+        boolean tightBarrier = barrierDist <= Math.max(stopDist * VPOC_NEAR_STOP_MULT, atr14 * VPOC_NEAR_ATR_MULT);
+
+        if (tightBarrier && !(leadBreakout || strongForecast)) {
+            return null;
+        }
+
+        if (barrierDist <= tp1Dist * 0.55) {
+            List<String> nf = new ArrayList<>(idea.flags);
+            nf.add(leadBreakout ? "VPOC_BREAKTRY" : "VPOC_NEAR");
+            double penalty = leadBreakout ? 1.5 : VPOC_SOFT_PENALTY;
+            return rebuildIdea(idea, Math.max(50, idea.probability - penalty), nf);
+        }
+
+        return idea;
+    }
+
+    private boolean hasLeadBreakout(com.bot.DecisionEngineMerged.TradeIdea idea) {
+        if (idea == null || idea.flags == null || idea.flags.isEmpty()) return false;
+        if (idea.side == com.bot.TradingCore.Side.LONG) {
+            return idea.flags.contains("EARLY_SOLO")
+                    || idea.flags.contains("BOS_UP_5M")
+                    || idea.flags.contains("COMP_BREAK_UP")
+                    || idea.flags.contains("ANTI_LAG_UP")
+                    || idea.flags.contains("PUMP_HUNT_B")
+                    || idea.flags.stream().anyMatch(f -> f.startsWith("VDA+"));
+        }
+        return idea.flags.contains("EARLY_SOLO")
+                || idea.flags.contains("BOS_DN_5M")
+                || idea.flags.contains("COMP_BREAK_DN")
+                || idea.flags.contains("ANTI_LAG_DN")
+                || idea.flags.contains("PUMP_HUNT_S")
+                || idea.flags.stream().anyMatch(f -> f.startsWith("VDA-"));
+    }
+
     // ══════════════════════════════════════════════════════════════
     //  CORRELATION GUARD
     // ══════════════════════════════════════════════════════════════
 
     private static final class CorrelationGuard {
         private int longCount = 0, shortCount = 0;
-        private final Map<String, Integer> sectorCount = new HashMap<>();
+        private int topLongCount = 0, topShortCount = 0;
+        private final Map<String, Integer> sectorDirCount = new HashMap<>();
         private final Set<String> registered = new HashSet<>();
         // [v10.0] Weekend-aware: Sat/Sun liquidity is 30-50% lower, alt cascades happen
         private static final int MAX_DIR_NORMAL  = 6;   // was 8
@@ -1393,18 +1546,23 @@ public final class SignalSender {
             return d == java.time.DayOfWeek.SATURDAY || d == java.time.DayOfWeek.SUNDAY;
         }
 
-        synchronized void resetCycle() { longCount = 0; shortCount = 0; sectorCount.clear(); registered.clear(); }
+        synchronized void resetCycle() {
+            longCount = 0;
+            shortCount = 0;
+            topLongCount = 0;
+            topShortCount = 0;
+            sectorDirCount.clear();
+            registered.clear();
+        }
 
         synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
             int maxDir = isWeekend() ? MAX_DIR_WEEKEND : MAX_DIR_NORMAL;
             if (side == com.bot.TradingCore.Side.LONG  && longCount  >= maxDir) return false;
             if (side == com.bot.TradingCore.Side.SHORT && shortCount >= maxDir) return false;
-            if (sector != null && sectorCount.getOrDefault(sector, 0) >= MAX_SECTOR) return false;
+            if (sector != null && sectorDirCount.getOrDefault(sector + "_" + side.name(), 0) >= MAX_SECTOR) return false;
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
-                long topSameDir = registered.stream()
-                        .filter(p -> categorizePair(p) == com.bot.DecisionEngineMerged.CoinCategory.TOP)
-                        .count();
+                int topSameDir = side == com.bot.TradingCore.Side.LONG ? topLongCount : topShortCount;
                 if (topSameDir >= MAX_TOP_SAME_DIR) return false;
             }
             return true;
@@ -1415,7 +1573,10 @@ public final class SignalSender {
             if (registered.contains(pair)) return;
             registered.add(pair);
             if (side == com.bot.TradingCore.Side.LONG) longCount++; else shortCount++;
-            if (sector != null) sectorCount.merge(sector, 1, Integer::sum);
+            if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
+                if (side == com.bot.TradingCore.Side.LONG) topLongCount++; else topShortCount++;
+            }
+            if (sector != null) sectorDirCount.merge(sector + "_" + side.name(), 1, Integer::sum);
         }
     }
 
@@ -1653,7 +1814,10 @@ public final class SignalSender {
             if (et != null && filterEarlySignal(et)) {
                 bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
                 earlySignals.incrementAndGet();
-                isc.registerSignal(et);
+                String sector = detectSector(pair);
+                com.bot.DecisionEngineMerged.CoinCategory cat =
+                        et.category != null ? et.category : categorizePair(pair);
+                registerApprovedSignal(et, pair, cat, sector, ts, true);
             }
         }
     }
@@ -1733,9 +1897,25 @@ public final class SignalSender {
         boolean isLong = sig.side == com.bot.TradingCore.Side.LONG;
         double rs = relStrengthHistory.getOrDefault(sig.symbol, new java.util.concurrent.ConcurrentLinkedDeque<>())
                 .stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
-        if (gic.getFilterWeight(sig.symbol, isLong, rs, detectSector(sig.symbol)) < 0.55) return false;
+        double gicWeight = gic.getFilterWeight(sig.symbol, isLong, rs, detectSector(sig.symbol));
+        double minEarlyGicWeight = sig.probability >= 76.0 ? 0.45 : 0.55;
+        if (gicWeight < minEarlyGicWeight) return false;
         if (!isc.allowSignal(sig)) return false;
         return sig.probability >= isc.getEffectiveMinConfidence();
+    }
+
+    private void registerApprovedSignal(com.bot.DecisionEngineMerged.TradeIdea idea,
+                                        String pair,
+                                        com.bot.DecisionEngineMerged.CoinCategory cat,
+                                        String sector,
+                                        long approvedAtMs,
+                                        boolean trackLifecycle) {
+        isc.registerSignal(idea);
+        decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, approvedAtMs);
+        correlationGuard.register(pair, idea.side, cat, sector);
+        if (trackLifecycle) {
+            com.bot.BotMain.trackSignal(idea);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -2007,8 +2187,12 @@ public final class SignalSender {
     private void logCycleStats() {
         long total = totalFetches.get(), hits = cacheHits.get();
         if (total > 0 && total % 500 == 0) {
-            System.out.printf("[Stats] cache=%.1f%% early=%d liq=%d corr=%d ws=%d msgs=%d bal=$%.2f%n",
-                    100.0*hits/total, earlySignals.get(), blockedLiq.get(), blockedCorr.get(), wsMap.size(), wsMessageCount.get(), accountBalance);
+            System.out.printf("[Stats] cache=%.1f%% early=%d liq=%d corr=%d stale=%d profit=%d e=%d opt=%d vpoc=%d fin=%d isc=%d q=+%.0f ws=%.0f%% msgs=%d bal=$%.2f%n",
+                    100.0*hits/total, earlySignals.get(), blockedLiq.get(), blockedCorr.get(),
+                    blockedStaleRt.get(), blockedProfit.get(), blockedEarlyConf.get(),
+                    blockedOptConf.get(), blockedVpoc.get(), blockedFinalConf.get(),
+                    blockedIsc.get(), cycleQualityPenalty, lastCycleWsCoverage * 100.0,
+                    wsMessageCount.get(), accountBalance);
         }
     }
 
@@ -2025,6 +2209,26 @@ public final class SignalSender {
     public double getAccountBalance() { return accountBalance; }
     public int  getActiveWsCount()   { return wsMap.size(); }
     public boolean isUdsConnected()  { return udsWebSocket != null; }
+    public double getCycleQualityPenalty() { return cycleQualityPenalty; }
+    public double getLastCycleStaleRatio() { return lastCycleStaleRatio; }
+    public double getLastCycleWsCoverage() { return lastCycleWsCoverage; }
+    public List<String> getScanUniverseSnapshot(int limit) {
+        List<String> sorted = new ArrayList<>(cachedPairs);
+        sorted.sort((a, b) -> Double.compare(
+                volume24hUSD.getOrDefault(b, 0.0),
+                volume24hUSD.getOrDefault(a, 0.0)));
+        if (limit <= 0 || sorted.size() <= limit) return sorted;
+        return new ArrayList<>(sorted.subList(0, limit));
+    }
+    public com.bot.DecisionEngineMerged.CoinCategory getCoinCategory(String pair) {
+        return categorizePair(pair);
+    }
+    public String getRejectionStats() {
+        return String.format("rej[liq=%d corr=%d stale=%d profit=%d e=%d opt=%d vpoc=%d final=%d isc=%d gic=%d q=+%.0f]",
+                blockedLiq.get(), blockedCorr.get(), blockedStaleRt.get(), blockedProfit.get(),
+                blockedEarlyConf.get(), blockedOptConf.get(), blockedVpoc.get(),
+                blockedFinalConf.get(), blockedIsc.get(), gicHardHeadwind.get(), cycleQualityPenalty);
+    }
 
     public com.bot.DecisionEngineMerged getDecisionEngine() { return decisionEngine; }
     public com.bot.SignalOptimizer getOptimizer()           { return optimizer; }

@@ -355,8 +355,9 @@ public final class BotMain {
 
         // [v23.0] Update Bayesian prior from ISC real win rate
         // This ensures probability estimates reflect ACTUAL trading performance
-        if (isc.getTotalTradeCount() >= 20) {
-            sender.getDecisionEngine().updateBayesPrior(isc.getOverallWinRate());
+        int totalTrades = isc.getTotalTradeCount();
+        if (totalTrades >= 20) {
+            sender.getDecisionEngine().updateBayesPrior(isc.getOverallWinRate(), totalTrades);
         }
 
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
@@ -977,12 +978,14 @@ public final class BotMain {
                                             com.bot.TelegramBotSender telegram) {
         LOG.info("[BT] Начало периодического бэктеста...");
         com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
-        String[] syms = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "LINKUSDT", "XRPUSDT"};
+        java.util.LinkedHashSet<String> universe = new java.util.LinkedHashSet<>(java.util.List.of(
+                "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "LINKUSDT", "XRPUSDT"));
+        universe.addAll(sender.getScanUniverseSnapshot(12));
         double totalEV = 0;
         int    count   = 0;
         StringBuilder btLog = new StringBuilder("[BT] Results: ");
 
-        for (String sym : syms) {
+        for (String sym : universe) {
             try {
                 List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 500);
                 List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  200);
@@ -991,8 +994,9 @@ public final class BotMain {
 
                 if (m15 == null || m15.size() < 250) continue;
 
+                com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
                 com.bot.SimpleBacktester.BacktestResult r = bt.run(
-                        sym, m1, m5, m15, h1, com.bot.DecisionEngineMerged.CoinCategory.TOP);
+                        sym, m1, m5, m15, h1, cat);
 
                 if (r.total >= 5) {
                     totalEV += r.ev;
@@ -1034,7 +1038,8 @@ public final class BotMain {
                         + "BTC:%s str=%.2f | "
                         + "WS:%d UDS:%s Bal:$%.2f | "
                         + "Day:%+.2f%% DD:%.1f%% | "
-                        + "FC:%.0f%%(%d/%d) Err:%d WD:%d | %s",
+                        + "FC:%.0f%%(%d/%d) Err:%d WD:%d | "
+                        + "DQ:+%.0f st=%.0f%% ws=%.0f%% | %s | %s",
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 trackedSignals.size(), forecastRecords.size(),
                 ctx.regime, ctx.impulseStrength,
@@ -1044,7 +1049,9 @@ public final class BotMain {
                 forecastTotal.get() > 0 ? (double) forecastCorrect.get() / forecastTotal.get() * 100 : 0.0,
                 forecastCorrect.get(), forecastTotal.get(),
                 errorCount.get(), watchdogAlerts.get(),
-                isc.getStats());
+                sender.getCycleQualityPenalty(), sender.getLastCycleStaleRatio() * 100.0,
+                sender.getLastCycleWsCoverage() * 100.0,
+                isc.getStats(), sender.getRejectionStats());
 
         LOG.info(msg);
     }

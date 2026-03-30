@@ -104,14 +104,22 @@ public final class DecisionEngineMerged {
     // could push bayesPrior to 0.35 and suppress every valid signal — "Bayesian depression".
     // Fix: anchor to 0.55 (slightly above neutral) until the system has proven sample size.
     // After 50 trades we allow winRate to influence within [0.50, 0.70].
-    private volatile int bayesUpdateCount = 0;
-    public void updateBayesPrior(double winRate) {
-        bayesUpdateCount++;
-        if (bayesUpdateCount < 50) {
+    private volatile int bayesSampleTrades = 0;
+    public void updateBayesPrior(double winRate, int confirmedTrades) {
+        bayesSampleTrades = Math.max(0, confirmedTrades);
+        if (bayesSampleTrades < 50) {
             // Insufficient sample — hold at stable neutral-optimistic prior
             this.bayesPrior = 0.55;
+            return;
+        }
+
+        double livePrior = Math.max(0.50, Math.min(0.70, winRate));
+        if (bayesSampleTrades < 120) {
+            // Ramp in slowly so medium-size samples don't whip the whole engine.
+            double mix = (bayesSampleTrades - 50) / 70.0;
+            this.bayesPrior = 0.55 * (1.0 - mix) + livePrior * mix;
         } else {
-            this.bayesPrior = Math.max(0.50, Math.min(0.70, winRate));
+            this.bayesPrior = livePrior;
         }
     }
 
@@ -194,20 +202,31 @@ public final class DecisionEngineMerged {
 
     /**
      * [FIX v32+] CVD Persistence check.
-     * Returns true only if the last CVD_PERSIST_BARS readings all agreed in direction.
+     * Returns true only if the last N readings all agreed in direction.
      * Prevents short-covering spikes from triggering LONG signals.
      */
-    private boolean isCVDPersistent(String sym, boolean bullish) {
+    private boolean isCVDPersistent(String sym, boolean bullish, int minBars) {
         Deque<Double> hist = cvdHistory.get(sym);
-        if (hist == null || hist.size() < CVD_PERSIST_BARS) return false;
+        if (hist == null || hist.size() < minBars) return false;
         List<Double> list = new ArrayList<>(hist);
         int n = list.size();
         int consecutive = 0;
-        for (int i = n - CVD_PERSIST_BARS; i < n; i++) {
+        for (int i = n - minBars; i < n; i++) {
             if (bullish  && list.get(i) > 0.05) consecutive++;
             if (!bullish && list.get(i) < -0.05) consecutive++;
         }
-        return consecutive >= CVD_PERSIST_BARS;
+        return consecutive >= minBars;
+    }
+
+    private int getBullCvdPersistenceBars(String symbol) {
+        if (gicRef != null) {
+            com.bot.GlobalImpulseController.CascadeLevel level = gicRef.getCurrentCascadeLevel();
+            if (level == com.bot.GlobalImpulseController.CascadeLevel.CRASH
+                    || level == com.bot.GlobalImpulseController.CascadeLevel.PANIC) {
+                return CVD_PERSIST_BARS;
+            }
+        }
+        return getRelativeStrength(symbol) >= 0.62 ? 2 : CVD_PERSIST_BARS;
     }
 
     /** [v29] VDA score [-1..+1]: +1=buy acceleration, -1=sell acceleration */
@@ -956,13 +975,23 @@ public final class DecisionEngineMerged {
             atrAvg50 /= 50;
         }
         boolean atrSqueeze = atrAvg50 > 0 && atr14 < atrAvg50 * 0.60;
+        CompressionResult comp = detectCompression(c15, c1);
+        double vdaVal = vdaMap.getOrDefault(symbol, 0.0);
         AntiLagResult antiLag = detectAntiLag(c1, c5, c15);
-        if (antiLag != null && antiLag.strength > 0.38 && !atrSqueeze) {
-            double bonus = mctx.s(antiLag.strength * 1.30);
-            if (antiLag.direction > 0) cMomentum.addLong(bonus, "ANTI_LAG_UP");
-            else                       cMomentum.addShort(bonus, "ANTI_LAG_DN");
-        } else if (atrSqueeze && antiLag != null && antiLag.strength > 0.38) {
-            allFlags.add("ANTI_LAG_SQUEEZE_BLOCKED");
+        if (antiLag != null && antiLag.strength > 0.38) {
+            boolean squeezeLeadAligned = atrSqueeze && (
+                    (comp.breakout && comp.direction == antiLag.direction)
+                            || (Math.abs(vdaVal) >= 0.22
+                            && Math.signum(vdaVal) == Math.signum((double) antiLag.direction))
+            );
+            if (!atrSqueeze || squeezeLeadAligned) {
+                double bonus = mctx.s(antiLag.strength * (atrSqueeze ? 0.82 : 1.30));
+                if (antiLag.direction > 0) cMomentum.addLong(bonus, "ANTI_LAG_UP");
+                else                       cMomentum.addShort(bonus, "ANTI_LAG_DN");
+                if (atrSqueeze) allFlags.add("ANTI_LAG_SQUEEZE_SOFT");
+            } else {
+                allFlags.add("ANTI_LAG_SQUEEZE_BLOCKED");
+            }
         }
 
         // Impulse (>0.55 ATR за 5 баров)
@@ -992,7 +1021,6 @@ public final class DecisionEngineMerged {
         }
 
         // Compression Breakout
-        CompressionResult comp = detectCompression(c15, c1);
         if (comp.breakout) {
             if (comp.direction > 0) cMomentum.addLong(mctx.s(0.58), "COMP_BREAK_UP");
             else                    cMomentum.addShort(mctx.s(0.58), "COMP_BREAK_DN");
@@ -1000,7 +1028,6 @@ public final class DecisionEngineMerged {
 
         // [v29] VDA — Volume Delta Acceleration. Leading indicator: fires on first ticks
         // of a real impulse before the candle shows it. Weight 0.60 = highest in cMomentum.
-        double vdaVal = vdaMap.getOrDefault(symbol, 0.0);
         if (Math.abs(vdaVal) >= 0.20) {
             double vdaScore = mctx.s(Math.min(0.60, Math.abs(vdaVal) * 0.70));
             if (vdaVal > 0) cMomentum.addLong(vdaScore,  "VDA_BUY_ACCEL");
@@ -1032,9 +1059,9 @@ public final class DecisionEngineMerged {
                     ? mctx.s(Math.min(0.65, Math.abs(cvdVal) * 0.70)) : 0.0;
             double bestScore = Math.max(vdScore, cvdScore);
 
-            // [FIX v32+] LONG CVD: require persistence (3 bars) to filter short-covering
-            boolean cvdBullPersistent = isCVDPersistent(symbol, true);
-            boolean cvdBearPersistent = isCVDPersistent(symbol, false); // SHORT: no persistence needed
+            // [v33] LONG CVD remains stricter than SHORT, but RS leaders can confirm faster.
+            int bullPersistBars = getBullCvdPersistenceBars(symbol);
+            boolean cvdBullPersistent = isCVDPersistent(symbol, true, bullPersistBars);
             boolean volBull = (vd != null && vd > 0 && vdRatio > 1.5) || (cvdVal > 0.10 && cvdBullPersistent);
             boolean volBear = (vd != null && vd < 0 && vdRatio > 1.5) || cvdVal < -0.10; // bear: instant
 
@@ -1395,13 +1422,29 @@ public final class DecisionEngineMerged {
 
         // [v8.0] EARLY-SOLO: сильный ранний сигнал может пройти с 1 кластером
         boolean earlyStrong = earlyRev.detected && earlyRev.strength > 0.65;
-        boolean earlySoloAllowed = earlyStrong && (
-                // EARLY + хотя бы Volume или Derivatives — контр-тренд подтверждён
-                (candidateSide == com.bot.TradingCore.Side.SHORT && cEarly.favorsShort()
-                        && (cVolume.favorsShort() || cDerivatives.favorsShort())) ||
-                        (candidateSide == com.bot.TradingCore.Side.LONG && cEarly.favorsLong()
-                                && (cVolume.favorsLong() || cDerivatives.favorsLong()))
+        boolean earlyLongLead = cEarly.favorsLong() && (
+                cVolume.favorsLong()
+                        || cDerivatives.favorsLong()
+                        || (cMomentum.favorsLong() && (
+                        allFlags.contains("ANTI_LAG_UP")
+                                || allFlags.contains("COMP_BREAK_UP")
+                                || allFlags.contains("PUMP_HUNT_B")
+                                || allFlags.stream().anyMatch(f -> f.startsWith("VDA+"))))
+                        || (cStructure.favorsLong() && allFlags.contains("BOS_UP_5M"))
         );
+        boolean earlyShortLead = cEarly.favorsShort() && (
+                cVolume.favorsShort()
+                        || cDerivatives.favorsShort()
+                        || (cMomentum.favorsShort() && (
+                        allFlags.contains("ANTI_LAG_DN")
+                                || allFlags.contains("COMP_BREAK_DN")
+                                || allFlags.contains("PUMP_HUNT_S")
+                                || allFlags.stream().anyMatch(f -> f.startsWith("VDA-"))))
+                        || (cStructure.favorsShort() && allFlags.contains("BOS_DN_5M"))
+        );
+        boolean earlySoloAllowed = earlyStrong
+                && ((candidateSide == com.bot.TradingCore.Side.LONG && earlyLongLead)
+                || (candidateSide == com.bot.TradingCore.Side.SHORT && earlyShortLead));
 
         int requiredClusters = earlySoloAllowed ? 1 : MIN_AGREEING_CLUSTERS;
 
@@ -1461,6 +1504,25 @@ public final class DecisionEngineMerged {
             lateEntryPenalty = true;
             allFlags.add("LATE_ENTRY_S");
         }
+        boolean leadBreakoutOverride = lateEntryPenalty && (
+                allFlags.contains("EARLY_SOLO")
+                        || (side == com.bot.TradingCore.Side.LONG && (
+                        allFlags.contains("BOS_UP_5M")
+                                || allFlags.contains("COMP_BREAK_UP")
+                                || allFlags.contains("ANTI_LAG_UP")
+                                || allFlags.contains("PUMP_HUNT_B")
+                                || allFlags.stream().anyMatch(f -> f.startsWith("VDA+"))))
+                        || (side == com.bot.TradingCore.Side.SHORT && (
+                        allFlags.contains("BOS_DN_5M")
+                                || allFlags.contains("COMP_BREAK_DN")
+                                || allFlags.contains("ANTI_LAG_DN")
+                                || allFlags.contains("PUMP_HUNT_S")
+                                || allFlags.stream().anyMatch(f -> f.startsWith("VDA-"))))
+        );
+        if (leadBreakoutOverride) {
+            lateEntryPenalty = false;
+            allFlags.add("LATE_OVERRIDE_LEAD");
+        }
 
         // [v11.0] VOLUME CONFIRMATION GATE
         boolean volumeSupports = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsLong())
@@ -1491,27 +1553,22 @@ public final class DecisionEngineMerged {
         // for 10 minutes after any position close. Eliminates spin-trading on same pair.
         if (isPostExitBlocked(symbol, side)) return null;
 
-        // [v26.0] GIC DIRECTIONAL HARD VETO — enforces onlyLong / onlyShort
-        // Previously: GIC computed these flags but generate() never read them (confirmed bug).
-        // Now: applied AFTER side is finalised, BEFORE probability computation.
-        //
-        // gicOnlyLong  = BTC_STRONG_UP + strength > 0.82
-        //   → all SHORT signals are vetoed. Rationale: shorting alts during BTC vertical
-        //     up-impulse is historically the #1 way to blow up. Hard stop.
-        //
-        // gicOnlyShort = BTC_CRASH / PANIC + strength > 0.78
-        //   → all LONG signals are vetoed. Rationale: catching a falling knife during
-        //     BTC cascade = negative EV. aggressiveShort already handles SHORT side.
-        //
-        // Exception: aggressiveShort flag overrides gicOnlyLong (crash-mode shorts
-        //   are allowed even when BTC was previously in up-impulse — trend has reversed).
+        // [v33] Panic remains a hard veto for LONG.
+        // Outside panic, SignalSender reapplies nuanced GIC weights after all downstream
+        // probability adjustments. Returning null here was double-counting the same filter
+        // and zeroing out counter-trend reversals before RS/sector overrides could act.
+        if (gicCtx != null
+                && (gicCtx.panicMode
+                || gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
+                && side == com.bot.TradingCore.Side.LONG) {
+            allFlags.add("GIC_PANIC_VETO_LONG");
+            return null;
+        }
         if (gicOnlyLong && side == com.bot.TradingCore.Side.SHORT) {
-            allFlags.add("GIC_VETO_SHORT_BTCUP");
-            return null; // Hard veto: no shorts during BTC strong up-impulse
+            allFlags.add("GIC_STRONG_BTCUP");
         }
         if (gicOnlyShort && side == com.bot.TradingCore.Side.LONG) {
-            allFlags.add("GIC_VETO_LONG_BTCCRASH");
-            return null; // Hard veto: no longs during BTC crash / panic
+            allFlags.add("GIC_STRONG_BTCDOWN");
         }
 
         // ════════════════════════════════════════════════════════
@@ -1532,6 +1589,11 @@ public final class DecisionEngineMerged {
             double crashConfBoost = btcCrashScore * 10.0;
             probability = Math.min(85, probability + crashConfBoost);
             allFlags.add("CRASH_CONF_BOOST");
+        }
+        if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
+            double bullConfBoost = 1.5 + Math.max(0.0, gicCtx.impulseStrength - 0.70) * 6.0;
+            probability = Math.min(86, probability + Math.min(4.0, bullConfBoost));
+            allFlags.add("BULL_CONF_BOOST");
         }
 
         // ════════════════════════════════════════════════════════
@@ -1588,6 +1650,9 @@ public final class DecisionEngineMerged {
         double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
             minConf = Math.max(45.0, minConf - 8.0);
+        }
+        if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
+            minConf = Math.max(50.0, minConf - 4.0);
         }
         if (probability < minConf) return null;
 
@@ -1960,6 +2025,10 @@ public final class DecisionEngineMerged {
             double histAcc = historicalAccuracy(hist, prob);
             prob = prob * 0.70 + histAcc * 0.30;
         }
+
+        // Global live prior is only a light anchor. Pair-level evidence still dominates.
+        double priorProb = 50.0 + (bayesPrior - 0.50) * 24.0;
+        prob = prob * 0.92 + priorProb * 0.08;
 
         return Math.round(clamp(prob, 50, 85)); // [v11.0] Ceiling 85 (was 88 — unrealistic for crypto scalping)
     }

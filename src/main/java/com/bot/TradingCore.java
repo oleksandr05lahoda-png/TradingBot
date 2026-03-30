@@ -1545,8 +1545,20 @@ public final class TradingCore {
 
             double dir;
             if (squeezed) {
-                // In squeeze: no directional conviction at all
-                dir = trendDir * 0.15;
+                // Compression is often the launchpad of the move, not a zero-edge state.
+                double squeezeBias = trendDir * 0.25 + ofScore * 0.35 + vpocPull * 0.20;
+                boolean freshBreakout = move.ageBars <= 4 && move.depthAtr < 1.8;
+                boolean orderflowLead = Math.abs(ofScore) > 0.18;
+                if (freshBreakout && orderflowLead) {
+                    double leadDir = Math.signum(ofScore);
+                    squeezeBias += leadDir * 0.18;
+                    if (leadDir != 0 && leadDir == Math.signum(trendDir)) {
+                        squeezeBias += leadDir * 0.10;
+                    }
+                } else if (freshBreakout && move.direction != 0) {
+                    squeezeBias += move.direction * 0.08;
+                }
+                dir = squeezeBias;
             } else if (exhaustionScore > 0.50 && exhaustionSignals >= 2) {
                 // [v19.0] STRONG exhaustion: forecast REVERSAL (opposite to current move)
                 // Lowered from 0.55 / 3 signals to make it catch bottoms/tops faster
@@ -1614,6 +1626,14 @@ public final class TradingCore {
                 boolean htfAgrees = Math.signum(f.getOrDefault("HTF", 0.0)) == dirSign;
                 boolean ofAgrees  = Math.signum(f.getOrDefault("OF",  0.0)) == dirSign;
                 if (htfAgrees && ofAgrees) conf = clamp(conf + 0.08, 0, 0.85);
+                if (squeezed) {
+                    boolean breakoutAligned = Math.abs(f.getOrDefault("OF", 0.0)) > 0.18
+                            && Math.abs(f.getOrDefault("SWING", 0.0)) > 0.12
+                            && Math.signum(f.getOrDefault("OF", 0.0)) == dirSign
+                            && Math.signum(f.getOrDefault("SWING", 0.0)) == dirSign;
+                    if (breakoutAligned) conf = clamp(conf + 0.06, 0.10, 0.85);
+                    else if (Math.abs(dir) < 0.10) conf = clamp(conf - 0.06, 0.10, 0.85);
+                }
             }
 
             // ═══════════════════════════════════════════════════════

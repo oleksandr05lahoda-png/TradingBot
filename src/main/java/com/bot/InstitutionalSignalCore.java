@@ -224,6 +224,12 @@ public final class InstitutionalSignalCore {
 
         double base = Math.max(baseMinConfidence, floor);
 
+        if (dailyPnLPct <= DAILY_LOSS_SURVIVAL_PCT) {
+            base += 12.0;
+        } else if (dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT) {
+            base += 6.0;
+        }
+
         // Backtest EV adjustment
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L)
             base += 3.0;
@@ -311,6 +317,19 @@ public final class InstitutionalSignalCore {
         if (sameDirCount >= MAX_SAME_DIRECTION) {
             log("🛑 BLOCK: Max same direction limit reached (" + MAX_SAME_DIRECTION + ")");
             return false;
+        }
+
+        int dirLosses = signal.side == com.bot.TradingCore.Side.LONG
+                ? consecutiveLongLosses
+                : consecutiveShortLosses;
+        if (dirLosses >= DIR_LOSS_PENALTY_THRESHOLD) {
+            double extraReq = Math.min(8.0, (dirLosses - DIR_LOSS_PENALTY_THRESHOLD + 1) * 3.0);
+            double requiredConf = Math.min(MAX_EFFECTIVE_MIN_CONF, getEffectiveMinConfidence() + extraReq);
+            if (signal.probability < requiredConf) {
+                log(String.format("BLOCK: directional loss guard %s losses=%d conf=%.1f<%.1f",
+                        signal.side, dirLosses, signal.probability, requiredConf));
+                return false;
+            }
         }
 
         return true;
@@ -445,7 +464,10 @@ public final class InstitutionalSignalCore {
     }
 
     /** [v31] True when daily loss exceeds -6% — SignalSender should halve position size. */
-    public boolean isCautiousMode() { return cautiousMode; }
+    public boolean isCautiousMode() {
+        resetDailyIfNeeded();
+        return dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT;
+    }
 
     public int getCurrentLossStreak() { return currentLossStreak; }
     public double getStreakBoost()    { return streakConfidenceBoost; }
