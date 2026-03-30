@@ -36,6 +36,9 @@ public final class SignalSender {
     private final double OBI_THRESHOLD;
     private final double DELTA_BLOCK_CONF;
     private final boolean ENABLE_EARLY_TICK;
+    private final int    MAX_SCAN_PAIRS_PER_CYCLE;
+    private final int    DEPTH_SNAPSHOT_TOP_N;
+    private final int    FUNDING_OI_TOP_N;
 
     // API ключи — нужны для UDS и размера позиции
     private final String API_KEY;
@@ -173,6 +176,14 @@ public final class SignalSender {
     private static final int    RL_CRITICAL_WEIGHT = 2100;
     private static final long   RL_WINDOW_MS       = 60_000L;
     private static final int    RL_MAX_CONCURRENT  = 10;
+    private static final int    BINANCE_WEIGHT_KLINES        = 5;
+    private static final int    BINANCE_WEIGHT_24H_TICKER    = 40;
+    private static final int    BINANCE_WEIGHT_EXCHANGE_INFO = 1;
+    private static final int    BINANCE_WEIGHT_PREMIUM_INDEX = 10;
+    private static final int    BINANCE_WEIGHT_OPEN_INTEREST = 1;
+    private static final int    BINANCE_WEIGHT_DEPTH10       = 2;
+    private static final int    BINANCE_WEIGHT_SIGNED_LIGHT  = 1;
+    private static final int    BINANCE_WEIGHT_BALANCE       = 5;
 
     private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
     private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
@@ -260,6 +271,29 @@ public final class SignalSender {
         rlRampUntil = rlIpBanUntil + 10 * 60_000L;
         System.out.println("[RL] 418 IP BAN 5min");
         // [v10.0] НЕ спамим в Telegram — бот просто подождёт и продолжит
+    }
+
+    private HttpResponse<String> sendBinanceRequest(HttpRequest request, int weight) throws Exception {
+        if (!rlAcquire(weight)) return null;
+        try {
+            HttpResponse<String> resp = http.send(request, HttpResponse.BodyHandlers.ofString());
+            resp.headers().firstValue("X-MBX-USED-WEIGHT-1M").ifPresent(w -> {
+                try {
+                    rlOnSuccess(Integer.parseInt(w));
+                } catch (NumberFormatException ignored) {}
+            });
+            if (resp.statusCode() == 429) {
+                rlOn429();
+                return null;
+            }
+            if (resp.statusCode() == 418) {
+                rlOn418();
+                return null;
+            }
+            return resp;
+        } finally {
+            rlRelease();
+        }
     }
 
     // RS history
@@ -353,6 +387,9 @@ public final class SignalSender {
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
         this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1; // [v29] ON by default
+        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 100);
+        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 100);
+        this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 40);
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();
@@ -366,7 +403,7 @@ public final class SignalSender {
         this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
         this.optimizer.setPumpHunter(this.pumpHunter);
 
-        int poolSize = Math.max(6, Math.min(TOP_N / 4, 25));
+        int poolSize = Math.max(8, Math.min((TOP_N + 2) / 3, 32));
         this.fetchPool = Executors.newFixedThreadPool(poolSize, r -> {
             Thread t = new Thread(r, "fetch-" + r.hashCode());
             t.setDaemon(true); return t;
@@ -397,8 +434,8 @@ public final class SignalSender {
         // Weight = 2 per request, so 25 pairs × 1 req/30s = 50 weight/30s = manageable.
         wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 30, TimeUnit.SECONDS);
 
-        System.out.printf("[SignalSender v7.0] TOP_N=%d POOL=%d LIVE_CANDLE=ON WS_AUTO=ON UDS=%s BALANCE_TRACK=%s%n",
-                TOP_N, poolSize,
+        System.out.printf("[SignalSender v7.0] TOP_N=%d SCAN=%d OI=%d DEPTH=%d POOL=%d LIVE_CANDLE=ON WS_AUTO=ON UDS=%s BALANCE_TRACK=%s%n",
+                TOP_N, MAX_SCAN_PAIRS_PER_CYCLE, FUNDING_OI_TOP_N, DEPTH_SNAPSHOT_TOP_N, poolSize,
                 !API_KEY.isBlank() ? "ON" : "OFF",
                 !API_KEY.isBlank() ? "ON" : "MANUAL");
 
@@ -420,6 +457,11 @@ public final class SignalSender {
         }
         if (rlIpBanned) rlIpBanned = false;
 
+        if (volume24hUSD.isEmpty() || System.currentTimeMillis() - lastVolRefresh > VOL_REFRESH_MS) {
+            refreshVolume24h();
+            lastVolRefresh = System.currentTimeMillis();
+        }
+
         if (cachedPairs.isEmpty() ||
                 System.currentTimeMillis() - lastPairsRefresh > BINANCE_REFRESH_MS) {
             Set<String> fresh = getTopSymbolsSet(TOP_N);
@@ -437,11 +479,6 @@ public final class SignalSender {
             lastFundingRefresh = System.currentTimeMillis();
             // [v10.0] Пауза после funding refresh (premiumIndex + 100× OI = ~700 weight)
             try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
-        }
-
-        if (System.currentTimeMillis() - lastVolRefresh > VOL_REFRESH_MS) {
-            refreshVolume24h();
-            lastVolRefresh = System.currentTimeMillis();
         }
 
         correlationGuard.resetCycle();
@@ -507,7 +544,7 @@ public final class SignalSender {
     }
 
     private int computePairBudget() {
-        int base = Math.min(TOP_N, 80);
+        int base = Math.min(TOP_N, MAX_SCAN_PAIRS_PER_CYCLE);
         long now = System.currentTimeMillis();
         if (rlIpBanned && now < rlIpBanUntil) return Math.min(12, base);
         if (now < rlRampUntil) return Math.min(20, base);
@@ -1017,15 +1054,15 @@ public final class SignalSender {
             String qs = "timestamp=" + ts;
             String sig = hmacSHA256(API_SECRET, qs);
 
-            HttpResponse<String> resp = http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder()
                             .uri(URI.create("https://fapi.binance.com/fapi/v2/balance?" + qs + "&signature=" + sig))
                             .timeout(Duration.ofSeconds(8))
                             .header("X-MBX-APIKEY", API_KEY)
                             .GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
+                    BINANCE_WEIGHT_BALANCE);
 
-            if (resp.statusCode() == 200) {
+            if (resp != null && resp.statusCode() == 200) {
                 JSONArray arr = new JSONArray(resp.body());
                 for (int i = 0; i < arr.length(); i++) {
                     JSONObject o = arr.getJSONObject(i);
@@ -1065,10 +1102,13 @@ public final class SignalSender {
 
     private void initLeverageAndMarginMode() {
         if (API_KEY.isBlank() || rlIpBanned) return;
-        Set<String> pairs = new java.util.HashSet<>(wsMap.keySet());
+        List<String> pairs = new ArrayList<>(wsMap.keySet());
+        pairs.sort((a, b) -> Double.compare(
+                volume24hUSD.getOrDefault(b, 0.0),
+                volume24hUSD.getOrDefault(a, 0.0)));
         if (pairs.isEmpty()) {
             // Fallback: use top symbols if WS not yet connected
-            pairs = getTopSymbolsSet(Math.min(TOP_N, 30));
+            pairs = new ArrayList<>(getTopSymbolsSet(Math.min(TOP_N, 30)));
         }
         int ok = 0, fail = 0;
         for (String pair : pairs) {
@@ -1085,7 +1125,7 @@ public final class SignalSender {
                         .header("X-MBX-APIKEY", API_KEY)
                         .POST(HttpRequest.BodyPublishers.noBody())
                         .build();
-                http.send(req1, HttpResponse.BodyHandlers.ofString()); // ignore "already set" 400
+                sendBinanceRequest(req1, BINANCE_WEIGHT_SIGNED_LIGHT); // ignore "already set" 400
 
                 // 2. Set leverage
                 long ts2 = System.currentTimeMillis();
@@ -1099,8 +1139,8 @@ public final class SignalSender {
                         .header("X-MBX-APIKEY", API_KEY)
                         .POST(HttpRequest.BodyPublishers.noBody())
                         .build();
-                HttpResponse<String> r2 = http.send(req2, HttpResponse.BodyHandlers.ofString());
-                if (r2.statusCode() == 200) ok++; else fail++;
+                HttpResponse<String> r2 = sendBinanceRequest(req2, BINANCE_WEIGHT_SIGNED_LIGHT);
+                if (r2 != null && r2.statusCode() == 200) ok++; else fail++;
 
             } catch (Exception e) {
                 fail++;
@@ -1126,15 +1166,15 @@ public final class SignalSender {
     private void initUserDataStream() {
         if (API_KEY.isBlank()) return;
         try {
-            HttpResponse<String> resp = http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder()
                             .uri(URI.create("https://fapi.binance.com/fapi/v1/listenKey"))
                             .timeout(Duration.ofSeconds(10))
                             .header("X-MBX-APIKEY", API_KEY)
                             .POST(HttpRequest.BodyPublishers.noBody()).build(),
-                    HttpResponse.BodyHandlers.ofString());
+                    BINANCE_WEIGHT_SIGNED_LIGHT);
 
-            if (resp.statusCode() != 200) { scheduleUdsRetry(10); return; }
+            if (resp == null || resp.statusCode() != 200) { scheduleUdsRetry(10); return; }
             udsListenKey = new JSONObject(resp.body()).getString("listenKey");
             connectUserDataStream(udsListenKey);
         } catch (Exception e) {
@@ -1247,14 +1287,14 @@ public final class SignalSender {
     private void renewListenKey() {
         if (API_KEY.isBlank() || udsListenKey == null) return;
         try {
-            HttpResponse<String> resp = http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder()
                             .uri(URI.create("https://fapi.binance.com/fapi/v1/listenKey"))
                             .timeout(Duration.ofSeconds(8))
                             .header("X-MBX-APIKEY", API_KEY)
                             .PUT(HttpRequest.BodyPublishers.noBody()).build(),
-                    HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 200) { System.out.println("[UDS] Key renewed"); }
+                    BINANCE_WEIGHT_SIGNED_LIGHT);
+            if (resp != null && resp.statusCode() == 200) { System.out.println("[UDS] Key renewed"); }
             else { initUserDataStream(); }
         } catch (Exception e) { initUserDataStream(); }
     }
@@ -1272,9 +1312,14 @@ public final class SignalSender {
     // Computes sum of bid volume L1-L5 and ask volume L1-L5.
     // Updates orderbookMap with full-depth OrderbookSnapshot.
     private void refreshDepth5Snapshots() {
-        if (API_KEY.isBlank() || rlIpBanned) return;
-        Set<String> activePairs = new java.util.HashSet<>(wsMap.keySet());
-        for (String pair : activePairs) {
+        if (rlIpBanned) return;
+        List<String> activePairs = new ArrayList<>(wsMap.keySet());
+        activePairs.sort((a, b) -> Double.compare(
+                volume24hUSD.getOrDefault(b, 0.0),
+                volume24hUSD.getOrDefault(a, 0.0)));
+        int depthPairs = Math.min(activePairs.size(), DEPTH_SNAPSHOT_TOP_N);
+        for (int idx = 0; idx < depthPairs; idx++) {
+            String pair = activePairs.get(idx);
             try {
                 String url = "https://fapi.binance.com/fapi/v1/depth?symbol="
                         + pair + "&limit=10";
@@ -1282,8 +1327,8 @@ public final class SignalSender {
                         .uri(URI.create(url))
                         .timeout(Duration.ofSeconds(5))
                         .GET().build();
-                HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-                if (resp.statusCode() != 200) continue;
+                HttpResponse<String> resp = sendBinanceRequest(req, BINANCE_WEIGHT_DEPTH10);
+                if (resp == null || resp.statusCode() != 200) continue;
                 JSONObject j = new JSONObject(resp.body());
                 JSONArray bids = j.optJSONArray("bids");
                 JSONArray asks = j.optJSONArray("asks");
@@ -1536,10 +1581,12 @@ public final class SignalSender {
         private int topLongCount = 0, topShortCount = 0;
         private final Map<String, Integer> sectorDirCount = new HashMap<>();
         private final Set<String> registered = new HashSet<>();
-        // [v10.0] Weekend-aware: Sat/Sun liquidity is 30-50% lower, alt cascades happen
-        private static final int MAX_DIR_NORMAL  = 6;   // was 8
-        private static final int MAX_DIR_WEEKEND = 3;
-        private static final int MAX_SECTOR = 3, MAX_TOP_SAME_DIR = 3; // was 4
+        // Limits stay directional, but are configurable so a 100-pair scanner
+        // is not silently stuck at the old "6 per side" profile.
+        private static final int MAX_DIR_NORMAL  = envInt("CORR_MAX_DIR_NORMAL", 10);
+        private static final int MAX_DIR_WEEKEND = envInt("CORR_MAX_DIR_WEEKEND", 6);
+        private static final int MAX_SECTOR      = envInt("CORR_MAX_SECTOR_SAME_DIR", 4);
+        private static final int MAX_TOP_SAME_DIR= envInt("CORR_MAX_TOP_SAME_DIR", 4);
 
         private static boolean isWeekend() {
             java.time.DayOfWeek d = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getDayOfWeek();
@@ -1611,22 +1658,13 @@ public final class SignalSender {
     }
 
     private List<com.bot.TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
-        if (!rlAcquire(5)) return Collections.emptyList(); // [v9.0] semaphore acquire
         try {
             String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
                     symbol, interval, limit);
-            HttpResponse<String> resp = http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-
-            // [v9.0] Server-side weight tracking
-            resp.headers().firstValue("X-MBX-USED-WEIGHT-1M").ifPresent(w -> {
-                try { rlOnSuccess(Integer.parseInt(w)); } catch (NumberFormatException ignored) {}
-            });
-
-            // [v9.0] Proper 429/418 handling with backoff
-            if (resp.statusCode() == 429) { rlOn429(); return Collections.emptyList(); }
-            if (resp.statusCode() == 418) { rlOn418(); return Collections.emptyList(); }
+                    BINANCE_WEIGHT_KLINES);
+            if (resp == null) return Collections.emptyList();
 
             String body = resp.body();
             if (!body.trim().startsWith("[")) return Collections.emptyList();
@@ -1642,7 +1680,6 @@ public final class SignalSender {
             }
             return list;
         } catch (Exception e) { return Collections.emptyList(); }
-        finally { rlRelease(); } // [v9.0] ALWAYS release semaphore
     }
 
     public CompletableFuture<List<com.bot.TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {
@@ -1926,9 +1963,12 @@ public final class SignalSender {
         if (rlIpBanned) return;
         try {
             // Bulk funding rates — 1 request for ALL pairs (weight ~10)
-            JSONArray arr = new JSONArray(http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/premiumIndex"))
-                            .timeout(Duration.ofSeconds(15)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
+                            .timeout(Duration.ofSeconds(15)).GET().build(),
+                    BINANCE_WEIGHT_PREMIUM_INDEX);
+            if (resp == null) return;
+            JSONArray arr = new JSONArray(resp.body());
             Map<String, Double> rates = new HashMap<>(arr.length());
             for (int i = 0; i < arr.length(); i++) { JSONObject o = arr.getJSONObject(i); rates.put(o.getString("symbol"), o.optDouble("lastFundingRate", 0)); }
 
@@ -1944,7 +1984,7 @@ public final class SignalSender {
             oiPairs.sort((a, b) -> Double.compare(
                     volume24hUSD.getOrDefault(b, 0.0),
                     volume24hUSD.getOrDefault(a, 0.0)));
-            int oiLimit = Math.min(20, oiPairs.size());
+            int oiLimit = Math.min(FUNDING_OI_TOP_N, oiPairs.size());
 
             for (int i = 0; i < oiLimit; i++) {
                 if (rlIpBanned) break;
@@ -1961,9 +2001,15 @@ public final class SignalSender {
     private void fetchAndUpdateOI(String symbol, double fr) {
         try {
             // [v10.0] Only current OI, skip expensive oiHist (saves 1 request per pair)
-            JSONObject oiJ = new JSONObject(http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/openInterest?symbol="+symbol))
-                            .timeout(Duration.ofSeconds(6)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
+                            .timeout(Duration.ofSeconds(6)).GET().build(),
+                    BINANCE_WEIGHT_OPEN_INTEREST);
+            if (resp == null) {
+                decisionEngine.updateFundingOI(symbol, fr, 0, 0, 0);
+                return;
+            }
+            JSONObject oiJ = new JSONObject(resp.body());
             double oi = oiJ.optDouble("openInterest", 0);
             decisionEngine.updateFundingOI(symbol, fr, oi, 0, 0);
         } catch (Exception e) { decisionEngine.updateFundingOI(symbol, fr, 0, 0, 0); }
@@ -1976,9 +2022,12 @@ public final class SignalSender {
     private void refreshVolume24h() {
         if (rlIpBanned) return; // [v10.0]
         try {
-            JSONArray arr = new JSONArray(http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/ticker/24hr"))
-                            .timeout(Duration.ofSeconds(15)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
+                            .timeout(Duration.ofSeconds(15)).GET().build(),
+                    BINANCE_WEIGHT_24H_TICKER);
+            if (resp == null) return;
+            JSONArray arr = new JSONArray(resp.body());
             for (int i = 0; i < arr.length(); i++) { JSONObject o = arr.getJSONObject(i); double v = o.optDouble("quoteVolume", 0); if (v > 0) volume24hUSD.put(o.getString("symbol"), v); }
         } catch (Exception e) { System.out.println("[VOL24H] Error: " + e.getMessage()); }
     }
@@ -1986,18 +2035,47 @@ public final class SignalSender {
     public Set<String> getTopSymbolsSet(int limit) {
         try {
             Set<String> binancePairs = getBinanceSymbolsFutures();
-            JSONArray cg = new JSONArray(http.send(
-                    HttpRequest.newBuilder().uri(URI.create("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"))
-                            .timeout(Duration.ofSeconds(15)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
             Set<String> top = new LinkedHashSet<>();
-            for (int i = 0; i < cg.length(); i++) {
-                String sym = cg.getJSONObject(i).getString("symbol").toUpperCase();
-                if (STABLE.contains(sym)) continue;
-                String pair = sym + "USDT";
-                if (binancePairs.contains(pair)) top.add(pair);
-                if (top.size() >= limit) break;
+
+            if (!volume24hUSD.isEmpty()) {
+                List<String> byVolume = new ArrayList<>(binancePairs);
+                byVolume.removeIf(p -> {
+                    String sym = p.endsWith("USDT") ? p.substring(0, p.length() - 4) : p;
+                    return STABLE.contains(sym);
+                });
+                byVolume.sort((a, b) -> Double.compare(
+                        volume24hUSD.getOrDefault(b, 0.0),
+                        volume24hUSD.getOrDefault(a, 0.0)));
+                for (String pair : byVolume) {
+                    if (volume24hUSD.getOrDefault(pair, 0.0) <= 0.0) break;
+                    top.add(pair);
+                    if (top.size() >= limit) break;
+                }
             }
-            if (top.size() < limit) { for (String p : binancePairs) { if (top.size() >= limit) break; top.add(p); } }
+
+            if (top.size() < limit) {
+                JSONArray cg = new JSONArray(http.send(
+                        HttpRequest.newBuilder().uri(URI.create("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"))
+                                .timeout(Duration.ofSeconds(15)).GET().build(), HttpResponse.BodyHandlers.ofString()).body());
+                for (int i = 0; i < cg.length(); i++) {
+                    String sym = cg.getJSONObject(i).getString("symbol").toUpperCase();
+                    if (STABLE.contains(sym)) continue;
+                    String pair = sym + "USDT";
+                    if (binancePairs.contains(pair)) top.add(pair);
+                    if (top.size() >= limit) break;
+                }
+            }
+
+            if (top.size() < limit) {
+                List<String> remaining = new ArrayList<>(binancePairs);
+                remaining.sort((a, b) -> Double.compare(
+                        volume24hUSD.getOrDefault(b, 0.0),
+                        volume24hUSD.getOrDefault(a, 0.0)));
+                for (String p : remaining) {
+                    if (top.size() >= limit) break;
+                    top.add(p);
+                }
+            }
             System.out.println("[PAIRS] Loaded " + top.size());
             return top;
         } catch (Exception e) {
@@ -2007,9 +2085,12 @@ public final class SignalSender {
 
     public Set<String> getBinanceSymbolsFutures() {
         try {
-            JSONArray arr = new JSONObject(http.send(
+            HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/exchangeInfo"))
-                            .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString()).body()).getJSONArray("symbols");
+                            .timeout(Duration.ofSeconds(10)).GET().build(),
+                    BINANCE_WEIGHT_EXCHANGE_INFO);
+            if (resp == null) return new HashSet<>(Arrays.asList("BTCUSDT","ETHUSDT","BNBUSDT"));
+            JSONArray arr = new JSONObject(resp.body()).getJSONArray("symbols");
             Set<String> res = new HashSet<>();
             for (int i = 0; i < arr.length(); i++) { JSONObject s = arr.getJSONObject(i); if ("TRADING".equalsIgnoreCase(s.optString("status","TRADING")) && s.getString("symbol").endsWith("USDT")) res.add(s.getString("symbol")); }
             return res;
@@ -2367,9 +2448,9 @@ public final class SignalSender {
         public Signal(String sym, String dir, double conf, double price) { symbol=sym; direction=dir; confidence=conf; this.price=price; timestamp=System.currentTimeMillis(); }
     }
 
-    private int    envInt(String k, int d)      { try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); } catch (Exception e) { return d; } }
-    private long   envLong(String k, long d)    { try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(d)));   } catch (Exception e) { return d; } }
-    private double envDouble(String k, double d){ try { return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(d))); } catch (Exception e) { return d; } }
+    private static int    envInt(String k, int d)      { try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); } catch (Exception e) { return d; } }
+    private static long   envLong(String k, long d)    { try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(d)));   } catch (Exception e) { return d; } }
+    private static double envDouble(String k, double d){ try { return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(d))); } catch (Exception e) { return d; } }
     private static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
     private static String pct(double v) { return String.format("%.0f", v * 100); }
 }

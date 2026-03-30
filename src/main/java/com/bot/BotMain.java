@@ -381,10 +381,18 @@ public final class BotMain {
                 .thenComparingDouble(i -> i.forecast != null ? i.forecast.confidence : 0.0).reversed()
                 .thenComparingDouble(i -> i.forecast != null ? Math.abs(i.forecast.directionScore) : 0.0).reversed());
         int limit = Math.min(signals.size(), MAX_SIGNALS_PER_CYCLE);
+        int totalLongs = 0;
+        for (com.bot.DecisionEngineMerged.TradeIdea signal : signals) {
+            if (signal.side == com.bot.TradingCore.Side.LONG) totalLongs++;
+        }
+        int totalShorts = signals.size() - totalLongs;
+        List<com.bot.DecisionEngineMerged.TradeIdea> dispatchSignals =
+                reorderSignalsForDispatch(new ArrayList<>(signals.subList(0, limit)));
 
         int sent = 0;
-        for (int idx = 0; idx < limit; idx++) {
-            com.bot.DecisionEngineMerged.TradeIdea s = signals.get(idx);
+        int sentLongs = 0;
+        int sentShorts = 0;
+        for (com.bot.DecisionEngineMerged.TradeIdea s : dispatchSignals) {
             telegram.sendMessageAsync(s.toTelegramString());
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
@@ -400,6 +408,8 @@ public final class BotMain {
                     + " forecast=" + forecastInfo
                     + " phase=" + phaseInfo);
             totalSignals.incrementAndGet();
+            if (s.side == com.bot.TradingCore.Side.LONG) sentLongs++;
+            else sentShorts++;
             sent++;
             trackSignal(s);
             lastSignalMs = System.currentTimeMillis();
@@ -412,6 +422,36 @@ public final class BotMain {
     // ══════════════════════════════════════════════════════════════
     //  TRACK SIGNAL
     // ══════════════════════════════════════════════════════════════
+
+    private static List<com.bot.DecisionEngineMerged.TradeIdea> reorderSignalsForDispatch(
+            List<com.bot.DecisionEngineMerged.TradeIdea> selected) {
+        if (selected == null || selected.size() < 3) return selected;
+
+        List<com.bot.DecisionEngineMerged.TradeIdea> longs = new ArrayList<>();
+        List<com.bot.DecisionEngineMerged.TradeIdea> shorts = new ArrayList<>();
+        for (com.bot.DecisionEngineMerged.TradeIdea idea : selected) {
+            if (idea.side == com.bot.TradingCore.Side.LONG) longs.add(idea);
+            else shorts.add(idea);
+        }
+        if (longs.isEmpty() || shorts.isEmpty()) return selected;
+
+        List<com.bot.DecisionEngineMerged.TradeIdea> ordered = new ArrayList<>(selected.size());
+        int li = 0, si = 0;
+        boolean takeLong = selected.get(0).side == com.bot.TradingCore.Side.LONG;
+        while (li < longs.size() || si < shorts.size()) {
+            if (takeLong && li < longs.size()) {
+                ordered.add(longs.get(li++));
+            } else if (!takeLong && si < shorts.size()) {
+                ordered.add(shorts.get(si++));
+            } else if (li < longs.size()) {
+                ordered.add(longs.get(li++));
+            } else if (si < shorts.size()) {
+                ordered.add(shorts.get(si++));
+            }
+            takeLong = !takeLong;
+        }
+        return ordered;
+    }
 
     static void trackSignal(com.bot.DecisionEngineMerged.TradeIdea idea) {
         if (idea == null) return;

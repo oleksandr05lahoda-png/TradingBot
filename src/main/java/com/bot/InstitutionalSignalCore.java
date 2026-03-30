@@ -47,10 +47,16 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;   // per symbol, bounded
 
     public InstitutionalSignalCore() {
-        // [v28.0] PATCH #18: maxGlobalSignals 20→8, maxPortfolioHeat 12%→8%, minConf 52→62
-        // OLD: this(20, 2, 0.12, 52.0, 0.0025, 2) — 20 signals×0.8% = 16% heat (exceeded 12% cap)
-        // NEW: 8 signals×1.0% = 8% heat (consistent with cap), minConf raised to 62% pre-edge-verification
-        this(8, 2, 0.08, 62.0, 0.0025, 2);
+        // Defaults stay conservative, but no longer hard-freeze the system at one profile.
+        // This lets the scanner scale to wider universes without recompiling the bot.
+        this(
+                envInt("ISC_MAX_GLOBAL_SIGNALS", 12),
+                envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 2),
+                envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.08),
+                envDouble("ISC_BASE_MIN_CONF", 62.0),
+                envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.0025),
+                envInt("ISC_MAX_SAME_SECTOR_DIR", 3)
+        );
     }
 
     public InstitutionalSignalCore(int maxGlobal, int maxPerSym, double maxHeat,
@@ -269,7 +275,7 @@ public final class InstitutionalSignalCore {
     // Was: max 4 concurrent LONGs or 4 SHORTs. On trending days this blocked
     // the 5th valid signal completely. With 25 pairs and TOP_N filtering,
     // 6 concurrent same-direction positions is still well within risk limits.
-    private static final int MAX_SAME_DIRECTION = 6;
+    private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 10);
 
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         // [Hole 10 FIX] Restored scanner mode to actually apply portfolio limits.
@@ -597,6 +603,22 @@ public final class InstitutionalSignalCore {
 
     private static long currentDay() {
         return System.currentTimeMillis() / 86_400_000L;
+    }
+
+    private static int envInt(String key, int fallback) {
+        try {
+            return Integer.parseInt(System.getenv().getOrDefault(key, String.valueOf(fallback)));
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
+    private static double envDouble(String key, double fallback) {
+        try {
+            return Double.parseDouble(System.getenv().getOrDefault(key, String.valueOf(fallback)));
+        } catch (Exception ignored) {
+            return fallback;
+        }
     }
 
     /** Called by BotMain when balance is refreshed — tracks drawdown (stats only) */
