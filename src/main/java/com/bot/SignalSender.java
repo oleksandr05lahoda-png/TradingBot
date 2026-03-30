@@ -163,7 +163,10 @@ public final class SignalSender {
     private static final long     VOL_REFRESH_MS   = 30 * 60_000L;
 
     // [FIX-COMP] Баланс для компаундинга
-    private volatile double accountBalance    = 1000.0; // [SCANNER MODE] fixed fallback — no API key needed for signal display
+    // [BUG-FIX] Убран хардкод $1000. Теперь читаем из env ACCOUNT_BALANCE (по умолчанию 100).
+    // Установи в Railway: ACCOUNT_BALANCE=500 (или любая сумма которую ты реально торгуешь).
+    // Если подключён API ключ — баланс подтягивается с биржи автоматически и env игнорируется.
+    private volatile double accountBalance    = envDouble("ACCOUNT_BALANCE", 100.0);
     private volatile long   lastBalanceRefresh = 0;
 
     // ══════════════════════════════════════════════════════════════
@@ -1195,6 +1198,7 @@ public final class SignalSender {
                     public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
                         try { processUserDataEvent(new JSONObject(data.toString())); udsEventsCount.incrementAndGet(); }
                         catch (Exception ignored) {}
+                        ws.request(1); // [BUG-FIX] Java 11 WS backpressure — without this UDS freezes after 1st event
                         return CompletableFuture.completedFuture(null);
                     }
 
@@ -1377,13 +1381,22 @@ public final class SignalSender {
         }
         // [SCANNER MODE] Force-reconnect ALL WS channels if wsMessageCount hasn't moved in 60s.
         // This catches the case where the TCP connection is open but Binance stopped sending frames.
+        // [BUG-FIX] OLD: lastWsHealthCheckMs was ALWAYS reset at end of method → timer could never exceed 30s.
+        // NEW: timer is only reset when messages ARE flowing. When frozen, timer keeps accumulating → triggers at 60s.
         long totalMessages = wsMessageCount.get();
-        if (lastWsHealthCheckMessages == totalMessages && !wsMap.isEmpty()
-                && now - lastWsHealthCheckMs > 60_000L) {
-            System.out.println("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
-            bot.sendMessageAsync("⚠️ *WS SILENT 60s* — форс-переподключение всех каналов...");
-            new ArrayList<>(wsMap.keySet()).forEach(this::reconnectWs);
+        if (lastWsHealthCheckMessages == totalMessages && !wsMap.isEmpty()) {
+            // Messages stopped — check if frozen for > 60s
+            if (now - lastWsHealthCheckMs > 60_000L) {
+                System.out.println("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
+                bot.sendMessageAsync("⚠️ *WS SILENT 60s* — форс-переподключение всех каналов...");
+                new ArrayList<>(wsMap.keySet()).forEach(this::reconnectWs);
+                lastWsHealthCheckMs = now; // reset ONLY after action taken
+            }
+            // else: still within 60s window — let timer accumulate
         } else {
+            // Messages ARE flowing — reconnect only individually stale pairs, update tracking vars
+            lastWsHealthCheckMessages = totalMessages;
+            lastWsHealthCheckMs = now;
             for (String pair : stalePairs) {
                 if (!wsMap.containsKey(pair)) continue;
                 System.out.printf("[WS-HEALTH] %s stale (no data for %ds) — reconnecting%n",
@@ -1392,8 +1405,6 @@ public final class SignalSender {
                 reconnectWs(pair);
             }
         }
-        lastWsHealthCheckMessages = totalMessages;
-        lastWsHealthCheckMs = now;
         if (!API_KEY.isBlank() && udsWebSocket == null) {
             scheduleUdsRetry(2);
         }
@@ -1723,7 +1734,10 @@ public final class SignalSender {
                                         JSONObject wrapper = new JSONObject(data.toString());
                                         String stream = wrapper.optString("stream", "");
                                         JSONObject j = wrapper.optJSONObject("data");
-                                        if (j == null) return CompletableFuture.completedFuture(null);
+                                        if (j == null) {
+                                            ws.request(1); // [BUG-FIX] unlock backpressure even on empty frames
+                                            return CompletableFuture.completedFuture(null);
+                                        }
 
                                         if (stream.endsWith("@aggTrade")) {
                                             processAggTrade(pair, j);
@@ -1731,6 +1745,7 @@ public final class SignalSender {
                                             processBookTicker(pair, j);
                                         }
                                     } catch (Exception ignored) {}
+                                    ws.request(1); // [BUG-FIX] Java 11 WS backpressure — MUST request next frame
                                     return CompletableFuture.completedFuture(null);
                                 }
                                 @Override public void onError(WebSocket ws, Throwable error) {
