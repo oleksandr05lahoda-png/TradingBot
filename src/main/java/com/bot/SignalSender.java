@@ -113,6 +113,17 @@ public final class SignalSender {
     private final Map<String, Long>               wsReconnectDelay= new ConcurrentHashMap<>();
     private final Map<String, MicroCandleBuilder> microBuilders   = new ConcurrentHashMap<>();
 
+    // ══════════════════════════════════════════════════════════════
+    //  [v17.0 §2] EARLY TICK SIGNAL BUFFER
+    //  Collects EARLY_TICK candidates across 1.5s windows per pair.
+    //  earlyTickFlusher drains the buffer, sorts by probability,
+    //  and dispatches only the TOP-1 per pair. Prevents signal spam
+    //  during volatile bursts where the same pair fires 5× in 3 seconds.
+    // ══════════════════════════════════════════════════════════════
+    /** Accumulates the best (highest probability) EARLY_TICK candidate per pair per flush window. */
+    private final Map<String, com.bot.DecisionEngineMerged.TradeIdea> earlyTickBuffer
+            = new ConcurrentHashMap<>();
+
     private final ScheduledExecutorService wsWatcher = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ws-watcher"); t.setDaemon(true); return t;
     });
@@ -433,9 +444,12 @@ public final class SignalSender {
         wsWatcher.scheduleAtFixedRate(this::checkWsHealth, 30, 30, TimeUnit.SECONDS);
 
         // [v28.0] PATCH #9: Poll depth5 snapshot every 30s for multi-level OBI.
-        // bookTicker gives L1 only. Institutional walls live on L2-L5.
-        // Weight = 2 per request, so 25 pairs × 1 req/30s = 50 weight/30s = manageable.
         wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 30, TimeUnit.SECONDS);
+
+        // [v17.0 §2] EARLY TICK SIGNAL BUFFER FLUSHER — runs every 1500ms.
+        // Drains earlyTickBuffer, sorts candidates by probability (highest first),
+        // dispatches TOP-1 per pair. Prevents burst spam of 5+ signals on the same pair.
+        wsWatcher.scheduleAtFixedRate(this::flushEarlyTickBuffer, 2, 2, TimeUnit.SECONDS);
 
         System.out.printf("[SignalSender v7.0] TOP_N=%d SCAN=%d OI=%d DEPTH=%d POOL=%d LIVE_CANDLE=ON WS_AUTO=ON UDS=%s BALANCE_TRACK=%s%n",
                 TOP_N, MAX_SCAN_PAIRS_PER_CYCLE, FUNDING_OI_TOP_N, DEPTH_SNAPSHOT_TOP_N, poolSize,
@@ -703,12 +717,16 @@ public final class SignalSender {
             cyclePairsSeen.incrementAndGet();
 
             Long lastRealtimeTick = lastTickTime.get(pair);
+            // [v16.0 FIX] Stale WS tick no longer hard-blocks the signal.
+            // OLD: stale → return null → ALL pairs without recent WS tick dropped (UDS=❌ caused
+            //      the bot to discard most pairs when WebSocket connectivity was degraded).
+            // NEW: stale → zero out delta/VDA (conservative assumption: no momentum) and CONTINUE.
+            // The historical candle data (15m/1h/2h) is still valid and sufficient for analysis.
             if (lastRealtimeTick == null || System.currentTimeMillis() - lastRealtimeTick > REALTIME_STALE_SKIP_MS) {
                 decisionEngine.setVolumeDelta(pair, 0.0);
                 decisionEngine.setVDA(pair, 0.0);
                 cyclePairsStale.incrementAndGet();
-                blockedStaleRt.incrementAndGet();
-                return null;
+                // Note: NOT returning null here anymore — analysis continues with zeroed delta
             }
 
             optimizer.updateFromCandles(pair, m15);
@@ -724,12 +742,13 @@ public final class SignalSender {
 
             if (idea == null) return null;
 
-            // [v7.0 FIX] Используем ISC effective min confidence (с учётом streak guard)
-            // вместо хардкодного MIN_CONF=50. Это предотвращает бесполезную работу
-            // GIC/PumpHunter/OBI/Optimizer на сигналах которые ISC потом отклонит.
+            // [v16.0 FIX] qualityPenalty removed from confidence gate — it now affects SIZE ONLY.
+            // OLD: earlyMinConf = effConf + symbolBoost + qualityPenalty (could reach 80%+)
+            // NEW: earlyMinConf = effConf + symbolBoost (max ~68+4=72%, actually achievable)
+            // qualityPenalty still reduces position size in getPositionSizeUsdt() below.
             double symbolConfBoost = isc.getSymbolMinConfBoost(pair);
             double qualityPenalty = cycleQualityPenalty;
-            double earlyMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost + qualityPenalty);
+            double earlyMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost);
             if (idea.probability < earlyMinConf) {
                 blockedEarlyConf.incrementAndGet();
                 return null;
@@ -835,17 +854,23 @@ public final class SignalSender {
 
             // [FIX-COMP] Добавляем рекомендованный размер позиции
             double posSize = getPositionSizeUsdt(idea, cat);
-            // [v31] CAUTIOUS MODE: daily loss > -6% — halve position size.
-            // The signal still passed the higher confidence gate (+8 pts) in ISC,
-            // but we trade with half size to limit exposure during losing streaks.
-            if (isc.isCautiousMode()) {
+            // [v16.0] SURVIVAL MODE (day <= -6%): position size ×0.25.
+            // [v16.0] CAUTIOUS MODE (day <= -3%): position size ×0.5.
+            // This replaces the old hard signal block with meaningful size reduction.
+            if (isc.isSurvivalMode()) {
+                posSize = posSize * 0.25;
+            } else if (isc.isCautiousMode()) {
                 posSize = posSize * 0.5;
             }
             if (qualityPenalty > 0.0) {
                 posSize *= Math.max(0.55, 1.0 - qualityPenalty * 0.06);
             }
             List<String> nf = new ArrayList<>(idea.flags);
-            String sizeMode = isc.isCautiousMode() ? " ⚠️CAUTIOUS" : "";
+            String sizeMode = isc.isSurvivalMode() ? " 🆘SURVIVAL"
+                    : isc.isCautiousMode() ? " ⚠️CAUTIOUS" : "";
+            // [v17.0 §4] Append REDUCED_RISK flag from DrawdownManager if active
+            String rrFlag = isc.getReducedRiskFlag();
+            if (!rrFlag.isEmpty()) sizeMode += " " + rrFlag;
             if (qualityPenalty > 0.0) sizeMode += String.format(" Q+%.0f", qualityPenalty);
             nf.add(String.format("SIZE=%.1f$%s", posSize, sizeMode));
             idea = rebuildIdea(idea, idea.probability, nf);
@@ -876,7 +901,8 @@ public final class SignalSender {
                 idea = rebuildIdea(idea, Math.min(85, idea.probability + liqBoost), lf);
             }
 
-            double finalMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost + qualityPenalty);
+            // [v16.0 FIX] qualityPenalty excluded from final confidence gate (size only).
+            double finalMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost);
             if (idea.probability < finalMinConf) {
                 blockedFinalConf.incrementAndGet();
                 return null;
@@ -1864,12 +1890,23 @@ public final class SignalSender {
         if (ENABLE_EARLY_TICK) {
             com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
             if (et != null && filterEarlySignal(et)) {
-                bot.sendMessageAsync("🎯 *EARLY TICK*\n" + et.toTelegramString());
-                earlySignals.incrementAndGet();
-                String sector = detectSector(pair);
-                com.bot.DecisionEngineMerged.CoinCategory cat =
-                        et.category != null ? et.category : categorizePair(pair);
-                registerApprovedSignal(et, pair, cat, sector, ts, true);
+                // [v17.0 §3] STRICT FORECAST GATE for EARLY_TICK signals.
+                // A mid-candle signal has no full 15m bar yet — ForecastEngine is the
+                // primary macro context. If it disagrees or is neutral → DROP.
+                boolean fcPasses = com.bot.DecisionEngineMerged.forecastPassesEarlyTickGate(
+                        et.forecast, et.side == com.bot.TradingCore.Side.LONG);
+                if (!fcPasses) {
+                    // Forecast neutral/opposite — do not send this EARLY_TICK
+                    return;
+                }
+
+                // [v17.0 §2] SIGNAL BUFFER — collect into per-pair buffer, flush best on timer.
+                // Instead of sending immediately (which caused signal spam during vol spikes),
+                // we store the candidate and let earlyTickFlush() pick the top signal per pair
+                // within a 1.5s collection window.
+                earlyTickBuffer.merge(pair, et, (existing, candidate) ->
+                        candidate.probability > existing.probability ? candidate : existing);
+                // Flush is handled by the earlyTickFlusher scheduled task (see constructor).
             }
         }
     }
@@ -1953,7 +1990,68 @@ public final class SignalSender {
         double minEarlyGicWeight = sig.probability >= 76.0 ? 0.45 : 0.55;
         if (gicWeight < minEarlyGicWeight) return false;
         if (!isc.allowSignal(sig)) return false;
+        // [v16.0 FIX] Use plain effectiveMinConfidence (no symbolBoost stacking in early path)
         return sig.probability >= isc.getEffectiveMinConfidence();
+    }
+
+    /**
+     * [v17.0 §2] EARLY TICK BUFFER FLUSH — called every 2 seconds by wsWatcher.
+     *
+     * Drains earlyTickBuffer atomically. Sorts remaining candidates by probability (desc),
+     * then dispatches each one: sends to Telegram, registers with ISC, tracks in BotMain.
+     *
+     * This converts the old "fire immediately on every tick" approach into a controlled
+     * "collect 2 seconds of candidates, pick best, send once" approach.
+     * Result: eliminates bursts of 5+ duplicate EARLY_TICK messages on the same pair.
+     */
+    private void flushEarlyTickBuffer() {
+        if (earlyTickBuffer.isEmpty()) return;
+
+        // Drain atomically — swap out the entire map contents
+        List<com.bot.DecisionEngineMerged.TradeIdea> candidates = new ArrayList<>();
+        for (String pair : new ArrayList<>(earlyTickBuffer.keySet())) {
+            com.bot.DecisionEngineMerged.TradeIdea idea = earlyTickBuffer.remove(pair);
+            if (idea != null) candidates.add(idea);
+        }
+        if (candidates.isEmpty()) return;
+
+        // Sort by probability descending — highest conviction goes first
+        candidates.sort(Comparator.comparingDouble(
+                (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
+
+        // [v17.0 §4] Apply REDUCED_RISK flag from DrawdownManager
+        String rrFlag = isc.getReducedRiskFlag();
+        double rrMult = isc.getReducedRiskMultiplier();
+
+        for (com.bot.DecisionEngineMerged.TradeIdea et : candidates) {
+            // Re-check ISC (state may have changed since buffering)
+            if (!isc.isSymbolAvailable(et.symbol)) continue;
+
+            // Apply REDUCED_RISK flag to signal if in drawdown mode
+            com.bot.DecisionEngineMerged.TradeIdea finalEt = et;
+            if (!rrFlag.isEmpty()) {
+                List<String> nf = new ArrayList<>(et.flags);
+                // Replace existing size flag with reduced-risk adjusted size
+                nf.removeIf(f -> f.startsWith("SIZE="));
+                double baseSize = 20.0; // default; real value already in flags
+                for (String f : et.flags) {
+                    if (f.startsWith("SIZE=")) {
+                        try { baseSize = Double.parseDouble(f.replace("SIZE=", "").replace("$", "").split(" ")[0]); }
+                        catch (Exception ignored) {}
+                    }
+                }
+                nf.add(String.format("SIZE=%.1f$ %s", baseSize * rrMult, rrFlag));
+                finalEt = rebuildIdea(et, et.probability, nf);
+            }
+
+            bot.sendMessageAsync("🎯 *EARLY TICK*\n" + finalEt.toTelegramString());
+            earlySignals.incrementAndGet();
+            String sector = detectSector(finalEt.symbol);
+            com.bot.DecisionEngineMerged.CoinCategory cat =
+                    finalEt.category != null ? finalEt.category : categorizePair(finalEt.symbol);
+            registerApprovedSignal(finalEt, finalEt.symbol, cat, sector,
+                    System.currentTimeMillis(), true);
+        }
     }
 
     private void registerApprovedSignal(com.bot.DecisionEngineMerged.TradeIdea idea,

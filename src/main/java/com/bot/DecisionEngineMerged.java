@@ -96,41 +96,89 @@ public final class DecisionEngineMerged {
     public DecisionEngineMerged() {}
 
     // [v23.0] Bayesian prior — updated from ISC real win rate
-    private volatile double bayesPrior = 0.50;
+    // [v17.0 FIX §5] bayesPrior: volatile double → AtomicReference<Double>.
+    // Problem: fetchPool runs up to 25 parallel threads, each calling updateBayesPrior().
+    // volatile guarantees visibility but NOT atomicity of the read-modify-write sequence:
+    //   thread A reads 0.55, thread B reads 0.55, both compute new value, last write wins.
+    // AtomicReference makes every update CAS-based — consistent across all threads.
+    private final java.util.concurrent.atomic.AtomicReference<Double> bayesPrior
+            = new java.util.concurrent.atomic.AtomicReference<>(0.50);
+
+    // [v17.0 FIX §5] AtomicInteger for bayesSampleTrades — same race condition fix.
+    private final java.util.concurrent.atomic.AtomicInteger bayesSampleTrades
+            = new java.util.concurrent.atomic.AtomicInteger(0);
 
     /** Update Bayesian prior from ISC historical win rate */
-    // [v31] bayesPrior stabilized: only update from real win rate after 50+ confirmed trades.
-    // Before 50 trades the win rate is statistical noise. A run of 5 losses on 15 trades
-    // could push bayesPrior to 0.35 and suppress every valid signal — "Bayesian depression".
-    // Fix: anchor to 0.55 (slightly above neutral) until the system has proven sample size.
-    // After 50 trades we allow winRate to influence within [0.50, 0.70].
-    private volatile int bayesSampleTrades = 0;
+    // [v31] Stabilised: only update after 50+ confirmed trades to avoid "Bayesian depression".
     public void updateBayesPrior(double winRate, int confirmedTrades) {
-        bayesSampleTrades = Math.max(0, confirmedTrades);
-        if (bayesSampleTrades < 50) {
-            // Insufficient sample — hold at stable neutral-optimistic prior
-            this.bayesPrior = 0.55;
+        int trades = Math.max(0, confirmedTrades);
+        bayesSampleTrades.set(trades);
+        if (trades < 50) {
+            bayesPrior.set(0.55);
             return;
         }
-
         double livePrior = Math.max(0.50, Math.min(0.70, winRate));
-        if (bayesSampleTrades < 120) {
-            // Ramp in slowly so medium-size samples don't whip the whole engine.
-            double mix = (bayesSampleTrades - 50) / 70.0;
-            this.bayesPrior = 0.55 * (1.0 - mix) + livePrior * mix;
+        if (trades < 120) {
+            double mix = (trades - 50) / 70.0;
+            bayesPrior.set(0.55 * (1.0 - mix) + livePrior * mix);
         } else {
-            this.bayesPrior = livePrior;
+            bayesPrior.set(livePrior);
         }
     }
 
-    public double getBayesPrior() { return bayesPrior; }
+    public double getBayesPrior() { return bayesPrior.get(); }
 
     // ── Setters ───────────────────────────────────────────────────
     public void setPumpHunter(com.bot.PumpHunter ph) { this.pumpHunter = ph; }
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
 
-    // [v23.0] Called by SignalSender AFTER ISC.allowSignal() confirms.
+    // ══════════════════════════════════════════════════════════════
+    //  [v17.0 §3] STRICT FORECAST GATE — used by SignalSender for EARLY_TICK signals
+    //
+    //  Philosophy: for signals generated mid-candle (EARLY_TICK), the ForecastEngine
+    //  is the ONLY macro context we have (no full 15m candle yet).
+    //  Therefore: EARLY_TICK MUST be confirmed by Forecast direction.
+    //
+    //  Rules:
+    //    LONG  → forecastResult.directionScore > EARLY_TICK_FC_MIN_SCORE  (default +0.12)
+    //    SHORT → forecastResult.directionScore < -EARLY_TICK_FC_MIN_SCORE
+    //    NEUTRAL (|score| < threshold) → REJECT
+    //    OPPOSITE strong signal → REJECT
+    //
+    //  For normal (full-candle) signals ForecastEngine remains an ADVISOR (penalty-based).
+    // ══════════════════════════════════════════════════════════════
+
+    /** Minimum absolute directionScore for EARLY_TICK forecast confirmation. */
+    private static final double EARLY_TICK_FC_MIN_SCORE = 0.12;
+
+    /**
+     * Returns true if the ForecastResult confirms the trade direction for an EARLY_TICK signal.
+     * Called from SignalSender.filterEarlySignal() BEFORE ISC check.
+     *
+     * @param forecast  result from ForecastEngine (may be null → pass-through, no hard block)
+     * @param isLong    true for LONG signal
+     * @return true = forecast confirms or is unavailable; false = forecast contradicts → REJECT
+     */
+    public static boolean forecastPassesEarlyTickGate(
+            com.bot.TradingCore.ForecastEngine.ForecastResult forecast,
+            boolean isLong) {
+
+        // No forecast engine attached yet (cold start) → allow through
+        if (forecast == null) return true;
+
+        double score = forecast.directionScore;
+
+        // NEUTRAL: |score| too small → no confirmed direction → REJECT EARLY_TICK
+        if (Math.abs(score) < EARLY_TICK_FC_MIN_SCORE) return false;
+
+        // OPPOSITE direction → REJECT
+        if (isLong  && score < 0) return false;
+        if (!isLong && score > 0) return false;
+
+        // Confirmed direction → ALLOW
+        return true;
+    }
     // Now accepts price to properly track lastSigPrice.
     public void confirmSignal(String symbol, com.bot.TradingCore.Side side, double price, long now) {
         registerSignal(symbol, side, now);
@@ -566,7 +614,7 @@ public final class DecisionEngineMerged {
 
         public String toTelegramString() {
             String emoji   = probability >= 83 ? "🔥" : probability >= 74 ? "✅"
-                    : probability >= 65 ? "🟡" : "⚪";
+                                                       : probability >= 65 ? "🟡" : "⚪";
             String sideStr = side == com.bot.TradingCore.Side.LONG ? "📈 LONG" : "📉 SHORT";
             String catStr  = category == CoinCategory.MEME ? "🐸 MEME"
                     : category == CoinCategory.TOP  ? "👑 TOP" : "🔷 ALT";
@@ -1474,7 +1522,7 @@ public final class DecisionEngineMerged {
         } else {
             minDiff = state == MarketState.STRONG_TREND ? 0.16
                     : state == MarketState.RANGE ? 0.28
-                    : 0.20;
+                      : 0.20;
         }
         // [v23.0] scoreDiff/dynThresh → penalty flags (was return null)
         boolean scoreDiffPenalty = scoreDiff < minDiff;
@@ -2027,7 +2075,7 @@ public final class DecisionEngineMerged {
         }
 
         // Global live prior is only a light anchor. Pair-level evidence still dominates.
-        double priorProb = 50.0 + (bayesPrior - 0.50) * 24.0;
+        double priorProb = 50.0 + (bayesPrior.get() - 0.50) * 24.0;
         prob = prob * 0.92 + priorProb * 0.08;
 
         return Math.round(clamp(prob, 50, 85)); // [v11.0] Ceiling 85 (was 88 — unrealistic for crypto scalping)

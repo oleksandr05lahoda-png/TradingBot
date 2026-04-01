@@ -9,8 +9,12 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v15.0 — CRITICAL ARCHITECTURE FIX EDITION                  ║
+ * ║       BotMain v17.0 — SIGNAL QUALITY & RISK ARCHITECTURE EDITION         ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  [v17.0] §1 Bipolar Guard: isSymbolAvailable() in runCycle dispatch     ║
+ * ║  [v17.0] §1 Final thread-safe bipolar check before telegram.send()      ║
+ * ║  [v17.0] §4 DrawdownManager: SL/TP explicit reason in closeTrade()      ║
+ * ║  [v17.0] §4 Trail-SL maps to "SL" reason; Trail-TP maps to "TP"        ║
  * ║  [v15.0] FIX Дыра 1: ConcurrentLinkedDeque everywhere (thread safety)  ║
  * ║  [v15.0] FIX Дыра 3: LR window 30→10, acceleration detection          ║
  * ║  [v15.0] FIX Дыра 4: Asymmetric streak reset (win halves boost)        ║
@@ -393,6 +397,16 @@ public final class BotMain {
         int sentLongs = 0;
         int sentShorts = 0;
         for (com.bot.DecisionEngineMerged.TradeIdea s : dispatchSignals) {
+
+            // [v17.0 §1] BIPOLAR GUARD — ISC.isSymbolAvailable() already runs inside
+            // allowSignal(), but processPair() is parallel and two threads can race to
+            // approve the same symbol before either registers it. This is the final,
+            // single-threaded check right before dispatch: absolutely no duplicates pass.
+            if (!isc.isSymbolAvailable(s.symbol)) {
+                LOG.info("[BIPOLAR SKIP] " + s.symbol + " already active or in cooldown — dropped");
+                continue;
+            }
+
             telegram.sendMessageAsync(s.toTelegramString());
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
@@ -412,6 +426,8 @@ public final class BotMain {
             else sentShorts++;
             sent++;
             trackSignal(s);
+            // [v17.0 §1] Mark symbol as active right after dispatch — blocks bipolar pairs
+            isc.markSymbolActive(s.symbol);
             lastSignalMs = System.currentTimeMillis();
         }
 
@@ -663,7 +679,8 @@ public final class BotMain {
                         : (ts.entry - ts.sl) / ts.entry * 100;
                 it.remove();
                 isc.registerConfirmedResult(false, ts.side);
-                isc.closeTrade(ts.symbol, ts.side, pnl);
+                // [v17.0 §4] Explicit "SL" reason → ISC.closeTrade triggers recordConsecutiveSL()
+                isc.closeTrade(ts.symbol, ts.side, pnl, "SL");
                 // [FIX v32+] Notify DecisionEngine for dynamic confidence penalty + post-exit cooldown
                 sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
                 sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
@@ -772,9 +789,8 @@ public final class BotMain {
                             : (ts.entry - ts.tp3) / ts.entry * 100;
                     it.remove();
                     isc.registerConfirmedResult(true, ts.side);
-                    isc.closeTrade(ts.symbol, ts.side, pnl);
-                    // [FIX v32+] Record win, post-exit cooldown
-                    sender.getDecisionEngine().recordWin(ts.symbol, ts.side);
+                    // [v17.0 §4] "TP" reason → ISC.closeTrade triggers resetConsecutiveSL()
+                    isc.closeTrade(ts.symbol, ts.side, pnl, "TP");
                     sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side, "HIT_TP3");
                     telegram.sendMessageAsync(String.format(
@@ -794,10 +810,8 @@ public final class BotMain {
                             : (ts.entry - ts.trailingStop) / ts.entry * 100;
                     it.remove();
                     isc.registerConfirmedResult(pnl > 0, ts.side);
-                    isc.closeTrade(ts.symbol, ts.side, pnl);
-                    // [FIX v32+] Update DecisionEngine streak tracking + post-exit cooldown
-                    if (pnl > 0) sender.getDecisionEngine().recordWin(ts.symbol, ts.side);
-                    else         sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
+                    // [v17.0 §4] "TRAIL" = profit if pnl>0 → resetConsecutiveSL; else SL-like
+                    isc.closeTrade(ts.symbol, ts.side, pnl, pnl > 0 ? "TP" : "SL");
                     sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side,
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
@@ -905,7 +919,7 @@ public final class BotMain {
                                 total, correct2, acc,
                                 acc >= 58 ? "✅ Edge confirmed — модель работает"
                                         : acc >= 50 ? "⚠️ Edge слабый — наблюдаем"
-                                        : "🔴 Edge отрицательный — нужна перекалибровка"));
+                                          : "🔴 Edge отрицательный — нужна перекалибровка"));
                     }
                 }
             } catch (Exception ex) {
