@@ -1381,6 +1381,201 @@ public final class TradingCore {
     public static boolean valid(List<?> c, int minBars)          { return c != null && c.size() >= minBars; }
 
     /* ════════════════════════════════════════════════════════════════
+       [MODULE 3 v33] VSA — VOLUME SPREAD ANALYSIS ENGINE
+       ════════════════════════════════════════════════════════════════
+       Philosophy: Richard Wyckoff + Tom Williams VSA methodology.
+       The relationship between PRICE SPREAD (candle range) and VOLUME
+       reveals the intentions of "smart money" (institutions/whales).
+
+       Core rules:
+         WIDE SPREAD + HIGH VOLUME  = genuine strength/weakness (real move)
+         WIDE SPREAD + LOW VOLUME   = fake/weak breakout (no institutional backing)
+         NARROW SPREAD + HIGH VOLUME = absorption (smart money absorbing retail)
+         NARROW SPREAD + LOW VOLUME  = low-interest consolidation (no edge)
+
+       These patterns fire BEFORE price confirmation — they are leading signals.
+       Standard indicators (RSI, MACD) all LAG because they are price-derived.
+       Volume relationship to spread does NOT lag — it describes the current candle.
+       ════════════════════════════════════════════════════════════════ */
+
+    public static final class VsaResult {
+        public enum VsaSignal {
+            NONE,
+            // ── Bullish signals ──────────────────────────────────────
+            EFFORT_TO_FALL_FAILED,   // Wide down-bar, high vol, closes near high → selling failed
+            STOPPING_VOLUME_BULL,    // Ultra-volume on down-bar closing in upper half → supply exhausted
+            NO_SUPPLY,               // Narrow down-bar, very low vol → no selling pressure
+            DEMAND_ABSORPTION,       // Narrow UP-bar, very high vol → supply being absorbed into rally
+            // ── Bearish signals ──────────────────────────────────────
+            EFFORT_TO_RISE_FAILED,   // Wide up-bar, high vol, closes near low → buying failed
+            STOPPING_VOLUME_BEAR,    // Ultra-volume on up-bar closing in lower half → demand exhausted
+            NO_DEMAND,               // Narrow up-bar, very low vol → no buying pressure
+            SUPPLY_ABSORPTION,       // Narrow DOWN-bar, very high vol → demand being absorbed into sell
+            // ── Structural ───────────────────────────────────────────
+            WEAK_BREAKOUT            // Wide range breakout with LOW vol → not trusted, likely fakeout
+        }
+
+        public final VsaSignal signal;
+        public final double    strength;   // [0..1] — how extreme the pattern is
+        public final boolean   isBullish;
+        public final boolean   isBearish;
+
+        public VsaResult(VsaSignal s, double str) {
+            this.signal   = s;
+            this.strength = clamp(str, 0, 1);
+            this.isBullish = s == VsaSignal.EFFORT_TO_FALL_FAILED ||
+                    s == VsaSignal.STOPPING_VOLUME_BULL   ||
+                    s == VsaSignal.NO_SUPPLY;
+            this.isBearish = s == VsaSignal.EFFORT_TO_RISE_FAILED ||
+                    s == VsaSignal.STOPPING_VOLUME_BEAR   ||
+                    s == VsaSignal.NO_DEMAND              ||
+                    s == VsaSignal.SUPPLY_ABSORPTION;
+        }
+
+        public boolean hasSignal() { return signal != VsaSignal.NONE; }
+        public static VsaResult none() { return new VsaResult(VsaSignal.NONE, 0); }
+
+        @Override public String toString() {
+            return "VSA{" + signal + " str=" + String.format("%.2f", strength) + "}";
+        }
+    }
+
+    /**
+     * Analyse recent candles for VSA patterns.
+     * Returns the strongest pattern found in the last {@code lookback} bars, or NONE.
+     *
+     * @param candles  15m candle list — minimum 25 bars required
+     * @param lookback how many recent candles to scan (2–4 is optimal for 15m TF)
+     */
+    public static VsaResult vsaAnalyse(List<Candle> candles, int lookback) {
+        if (candles == null || candles.size() < 25) return VsaResult.none();
+
+        int n = candles.size();
+
+        // ── Rolling context: 20-bar average volume, 14-bar average range ──
+        int volWin   = Math.min(20, n - 1);
+        int rangeWin = Math.min(14, n - 1);
+        double avgVol = 0, avgRange = 0;
+        for (int i = n - 1 - volWin; i < n - 1; i++)   avgVol   += candles.get(i).volume;
+        for (int i = n - 1 - rangeWin; i < n - 1; i++) avgRange += candles.get(i).range;
+        avgVol   /= volWin;
+        avgRange /= rangeWin;
+
+        if (avgVol < 1e-9 || avgRange < 1e-9) return VsaResult.none();
+
+        // ── Scan the most recent bars (exclude the forming candle = last index) ──
+        VsaResult best = VsaResult.none();
+        int from = Math.max(0, n - 1 - Math.min(lookback, 4));
+        for (int i = from; i < n - 1; i++) {          // n-1: last candle may still be forming
+            VsaResult r = vsaClassifyBar(candles.get(i), avgVol, avgRange);
+            if (r.strength > best.strength) best = r;
+        }
+        return best;
+    }
+
+    /** Classify a single bar against rolling averages. Package-private for testing. */
+    static VsaResult vsaClassifyBar(Candle c, double avgVol, double avgRange) {
+        if (c.range < 1e-9) return VsaResult.none();
+
+        double volRatio   = c.volume / (avgVol   + 1e-9);
+        double rangeRatio = c.range  / (avgRange + 1e-9);
+
+        // Thresholds — calibrated for 15m crypto futures
+        boolean ultraVol  = volRatio   > 3.00;  // 3× average = genuine spike (whale activity)
+        boolean highVol   = volRatio   > 1.80;  // 80%+ above average = institutional participation
+        boolean lowVol    = volRatio   < 0.50;  // half average = retail-only, no smart money
+        boolean wideRange = rangeRatio > 1.50;  // 50%+ wider than average
+        boolean thinRange = rangeRatio < 0.55;  // narrow: less than half average range
+
+        // Close position within the bar: 0 = at the low, 1 = at the high
+        double closePos   = (c.close - c.low) / c.range;
+        boolean closedHigh = closePos >= 0.65;  // closed in upper 35% of bar
+        boolean closedLow  = closePos <= 0.35;  // closed in lower 35% of bar
+
+        // ════════════════════════════════════════════════════════
+        // BULLISH PATTERNS (ordered by statistical reliability)
+        // ════════════════════════════════════════════════════════
+
+        // STOPPING VOLUME BULL — the single most reliable bottom signal in VSA.
+        // Ultra-high volume on a down-bar that closes near the HIGH of the bar.
+        // Interpretation: a tsunami of sell orders hit the market, but buyers
+        // absorbed every single one and pushed price back up. Supply is exhausted.
+        // This is frequently the exact low of a V-reversal.
+        if (ultraVol && !c.isBullish && closedHigh) {
+            double str = Math.min(1.0, (volRatio - 3.0) / 5.0 + 0.55);
+            return new VsaResult(VsaResult.VsaSignal.STOPPING_VOLUME_BULL, str);
+        }
+
+        // EFFORT TO FALL FAILED — bears put in huge effort (wide range + high vol)
+        // but couldn't hold price down. Bar closes in the upper half despite being bearish.
+        // Effort without result = the effort is done, reversal likely.
+        if (wideRange && highVol && !c.isBullish && closePos > 0.55) {
+            double str = clamp((volRatio - 1.8) / 3.5 * (rangeRatio / 1.5), 0.30, 0.85);
+            return new VsaResult(VsaResult.VsaSignal.EFFORT_TO_FALL_FAILED, str);
+        }
+
+        // NO SUPPLY — very narrow range down bar on very low volume.
+        // Interpretation: the market is testing support and nobody is selling.
+        // This is a background condition for longs (needs HTF uptrend for full strength).
+        if (thinRange && lowVol && !c.isBullish) {
+            double str = clamp((1.0 - volRatio) * (1.0 - rangeRatio), 0.20, 0.65);
+            return new VsaResult(VsaResult.VsaSignal.NO_SUPPLY, str);
+        }
+
+        // DEMAND ABSORPTION — narrow UP bar but very high volume.
+        // Paradoxically BEARISH: price can't advance despite huge buying = smart money
+        // is selling (distributing) into every retail buy order. Overhead supply.
+        if (thinRange && highVol && c.isBullish) {
+            double str = clamp((volRatio - 1.8) / 4.0, 0.25, 0.75);
+            return new VsaResult(VsaResult.VsaSignal.DEMAND_ABSORPTION, str);
+        }
+
+        // ════════════════════════════════════════════════════════
+        // BEARISH PATTERNS
+        // ════════════════════════════════════════════════════════
+
+        // STOPPING VOLUME BEAR — ultra-volume on an up-bar that closes near the LOW.
+        // Interpretation: massive demand hit the market, sellers absorbed it all.
+        // Classic distribution top, frequently precedes waterfall declines.
+        if (ultraVol && c.isBullish && closedLow) {
+            double str = Math.min(1.0, (volRatio - 3.0) / 5.0 + 0.55);
+            return new VsaResult(VsaResult.VsaSignal.STOPPING_VOLUME_BEAR, str);
+        }
+
+        // EFFORT TO RISE FAILED — bulls pushed hard (wide range + high vol upward)
+        // but bar closes near the LOW. The buying effort produced no result.
+        if (wideRange && highVol && c.isBullish && closedLow) {
+            double str = clamp((volRatio - 1.8) / 3.5 * (rangeRatio / 1.5), 0.30, 0.85);
+            return new VsaResult(VsaResult.VsaSignal.EFFORT_TO_RISE_FAILED, str);
+        }
+
+        // NO DEMAND — narrow up bar on very low volume.
+        // Price is ticking up with zero institutional interest. Fade the weak rally.
+        if (thinRange && lowVol && c.isBullish) {
+            double str = clamp((1.0 - volRatio) * (1.0 - rangeRatio), 0.20, 0.65);
+            return new VsaResult(VsaResult.VsaSignal.NO_DEMAND, str);
+        }
+
+        // SUPPLY ABSORPTION — narrow DOWN bar, very high volume.
+        // Paradoxically BULLISH: price won't fall despite huge selling = smart money
+        // is buying (accumulating) into every retail sell order.
+        if (thinRange && highVol && !c.isBullish) {
+            double str = clamp((volRatio - 1.8) / 4.0, 0.25, 0.70);
+            return new VsaResult(VsaResult.VsaSignal.SUPPLY_ABSORPTION, str);
+        }
+
+        // WEAK BREAKOUT — wide range breakout direction bar, but LOW volume.
+        // No institutional participation = retail-driven fakeout. High failure rate.
+        // The classic bull/bear trap that stops out early entries.
+        if (wideRange && lowVol) {
+            double str = clamp((rangeRatio / 3.5) * (1.0 - volRatio), 0.20, 0.60);
+            return new VsaResult(VsaResult.VsaSignal.WEAK_BREAKOUT, str);
+        }
+
+        return VsaResult.none();
+    }
+
+    /* ════════════════════════════════════════════════════════════════
        [v16.0] FORECAST ENGINE — REVERSAL-AWARE Direction Forecaster
        ════════════════════════════════════════════════════════════════
 

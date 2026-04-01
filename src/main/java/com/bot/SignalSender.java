@@ -78,6 +78,32 @@ public final class SignalSender {
     private final Map<String, Long>   vdaWindowStart= new ConcurrentHashMap<>();
     private final Map<String, Double> vdaScoreMap   = new ConcurrentHashMap<>();
 
+    // [MODULE 2 v33] ORDER FLOW VELOCITY (OFV) — stale-orderbook detection.
+    //
+    // PROBLEM: OBI (order book imbalance) is a STATIC snapshot. A wall of 500 BTC
+    // bids looks bullish, but if it's been sitting there for 2 minutes without being
+    // hit, it's likely a spoof — institutions use it to attract retail longs before
+    // pulling the wall and dumping.
+    //
+    // OFV measures the RATE OF CHANGE of the bid/ask wall:
+    //   OFV > 0 → bid wall is growing faster than ask wall → real demand absorbing sells
+    //   OFV < 0 → ask wall growing faster than bids → distribution into buy pressure
+    //   OFV ≈ 0 but OBI strong → static wall → spoofing risk
+    //
+    // This is the single most reliable pre-impulse signal because:
+    // 1. Institutional algo bots top up the bid wall 200-500ms BEFORE the impulse.
+    // 2. The wall change is visible in bookTicker BEFORE price moves.
+    // 3. Retail can't react fast enough — this is our edge.
+    //
+    // Implementation: store last 5 OBI snapshots per pair (rolling).
+    // OFV = slope of OBI over the last N snapshots (linear regression coefficient).
+    private static final int    OFV_HISTORY_SIZE   = 8;    // 8 × ~500ms ticks = ~4s window
+    private static final double OFV_SIGNAL_THRESH  = 0.015; // rate of OBI change per tick
+    private static final double OFV_STRONG_THRESH  = 0.040; // strong directional flow
+    private final Map<String, Deque<double[]>> ofvHistory = new ConcurrentHashMap<>();
+    // OFV score per pair: positive = bullish flow velocity, negative = bearish
+    private final Map<String, Double> ofvScoreMap = new ConcurrentHashMap<>();
+
     // [v29] RT-CVD — real-time CVD from aggTrade (resets each 15m candle)
     private final Map<String, Double> rtCvdBuy   = new ConcurrentHashMap<>();
     private final Map<String, Double> rtCvdTotal = new ConcurrentHashMap<>();
@@ -375,11 +401,21 @@ public final class SignalSender {
         this.bot = bot;
         this.gic = sharedGIC;
         this.isc = sharedISC;
-        this.httpIoExecutor = Executors.newFixedThreadPool(8, r -> {
-            Thread t = new Thread(r, "http-io-" + r.hashCode());
-            t.setDaemon(true);
-            return t;
-        });
+        // [PATCH B1 v33] OOM FIX — httpIoExecutor.
+        // Executors.newFixedThreadPool() uses LinkedBlockingQueue (UNBOUNDED).
+        // Under Binance API lag: tasks pile up infinitely → Railway OOM crash.
+        // Fix: bounded queue(100) + DiscardPolicy → drops oldest pending HTTP task,
+        // never blocks the scheduler, never crashes the JVM.
+        this.httpIoExecutor = new ThreadPoolExecutor(
+                8, 8, 0L, TimeUnit.MILLISECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(100),
+                r -> {
+                    Thread t = new Thread(r, "http-io-" + r.hashCode());
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.DiscardPolicy()
+        );
         this.http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(12))
                 .version(HttpClient.Version.HTTP_2)
@@ -389,21 +425,27 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
 
-        // [v28.0] PATCH #8: TOP_N reduced 100→25.
-        // OLD: 100 pairs analysed each cycle — 100 pairs × 10 signals = shallow analysis.
-        // NEW: 25 pairs with real volume >$50M/24h — deep analysis, lower overtrading.
-        // Override via env var TOP_N if you want more pairs.
-        this.TOP_N            = envInt("TOP_N", 100);
-        this.MIN_CONF         = envDouble("MIN_CONF", 50.0);
+        // [PATCH A1 v33] TOP_N default corrected: 100→30.
+        // At TOP_N=100 with BINANCE_WEIGHT_KLINES=5 per pair: 100×5=500 weight per cycle.
+        // Plus depth, funding, OI calls: realistic budget consumption ~800-1100 weight/min.
+        // At RL_SAFE_WEIGHT=1800 this leaves barely 700 for WebSocket overhead and retries.
+        // At 30 pairs: ~150-200 weight for klines + rich per-pair analysis = safe budget.
+        // Volume filter ($30M ALT / $10M MEME) naturally caps real candidates to 35-45 anyway.
+        // Set TOP_N=60 or higher via Railway env var only if Binance weight logs show headroom.
+        this.TOP_N            = envInt("TOP_N", 30);
+        // [PATCH A1 v33] MIN_CONF floor raised 50→62.
+        // At 50.0 any signal above noise floor passes — zero discrimination.
+        // 62.0 aligns with BASE_CONF in DecisionEngineMerged (was inconsistent).
+        this.MIN_CONF         = envDouble("MIN_CONF", 62.0);
         this.KLINES_LIMIT     = envInt("KLINES", 220);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
         this.TICK_HISTORY     = envInt("TICK_HISTORY", 120);
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
-        this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1; // [v29] ON by default
-        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 100);
-        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 100);
-        this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 40);
+        this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1;
+        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 40);
+        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 30);
+        this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 30);
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();
@@ -417,11 +459,21 @@ public final class SignalSender {
         this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
         this.optimizer.setPumpHunter(this.pumpHunter);
 
-        int poolSize = Math.max(8, Math.min((TOP_N + 2) / 3, 32));
-        this.fetchPool = Executors.newFixedThreadPool(poolSize, r -> {
-            Thread t = new Thread(r, "fetch-" + r.hashCode());
-            t.setDaemon(true); return t;
-        });
+        // [PATCH B2 v33] OOM FIX — fetchPool.
+        // Unbounded LinkedBlockingQueue → OOM under TOP_N=100 load.
+        // CallerRunsPolicy: if queue full, submitter thread executes task inline
+        // → natural backpressure, zero silent drops. Pool capped at 24 (Railway 2vCPU).
+        int poolSize = Math.max(8, Math.min((TOP_N + 2) / 3, 24));
+        this.fetchPool = new ThreadPoolExecutor(
+                poolSize, poolSize, 0L, TimeUnit.MILLISECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(200),
+                r -> {
+                    Thread t = new Thread(r, "fetch-" + r.hashCode());
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.CallerRunsPolicy()
+        );
 
         // [FIX-UDS] User Data Stream
         if (!API_KEY.isBlank()) {
@@ -609,6 +661,7 @@ public final class SignalSender {
             lastTickPrice.remove(zombie);
             microBuilders.remove(zombie);
             orderbookMap.remove(zombie);
+            ofvHistory.remove(zombie); ofvScoreMap.remove(zombie); // [MODULE 2 v33]
             wsReconnectDelay.remove(zombie);
             // [ДЫРА №1/№2] Очищаем CVD и ликвидации для ротированных пар
             cvdMap.remove(zombie);
@@ -829,7 +882,37 @@ public final class SignalSender {
                 }
             }
 
-            // [v18.0 REFACTOR] Delta: flag only, no blocking
+            // [MODULE 2 v33] ORDER FLOW VELOCITY — applied after OBI check.
+            // OFV measures whether the bid/ask wall is ACTIVELY GROWING (real demand)
+            // or static (probable spoof). Key distinction from plain OBI:
+            //
+            //   OBI strong + OFV positive → real institutional accumulation → BOOST signal
+            //   OBI strong + OFV ≈ 0     → static wall, no active buyers → no boost (spoof risk)
+            //   OFV strong + no OBI flag  → flow building before wall appears → EARLY signal boost
+            //   OFV negative vs direction → active distribution into price → PENALTY
+            //
+            // Score [-1..+1]: positive = bullish flow velocity, negative = bearish
+            Double ofvScore = ofvScoreMap.get(pair);
+            if (ofvScore != null && Math.abs(ofvScore) >= OFV_SIGNAL_THRESH) {
+                boolean ofvBullish = ofvScore > 0;
+                boolean ofvBearish = ofvScore < 0;
+                boolean aligned    = (isLong && ofvBullish) || (!isLong && ofvBearish);
+                boolean opposed    = (isLong && ofvBearish) || (!isLong && ofvBullish);
+
+                List<String> nf = new ArrayList<>(idea.flags);
+                if (aligned) {
+                    // OFV confirms direction — confidence boost
+                    double boost = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 4.5 : 2.5;
+                    String tag = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? "OFV_STRONG" : "OFV_ALIGN";
+                    nf.add(tag + (isLong ? "↑" : "↓"));
+                    idea = rebuildIdea(idea, Math.min(85.0, idea.probability + boost), nf);
+                } else if (opposed) {
+                    // Active flow against the signal direction — reduce confidence
+                    double penalty = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 5.0 : 2.5;
+                    nf.add("OFV_OPPOSE" + (isLong ? "↓" : "↑"));
+                    idea = rebuildIdea(idea, idea.probability - penalty, nf);
+                }
+            }
             if (Math.abs(normDelta) > 0.28) {
                 List<String> nf = new ArrayList<>(idea.flags);
                 nf.add("Δ" + (normDelta > 0 ? "BUY" : "SELL") + pct(Math.abs(normDelta)));
@@ -936,6 +1019,21 @@ public final class SignalSender {
             }
 
             isc.registerSignal(idea);
+            // [PATCH B4 v33] HARD R:R GATE — enforced AFTER adaptive TP calibration.
+            // tp2Mult floor is Math.max(1.00, ...) → worst case TP2=entry±1×risk → R:R=1:1.
+            // This violates the system's minimum 1:2 requirement.
+            // Gate: actualRR measured from TP2 (realistic partial exit target), not TP3.
+            // Tolerance: 1.80 instead of 2.00 — 10% buffer for slippage on entry fill.
+            double _riskDist = Math.abs(idea.stop - idea.price);
+            double _tp2Dist  = Math.abs(idea.tp2 - idea.price);
+            double actualRR  = _riskDist > 1e-9 ? _tp2Dist / _riskDist : 0;
+            if (actualRR < 1.80) {
+                // Undo the registration — R:R is insufficient
+                isc.unregisterSignal(idea);
+                System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < 1.80 (TP2=%.6f entry=%.6f SL=%.6f)%n",
+                        pair, idea.side, actualRR, idea.tp2, idea.price, idea.stop);
+                return null;
+            }
             // [v23.0] Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
             decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, System.currentTimeMillis());
             correlationGuard.register(pair, idea.side, cat, sector);
@@ -1808,16 +1906,45 @@ public final class SignalSender {
         wsReconnectDelay.put(pair, Math.min(delay * 2, WS_MAX_DELAY_MS));
     }
 
-    /** Process bookTicker event — populates orderbookMap for OBI analysis */
+    /** Process bookTicker event — populates orderbookMap and computes OFV */
     private void processBookTicker(String pair, JSONObject j) {
         double bidQty = j.optDouble("B", 0);
         double askQty = j.optDouble("A", 0);
         if (bidQty > 0 || askQty > 0) {
-            // Try to merge with existing depth5 snapshot if available
+            // Merge with existing depth5 snapshot if available
             OrderbookSnapshot existing = orderbookMap.get(pair);
             double bd5 = existing != null ? existing.bidDepth5 : bidQty;
             double ad5 = existing != null ? existing.askDepth5 : askQty;
-            orderbookMap.put(pair, new OrderbookSnapshot(bidQty, askQty, bd5, ad5, System.currentTimeMillis()));
+            OrderbookSnapshot snap = new OrderbookSnapshot(bidQty, askQty, bd5, ad5, System.currentTimeMillis());
+            orderbookMap.put(pair, snap);
+
+            // [MODULE 2 v33] COMPUTE ORDER FLOW VELOCITY
+            // Record this OBI tick in the rolling history and derive slope.
+            double currentObi = snap.obi();
+            Deque<double[]> hist = ofvHistory.computeIfAbsent(pair,
+                    k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+            hist.addLast(new double[]{currentObi, System.currentTimeMillis()});
+            while (hist.size() > OFV_HISTORY_SIZE) hist.removeFirst();
+
+            // Need at least 4 points for a meaningful slope
+            if (hist.size() >= 4) {
+                // Simple linear regression slope: Σ(xi - x̄)(yi - ȳ) / Σ(xi - x̄)²
+                // x = index (0..N-1), y = OBI value
+                double[] pts = hist.stream().mapToDouble(d -> d[0]).toArray();
+                int n = pts.length;
+                double xMean = (n - 1) / 2.0;
+                double yMean = 0;
+                for (double p : pts) yMean += p;
+                yMean /= n;
+                double num = 0, den = 0;
+                for (int i = 0; i < n; i++) {
+                    double dx = i - xMean;
+                    num += dx * (pts[i] - yMean);
+                    den += dx * dx;
+                }
+                double slope = den > 1e-12 ? num / den : 0;
+                ofvScoreMap.put(pair, slope);
+            }
         }
     }
 
@@ -2406,6 +2533,11 @@ public final class SignalSender {
     public double getCycleQualityPenalty() { return cycleQualityPenalty; }
     public double getLastCycleStaleRatio() { return lastCycleStaleRatio; }
     public double getLastCycleWsCoverage() { return lastCycleWsCoverage; }
+    /** [MODULE 2 v33] Returns OFV score for a pair: >0 bullish flow, <0 bearish. 0 if no data. */
+    public double getOfvScore(String pair) {
+        Double s = ofvScoreMap.get(pair);
+        return s != null ? s : 0.0;
+    }
     public List<String> getScanUniverseSnapshot(int limit) {
         List<String> sorted = new ArrayList<>(cachedPairs);
         sorted.sort((a, b) -> Double.compare(

@@ -407,6 +407,21 @@ public final class BotMain {
                 continue;
             }
 
+            // [PATCH B4 v33] DISPATCH R:R GATE — final check before user sees the signal.
+            // processPair() already filters, but rebuildIdea() and adaptive TP calibration
+            // run AFTER allowSignal() and can push TP2 closer to entry.
+            // This gate ensures every signal the trader sees has minimum 1:2 risk/reward.
+            // Measured against TP2 (the realistic partial-exit target, not the lottery TP3).
+            double _rrRiskDist = Math.abs(s.stop  - s.price);
+            double _rrTp2Dist  = Math.abs(s.tp2   - s.price);
+            double _rrActual   = _rrRiskDist > 1e-9 ? _rrTp2Dist / _rrRiskDist : 0;
+            if (_rrActual < 1.80) {
+                LOG.info("[RR-DISPATCH-BLOCK] " + s.symbol + " " + s.side
+                        + " rr=" + String.format("%.2f", _rrActual)
+                        + " entry=" + s.price + " sl=" + s.stop + " tp2=" + s.tp2);
+                continue;
+            }
+
             telegram.sendMessageAsync(s.toTelegramString());
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
@@ -655,12 +670,16 @@ public final class BotMain {
                         sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                         markForecastRecord(ts.symbol + "_" + ts.side,
                                 pnl > 0 ? "CHANDELIER_PROFIT" : "CHANDELIER_FLAT");
-                        String emoji = pnl >= 0.3 ? "✅" : "⚠️";
-                        telegram.sendMessageAsync(String.format(
-                                "%s *CHANDELIER EXIT* %s %s | PnL: %+.2f%%\n"
-                                        + "📌 ATR trail закрыл до TP1 на `%.6f`\n"
-                                        + "💡 Причина: разворот до TP1, прибыль сохранена",
-                                emoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                        // [PATCH B3 v33] SILENCED — was sending fake "profit" alerts.
+                        // runTradeResolver checks historical candle extremes, NOT live fills.
+                        // extremeHigh/Low are accumulated since entry — a touch ≠ an execution.
+                        // Real PnL is tracked by ISC internally. Telegram gets only entry signals.
+                        // String emoji = pnl >= 0.3 ? "✅" : "⚠️";
+                        // telegram.sendMessageAsync(String.format(
+                        //         "%s *CHANDELIER EXIT* %s %s | PnL: %+.2f%%\n"
+                        //                 + "📌 ATR trail закрыл до TP1 на `%.6f`\n"
+                        //                 + "💡 Причина: разворот до TP1, прибыль сохранена",
+                        //         emoji, ts.symbol, ts.side, pnl, ts.trailingStop));
                         LOG.info("[TR] CHANDELIER EXIT: " + ts.symbol
                                 + " pnl=" + String.format("%.2f%%", pnl));
                         continue;
@@ -685,11 +704,15 @@ public final class BotMain {
                 sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
                 sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                 markForecastRecord(ts.symbol + "_" + ts.side, "HIT_SL");
-                telegram.sendMessageAsync(String.format(
-                        "❌ *SL HIT* %s %s | PnL: %+.2f%%\n"
-                                + "Forecast was: %s (score %.2f)",
-                        ts.symbol, ts.side, pnl,
-                        ts.forecastBias, ts.forecastScore));
+                // [PATCH B3 v33] SILENCED — ISC tracks SL internally via closeTrade("SL").
+                // TradeResolver checks extremeLow/High — a wick touch is NOT a guaranteed fill.
+                // Real slippage on SL can be worse than ts.sl (especially on volatile alts).
+                // Sending "❌ SL HIT" for every wick creates false precision.
+                // telegram.sendMessageAsync(String.format(
+                //         "❌ *SL HIT* %s %s | PnL: %+.2f%%\n"
+                //                 + "Forecast was: %s (score %.2f)",
+                //         ts.symbol, ts.side, pnl,
+                //         ts.forecastBias, ts.forecastScore));
                 LOG.info("[TR] SL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 continue;
             }
@@ -706,14 +729,18 @@ public final class BotMain {
                 if (ts.trailingStop < ts.entry || ts.trailingStop == 0) {
                     ts.trailingStop = ts.entry;
                 }
+                // [PATCH B3 v33] TP1 SILENCED — candle extreme touch ≠ fill.
+                // Trail moved to breakeven (critical risk management — KEPT).
+                // Telegram alert removed: creates false confidence in a partial exit
+                // that may never have executed at that exact price.
                 double tp1PnlPct = isLong
                         ? (ts.tp1 - ts.entry) / ts.entry * 100
                         : (ts.entry - ts.tp1) / ts.entry * 100;
-                telegram.sendMessageAsync(String.format(
-                        "🟢 *TP1 ✓* %s %s | +%.2f%%\n"
-                                + "💰 50%% позиции — фиксируй прибыль\n"
-                                + "🛡 Стоп → безубыток `%.6f`",
-                        ts.symbol, ts.side, tp1PnlPct, ts.entry));
+                // telegram.sendMessageAsync(String.format(
+                //         "🟢 *TP1 ✓* %s %s | +%.2f%%\n"
+                //                 + "💰 50%% позиции — фиксируй прибыль\n"
+                //                 + "🛡 Стоп → безубыток `%.6f`",
+                //         ts.symbol, ts.side, tp1PnlPct, ts.entry));
                 LOG.info("[TR] TP1 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp1PnlPct));
             }
 
@@ -763,15 +790,17 @@ public final class BotMain {
                         : extremeLow  <= ts.tp2;
 
                 if (tp2Reached && !ts.tp2Hit) {
-                    ts.tp2Hit = true; // ← флаг ПЕРЕД отправкой — предотвращает дубли
+                    ts.tp2Hit = true;
                     double tp2PnlPct = isLong
                             ? (ts.tp2 - ts.entry) / ts.entry * 100
                             : (ts.entry - ts.tp2) / ts.entry * 100;
-                    telegram.sendMessageAsync(String.format(
-                            "🔵 *TP2 ✓* %s %s | +%.2f%%\n"
-                                    + "💰 30%% позиции — фиксируй прибыль\n"
-                                    + "🛡 Трейлинг поднят → TP1 `%.6f`",
-                            ts.symbol, ts.side, tp2PnlPct, ts.tp1));
+                    // [PATCH B3 v33] TP2 SILENCED — same reason as TP1.
+                    // Trailing stop upgrade to TP1 level is KEPT (critical).
+                    // telegram.sendMessageAsync(String.format(
+                    //         "🔵 *TP2 ✓* %s %s | +%.2f%%\n"
+                    //                 + "💰 30%% позиции — фиксируй прибыль\n"
+                    //                 + "🛡 Трейлинг поднят → TP1 `%.6f`",
+                    //         ts.symbol, ts.side, tp2PnlPct, ts.tp1));
                     LOG.info("[TR] TP2 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp2PnlPct));
                     // Перемещаем trailing до tp1 уровня
                     if (isLong) ts.trailingStop = Math.max(ts.trailingStop, ts.tp1);
@@ -793,9 +822,12 @@ public final class BotMain {
                     isc.closeTrade(ts.symbol, ts.side, pnl, "TP");
                     sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side, "HIT_TP3");
-                    telegram.sendMessageAsync(String.format(
-                            "✅✅ *TP3 HIT* %s %s | PnL: %+.2f%% 🚀",
-                            ts.symbol, ts.side, pnl));
+                    // [PATCH B3 v33] TP3 SILENCED — full close is tracked by ISC.
+                    // Daily summary (09:00 UTC) will show real aggregate PnL.
+                    // telegram.sendMessageAsync(String.format(
+                    //         "✅✅ *TP3 HIT* %s %s | PnL: %+.2f%% 🚀",
+                    //         ts.symbol, ts.side, pnl));
+                    LOG.info("[TR] TP3 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                     continue;
                 }
 
@@ -815,11 +847,12 @@ public final class BotMain {
                     sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side,
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
-                    String trailEmoji = pnl > 0 ? "✅" : "⚠️";
-                    telegram.sendMessageAsync(String.format(
-                            "%s *TRAILING STOP* %s %s | PnL: %+.2f%%\n"
-                                    + "📌 Закрыто трейлингом на `%.6f`",
-                            trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                    // [PATCH B3 v33] TRAILING STOP SILENCED — ISC closes trade internally.
+                    // Trail level is calculated from 1m candle close, not a real order.
+                    // telegram.sendMessageAsync(String.format(
+                    //         "%s *TRAILING STOP* %s %s | PnL: %+.2f%%\n"
+                    //                 + "📌 Закрыто трейлингом на `%.6f`",
+                    //         trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
                     LOG.info("[TR] TRAIL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 }
             }

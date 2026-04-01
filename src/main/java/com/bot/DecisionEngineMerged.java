@@ -396,15 +396,40 @@ public final class DecisionEngineMerged {
     public static final class FundingOIData {
         public final double fundingRate, openInterest, oiChange1h, oiChange4h;
         public final double prevFundingRate, fundingDelta;
+        // [MODULE 1 v33] FR MOMENTUM — acceleration of funding rate change.
+        // Single delta (fr - prevFr) tells you the direction of the last tick.
+        // Acceleration (delta - prevDelta) tells you if it's SPEEDING UP or reversing.
+        //
+        // Examples:
+        //   FR: +0.01% → +0.05% → +0.09%  = delta=+0.04%, accel=+0.04% (longs overheating → short setup)
+        //   FR: +0.09% → +0.05% → +0.03%  = delta=-0.04%, accel=+0.02% (peak FR, shorts forming)
+        //   FR: -0.08% → -0.05% → -0.02%  = delta=+0.03%, accel=+0.03% (short squeeze building → long setup)
+        //
+        // frAcceleration > 0 = FR moving faster in the SAME direction = momentum building
+        // frAcceleration < 0 = FR reversing = peak/trough forming = contrarian signal
+        public final double frAcceleration; // 2nd derivative of FR (per update cycle)
+        public final boolean frPeakWarning; // FR > extreme AND decelerating → reversal imminent
+        public final boolean frTroughWarning; // FR < extreme negative AND decelerating
         public final long   timestamp;
 
         public FundingOIData(double fr, double oi, double oi1h, double oi4h) {
-            this(fr, oi, oi1h, oi4h, fr, 0.0);
+            this(fr, oi, oi1h, oi4h, fr, 0.0, 0.0);
         }
         public FundingOIData(double fr, double oi, double oi1h, double oi4h, double prevFr, double delta) {
+            this(fr, oi, oi1h, oi4h, prevFr, delta, 0.0);
+        }
+        public FundingOIData(double fr, double oi, double oi1h, double oi4h,
+                             double prevFr, double delta, double accel) {
             this.fundingRate = fr; this.openInterest = oi;
             this.oiChange1h = oi1h; this.oiChange4h = oi4h;
             this.prevFundingRate = prevFr; this.fundingDelta = delta;
+            this.frAcceleration  = accel;
+            // Peak warning: FR is extremely positive AND acceleration is turning negative
+            // (rate of increase is slowing down = longs are exhausted, squeeze incoming)
+            this.frPeakWarning   = fr > 0.0008 && accel < -0.0001;
+            // Trough warning: FR is extremely negative AND acceleration turning positive
+            // (rate of decrease slowing = shorts exhausted, bounce incoming)
+            this.frTroughWarning = fr < -0.0005 && accel > 0.0001;
             this.timestamp = System.currentTimeMillis();
         }
         public boolean isValid() { return System.currentTimeMillis() - timestamp < 5 * 60_000L; }
@@ -516,7 +541,12 @@ public final class DecisionEngineMerged {
                 "GIC_VETO_",     // internal GIC veto log
                 "VDA_DIV_",      // VDA divergence — internal
                 "EXHAUST_PENALTY_", // exhaustion penalty debug
-                "EXHAUST_VETO_"  // exhaustion hard veto debug
+                "EXHAUST_VETO_",  // exhaustion hard veto debug
+                // [MODULE 3 v33] VSA internal flags — structural signals, not for Telegram
+                "VSA_STOP_VOL_", "VSA_EFFORT_FAIL_", "VSA_NO_SUPPLY", "VSA_NO_DEMAND",
+                "VSA_ABSORB_", "VSA_WEAK_BRK_",
+                // [MODULE 1 v33] FR Momentum internal flags
+                "FR_PEAK_WARN", "FR_TROUGH_WARN", "FR_ACCEL_DIV_"
         );
 
         /** Флаги видимые трейдеру — размер, OBI, дельта, конфлюэнция, фаза */
@@ -701,10 +731,26 @@ public final class DecisionEngineMerged {
     //  PUBLIC API
     // ══════════════════════════════════════════════════════════════
 
+    // [MODULE 1 v33] FR MOMENTUM HISTORY — stores last N funding rate snapshots per symbol.
+    // Needed to compute 2nd derivative (acceleration) of funding rate.
+    // Deque bounded at FR_HISTORY_SIZE to prevent memory growth.
+    // Each entry: [fundingRate, timestamp] stored as double[2].
+    private final Map<String, Deque<double[]>> frHistory = new ConcurrentHashMap<>();
+    private static final int FR_HISTORY_SIZE = 12; // ~1 hour at 5-min refresh = 12 snapshots
+
     public void updateFundingOI(String sym, double fr, double oi, double oi1h, double oi4h) {
         FundingOIData prev = fundingCache.get(sym);
-        double prevFr = prev != null ? prev.fundingRate : fr;
-        fundingCache.put(sym, new FundingOIData(fr, oi, oi1h, oi4h, prevFr, fr - prevFr));
+        double prevFr    = prev != null ? prev.fundingRate   : fr;
+        double prevDelta = prev != null ? prev.fundingDelta  : 0.0;
+        double delta     = fr - prevFr;
+        double accel     = delta - prevDelta; // 2nd derivative: is FR changing faster or slower?
+
+        // [MODULE 1] Persist FR history for rolling acceleration analysis
+        Deque<double[]> hist = frHistory.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        hist.addLast(new double[]{fr, System.currentTimeMillis()});
+        while (hist.size() > FR_HISTORY_SIZE) hist.removeFirst();
+
+        fundingCache.put(sym, new FundingOIData(fr, oi, oi1h, oi4h, prevFr, delta, accel));
     }
 
     public FundingOIData getFundingOI(String sym) {
@@ -1006,6 +1052,62 @@ public final class DecisionEngineMerged {
         if (bullishStructure(c15)) cStructure.boostLong(mctx.s(0.18), null);
         if (bearishStructure(c15)) cStructure.boostShort(mctx.s(0.18), null);
 
+        // [MODULE 3 v33] VSA — VOLUME SPREAD ANALYSIS
+        // Applied as the FINAL layer of cStructure. VSA is a structural filter:
+        // it confirms or contradicts what price structure is showing.
+        //
+        // Integration logic:
+        //   Bullish VSA + bullish structure  → reinforce (boost cStructure LONG)
+        //   Bearish VSA + bearish structure  → reinforce (boost cStructure SHORT)
+        //   Bullish VSA + bearish structure  → conflict (partial penalty on SHORT)
+        //   Bearish VSA + bullish structure  → conflict (partial penalty on LONG)
+        //   NO_DEMAND / NO_SUPPLY            → exhaustion veto (hard penalty regardless of structure)
+        //   WEAK_BREAKOUT detected           → scale back both sides (false breakout warning)
+        //
+        // VSA scan: last 3 candles (avoid stale patterns from 8+ bars ago)
+        if (c15.size() >= 25) {
+            com.bot.TradingCore.VsaResult vsa = com.bot.TradingCore.vsaAnalyse(c15, 3);
+            if (vsa.hasSignal()) {
+                double vsaW = mctx.s(vsa.strength * 0.65); // max weight 0.65 — advisory, not dominant
+
+                if (vsa.isBullish) {
+                    switch (vsa.signal) {
+                        case STOPPING_VOLUME_BULL ->
+                            // Strongest bullish VSA: massive selling absorbed → very high confidence
+                                cStructure.addLong(mctx.s(vsa.strength * 0.75), "VSA_STOP_VOL_B");
+                        case EFFORT_TO_FALL_FAILED ->
+                                cStructure.addLong(vsaW, "VSA_EFFORT_FAIL_D");
+                        case NO_SUPPLY ->
+                            // No supply = backdrop for long (mild boost, needs other confluence)
+                                cStructure.boostLong(mctx.s(vsa.strength * 0.40), "VSA_NO_SUPPLY");
+                        case DEMAND_ABSORPTION ->
+                            // Paradoxically bearish — narrow up bar + huge vol = supply overhead
+                                cStructure.boostShort(mctx.s(vsa.strength * 0.45), "VSA_ABSORB_D");
+                        default -> {}
+                    }
+                } else if (vsa.isBearish) {
+                    switch (vsa.signal) {
+                        case STOPPING_VOLUME_BEAR ->
+                                cStructure.addShort(mctx.s(vsa.strength * 0.75), "VSA_STOP_VOL_S");
+                        case EFFORT_TO_RISE_FAILED ->
+                                cStructure.addShort(vsaW, "VSA_EFFORT_FAIL_U");
+                        case NO_DEMAND ->
+                            // No demand = backdrop for short (mild boost)
+                                cStructure.boostShort(mctx.s(vsa.strength * 0.40), "VSA_NO_DEMAND");
+                        case SUPPLY_ABSORPTION ->
+                                cStructure.boostLong(mctx.s(vsa.strength * 0.45), "VSA_ABSORB_S");
+                        default -> {}
+                    }
+                } else if (vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.WEAK_BREAKOUT) {
+                    // Breakout on low volume = probable fakeout → penalise whichever side
+                    // the current price move is pushing. Don't generate fresh signal here.
+                    double breakPenalty = mctx.s(vsa.strength * 0.50);
+                    if (move5 > 0) cStructure.boostShort(breakPenalty, "VSA_WEAK_BRK_U");
+                    else           cStructure.boostLong(breakPenalty,  "VSA_WEAK_BRK_D");
+                }
+            }
+        }
+
         // ════════════════════════════════════════════════════════
         // КЛАСТЕР 2: MOMENTUM
         // ════════════════════════════════════════════════════════
@@ -1201,12 +1303,49 @@ public final class DecisionEngineMerged {
             fundingRate  = frData.fundingRate;
             fundingDelta = frData.fundingDelta;
             oiChange     = frData.oiChange1h;
+
+            // ── Baseline FR directional signals (existing) ──────────────────
             if (fundingRate < -0.0005) { cDerivatives.addLong(mctx.s(0.45), "FR_NEG"); hasFR = true; }
             if (fundingRate >  0.0010) { cDerivatives.addShort(mctx.s(0.40), "FR_POS"); hasFR = true; }
             if (fundingDelta < -0.0003) cDerivatives.boostLong(mctx.s(0.18), "FR_FALL");
             if (fundingDelta >  0.0003) cDerivatives.boostShort(mctx.s(0.18), "FR_RISE");
             if (oiChange > 3.0 && move5 > 0) cDerivatives.boostLong(mctx.s(0.25), "OI_UP");
             if (oiChange < -3.0 && move5 < 0) cDerivatives.boostShort(mctx.s(0.25), "OI_DN");
+
+            // [MODULE 1 v33] FR MOMENTUM — 2nd derivative signals.
+            // These fire EARLIER than baseline FR signals because they detect the
+            // rate-of-change turning BEFORE the extreme is reached.
+            //
+            // PEAK WARNING: FR is high AND acceleration is turning negative.
+            // Interpretation: longs are over-leveraged, funding squeeze is imminent.
+            // Smart money is already building shorts into this condition.
+            // → Strong SHORT bias, even if price is still rising.
+            if (frData.frPeakWarning) {
+                cDerivatives.addShort(mctx.s(0.55), "FR_PEAK_WARN"); // stronger than FR_POS
+                hasFR = true;
+            }
+
+            // TROUGH WARNING: FR is very negative AND acceleration is turning positive.
+            // Interpretation: shorts are paying max funding, squeeze is building.
+            // → Strong LONG bias, mean-reversion or squeeze bounce setup.
+            if (frData.frTroughWarning) {
+                cDerivatives.addLong(mctx.s(0.55), "FR_TROUGH_WARN"); // stronger than FR_NEG
+                hasFR = true;
+            }
+
+            // ACCELERATION DIVERGENCE: FR accelerating AGAINST price move.
+            // Example: price pumping UP but FR accelerating negatively (delta getting worse for longs)
+            // = institutional shorts increasing exposure INTO the pump = distribution.
+            boolean priceUp   = move5 > 0.003;
+            boolean priceDown = move5 < -0.003;
+            if (priceUp   && frData.frAcceleration < -0.0002) {
+                // Price up but FR momentum turning south → probable pump-and-dump
+                cDerivatives.boostShort(mctx.s(0.30), "FR_ACCEL_DIV_BEAR");
+            }
+            if (priceDown && frData.frAcceleration > 0.0002) {
+                // Price down but FR momentum turning bullish → probable capitulation bottom
+                cDerivatives.boostLong(mctx.s(0.30), "FR_ACCEL_DIV_BULL");
+            }
         }
 
         // RSI Divergences

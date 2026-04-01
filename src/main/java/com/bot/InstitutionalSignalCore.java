@@ -163,26 +163,34 @@ public final class InstitutionalSignalCore {
     //    · Mode surfaced via getReducedRiskMultiplier() to SignalSender.
     // ══════════════════════════════════════════════════════════════
 
-    private volatile int consecutiveSlCount = 0;
-    private static final int REDUCED_RISK_THRESHOLD      = 3; // 3 SLs in a row
-    private static final int DEEP_REDUCED_RISK_THRESHOLD = 5; // 5 SLs in a row
+    // [PATCH B5 v33] RACE CONDITION FIX — consecutiveSlCount.
+    // volatile int + ++ operator is NOT atomic: read-increment-write = 3 ops.
+    // Two parallel SL closures (different symbols closing simultaneously in TradeResolver)
+    // can both read the same value, both increment, and write the same +1 result.
+    // Net effect: one SL is silently lost from the counter → DrawdownManager under-counts.
+    // At REDUCED_RISK_THRESHOLD=3: missing 1 count means bot stays at full risk 1 SL too long.
+    // Fix: AtomicInteger.incrementAndGet() is a single CAS operation — always correct.
+    private final java.util.concurrent.atomic.AtomicInteger consecutiveSlCount
+            = new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final int REDUCED_RISK_THRESHOLD      = 3;
+    private static final int DEEP_REDUCED_RISK_THRESHOLD = 5;
 
     /** Called by BotMain.runTradeResolver() on every SL hit. */
     public void recordConsecutiveSL() {
-        consecutiveSlCount++;
-        if (consecutiveSlCount >= DEEP_REDUCED_RISK_THRESHOLD) {
-            log("🔴 DEEP_REDUCED_RISK: " + consecutiveSlCount + " consecutive SLs — size ×0.25");
-        } else if (consecutiveSlCount >= REDUCED_RISK_THRESHOLD) {
-            log("🟡 REDUCED_RISK: " + consecutiveSlCount + " consecutive SLs — size ×0.5");
+        int c = consecutiveSlCount.incrementAndGet();
+        if (c >= DEEP_REDUCED_RISK_THRESHOLD) {
+            log("🔴 DEEP_REDUCED_RISK: " + c + " consecutive SLs — size ×0.25");
+        } else if (c >= REDUCED_RISK_THRESHOLD) {
+            log("🟡 REDUCED_RISK: " + c + " consecutive SLs — size ×0.5");
         }
     }
 
     /** Called by BotMain.runTradeResolver() on any profitable exit (TP / Chandelier / Trail+). */
     public void resetConsecutiveSL() {
-        if (consecutiveSlCount >= REDUCED_RISK_THRESHOLD) {
-            log("✅ REDUCED_RISK reset after profitable exit (was " + consecutiveSlCount + " SLs)");
+        int prev = consecutiveSlCount.getAndSet(0);
+        if (prev >= REDUCED_RISK_THRESHOLD) {
+            log("✅ REDUCED_RISK reset after profitable exit (was " + prev + " SLs)");
         }
-        consecutiveSlCount = 0;
     }
 
     /**
@@ -191,15 +199,17 @@ public final class InstitutionalSignalCore {
      * Returns: 1.0 normal | 0.5 reduced | 0.25 deep_reduced.
      */
     public double getReducedRiskMultiplier() {
-        if (consecutiveSlCount >= DEEP_REDUCED_RISK_THRESHOLD) return 0.25;
-        if (consecutiveSlCount >= REDUCED_RISK_THRESHOLD)      return 0.50;
+        int c = consecutiveSlCount.get();
+        if (c >= DEEP_REDUCED_RISK_THRESHOLD) return 0.25;
+        if (c >= REDUCED_RISK_THRESHOLD)      return 0.50;
         return 1.0;
     }
 
     /** Returns the REDUCED_RISK flag string to embed in signal flags. Empty if normal. */
     public String getReducedRiskFlag() {
-        if (consecutiveSlCount >= DEEP_REDUCED_RISK_THRESHOLD) return "🔴DEEP_REDUCED_RISK";
-        if (consecutiveSlCount >= REDUCED_RISK_THRESHOLD)      return "🟡REDUCED_RISK";
+        int c = consecutiveSlCount.get();
+        if (c >= DEEP_REDUCED_RISK_THRESHOLD) return "🔴DEEP_REDUCED_RISK";
+        if (c >= REDUCED_RISK_THRESHOLD)      return "🟡REDUCED_RISK";
         return "";
     }
 
@@ -503,6 +513,25 @@ public final class InstitutionalSignalCore {
         markSymbolActive(signal.symbol);
     }
 
+    /**
+     * [PATCH B4 v33] UNREGISTER SIGNAL — undo a registerSignal() call.
+     * Used by the R:R gate in SignalSender when a trade passes allowSignal()
+     * but then fails the hard R:R >= 1.80 check (after adaptive TP calibration).
+     * Without this, the symbol stays "active" and heat is inflated permanently.
+     */
+    public synchronized void unregisterSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
+        List<ActiveSignal> list = activeSignals.get(signal.symbol);
+        if (list == null) return;
+        list.removeIf(s -> s.side == signal.side &&
+                Math.abs(s.entry - signal.price) < signal.price * 0.001);
+        if (list.isEmpty()) activeSignals.remove(signal.symbol);
+        // Release heat and bipolar lock so the symbol is immediately available again
+        double estRisk = estimateRisk(signal.probability, signal.category);
+        currentHeat = Math.max(0, currentHeat - estRisk);
+        activeSymbols.remove(signal.symbol);
+        log("[UNREGISTER] " + signal.symbol + " " + signal.side + " — R:R gate rollback");
+    }
+
     // ══════════════════════════════════════════════════════════════
     //  TRADE CLOSE
     // ══════════════════════════════════════════════════════════════
@@ -722,7 +751,7 @@ public final class InstitutionalSignalCore {
                 consecutiveLongLosses, consecutiveShortLosses,
                 getEffectiveMinConfidence(),
                 dailyPnLPct,
-                consecutiveSlCount,
+                consecutiveSlCount.get(),
                 rrFlag.isEmpty() ? "" : " " + rrFlag);
     }
 
