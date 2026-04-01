@@ -341,8 +341,8 @@ public final class GlobalImpulseController {
         btcMomentumAccel = move3 < 0
                 ? Math.max(0, Math.abs(move3) - Math.abs(prevMove3))
                 : move3 > 0
-                ? Math.max(0, Math.abs(move3) - Math.abs(prevMove3))
-                : 0;
+                  ? Math.max(0, Math.abs(move3) - Math.abs(prevMove3))
+                  : 0;
 
         // ── BTC move history ─────────────────────────────────────
         btcMoveHistory.addLast(move1);
@@ -540,7 +540,7 @@ public final class GlobalImpulseController {
         // Ускорение на 5m уровне
         double prevFastMove = n > 7
                 ? (btc5mCandles.get(n - 4).close - btc5mCandles.get(n - 7).close)
-                / (btc5mCandles.get(n - 7).close + 1e-9)
+                  / (btc5mCandles.get(n - 7).close + 1e-9)
                 : fastMove;
 
         // fastMomentum: отрицательное при падении
@@ -788,8 +788,8 @@ public final class GlobalImpulseController {
         GlobalRegime newRegime = newLevel == CascadeLevel.PANIC
                 ? GlobalRegime.BTC_PANIC
                 : newLevel == CascadeLevel.CRASH
-                ? GlobalRegime.BTC_CRASH
-                : old.regime;
+                  ? GlobalRegime.BTC_CRASH
+                  : old.regime;
 
         currentContext = new GlobalContext(
                 newRegime, old.impulseStrength, old.volatilityExpansion, old.strongPressure,
@@ -989,7 +989,7 @@ public final class GlobalImpulseController {
                                 boolean leading = sc != null && sc.bias > 0.4 && sc.leading;
                                 weight = relStrength > 0.80 ? (leading ? 0.90 : 0.75)
                                         : relStrength > 0.65 ? 0.65  // was 0.28
-                                        : 0.45;                        // was 0.10
+                                          : 0.45;                        // was 0.10
                             }
                         } else {
                             // SHORT при BTC_STRONG_DOWN — буст

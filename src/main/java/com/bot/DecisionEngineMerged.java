@@ -750,6 +750,13 @@ public final class DecisionEngineMerged {
         hist.addLast(new double[]{fr, System.currentTimeMillis()});
         while (hist.size() > FR_HISTORY_SIZE) hist.removeFirst();
 
+        // [BUG-FIX v33.1] frHistory TTL eviction — remove entries older than 2 hours.
+        // Without this, pairs that stop trading (delisted, low vol rotated out) permanently
+        // accumulate entries in frHistory. At FR_HISTORY_SIZE=12 per pair × N dead pairs
+        // over weeks of uptime → significant memory leak on Railway container.
+        long twoHoursAgo = System.currentTimeMillis() - 2 * 60 * 60_000L;
+        hist.removeIf(e -> e[1] < twoHoursAgo);
+
         fundingCache.put(sym, new FundingOIData(fr, oi, oi1h, oi4h, prevFr, delta, accel));
     }
 
@@ -886,6 +893,7 @@ public final class DecisionEngineMerged {
 
         double price     = last(c15).close;
         double atr14     = atr(c15, 14);
+        double move5     = c15.size() >= 5 ? (last(c15).close - c15.get(c15.size() - 5).close) / price : 0.0;
         double lastRange = last(c15).high - last(c15).low;
 
         if (lastRange > atr14 * 4.5 || atr14 <= 0) return null;
@@ -1068,23 +1076,42 @@ public final class DecisionEngineMerged {
         if (c15.size() >= 25) {
             com.bot.TradingCore.VsaResult vsa = com.bot.TradingCore.vsaAnalyse(c15, 3);
             if (vsa.hasSignal()) {
-                double vsaW = mctx.s(vsa.strength * 0.65); // max weight 0.65 — advisory, not dominant
+                double vsaW = mctx.s(vsa.strength * 0.65);
 
-                if (vsa.isBullish) {
+                // [BUG-FIX v33.1] DEMAND_ABSORPTION and SUPPLY_ABSORPTION are NOT
+                // isBullish or isBearish in TradingCore.VsaResult (they are paradoxical
+                // — a bullish-looking bar with a bearish implication and vice versa).
+                // The original code placed DEMAND_ABSORPTION inside the isBullish switch,
+                // making it UNREACHABLE because vsa.isBullish=false for that signal.
+                // Fix: handle paradoxical patterns explicitly FIRST, before directional checks.
+
+                if (vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.DEMAND_ABSORPTION) {
+                    // Narrow UP bar + ultra-high vol = smart money selling INTO retail bids.
+                    // Despite being an up-bar, this is a BEARISH distribution signal.
+                    cStructure.boostShort(mctx.s(vsa.strength * 0.45), "VSA_ABSORB_D");
+
+                } else if (vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.SUPPLY_ABSORPTION) {
+                    // Narrow DOWN bar + ultra-high vol = smart money buying INTO retail sells.
+                    // Despite being a down-bar, this is a BULLISH accumulation signal.
+                    cStructure.boostLong(mctx.s(vsa.strength * 0.45), "VSA_ABSORB_S");
+
+                } else if (vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.WEAK_BREAKOUT) {
+                    // Wide-range breakout on low volume = probable retail fakeout.
+                    double breakPenalty = mctx.s(vsa.strength * 0.50);
+                    if (move5 > 0) cStructure.boostShort(breakPenalty, "VSA_WEAK_BRK_U");
+                    else           cStructure.boostLong(breakPenalty,  "VSA_WEAK_BRK_D");
+
+                } else if (vsa.isBullish) {
                     switch (vsa.signal) {
                         case STOPPING_VOLUME_BULL ->
-                            // Strongest bullish VSA: massive selling absorbed → very high confidence
                                 cStructure.addLong(mctx.s(vsa.strength * 0.75), "VSA_STOP_VOL_B");
                         case EFFORT_TO_FALL_FAILED ->
                                 cStructure.addLong(vsaW, "VSA_EFFORT_FAIL_D");
                         case NO_SUPPLY ->
-                            // No supply = backdrop for long (mild boost, needs other confluence)
                                 cStructure.boostLong(mctx.s(vsa.strength * 0.40), "VSA_NO_SUPPLY");
-                        case DEMAND_ABSORPTION ->
-                            // Paradoxically bearish — narrow up bar + huge vol = supply overhead
-                                cStructure.boostShort(mctx.s(vsa.strength * 0.45), "VSA_ABSORB_D");
                         default -> {}
                     }
+
                 } else if (vsa.isBearish) {
                     switch (vsa.signal) {
                         case STOPPING_VOLUME_BEAR ->
@@ -1092,18 +1119,9 @@ public final class DecisionEngineMerged {
                         case EFFORT_TO_RISE_FAILED ->
                                 cStructure.addShort(vsaW, "VSA_EFFORT_FAIL_U");
                         case NO_DEMAND ->
-                            // No demand = backdrop for short (mild boost)
                                 cStructure.boostShort(mctx.s(vsa.strength * 0.40), "VSA_NO_DEMAND");
-                        case SUPPLY_ABSORPTION ->
-                                cStructure.boostLong(mctx.s(vsa.strength * 0.45), "VSA_ABSORB_S");
                         default -> {}
                     }
-                } else if (vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.WEAK_BREAKOUT) {
-                    // Breakout on low volume = probable fakeout → penalise whichever side
-                    // the current price move is pushing. Don't generate fresh signal here.
-                    double breakPenalty = mctx.s(vsa.strength * 0.50);
-                    if (move5 > 0) cStructure.boostShort(breakPenalty, "VSA_WEAK_BRK_U");
-                    else           cStructure.boostLong(breakPenalty,  "VSA_WEAK_BRK_D");
                 }
             }
         }
@@ -1146,7 +1164,6 @@ public final class DecisionEngineMerged {
 
         // Impulse (>0.55 ATR за 5 баров)
         boolean impulseFlag = impulse(c15);
-        double move5 = (last(c15).close - c15.get(c15.size() - 5).close) / price;
         if (impulseFlag) {
             if (move5 > 0) cMomentum.addLong(mctx.s(0.50), "IMP_UP");
             else           cMomentum.addShort(mctx.s(0.50), "IMP_DN");

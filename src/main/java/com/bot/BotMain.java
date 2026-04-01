@@ -44,12 +44,6 @@ public final class BotMain {
     // "silent" for hours/days under heavy signal load).
     private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 10);
 
-    // [v14.0 FIX #8] Тихие часы расширены: 01:00–05:00 UTC (было 03:00–05:00)
-    // Ликвидность падает уже с 01:00, спреды расширяются
-    private static final int QUIET_START_H = 1;
-    private static final int QUIET_END_H   = 5;
-    private static final boolean QUIET_HOURS_ENABLED = envInt("QUIET_HOURS_ENABLED", 1) == 1;
-
     // ── Секторальные лидеры для GIC ───────────────────────────────────────
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
         put("DOGEUSDT", "MEME");
@@ -65,7 +59,6 @@ public final class BotMain {
     // ── Счётчики ──────────────────────────────────────────────────────────
     private static final AtomicLong totalCycles   = new AtomicLong(0);
     private static final AtomicLong totalSignals  = new AtomicLong(0);
-    private static final AtomicLong skippedQuiet  = new AtomicLong(0);
     private static final AtomicLong errorCount    = new AtomicLong(0);
     private static long startTimeMs = 0;
 
@@ -95,6 +88,21 @@ public final class BotMain {
 
     // ── Daily summary ─────────────────────────────────────────────────────
     private static volatile int lastSummaryDay = -1;
+
+    // ── [MODULE 4 v33] ADVANCE FORECAST STATE ────────────────────────────
+    // Дедупликация: отправляем прогноз только если он ИЗМЕНИЛСЯ с прошлого цикла.
+    // Без этого каждые 5 минут одинаковый "РОСТ БИТКОИНА" будет спамить чат.
+    private static final java.util.concurrent.ConcurrentHashMap<String, String>
+            lastForecastSent = new java.util.concurrent.ConcurrentHashMap<>();
+    // Cooldown: один прогноз по одной паре не чаще раза в 20 минут
+    private static final java.util.concurrent.ConcurrentHashMap<String, Long>
+            forecastCooldown = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 20 * 60_000L;
+    // Порог значимости прогноза: слабые сигналы не отправляем
+    private static final double AFC_MIN_DIRECTION_SCORE = 0.28; // |score| >= 0.28 (умеренный)
+    private static final double AFC_STRONG_SCORE        = 0.55; // |score| >= 0.55 (сильный)
+    // Максимум прогнозов за один запуск (не спамим)
+    private static final int AFC_MAX_PER_RUN = 4;
 
     // ── Forecast accuracy tracker ─────────────────────────────────────────
     // [v14.0 FIX #5] MAX_FORECAST_RECORDS предотвращает утечку памяти
@@ -232,9 +240,14 @@ public final class BotMain {
         final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
         final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram, gic, isc);
 
-        // Callbacks — только в лог, не в Telegram
+        // [BUG-FIX v33.1] panicCallback was routed to LOG only — trader never saw BTC CRASH alerts.
+        // Now: GIC CRASH/PANIC events go to Telegram immediately (bypass normal queue, use offerFirst).
         isc.setTimeStopCallback((sym, msg) -> LOG.info("[ISC time-stop] " + sym + ": " + msg));
-        gic.setPanicCallback(msg -> LOG.warning("[GIC panic] " + msg));
+        gic.setPanicCallback(msg -> {
+            LOG.warning("[GIC panic] " + msg);
+            telegram.sendMessageAsync("🚨 *MARKET ALERT* 🚨\n" + msg
+                    + "\n_⚠️ Проверь открытые позиции_");
+        });
 
         // ── Schedulers ───────────────────────────────────────────
         ScheduledExecutorService mainSched = Executors.newScheduledThreadPool(2, r -> {
@@ -286,6 +299,15 @@ public final class BotMain {
         auxSched.scheduleAtFixedRate(
                 safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
                 16, 15, TimeUnit.MINUTES);
+
+        // ── [MODULE 4 v33] ADVANCE FORECAST ALERTS — каждые 5 минут ──
+        // Анализирует рыночную структуру и отправляет заблаговременные
+        // прогнозы о готовящихся пампах/дампах/разворотах — ДО сигнала входа.
+        // Это даёт трейдеру время подготовиться: поставить лимитник, убрать стоп,
+        // уменьшить позицию — до того как движение начнётся.
+        auxSched.scheduleAtFixedRate(
+                safe("AdvanceForecast", () -> runAdvanceForecast(sender, gic, isc, telegram)),
+                3, 5, TimeUnit.MINUTES);
 
         // ── Backtest каждые 2 часа в изолированном потоке ─────────
         auxSched.scheduleAtFixedRate(
@@ -385,17 +407,10 @@ public final class BotMain {
                 .thenComparingDouble(i -> i.forecast != null ? i.forecast.confidence : 0.0).reversed()
                 .thenComparingDouble(i -> i.forecast != null ? Math.abs(i.forecast.directionScore) : 0.0).reversed());
         int limit = Math.min(signals.size(), MAX_SIGNALS_PER_CYCLE);
-        int totalLongs = 0;
-        for (com.bot.DecisionEngineMerged.TradeIdea signal : signals) {
-            if (signal.side == com.bot.TradingCore.Side.LONG) totalLongs++;
-        }
-        int totalShorts = signals.size() - totalLongs;
         List<com.bot.DecisionEngineMerged.TradeIdea> dispatchSignals =
                 reorderSignalsForDispatch(new ArrayList<>(signals.subList(0, limit)));
 
         int sent = 0;
-        int sentLongs = 0;
-        int sentShorts = 0;
         for (com.bot.DecisionEngineMerged.TradeIdea s : dispatchSignals) {
 
             // [v17.0 §1] BIPOLAR GUARD — ISC.isSymbolAvailable() already runs inside
@@ -437,8 +452,6 @@ public final class BotMain {
                     + " forecast=" + forecastInfo
                     + " phase=" + phaseInfo);
             totalSignals.incrementAndGet();
-            if (s.side == com.bot.TradingCore.Side.LONG) sentLongs++;
-            else sentShorts++;
             sent++;
             trackSignal(s);
             // [v17.0 §1] Mark symbol as active right after dispatch — blocks bipolar pairs
@@ -1165,13 +1178,6 @@ public final class BotMain {
         }
     }
 
-    private static boolean isQuietHours() {
-        if (!QUIET_HOURS_ENABLED) return false;
-        ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
-        int h = utc.getHour();
-        return h >= QUIET_START_H && h < QUIET_END_H;
-    }
-
     private static void markForecastRecord(String key, String outcome) {
         forecastRecords.entrySet().stream()
                 .filter(e -> e.getKey().startsWith(key) && !e.getValue().resolved)
@@ -1188,20 +1194,249 @@ public final class BotMain {
                 });
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  [MODULE 4 v33] ADVANCE FORECAST ALERTS
+    //  Запускается каждые 5 минут. Сканирует топ-пары через ForecastEngine
+    //  и отправляет заблаговременные прогнозы в Telegram ДО формирования сигнала.
+    //
+    //  Логика отправки прогноза:
+    //  1. |directionScore| >= AFC_MIN_DIRECTION_SCORE (умеренный сигнал)
+    //  2. Прогноз изменился с предыдущего цикла (дедупликация по ключу)
+    //  3. Cooldown 20 минут на пару (не спамим)
+    //  4. GIC не в PANIC режиме (в панике прогнозы неактуальны)
+    //  5. Не более AFC_MAX_PER_RUN прогнозов за один запуск
+    //
+    //  Типы прогнозов:
+    //    🚀 ПАМП — сильный бычий импульс ожидается (score > AFC_STRONG_SCORE)
+    //    📉 ДАМП — сильный медвежий импульс ожидается
+    //    🔄 РАЗВОРОТ ВВЕРХ — смена тренда с нисходящего на восходящий
+    //    🔄 РАЗВОРОТ ВНИЗ — смена тренда с восходящего на нисходящий
+    //    📈 ТРЕНД ФОРМИРУЕТСЯ — ранняя фаза (EARLY) направленного движения
+    //    ⛽ ИСТОЩЕНИЕ — тренд заканчивается, ожидать разворота или консолидации
+    // ══════════════════════════════════════════════════════════════
+
+    private static void runAdvanceForecast(com.bot.SignalSender sender,
+                                           com.bot.GlobalImpulseController gic,
+                                           com.bot.InstitutionalSignalCore isc,
+                                           com.bot.TelegramBotSender telegram) {
+        // Не работаем в PANIC режиме — рынок непредсказуем
+        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
+        if (ctx.panicMode) {
+            LOG.fine("[AFC] SKIP — GIC in PANIC mode");
+            return;
+        }
+
+        // Берём топ-пары по объёму из SignalSender
+        List<String> topPairs = sender.getTopPairsForForecast(20);
+        if (topPairs == null || topPairs.isEmpty()) return;
+
+        int sent = 0;
+        long now = System.currentTimeMillis();
+
+        for (String pair : topPairs) {
+            if (sent >= AFC_MAX_PER_RUN) break;
+
+            // Cooldown проверка
+            Long lastSent = forecastCooldown.get(pair);
+            if (lastSent != null && now - lastSent < ADVANCE_FORECAST_COOLDOWN_MS) continue;
+
+            // Symbol must be available (not in active trade / SL cooldown)
+            if (!isc.isSymbolAvailable(pair)) continue;
+
+            try {
+                // Получаем 15m и 1h свечи для ForecastEngine
+                List<com.bot.TradingCore.Candle> c15 = sender.fetchKlines(pair, "15m", 100);
+                List<com.bot.TradingCore.Candle> c1h  = sender.fetchKlines(pair, "1h",  48);
+                if (c15 == null || c15.size() < 30) continue;
+
+                // Запускаем ForecastEngine
+                com.bot.TradingCore.ForecastEngine fe = new com.bot.TradingCore.ForecastEngine();
+                com.bot.TradingCore.ForecastEngine.ForecastResult fc =
+                        fe.forecast(null, c15, c1h != null ? c1h : List.of(), 0.0);
+                if (fc == null) continue;
+
+                double score = fc.directionScore;
+                if (Math.abs(score) < AFC_MIN_DIRECTION_SCORE) continue;
+
+                // VSA дополнительное подтверждение
+                com.bot.TradingCore.VsaResult vsa = com.bot.TradingCore.vsaAnalyse(c15, 3);
+
+                // Строим ключ прогноза для дедупликации
+                String forecastKey = buildForecastKey(fc, vsa, score);
+                String prevKey = lastForecastSent.get(pair);
+                if (forecastKey.equals(prevKey)) continue; // прогноз не изменился
+
+                // Формируем сообщение
+                String msg = buildAdvanceForecastMessage(pair, fc, vsa, score, ctx);
+                if (msg == null) continue;
+
+                telegram.sendMessageAsync(msg);
+                lastForecastSent.put(pair, forecastKey);
+                forecastCooldown.put(pair, now);
+                sent++;
+                LOG.info("[AFC] Sent advance forecast: " + pair
+                        + " score=" + String.format("%.2f", score)
+                        + " phase=" + fc.trendPhase
+                        + " bias=" + fc.bias);
+
+            } catch (Exception e) {
+                LOG.fine("[AFC] Error for " + pair + ": " + e.getMessage());
+            }
+        }
+    }
+
+    /** Строит дедупликационный ключ из ключевых параметров прогноза */
+    private static String buildForecastKey(
+            com.bot.TradingCore.ForecastEngine.ForecastResult fc,
+            com.bot.TradingCore.VsaResult vsa,
+            double score) {
+        // Округляем score до шага 0.10 — небольшие флуктуации не меняют суть прогноза
+        int scoreStep = (int)(score * 10);
+        String vsaTag  = vsa.hasSignal() ? vsa.signal.name() : "NONE";
+        return fc.bias.name() + "_" + fc.trendPhase.name() + "_" + scoreStep + "_" + vsaTag;
+    }
+
+    /** Строит полное Telegram-сообщение advance forecast */
+    private static String buildAdvanceForecastMessage(
+            String pair,
+            com.bot.TradingCore.ForecastEngine.ForecastResult fc,
+            com.bot.TradingCore.VsaResult vsa,
+            double score,
+            com.bot.GlobalImpulseController.GlobalContext ctx) {
+
+        boolean bullish = score > 0;
+        boolean strong  = Math.abs(score) >= AFC_STRONG_SCORE;
+
+        // ── Определяем тип события ──────────────────────────────────
+        String eventType;
+        String eventEmoji;
+
+        boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
+        boolean isEarly      = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
+        boolean vsaReversal  = vsa.hasSignal() && (
+                vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.STOPPING_VOLUME_BULL ||
+                        vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.STOPPING_VOLUME_BEAR ||
+                        vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.EFFORT_TO_FALL_FAILED ||
+                        vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.EFFORT_TO_RISE_FAILED);
+
+        if (isExhaustion && vsaReversal) {
+            eventType  = bullish ? "🔄 РАЗВОРОТ ВНИЗ" : "🔄 РАЗВОРОТ ВВЕРХ";
+            eventEmoji = "🔄";
+        } else if (isExhaustion) {
+            eventType  = "⛽ ИСТОЩЕНИЕ ТРЕНДА";
+            eventEmoji = "⛽";
+        } else if (isEarly && strong) {
+            eventType  = bullish ? "🚀 ПАМП ФОРМИРУЕТСЯ" : "📉 ДАМП ФОРМИРУЕТСЯ";
+            eventEmoji = bullish ? "🚀" : "📉";
+        } else if (isEarly) {
+            eventType  = bullish ? "📈 ТРЕНД ВВЕРХ — РАННЯЯ ФАЗА" : "📉 ТРЕНД ВНИЗ — РАННЯЯ ФАЗА";
+            eventEmoji = bullish ? "📈" : "📉";
+        } else if (strong) {
+            eventType  = bullish ? "🚀 СИЛЬНЫЙ ПАМП" : "💥 СИЛЬНЫЙ ДАМП";
+            eventEmoji = bullish ? "🚀" : "💥";
+        } else {
+            eventType  = bullish ? "📈 ДВИЖЕНИЕ ВВЕРХ" : "📉 ДВИЖЕНИЕ ВНИЗ";
+            eventEmoji = bullish ? "📈" : "📉";
+        }
+
+        // ── Блок VSA-подтверждения ───────────────────────────────────
+        String vsaLine = "";
+        if (vsa.hasSignal()) {
+            String vsaDesc = switch (vsa.signal) {
+                case STOPPING_VOLUME_BULL  -> "✅ STOPPING VOL — покупки поглотили продажи";
+                case STOPPING_VOLUME_BEAR  -> "✅ STOPPING VOL — продажи поглотили покупки";
+                case EFFORT_TO_FALL_FAILED -> "✅ ПРОДАЖИ ПРОВАЛИЛИСЬ — закрытие у максимума";
+                case EFFORT_TO_RISE_FAILED -> "✅ ПОКУПКИ ПРОВАЛИЛИСЬ — закрытие у минимума";
+                case NO_SUPPLY             -> "🟢 НЕТ ПРОДАЖ — рынок готов к росту";
+                case NO_DEMAND             -> "🔴 НЕТ ПОКУПОК — рынок готов к падению";
+                case DEMAND_ABSORPTION     -> "⚠️ ПОГЛОЩЕНИЕ СПРОСА — дистрибуция институционалов";
+                case SUPPLY_ABSORPTION     -> "⚠️ ПОГЛОЩЕНИЕ ПРЕДЛОЖЕНИЯ — аккумуляция институционалов";
+                case WEAK_BREAKOUT         -> "⚠️ СЛАБЫЙ ПРОБОЙ — низкий объём, вероятна ловушка";
+                default                    -> "";
+            };
+            if (!vsaDesc.isEmpty())
+                vsaLine = "\n📊 VSA: " + vsaDesc;
+        }
+
+        // ── Фаза тренда ─────────────────────────────────────────────
+        String phaseDesc = switch (fc.trendPhase) {
+            case EARLY      -> "🌱 РАННЯЯ — движение только начинается";
+            case MID        -> "📈 СЕРЕДИНА — тренд в полной силе";
+            case LATE       -> "⏳ ПОЗДНЯЯ — осталось немного";
+            case EXHAUSTION -> "⛽ ИСТОЩЕНИЕ — тренд заканчивается";
+        };
+
+        // ── BTC контекст ─────────────────────────────────────────────
+        String btcLine = "";
+        if (ctx != null && ctx.impulseStrength > 0.3) {
+            String btcEmoji = ctx.impulseStrength > 0.7 ? "🟢" : "🟡";
+            btcLine = String.format("\n%s BTC: %s | сила %.0f%%",
+                    btcEmoji, ctx.regime, ctx.impulseStrength * 100);
+        }
+
+        // ── Прогнозируемое движение ──────────────────────────────────
+        String moveLine = "";
+        if (fc.projectedMovePct != 0) {
+            moveLine = String.format("\n📐 Ожидаемое движение: %+.2f%%", fc.projectedMovePct * 100);
+        }
+
+        // ── Уровень магнита (VPOC) ───────────────────────────────────
+        String magnetLine = "";
+        if (fc.magnetLevel > 0) {
+            magnetLine = String.format("\n🧲 Магнит объёма: `%.6f`", fc.magnetLevel);
+        }
+
+        // ── Уверенность бота ─────────────────────────────────────────
+        String confBar = buildConfBar(Math.abs(score));
+
+        String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
+                .toLocalTime().withNano(0).toString();
+
+        return String.format(
+                "🔔 *ADVANCE FORECAST* | %s\n"
+                        + "━━━━━━━━━━━━━━━━━━━━━\n"
+                        + "%s *%s*\n"
+                        + "\n"
+                        + "⚡ Сила сигнала: %s\n"
+                        + "🔮 Фаза: %s\n"
+                        + "%s%s%s%s\n"
+                        + "━━━━━━━━━━━━━━━━━━━━━\n"
+                        + "💡 _Это прогноз, не сигнал входа._\n"
+                        + "_Жди подтверждения от бота._\n"
+                        + "_⏰ %s_",
+                pair,
+                eventEmoji, eventType,
+                confBar,
+                phaseDesc,
+                vsaLine, btcLine, moveLine, magnetLine,
+                time);
+    }
+
+    /** Строит визуальную шкалу уверенности [0..1] → █████░░░░░ */
+    private static String buildConfBar(double score) {
+        int filled = (int) Math.round(score * 10);
+        filled = Math.max(0, Math.min(10, filled));
+        String bar = "█".repeat(filled) + "░".repeat(10 - filled);
+        String label = score >= 0.70 ? "ВЫСОКАЯ" : score >= 0.45 ? "СРЕДНЯЯ" : "УМЕРЕННАЯ";
+        return String.format("[%s] %s (%.0f%%)", bar, label, score * 100);
+    }
+
     private static String buildStartMessage() {
         return String.format(
-                "🚀 *GodBot PRO — Запущен*\n"
-                        + "📊 Фьючерсы 15M | TOP-100 пар | 9-факторный анализ\n"
+                "🚀 *GodBot PRO v33 — Запущен*\n"
+                        + "📊 Фьючерсы 15M | TOP-30 пар ($30M+) | 10-факторный анализ\n"
                         + "───────────────────────────────\n"
-                        + "🔮 ForecastEngine — прогноз направления движения\n"
-                        + "📈 TrendPhase — определение фазы тренда (EARLY/MID/LATE/EXHAUST)\n"
+                        + "🔮 ForecastEngine — прогноз направления (EARLY/MID/LATE/EXHAUST)\n"
+                        + "📐 VSA — Volume Spread Analysis (институциональный след)\n"
+                        + "💸 FR Momentum — ускорение ставки финансирования (пик/трог)\n"
+                        + "⚡ OFV — Order Flow Velocity (скорость изменения стакана)\n"
                         + "🛡 Структурные стопы — за swing high/low рынка\n"
-                        + "🎯 TP1 → TP2 → TP3 с трейлингом\n"
-                        + "⚡ WebSocket LiveFeed — сигналы без 14-минутной слепоты\n"
-                        + "🏦 ISC — контроль риска портфеля в реальном времени\n"
-                        + "🌐 GIC — глобальный контекст BTC + секторальные лидеры\n"
+                        + "🎯 TP1 → TP2 → TP3 с Chandelier trailing\n"
+                        + "🏦 ISC — контроль риска портфеля + DrawdownManager\n"
+                        + "🌐 GIC — BTC контекст + Cascade/Panic алерты в Telegram\n"
+                        + "🔔 Advance Forecast — заблаговременные прогнозы памп/дамп\n"
                         + "───────────────────────────────\n"
-                        + "⏰ Тихие часы: UTC 01:00–05:00 (низкая ликвидность)\n"
+                        + "✅ Min R:R 1:2 | ✅ Anti-spoof OBI | ✅ CVD Persist\n"
                         + "📅 Daily отчёт каждый день в 09:00 UTC\n"
                         + "───────────────────────────────\n"
                         + "🕐 %s (Warsaw)",

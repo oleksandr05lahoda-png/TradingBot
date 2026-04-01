@@ -425,17 +425,12 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
 
-        // [PATCH A1 v33] TOP_N default corrected: 100→30.
-        // At TOP_N=100 with BINANCE_WEIGHT_KLINES=5 per pair: 100×5=500 weight per cycle.
-        // Plus depth, funding, OI calls: realistic budget consumption ~800-1100 weight/min.
-        // At RL_SAFE_WEIGHT=1800 this leaves barely 700 for WebSocket overhead and retries.
-        // At 30 pairs: ~150-200 weight for klines + rich per-pair analysis = safe budget.
-        // Volume filter ($30M ALT / $10M MEME) naturally caps real candidates to 35-45 anyway.
-        // Set TOP_N=60 or higher via Railway env var only if Binance weight logs show headroom.
-        this.TOP_N            = envInt("TOP_N", 30);
-        // [PATCH A1 v33] MIN_CONF floor raised 50→62.
-        // At 50.0 any signal above noise floor passes — zero discrimination.
-        // 62.0 aligns with BASE_CONF in DecisionEngineMerged (was inconsistent).
+        // TOP_N=100 — сканируем все 100 ликвидных пар.
+        // Реальный пропуск через volume filter ($30M ALT / $10M MEME) ограничивает
+        // кандидатов до ~35-50 активных пар. CallerRunsPolicy на fetchPool гарантирует
+        // что перегрузка Binance API вызовет backpressure, не OOM.
+        this.TOP_N            = envInt("TOP_N", 100);
+        // MIN_CONF 62.0 — выровнен с BASE_CONF в DecisionEngineMerged
         this.MIN_CONF         = envDouble("MIN_CONF", 62.0);
         this.KLINES_LIMIT     = envInt("KLINES", 220);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
@@ -443,9 +438,9 @@ public final class SignalSender {
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
         this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1;
-        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 40);
-        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 30);
-        this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 30);
+        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 100);
+        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 100);
+        this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 40);
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();
@@ -461,12 +456,14 @@ public final class SignalSender {
 
         // [PATCH B2 v33] OOM FIX — fetchPool.
         // Unbounded LinkedBlockingQueue → OOM under TOP_N=100 load.
-        // CallerRunsPolicy: if queue full, submitter thread executes task inline
-        // → natural backpressure, zero silent drops. Pool capped at 24 (Railway 2vCPU).
-        int poolSize = Math.max(8, Math.min((TOP_N + 2) / 3, 24));
+        // CallerRunsPolicy: if queue full, submitter thread runs the task itself
+        // → natural backpressure, zero silent drops.
+        // At TOP_N=100: poolSize = min((100+2)/3, 34) = 34 threads.
+        // Queue=400 accommodates 4× burst without blocking the main scheduler.
+        int poolSize = Math.max(8, Math.min((TOP_N + 2) / 3, 34));
         this.fetchPool = new ThreadPoolExecutor(
                 poolSize, poolSize, 0L, TimeUnit.MILLISECONDS,
-                new java.util.concurrent.ArrayBlockingQueue<>(200),
+                new java.util.concurrent.ArrayBlockingQueue<>(400),
                 r -> {
                     Thread t = new Thread(r, "fetch-" + r.hashCode());
                     t.setDaemon(true);
@@ -2528,6 +2525,21 @@ public final class SignalSender {
     }
 
     public double getAccountBalance() { return accountBalance; }
+
+    /**
+     * [MODULE 4 v33] Returns top N pairs by 24h USD volume for Advance Forecast scanning.
+     * Filtered by minimum volume ($30M+) and sorted descending by volume.
+     * Used by BotMain.runAdvanceForecast() to know which pairs to analyse.
+     */
+    public List<String> getTopPairsForForecast(int n) {
+        if (volume24hUSD.isEmpty()) return List.of();
+        return volume24hUSD.entrySet().stream()
+                .filter(e -> e.getValue() >= MIN_VOL_ALT_USD)
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .limit(n)
+                .map(Map.Entry::getKey)
+                .collect(java.util.stream.Collectors.toList());
+    }
     public int  getActiveWsCount()   { return wsMap.size(); }
     public boolean isUdsConnected()  { return udsWebSocket != null; }
     public double getCycleQualityPenalty() { return cycleQualityPenalty; }
