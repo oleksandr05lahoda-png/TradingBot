@@ -176,18 +176,25 @@ public final class SignalOptimizer {
     private MicroTrendResult computeFromTicks(String symbol, Deque<Double> dq) {
         List<Double> buffer = new ArrayList<>(MAX_TICKS);
 
-        synchronized (dq) {
-            Iterator<Double> it = dq.descendingIterator();
-            while (it.hasNext() && buffer.size() < MAX_TICKS) {
-                buffer.add(it.next());
+        // [v34.0 FIX] RACE CONDITION: synchronized(ConcurrentLinkedDeque) is an anti-pattern.
+        // ConcurrentLinkedDeque is lock-free — external sync doesn't prevent concurrent adds.
+        // Fix: use toArray() for atomic snapshot, then iterate the copy.
+        try {
+            Object[] snapshot = dq.toArray();
+            int start = Math.max(0, snapshot.length - MAX_TICKS);
+            for (int i = start; i < snapshot.length; i++) {
+                buffer.add((Double) snapshot[i]);
             }
+        } catch (Exception e) {
+            // Defensive: if deque is modified during toArray, use fallback
+            return ZERO;
         }
 
         if (buffer.size() < MIN_TICKS) {
             return ZERO;
         }
 
-        Collections.reverse(buffer);
+        // [v34.0] No reverse needed — toArray() returns forward chronological order
         MicroTrendResult result = computeFromPrices(symbol, buffer, true);
         microTrendCache.put(symbol, result);
         return result;
@@ -473,16 +480,20 @@ public final class SignalOptimizer {
         Deque<Double> dq = tickPriceDeque.get(symbol);
         if (dq == null || dq.size() < 25) return false;
 
+        // [v34.0 FIX] Race condition: use toArray() snapshot instead of synchronized
         List<Double> recent = new ArrayList<>();
-        synchronized (dq) {
-            Iterator<Double> it = dq.descendingIterator();
-            while (it.hasNext() && recent.size() < 40) {
-                recent.add(it.next());
+        try {
+            Object[] snapshot = dq.toArray();
+            int start = Math.max(0, snapshot.length - 40);
+            for (int i = start; i < snapshot.length; i++) {
+                recent.add((Double) snapshot[i]);
             }
+        } catch (Exception e) {
+            return false;
         }
 
         if (recent.size() < 25) return false;
-        Collections.reverse(recent);
+        // [v34.0] Already in forward chronological order from toArray()
 
         double first = recent.get(recent.size() - 20);
         double last  = recent.get(recent.size() - 1);

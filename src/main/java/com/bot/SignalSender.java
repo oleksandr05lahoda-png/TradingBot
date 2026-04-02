@@ -11,8 +11,14 @@ import java.util.concurrent.atomic.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  SignalSender — GODBOT PRO EDITION v7.0                                 ║
+ * ║  SignalSender — GODBOT PRO EDITION v34.0                                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  [v34.0] Dynamic CoinCategory: volume-based TOP, keyword MEME          ║
+ * ║  [v34.0] Extended detectSector: AI, RWA, DePin, Commodities, Metals    ║
+ * ║  [v34.0] Category-aware EARLY_TICK velocity thresholds                  ║
+ * ║  [v34.0] Category-aware event coin filter (TOP=5%, ALT=8%, MEME=12%)   ║
+ * ║  [v34.0] Asset type display in Telegram signals + tradability hints     ║
+ * ║  [v34.0] PumpHunter integration with category-aware thresholds          ║
  * ║  [FIX-BLIND]  14-минутная слепота устранена — LiveCandleAssembler      ║
  * ║  [FIX-WS]     WebSocket автозапускается для топ-30 пар по объёму       ║
  * ║  [FIX-UDS]    User Data Stream — реальное закрытие ордеров с биржи     ║
@@ -149,6 +155,27 @@ public final class SignalSender {
     /** Accumulates the best (highest probability) EARLY_TICK candidate per pair per flush window. */
     private final Map<String, com.bot.DecisionEngineMerged.TradeIdea> earlyTickBuffer
             = new ConcurrentHashMap<>();
+
+    // [v34.0] EARLY_TICK hourly rate limit per pair.
+    // Problem: volatile ALT fires 8 EARLY_TICK signals in 30 min — all same move.
+    // Manual trader can't act on more than 2-3 signals per hour on same pair.
+    // Fix: max 3 EARLY_TICK per pair per rolling 60 minutes.
+    private static final int    MAX_EARLY_TICK_PER_HOUR = 3;
+    private static final long   EARLY_TICK_WINDOW_MS    = 60 * 60_000L;
+    private final Map<String, Deque<Long>> earlyTickTimestamps = new ConcurrentHashMap<>();
+
+    private boolean earlyTickHourlyLimitReached(String pair) {
+        Deque<Long> ts = earlyTickTimestamps.get(pair);
+        if (ts == null) return false;
+        long cutoff = System.currentTimeMillis() - EARLY_TICK_WINDOW_MS;
+        while (!ts.isEmpty() && ts.peekFirst() < cutoff) ts.pollFirst();
+        return ts.size() >= MAX_EARLY_TICK_PER_HOUR;
+    }
+
+    private void recordEarlyTickSent(String pair) {
+        earlyTickTimestamps.computeIfAbsent(pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>())
+                .addLast(System.currentTimeMillis());
+    }
 
     private final ScheduledExecutorService wsWatcher = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ws-watcher"); t.setDaemon(true); return t;
@@ -372,21 +399,47 @@ public final class SignalSender {
 
     private static final Set<String> STABLE = Set.of("USDT","USDC","BUSD","TUSD","USDP","DAI");
 
-    private static String detectSector(String pair) {
+    // [v34.0] DYNAMIC SECTOR DETECTION — extended with AI, RWA, DePin sectors
+    // and auto-detection for commodity/metal tokens
+    private String detectSector(String pair) {
         String s = pair.endsWith("USDT") ? pair.substring(0, pair.length() - 4) : pair;
+
+        // [v34.0] Auto-detect non-crypto assets first
+        com.bot.DecisionEngineMerged.AssetType assetType =
+                com.bot.DecisionEngineMerged.detectAssetType(pair);
+        if (assetType != com.bot.DecisionEngineMerged.AssetType.CRYPTO
+                && assetType != com.bot.DecisionEngineMerged.AssetType.UNKNOWN) {
+            return switch (assetType) {
+                case PRECIOUS_METAL_GOLD, PRECIOUS_METAL_SILVER,
+                     PRECIOUS_METAL_PLATINUM, PRECIOUS_METAL_OTHER -> "METALS";
+                case COMMODITY_OIL, COMMODITY_GAS, COMMODITY_OTHER  -> "COMMODITY";
+                case FOREX                                           -> "FOREX";
+                case INDEX                                           -> "INDEX";
+                default -> null;
+            };
+        }
+
         return switch (s) {
             case "DOGE","SHIB","PEPE","FLOKI","WIF","BONK","MEME",
-                 "NEIRO","POPCAT","COW","MOG","BRETT","TURBO" -> "MEME";
-            case "BTC","ETH","BNB","OKB"                      -> "TOP";
+                 "NEIRO","POPCAT","COW","MOG","BRETT","TURBO",
+                 "PEOPLE","MYRO","BOME","MEW","TRUMP" -> "MEME";
+            case "BTC","ETH","BNB","OKB"               -> "TOP";
             case "SOL","AVAX","NEAR","APT","SUI","ADA","DOT",
-                 "ATOM","FTM","ONE","HBAR","VET","THETA"      -> "L1";
-            case "MATIC","ARB","OP","IMX","LRC","ZK","METIS"  -> "L2";
+                 "ATOM","FTM","ONE","HBAR","VET","THETA",
+                 "SEI","TIA","TON","TRX","INJ","ICP","STX" -> "L1";
+            case "MATIC","ARB","OP","IMX","LRC","ZK","METIS",
+                 "MANTA","BLAST","STRK","SCROLL"       -> "L2";
             case "UNI","AAVE","CRV","GMX","SNX","COMP","MKR",
-                 "SUSHI","YFI","1INCH","DYDX","RUNE","JUP"    -> "DEFI";
-            case "LINK","BAND","API3","GRT","FIL","AR","STORJ" -> "INFRA";
-            case "XRP","XLM","LTC","BCH","DASH","XMR"         -> "PAYMENT";
-            case "AXS","SAND","MANA","ENJ","GALA","GMT"       -> "GAMING";
-            case "FET","AGIX","OCEAN","RNDR","WLD","TAO"      -> "AI";
+                 "SUSHI","YFI","1INCH","DYDX","RUNE","JUP",
+                 "PENDLE","ENA","ETHFI"                 -> "DEFI";
+            case "LINK","BAND","API3","GRT","FIL","AR","STORJ",
+                 "PYTH","TRB","W"                       -> "INFRA";
+            case "XRP","XLM","LTC","BCH","DASH","XMR","ALGO" -> "PAYMENT";
+            case "AXS","SAND","MANA","ENJ","GALA","GMT",
+                 "PIXELS","PORTAL","RONIN"              -> "GAMING";
+            case "FET","AGIX","OCEAN","RNDR","WLD","TAO",
+                 "ARKM","AIOZ","IO","AEVO"              -> "AI";
+            case "ONDO","RWA","POLY","CPOOL"            -> "RWA";
             default -> null;
         };
     }
@@ -724,27 +777,35 @@ public final class SignalSender {
 
             if (m15 == null || m15.size() < 160 || h1 == null || h1.size() < 160) return null;
 
+            // [v34.0] Categorize early — needed for event filter and all downstream logic
+            com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
+            String sector = detectSector(pair);
+
             // ═══════════════════════════════════════════════════════
-            // [v13.0] EVENT COIN FILTER
-            // If coin's daily move > 8% OR today's volume > 4× average
-            // → this is an EVENT (delisting, hack, whale dump), not a pattern.
-            // All indicators break on event coins. Skip entirely.
-            // Example: FRAX dropped 20% → volume spiked → bot picked it up
-            // → gave SHORT after 80% of the move was done → loss.
+            // [v13.0+v34.0] EVENT COIN FILTER — category-aware
+            // TOP coins: 5% daily move = massive event (BTC rarely does 8%)
+            // ALT: 8% = event
+            // MEME: 12% = event (they routinely move 5-8%)
             // ═══════════════════════════════════════════════════════
             {
                 int n15 = m15.size();
-                // Daily price change: compare current price to price ~96 bars ago (24h on 15m)
                 int dayBarsAgo = Math.min(96, n15 - 1);
                 double dayOpen = m15.get(n15 - 1 - dayBarsAgo).close;
                 double dayCurrent = m15.get(n15 - 1).close;
                 double dailyChangePct = Math.abs(dayCurrent - dayOpen) / (dayOpen + 1e-9);
 
-                if (dailyChangePct > 0.08) { // > 8% daily move = event coin
-                    return null; // skip entirely, no log, no signal
+                // [v34.0] Category-aware event threshold
+                double eventThreshold = switch (cat) {
+                    case TOP  -> 0.05;   // 5% for BTC/ETH = massive event
+                    case ALT  -> 0.08;   // 8% for ALT = event
+                    case MEME -> 0.12;   // 12% for MEME = event (they're volatile by nature)
+                };
+                if (dailyChangePct > eventThreshold) {
+                    return null;
                 }
 
                 // Volume anomaly: compare last 4 bars avg volume to 96-bar avg
+                // [v34.0] Category-aware: TOP 4x spike = event, MEME needs 8x
                 if (n15 > 100) {
                     double recentVol = 0;
                     for (int vi = n15 - 4; vi < n15; vi++) recentVol += m15.get(vi).volume;
@@ -754,14 +815,16 @@ public final class SignalSender {
                     for (int vi = n15 - 100; vi < n15 - 4; vi++) histVol += m15.get(vi).volume;
                     histVol /= 96;
 
-                    if (histVol > 0 && recentVol > histVol * 5.0) { // 5× volume spike = event
+                    double volEventMult = switch (cat) {
+                        case TOP  -> 4.0;  // BTC 4x volume = serious event
+                        case ALT  -> 5.0;  // ALT 5x = event
+                        case MEME -> 8.0;  // MEME 8x = event (they spike routinely)
+                    };
+                    if (histVol > 0 && recentVol > histVol * volEventMult) {
                         return null;
                     }
                 }
             }
-
-            com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
-            String sector = detectSector(pair);
 
             if (!checkLiquidity(pair, cat)) { blockedLiq.incrementAndGet(); return null; }
             cyclePairsSeen.incrementAndGet();
@@ -834,7 +897,8 @@ public final class SignalSender {
             }
 
             // [v18.0 REFACTOR] PumpHunter: flag only, no arbitrary confidence scaling
-            com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15);
+            // [v34.0] Pass category for category-aware thresholds
+            com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15, cat);
             if (pump != null && pump.strength > 0.40) {
                 boolean aligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
                         (idea.side == com.bot.TradingCore.Side.SHORT && pump.isBearish());
@@ -2035,7 +2099,8 @@ public final class SignalSender {
         }
     }
 
-    // [v29+v30] EARLY TICK — rewritten with exhaustion guard + VDA + correct conf floor
+    // [v29+v30+v34] EARLY TICK — rewritten with exhaustion guard + VDA + correct conf floor
+    // [v34.0] Category-aware velocity threshold: TOP coins (BTC/ETH) move slower in %
     private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(String symbol, double price, long ts) {
         Deque<Double> dq = tickPriceDeque.get(symbol);
         Deque<Double> vq = tickVolumeDeque.get(symbol);
@@ -2047,7 +2112,18 @@ public final class SignalSender {
         double move = buf.get(n - 1) - buf.get(n - 22);
         double avg  = buf.stream().mapToDouble(Double::doubleValue).average().orElse(price);
         double vel  = Math.abs(move) / (avg + 1e-9);
-        if (vel < 0.0018) return null;
+
+        // [v34.0] Category-aware velocity threshold
+        // TOP coins (BTC/ETH) have ~3-5x lower % moves than ALTs
+        // Old: flat 0.0018 → BTC almost never triggered
+        // New: TOP=0.0008, ALT=0.0015, MEME=0.0020
+        com.bot.DecisionEngineMerged.CoinCategory etCat = categorizePair(symbol);
+        double velThreshold = switch (etCat) {
+            case TOP  -> 0.0008;  // BTC 0.08% move = significant
+            case ALT  -> 0.0015;  // ALT 0.15% = meaningful
+            case MEME -> 0.0020;  // MEME needs stronger signal (noisy)
+        };
+        if (vel < velThreshold) return null;
         boolean up = move > 0;
 
         double atrV = getAtr(symbol);
@@ -2064,19 +2140,23 @@ public final class SignalSender {
         if (moveFromBase > exhaustThresh * 2.5) return null;
 
         // Acceleration check
+        // [v34.0] TOP coins have smoother moves — lower acceleration threshold
+        double accelThreshold = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.15 : 1.35;
         double m1 = buf.get(n / 2 - 1) - buf.get(0);
         double m2 = buf.get(n - 1) - buf.get(n / 2);
-        if (!(Math.abs(m2) > Math.abs(m1) * 1.35)) return null;
+        if (!(Math.abs(m2) > Math.abs(m1) * accelThreshold)) return null;
 
         // VDA: must not actively disagree
         double vda = vdaScoreMap.getOrDefault(symbol, 0.0);
         if (Math.abs(vda) > 0.30 && ((up && vda < 0) || (!up && vda > 0))) return null;
 
         // Volume spike
+        // [v34.0] TOP coins: lower volume spike threshold (institutional flow is steadier)
+        double volSpikeThresh = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.15 : 1.35;
         int vw = Math.min(30, volBuf.size());
         double avgVol = volBuf.subList(0, vw - 5).stream().mapToDouble(Double::doubleValue).average().orElse(0.001);
         double recVol = volBuf.subList(vw - 5, vw).stream().mapToDouble(Double::doubleValue).average().orElse(0);
-        if (recVol < avgVol * 1.35) return null;
+        if (recVol < avgVol * volSpikeThresh) return null;
 
         // Tick streak
         int streak = 0;
@@ -2085,9 +2165,19 @@ public final class SignalSender {
         }
         if (streak < 2) return null;
 
-        // Confidence: starts at 62 (ISC floor), +velocity, +VDA
-        double conf = 62.0
-                + Math.min(8.0,  vel * 3500)
+        // Confidence: starts at 66 (raised from 62 for manual trading quality)
+        // [v34.0] EARLY_TICK confidence floor raised: 62 → 66.
+        // At 62%, signal is barely above noise. Manual trader needs 3-5 seconds to
+        // read Telegram, open exchange, place order. By then, micro-impulse is over.
+        // At 66%+ the move has enough structure to survive the 5s execution delay.
+        // [v34.0] Velocity multiplier scaled by category (TOP moves are smaller but significant)
+        double velMultiplier = switch (etCat) {
+            case TOP  -> 6000;  // BTC 0.1% vel → +6 conf
+            case ALT  -> 3500;  // ALT 0.2% vel → +7 conf
+            case MEME -> 2500;  // MEME 0.3% vel → +7.5 conf
+        };
+        double conf = 66.0
+                + Math.min(8.0,  vel * velMultiplier)
                 + Math.min(5.0,  Math.abs(vda) * 15)
                 + (((up && vda > 0.15) || (!up && vda < -0.15)) ? 3.0 : 0.0);
         conf = Math.min(84.0, conf);
@@ -2151,6 +2241,14 @@ public final class SignalSender {
             // Re-check ISC (state may have changed since buffering)
             if (!isc.isSymbolAvailable(et.symbol)) continue;
 
+            // [v34.0] EARLY_TICK hourly rate limit — max 3 per pair per hour
+            if (earlyTickHourlyLimitReached(et.symbol)) continue;
+
+            // [v34.0 FIX] Categorize BEFORE using cat — was causing "Cannot resolve symbol 'cat'"
+            com.bot.DecisionEngineMerged.CoinCategory cat =
+                    et.category != null ? et.category : categorizePair(et.symbol);
+            String sector = detectSector(et.symbol);
+
             // Apply REDUCED_RISK flag to signal if in drawdown mode
             com.bot.DecisionEngineMerged.TradeIdea finalEt = et;
             if (!rrFlag.isEmpty()) {
@@ -2168,11 +2266,22 @@ public final class SignalSender {
                 finalEt = rebuildIdea(et, et.probability, nf);
             }
 
-            bot.sendMessageAsync("🎯 *EARLY TICK*\n" + finalEt.toTelegramString());
+            // [v34.0] Show asset type + category instead of generic "EARLY TICK"
+            com.bot.DecisionEngineMerged.AssetType assetType =
+                    com.bot.DecisionEngineMerged.detectAssetType(finalEt.symbol);
+            String earlyLabel = assetType.emoji + " " + assetType.label;
+            String catLabel = cat == com.bot.DecisionEngineMerged.CoinCategory.MEME ? "🐸 MEME"
+                    : cat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? "👑 TOP" : "🔷 ALT";
+            String headerLine = "🎯 *EARLY TICK* | " + earlyLabel + " " + catLabel;
+            // [v34.0] Non-crypto tradability warning
+            if (assetType != com.bot.DecisionEngineMerged.AssetType.CRYPTO
+                    && assetType != com.bot.DecisionEngineMerged.AssetType.UNKNOWN) {
+                headerLine += "\n⚠️ _Не крипта — проверь на бирже_";
+            }
+            bot.sendMessageAsync(headerLine + "\n" + finalEt.toTelegramString());
             earlySignals.incrementAndGet();
-            String sector = detectSector(finalEt.symbol);
-            com.bot.DecisionEngineMerged.CoinCategory cat =
-                    finalEt.category != null ? finalEt.category : categorizePair(finalEt.symbol);
+            // [v34.0] Record for hourly rate limit
+            recordEarlyTickSent(finalEt.symbol);
             registerApprovedSignal(finalEt, finalEt.symbol, cat, sector,
                     System.currentTimeMillis(), true);
         }
@@ -2334,13 +2443,64 @@ public final class SignalSender {
         } catch (Exception e) { return new HashSet<>(Arrays.asList("BTCUSDT","ETHUSDT","BNBUSDT")); }
     }
 
-    private static com.bot.DecisionEngineMerged.CoinCategory categorizePair(String pair) {
+    // ══════════════════════════════════════════════════════════════
+    // [v34.0] DYNAMIC COIN CATEGORIZATION
+    // Old: hardcoded switch → missed new TOP coins, couldn't adapt.
+    // New: volume-based dynamic classification + known-list seed.
+    //
+    // Logic:
+    //   1. Known TOP coins (BTC, ETH, BNB, SOL...) → always TOP
+    //   2. Known MEME coins (DOGE, SHIB, PEPE...) → always MEME
+    //   3. Unknown coins: classified by 24h volume bracket
+    //      - >$200M/24h → TOP (institutional-grade liquidity)
+    //      - <$200M && name matches meme patterns → MEME
+    //      - default → ALT
+    //
+    // This is a HYBRID approach: known coins use stable labels,
+    // new coins get auto-classified by market behavior.
+    // ══════════════════════════════════════════════════════════════
+
+    // [v34.0] Known seeds — these NEVER change category regardless of volume
+    private static final java.util.Set<String> KNOWN_TOP = java.util.Set.of(
+            "BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOT","LINK",
+            "MATIC","LTC","ATOM","UNI","AAVE","TON","TRX","NEAR","APT",
+            "SUI","DYDX","ARB","OP","FIL","ICP","HBAR","VET","ALGO",
+            "FTM","INJ","SEI","TIA","JUP","RENDER","STX","MKR","RUNE"
+    );
+    private static final java.util.Set<String> KNOWN_MEME = java.util.Set.of(
+            "DOGE","SHIB","PEPE","FLOKI","WIF","BONK","MEME","NEIRO",
+            "POPCAT","COW","MOG","BRETT","TURBO","BABYDOGE","PEOPLE",
+            "ELON","SATS","ORDI","RATS","MYRO","BOME","SLERF","MEW",
+            "TRUMP","WEN","DEGEN"
+    );
+    // [v34.0] Meme pattern keywords — auto-detect new meme coins
+    private static final java.util.Set<String> MEME_KEYWORDS = java.util.Set.of(
+            "DOG","CAT","INU","MOON","PEPE","DOGE","SHIB","FROG",
+            "BABY","ELON","MEME","WOJAK","CHAD","TURBO","FLOKI",
+            "APE","HAMSTER","PIG","COW","PENGUIN","PANDA","PORK"
+    );
+
+    private com.bot.DecisionEngineMerged.CoinCategory categorizePair(String pair) {
         String sym = pair.endsWith("USDT") ? pair.substring(0, pair.length()-4) : pair;
-        return switch (sym) {
-            case "DOGE","SHIB","PEPE","FLOKI","WIF","BONK","MEME","NEIRO","POPCAT","COW","MOG","BRETT","TURBO" -> com.bot.DecisionEngineMerged.CoinCategory.MEME;
-            case "BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOT","LINK","MATIC","LTC","ATOM","UNI","AAVE" -> com.bot.DecisionEngineMerged.CoinCategory.TOP;
-            default -> com.bot.DecisionEngineMerged.CoinCategory.ALT;
-        };
+        String upper = sym.toUpperCase();
+
+        // 1. Known lists (stable, fast)
+        if (KNOWN_TOP.contains(upper))  return com.bot.DecisionEngineMerged.CoinCategory.TOP;
+        if (KNOWN_MEME.contains(upper)) return com.bot.DecisionEngineMerged.CoinCategory.MEME;
+
+        // 2. Volume-based dynamic classification
+        double vol24h = volume24hUSD.getOrDefault(pair, 0.0);
+
+        // >$200M/24h → institutional liquidity → TOP behavior
+        if (vol24h >= 200_000_000) return com.bot.DecisionEngineMerged.CoinCategory.TOP;
+
+        // 3. Meme keyword detection (auto-catches new meme coins)
+        for (String keyword : MEME_KEYWORDS) {
+            if (upper.contains(keyword)) return com.bot.DecisionEngineMerged.CoinCategory.MEME;
+        }
+
+        // 4. Default: ALT
+        return com.bot.DecisionEngineMerged.CoinCategory.ALT;
     }
 
     private com.bot.DecisionEngineMerged.TradeIdea rebuildIdea(com.bot.DecisionEngineMerged.TradeIdea src, double p, List<String> f) {

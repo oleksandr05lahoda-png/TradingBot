@@ -124,10 +124,36 @@ public final class PumpHunter {
 
     // ======================= MAIN DETECTION =======================
 
+    // [v34.0] Category-aware overload — TOP coins use relaxed thresholds
+    public PumpEvent detectPump(String symbol,
+                                List<com.bot.TradingCore.Candle> c1m,
+                                List<com.bot.TradingCore.Candle> c5m,
+                                List<com.bot.TradingCore.Candle> c15m,
+                                com.bot.DecisionEngineMerged.CoinCategory cat) {
+        // Apply category-specific threshold multipliers
+        // TOP coins (BTC/ETH): heavy assets move slower → relax thresholds by 40%
+        // ALT: standard thresholds
+        // MEME: already noisy → tighten by 10%
+        double catMult = switch (cat) {
+            case TOP  -> 0.60;  // 40% easier to trigger (BTC 1.2% → 0.72% min move)
+            case ALT  -> 1.00;
+            case MEME -> 1.10;  // 10% harder (reduce noise)
+        };
+        return detectPumpInternal(symbol, c1m, c5m, c15m, catMult);
+    }
+
     public PumpEvent detectPump(String symbol,
                                 List<com.bot.TradingCore.Candle> c1m,
                                 List<com.bot.TradingCore.Candle> c5m,
                                 List<com.bot.TradingCore.Candle> c15m) {
+        return detectPumpInternal(symbol, c1m, c5m, c15m, 1.0);
+    }
+
+    private PumpEvent detectPumpInternal(String symbol,
+                                         List<com.bot.TradingCore.Candle> c1m,
+                                         List<com.bot.TradingCore.Candle> c5m,
+                                         List<com.bot.TradingCore.Candle> c15m,
+                                         double catMult) {
 
         if (c1m == null || c1m.size() < 30 ||
                 c5m == null || c5m.size() < 20 ||
@@ -146,6 +172,15 @@ public final class PumpHunter {
         PumpMetrics m5 = analyzeCandle(c5m, ATR_PERIOD);
         PumpMetrics m15 = analyzeCandle(c15m, ATR_PERIOD);
 
+        // [v34.0] Apply category multiplier to move thresholds
+        double effMinMove    = MIN_MOVE_PCT    * catMult;
+        double effStrongMove = STRONG_MOVE_PCT * catMult;
+        double effMegaMove   = MEGA_MOVE_PCT   * catMult;
+        double effBodyAtr    = PUMP_BODY_ATR_MULT * catMult;
+        double effMegaBody   = MEGA_PUMP_BODY_ATR_MULT * catMult;
+        double effVolSpike   = VOLUME_SPIKE_MULT * catMult;
+        double effMegaVol    = MEGA_VOLUME_SPIKE_MULT * catMult;
+
         PumpType type = PumpType.NONE;
         double strength = 0;
         double movePct = 0;
@@ -153,9 +188,9 @@ public final class PumpHunter {
         double bodyToAtr = 0;
 
         // 15M Analysis
-        if (m15.bodyToAtr >= MEGA_PUMP_BODY_ATR_MULT &&
-                m15.volumeRatio >= MEGA_VOLUME_SPIKE_MULT &&
-                Math.abs(m15.movePct) >= MEGA_MOVE_PCT) {
+        if (m15.bodyToAtr >= effMegaBody &&
+                m15.volumeRatio >= effMegaVol &&
+                Math.abs(m15.movePct) >= effMegaMove) {
 
             type = m15.isGreen ? PumpType.MEGA_PUMP_UP : PumpType.MEGA_PUMP_DOWN;
             strength = calculateStrength(m15, true);
@@ -164,9 +199,9 @@ public final class PumpHunter {
             bodyToAtr = m15.bodyToAtr;
             flags.add("15M_MEGA");
 
-        } else if (m15.bodyToAtr >= PUMP_BODY_ATR_MULT &&
-                m15.volumeRatio >= VOLUME_SPIKE_MULT &&
-                Math.abs(m15.movePct) >= STRONG_MOVE_PCT) {
+        } else if (m15.bodyToAtr >= effBodyAtr &&
+                m15.volumeRatio >= effVolSpike &&
+                Math.abs(m15.movePct) >= effStrongMove) {
 
             type = m15.isGreen ? PumpType.PUMP_UP : PumpType.PUMP_DOWN;
             strength = calculateStrength(m15, false);
@@ -176,11 +211,11 @@ public final class PumpHunter {
             flags.add("15M_PUMP");
         }
         // 5M Analysis
-        else if (m5.bodyToAtr >= PUMP_BODY_ATR_MULT * 0.9 &&
-                m5.volumeRatio >= VOLUME_SPIKE_MULT &&
-                Math.abs(m5.movePct) >= MIN_MOVE_PCT) {
+        else if (m5.bodyToAtr >= effBodyAtr * 0.9 &&
+                m5.volumeRatio >= effVolSpike &&
+                Math.abs(m5.movePct) >= effMinMove) {
 
-            if (m5.bodyToAtr >= MEGA_PUMP_BODY_ATR_MULT && m5.volumeRatio >= MEGA_VOLUME_SPIKE_MULT) {
+            if (m5.bodyToAtr >= effMegaBody && m5.volumeRatio >= effMegaVol) {
                 type = m5.isGreen ? PumpType.MEGA_PUMP_UP : PumpType.MEGA_PUMP_DOWN;
                 strength = calculateStrength(m5, true) * 0.95;
                 flags.add("5M_MEGA");

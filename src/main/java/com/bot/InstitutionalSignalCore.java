@@ -111,11 +111,44 @@ public final class InstitutionalSignalCore {
     /** Post-exit cooldowns. Symbol → earliest time a new signal is allowed (epoch ms). */
     private final Map<String, Long> symbolCooldownUntil = new ConcurrentHashMap<>();
 
+    // [v34.0] DAILY SIGNAL LIMIT PER SYMBOL — prevents "milking" one volatile coin all day.
+    // Problem: BULLAUSDT fires 12 signals in 6 hours — all correlated, same pattern = one big bet.
+    // Fix: max 4 signals per symbol per rolling 8h window. Forces diversification.
+    private static final int    MAX_SIGNALS_PER_SYMBOL_8H = 4;
+    private static final long   SIGNAL_WINDOW_8H_MS       = 8 * 60 * 60_000L;
+    private final Map<String, Deque<Long>> symbolSignalTimestamps = new ConcurrentHashMap<>();
+
+    /** Check if symbol has exceeded its daily signal quota */
+    private boolean symbolDailyLimitReached(String symbol) {
+        Deque<Long> timestamps = symbolSignalTimestamps.get(symbol);
+        if (timestamps == null) return false;
+        long cutoff = System.currentTimeMillis() - SIGNAL_WINDOW_8H_MS;
+        // Prune old timestamps
+        while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
+            timestamps.pollFirst();
+        }
+        return timestamps.size() >= MAX_SIGNALS_PER_SYMBOL_8H;
+    }
+
+    /** Record a signal timestamp for daily quota tracking */
+    private void recordSymbolSignal(String symbol) {
+        Deque<Long> timestamps = symbolSignalTimestamps.computeIfAbsent(symbol,
+                k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        timestamps.addLast(System.currentTimeMillis());
+        // Prune to prevent memory leak
+        long cutoff = System.currentTimeMillis() - SIGNAL_WINDOW_8H_MS;
+        while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
+            timestamps.pollFirst();
+        }
+    }
+
     /** SL cooldown: 2 × 15m candles = 30 minutes (prevents "falling knife" re-entry). */
     private static final long SL_COOLDOWN_MS  = 30 * 60_000L;
 
-    /** TP cooldown: short pause after winning trade, allows market to reset. */
-    private static final long TP_COOLDOWN_MS  = 5  * 60_000L;
+    /** [v34.0 FIX] TP cooldown: 15min (was 5min — caused same-coin spam loop).
+     *  After TP, coin is still volatile. 5min = bot re-enters same move.
+     *  15min = 1 full 15m candle resets structure. */
+    private static final long TP_COOLDOWN_MS  = 15 * 60_000L;
 
     /** Register symbol as having an open trade. Called from registerSignal(). */
     public void markSymbolActive(String symbol) {
@@ -435,6 +468,14 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
+        // [v34.0] DAILY SIGNAL LIMIT — max 4 signals per symbol per 8h window.
+        // Prevents "milking" one volatile coin all day with correlated entries.
+        if (symbolDailyLimitReached(signal.symbol)) {
+            log("🚫 DAILY LIMIT: " + signal.symbol + " exceeded "
+                    + MAX_SIGNALS_PER_SYMBOL_8H + " signals in 8h window");
+            return false;
+        }
+
         // 1. Daily Loss Mode — update cautiousMode flag (affects position size in SignalSender)
         if (dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT) {
             cautiousMode = true;
@@ -511,6 +552,8 @@ public final class InstitutionalSignalCore {
         currentHeat += estRisk;
         // [v17.0 §1] Mark symbol as occupied — blocks bipolar signals until trade closes
         markSymbolActive(signal.symbol);
+        // [v34.0] Record for daily signal quota tracking
+        recordSymbolSignal(signal.symbol);
     }
 
     /**

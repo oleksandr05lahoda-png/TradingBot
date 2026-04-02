@@ -9,8 +9,15 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v17.0 — SIGNAL QUALITY & RISK ARCHITECTURE EDITION         ║
+ * ║       BotMain v34.0 — ASSET CLASSIFICATION & TOP COIN FIX EDITION       ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  [v34.0] §1 AssetType auto-detection (crypto/oil/gas/metals/forex)     ║
+ * ║  [v34.0] §2 Dynamic CoinCategory (volume-based TOP, keyword MEME)      ║
+ * ║  [v34.0] §3 TOP coin EARLY_TICK fix (BTC/ETH velocity thresholds)      ║
+ * ║  [v34.0] §4 PumpHunter category-aware thresholds (60% for TOP)         ║
+ * ║  [v34.0] §5 Telegram format: asset type + category in first line       ║
+ * ║  [v34.0] §6 Advance Forecast shows asset type                          ║
+ * ║  [v34.0] §7 Extended sector detection (AI, RWA, DePin + commodities)   ║
  * ║  [v17.0] §1 Bipolar Guard: isSymbolAvailable() in runCycle dispatch     ║
  * ║  [v17.0] §1 Final thread-safe bipolar check before telegram.send()      ║
  * ║  [v17.0] §4 DrawdownManager: SL/TP explicit reason in closeTrade()      ║
@@ -437,7 +444,19 @@ public final class BotMain {
                 continue;
             }
 
-            telegram.sendMessageAsync(s.toTelegramString());
+            // [v34.0] Add asset type header to signal dispatch
+            com.bot.DecisionEngineMerged.AssetType dispatchAssetType =
+                    com.bot.DecisionEngineMerged.detectAssetType(s.symbol);
+            String dispatchCatStr = s.category == com.bot.DecisionEngineMerged.CoinCategory.MEME ? "🐸 MEME"
+                    : s.category == com.bot.DecisionEngineMerged.CoinCategory.TOP ? "👑 TOP" : "🔷 ALT";
+            String signalHeader = dispatchAssetType.emoji + " " + dispatchAssetType.label
+                    + " | " + dispatchCatStr;
+            // Non-crypto warning
+            if (dispatchAssetType != com.bot.DecisionEngineMerged.AssetType.CRYPTO
+                    && dispatchAssetType != com.bot.DecisionEngineMerged.AssetType.UNKNOWN) {
+                signalHeader += "\n⚠️ _Не крипта — проверь доступность на бирже_";
+            }
+            telegram.sendMessageAsync(signalHeader + "\n" + s.toTelegramString());
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
             String forecastInfo = "N/A";
@@ -706,9 +725,19 @@ public final class BotMain {
                     : extremeHigh >= ts.sl;
 
             if (slHit) {
+                // [v34.0] REALISTIC SLIPPAGE ESTIMATION
+                // Problem (Gemini critique): on low-liquidity alts, wick touch ≠ fill at ts.sl.
+                // Real slippage: TOP=0.05%, ALT=0.15%, MEME=0.40%
+                // This makes ISC stats more realistic → better risk management decisions.
+                com.bot.DecisionEngineMerged.CoinCategory slCat = sender.getCoinCategory(ts.symbol);
+                double slippagePct = switch (slCat) {
+                    case TOP  -> 0.05;
+                    case ALT  -> 0.15;
+                    case MEME -> 0.40;
+                };
                 double pnl = isLong
-                        ? (ts.sl - ts.entry) / ts.entry * 100
-                        : (ts.entry - ts.sl) / ts.entry * 100;
+                        ? (ts.sl - ts.entry) / ts.entry * 100 - slippagePct
+                        : (ts.entry - ts.sl) / ts.entry * 100 - slippagePct;
                 it.remove();
                 isc.registerConfirmedResult(false, ts.side);
                 // [v17.0 §4] Explicit "SL" reason → ISC.closeTrade triggers recordConsecutiveSL()
@@ -1392,8 +1421,14 @@ public final class BotMain {
         String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
                 .toLocalTime().withNano(0).toString();
 
+        // [v34.0] Asset type auto-detection for advance forecast
+        com.bot.DecisionEngineMerged.AssetType assetType =
+                com.bot.DecisionEngineMerged.detectAssetType(pair);
+        String assetLabel = assetType.emoji + " " + assetType.label;
+
         return String.format(
                 "🔔 *ADVANCE FORECAST* | %s\n"
+                        + "🏷 %s\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "%s *%s*\n"
                         + "\n"
@@ -1405,6 +1440,7 @@ public final class BotMain {
                         + "_Жди подтверждения от бота._\n"
                         + "_⏰ %s_",
                 pair,
+                assetLabel,
                 eventEmoji, eventType,
                 confBar,
                 phaseDesc,
@@ -1423,18 +1459,21 @@ public final class BotMain {
 
     private static String buildStartMessage() {
         return String.format(
-                "🚀 *GodBot PRO v33 — Запущен*\n"
-                        + "📊 Фьючерсы 15M | TOP-30 пар ($30M+) | 10-факторный анализ\n"
+                "🚀 *GodBot PRO v34.0 — Asset Classification Edition*\n"
+                        + "📊 Фьючерсы 15M | TOP+ALT+MEME | Динамическая классификация\n"
+                        + "───────────────────────────────\n"
+                        + "🪙 Авто-определение типа актива (крипта/нефть/газ/металлы)\n"
+                        + "👑 TOP: BTC/ETH/SOL + динамика по объёму ($200M+)\n"
+                        + "🔷 ALT: адаптивная категоризация по ликвидности\n"
+                        + "🐸 MEME: авто-определение по ключевым словам\n"
                         + "───────────────────────────────\n"
                         + "🔮 ForecastEngine — прогноз направления (EARLY/MID/LATE/EXHAUST)\n"
                         + "📐 VSA — Volume Spread Analysis (институциональный след)\n"
-                        + "💸 FR Momentum — ускорение ставки финансирования (пик/трог)\n"
                         + "⚡ OFV — Order Flow Velocity (скорость изменения стакана)\n"
                         + "🛡 Структурные стопы — за swing high/low рынка\n"
                         + "🎯 TP1 → TP2 → TP3 с Chandelier trailing\n"
                         + "🏦 ISC — контроль риска портфеля + DrawdownManager\n"
-                        + "🌐 GIC — BTC контекст + Cascade/Panic алерты в Telegram\n"
-                        + "🔔 Advance Forecast — заблаговременные прогнозы памп/дамп\n"
+                        + "🌐 GIC — BTC контекст + Cascade/Panic алерты\n"
                         + "───────────────────────────────\n"
                         + "✅ Min R:R 1:2 | ✅ Anti-spoof OBI | ✅ CVD Persist\n"
                         + "📅 Daily отчёт каждый день в 09:00 UTC\n"

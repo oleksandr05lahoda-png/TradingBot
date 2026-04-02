@@ -11,20 +11,122 @@ public final class DecisionEngineMerged {
     public enum MarketState  { STRONG_TREND, WEAK_TREND, RANGE }
     public enum HTFBias      { BULL, BEAR, NONE }
 
+    // ══════════════════════════════════════════════════════════════
+    // [v34.0] ASSET TYPE — auto-classification for Telegram display
+    // Trader instantly sees whether the signal is tradeable on Binance,
+    // or it's a commodity/metal proxy that needs separate platform.
+    // ══════════════════════════════════════════════════════════════
+    public enum AssetType {
+        CRYPTO("🪙", "CRYPTO"),
+        PRECIOUS_METAL_GOLD("🌕", "ЗОЛОТО (XAU)"),
+        PRECIOUS_METAL_SILVER("🥈", "СЕРЕБРО (XAG)"),
+        PRECIOUS_METAL_PLATINUM("⚪", "ПЛАТИНА (XPT)"),
+        PRECIOUS_METAL_OTHER("💎", "ДРАГ.МЕТАЛЛ"),
+        COMMODITY_OIL("🛢", "НЕФТЬ"),
+        COMMODITY_GAS("🔥", "ГАЗ"),
+        COMMODITY_OTHER("📦", "СЫРЬЁ"),
+        FOREX("💱", "ФОРЕКС"),
+        INDEX("📊", "ИНДЕКС"),
+        UNKNOWN("❓", "UNKNOWN");
+
+        public final String emoji;
+        public final String label;
+        AssetType(String emoji, String label) {
+            this.emoji = emoji;
+            this.label = label;
+        }
+    }
+
+    // ── Keywords for auto-detection (case-insensitive) ──────────
+    // These are checked against the BASE symbol (without USDT suffix).
+    // Any new asset that appears in top-100 and contains these keywords
+    // will be automatically classified — NO manual updates needed.
+    private static final java.util.Map<String, AssetType> ASSET_KEYWORD_MAP;
+    static {
+        java.util.Map<String, AssetType> m = new java.util.LinkedHashMap<>();
+        // ── Precious Metals ──
+        m.put("XAU",     AssetType.PRECIOUS_METAL_GOLD);
+        m.put("GOLD",    AssetType.PRECIOUS_METAL_GOLD);
+        m.put("PAXG",    AssetType.PRECIOUS_METAL_GOLD);    // PAX Gold token
+        m.put("XAUT",    AssetType.PRECIOUS_METAL_GOLD);    // Tether Gold
+        m.put("KAG",     AssetType.PRECIOUS_METAL_SILVER);
+        m.put("XAG",     AssetType.PRECIOUS_METAL_SILVER);
+        m.put("SILVER",  AssetType.PRECIOUS_METAL_SILVER);
+        m.put("XPT",     AssetType.PRECIOUS_METAL_PLATINUM);
+        m.put("PLAT",    AssetType.PRECIOUS_METAL_PLATINUM);
+        m.put("BRONZE",  AssetType.PRECIOUS_METAL_OTHER);
+        m.put("COPPER",  AssetType.PRECIOUS_METAL_OTHER);
+        m.put("XCU",     AssetType.PRECIOUS_METAL_OTHER);
+        m.put("PALLADIUM", AssetType.PRECIOUS_METAL_OTHER);
+        m.put("XPD",     AssetType.PRECIOUS_METAL_OTHER);
+        // ── Oil ──
+        m.put("OIL",     AssetType.COMMODITY_OIL);
+        m.put("BRENT",   AssetType.COMMODITY_OIL);
+        m.put("WTI",     AssetType.COMMODITY_OIL);
+        m.put("CRUDE",   AssetType.COMMODITY_OIL);
+        m.put("PETRO",   AssetType.COMMODITY_OIL);
+        // ── Gas ──
+        m.put("GAS",     AssetType.COMMODITY_GAS);
+        m.put("NATGAS",  AssetType.COMMODITY_GAS);
+        m.put("NGAS",    AssetType.COMMODITY_GAS);
+        m.put("LNG",     AssetType.COMMODITY_GAS);
+        // ── Other commodities ──
+        m.put("WHEAT",   AssetType.COMMODITY_OTHER);
+        m.put("CORN",    AssetType.COMMODITY_OTHER);
+        m.put("SOYBEAN", AssetType.COMMODITY_OTHER);
+        m.put("COFFEE",  AssetType.COMMODITY_OTHER);
+        m.put("SUGAR",   AssetType.COMMODITY_OTHER);
+        m.put("COTTON",  AssetType.COMMODITY_OTHER);
+        // ── Forex proxies ──
+        m.put("EUR",     AssetType.FOREX);
+        m.put("GBP",     AssetType.FOREX);
+        m.put("JPY",     AssetType.FOREX);
+        // ── Index proxies ──
+        m.put("SPX",     AssetType.INDEX);
+        m.put("NDX",     AssetType.INDEX);
+        m.put("DJI",     AssetType.INDEX);
+        ASSET_KEYWORD_MAP = Collections.unmodifiableMap(m);
+    }
+
+    /**
+     * [v34.0] Auto-detect asset type from symbol name.
+     * Checks keyword map first (contains/startsWith), then defaults to CRYPTO.
+     * No manual updates needed — new commodity/metal tokens are detected automatically
+     * as they appear on Binance Futures.
+     */
+    public static AssetType detectAssetType(String symbol) {
+        if (symbol == null || symbol.isEmpty()) return AssetType.UNKNOWN;
+        String base = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4)
+                : symbol.endsWith("BUSD") ? symbol.substring(0, symbol.length() - 4)
+                  : symbol.endsWith("USDC") ? symbol.substring(0, symbol.length() - 4)
+                    : symbol;
+        String upper = base.toUpperCase();
+
+        // Exact match first (most reliable)
+        AssetType exact = ASSET_KEYWORD_MAP.get(upper);
+        if (exact != null) return exact;
+
+        // Contains match (catches e.g. "OILUSDT", "GOLDUSDT", "XAUUSDT")
+        for (java.util.Map.Entry<String, AssetType> e : ASSET_KEYWORD_MAP.entrySet()) {
+            if (upper.contains(e.getKey())) return e.getValue();
+        }
+
+        // Default: everything on Binance Futures that ends in USDT = crypto
+        return AssetType.CRYPTO;
+    }
+
     // ── Константы ─────────────────────────────────────────────────
     private static final int    MIN_BARS        = 150;
-    // [v28.0 FIX] Cooldowns unchanged
-    // [v30] Cooldowns reduced: TOP 8→3m, ALT 6→2m, MEME 4→2m.
-    // Old 8-minute TOP cooldown blocked re-entry after a valid reversal signal.
-    // On 15m timeframe: 8 min = half a candle. Opportunities missed.
-    // New 3m: short enough to catch the next structural signal, long enough to prevent flip-flops.
-    // [FIX v32+] Cooldowns restored to meaningful values.
-    // 1-minute cooldown was causing 5 signals on same pair in 8 minutes (CRVUSDT ×5).
-    // At 1m cooldown on 15m TF = 1/15 of a candle. Structurally meaningless.
-    // 5m TOP / 4m ALT ensures at minimum 1/3 of a 15m candle between re-entries.
-    private static final long   COOLDOWN_TOP    = 5  * 60_000L;  // was 1m — restored to meaningful level
-    private static final long   COOLDOWN_ALT    = 4  * 60_000L;  // was 1m
-    private static final long   COOLDOWN_MEME   = 6  * 60_000L;  // was 2m
+    // [v34.0 FIX] Cooldowns increased to meaningful levels.
+    // On 15m TF, minimum 1 full candle between signals on same pair.
+    // This is the ROOT CAUSE of "same coin spam" — short cooldowns
+    // let the bot re-enter the same move 3-5 times.
+    // TOP=10m (2/3 of 15m candle — BTC structure changes slowly)
+    // ALT=8m (half candle — ALT moves faster)
+    // MEME=12m (almost full candle — MEME noise needs more time to settle)
+    private static final long   COOLDOWN_TOP    = 10 * 60_000L;  // was 5m
+    private static final long   COOLDOWN_ALT    = 8  * 60_000L;  // was 4m
+    private static final long   COOLDOWN_MEME   = 12 * 60_000L;  // was 6m
     // [FIX v32+] BASE_CONF restored to 62.0. At 52.0 any signal above noise floor passes.
     // With probability floor=50 and range≤36, 52-floor gives zero discrimination.
     // 62.0 is the minimum where signal/noise ratio becomes meaningful.
@@ -649,6 +751,19 @@ public final class DecisionEngineMerged {
             String catStr  = category == CoinCategory.MEME ? "🐸 MEME"
                     : category == CoinCategory.TOP  ? "👑 TOP" : "🔷 ALT";
 
+            // [v34.0] Auto-detect asset type for first-line identification
+            AssetType assetType = detectAssetType(symbol);
+            String assetLine = assetType.emoji + " " + assetType.label;
+            // For crypto: show category (TOP/ALT/MEME). For non-crypto: asset type is enough.
+            String typeAndCat = assetType == AssetType.CRYPTO
+                    ? catStr + " | " + assetLine
+                    : assetLine + " | " + catStr;
+            // [v34.0] Tradability hint — non-crypto may not be on Binance
+            String tradabilityHint = "";
+            if (assetType != AssetType.CRYPTO && assetType != AssetType.UNKNOWN) {
+                tradabilityHint = "\n⚠️ _Не крипта — проверь доступность на бирже_";
+            }
+
             double riskPct = Math.abs(price - stop) / price * 100;
             double rp1Pct  = Math.abs(tp1 - price) / price * 100;
             double rp2Pct  = Math.abs(tp2 - price) / price * 100;
@@ -681,11 +796,6 @@ public final class DecisionEngineMerged {
                 extra.append(String.format(" | R/R: 1:%.1f", rr));
 
             // ── ForecastEngine — контекстный ярлык, БЕЗ отдельного числа уверенности ────
-            // [v26.0] REMOVED: forecast.confidence * 100 и projectedMovePct как отдельные цифры.
-            // ПРИЧИНА: Трейдер видел "Вер-ть: 78%" и тут же "Прогноз: 45% уверенность" —
-            // два разных числа создавали ложное ощущение противоречия.
-            // На самом деле probability УЖЕ ВКЛЮЧАЕТ FC через penalty/boost (v25 weighted ensemble).
-            // Теперь: только НАПРАВЛЕНИЕ + ФАЗА как контекстные маркеры (без числа).
             if (forecast != null) {
                 String biasIcon = switch (forecast.bias) {
                     case STRONG_BULL -> "🟢 РОСТ↑↑";
@@ -704,23 +814,26 @@ public final class DecisionEngineMerged {
                 extra.append(String.format("%n🔮 Контекст: %s  |  Фаза: %s", biasIcon, phaseIcon));
             }
 
-            // [v27.0] SIGNAL STRENGTH BAR REMOVED — duplicated 🎯 Вер-ть line.
-            // Probability appears once in the main format string. No repeat needed.
-
             return String.format(
-                    "%s *%s* → *%s* %s%n"
+                    "%s 【%s】 *%s* → *%s*%n"
+                            + "🏷 %s%n"
+                            + "━━━━━━━━━━━━━━━━━━━━━%n"
                             + "💰 Цена:   `%.6f`%n"
                             + "🎯 Вер-ть: *%.0f%%*%n"
                             + "🛑 SL:     `%.6f`  (риск %.2f%%)%n"
                             + "🟢 TP1:    `%.6f`  (+%.2f%%)  ← 50%% позиции%n"
                             + "🔵 TP2:    `%.6f`  (+%.2f%%)  ← 30%% позиции%n"
                             + "💎 TP3:    `%.6f`  (+%.2f%%)  ← 20%% трейл%n"
-                            + "🏷 %s%s%n"
+                            + "📌 %s%s%s%n"
                             + "_⏰ %s_",
-                    emoji, symbol, sideStr, catStr,
+                    emoji, typeAndCat, symbol, sideStr,
+                    flagStr,
                     price, probability, stop, riskPct,
                     tp1, rp1Pct, tp2, rp2Pct, tp3, rp3Pct,
-                    flagStr, extra.toString(), time
+                    extra.toString().isEmpty() ? "" : extra.toString(),
+                    tradabilityHint,
+                    "",
+                    time
             );
         }
 
