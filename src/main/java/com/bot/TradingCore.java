@@ -1636,23 +1636,25 @@ public final class TradingCore {
             }
         }
 
-        // [v36-FIX Дыра4] Static factor weight maps — нет new HashMap() на каждый вызов forecast().
-        // Удалены мультиколлинеарные факторы: LR_8 (≈SWING), Fisher (≈OF/dir), SQUEEZE (шум, вес=0.5).
-        // 5 оставшихся факторов покрывают структуру рынка (HTF, SWING), поток ордеров (OF),
-        // истощение тренда (EXHAUSTION) и объёмный профиль (VPOC_PULL).
+        // [v37.0] Static factor weight maps — включают новые forward-looking факторы.
+        // CVD_RT (реальное время) и ACCEL (ускорение) дают опережение на 3-5 свечей.
         private static final Map<String, Double> FW_BASE = Map.of(
                 "HTF",        3.0,  // часовой тренд — наиболее надёжный
-                "OF",         3.0,  // orderflow / CVD — институциональный след
+                "OF",         2.5,  // orderflow / CVD исторический
+                "CVD_RT",     3.5,  // [v37] RT-CVD из aggTrade — самый опережающий
                 "SWING",      2.0,  // рыночная структура HH/HL
                 "EXHAUSTION", 2.0,  // истощение движения
+                "ACCEL",      2.0,  // [v37] ускорение цены — ранний сигнал
                 "VPOC_PULL",  1.5   // объёмный профиль
         );
-        // В режиме сжатия (squeeze) структурный пробой важнее трендовых индикаторов
+        // В режиме сжатия (squeeze) пробой + поток ордеров важнее трендовых
         private static final Map<String, Double> FW_SQUEEZE = Map.of(
                 "HTF",        1.0,
                 "OF",         1.5,
+                "CVD_RT",     3.0,  // [v37] RT-CVD критичен при пробое сквиза
                 "SWING",      4.0,  // пробой структуры = главный сигнал
                 "EXHAUSTION", 1.0,
+                "ACCEL",      2.5,  // [v37] ускорение при пробое = ранний вход
                 "VPOC_PULL",  1.0
         );
 
@@ -1744,6 +1746,54 @@ public final class TradingCore {
             double fisherScore = calcFisher(c15, 10);
             f.put("FISHER", fisherScore);
             trendDir += fisherScore * 0.10;
+
+            // ═══════════════════════════════════════════════════════
+            // [v37.0] STEP 3b: FORWARD-LOOKING FACTORS
+            //
+            // Проблема: все индикаторы выше — ЗАПАЗДЫВАЮЩИЕ (lagging).
+            // RSI, HTF, SWING смотрят в прошлое. Прогноз запаздывает на 1-3 свечи.
+            //
+            // Решение: добавить ОПЕРЕЖАЮЩИЕ (leading) факторы:
+            //
+            // CVD_RT (Real-Time CVD): накопленная дельта объёма текущей свечи.
+            //   Источник: aggTrade WebSocket (миллисекундная точность).
+            //   Если покупки > продаж прямо сейчас → цена пойдёт вверх ещё до
+            //   закрытия свечи → мы знаем раньше любого RSI.
+            //
+            // ACCEL (Price Acceleration): сравнение скорости последних 3 баров
+            //   с предыдущими 3 барами. Ускорение = начало нового движения
+            //   до того как тренд становится очевидным.
+            //
+            // Вместе они дают ~3-5 свечей форы перед lagging индикаторами.
+            // ═══════════════════════════════════════════════════════
+
+            // Factor T5: RT-CVD — реальное соотношение покупок/продаж прямо сейчас
+            // volumeDelta приходит из aggTrade WebSocket через SignalSender.processAggTrade()
+            // Диапазон: [-1..+1] где +1 = все сделки — покупки, -1 = все — продажи
+            double cvdRt = clamp(volumeDelta * 1.8, -0.85, 0.85);
+            f.put("CVD_RT", cvdRt);
+            trendDir += cvdRt * 0.18; // высокий вес: это реальный поток, не история
+
+            // Factor T6: Price Acceleration — скорость изменения скорости цены
+            // Ускорение > 0 в одном направлении = новое движение начинается
+            int nc = c15.size();
+            if (nc >= 7) {
+                double mom1 = (c15.get(nc-1).close - c15.get(nc-4).close) / (price + 1e-9);
+                double mom2 = (c15.get(nc-4).close - c15.get(nc-7).close) / (c15.get(nc-4).close + 1e-9);
+                double accelScore = 0;
+                // Ускорение вверх: оба момента позитивные И последний > предыдущий
+                if (mom1 > 0 && mom2 > 0 && mom1 > mom2 * 1.25) {
+                    accelScore = clamp((mom1 - mom2) / Math.max(1e-6, Math.abs(mom2)), 0, 0.60);
+                    // Ускорение вниз: оба момента негативные И последний < предыдущего
+                } else if (mom1 < 0 && mom2 < 0 && mom1 < mom2 * 1.25) {
+                    accelScore = clamp((mom1 - mom2) / Math.max(1e-6, Math.abs(mom2)), -0.60, 0);
+                    // Смена направления: коррекция закончилась, основной тренд возобновляется
+                } else if (Math.signum(mom1) != Math.signum(mom2) && Math.abs(mom1) > atr14 * 0.3 / (price + 1e-9)) {
+                    accelScore = clamp(mom1 * 15, -0.35, 0.35);
+                }
+                f.put("ACCEL", accelScore);
+                trendDir += accelScore * 0.12;
+            }
 
             trendDir = clamp(trendDir, -1.0, 1.0);
 

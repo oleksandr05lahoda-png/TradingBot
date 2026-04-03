@@ -2333,6 +2333,7 @@ public final class SignalSender {
         if (vel < velThreshold) return null;
         boolean up = move > 0;
 
+        // atrV computed below in confidence gate (with robustAtr) — pre-fetch for exhaustion guard
         double atrV = getAtr(symbol);
         if (atrV <= 0) atrV = price * 0.005;
 
@@ -2372,35 +2373,83 @@ public final class SignalSender {
         }
         if (streak < 2) return null;
 
-        // Confidence: starts at 66 (raised from 62 for manual trading quality)
-        // [v34.0] EARLY_TICK confidence floor raised: 62 → 66.
-        // At 62%, signal is barely above noise. Manual trader needs 3-5 seconds to
-        // read Telegram, open exchange, place order. By then, micro-impulse is over.
-        // At 66%+ the move has enough structure to survive the 5s execution delay.
-        // [v34.0] Velocity multiplier scaled by category (TOP moves are smaller but significant)
-        double velMultiplier = switch (etCat) {
-            case TOP  -> 6000;  // BTC 0.1% vel → +6 conf
-            case ALT  -> 3500;  // ALT 0.2% vel → +7 conf
-            case MEME -> 2500;  // MEME 0.3% vel → +7.5 conf
+        // ═══════════════════════════════════════════════════════
+        // [v37.0] VOLATILITY-AWARE EARLY_TICK CONFIDENCE GATE
+        //
+        // ПРОБЛЕМА (RIVER): бот давал сигнал на шумной монете с conf=73%.
+        // На ALT с ATR/price > 2%, 73% confidence вообще не означает "высокое".
+        // Noise score > 3 = хаотичные хвосты → нужно 78%+ чтобы пробить фильтр.
+        //
+        // Правило:
+        //   LOW_VOL   (BTC/ETH-class): floor 66%
+        //   MEDIUM_VOL:                floor 68%
+        //   HIGH_VOL (>1.5% ATR):     floor 74%
+        //   EXTREME_VOL (>3.5% ATR):  floor 82% (почти никогда не проходит — правильно)
+        //   + noiseScore > 3.0:        +6% к порогу
+        //   + noiseScore > 4.0:        блок полностью
+        // ═══════════════════════════════════════════════════════
+        // atrV already declared above (reused from exhaustion guard)
+        double atrVPct     = atrV / price;
+        double noiseScoreV = getNoiseScore(symbol);
+
+        // EXTREME noise block: хаотичная монета — EARLY_TICK невозможен
+        if (noiseScoreV > 4.0 && atrVPct > 0.015) {
+            blockedEarlyConf.incrementAndGet();
+            return null;
+        }
+
+        // Dynamic confidence floor per volatility bucket
+        double etConfFloor = switch (etCat) {
+            case TOP  -> 66.0; // BTC/ETH — чистый сигнал, низкий порог
+            case ALT  -> atrVPct > 0.035 ? 82.0
+                    : atrVPct > 0.015 ? 74.0
+                      : atrVPct > 0.008 ? 70.0 : 67.0;
+            case MEME -> atrVPct > 0.035 ? 85.0 : 78.0;
         };
-        double conf = 66.0
-                + Math.min(8.0,  vel * velMultiplier)
-                + Math.min(5.0,  Math.abs(vda) * 15)
+        // Noise penalty
+        if (noiseScoreV > 3.0) etConfFloor += 6.0;
+        else if (noiseScoreV > 2.5) etConfFloor += 3.0;
+
+        // [v34.0] Velocity-based confidence (kept from before)
+        double velMultiplier = switch (etCat) {
+            case TOP  -> 6000;
+            case ALT  -> 3500;
+            case MEME -> 2500;
+        };
+        double conf = etConfFloor
+                + Math.min(8.0, vel * velMultiplier)
+                + Math.min(5.0, Math.abs(vda) * 15)
                 + (((up && vda > 0.15) || (!up && vda < -0.15)) ? 3.0 : 0.0);
-        conf = Math.min(84.0, conf);
+        conf = Math.min(87.0, conf);
+
+        // Final gate: if conf < dynamic floor, drop signal
+        if (conf < etConfFloor) {
+            blockedEarlyConf.incrementAndGet();
+            return null;
+        }
+
+        // [v37.0] EARLY_TICK stop uses VolatilityBucket minimum ATR mult.
+        // БЫЛО: atrV * 1.4 — слишком близко для HIGH/EXTREME vol монет.
+        // СТАЛО: atrV * bucket.minAtrMult — гарантирует уважение к шуму монеты.
+        com.bot.DecisionEngineMerged.VolatilityBucket etVolBucket =
+                com.bot.DecisionEngineMerged.classifyVolatility(atrVPct);
+        double etStopMult = etVolBucket.minAtrMult;
+        double etTpMult   = etStopMult * (etVolBucket == com.bot.DecisionEngineMerged.VolatilityBucket.EXTREME ? 1.8
+                : etVolBucket == com.bot.DecisionEngineMerged.VolatilityBucket.HIGH   ? 2.2 : 2.8);
 
         return new com.bot.DecisionEngineMerged.TradeIdea(
                 symbol,
                 up ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
                 price,
-                up ? price - atrV * 1.4 : price + atrV * 1.4,
-                up ? price + atrV * 3.0 : price - atrV * 3.0,
+                up ? price - atrV * etStopMult : price + atrV * etStopMult,
+                up ? price + atrV * etTpMult   : price - atrV * etTpMult,
                 conf,
                 new java.util.ArrayList<>(java.util.List.of(
                         "EARLY_TICK", up ? "UP" : "DN",
                         String.format("vel=%.2e", vel),
                         String.format("vda=%+.2f", vda),
-                        "stk=" + streak)));
+                        "stk=" + streak,
+                        "vBkt=" + etVolBucket.label)));
     }
 
     private boolean filterEarlySignal(com.bot.DecisionEngineMerged.TradeIdea sig) {
@@ -2898,7 +2947,18 @@ public final class SignalSender {
     public double getAtr(String symbol) {
         CachedCandles cc = candleCache.get(symbol + "_15m");
         if (cc == null || cc.candles.isEmpty()) return 0;
-        return atr(cc.candles, 14);
+        // [v37.0] Use robustAtr — prevents underestimation during consolidation
+        return com.bot.DecisionEngineMerged.robustAtr(cc.candles, 14);
+    }
+
+    /**
+     * [v37.0] Returns the noise score (wick/body ratio) for a symbol from cached 15m candles.
+     * Used by EARLY_TICK gate to raise confidence threshold for noisy coins.
+     */
+    public double getNoiseScore(String symbol) {
+        CachedCandles cc = candleCache.get(symbol + "_15m");
+        if (cc == null || cc.candles.isEmpty()) return 1.5;
+        return com.bot.DecisionEngineMerged.computeNoiseScore(cc.candles, 14);
     }
 
     public double getAccountBalance() { return accountBalance; }

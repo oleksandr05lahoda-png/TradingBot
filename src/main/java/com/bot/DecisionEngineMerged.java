@@ -492,8 +492,90 @@ public final class DecisionEngineMerged {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  INNER DATA TYPES
+    //  [v37.0] VOLATILITY BUCKET — per-symbol volatility classification
+    //
+    //  PROBLEM (RIVER case): bот ставил стоп 0.70% на монете с ATR 2-3%.
+    //  Причина: ATR во время консолидации был искусственно сжат.
+    //  Бот использовал текущий (сжатый) ATR как базу для стопа.
+    //  При первом же «вздохе» цены стоп сносило.
+    //
+    //  РЕШЕНИЕ: классифицировать монету по ДОЛГОСРОЧНОМУ ATR и применять
+    //  соответствующие минимальные кратные для стопа и тейков.
     // ══════════════════════════════════════════════════════════════
+
+    public enum VolatilityBucket {
+        LOW    ("LOW",    2.2, 0.04, 1.00),  // <0.5% ATR/price:  BTC/ETH
+        MEDIUM ("MEDIUM", 2.8, 0.06, 1.10),  // 0.5-1.5%: major ALTs
+        HIGH   ("HIGH",   3.5, 0.09, 1.25),  // 1.5-3.5%: volatile ALTs
+        EXTREME("EXTREME",4.5, 0.14, 1.45);  // >3.5%: micro-caps/memes
+
+        public final String label;
+        public final double minAtrMult;   // minimum ATR multiplier for stop floor
+        public final double maxStopPct;   // max stop distance as % of price
+        public final double tpShrink;     // TP shrink factor (HIGH vol → tighter TPs)
+
+        VolatilityBucket(String l, double m, double s, double t) {
+            label = l; minAtrMult = m; maxStopPct = s; tpShrink = t;
+        }
+    }
+
+    /** Classify coin by robust ATR percentage (uses long-term ATR to avoid consolidation trap) */
+    public static VolatilityBucket classifyVolatility(double atrPct) {
+        if (atrPct < 0.005) return VolatilityBucket.LOW;
+        if (atrPct < 0.015) return VolatilityBucket.MEDIUM;
+        if (atrPct < 0.035) return VolatilityBucket.HIGH;
+        return VolatilityBucket.EXTREME;
+    }
+
+    /**
+     * [v37.0] Robust ATR: max(currentATR, longTermATR × 0.80).
+     *
+     * PROBLEM: during consolidation, current ATR can drop to 30-40% of normal.
+     * This makes the ATR-based stop floor dangerously tight.
+     * Using the long-term ATR as a floor ensures the stop always respects
+     * the coin's actual trading noise, even during quiet periods.
+     */
+    public static double robustAtr(List<com.bot.TradingCore.Candle> c15, int fastN) {
+        double fast = atr(c15, fastN);
+        if (c15.size() < fastN + 36) return fast;
+        // Long-term ATR: 50-bar window ending 10 bars before current (avoids recency bias)
+        int ltEnd = Math.max(fastN + 1, c15.size() - 10);
+        int ltStart = Math.max(0, ltEnd - 50);
+        double longTerm = c15.size() > ltEnd
+                ? atr(c15.subList(ltStart, ltEnd), Math.min(14, ltEnd - ltStart - 1))
+                : fast;
+        // Never let stop base fall below 80% of long-term ATR
+        return Math.max(fast, longTerm * 0.80);
+    }
+
+    /**
+     * [v37.0] Noise Score: average wick/body ratio over last N candles.
+     *
+     * High score (>2.5) = long wicks relative to body = market is choppy.
+     * RIVER on the screenshot = classic "noisy" coin: wicks dominate body.
+     * Noisy coins need wider stops and higher confidence thresholds.
+     *
+     * Score interpretation:
+     *   <1.5 = clean (trending candles)
+     *   1.5–2.5 = moderate noise
+     *   >2.5 = high noise (like RIVER in consolidation)
+     *   >4.0 = extreme noise (avoid entirely)
+     */
+    public static double computeNoiseScore(List<com.bot.TradingCore.Candle> c, int n) {
+        if (c == null || c.size() < n) return 1.0;
+        double ratioSum = 0;
+        int count = 0;
+        for (int i = c.size() - n; i < c.size(); i++) {
+            com.bot.TradingCore.Candle bar = c.get(i);
+            double body = Math.abs(bar.close - bar.open);
+            double wickRange = (bar.high - bar.low);
+            if (body > 0 && wickRange > 0) {
+                ratioSum += wickRange / body;
+                count++;
+            }
+        }
+        return count > 0 ? ratioSum / count : 1.5;
+    }
 
     public static final class FundingOIData {
         public final double fundingRate, openInterest, oiChange1h, oiChange4h;
@@ -1990,25 +2072,78 @@ public final class DecisionEngineMerged {
         }
         if (probability < minConf) return null;
 
-        if (atr14 / price > 0.0020) allFlags.add("HIGH_ATR");
+        // ════════════════════════════════════════════════════════
+        // [v37.0] VOLATILITY CLASSIFICATION + NOISE GUARD
+        //
+        // RIVER FIX: бот ставил стоп 0.70% на монете с ATR 2-3%.
+        // Причина: ATR был сжат в консолидации → стоп = noise level.
+        // Решение: robustAtr() = max(currentATR, longTermATR×0.80).
+        // Noise score: монеты с большими хвостами требуют шире стоп.
+        // ════════════════════════════════════════════════════════
+        double robustAtr14   = robustAtr(c15, 14);
+        double robustAtrPct  = robustAtr14 / price;
+        double noiseScore    = computeNoiseScore(c15, 14); // avg wick/body ratio
+
+        // Classify coin's volatility for this symbol
+        VolatilityBucket volBucket = classifyVolatility(robustAtrPct);
+
+        // [v37.0] EXTREME VOLATILITY BLOCK: atr/price > 5% = shitcoin/micro-cap noise.
+        // No indicator works reliably at this level. Signal would be 90% false positive.
+        if (robustAtrPct > 0.05) {
+            allFlags.add("EXTREME_VOL_BLOCK");
+            return null;
+        }
+
+        // [v37.0] HIGH_ATR threshold corrected: 0.2% (was) → 1.5% (meaningful).
+        // At 0.2% every single ALT would trigger HIGH_ATR — meaningless label.
+        if (robustAtrPct > 0.015) allFlags.add("HIGH_ATR");
+
+        // [v37.0] NOISE GUARD: extreme wicks = uncontrollable price action.
+        // noiseScore > 3.5 = wicks are 3.5x the candle body = pure noise.
+        // Signal is still possible but confidence is penalised.
+        if (noiseScore > 3.5) {
+            probability = Math.max(50, probability - 10);
+            allFlags.add("HIGH_NOISE");
+            if (probability < minConf) return null;
+        }
+        // Moderate noise: small penalty
+        if (noiseScore > 2.5) {
+            probability = Math.max(50, probability - 4);
+        }
 
         // ════════════════════════════════════════════════════════
-        // СТОП И ТЕЙК — [v11.0] STRUCTURAL STOP PLACEMENT
-        // Instead of fixed ATR multiplier, SL goes behind nearest
-        // swing high/low. This respects market structure and prevents
-        // the #1 killer: arbitrary SL that gets hunted by liquidity grabs.
+        // СТОП И ТЕЙК — [v37.0] ROBUST STRUCTURAL STOP PLACEMENT
+        //
+        // Иерархия приоритетов:
+        // 1. Structural stop (swing high/low) — уважаем рыночную структуру
+        // 2. ATR floor = robustAtr × minAtrMult (зависит от VolatilityBucket)
+        // 3. Noise adjustment: шумные монеты получают +20-40% к стопу
+        // 4. Cap: category-specific max stop % (не более maxStopPct)
         // ════════════════════════════════════════════════════════
         double riskMult = cat == CoinCategory.MEME ? 1.40 : cat == CoinCategory.ALT ? 1.10 : 0.88;
         double rrRatio  = scoreDiff > 1.2 ? 3.4 : scoreDiff > 0.9 ? 3.0 : scoreDiff > 0.6 ? 2.7 : 2.3;
 
-        // [v12.0] Find structural stop level (-1 = not found, use ATR)
-        double structuralStop = findStructuralStop(c15, side, price, atr14);
-        double atrStop = Math.max(atr14 * 1.85 * riskMult, price * 0.0018);
+        // [v37.0] ATR floor: uses robustAtr + VolatilityBucket multiplier.
+        // БЫЛО: atr14 * 1.85 * riskMult → на RIVER в консолидации = 0.70%.
+        // СТАЛО: robustAtr14 * bucket.minAtrMult * riskMult → всегда учитывает долгосрочный шум.
+        double atrStop = Math.max(
+                robustAtr14 * volBucket.minAtrMult * riskMult,
+                price * 0.0025   // абсолютный минимум 0.25% (было 0.18%)
+        );
 
-        // Use the WIDER of structural and ATR stop — never tighter than structure
+        // [v37.0] Noise adjustment: шумные монеты с широкими хвостами — шире стоп
+        // noiseScore=2.5: +0%, noiseScore=3.5: +20%, noiseScore=5.0: +50%
+        if (noiseScore > 2.5) {
+            double noiseAdj = Math.min(0.60, (noiseScore - 2.5) * 0.20);
+            atrStop *= (1.0 + noiseAdj);
+        }
+
+        // Structural stop
+        double structuralStop = findStructuralStop(c15, side, price, robustAtr14);
+
+        // Use the WIDER of structural and ATR stop
         double stopDist;
         if (structuralStop <= 0) {
-            // [v12.0] No swing found — use ATR stop (no silent rejection!)
             stopDist = atrStop;
             allFlags.add("ATR_STOP");
         } else if (side == com.bot.TradingCore.Side.LONG) {
@@ -2021,23 +2156,22 @@ public final class DecisionEngineMerged {
             allFlags.add("STRUCT_STOP");
         }
 
-        // [v11.0] Cap stop at 3% to prevent absurd risk
-        stopDist = Math.min(stopDist, price * 0.030);
+        // [v37.0] Category-specific stop cap (replaces flat 3% for all)
+        // ALT монеты могут требовать 5-8% стоп в HIGH_VOL режиме — это нормально.
+        stopDist = Math.min(stopDist, price * volBucket.maxStopPct);
 
-        // [v23.0] Wide structure → penalty, not veto
+        // Wide structure → penalty, not veto
         if (stopDist > atrStop * 2.5) {
             allFlags.add("STRUCT_WIDE");
             probability = Math.max(50, probability - 7);
-            if (probability < minConf) return null; // re-check after penalty
+            if (probability < minConf) return null;
         }
 
         double stopPrice = side == com.bot.TradingCore.Side.LONG  ? price - stopDist : price + stopDist;
         double takePrice = side == com.bot.TradingCore.Side.LONG  ? price + stopDist * rrRatio
                 : price - stopDist * rrRatio;
 
-        if (!priceMovedEnough(symbol, price, atr14 / price)) return null;
-        // [v14.0 FIX] НЕ вызываем registerSignal() здесь — cooldown ставится
-        // только ПОСЛЕ ISC.allowSignal() в SignalSender через confirmSignal()
+        if (!priceMovedEnough(symbol, price, robustAtrPct)) return null;
 
         // ════════════════════════════════════════════════════════
         // [v17.0] ForecastEngine Integration — RELAXED GATING
@@ -2265,24 +2399,44 @@ public final class DecisionEngineMerged {
                 && forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
 
         if (isExhaustPhase) {
-            // Истощение — скальп, быстро берём что дают
             tp1Mult = 0.70; tp2Mult = 1.20; tp3Mult = 1.80;
             allFlags.add("TP_EXHAUST");
         } else if (isRangeState) {
-            // Боковик — умеренные TP, TP3 часто не достигается
             tp1Mult = 0.80; tp2Mult = 1.40; tp3Mult = 2.20;
             allFlags.add("TP_RANGE");
         } else if (isTrendState && isEarlyPhase) {
-            // Сильный тренд + начало движения — максимальные TP
             tp1Mult = 1.30; tp2Mult = 2.60; tp3Mult = 4.20;
             allFlags.add("TP_TREND_EARLY");
         } else if (isTrendState) {
-            // Сильный тренд — расширяем TP
             tp1Mult = 1.15; tp2Mult = 2.30; tp3Mult = 3.60;
             allFlags.add("TP_TREND");
         } else {
-            // Слабый тренд — стандарт
             tp1Mult = 1.00; tp2Mult = 2.00; tp3Mult = 3.20;
+        }
+
+        // ════════════════════════════════════════════════════════
+        // [v37.0] VOLATILITY-BUCKET TP ADJUSTMENT
+        //
+        // HIGH/EXTREME vol монеты разворачиваются быстрее → тейки ближе.
+        // Нет смысла держать позицию на +4% если монета ходит по ±3% в день.
+        //
+        // LOW vol в тренде (BTC/ETH) → можно держать дольше, движение чище.
+        //
+        // Bucket  | Factor  | Логика
+        // LOW     | +10%    | Чистый тренд, мало шума, можно держать
+        // MEDIUM  | ×1.00   | Стандарт
+        // HIGH    | ×0.80   | Волатильная ALT — берём быстрее
+        // EXTREME | ×0.60   | Шиткоин — только скальп, иначе уйдёт обратно
+        // ════════════════════════════════════════════════════════
+        double vtpFactor = switch (volBucket) {
+            case LOW     -> isTrendState ? 1.10 : 1.00;
+            case MEDIUM  -> 1.00;
+            case HIGH    -> isExhaustPhase ? 0.65 : 0.80;
+            case EXTREME -> 0.60;
+        };
+        if (vtpFactor != 1.00) {
+            tp1Mult *= vtpFactor; tp2Mult *= vtpFactor; tp3Mult *= vtpFactor;
+            allFlags.add("TP_VOL_" + volBucket.label);
         }
 
         // Пересчитываем rrRatio на основе выбранного tp3
