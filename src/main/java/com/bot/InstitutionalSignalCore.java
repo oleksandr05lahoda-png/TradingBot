@@ -59,15 +59,15 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;   // per symbol, bounded
 
     public InstitutionalSignalCore() {
-        // Defaults stay conservative, but no longer hard-freeze the system at one profile.
-        // This lets the scanner scale to wider universes without recompiling the bot.
+        // [v38.0] Tightened defaults: MAX_GLOBAL 12→6, MAX_SECTOR 3→2
+        // Aligned with CorrelationGuard MAX_TOTAL=6
         this(
-                envInt("ISC_MAX_GLOBAL_SIGNALS", 12),
-                envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 2),
-                envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.08),
-                envDouble("ISC_BASE_MIN_CONF", 62.0),
-                envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.0025),
-                envInt("ISC_MAX_SAME_SECTOR_DIR", 3)
+                envInt("ISC_MAX_GLOBAL_SIGNALS", 6),
+                envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),  // [v38.0] 2→1: no stacking
+                envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06), // [v38.0] 8%→6%
+                envDouble("ISC_BASE_MIN_CONF", 65.0),      // [v38.0] 62→65: higher bar
+                envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003), // [v38.0] 0.25%→0.3%
+                envInt("ISC_MAX_SAME_SECTOR_DIR", 2)       // [v38.0] 3→2
         );
     }
 
@@ -543,17 +543,32 @@ public final class InstitutionalSignalCore {
     }
 
     public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
-        // [Hole 10 FIX] Actually register the signal to track open positions and heat
         double estRisk = estimateRisk(signal.probability, signal.category);
+        // [v38.0] Per-signal factor logging — record which indicators voted for this signal
+        String factorLog = "";
+        if (signal.forecast != null && signal.forecast.factorScores != null) {
+            StringBuilder fl = new StringBuilder();
+            for (var e : signal.forecast.factorScores.entrySet()) {
+                if (Math.abs(e.getValue()) > 0.08) { // only log significant factors
+                    if (fl.length() > 0) fl.append(",");
+                    fl.append(e.getKey()).append("=").append(String.format("%.2f", e.getValue()));
+                }
+            }
+            factorLog = fl.toString();
+        }
         ActiveSignal act = new ActiveSignal(signal.symbol, signal.side, signal.price, signal.stop,
-                signal.tp1, signal.probability, estRisk, signal.category.name(), "");
+                signal.tp1, signal.probability, estRisk, signal.category.name(), factorLog);
 
         activeSignals.computeIfAbsent(signal.symbol, k -> new CopyOnWriteArrayList<>()).add(act);
         currentHeat += estRisk;
-        // [v17.0 §1] Mark symbol as occupied — blocks bipolar signals until trade closes
         markSymbolActive(signal.symbol);
-        // [v34.0] Record for daily signal quota tracking
         recordSymbolSignal(signal.symbol);
+
+        // [v38.0] Log signal factors for post-hoc analysis
+        if (!factorLog.isEmpty()) {
+            log(String.format("[SIGNAL] %s %s prob=%.0f%% factors=[%s]",
+                    signal.symbol, signal.side, signal.probability, factorLog));
+        }
     }
 
     /**
@@ -597,6 +612,14 @@ public final class InstitutionalSignalCore {
         }
         if (matched != null) {
             currentHeat = Math.max(0, currentHeat - matched.riskPct);
+
+            // [v38.0] P&L ATTRIBUTION — log which factors led to this outcome
+            // After 500+ trades, analyze: which factors correlate with wins vs losses
+            String outcome = pnlPct > 0.05 ? "WIN" : pnlPct < -0.05 ? "LOSS" : "FLAT";
+            if (!matched.sector.isEmpty()) { // sector field stores factor log in v38
+                log(String.format("[P&L_ATTR] %s %s %s pnl=%+.2f%% dur=%dm factors=[%s]",
+                        symbol, side, outcome, pnlPct, matched.ageMs() / 60_000, matched.sector));
+            }
 
             // Add to bounded history
             Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(symbol, k -> new ConcurrentLinkedDeque<>());

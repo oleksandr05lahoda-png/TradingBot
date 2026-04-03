@@ -1255,6 +1255,38 @@ public final class TradingCore {
             return Math.min(fullKelly * this.kellyFractionFactor, maxPortfolioRisk);
         }
 
+        /**
+         * [v38.0] ATR-BASED POSITION SIZING + QUARTER-KELLY
+         *
+         * Формула: size = (balance × riskPct) / (ATR × leverage)
+         * Kelly: f* = (p × b − q) / b, применяется × 0.25 (quarter Kelly)
+         *
+         * Это даёт правильный размер позиции, учитывающий:
+         * 1. Текущую волатильность монеты (ATR) — а не фиксированный %
+         * 2. Реальный edge системы (Kelly) — а не hardcoded risk%
+         * 3. Категорию монеты (MEME → уменьшение)
+         */
+        public double positionSizeATR(double balance, double entry, double atr,
+                                      double stopDist, CoinType type,
+                                      double winRate, double avgRR, int leverage) {
+            if (balance <= 0 || entry <= 0 || atr <= 0) return 0;
+
+            // Kelly fraction (quarter Kelly for safety)
+            double kellyF = kellyFraction(winRate, avgRR > 0 ? avgRR : 2.0, 1.0);
+            double riskPct = kellyF > 0.003
+                    ? Math.min(kellyF, maxPortfolioRisk / type.riskMultiplier)
+                    : maxPortfolioRisk * 0.5 / type.riskMultiplier;
+
+            // ATR-based sizing: (balance × riskPct) / (stopDistance_as_fraction)
+            double stopFraction = Math.max(0.001, stopDist / entry);
+            double posSize = (balance * riskPct) / stopFraction;
+
+            // Caps
+            posSize = Math.min(posSize, balance * maxTotalExposure);
+            posSize = Math.min(posSize, balance * type.maxLeverage);
+            return Math.max(posSize, 6.5); // minimum viable order
+        }
+
         public double positionSize(double balance, double entry, double stopLoss,
                                    CoinType type, double confidence, double avgRR) {
             if (balance <= 0 || entry <= 0) return 0;
@@ -1717,65 +1749,41 @@ public final class TradingCore {
             f.put("EXHAUSTION", exhaustionScore);
 
             // ═══════════════════════════════════════════════════════
-            // STEP 3: TREND BRAIN — but weaker voice now
+            // STEP 3: TREND BRAIN — [v38.0] SIMPLIFIED
+            // Удалены мультиколлинеарные факторы:
+            //   LR_8 ≈ SWING (оба = краткосрочное направление) → оставляем SWING
+            //   FISHER ≈ OF (оба = осцилляторы потока) → оставляем OF
+            // Оставлены 3 ключевых: SWING (структура), OF (поток), HTF (тренд)
+            // + 2 опережающих: CVD_RT (реальное время), ACCEL (ускорение)
             // ═══════════════════════════════════════════════════════
             double trendDir = 0;
 
-            // Short-term LR slope (fast, 8 bars)
-            double lr8 = linRegSlope(c15, 8);
-            double lrScore = clamp(lr8 * 6 / atr14 * 0.30, -0.6, 0.6);
-            f.put("LR_8", lrScore);
-            trendDir += lrScore * 0.20;
-
-            // Swing structure
+            // Swing structure — HH/HL vs LL/LH
             double swingScore = com.bot.DecisionEngineMerged.marketStructure(c15) * 0.50;
             f.put("SWING", swingScore);
-            trendDir += swingScore * 0.15;
+            trendDir += swingScore * 0.22; // повышен с 0.15
 
-            // Orderflow
+            // Orderflow — CVD исторический
             double ofScore = calcOrderflow(c15, volumeDelta);
             f.put("OF", ofScore);
-            trendDir += ofScore * 0.15;
+            trendDir += ofScore * 0.20; // повышен с 0.15
 
-            // HTF alignment (1h)
+            // HTF alignment (1h) — наиболее надёжный
             double htfScore = calcHTF(c15, c1h);
             f.put("HTF", htfScore);
-            trendDir += htfScore * 0.15;
-
-            // Fisher cross
-            double fisherScore = calcFisher(c15, 10);
-            f.put("FISHER", fisherScore);
-            trendDir += fisherScore * 0.10;
+            trendDir += htfScore * 0.20; // повышен с 0.15
 
             // ═══════════════════════════════════════════════════════
-            // [v37.0] STEP 3b: FORWARD-LOOKING FACTORS
-            //
-            // Проблема: все индикаторы выше — ЗАПАЗДЫВАЮЩИЕ (lagging).
-            // RSI, HTF, SWING смотрят в прошлое. Прогноз запаздывает на 1-3 свечи.
-            //
-            // Решение: добавить ОПЕРЕЖАЮЩИЕ (leading) факторы:
-            //
-            // CVD_RT (Real-Time CVD): накопленная дельта объёма текущей свечи.
-            //   Источник: aggTrade WebSocket (миллисекундная точность).
-            //   Если покупки > продаж прямо сейчас → цена пойдёт вверх ещё до
-            //   закрытия свечи → мы знаем раньше любого RSI.
-            //
-            // ACCEL (Price Acceleration): сравнение скорости последних 3 баров
-            //   с предыдущими 3 барами. Ускорение = начало нового движения
-            //   до того как тренд становится очевидным.
-            //
-            // Вместе они дают ~3-5 свечей форы перед lagging индикаторами.
+            // [v38.0] LEADING FACTORS — опережающие индикаторы
+            // CVD_RT + ACCEL дают 3-5 свечей форы
             // ═══════════════════════════════════════════════════════
 
-            // Factor T5: RT-CVD — реальное соотношение покупок/продаж прямо сейчас
-            // volumeDelta приходит из aggTrade WebSocket через SignalSender.processAggTrade()
-            // Диапазон: [-1..+1] где +1 = все сделки — покупки, -1 = все — продажи
+            // RT-CVD — реальное соотношение покупок/продаж
             double cvdRt = clamp(volumeDelta * 1.8, -0.85, 0.85);
             f.put("CVD_RT", cvdRt);
-            trendDir += cvdRt * 0.18; // высокий вес: это реальный поток, не история
+            trendDir += cvdRt * 0.22; // повышен с 0.18 — это самый опережающий фактор
 
-            // Factor T6: Price Acceleration — скорость изменения скорости цены
-            // Ускорение > 0 в одном направлении = новое движение начинается
+            // Price Acceleration — скорость изменения скорости цены
             int nc = c15.size();
             if (nc >= 7) {
                 double mom1 = (c15.get(nc-1).close - c15.get(nc-4).close) / (price + 1e-9);
@@ -1898,7 +1906,8 @@ public final class TradingCore {
             else if (dir < -0.12) bias = ForecastBias.BEAR;
             else bias = ForecastBias.NEUTRAL;
 
-            double projMove = lr8 * 6 / price;
+            // [v38.0] projMove: estimated next-bar move based on direction strength and ATR
+            double projMove = dir * atr14 * 2.0 / price;
             double vpoc = calcVPOC(c15, 50);
 
             return new ForecastResult(bias, dir, conf, phase, projMove, vpoc, f);

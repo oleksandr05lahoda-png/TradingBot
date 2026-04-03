@@ -49,7 +49,7 @@ public final class BotMain {
     private static final int    KLINES    = envInt("KLINES_LIMIT", 220);
     // Hard cap to avoid Telegram queue backlog (which can make the bot
     // "silent" for hours/days under heavy signal load).
-    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 10);
+    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 5); // [v38.0] 10→5: precision over frequency
 
     // ── Секторальные лидеры для GIC ───────────────────────────────────────
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
@@ -92,8 +92,8 @@ public final class BotMain {
     private static volatile long lastCycleSuccessMs = 0;
     private static volatile long lastStatsSuccessMs = 0;
     private static volatile long lastWatchdogAlertMs = 0;
-    private static final long SIGNAL_DROUGHT_MS     = 30 * 60_000L;
-    private static final long WATCHDOG_COOLDOWN_MS  = 10 * 60_000L;
+    private static final long SIGNAL_DROUGHT_MS     = 60 * 60_000L;  // [v38.0] 30→60min: tight filters = fewer signals, not a bug
+    private static final long WATCHDOG_COOLDOWN_MS  = 30 * 60_000L;  // [v38.0] 10→30min: reduce spam
     private static final AtomicLong watchdogAlerts  = new AtomicLong(0);
 
     // ── Daily summary ─────────────────────────────────────────────────────
@@ -703,21 +703,19 @@ public final class BotMain {
                         it.remove();
                         isc.registerConfirmedResult(pnl > 0, ts.side);
                         isc.closeTrade(ts.symbol, ts.side, pnl);
-                        // [FIX v32+] Update DecisionEngine streak + post-exit cooldown
                         if (pnl > 0) sender.getDecisionEngine().recordWin(ts.symbol, ts.side);
                         else         sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
                         sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                         markForecastRecord(ts.symbol + "_" + ts.side,
                                 pnl > 0 ? "CHANDELIER_PROFIT" : "CHANDELIER_FLAT");
-                        // [v36-FIX Дыра6] Восстановлен Chandelier-алерт.
-                        // Трейдер должен знать что ATR-трейлинг закрыл позицию до TP1.
-                        String chEmoji = pnl >= 0.3 ? "✅" : "⚠️";
-                        telegram.sendMessageAsync(String.format(
-                                "%s *TRAIL EXIT* %s %s | PnL: %+.2f%%\n"
-                                        + "📌 ATR trail: `%.4f`\n"
-                                        + "_Разворот до TP1 — прибыль сохранена_\n"
-                                        + "_⚠️ Расчётный уровень — проверь реальный fill_",
-                                chEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                        // [v38.0] Suppress noise: PnL ≈ 0% exits are breakeven, not worth notifying
+                        if (Math.abs(pnl) >= 0.20) {
+                            String chEmoji = pnl >= 0.5 ? "✅" : pnl > 0 ? "🟡" : "🔴";
+                            telegram.sendMessageAsync(String.format(
+                                    "%s *TRAIL* %s %s | *%+.2f%%*\n"
+                                            + "📌 ATR trail: `%.4f`",
+                                    chEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                        }
                         LOG.info("[TR] CHANDELIER EXIT: " + ts.symbol
                                 + " pnl=" + String.format("%.2f%%", pnl));
                         continue;
@@ -757,12 +755,9 @@ public final class BotMain {
                 // Для ручного трейдера молчание хуже ложной точности: он не знает что позиция умерла.
                 // Дисклеймер добавлен в текст — трейдер понимает что это расчётный уровень, не факт.
                 telegram.sendMessageAsync(String.format(
-                        "🛑 *SL* %s %s\n"
-                                + "📌 Уровень: `%.4f` | PnL: %+.2f%%\n"
-                                + "_%s_\n"
-                                + "_⚠️ Расчётный уровень — проверь реальный fill_",
-                        ts.symbol, ts.side, ts.sl, pnl,
-                        ts.forecastBias + " score " + String.format("%.2f", ts.forecastScore)));
+                        "🛑 *SL* %s %s | *%+.2f%%*\n"
+                                + "📌 `%.4f`",
+                        ts.symbol, ts.side, pnl, ts.sl));
                 LOG.info("[TR] SL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 continue;
             }
@@ -896,13 +891,14 @@ public final class BotMain {
                     sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side,
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
-                    // [v36-FIX Дыра6] Trail алерт восстановлен.
-                    String trailEmoji = pnl > 0 ? "✅" : "⚠️";
-                    telegram.sendMessageAsync(String.format(
-                            "%s *TRAILING STOP* %s %s | %+.2f%%\n"
-                                    + "📌 Трейл: `%.4f`\n"
-                                    + "_⚠️ Расчётный уровень_",
-                            trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                    // [v38.0] Suppress breakeven noise (PnL ≈ 0)
+                    if (Math.abs(pnl) >= 0.20) {
+                        String trailEmoji = pnl >= 0.5 ? "✅" : pnl > 0 ? "🟡" : "🔴";
+                        telegram.sendMessageAsync(String.format(
+                                "%s *TRAIL* %s %s | *%+.2f%%*\n"
+                                        + "📌 `%.4f`",
+                                trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                    }
                     LOG.info("[TR] TRAIL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 }
             }
@@ -918,27 +914,30 @@ public final class BotMain {
     private static void sendPositionStatus(com.bot.TelegramBotSender telegram) {
         if (trackedSignals.isEmpty()) return;
 
-        StringBuilder sb = new StringBuilder("📊 *Позиции*\n");
+        StringBuilder sb = new StringBuilder("📊 *Открытые позиции* (");
+        sb.append(trackedSignals.size()).append(")\n");
         sb.append("━━━━━━━━━━━━━━━━━━━━\n");
 
         long now = System.currentTimeMillis();
+        int longCount = 0, shortCount = 0;
         for (TrackedSignal ts : trackedSignals.values()) {
             long ageMin = ts.ageMs() / 60_000;
-            String status = ts.tp2Hit ? "TP2✓" : ts.tp1Hit ? "TP1✓" : "OPEN";
+            String status = ts.tp2Hit ? "TP2✓" : ts.tp1Hit ? "TP1✓" : "";
             String dir = ts.side == com.bot.TradingCore.Side.LONG ? "📈" : "📉";
+            if (ts.side == com.bot.TradingCore.Side.LONG) longCount++; else shortCount++;
 
-            sb.append(String.format("%s *%s* %s | %s | %dm\n",
+            sb.append(String.format("%s *%s* %s %s %dm\n",
                     dir, ts.symbol, ts.side, status, ageMin));
 
             if (ts.trailingStop > 0 && ts.tp1Hit) {
-                sb.append(String.format("  🛡 Trail: `%.4f`\n", ts.trailingStop));
+                sb.append(String.format("  🛡 `%.4f`\n", ts.trailingStop));
             } else {
-                sb.append(String.format("  🛑 SL: `%.4f`\n", ts.sl));
+                sb.append(String.format("  🛑 `%.4f`\n", ts.sl));
             }
         }
 
         sb.append("━━━━━━━━━━━━━━━━━━━━\n");
-        sb.append("_Уровни расчётные, не реальные fills_");
+        sb.append(String.format("📈 %d LONG | 📉 %d SHORT", longCount, shortCount));
         telegram.sendMessageAsync(sb.toString());
     }
 

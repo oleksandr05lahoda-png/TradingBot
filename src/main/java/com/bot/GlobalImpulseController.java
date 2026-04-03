@@ -121,8 +121,9 @@ public final class GlobalImpulseController {
         BTC_IMPULSE_DOWN,
         BTC_STRONG_UP,
         BTC_STRONG_DOWN,
-        BTC_CRASH,        // [NEW] Отдельный режим для быстрого краша
-        BTC_PANIC         // [NEW] Паника — все лонги заблокированы
+        BTC_CRASH,
+        BTC_PANIC,
+        BTC_CHOPPY         // [v38.0] Нечитаемый рынок — блок ВСЕХ новых входов
     }
 
     public enum VolatilityRegime {
@@ -439,7 +440,25 @@ public final class GlobalImpulseController {
         } else if (move3 < -0.004) {
             regime = GlobalRegime.BTC_IMPULSE_DOWN;
         } else {
-            regime = GlobalRegime.NEUTRAL;
+            // [v38.0] CHOPPY DETECTION: BTC swinging both directions rapidly
+            // Check if last 6 candles alternate direction (wick-heavy, no trend)
+            if (n >= 8) {
+                int dirChanges = 0;
+                for (int ci = n - 6; ci < n - 1; ci++) {
+                    double body1 = btcCandles.get(ci).close - btcCandles.get(ci).open;
+                    double body2 = btcCandles.get(ci + 1).close - btcCandles.get(ci + 1).open;
+                    if (body1 * body2 < 0) dirChanges++;
+                }
+                double adxBtc = com.bot.TradingCore.adx(btcCandles, 14).adx;
+                // 4+ direction changes in 6 bars + ADX < 15 = choppy
+                if (dirChanges >= 4 && adxBtc < 15) {
+                    regime = GlobalRegime.BTC_CHOPPY;
+                } else {
+                    regime = GlobalRegime.NEUTRAL;
+                }
+            } else {
+                regime = GlobalRegime.NEUTRAL;
+            }
         }
 
         boolean strongPressure = rawStrength > 0.70 && volExpansion > 1.4;
@@ -887,11 +906,17 @@ public final class GlobalImpulseController {
         // ── Паника — безоговорочный вето на лонги ───────────────
         if (ctx.panicMode || ctx.regime == GlobalRegime.BTC_PANIC) {
             if (isLong) {
-                return 0.0; // В панике LONG невозможен
+                return 0.0;
             } else {
-                // SHORT при панике — максимальный буст
                 return Math.min(1.90, ctx.shortBoost);
             }
+        }
+
+        // [v38.0] CHOPPY MARKET — suppress ALL new entries (both LONG and SHORT)
+        // BTC is alternating direction rapidly with no structure.
+        // No edge exists in either direction — sitting out is the correct trade.
+        if (ctx.regime == GlobalRegime.BTC_CHOPPY) {
+            return 0.05; // effectively blocked by GIC weight gate in SignalSender
         }
 
         // ── Уровень каскада определяет вес ──────────────────────

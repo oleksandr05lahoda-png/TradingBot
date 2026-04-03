@@ -536,15 +536,13 @@ public final class DecisionEngineMerged {
      * the coin's actual trading noise, even during quiet periods.
      */
     public static double robustAtr(List<com.bot.TradingCore.Candle> c15, int fastN) {
-        double fast = atr(c15, fastN);
+        double fast = com.bot.TradingCore.atr(c15, fastN);
         if (c15.size() < fastN + 36) return fast;
-        // Long-term ATR: 50-bar window ending 10 bars before current (avoids recency bias)
         int ltEnd = Math.max(fastN + 1, c15.size() - 10);
         int ltStart = Math.max(0, ltEnd - 50);
         double longTerm = c15.size() > ltEnd
-                ? atr(c15.subList(ltStart, ltEnd), Math.min(14, ltEnd - ltStart - 1))
+                ? com.bot.TradingCore.atr(c15.subList(ltStart, ltEnd), Math.min(14, ltEnd - ltStart - 1))
                 : fast;
-        // Never let stop base fall below 80% of long-term ATR
         return Math.max(fast, longTerm * 0.80);
     }
 
@@ -826,113 +824,136 @@ public final class DecisionEngineMerged {
             return result;
         }
 
+        // ═══════════════════════════════════════════════════════
+        // [v38.0] TradingView-совместимый тикер для поиска монеты
+        // ═══════════════════════════════════════════════════════
+        private static String toTradingViewTicker(String symbol) {
+            // BTCUSDT → BINANCE:BTCUSDT.P (Perpetual Futures)
+            return "BINANCE:" + symbol + ".P";
+        }
+
+        // [v38.0] Аналог в традиционных активах — помогает понять масштаб монеты
+        private static String getComparableAsset(String symbol, CoinCategory cat) {
+            if (cat == CoinCategory.TOP) {
+                if (symbol.startsWith("BTC"))  return "🥇 ≈ Золото (XAU)";
+                if (symbol.startsWith("ETH"))  return "🥈 ≈ Серебро (XAG)";
+                if (symbol.startsWith("BNB"))  return "🛢 ≈ Нефть (CL)";
+                if (symbol.startsWith("SOL"))  return "⛽ ≈ Газ (NG)";
+                if (symbol.startsWith("XRP"))  return "🏦 ≈ Forex (EUR/USD)";
+                return "💎 ≈ Платина (XPT)";
+            }
+            if (cat == CoinCategory.MEME) return "🎰 ≈ Пенни-акция";
+            // ALT
+            if (symbol.contains("AI") || symbol.contains("FET") || symbol.contains("RENDER"))
+                return "🤖 ≈ Tech-акция (NVDA)";
+            if (symbol.contains("LINK") || symbol.contains("DOT") || symbol.contains("ATOM"))
+                return "🔗 ≈ Инфраструктура (AWS)";
+            if (symbol.contains("UNI") || symbol.contains("AAVE") || symbol.contains("MKR"))
+                return "🏦 ≈ Финтех-акция";
+            return "📊 ≈ Mid-cap акция";
+        }
+
+        // [v38.0] Сектор монеты для контекста
+        private static String detectCoinSector(String symbol) {
+            String s = symbol.toUpperCase();
+            if (s.contains("AI") || s.contains("FET") || s.contains("RENDER") || s.contains("RNDR")
+                    || s.contains("AGIX") || s.contains("OCEAN")) return "AI";
+            if (s.contains("UNI") || s.contains("AAVE") || s.contains("SUSHI") || s.contains("CRV")
+                    || s.contains("COMP") || s.contains("MKR") || s.contains("SNX")) return "DeFi";
+            if (s.contains("MATIC") || s.contains("ARB") || s.contains("OP") || s.contains("STRK")
+                    || s.contains("MANTA") || s.contains("ZK")) return "L2";
+            if (s.contains("SOL") || s.contains("AVAX") || s.contains("NEAR") || s.contains("APT")
+                    || s.contains("SUI") || s.contains("SEI") || s.contains("TIA")) return "L1";
+            if (s.contains("DOGE") || s.contains("SHIB") || s.contains("PEPE") || s.contains("FLOKI")
+                    || s.contains("WIF") || s.contains("BONK") || s.contains("MEME")) return "Meme";
+            if (s.contains("LINK") || s.contains("DOT") || s.contains("ATOM")
+                    || s.contains("INJ") || s.contains("PYTH")) return "Infra";
+            if (s.contains("ONDO") || s.contains("PENDLE") || s.contains("TRU")) return "RWA";
+            return "Crypto";
+        }
+
         public String toTelegramString() {
-            // ╔══════════════════════════════════════════════════════╗
-            // ║  [v36.0] НОВЫЙ ФОРМАТ СИГНАЛА                       ║
-            // ║  Символ → Направление → Категория/Актив в 1 строке  ║
-            // ║  Выравненные колонки, секунды в таймстампе           ║
-            // ║  Авто-определение типа актива (крипта/нефть/металл)  ║
-            // ╚══════════════════════════════════════════════════════╝
+            // ╔══════════════════════════════════════════════════════════╗
+            // ║  [v38.0] ЧИСТЫЙ ФОРМАТ СИГНАЛА                          ║
+            // ║  • TradingView тикер для быстрого поиска                 ║
+            // ║  • Аналог в традиционных активах                         ║
+            // ║  • Сектор монеты                                          ║
+            // ║  • Минимум шума — только то, что нужно трейдеру           ║
+            // ╚══════════════════════════════════════════════════════════╝
             boolean isLong   = side == com.bot.TradingCore.Side.LONG;
             String sideEmoji = isLong ? "📈" : "📉";
             String sideStr   = isLong ? "LONG" : "SHORT";
 
-            // ── Уверенность ─────────────────────────────────────────
+            // Уверенность
             String confEmoji = probability >= 83 ? "🔥"
                     : probability >= 74 ? "✅"
                       : probability >= 65 ? "🟡" : "⚪";
 
-            // ── Тип актива и категория ───────────────────────────────
-            AssetType assetType = detectAssetType(symbol);
-            String assetStr;
-            String assetWarn = "";
-            if (assetType == AssetType.CRYPTO || assetType == AssetType.UNKNOWN) {
-                // Крипта: показываем категорию (TOP / ALT / MEME)
-                assetStr = switch (category) {
-                    case TOP  -> "👑 TOP";
-                    case MEME -> "🐸 MEME";
-                    default   -> "🔷 ALT";
-                };
-            } else {
-                // Не крипта: показываем тип сырья/металла/форекса
-                assetStr = assetType.emoji + " " + assetType.label;
-                assetWarn = "\n⚠️ _Не крипта_ — " + assetType.label;
-            }
+            // Категория + сектор
+            String catStr = switch (category) {
+                case TOP  -> "👑 TOP";
+                case MEME -> "🐸 MEME";
+                default   -> "🔷 ALT";
+            };
+            String sector = detectCoinSector(symbol);
+            String comparable = getComparableAsset(symbol, category);
+            String tvTicker = toTradingViewTicker(symbol);
 
-            // ── Цены ─────────────────────────────────────────────────
+            // Цены
             double riskPct = Math.abs(price - stop) / price * 100;
             double rp1Pct  = Math.abs(tp1 - price)  / price * 100;
             double rp2Pct  = Math.abs(tp2 - price)  / price * 100;
             double rp3Pct  = Math.abs(tp3 - price)  / price * 100;
 
-            // ── Формат числа — убираем лишние нули ───────────────────
-            // price < 0.01 → 6 знаков, иначе 4 знака
-            String fmt = price < 0.001 ? "%.6f" : price < 0.1 ? "%.5f" : price < 10 ? "%.4f" : "%.2f";
+            // Формат числа
+            String fmt = price < 0.001 ? "%.6f" : price < 0.01 ? "%.5f" : price < 0.1 ? "%.4f" : price < 10 ? "%.4f" : "%.2f";
 
-            // ── Флаги для трейдера ────────────────────────────────────
-            List<String> tf = traderFlags();
-            String flagStr = tf.isEmpty() ? "-" : String.join(" ", tf);
-
-            // ── Размер позиции ────────────────────────────────────────
+            // Размер позиции
             String sizeStr = "";
             for (String f : flags) {
                 if (f.startsWith("SIZE=")) { sizeStr = f; break; }
             }
 
-            // ── Фандинг (если значимый) ───────────────────────────────
-            String frStr = "";
+            // Funding rate warning
+            String frLine = "";
             if (Math.abs(fundingRate) > 0.0008) {
-                frStr = String.format(" | FR %+.2f%%", fundingRate * 100);
+                String frWarn = "";
+                if (isLong && fundingRate > 0.0005) frWarn = " ⚠️платишь FR";
+                if (!isLong && fundingRate < -0.0005) frWarn = " ⚠️платишь FR";
+                frLine = String.format("\n💸 Funding: %+.3f%%%s", fundingRate * 100, frWarn);
             }
 
-            // ── Прогноз (компактно в одну строку) ────────────────────
-            String forecastLine = "";
-            if (forecast != null) {
-                String fBias = switch (forecast.bias) {
-                    case STRONG_BULL -> "🟢↑↑"; case BULL -> "🟩↑";
-                    case NEUTRAL     -> "⬜—";
-                    case BEAR        -> "🟥↓";  case STRONG_BEAR -> "🔴↓↓";
-                };
-                String fPhase = switch (forecast.trendPhase) {
-                    case EARLY      -> "старт"; case MID  -> "тренд";
-                    case LATE       -> "поздно"; case EXHAUSTION -> "исток";
-                };
-                forecastLine = String.format("\n🔮 %s %s", fBias, fPhase);
-            }
-
-            // ── Время с секундами ─────────────────────────────────────
+            // Время
             String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
                     .toLocalTime().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
 
-            // ── Строка R:R + SIZE + FR ────────────────────────────────
-            StringBuilder bottomLine = new StringBuilder();
-            if (rr > 0) bottomLine.append(String.format("R/R: 1:%.1f", rr));
-            if (!sizeStr.isEmpty()) {
-                if (bottomLine.length() > 0) bottomLine.append(" | ");
-                bottomLine.append(sizeStr);
-            }
-            if (!frStr.isEmpty()) bottomLine.append(frStr);
+            // R:R
+            String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
 
             return String.format(
-                    "%s *%s* → *%s %s* %s%n"
-                            + "💰 Цена:   `" + fmt + "`%n"
-                            + "🎯 Вер-ть: *%.0f%%*%s%n"
-                            + "🛑 SL:     `" + fmt + "`  (риск %.2f%%)%n"
-                            + "🟢 TP1:    `" + fmt + "`  (+%.2f%%)  ← 50%% позиции%n"
-                            + "🔵 TP2:    `" + fmt + "`  (+%.2f%%)  ← 30%% позиции%n"
-                            + "💎 TP3:    `" + fmt + "`  (+%.2f%%)  ← 20%% трейл%n"
-                            + "🏷 %s | %s%n"
-                            + "%s"
+                    "%s *%s %s* %s | %s%n"
+                            + "📍 `%s` | %s%n"
+                            + "━━━━━━━━━━━━━━━━━━%n"
+                            + "💰 Вход: `" + fmt + "`%n"
+                            + "🛑 SL:   `" + fmt + "` (%.2f%%)%n"
+                            + "🟢 TP1:  `" + fmt + "` (+%.2f%%)%n"
+                            + "🔵 TP2:  `" + fmt + "` (+%.2f%%)%n"
+                            + "💎 TP3:  `" + fmt + "` (+%.2f%%)%n"
+                            + "━━━━━━━━━━━━━━━━━━%n"
+                            + "🎯 *%.0f%%* | R:R *%s*%s%s%n"
+                            + "%s%n"
                             + "_⏰ %s_",
-                    confEmoji, symbol, sideEmoji, sideStr, assetStr,
+                    confEmoji, sideEmoji, sideStr, catStr, sector,
+                    tvTicker, comparable,
                     price,
-                    probability, forecastLine,
                     stop, riskPct,
                     tp1, rp1Pct,
                     tp2, rp2Pct,
                     tp3, rp3Pct,
-                    flagStr, bottomLine,
-                    assetWarn.isEmpty() ? "" : assetWarn + "\n",
+                    probability, rrStr,
+                    sizeStr.isEmpty() ? "" : " | " + sizeStr,
+                    frLine,
+                    "", // reserved
                     time);
         }
 
@@ -1161,6 +1182,38 @@ public final class DecisionEngineMerged {
         boolean adxRangePenalty = false;
         if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) {
             adxRangePenalty = true;
+        }
+
+        // ════════════════════════════════════════════════════════
+        // [v38.0] REGIME FILTER — блокировка нечитаемого рынка
+        // Если ADX < 12 И ATR в нижнем 15-м перцентиле И рынок RANGE
+        // → структура отсутствует, любой сигнал = монетка.
+        // Исключение: aggressiveShort (BTC crash) пробивает фильтр.
+        // ════════════════════════════════════════════════════════
+        if (!aggressiveShort && state == MarketState.RANGE) {
+            double adxVal = adx(c15, 14);
+            double atrPct = atr14 / (price + 1e-9);
+            // ATR percentile: сравниваем текущий ATR с историческим
+            double atrPctile = com.bot.TradingCore.atrPercentile(c15, 14, 96);
+            if (adxVal < 12 && atrPctile < 0.15) {
+                // Рынок абсолютно плоский — нет edge ни для тренда, ни для mean reversion
+                return null;
+            }
+            // В RANGE с низким ADX — только mean-reversion (RSI extreme), NO trend-following
+            if (adxVal < 18 && atrPctile < 0.25) {
+                double rsi14 = rsi(c15, 14);
+                // Допускаем только extreme RSI в RANGE (mean-reversion)
+                if (rsi14 > 25 && rsi14 < 75) return null; // ни перекуплено, ни перепродано
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // [v38.0] SYMBOL NAME FILTER — блокировка мусорных пар
+        // Пары с не-ASCII символами (иероглифы, спецзнаки) = неликвид
+        // ════════════════════════════════════════════════════════
+        for (int ci = 0; ci < symbol.length(); ci++) {
+            char ch = symbol.charAt(ci);
+            if (ch > 127) return null; // не-ASCII = мусорная пара
         }
 
         int n15 = c15.size();
@@ -1528,10 +1581,24 @@ public final class DecisionEngineMerged {
         FundingOIData frData = fundingCache.get(symbol);
         boolean hasFR = false;
         double fundingRate = 0, fundingDelta = 0, oiChange = 0;
+        // [v38.0] Funding Rate Confidence Filter
+        // FR > +0.05% → ритейл переплачивает за LONG → штраф -10 для LONG, бонус +5 для SHORT
+        // FR < -0.05% → ритейл переплачивает за SHORT → штраф -10 для SHORT, бонус +5 для LONG
+        double frConfPenaltyLong  = 0;
+        double frConfPenaltyShort = 0;
         if (frData != null && frData.isValid()) {
             fundingRate  = frData.fundingRate;
             fundingDelta = frData.fundingDelta;
             oiChange     = frData.oiChange1h;
+
+            // [v38.0] FR CONFIDENCE ADJUSTMENT — один из немногих бесплатных edge в крипте
+            if (fundingRate > 0.0005) { // +0.05%: crowded long
+                frConfPenaltyLong  = -Math.min(12, fundingRate / 0.0005 * 5); // до -12 для LONG
+                frConfPenaltyShort = Math.min(8, fundingRate / 0.0005 * 3);   // до +8 для SHORT
+            } else if (fundingRate < -0.0005) { // -0.05%: crowded short
+                frConfPenaltyShort = Math.max(-12, fundingRate / 0.0005 * 5); // до -12 для SHORT
+                frConfPenaltyLong  = Math.min(8, Math.abs(fundingRate) / 0.0005 * 3); // до +8 для LONG
+            }
 
             // ── Baseline FR directional signals (existing) ──────────────────
             if (fundingRate < -0.0005) { cDerivatives.addLong(mctx.s(0.45), "FR_NEG"); hasFR = true; }
@@ -1542,37 +1609,22 @@ public final class DecisionEngineMerged {
             if (oiChange < -3.0 && move5 < 0) cDerivatives.boostShort(mctx.s(0.25), "OI_DN");
 
             // [MODULE 1 v33] FR MOMENTUM — 2nd derivative signals.
-            // These fire EARLIER than baseline FR signals because they detect the
-            // rate-of-change turning BEFORE the extreme is reached.
-            //
-            // PEAK WARNING: FR is high AND acceleration is turning negative.
-            // Interpretation: longs are over-leveraged, funding squeeze is imminent.
-            // Smart money is already building shorts into this condition.
-            // → Strong SHORT bias, even if price is still rising.
             if (frData.frPeakWarning) {
-                cDerivatives.addShort(mctx.s(0.55), "FR_PEAK_WARN"); // stronger than FR_POS
+                cDerivatives.addShort(mctx.s(0.55), "FR_PEAK_WARN");
                 hasFR = true;
             }
-
-            // TROUGH WARNING: FR is very negative AND acceleration is turning positive.
-            // Interpretation: shorts are paying max funding, squeeze is building.
-            // → Strong LONG bias, mean-reversion or squeeze bounce setup.
             if (frData.frTroughWarning) {
-                cDerivatives.addLong(mctx.s(0.55), "FR_TROUGH_WARN"); // stronger than FR_NEG
+                cDerivatives.addLong(mctx.s(0.55), "FR_TROUGH_WARN");
                 hasFR = true;
             }
 
-            // ACCELERATION DIVERGENCE: FR accelerating AGAINST price move.
-            // Example: price pumping UP but FR accelerating negatively (delta getting worse for longs)
-            // = institutional shorts increasing exposure INTO the pump = distribution.
+            // ACCELERATION DIVERGENCE
             boolean priceUp   = move5 > 0.003;
             boolean priceDown = move5 < -0.003;
             if (priceUp   && frData.frAcceleration < -0.0002) {
-                // Price up but FR momentum turning south → probable pump-and-dump
                 cDerivatives.boostShort(mctx.s(0.30), "FR_ACCEL_DIV_BEAR");
             }
             if (priceDown && frData.frAcceleration > 0.0002) {
-                // Price down but FR momentum turning bullish → probable capitulation bottom
                 cDerivatives.boostLong(mctx.s(0.30), "FR_ACCEL_DIV_BULL");
             }
         }
@@ -2063,6 +2115,15 @@ public final class DecisionEngineMerged {
         // Probability already mildly dipped above. No further deduction needed.
         if (lateEntryPenalty) allFlags.add("LATE_ENTRY_SIZE_CUT");
 
+        // [v38.0] FUNDING RATE CONFIDENCE ADJUSTMENT — applied after all cluster logic
+        boolean _isLong = (side == com.bot.TradingCore.Side.LONG);
+        double frAdj = _isLong ? frConfPenaltyLong : frConfPenaltyShort;
+        if (Math.abs(frAdj) > 0.5) {
+            probability = Math.max(50, Math.min(85, probability + frAdj));
+            if (frAdj < -3) allFlags.add("FR_CROWD_PENALTY");
+            if (frAdj > 3)  allFlags.add("FR_EDGE_BOOST");
+        }
+
         double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
             minConf = Math.max(45.0, minConf - 8.0);
@@ -2506,6 +2567,9 @@ public final class DecisionEngineMerged {
         // Category adjustment
         if (cat == CoinCategory.MEME)               prob -= 5.0;
         else if (cat == CoinCategory.ALT)           prob -= 2.0;
+
+        // [v38.0] MEME MINIMUM THRESHOLD — для MEME поднимаем минимальный порог до 72
+        if (cat == CoinCategory.MEME && prob < 72) return 40;
 
         // Historical calibration
         Deque<CalibRecord> hist = calibHist.get(symbol);

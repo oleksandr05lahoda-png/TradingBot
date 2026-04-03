@@ -29,7 +29,7 @@ public final class SimpleBacktester {
     private double initialBalance   = 100.0;
     private double takerFee         = 0.0004;     // 0.04% per side
     private double fundingPer15m    = 0.0001 / 32; // ~0.01%/8h → per 15m
-    private int    maxConcurrent    = 8;
+    private int    maxConcurrent    = 6;           // [v38.0] 8→6: aligned with ISC MAX_GLOBAL
     private int    timeStopBars     = 6;           // 90 min at 15m
     private boolean compound        = true;
     private boolean useM1Resolution = true;

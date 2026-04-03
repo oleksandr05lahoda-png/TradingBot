@@ -826,6 +826,14 @@ public final class SignalSender {
     private List<String> selectPairsForScan(int budget) {
         if (cachedPairs.isEmpty()) return List.of();
         List<String> sorted = new ArrayList<>(cachedPairs);
+        // [v38.0] GARBAGE PAIR FILTER — remove non-ASCII symbols (Chinese chars, etc.)
+        // These are low-liquidity micro-cap tokens with manipulated order books.
+        sorted.removeIf(pair -> {
+            for (int i = 0; i < pair.length(); i++) {
+                if (pair.charAt(i) > 127) return true;
+            }
+            return false;
+        });
         sorted.sort((a, b) -> Double.compare(
                 volume24hUSD.getOrDefault(b, 0.0),
                 volume24hUSD.getOrDefault(a, 0.0)));
@@ -1161,6 +1169,12 @@ public final class SignalSender {
             if (qualityPenalty > 0.0) {
                 posSize *= Math.max(0.55, 1.0 - qualityPenalty * 0.06);
             }
+            // [v38.0] CORRELATION SIZE REDUCTION
+            // Каждая дополнительная позиция в том же направлении уменьшает размер.
+            // 8 ALT LONG = фактически 1 позиция с 8× риском (corr ~0.85).
+            double corrMult = correlationGuard.getCorrelationSizeMultiplier(pair, idea.side, cat);
+            posSize *= corrMult;
+
             List<String> nf = new ArrayList<>(idea.flags);
             String sizeMode = isc.isSurvivalMode() ? " 🆘SURVIVAL"
                     : isc.isCautiousMode() ? " ⚠️CAUTIOUS" : "";
@@ -1952,12 +1966,20 @@ public final class SignalSender {
         private int topLongCount = 0, topShortCount = 0;
         private final Map<String, Integer> sectorDirCount = new HashMap<>();
         private final Set<String> registered = new HashSet<>();
-        // Limits stay directional, but are configurable so a 100-pair scanner
-        // is not silently stuck at the old "6 per side" profile.
-        private static final int MAX_DIR_NORMAL  = envInt("CORR_MAX_DIR_NORMAL", 10);
-        private static final int MAX_DIR_WEEKEND = envInt("CORR_MAX_DIR_WEEKEND", 6);
-        private static final int MAX_SECTOR      = envInt("CORR_MAX_SECTOR_SAME_DIR", 4);
-        private static final int MAX_TOP_SAME_DIR= envInt("CORR_MAX_TOP_SAME_DIR", 4);
+
+        // [v38.0] TIGHTENED LIMITS — 8 ALT in one direction = suicide
+        // MAX_DIR reduced from 10→5 (normal), 6→3 (weekend)
+        // MAX_SECTOR reduced from 4→2
+        private static final int MAX_DIR_NORMAL  = envInt("CORR_MAX_DIR_NORMAL", 5);
+        private static final int MAX_DIR_WEEKEND = envInt("CORR_MAX_DIR_WEEKEND", 3);
+        private static final int MAX_SECTOR      = envInt("CORR_MAX_SECTOR_SAME_DIR", 2);
+        private static final int MAX_TOP_SAME_DIR= envInt("CORR_MAX_TOP_SAME_DIR", 2);
+        // [v38.0] MAX_TOTAL — absolute cap on simultaneous open positions
+        private static final int MAX_TOTAL       = envInt("CORR_MAX_TOTAL", 6);
+        // [v38.0] MAX_SAME_SIDE_ALT — ALTs are 0.85+ correlated with BTC
+        private static final int MAX_ALT_SAME_DIR = envInt("CORR_MAX_ALT_SAME_DIR", 3);
+
+        private int altLongCount = 0, altShortCount = 0;
 
         private static boolean isWeekend() {
             java.time.DayOfWeek d = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getDayOfWeek();
@@ -1969,15 +1991,44 @@ public final class SignalSender {
             shortCount = 0;
             topLongCount = 0;
             topShortCount = 0;
+            altLongCount = 0;
+            altShortCount = 0;
             sectorDirCount.clear();
             registered.clear();
         }
 
+        /**
+         * [v38.0] CORRELATION-AWARE POSITION SIZING
+         * Returns multiplier [0.0, 1.0] for position size reduction.
+         * If too many correlated positions are open → shrink new position.
+         */
+        double getCorrelationSizeMultiplier(String pair, com.bot.TradingCore.Side side,
+                                            com.bot.DecisionEngineMerged.CoinCategory cat) {
+            // ALTs are ~0.85 correlated with each other
+            int sameDir = side == com.bot.TradingCore.Side.LONG ? longCount : shortCount;
+            if (sameDir == 0) return 1.0;
+            // Each additional same-direction position reduces size by 15%
+            double mult = Math.max(0.30, 1.0 - sameDir * 0.15);
+            // MEME gets extra reduction
+            if (cat == com.bot.DecisionEngineMerged.CoinCategory.MEME) mult *= 0.70;
+            return mult;
+        }
+
         synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
+            // [v38.0] Total position cap
+            if (longCount + shortCount >= MAX_TOTAL) return false;
+
             int maxDir = isWeekend() ? MAX_DIR_WEEKEND : MAX_DIR_NORMAL;
             if (side == com.bot.TradingCore.Side.LONG  && longCount  >= maxDir) return false;
             if (side == com.bot.TradingCore.Side.SHORT && shortCount >= maxDir) return false;
+
+            // [v38.0] ALT correlation guard — max 3 ALTs in same direction
+            if (cat == com.bot.DecisionEngineMerged.CoinCategory.ALT) {
+                int altSameDir = side == com.bot.TradingCore.Side.LONG ? altLongCount : altShortCount;
+                if (altSameDir >= MAX_ALT_SAME_DIR) return false;
+            }
+
             if (sector != null && sectorDirCount.getOrDefault(sector + "_" + side.name(), 0) >= MAX_SECTOR) return false;
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
                 int topSameDir = side == com.bot.TradingCore.Side.LONG ? topLongCount : topShortCount;
@@ -1993,6 +2044,9 @@ public final class SignalSender {
             if (side == com.bot.TradingCore.Side.LONG) longCount++; else shortCount++;
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
                 if (side == com.bot.TradingCore.Side.LONG) topLongCount++; else topShortCount++;
+            }
+            if (cat == com.bot.DecisionEngineMerged.CoinCategory.ALT) {
+                if (side == com.bot.TradingCore.Side.LONG) altLongCount++; else altShortCount++;
             }
             if (sector != null) sectorDirCount.merge(sector + "_" + side.name(), 1, Integer::sum);
         }
