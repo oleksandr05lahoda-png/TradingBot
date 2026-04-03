@@ -444,19 +444,9 @@ public final class BotMain {
                 continue;
             }
 
-            // [v34.0] Add asset type header to signal dispatch
-            com.bot.DecisionEngineMerged.AssetType dispatchAssetType =
-                    com.bot.DecisionEngineMerged.detectAssetType(s.symbol);
-            String dispatchCatStr = s.category == com.bot.DecisionEngineMerged.CoinCategory.MEME ? "🐸 MEME"
-                    : s.category == com.bot.DecisionEngineMerged.CoinCategory.TOP ? "👑 TOP" : "🔷 ALT";
-            String signalHeader = dispatchAssetType.emoji + " " + dispatchAssetType.label
-                    + " | " + dispatchCatStr;
-            // Non-crypto warning
-            if (dispatchAssetType != com.bot.DecisionEngineMerged.AssetType.CRYPTO
-                    && dispatchAssetType != com.bot.DecisionEngineMerged.AssetType.UNKNOWN) {
-                signalHeader += "\n⚠️ _Не крипта — проверь доступность на бирже_";
-            }
-            telegram.sendMessageAsync(signalHeader + "\n" + s.toTelegramString());
+            // [v35.0] CLEAN DISPATCH — toTelegramString() is self-contained now.
+            // No external header needed. Removes duplicate category/type info.
+            telegram.sendMessageAsync(s.toTelegramString());
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
             String forecastInfo = "N/A";
@@ -1424,28 +1414,24 @@ public final class BotMain {
         // [v34.0] Asset type auto-detection for advance forecast
         com.bot.DecisionEngineMerged.AssetType assetType =
                 com.bot.DecisionEngineMerged.detectAssetType(pair);
-        String assetLabel = assetType.emoji + " " + assetType.label;
+        String assetLabel = assetType == com.bot.DecisionEngineMerged.AssetType.CRYPTO
+                ? "🪙 Крипта" : assetType.emoji + " " + assetType.label;
 
-        return String.format(
-                "🔔 *ADVANCE FORECAST* | %s\n"
-                        + "🏷 %s\n"
-                        + "━━━━━━━━━━━━━━━━━━━━━\n"
-                        + "%s *%s*\n"
-                        + "\n"
-                        + "⚡ Сила сигнала: %s\n"
-                        + "🔮 Фаза: %s\n"
-                        + "%s%s%s%s\n"
-                        + "━━━━━━━━━━━━━━━━━━━━━\n"
-                        + "💡 _Это прогноз, не сигнал входа._\n"
-                        + "_Жди подтверждения от бота._\n"
-                        + "_⏰ %s_",
-                pair,
-                assetLabel,
-                eventEmoji, eventType,
-                confBar,
-                phaseDesc,
-                vsaLine, btcLine, moveLine, magnetLine,
-                time);
+        // [v35.0] Compact forecast format — same style as signal
+        StringBuilder body = new StringBuilder();
+        body.append(String.format("🔔 *ПРОГНОЗ* • #%s%n", pair));
+        body.append(String.format("%s%n", assetLabel));
+        body.append("━━━━━━━━━━━━━━━━━━━━\n");
+        body.append(String.format("%s %s%n", eventEmoji, eventType));
+        body.append(String.format("⚡ %s%n", confBar));
+        if (!vsaLine.isEmpty()) body.append(vsaLine.stripLeading()).append("\n");
+        if (!btcLine.isEmpty()) body.append(btcLine.stripLeading()).append("\n");
+        if (fc.magnetLevel > 0) body.append(String.format("🧲 Магнит: %.4f%n", fc.magnetLevel));
+        body.append("━━━━━━━━━━━━━━━━━━━━\n");
+        body.append("💡 _Прогноз, не сигнал. Жди подтверждения._\n");
+        body.append(String.format("_⏰ %s Warsaw_", time));
+
+        return body.toString();
     }
 
     /** Строит визуальную шкалу уверенности [0..1] → █████░░░░░ */

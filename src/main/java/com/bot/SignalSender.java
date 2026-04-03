@@ -2214,10 +2214,12 @@ public final class SignalSender {
      * Drains earlyTickBuffer atomically. Sorts remaining candidates by probability (desc),
      * then dispatches each one: sends to Telegram, registers with ISC, tracks in BotMain.
      *
-     * This converts the old "fire immediately on every tick" approach into a controlled
-     * "collect 2 seconds of candidates, pick best, send once" approach.
-     * Result: eliminates bursts of 5+ duplicate EARLY_TICK messages on the same pair.
+     * [v35.0] MAX 3 signals per flush — prevents 9 signals in 2 minutes.
+     * When BTC moves, all ALTs correlate → 30 pairs fire simultaneously.
+     * Sending all 30 to Telegram = information overload. Top 3 is plenty.
      */
+    private static final int MAX_EARLY_PER_FLUSH = 3;
+
     private void flushEarlyTickBuffer() {
         if (earlyTickBuffer.isEmpty()) return;
 
@@ -2233,6 +2235,11 @@ public final class SignalSender {
         candidates.sort(Comparator.comparingDouble(
                 (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
 
+        // [v35.0] Cap to top-N best signals per flush
+        if (candidates.size() > MAX_EARLY_PER_FLUSH) {
+            candidates = new ArrayList<>(candidates.subList(0, MAX_EARLY_PER_FLUSH));
+        }
+
         // [v17.0 §4] Apply REDUCED_RISK flag from DrawdownManager
         String rrFlag = isc.getReducedRiskFlag();
         double rrMult = isc.getReducedRiskMultiplier();
@@ -2244,7 +2251,22 @@ public final class SignalSender {
             // [v34.0] EARLY_TICK hourly rate limit — max 3 per pair per hour
             if (earlyTickHourlyLimitReached(et.symbol)) continue;
 
-            // [v34.0 FIX] Categorize BEFORE using cat — was causing "Cannot resolve symbol 'cat'"
+            // [v35.0] VOLUME FILTER for EARLY_TICK — blocks trash coins.
+            // Problem: RIVERUSDT, SIRENUSDT, VVVUSDT pass EARLY_TICK without
+            // any liquidity check. Their $2M daily volume = untradeable.
+            // Fix: same MIN_VOL check as processPair.
+            Double etVol = volume24hUSD.get(et.symbol);
+            if (etVol != null) {
+                com.bot.DecisionEngineMerged.CoinCategory etCatCheck = categorizePair(et.symbol);
+                double minVol = switch (etCatCheck) {
+                    case TOP  -> MIN_VOL_TOP_USD;
+                    case ALT  -> MIN_VOL_ALT_USD;
+                    case MEME -> MIN_VOL_MEME_USD;
+                };
+                if (etVol < minVol) continue; // Skip illiquid pair
+            }
+
+            // [v34.0 FIX] Categorize BEFORE using cat
             com.bot.DecisionEngineMerged.CoinCategory cat =
                     et.category != null ? et.category : categorizePair(et.symbol);
             String sector = detectSector(et.symbol);
@@ -2253,9 +2275,8 @@ public final class SignalSender {
             com.bot.DecisionEngineMerged.TradeIdea finalEt = et;
             if (!rrFlag.isEmpty()) {
                 List<String> nf = new ArrayList<>(et.flags);
-                // Replace existing size flag with reduced-risk adjusted size
                 nf.removeIf(f -> f.startsWith("SIZE="));
-                double baseSize = 20.0; // default; real value already in flags
+                double baseSize = 20.0;
                 for (String f : et.flags) {
                     if (f.startsWith("SIZE=")) {
                         try { baseSize = Double.parseDouble(f.replace("SIZE=", "").replace("$", "").split(" ")[0]); }
@@ -2266,21 +2287,10 @@ public final class SignalSender {
                 finalEt = rebuildIdea(et, et.probability, nf);
             }
 
-            // [v34.0] Show asset type + category instead of generic "EARLY TICK"
-            com.bot.DecisionEngineMerged.AssetType assetType =
-                    com.bot.DecisionEngineMerged.detectAssetType(finalEt.symbol);
-            String earlyLabel = assetType.emoji + " " + assetType.label;
-            String catLabel = cat == com.bot.DecisionEngineMerged.CoinCategory.MEME ? "🐸 MEME"
-                    : cat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? "👑 TOP" : "🔷 ALT";
-            String headerLine = "🎯 *EARLY TICK* | " + earlyLabel + " " + catLabel;
-            // [v34.0] Non-crypto tradability warning
-            if (assetType != com.bot.DecisionEngineMerged.AssetType.CRYPTO
-                    && assetType != com.bot.DecisionEngineMerged.AssetType.UNKNOWN) {
-                headerLine += "\n⚠️ _Не крипта — проверь на бирже_";
-            }
-            bot.sendMessageAsync(headerLine + "\n" + finalEt.toTelegramString());
+            // [v35.0] CLEAN DISPATCH — toTelegramString() is now self-contained.
+            // No external header needed. Just send the signal directly.
+            bot.sendMessageAsync(finalEt.toTelegramString());
             earlySignals.incrementAndGet();
-            // [v34.0] Record for hourly rate limit
             recordEarlyTickSent(finalEt.symbol);
             registerApprovedSignal(finalEt, finalEt.symbol, cat, sector,
                     System.currentTimeMillis(), true);
