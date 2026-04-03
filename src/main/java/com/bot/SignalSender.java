@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  SignalSender — GODBOT PRO EDITION v34.0                                ║
+ * ║  SignalSender — GODBOT PRO EDITION v36.0                                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  [v34.0] Dynamic CoinCategory: volume-based TOP, keyword MEME          ║
  * ║  [v34.0] Extended detectSector: AI, RWA, DePin, Commodities, Metals    ║
@@ -190,7 +190,7 @@ public final class SignalSender {
 
     // [FIX-BLIND] Буфер 1m свечей для LiveCandleAssembler
     private final Map<String, List<com.bot.TradingCore.Candle>> liveM1Buffer = new ConcurrentHashMap<>();
-    private static final int LIVE_M1_BUFFER_SIZE = 20;
+    private static final int LIVE_M1_BUFFER_SIZE = 240; // [v36-FIX] 4h of 1m bars from WS ticks
 
     private final Map<String, Long> lastFetchTime = new ConcurrentHashMap<>();
 
@@ -375,6 +375,156 @@ public final class SignalSender {
     private final CorrelationGuard correlationGuard;
     private final ExecutorService fetchPool;
 
+    // ══════════════════════════════════════════════════════════════
+    //  [v36-FIX Дыра3] ORDER EXECUTOR — встроен в SignalSender
+    //  Включается через env ENABLE_AUTO_TRADE=1.
+    //  При 0 — работает в режиме сигналов (текущее поведение).
+    //  Исполняет: MARKET entry + STOP_MARKET SL + TAKE_PROFIT TP1.
+    //  API-ключи берутся из уже существующих полей API_KEY / API_SECRET.
+    // ══════════════════════════════════════════════════════════════
+    private static final boolean AUTO_TRADE_ENABLED =
+            "1".equals(System.getenv("ENABLE_AUTO_TRADE"));
+    private static final int AUTO_TRADE_LEVERAGE =
+            Integer.parseInt(System.getenv().getOrDefault("AUTO_TRADE_LEVERAGE", "5"));
+
+    /**
+     * Выставляет MARKET ордер + STOP_MARKET SL + TAKE_PROFIT_MARKET TP1.
+     * Вызывается после dispatch сигнала если ENABLE_AUTO_TRADE=1.
+     * Полностью асинхронный — не блокирует цикл.
+     */
+    public void executeOrderAsync(com.bot.DecisionEngineMerged.TradeIdea idea, double sizeUsdt) {
+        if (!AUTO_TRADE_ENABLED) return;
+        if (API_KEY.isBlank() || API_SECRET.isBlank()) {
+            System.out.println("[OE] ENABLE_AUTO_TRADE=1 но API ключи не заданы — пропуск");
+            return;
+        }
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                String side      = idea.side == com.bot.TradingCore.Side.LONG ? "BUY"  : "SELL";
+                String closeSide = idea.side == com.bot.TradingCore.Side.LONG ? "SELL" : "BUY";
+
+                // 1. Установить плечо
+                oeSetLeverage(idea.symbol, AUTO_TRADE_LEVERAGE);
+                Thread.sleep(200);
+
+                // 2. Рассчитать quantity
+                double qty = (sizeUsdt * AUTO_TRADE_LEVERAGE) / idea.price;
+                String qtyStr = oeFormatQty(idea.symbol, qty);
+
+                // 3. MARKET entry
+                long orderId = oePlaceOrder(idea.symbol, side, "MARKET", qtyStr, 0, false);
+                if (orderId < 0) {
+                    bot.sendMessageAsync("❌ [AUTO] MARKET failed: " + idea.symbol);
+                    return;
+                }
+                Thread.sleep(300);
+
+                // 4. STOP_MARKET SL — reduceOnly=true
+                oePlaceOrder(idea.symbol, closeSide, "STOP_MARKET", qtyStr, idea.stop, true);
+                Thread.sleep(200);
+
+                // 5. TAKE_PROFIT_MARKET TP1 — reduceOnly=true
+                oePlaceOrder(idea.symbol, closeSide, "TAKE_PROFIT_MARKET", qtyStr, idea.tp1, true);
+
+                bot.sendMessageAsync(String.format(
+                        "✅ [AUTO EXEC] %s %s\n"
+                                + "📌 Entry MARKET | SL: `%.4f` | TP1: `%.4f`\n"
+                                + "💰 Размер: $%.1f × %dx лечо",
+                        idea.symbol, idea.side, idea.stop, idea.tp1,
+                        sizeUsdt, AUTO_TRADE_LEVERAGE));
+
+            } catch (Exception e) {
+                System.out.println("[OE] Error " + idea.symbol + ": " + e.getMessage());
+                bot.sendMessageAsync("⚠️ [AUTO] Error " + idea.symbol + ": " + e.getMessage());
+            }
+        }, fetchPool);
+    }
+
+    /** Выставляет ордер на Binance Futures. Возвращает orderId или -1 при ошибке. */
+    private long oePlaceOrder(String symbol, String side, String type,
+                              String qty, double stopPrice, boolean reduceOnly) {
+        try {
+            StringBuilder body = new StringBuilder();
+            body.append("symbol=").append(symbol);
+            body.append("&side=").append(side);
+            body.append("&type=").append(type);
+            body.append("&quantity=").append(qty);
+            if (stopPrice > 0)
+                body.append("&stopPrice=").append(String.format("%.4f", stopPrice));
+            if (reduceOnly)
+                body.append("&reduceOnly=true");
+            body.append("&timestamp=").append(System.currentTimeMillis());
+
+            String sig = oeHmac(body.toString());
+            body.append("&signature=").append(sig);
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://fapi.binance.com/fapi/v1/order"))
+                    .timeout(Duration.ofSeconds(5))
+                    .header("X-MBX-APIKEY", API_KEY)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                    .build();
+
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                System.out.println("[OE] Order error " + resp.statusCode() + ": " + resp.body());
+                return -1;
+            }
+            String r = resp.body();
+            int idx = r.indexOf("\"orderId\":");
+            if (idx < 0) return -1;
+            int start = idx + 10, end = r.indexOf(',', start);
+            if (end < 0) end = r.indexOf('}', start);
+            return Long.parseLong(r.substring(start, end).trim());
+        } catch (Exception e) {
+            System.out.println("[OE] placeOrder exception: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    /** Устанавливает плечо на паре через Binance API. */
+    private void oeSetLeverage(String symbol, int leverage) {
+        try {
+            String body = "symbol=" + symbol + "&leverage=" + leverage
+                    + "&timestamp=" + System.currentTimeMillis();
+            String sig = oeHmac(body);
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://fapi.binance.com/fapi/v1/leverage"))
+                    .timeout(Duration.ofSeconds(5))
+                    .header("X-MBX-APIKEY", API_KEY)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
+                    .build();
+            http.send(req, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception ignored) {}
+    }
+
+    /** Форматирует qty с правильной точностью по типу монеты. */
+    private static String oeFormatQty(String symbol, double qty) {
+        // BTC/ETH — 3 знака; большинство ALT — 1 знак; мелкие монеты — целые
+        if (symbol.startsWith("BTC") || symbol.startsWith("ETH")) return String.format("%.3f", qty);
+        if (qty >= 10) return String.format("%.1f", qty);
+        return String.format("%.0f", qty);
+    }
+
+    /** HMAC-SHA256 подпись для Binance API. */
+    private String oeHmac(String data) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(
+                    API_SECRET.getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] raw = mac.doFinal(
+                    data.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(raw.length * 2);
+            for (byte b : raw) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            throw new RuntimeException("HMAC failed", e);
+        }
+    }
+
     // Stats
     private final AtomicLong totalFetches   = new AtomicLong(0);
     private final AtomicLong cacheHits      = new AtomicLong(0);
@@ -492,7 +642,7 @@ public final class SignalSender {
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
         this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1;
         this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 100);
-        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 100);
+        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 10); // [v36-FIX Дыра10] was 100 → 10 (bookTicker WS covers L1)
         this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 40);
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
@@ -546,7 +696,7 @@ public final class SignalSender {
         wsWatcher.scheduleAtFixedRate(this::checkWsHealth, 30, 30, TimeUnit.SECONDS);
 
         // [v28.0] PATCH #9: Poll depth5 snapshot every 30s for multi-level OBI.
-        wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 30, TimeUnit.SECONDS);
+        wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 60, TimeUnit.SECONDS); // [v36-FIX Дыра10] was 30s → 60s
 
         // [v17.0 §2] EARLY TICK SIGNAL BUFFER FLUSHER — runs every 1500ms.
         // Drains earlyTickBuffer, sorts candidates by probability (highest first),
@@ -763,13 +913,15 @@ public final class SignalSender {
 
     private com.bot.DecisionEngineMerged.TradeIdea processPair(String pair) {
         try {
-            List<com.bot.TradingCore.Candle> m1  = getCached(pair, "1m",  KLINES_LIMIT);
+            // [v36-FIX Дыра1/2] m1 берётся из WS-буфера (aggTrade → MicroCandleBuilder).
+            // REST для 1m больше не вызывается в основном цикле — только холодный старт.
+            // Экономия: ~50 REST запросов/мин × weight=5 = 250 weight/мин.
+            List<com.bot.TradingCore.Candle> m1  = getM1FromWs(pair);
             List<com.bot.TradingCore.Candle> m5  = getCached(pair, "5m",  KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> m15 = getCached15mWithLive(pair); // [FIX-BLIND]
             List<com.bot.TradingCore.Candle> h1  = getCached(pair, "1h",  KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> h2  = getCached(pair, "2h",  120);
-
-            if (m1 != null && !m1.isEmpty()) updateLiveM1Buffer(pair, m1);
+            // updateLiveM1Buffer больше не нужен — буфер заполняется из processAggTrade()
 
             // [ДЫРА №1] CVD — считаем накопленную дельту из 1m свечей
             double cvdNormalized = computeAndStoreCVD(pair, m1);
@@ -1145,6 +1297,10 @@ public final class SignalSender {
         long now = System.currentTimeMillis();
         long current15mStart = (now / (15 * 60_000L)) * (15 * 60_000L);
 
+        // [v36-FIX Дыра2] Если текущая 15m свеча только началась (<2 мин WS-данных),
+        // не отдаём "урезанную" свечу в индикаторы — она исказит ATR и RSI.
+        if (now - current15mStart < 120_000L) return null;
+
         double open = Double.NaN, high = Double.NEGATIVE_INFINITY,
                 low  = Double.POSITIVE_INFINITY, close = Double.NaN;
         double volume = 0, qvol = 0;
@@ -1168,10 +1324,29 @@ public final class SignalSender {
                 current15mStart + 15 * 60_000L - 1);
     }
 
+    /**
+     * [v36-FIX Дыра1/2] Возвращает 1m свечи из WS-буфера (aggTrade → MicroCandleBuilder).
+     * При холодном старте (буфер пуст или < 60 баров) делает ОДИН REST-запрос для посева.
+     * После этого REST для 1m больше не вызывается — только WS-тики.
+     */
+    public List<com.bot.TradingCore.Candle> getM1FromWs(String pair) {
+        List<com.bot.TradingCore.Candle> buf = liveM1Buffer.get(pair);
+        if (buf != null && buf.size() >= 60) return Collections.unmodifiableList(buf);
+
+        // Холодный старт — разовый REST-посев истории
+        List<com.bot.TradingCore.Candle> seed = fetchKlinesDirect(pair, "1m", KLINES_LIMIT);
+        if (seed == null || seed.isEmpty()) {
+            return buf != null ? Collections.unmodifiableList(buf) : Collections.emptyList();
+        }
+        // Начиная с этого момента WS-тики будут дополнять буфер через processAggTrade()
+        liveM1Buffer.put(pair, new ArrayList<>(seed));
+        return Collections.unmodifiableList(seed);
+    }
+
+    /** @deprecated Заменён на getM1FromWs(). Оставлен для совместимости с TradeResolver. */
+    @Deprecated
     private void updateLiveM1Buffer(String pair, List<com.bot.TradingCore.Candle> m1) {
-        if (m1 == null || m1.isEmpty()) return;
-        int start = Math.max(0, m1.size() - LIVE_M1_BUFFER_SIZE);
-        liveM1Buffer.put(pair, new ArrayList<>(m1.subList(start, m1.size())));
+        // no-op: liveM1Buffer теперь заполняется исключительно из processAggTrade()
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1827,26 +2002,48 @@ public final class SignalSender {
     //  CANDLE CACHE
     // ══════════════════════════════════════════════════════════════
 
+    // [v36-FIX Дыра5] Per-key cache locks — предотвращают stampede.
+    // Без этого 34 потока fetchPool одновременно вызывают fetchKlinesDirect() для одного ключа
+    // при cache-miss → N×weight REST запросов вместо одного.
+    private final ConcurrentHashMap<String, Object> cacheLocks = new ConcurrentHashMap<>();
+
     private List<com.bot.TradingCore.Candle> getCached(String symbol, String interval, int limit) {
         String key = symbol + "_" + interval;
         long   ttl = CACHE_TTL.getOrDefault(interval, 60_000L);
-        CachedCandles cached = candleCache.get(key);
         totalFetches.incrementAndGet();
+
+        // Fast path: без блокировки если кэш свежий
+        CachedCandles cached = candleCache.get(key);
         if (cached != null && !cached.isStale(ttl) && !cached.candles.isEmpty()) {
-            cacheHits.incrementAndGet(); return cached.candles;
+            cacheHits.incrementAndGet();
+            return cached.candles;
         }
-        List<com.bot.TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
-        if (!fresh.isEmpty()) { candleCache.put(key, new CachedCandles(fresh)); lastFetchTime.put(key, System.currentTimeMillis()); }
-        // [v24.0 FIX WEAK-5] Hard staleness guard: if cache > 3x TTL and fetch failed,
-        // return EMPTY instead of ancient data. Old code returned stale cache silently →
-        // bot traded on 30-minute-old prices when WebSocket was down.
-        else if (cached != null && !cached.isStale(ttl * 3)) return cached.candles;
-        else if (cached != null) {
-            System.out.printf("[STALE] %s cache too old (%ds), skipping%n",
-                    key, (System.currentTimeMillis() - cached.fetchedAt) / 1000);
-            return Collections.emptyList();
+
+        // Slow path: один поток обновляет, остальные ждут
+        Object lock = cacheLocks.computeIfAbsent(key, k -> new Object());
+        synchronized (lock) {
+            // Re-check внутри блокировки
+            cached = candleCache.get(key);
+            if (cached != null && !cached.isStale(ttl) && !cached.candles.isEmpty()) {
+                cacheHits.incrementAndGet();
+                return cached.candles;
+            }
+
+            List<com.bot.TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
+            if (!fresh.isEmpty()) {
+                candleCache.put(key, new CachedCandles(fresh));
+                lastFetchTime.put(key, System.currentTimeMillis());
+                return fresh;
+            }
+            // [v24.0 FIX WEAK-5] Staleness guard
+            if (cached != null && !cached.isStale(ttl * 3)) return cached.candles;
+            if (cached != null) {
+                System.out.printf("[STALE] %s cache too old (%ds), skipping%n",
+                        key, (System.currentTimeMillis() - cached.fetchedAt) / 1000);
+                return Collections.emptyList();
+            }
+            return fresh;
         }
-        return fresh;
     }
 
     public List<com.bot.TradingCore.Candle> fetchKlines(String symbol, String interval, int limit) {
@@ -2073,7 +2270,17 @@ public final class SignalSender {
         vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.pollFirst();
         lastTickPrice.put(pair, price);
         lastTickTime.put(pair, ts);
-        microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(30_000)).addTick(ts, price, qty);
+        // [v36-FIX Дыра1/2] Wire WS tick → liveM1Buffer (1m candle from aggTrade)
+        Optional<com.bot.TradingCore.Candle> closedM1 =
+                microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(60_000))
+                        .addTick(ts, price, qty);
+        closedM1.ifPresent(c -> liveM1Buffer.compute(pair, (k, existing) -> {
+            List<com.bot.TradingCore.Candle> buf =
+                    existing != null ? new ArrayList<>(existing) : new ArrayList<>();
+            buf.add(c);
+            if (buf.size() > LIVE_M1_BUFFER_SIZE) buf.subList(0, buf.size() - LIVE_M1_BUFFER_SIZE).clear();
+            return buf;
+        }));
 
         if (ENABLE_EARLY_TICK) {
             com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
@@ -2695,6 +2902,9 @@ public final class SignalSender {
     }
 
     public double getAccountBalance() { return accountBalance; }
+    // [v36-FIX Дыра3] Accessors for OrderExecutor (авто-исполнение)
+    public String getApiKey()    { return API_KEY; }
+    public String getSecretKey() { return API_SECRET; }
 
     /**
      * [MODULE 4 v33] Returns top N pairs by 24h USD volume for Advance Forecast scanning.

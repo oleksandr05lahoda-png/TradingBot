@@ -1636,6 +1636,26 @@ public final class TradingCore {
             }
         }
 
+        // [v36-FIX Дыра4] Static factor weight maps — нет new HashMap() на каждый вызов forecast().
+        // Удалены мультиколлинеарные факторы: LR_8 (≈SWING), Fisher (≈OF/dir), SQUEEZE (шум, вес=0.5).
+        // 5 оставшихся факторов покрывают структуру рынка (HTF, SWING), поток ордеров (OF),
+        // истощение тренда (EXHAUSTION) и объёмный профиль (VPOC_PULL).
+        private static final Map<String, Double> FW_BASE = Map.of(
+                "HTF",        3.0,  // часовой тренд — наиболее надёжный
+                "OF",         3.0,  // orderflow / CVD — институциональный след
+                "SWING",      2.0,  // рыночная структура HH/HL
+                "EXHAUSTION", 2.0,  // истощение движения
+                "VPOC_PULL",  1.5   // объёмный профиль
+        );
+        // В режиме сжатия (squeeze) структурный пробой важнее трендовых индикаторов
+        private static final Map<String, Double> FW_SQUEEZE = Map.of(
+                "HTF",        1.0,
+                "OF",         1.5,
+                "SWING",      4.0,  // пробой структуры = главный сигнал
+                "EXHAUSTION", 1.0,
+                "VPOC_PULL",  1.0
+        );
+
         public ForecastResult forecast(List<Candle> c5, List<Candle> c15,
                                        List<Candle> c1h, double volumeDelta) {
             if (c15 == null || c15.size() < 100 || c1h == null || c1h.size() < 50) return null;
@@ -1782,31 +1802,18 @@ public final class TradingCore {
             // [ДЫРА №3] Раньше все факторы имели одинаковый вес.
             // HTF (часовой тренд) и OF (orderflow/CVD) = фундаментальные.
             // LR_8 и FISHER = быстрые осцилляторы, менее надёжны.
-            // Веса: HTF×3, OF×3, SWING×2, EXHAUST×2, LR×1, FISHER×1
+            // Веса: HTF×3, OF×3, SWING×2, EXHAUST×2, VPOC×1.5
+            // [v36-FIX Дыра4] FACTOR_WEIGHTS вынесены в static final (нет аллокаций на каждый вызов).
+            // Удалены мультиколлинеарные факторы: LR_8 (≈SWING), Fisher (≈OF/dir), SQUEEZE (шум вес=0.5).
+            // Оставлены 5 ключевых факторов с наибольшей предиктивной силой.
             // ═══════════════════════════════════════════════════════
             double conf;
             if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
                 conf = clamp(0.50 + exhaustionScore * 0.30, 0.50, 0.85);
             } else {
-                // Взвешенные веса по классу фактора
-                Map<String, Double> FACTOR_WEIGHTS = new HashMap<>(Map.of(
-                        "HTF",      3.0,   // часовой тренд — самый надёжный
-                        "OF",       3.0,   // orderflow/CVD — институциональный след
-                        "SWING",    2.0,   // рыночная структура HH/HL
-                        "EXHAUSTION", 2.0, // истощение движения
-                        "LR_8",     1.0,   // быстрый slope — шумный
-                        "FISHER",   1.0,   // осциллятор — вторичный
-                        "VPOC_PULL",1.5,   // объёмный профиль — хорошо
-                        "SQUEEZE",  0.5    // сжатие — низкая информативность
-                ));
-
-                // [v32] Fix Squeeze Blindness: no hard block!
-                // During squeeze, lagging trend indicators matter less, breakout structure (SWING/BOS) matters more.
-                if (squeezed) {
-                    FACTOR_WEIGHTS.put("HTF", 1.0);
-                    FACTOR_WEIGHTS.put("OF", 1.5);
-                    FACTOR_WEIGHTS.put("SWING", 4.0);
-                }
+                // [v36-FIX Дыра4] static final Maps — нет new HashMap() на каждый forecast()
+                Map<String, Double> FACTOR_WEIGHTS = squeezed
+                        ? FW_SQUEEZE : FW_BASE;
                 double dirSign      = Math.signum(dir);
                 double weightedAgree = 0, totalWeight = 0;
                 for (Map.Entry<String, Double> fe : f.entrySet()) {

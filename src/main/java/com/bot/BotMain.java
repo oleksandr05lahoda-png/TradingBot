@@ -9,7 +9,7 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v34.0 — ASSET CLASSIFICATION & TOP COIN FIX EDITION       ║
+ * ║       BotMain v36.0 — ARCH FIX: WS CANDLES + ORDER EXEC + ALERTS RESTORED       ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  [v34.0] §1 AssetType auto-detection (crypto/oil/gas/metals/forex)     ║
  * ║  [v34.0] §2 Dynamic CoinCategory (volume-based TOP, keyword MEME)      ║
@@ -67,6 +67,9 @@ public final class BotMain {
     private static final AtomicLong totalCycles   = new AtomicLong(0);
     private static final AtomicLong totalSignals  = new AtomicLong(0);
     private static final AtomicLong errorCount    = new AtomicLong(0);
+    // [v36-FIX Дыра9] Монотонный счётчик для ключей forecastRecords.
+    // System.currentTimeMillis() вызывает коллизию если два сигнала приходят за 1ms.
+    private static final AtomicLong forecastSeq   = new AtomicLong(0);
     private static long startTimeMs = 0;
 
     // ── Circuit breaker ─────────────────────────────────────────────────
@@ -302,6 +305,13 @@ public final class BotMain {
                 safe("TradeResolver", () -> runTradeResolver(sender, isc, telegram)),
                 90, 45, TimeUnit.SECONDS);
 
+        // ── [v36-FIX Дыра6] Position Status Report каждые 30 минут ──
+        // Трейдер видит где стоят позиции без постоянного спама.
+        // Отправляется только если есть открытые позиции.
+        auxSched.scheduleAtFixedRate(
+                safe("PositionStatus", () -> sendPositionStatus(telegram)),
+                15, 30, TimeUnit.MINUTES);
+
         // ── Forecast accuracy checker (каждые 15m) ────────────────
         auxSched.scheduleAtFixedRate(
                 safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
@@ -445,8 +455,12 @@ public final class BotMain {
             }
 
             // [v35.0] CLEAN DISPATCH — toTelegramString() is self-contained now.
-            // No external header needed. Removes duplicate category/type info.
             telegram.sendMessageAsync(s.toTelegramString());
+
+            // [v36-FIX Дыра3] AUTO EXECUTION — если ENABLE_AUTO_TRADE=1
+            // Выставляет реальные ордера через встроенный OrderExecutor в SignalSender.
+            double autoSizeUsdt = sender.getPositionSizeUsdt(s, sender.getCoinCategory(s.symbol));
+            sender.executeOrderAsync(s, autoSizeUsdt);
 
             // [v14.0 FIX #7] Безопасный доступ к forecast
             String forecastInfo = "N/A";
@@ -540,7 +554,8 @@ public final class BotMain {
             }
         }
 
-        forecastRecords.put(key + "_" + System.currentTimeMillis(),
+        // [v36-FIX Дыра9] Используем forecastSeq вместо currentTimeMillis() — нет коллизий
+        forecastRecords.put(key + "_" + forecastSeq.incrementAndGet(),
                 new ForecastRecord(idea.symbol, idea.side, idea.price,
                         forecastBias, forecastScore));
     }
@@ -591,8 +606,10 @@ public final class BotMain {
             double priceClose;
             double atr14Trail = 0; // [v25.0] 1m ATR for Chandelier Exit
             try {
-                // [v25.0] Fetch 60 bars (was 20) — needed for 14-bar ATR calculation and stabilizing
-                List<com.bot.TradingCore.Candle> candles = sender.fetchKlines(ts.symbol, "1m", 60);
+                // [v36-FIX Дыра7] Используем WS-буфер вместо REST fetchKlines.
+                // REST вызов здесь из auxSched-потока → rlAcquire() с Thread.sleep() → стоп мира.
+                // getM1FromWs() возвращает данные из памяти (aggTrade → MicroCandleBuilder).
+                List<com.bot.TradingCore.Candle> candles = sender.getM1FromWs(ts.symbol);
                 if (candles == null || candles.isEmpty()) continue;
 
                 double newLow = Double.MAX_VALUE, newHigh = Double.NEGATIVE_INFINITY;
@@ -692,16 +709,15 @@ public final class BotMain {
                         sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                         markForecastRecord(ts.symbol + "_" + ts.side,
                                 pnl > 0 ? "CHANDELIER_PROFIT" : "CHANDELIER_FLAT");
-                        // [PATCH B3 v33] SILENCED — was sending fake "profit" alerts.
-                        // runTradeResolver checks historical candle extremes, NOT live fills.
-                        // extremeHigh/Low are accumulated since entry — a touch ≠ an execution.
-                        // Real PnL is tracked by ISC internally. Telegram gets only entry signals.
-                        // String emoji = pnl >= 0.3 ? "✅" : "⚠️";
-                        // telegram.sendMessageAsync(String.format(
-                        //         "%s *CHANDELIER EXIT* %s %s | PnL: %+.2f%%\n"
-                        //                 + "📌 ATR trail закрыл до TP1 на `%.6f`\n"
-                        //                 + "💡 Причина: разворот до TP1, прибыль сохранена",
-                        //         emoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                        // [v36-FIX Дыра6] Восстановлен Chandelier-алерт.
+                        // Трейдер должен знать что ATR-трейлинг закрыл позицию до TP1.
+                        String chEmoji = pnl >= 0.3 ? "✅" : "⚠️";
+                        telegram.sendMessageAsync(String.format(
+                                "%s *TRAIL EXIT* %s %s | PnL: %+.2f%%\n"
+                                        + "📌 ATR trail: `%.4f`\n"
+                                        + "_Разворот до TP1 — прибыль сохранена_\n"
+                                        + "_⚠️ Расчётный уровень — проверь реальный fill_",
+                                chEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
                         LOG.info("[TR] CHANDELIER EXIT: " + ts.symbol
                                 + " pnl=" + String.format("%.2f%%", pnl));
                         continue;
@@ -736,15 +752,17 @@ public final class BotMain {
                 sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
                 sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                 markForecastRecord(ts.symbol + "_" + ts.side, "HIT_SL");
-                // [PATCH B3 v33] SILENCED — ISC tracks SL internally via closeTrade("SL").
-                // TradeResolver checks extremeLow/High — a wick touch is NOT a guaranteed fill.
-                // Real slippage on SL can be worse than ts.sl (especially on volatile alts).
-                // Sending "❌ SL HIT" for every wick creates false precision.
-                // telegram.sendMessageAsync(String.format(
-                //         "❌ *SL HIT* %s %s | PnL: %+.2f%%\n"
-                //                 + "Forecast was: %s (score %.2f)",
-                //         ts.symbol, ts.side, pnl,
-                //         ts.forecastBias, ts.forecastScore));
+                // [v36-FIX Дыра6] Восстановлен SL-алерт для ручной торговли.
+                // PATCH B3 заглушил его с аргументом "wick touch ≠ fill" — корректно для автоторговли.
+                // Для ручного трейдера молчание хуже ложной точности: он не знает что позиция умерла.
+                // Дисклеймер добавлен в текст — трейдер понимает что это расчётный уровень, не факт.
+                telegram.sendMessageAsync(String.format(
+                        "🛑 *SL* %s %s\n"
+                                + "📌 Уровень: `%.4f` | PnL: %+.2f%%\n"
+                                + "_%s_\n"
+                                + "_⚠️ Расчётный уровень — проверь реальный fill_",
+                        ts.symbol, ts.side, ts.sl, pnl,
+                        ts.forecastBias + " score " + String.format("%.2f", ts.forecastScore)));
                 LOG.info("[TR] SL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 continue;
             }
@@ -826,13 +844,13 @@ public final class BotMain {
                     double tp2PnlPct = isLong
                             ? (ts.tp2 - ts.entry) / ts.entry * 100
                             : (ts.entry - ts.tp2) / ts.entry * 100;
-                    // [PATCH B3 v33] TP2 SILENCED — same reason as TP1.
-                    // Trailing stop upgrade to TP1 level is KEPT (critical).
-                    // telegram.sendMessageAsync(String.format(
-                    //         "🔵 *TP2 ✓* %s %s | +%.2f%%\n"
-                    //                 + "💰 30%% позиции — фиксируй прибыль\n"
-                    //                 + "🛡 Трейлинг поднят → TP1 `%.6f`",
-                    //         ts.symbol, ts.side, tp2PnlPct, ts.tp1));
+                    // [v36-FIX Дыра6] TP2 алерт восстановлен — трейдер должен двигать стоп вручную.
+                    telegram.sendMessageAsync(String.format(
+                            "🔵 *TP2* %s %s | +%.2f%%\n"
+                                    + "💰 Закрой 30%% позиции\n"
+                                    + "🛡 Передвинь стоп → TP1 `%.4f`\n"
+                                    + "_⚠️ Расчётный уровень_",
+                            ts.symbol, ts.side, tp2PnlPct, ts.tp1));
                     LOG.info("[TR] TP2 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp2PnlPct));
                     // Перемещаем trailing до tp1 уровня
                     if (isLong) ts.trailingStop = Math.max(ts.trailingStop, ts.tp1);
@@ -850,15 +868,15 @@ public final class BotMain {
                             : (ts.entry - ts.tp3) / ts.entry * 100;
                     it.remove();
                     isc.registerConfirmedResult(true, ts.side);
-                    // [v17.0 §4] "TP" reason → ISC.closeTrade triggers resetConsecutiveSL()
                     isc.closeTrade(ts.symbol, ts.side, pnl, "TP");
                     sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side, "HIT_TP3");
-                    // [PATCH B3 v33] TP3 SILENCED — full close is tracked by ISC.
-                    // Daily summary (09:00 UTC) will show real aggregate PnL.
-                    // telegram.sendMessageAsync(String.format(
-                    //         "✅✅ *TP3 HIT* %s %s | PnL: %+.2f%% 🚀",
-                    //         ts.symbol, ts.side, pnl));
+                    // [v36-FIX Дыра6] TP3 алерт восстановлен — финальный выход, важно для трейдера.
+                    telegram.sendMessageAsync(String.format(
+                            "✅ *TP3* %s %s | +%.2f%%\n"
+                                    + "💎 Позиция полностью закрыта\n"
+                                    + "_⚠️ Расчётный уровень_",
+                            ts.symbol, ts.side, pnl));
                     LOG.info("[TR] TP3 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                     continue;
                 }
@@ -874,21 +892,54 @@ public final class BotMain {
                             : (ts.entry - ts.trailingStop) / ts.entry * 100;
                     it.remove();
                     isc.registerConfirmedResult(pnl > 0, ts.side);
-                    // [v17.0 §4] "TRAIL" = profit if pnl>0 → resetConsecutiveSL; else SL-like
                     isc.closeTrade(ts.symbol, ts.side, pnl, pnl > 0 ? "TP" : "SL");
                     sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
                     markForecastRecord(ts.symbol + "_" + ts.side,
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
-                    // [PATCH B3 v33] TRAILING STOP SILENCED — ISC closes trade internally.
-                    // Trail level is calculated from 1m candle close, not a real order.
-                    // telegram.sendMessageAsync(String.format(
-                    //         "%s *TRAILING STOP* %s %s | PnL: %+.2f%%\n"
-                    //                 + "📌 Закрыто трейлингом на `%.6f`",
-                    //         trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                    // [v36-FIX Дыра6] Trail алерт восстановлен.
+                    String trailEmoji = pnl > 0 ? "✅" : "⚠️";
+                    telegram.sendMessageAsync(String.format(
+                            "%s *TRAILING STOP* %s %s | %+.2f%%\n"
+                                    + "📌 Трейл: `%.4f`\n"
+                                    + "_⚠️ Расчётный уровень_",
+                            trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
                     LOG.info("[TR] TRAIL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 }
             }
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v36-FIX Дыра6] POSITION STATUS REPORTER
+    //  Отправляет сводку открытых позиций каждые 30 минут.
+    //  Трейдер видит актуальный статус без лишнего спама.
+    // ══════════════════════════════════════════════════════════════
+
+    private static void sendPositionStatus(com.bot.TelegramBotSender telegram) {
+        if (trackedSignals.isEmpty()) return;
+
+        StringBuilder sb = new StringBuilder("📊 *Позиции*\n");
+        sb.append("━━━━━━━━━━━━━━━━━━━━\n");
+
+        long now = System.currentTimeMillis();
+        for (TrackedSignal ts : trackedSignals.values()) {
+            long ageMin = ts.ageMs() / 60_000;
+            String status = ts.tp2Hit ? "TP2✓" : ts.tp1Hit ? "TP1✓" : "OPEN";
+            String dir = ts.side == com.bot.TradingCore.Side.LONG ? "📈" : "📉";
+
+            sb.append(String.format("%s *%s* %s | %s | %dm\n",
+                    dir, ts.symbol, ts.side, status, ageMin));
+
+            if (ts.trailingStop > 0 && ts.tp1Hit) {
+                sb.append(String.format("  🛡 Trail: `%.4f`\n", ts.trailingStop));
+            } else {
+                sb.append(String.format("  🛑 SL: `%.4f`\n", ts.sl));
+            }
+        }
+
+        sb.append("━━━━━━━━━━━━━━━━━━━━\n");
+        sb.append("_Уровни расчётные, не реальные fills_");
+        telegram.sendMessageAsync(sb.toString());
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1095,23 +1146,35 @@ public final class BotMain {
     private static void runPeriodicBacktest(com.bot.SignalSender sender,
                                             com.bot.InstitutionalSignalCore isc,
                                             com.bot.TelegramBotSender telegram) {
+        // [v36-FIX Дыра8] Backtest REST Burst:
+        // БЫЛО: 12 пар × (500+200+500+300) bars = ~9000 weight/burst — одновременно с live-торговлей.
+        // СТАЛО:
+        //   • Universe сокращён до 6 seed + 6 dynamic = 12 max (было 6+12=18)
+        //   • Лимиты свечей снижены: m15=300, h1=100, m5=200 (было 500/200/300)
+        //   • m1 берётся из WS-буфера (0 REST weight), не из fetchKlines
+        //   • Задержка 3s между символами = нагрузка растянута на 36s вместо burst
+        // Итог: ~3600 weight за 36s = 100 weight/s vs старые 9000 weight/s.
         LOG.info("[BT] Начало периодического бэктеста...");
         com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
         java.util.LinkedHashSet<String> universe = new java.util.LinkedHashSet<>(java.util.List.of(
                 "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "LINKUSDT", "XRPUSDT"));
-        universe.addAll(sender.getScanUniverseSnapshot(12));
+        universe.addAll(sender.getScanUniverseSnapshot(6)); // было 12 → 6 dynamic
         double totalEV = 0;
         int    count   = 0;
         StringBuilder btLog = new StringBuilder("[BT] Results: ");
 
         for (String sym : universe) {
             try {
-                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 500);
-                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  200);
-                List<com.bot.TradingCore.Candle> m1  = sender.fetchKlines(sym, "1m",  500);
-                List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m",  300);
+                // [v36-FIX] 3s throttle между символами — не даём RL burst во время торговли
+                Thread.sleep(3_000L);
 
-                if (m15 == null || m15.size() < 250) continue;
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 300); // было 500
+                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  100); // было 200
+                // [v36-FIX] m1 из WS-буфера — 0 REST weight
+                List<com.bot.TradingCore.Candle> m1  = sender.getM1FromWs(sym);
+                List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m",  200); // было 300
+
+                if (m15 == null || m15.size() < 200) continue;
 
                 com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
                 com.bot.SimpleBacktester.BacktestResult r = bt.run(
@@ -1121,10 +1184,12 @@ public final class BotMain {
                     totalEV += r.ev;
                     count++;
                     btLog.append(sym).append("=").append(String.format("%.3f", r.ev)).append(" ");
-                    // [v28.0] PATCH #7: Per-symbol EV → ISC for per-symbol minConf boost.
-                    // Each symbol now gets individual threshold adjustment based on its OOS EV.
                     isc.setSymbolBacktestResult(sym, r.ev);
                 }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                LOG.info("[BT] Прерван");
+                return;
             } catch (Exception e) {
                 LOG.warning("[BT] " + sym + ": " + e.getMessage());
             }

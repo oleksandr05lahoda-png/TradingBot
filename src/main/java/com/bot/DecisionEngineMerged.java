@@ -745,78 +745,113 @@ public final class DecisionEngineMerged {
         }
 
         public String toTelegramString() {
-            // [v35.0] CLEAN FORMAT — no duplicate info, no clutter, instant readability.
-            String sideEmoji = side == com.bot.TradingCore.Side.LONG ? "📈" : "📉";
-            String sideStr   = side == com.bot.TradingCore.Side.LONG ? "LONG" : "SHORT";
-            String confEmoji = probability >= 83 ? "🔥" : probability >= 74 ? "✅"
-                                                         : probability >= 65 ? "🟡" : "⚪";
+            // ╔══════════════════════════════════════════════════════╗
+            // ║  [v36.0] НОВЫЙ ФОРМАТ СИГНАЛА                       ║
+            // ║  Символ → Направление → Категория/Актив в 1 строке  ║
+            // ║  Выравненные колонки, секунды в таймстампе           ║
+            // ║  Авто-определение типа актива (крипта/нефть/металл)  ║
+            // ╚══════════════════════════════════════════════════════╝
+            boolean isLong   = side == com.bot.TradingCore.Side.LONG;
+            String sideEmoji = isLong ? "📈" : "📉";
+            String sideStr   = isLong ? "LONG" : "SHORT";
 
-            String catStr  = category == CoinCategory.MEME ? "🐸 MEME"
-                    : category == CoinCategory.TOP ? "👑 TOP" : "🔷 ALT";
+            // ── Уверенность ─────────────────────────────────────────
+            String confEmoji = probability >= 83 ? "🔥"
+                    : probability >= 74 ? "✅"
+                      : probability >= 65 ? "🟡" : "⚪";
+
+            // ── Тип актива и категория ───────────────────────────────
             AssetType assetType = detectAssetType(symbol);
-            String assetStr = assetType == AssetType.CRYPTO ? catStr
-                    : assetType.emoji + " " + assetType.label;
+            String assetStr;
+            String assetWarn = "";
+            if (assetType == AssetType.CRYPTO || assetType == AssetType.UNKNOWN) {
+                // Крипта: показываем категорию (TOP / ALT / MEME)
+                assetStr = switch (category) {
+                    case TOP  -> "👑 TOP";
+                    case MEME -> "🐸 MEME";
+                    default   -> "🔷 ALT";
+                };
+            } else {
+                // Не крипта: показываем тип сырья/металла/форекса
+                assetStr = assetType.emoji + " " + assetType.label;
+                assetWarn = "\n⚠️ _Не крипта_ — " + assetType.label;
+            }
 
+            // ── Цены ─────────────────────────────────────────────────
             double riskPct = Math.abs(price - stop) / price * 100;
-            double rp1Pct  = Math.abs(tp1 - price) / price * 100;
-            double rp2Pct  = Math.abs(tp2 - price) / price * 100;
-            double rp3Pct  = Math.abs(tp3 - price) / price * 100;
+            double rp1Pct  = Math.abs(tp1 - price)  / price * 100;
+            double rp2Pct  = Math.abs(tp2 - price)  / price * 100;
+            double rp3Pct  = Math.abs(tp3 - price)  / price * 100;
 
+            // ── Формат числа — убираем лишние нули ───────────────────
+            // price < 0.01 → 6 знаков, иначе 4 знака
+            String fmt = price < 0.001 ? "%.6f" : price < 0.1 ? "%.5f" : price < 10 ? "%.4f" : "%.2f";
+
+            // ── Флаги для трейдера ────────────────────────────────────
             List<String> tf = traderFlags();
-            String flagLine = tf.isEmpty() ? "" : String.join(" • ", tf) + "\n";
+            String flagStr = tf.isEmpty() ? "-" : String.join(" ", tf);
 
-            String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
-                    .toLocalTime().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
-
-            // ── Bottom info line ─────────
-            StringBuilder info = new StringBuilder();
-            if (rr > 0) info.append(String.format("R:R 1:%.1f", rr));
+            // ── Размер позиции ────────────────────────────────────────
+            String sizeStr = "";
             for (String f : flags) {
-                if (f.startsWith("SIZE=")) {
-                    if (info.length() > 0) info.append(" • ");
-                    info.append(f); break;
-                }
-            }
-            if (Math.abs(fundingRate) > 0.0008) {
-                if (info.length() > 0) info.append(" • ");
-                info.append(String.format("FR %+.2f%%", fundingRate * 100));
+                if (f.startsWith("SIZE=")) { sizeStr = f; break; }
             }
 
+            // ── Фандинг (если значимый) ───────────────────────────────
+            String frStr = "";
+            if (Math.abs(fundingRate) > 0.0008) {
+                frStr = String.format(" | FR %+.2f%%", fundingRate * 100);
+            }
+
+            // ── Прогноз (компактно в одну строку) ────────────────────
             String forecastLine = "";
             if (forecast != null) {
-                String bias = switch (forecast.bias) {
+                String fBias = switch (forecast.bias) {
                     case STRONG_BULL -> "🟢↑↑"; case BULL -> "🟩↑";
-                    case NEUTRAL -> "⬜—"; case BEAR -> "🟥↓";
-                    case STRONG_BEAR -> "🔴↓↓";
+                    case NEUTRAL     -> "⬜—";
+                    case BEAR        -> "🟥↓";  case STRONG_BEAR -> "🔴↓↓";
                 };
-                String phase = switch (forecast.trendPhase) {
-                    case EARLY -> "старт"; case MID -> "тренд";
-                    case LATE -> "конец"; case EXHAUSTION -> "исток";
+                String fPhase = switch (forecast.trendPhase) {
+                    case EARLY      -> "старт"; case MID  -> "тренд";
+                    case LATE       -> "поздно"; case EXHAUSTION -> "исток";
                 };
-                forecastLine = String.format("%n🔮 %s %s", bias, phase);
+                forecastLine = String.format("\n🔮 %s %s", fBias, fPhase);
             }
 
-            String warn = (assetType != AssetType.CRYPTO && assetType != AssetType.UNKNOWN)
-                    ? "\n⚠️ _Не крипта — проверь на бирже_" : "";
+            // ── Время с секундами ─────────────────────────────────────
+            String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
+                    .toLocalTime().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+
+            // ── Строка R:R + SIZE + FR ────────────────────────────────
+            StringBuilder bottomLine = new StringBuilder();
+            if (rr > 0) bottomLine.append(String.format("R/R: 1:%.1f", rr));
+            if (!sizeStr.isEmpty()) {
+                if (bottomLine.length() > 0) bottomLine.append(" | ");
+                bottomLine.append(sizeStr);
+            }
+            if (!frStr.isEmpty()) bottomLine.append(frStr);
 
             return String.format(
-                    "%s *%s* • #%s%n"
-                            + "%s • %s %.0f%%%n"
-                            + "━━━━━━━━━━━━━━━━━━━━%n"
+                    "%s *%s* → *%s %s* %s%n"
+                            + "💰 Цена:   `" + fmt + "`%n"
+                            + "🎯 Вер-ть: *%.0f%%*%s%n"
+                            + "🛑 SL:     `" + fmt + "`  (риск %.2f%%)%n"
+                            + "🟢 TP1:    `" + fmt + "`  (+%.2f%%)  ← 50%% позиции%n"
+                            + "🔵 TP2:    `" + fmt + "`  (+%.2f%%)  ← 30%% позиции%n"
+                            + "💎 TP3:    `" + fmt + "`  (+%.2f%%)  ← 20%% трейл%n"
+                            + "🏷 %s | %s%n"
                             + "%s"
-                            + "💰  %.6f%n"
-                            + "🛑  %.6f  (−%.2f%%)%n"
-                            + "🟢  %.6f  (+%.2f%%)%n"
-                            + "🔵  %.6f  (+%.2f%%)%n"
-                            + "💎  %.6f  (+%.2f%%)%n"
-                            + "━━━━━━━━━━━━━━━━━━━━%n"
-                            + "%s%s%s%n"
-                            + "_⏰ %s Warsaw_",
-                    sideEmoji, sideStr, symbol,
-                    assetStr, confEmoji, probability,
-                    flagLine, price, stop, riskPct,
-                    tp1, rp1Pct, tp2, rp2Pct, tp3, rp3Pct,
-                    info, forecastLine, warn, time);
+                            + "_⏰ %s_",
+                    confEmoji, symbol, sideEmoji, sideStr, assetStr,
+                    price,
+                    probability, forecastLine,
+                    stop, riskPct,
+                    tp1, rp1Pct,
+                    tp2, rp2Pct,
+                    tp3, rp3Pct,
+                    flagStr, bottomLine,
+                    assetWarn.isEmpty() ? "" : assetWarn + "\n",
+                    time);
         }
 
         @Override public String toString() { return toTelegramString(); }
