@@ -415,7 +415,15 @@ public final class SignalSender {
                 // 3. MARKET entry
                 long orderId = oePlaceOrder(idea.symbol, side, "MARKET", qtyStr, 0, false);
                 if (orderId < 0) {
-                    bot.sendMessageAsync("❌ [AUTO] MARKET failed: " + idea.symbol);
+                    bot.sendMessageAsync(String.format(
+                            "%s %s | #%s%n"
+                                    + "❌ СТАТУС: *AUTO FAILED*%n"
+                                    + "━━━━━━━━━━━━━━━━━━%n"
+                                    + "MARKET order failed%n"
+                                    + "━━━━━━━━━━━━━━━━━━",
+                            com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).emoji,
+                            com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).label,
+                            idea.symbol));
                     return;
                 }
                 Thread.sleep(300);
@@ -428,15 +436,30 @@ public final class SignalSender {
                 oePlaceOrder(idea.symbol, closeSide, "TAKE_PROFIT_MARKET", qtyStr, idea.tp1, true);
 
                 bot.sendMessageAsync(String.format(
-                        "✅ [AUTO EXEC] %s %s\n"
-                                + "📌 Entry MARKET | SL: `%.4f` | TP1: `%.4f`\n"
-                                + "💰 Размер: $%.1f × %dx лечо",
-                        idea.symbol, idea.side, idea.stop, idea.tp1,
+                        "%s %s | #%s%n"
+                                + "✅ СТАТУС: *AUTO EXEC*%n"
+                                + "━━━━━━━━━━━━━━━━━━%n"
+                                + "📌 Entry: MARKET%n"
+                                + "🛑 Стоп: `%.4f`%n"
+                                + "🎯 TP1: `%.4f`%n"
+                                + "💰 Размер: $%.1f × %dx%n"
+                                + "━━━━━━━━━━━━━━━━━━",
+                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).emoji,
+                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).label,
+                        idea.symbol, idea.stop, idea.tp1,
                         sizeUsdt, AUTO_TRADE_LEVERAGE));
 
             } catch (Exception e) {
                 System.out.println("[OE] Error " + idea.symbol + ": " + e.getMessage());
-                bot.sendMessageAsync("⚠️ [AUTO] Error " + idea.symbol + ": " + e.getMessage());
+                bot.sendMessageAsync(String.format(
+                        "%s %s | #%s%n"
+                                + "⚠️ СТАТУС: *AUTO ERROR*%n"
+                                + "━━━━━━━━━━━━━━━━━━%n"
+                                + "%s%n"
+                                + "━━━━━━━━━━━━━━━━━━",
+                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).emoji,
+                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).label,
+                        idea.symbol, e.getMessage()));
             }
         }, fetchPool);
     }
@@ -1462,7 +1485,11 @@ public final class SignalSender {
         double[] milestones = {200, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 500000, 1_000_000};
         for (double m : milestones) {
             if (old < m && newBal >= m) {
-                bot.sendMessageAsync(String.format("🎯 *MILESTONE* Баланс достиг $%.0f! 🚀🚀🚀", m));
+                bot.sendMessageAsync(String.format(
+                        "🎯 СИСТЕМА | *MILESTONE*%n"
+                                + "━━━━━━━━━━━━━━━━━━%n"
+                                + "💰 Баланс достиг $%.0f%n"
+                                + "━━━━━━━━━━━━━━━━━━", m));
             }
         }
     }
@@ -1528,11 +1555,17 @@ public final class SignalSender {
                 ok, fail, TARGET_LEVERAGE);
         if (fail > 0) {
             bot.sendMessageAsync(String.format(
-                    "⚠️ *LEVERAGE INIT* %d пар настроено, %d ошибок\n" +
-                            "Проверьте %dx ISOLATED вручную перед торговлей!", ok, fail, TARGET_LEVERAGE));
+                    "⚠️ СИСТЕМА | *LEVERAGE INIT*%n"
+                            + "━━━━━━━━━━━━━━━━━━%n"
+                            + "%d пар настроено, %d ошибок%n"
+                            + "Проверьте %dx ISOLATED вручную%n"
+                            + "━━━━━━━━━━━━━━━━━━", ok, fail, TARGET_LEVERAGE));
         } else {
             bot.sendMessageAsync(String.format(
-                    "✅ *LEVERAGE OK* Все %d пар: %dx ISOLATED", ok, TARGET_LEVERAGE));
+                    "✅ СИСТЕМА | *LEVERAGE OK*%n"
+                            + "━━━━━━━━━━━━━━━━━━%n"
+                            + "Все %d пар: %dx ISOLATED%n"
+                            + "━━━━━━━━━━━━━━━━━━", ok, TARGET_LEVERAGE));
         }
     }
 
@@ -1630,8 +1663,15 @@ public final class SignalSender {
                     // [v9.0] Remove from BotMain TradeResolver tracking
                     com.bot.BotMain.trackedSignals.remove(symbol + "_" + closedSide);
                     String emoji = realizedPnl >= 0 ? "✅" : "❌";
-                    bot.sendMessageAsync(String.format("%s *UDS CLOSED* %s %s\nPnL: %+.4f$ (%+.2f%%)",
-                            emoji, symbol, closedSide, realizedPnl, pnlPct));
+                    bot.sendMessageAsync(String.format(
+                            "%s %s | #%s%n"
+                                    + "%s СТАТУС: *UDS CLOSED*%n"
+                                    + "━━━━━━━━━━━━━━━━━━%n"
+                                    + "💰 PnL: %+.4f$ (%+.2f%%)%n"
+                                    + "━━━━━━━━━━━━━━━━━━",
+                            com.bot.DecisionEngineMerged.detectAssetType(symbol).emoji,
+                            com.bot.DecisionEngineMerged.detectAssetType(symbol).label,
+                            symbol, emoji, realizedPnl, pnlPct));
                     System.out.printf("[UDS] CLOSED %s %s PnL=%+.4f%n", symbol, closedSide, realizedPnl);
                 }
             }
@@ -1652,7 +1692,10 @@ public final class SignalSender {
             }
 
             case "MARGIN_CALL" -> {
-                bot.sendMessageAsync("🚨 *MARGIN CALL* — немедленно проверьте аккаунт!");
+                bot.sendMessageAsync("🚨 СИСТЕМА | *MARGIN CALL*\n"
+                        + "━━━━━━━━━━━━━━━━━━\n"
+                        + "⚠️ Немедленно проверьте аккаунт\n"
+                        + "━━━━━━━━━━━━━━━━━━");
                 System.out.println("[UDS] ⚠️ MARGIN CALL!");
             }
 
@@ -1748,7 +1791,11 @@ public final class SignalSender {
             // [v28.0] PATCH #19 + [SCANNER] alert if >20% of pairs are stale (not just any pair)
             if (stalePairs.size() > wsMap.size() * 0.20) {
                 bot.sendMessageAsync(String.format(
-                        "⚠️ *WS DATA LOSS* — %d пар без данных >60s: %s\n🔄 Переподключение...",
+                        "⚠️ СИСТЕМА | *WS DATA LOSS*%n"
+                                + "━━━━━━━━━━━━━━━━━━%n"
+                                + "%d пар без данных >60s: %s%n"
+                                + "🔄 Переподключение...%n"
+                                + "━━━━━━━━━━━━━━━━━━",
                         stalePairs.size(),
                         stalePairs.size() <= 5 ? stalePairs.toString() : stalePairs.size() + " пар"));
             }
@@ -1762,7 +1809,10 @@ public final class SignalSender {
             // Messages stopped — check if frozen for > 60s
             if (now - lastWsHealthCheckMs > 60_000L) {
                 System.out.println("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
-                bot.sendMessageAsync("⚠️ *WS SILENT 60s* — форс-переподключение всех каналов...");
+                bot.sendMessageAsync("⚠️ СИСТЕМА | *WS SILENT 60s*\n"
+                        + "━━━━━━━━━━━━━━━━━━\n"
+                        + "Форс-переподключение всех каналов\n"
+                        + "━━━━━━━━━━━━━━━━━━");
                 new ArrayList<>(wsMap.keySet()).forEach(this::reconnectWs);
                 lastWsHealthCheckMs = now; // reset ONLY after action taken
             }

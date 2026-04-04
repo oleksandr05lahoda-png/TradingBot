@@ -255,8 +255,9 @@ public final class BotMain {
         isc.setTimeStopCallback((sym, msg) -> LOG.info("[ISC time-stop] " + sym + ": " + msg));
         gic.setPanicCallback(msg -> {
             LOG.warning("[GIC panic] " + msg);
-            telegram.sendMessageAsync("🚨 *MARKET ALERT* 🚨\n" + msg
-                    + "\n_⚠️ Проверь открытые позиции_");
+            telegram.sendMessageAsync("🚨 СИСТЕМА | *MARKET ALERT*\n"
+                    + "━━━━━━━━━━━━━━━━━━\n" + msg
+                    + "\n━━━━━━━━━━━━━━━━━━\n_⚠️ Проверь открытые позиции_");
         });
 
         // ── Schedulers ───────────────────────────────────────────
@@ -587,10 +588,15 @@ public final class BotMain {
                 it.remove();
                 isc.closeTrade(ts.symbol, ts.side, 0.0, "SCORE_EXIT");
                 telegram.sendMessageAsync(String.format(
-                        "⚠️ *SCORE EXIT* %s %s\n" +
-                                "📉 Symbol score: %.2f (3+ consecutive losses)\n" +
-                                "🔒 Позиция принудительно закрыта",
-                        ts.symbol, ts.side, symScore));
+                        "%s %s | #%s%n" +
+                                "⚠️ СТАТУС: *SCORE EXIT*%n" +
+                                "━━━━━━━━━━━━━━━━━━%n" +
+                                "📉 Score: %.2f (3+ consecutive losses)%n" +
+                                "🔒 Позиция принудительно закрыта%n" +
+                                "━━━━━━━━━━━━━━━━━━",
+                        com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).emoji,
+                        com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).label,
+                        ts.symbol, symScore));
                 LOG.info("[TR] SCORE EXIT: " + ts.symbol + " score=" + String.format("%.2f", symScore));
                 continue;
             }
@@ -712,9 +718,14 @@ public final class BotMain {
                         if (Math.abs(pnl) >= 0.20) {
                             String chEmoji = pnl >= 0.5 ? "✅" : pnl > 0 ? "🟡" : "🔴";
                             telegram.sendMessageAsync(String.format(
-                                    "%s *TRAIL* %s %s | *%+.2f%%*\n"
-                                            + "📌 ATR trail: `%.4f`",
-                                    chEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                                    "%s %s | #%s%n" +
+                                            "%s СТАТУС: *TRAIL* | *%+.2f%%*%n" +
+                                            "━━━━━━━━━━━━━━━━━━%n" +
+                                            "📌 Trail: `%.4f`%n" +
+                                            "━━━━━━━━━━━━━━━━━━",
+                                    com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).emoji,
+                                    com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).label,
+                                    ts.symbol, chEmoji, pnl, ts.trailingStop));
                         }
                         LOG.info("[TR] CHANDELIER EXIT: " + ts.symbol
                                 + " pnl=" + String.format("%.2f%%", pnl));
@@ -755,9 +766,14 @@ public final class BotMain {
                 // Для ручного трейдера молчание хуже ложной точности: он не знает что позиция умерла.
                 // Дисклеймер добавлен в текст — трейдер понимает что это расчётный уровень, не факт.
                 telegram.sendMessageAsync(String.format(
-                        "🛑 *SL* %s %s | *%+.2f%%*\n"
-                                + "📌 `%.4f`",
-                        ts.symbol, ts.side, pnl, ts.sl));
+                        "%s %s | #%s%n" +
+                                "🛑 СТАТУС: *SL HIT* | *%+.2f%%*%n" +
+                                "━━━━━━━━━━━━━━━━━━%n" +
+                                "📌 Уровень: `%.4f`%n" +
+                                "━━━━━━━━━━━━━━━━━━",
+                        com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).emoji,
+                        com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).label,
+                        ts.symbol, pnl, ts.sl));
                 LOG.info("[TR] SL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 continue;
             }
@@ -841,11 +857,15 @@ public final class BotMain {
                             : (ts.entry - ts.tp2) / ts.entry * 100;
                     // [v36-FIX Дыра6] TP2 алерт восстановлен — трейдер должен двигать стоп вручную.
                     telegram.sendMessageAsync(String.format(
-                            "🔵 *TP2* %s %s | +%.2f%%\n"
-                                    + "💰 Закрой 30%% позиции\n"
-                                    + "🛡 Передвинь стоп → TP1 `%.4f`\n"
-                                    + "_⚠️ Расчётный уровень_",
-                            ts.symbol, ts.side, tp2PnlPct, ts.tp1));
+                            "%s %s | #%s%n" +
+                                    "🔵 СТАТУС: *TP2* | *+%.2f%%*%n" +
+                                    "━━━━━━━━━━━━━━━━━━%n" +
+                                    "💰 Закрой 30%% позиции%n" +
+                                    "🛡 Стоп → TP1: `%.4f`%n" +
+                                    "━━━━━━━━━━━━━━━━━━",
+                            com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).emoji,
+                            com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).label,
+                            ts.symbol, tp2PnlPct, ts.tp1));
                     LOG.info("[TR] TP2 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp2PnlPct));
                     // Перемещаем trailing до tp1 уровня
                     if (isLong) ts.trailingStop = Math.max(ts.trailingStop, ts.tp1);
@@ -868,10 +888,14 @@ public final class BotMain {
                     markForecastRecord(ts.symbol + "_" + ts.side, "HIT_TP3");
                     // [v36-FIX Дыра6] TP3 алерт восстановлен — финальный выход, важно для трейдера.
                     telegram.sendMessageAsync(String.format(
-                            "✅ *TP3* %s %s | +%.2f%%\n"
-                                    + "💎 Позиция полностью закрыта\n"
-                                    + "_⚠️ Расчётный уровень_",
-                            ts.symbol, ts.side, pnl));
+                            "%s %s | #%s%n" +
+                                    "✅ СТАТУС: *TP3* | *+%.2f%%*%n" +
+                                    "━━━━━━━━━━━━━━━━━━%n" +
+                                    "💎 Позиция полностью закрыта%n" +
+                                    "━━━━━━━━━━━━━━━━━━",
+                            com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).emoji,
+                            com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).label,
+                            ts.symbol, pnl));
                     LOG.info("[TR] TP3 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                     continue;
                 }
@@ -895,9 +919,14 @@ public final class BotMain {
                     if (Math.abs(pnl) >= 0.20) {
                         String trailEmoji = pnl >= 0.5 ? "✅" : pnl > 0 ? "🟡" : "🔴";
                         telegram.sendMessageAsync(String.format(
-                                "%s *TRAIL* %s %s | *%+.2f%%*\n"
-                                        + "📌 `%.4f`",
-                                trailEmoji, ts.symbol, ts.side, pnl, ts.trailingStop));
+                                "%s %s | #%s%n" +
+                                        "%s СТАТУС: *TRAIL* | *%+.2f%%*%n" +
+                                        "━━━━━━━━━━━━━━━━━━%n" +
+                                        "📌 Trail: `%.4f`%n" +
+                                        "━━━━━━━━━━━━━━━━━━",
+                                com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).emoji,
+                                com.bot.DecisionEngineMerged.detectAssetType(ts.symbol).label,
+                                ts.symbol, trailEmoji, pnl, ts.trailingStop));
                     }
                     LOG.info("[TR] TRAIL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 }
@@ -914,20 +943,22 @@ public final class BotMain {
     private static void sendPositionStatus(com.bot.TelegramBotSender telegram) {
         if (trackedSignals.isEmpty()) return;
 
-        StringBuilder sb = new StringBuilder("📊 *Открытые позиции* (");
-        sb.append(trackedSignals.size()).append(")\n");
-        sb.append("━━━━━━━━━━━━━━━━━━━━\n");
+        StringBuilder sb = new StringBuilder();
+        sb.append("📊 СТАТУС | *Открытые позиции*\n");
+        sb.append("━━━━━━━━━━━━━━━━━━\n");
 
         long now = System.currentTimeMillis();
         int longCount = 0, shortCount = 0;
         for (TrackedSignal ts : trackedSignals.values()) {
             long ageMin = ts.ageMs() / 60_000;
-            String status = ts.tp2Hit ? "TP2✓" : ts.tp1Hit ? "TP1✓" : "";
+            String status = ts.tp2Hit ? "TP2✓" : ts.tp1Hit ? "TP1✓" : "—";
             String dir = ts.side == com.bot.TradingCore.Side.LONG ? "📈" : "📉";
             if (ts.side == com.bot.TradingCore.Side.LONG) longCount++; else shortCount++;
 
-            sb.append(String.format("%s *%s* %s %s %dm\n",
-                    dir, ts.symbol, ts.side, status, ageMin));
+            com.bot.DecisionEngineMerged.AssetType at =
+                    com.bot.DecisionEngineMerged.detectAssetType(ts.symbol);
+            sb.append(String.format("%s %s #%s %s %s %dm\n",
+                    at.emoji, dir, ts.symbol, ts.side, status, ageMin));
 
             if (ts.trailingStop > 0 && ts.tp1Hit) {
                 sb.append(String.format("  🛡 `%.4f`\n", ts.trailingStop));
@@ -936,8 +967,9 @@ public final class BotMain {
             }
         }
 
-        sb.append("━━━━━━━━━━━━━━━━━━━━\n");
-        sb.append(String.format("📈 %d LONG | 📉 %d SHORT", longCount, shortCount));
+        sb.append("━━━━━━━━━━━━━━━━━━\n");
+        sb.append(String.format("📊 📈 %d LONG | 📉 %d SHORT | Всего: %d",
+                longCount, shortCount, trackedSignals.size()));
         telegram.sendMessageAsync(sb.toString());
     }
 
@@ -1028,13 +1060,16 @@ public final class BotMain {
                     if (nowMs - lastForecastReportMs >= FORECAST_REPORT_INTERVAL_MS) {
                         lastForecastReportMs = nowMs;
                         telegram.sendMessageAsync(String.format(
-                                "📈 *Forecast Accuracy Report*\n"
-                                        + "Total: %d | Correct: %d | Accuracy: %.1f%%\n"
+                                "📊 СТАТУС | *Forecast Accuracy*%n"
+                                        + "━━━━━━━━━━━━━━━━━━%n"
+                                        + "📈 Total: %d | Correct: %d%n"
+                                        + "📊 Conf: *%.1f%%*%n"
+                                        + "━━━━━━━━━━━━━━━━━━%n"
                                         + "%s",
                                 total, correct2, acc,
-                                acc >= 58 ? "✅ Edge confirmed — модель работает"
-                                        : acc >= 50 ? "⚠️ Edge слабый — наблюдаем"
-                                          : "🔴 Edge отрицательный — нужна перекалибровка"));
+                                acc >= 58 ? "✅ Edge confirmed"
+                                        : acc >= 50 ? "⚠️ Edge слабый"
+                                          : "🔴 Edge отрицательный"));
                     }
                 }
             } catch (Exception ex) {
@@ -1087,8 +1122,10 @@ public final class BotMain {
             watchdogAlerts.incrementAndGet();
             LOG.warning("[WD #" + watchdogAlerts.get() + "] " + String.join(" | ", issues));
             // [SCANNER MODE] Also send watchdog alerts to Telegram so issues are visible.
-            telegram.sendMessageAsync("🔧 *Watchdog #" + watchdogAlerts.get() + "*\n"
-                    + String.join("\n", issues));
+            telegram.sendMessageAsync("🔧 СИСТЕМА | *Watchdog #" + watchdogAlerts.get() + "*\n"
+                    + "━━━━━━━━━━━━━━━━━━\n"
+                    + String.join("\n", issues)
+                    + "\n━━━━━━━━━━━━━━━━━━");
         }
     }
 
@@ -1113,16 +1150,16 @@ public final class BotMain {
         double fcAcc   = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
 
         String msg = String.format(
-                "📊 *GodBot v15.0 — Daily Report*\n"
-                        + "🕙 %s (Warsaw)\n"
-                        + "───────────────────────\n"
-                        + "Up: %dm | Cycles: %d | Signals: %d\n"
-                        + "Day PnL: %+.2f%% | MaxDD: %.1f%%\n"
-                        + "BTC: %s | Vol: %s\n"
-                        + "WS: %d | UDS: %s | Bal: $%.2f\n"
-                        + "───────────────────────\n"
-                        + "🔮 Forecast Accuracy: %.0f%% (%d/%d)\n"
-                        + "📊 Tracked: %d | ForecastRecords: %d\n"
+                "📊 СИСТЕМА | *Daily Report*%n"
+                        + "━━━━━━━━━━━━━━━━━━%n"
+                        + "🕙 %s (Warsaw)%n"
+                        + "⏱ Up: %dm | Cycles: %d | Signals: %d%n"
+                        + "💰 Day PnL: %+.2f%% | MaxDD: %.1f%%%n"
+                        + "📡 BTC: %s | Vol: %s%n"
+                        + "🔌 WS: %d | UDS: %s | Bal: $%.2f%n"
+                        + "━━━━━━━━━━━━━━━━━━%n"
+                        + "📊 Forecast: *%.0f%%* (%d/%d)%n"
+                        + "📌 Tracked: %d | Records: %d%n"
                         + "%s",
                 nowWarsawStr(),
                 uptimeMin, totalCycles.get(), totalSignals.get(),
@@ -1390,10 +1427,16 @@ public final class BotMain {
         boolean bullish = score > 0;
         boolean strong  = Math.abs(score) >= AFC_STRONG_SCORE;
 
-        // ── Определяем тип события ──────────────────────────────────
-        String eventType;
-        String eventEmoji;
+        // ── [v39.0] SINGLE LOOK POLICY — unified forecast format ────
+        // Header → Direction → Body → Footer (same structure as signal)
 
+        // ── Header: AssetType auto-detection ──
+        com.bot.DecisionEngineMerged.AssetType assetType =
+                com.bot.DecisionEngineMerged.detectAssetType(pair);
+        String header = String.format("%s %s | #%s",
+                assetType.emoji, assetType.label, pair);
+
+        // ── Direction: event type ──
         boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
         boolean isEarly      = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
         boolean vsaReversal  = vsa.hasSignal() && (
@@ -1402,110 +1445,72 @@ public final class BotMain {
                         vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.EFFORT_TO_FALL_FAILED ||
                         vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.EFFORT_TO_RISE_FAILED);
 
+        String eventType;
         if (isExhaustion && vsaReversal) {
-            eventType  = bullish ? "🔄 РАЗВОРОТ ВНИЗ" : "🔄 РАЗВОРОТ ВВЕРХ";
-            eventEmoji = "🔄";
+            eventType = bullish ? "🔄 РАЗВОРОТ ВНИЗ" : "🔄 РАЗВОРОТ ВВЕРХ";
         } else if (isExhaustion) {
-            eventType  = "⛽ ИСТОЩЕНИЕ ТРЕНДА";
-            eventEmoji = "⛽";
+            eventType = "⛽ ИСТОЩЕНИЕ ТРЕНДА";
         } else if (isEarly && strong) {
-            eventType  = bullish ? "🚀 ПАМП ФОРМИРУЕТСЯ" : "📉 ДАМП ФОРМИРУЕТСЯ";
-            eventEmoji = bullish ? "🚀" : "📉";
+            eventType = bullish ? "🚀 ПАМП ФОРМИРУЕТСЯ" : "📉 ДАМП ФОРМИРУЕТСЯ";
         } else if (isEarly) {
-            eventType  = bullish ? "📈 ТРЕНД ВВЕРХ — РАННЯЯ ФАЗА" : "📉 ТРЕНД ВНИЗ — РАННЯЯ ФАЗА";
-            eventEmoji = bullish ? "📈" : "📉";
+            eventType = bullish ? "📈 ТРЕНД ВВЕРХ" : "📉 ТРЕНД ВНИЗ";
         } else if (strong) {
-            eventType  = bullish ? "🚀 СИЛЬНЫЙ ПАМП" : "💥 СИЛЬНЫЙ ДАМП";
-            eventEmoji = bullish ? "🚀" : "💥";
+            eventType = bullish ? "🚀 СИЛЬНЫЙ ПАМП" : "💥 СИЛЬНЫЙ ДАМП";
         } else {
-            eventType  = bullish ? "📈 ДВИЖЕНИЕ ВВЕРХ" : "📉 ДВИЖЕНИЕ ВНИЗ";
-            eventEmoji = bullish ? "📈" : "📉";
+            eventType = bullish ? "📈 ДВИЖЕНИЕ ВВЕРХ" : "📉 ДВИЖЕНИЕ ВНИЗ";
         }
 
-        // ── Блок VSA-подтверждения ───────────────────────────────────
-        String vsaLine = "";
+        // ── VSA status line ──
+        String vsaStatus = "";
         if (vsa.hasSignal()) {
-            String vsaDesc = switch (vsa.signal) {
-                case STOPPING_VOLUME_BULL  -> "✅ STOPPING VOL — покупки поглотили продажи";
-                case STOPPING_VOLUME_BEAR  -> "✅ STOPPING VOL — продажи поглотили покупки";
-                case EFFORT_TO_FALL_FAILED -> "✅ ПРОДАЖИ ПРОВАЛИЛИСЬ — закрытие у максимума";
-                case EFFORT_TO_RISE_FAILED -> "✅ ПОКУПКИ ПРОВАЛИЛИСЬ — закрытие у минимума";
-                case NO_SUPPLY             -> "🟢 НЕТ ПРОДАЖ — рынок готов к росту";
-                case NO_DEMAND             -> "🔴 НЕТ ПОКУПОК — рынок готов к падению";
-                case DEMAND_ABSORPTION     -> "⚠️ ПОГЛОЩЕНИЕ СПРОСА — дистрибуция институционалов";
-                case SUPPLY_ABSORPTION     -> "⚠️ ПОГЛОЩЕНИЕ ПРЕДЛОЖЕНИЯ — аккумуляция институционалов";
-                case WEAK_BREAKOUT         -> "⚠️ СЛАБЫЙ ПРОБОЙ — низкий объём, вероятна ловушка";
+            vsaStatus = switch (vsa.signal) {
+                case STOPPING_VOLUME_BULL  -> "Покупки поглотили продажи";
+                case STOPPING_VOLUME_BEAR  -> "Продажи поглотили покупки";
+                case EFFORT_TO_FALL_FAILED -> "Продажи провалились";
+                case EFFORT_TO_RISE_FAILED -> "Покупки провалились";
+                case NO_SUPPLY             -> "Нет продаж";
+                case NO_DEMAND             -> "Нет покупок";
+                case DEMAND_ABSORPTION     -> "Поглощение спроса";
+                case SUPPLY_ABSORPTION     -> "Поглощение предложения";
+                case WEAK_BREAKOUT         -> "Слабый пробой — ловушка";
                 default                    -> "";
             };
-            if (!vsaDesc.isEmpty())
-                vsaLine = "\n📊 VSA: " + vsaDesc;
         }
 
-        // ── Фаза тренда ─────────────────────────────────────────────
-        String phaseDesc = switch (fc.trendPhase) {
-            case EARLY      -> "🌱 РАННЯЯ — движение только начинается";
-            case MID        -> "📈 СЕРЕДИНА — тренд в полной силе";
-            case LATE       -> "⏳ ПОЗДНЯЯ — осталось немного";
-            case EXHAUSTION -> "⛽ ИСТОЩЕНИЕ — тренд заканчивается";
-        };
+        // ── Confidence ──
+        double confPct = Math.abs(score) * 100;
+        String confLabel = confPct >= 70 ? "Ожидание подтверждения" : "Ожидание подтверждения";
 
-        // ── BTC контекст ─────────────────────────────────────────────
-        String btcLine = "";
+        // ── Time ──
+        String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
+                .toLocalTime().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+
+        // ── Build unified body ──
+        StringBuilder body = new StringBuilder();
+        body.append(header).append('\n');
+        body.append(String.format("%s НАПРАВЛЕНИЕ: *%s* (Прогноз)%n", bullish ? "📈" : "📉", eventType));
+        body.append("━━━━━━━━━━━━━━━━━━\n");
+        if (fc.magnetLevel > 0) {
+            body.append(String.format("🧲 Магнит: `%.4f`%n", fc.magnetLevel));
+        }
+        if (fc.projectedMovePct != 0) {
+            body.append(String.format("📐 Движение: `%+.2f%%`%n", fc.projectedMovePct * 100));
+        }
+        if (!vsaStatus.isEmpty()) {
+            body.append(String.format("⚠️ VSA: %s%n", vsaStatus));
+        }
+        // BTC context
         if (ctx != null && ctx.impulseStrength > 0.3) {
             String btcEmoji = ctx.impulseStrength > 0.7 ? "🟢" : "🟡";
-            btcLine = String.format("\n%s BTC: %s | сила %.0f%%",
-                    btcEmoji, ctx.regime, ctx.impulseStrength * 100);
+            body.append(String.format("%s BTC: %s | %.0f%%%n", btcEmoji, ctx.regime, ctx.impulseStrength * 100));
         }
-
-        // ── Прогнозируемое движение ──────────────────────────────────
-        String moveLine = "";
-        if (fc.projectedMovePct != 0) {
-            moveLine = String.format("\n📐 Ожидаемое движение: %+.2f%%", fc.projectedMovePct * 100);
-        }
-
-        // ── Уровень магнита (VPOC) ───────────────────────────────────
-        String magnetLine = "";
-        if (fc.magnetLevel > 0) {
-            magnetLine = String.format("\n🧲 Магнит объёма: `%.6f`", fc.magnetLevel);
-        }
-
-        // ── Уверенность бота ─────────────────────────────────────────
-        String confBar = buildConfBar(Math.abs(score));
-
-        String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
-                .toLocalTime().withNano(0).toString();
-
-        // [v34.0] Asset type auto-detection for advance forecast
-        com.bot.DecisionEngineMerged.AssetType assetType =
-                com.bot.DecisionEngineMerged.detectAssetType(pair);
-        String assetLabel = assetType == com.bot.DecisionEngineMerged.AssetType.CRYPTO
-                ? "🪙 Крипта" : assetType.emoji + " " + assetType.label;
-
-        // [v35.0] Compact forecast format — same style as signal
-        StringBuilder body = new StringBuilder();
-        body.append(String.format("🔔 *ПРОГНОЗ* • #%s%n", pair));
-        body.append(String.format("%s%n", assetLabel));
-        body.append("━━━━━━━━━━━━━━━━━━━━\n");
-        body.append(String.format("%s %s%n", eventEmoji, eventType));
-        body.append(String.format("⚡ %s%n", confBar));
-        if (!vsaLine.isEmpty()) body.append(vsaLine.stripLeading()).append("\n");
-        if (!btcLine.isEmpty()) body.append(btcLine.stripLeading()).append("\n");
-        if (fc.magnetLevel > 0) body.append(String.format("🧲 Магнит: %.4f%n", fc.magnetLevel));
-        body.append("━━━━━━━━━━━━━━━━━━━━\n");
-        body.append("💡 _Прогноз, не сигнал. Жди подтверждения._\n");
-        body.append(String.format("_⏰ %s Warsaw_", time));
+        body.append("━━━━━━━━━━━━━━━━━━\n");
+        body.append(String.format("📊 Conf: *%.0f%%* | %s%n", confPct, confLabel));
+        body.append(String.format("_⏰ %s_", time));
 
         return body.toString();
     }
 
-    /** Строит визуальную шкалу уверенности [0..1] → █████░░░░░ */
-    private static String buildConfBar(double score) {
-        int filled = (int) Math.round(score * 10);
-        filled = Math.max(0, Math.min(10, filled));
-        String bar = "█".repeat(filled) + "░".repeat(10 - filled);
-        String label = score >= 0.70 ? "ВЫСОКАЯ" : score >= 0.45 ? "СРЕДНЯЯ" : "УМЕРЕННАЯ";
-        return String.format("[%s] %s (%.0f%%)", bar, label, score * 100);
-    }
 
     private static String buildStartMessage() {
         return String.format(

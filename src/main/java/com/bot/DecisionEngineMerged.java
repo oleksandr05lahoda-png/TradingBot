@@ -874,87 +874,69 @@ public final class DecisionEngineMerged {
 
         public String toTelegramString() {
             // ╔══════════════════════════════════════════════════════════╗
-            // ║  [v38.0] ЧИСТЫЙ ФОРМАТ СИГНАЛА                          ║
-            // ║  • TradingView тикер для быстрого поиска                 ║
-            // ║  • Аналог в традиционных активах                         ║
-            // ║  • Сектор монеты                                          ║
-            // ║  • Минимум шума — только то, что нужно трейдеру           ║
+            // ║  [v39.0] SINGLE LOOK POLICY — unified signal format      ║
+            // ║  Header → Direction → Prices → Footer                    ║
+            // ║  Трейдер читает сигнал за 0.5 секунды                    ║
             // ╚══════════════════════════════════════════════════════════╝
             boolean isLong   = side == com.bot.TradingCore.Side.LONG;
             String sideEmoji = isLong ? "📈" : "📉";
             String sideStr   = isLong ? "LONG" : "SHORT";
 
-            // Уверенность
-            String confEmoji = probability >= 83 ? "🔥"
-                    : probability >= 74 ? "✅"
-                      : probability >= 65 ? "🟡" : "⚪";
+            // ── Header: AssetType auto-detection ──
+            AssetType assetType = detectAssetType(symbol);
+            String header = String.format("%s %s | #%s", assetType.emoji, assetType.label, symbol);
 
-            // Категория + сектор
-            String catStr = switch (category) {
-                case TOP  -> "👑 TOP";
-                case MEME -> "🐸 MEME";
-                default   -> "🔷 ALT";
-            };
-            String sector = detectCoinSector(symbol);
-            String comparable = getComparableAsset(symbol, category);
-            String tvTicker = toTradingViewTicker(symbol);
-
-            // Цены
+            // ── Price format ──
+            String fmt = price < 0.001 ? "%.6f" : price < 0.01 ? "%.5f"
+                                                  : price < 0.1 ? "%.4f" : price < 10 ? "%.4f" : "%.2f";
             double riskPct = Math.abs(price - stop) / price * 100;
-            double rp1Pct  = Math.abs(tp1 - price)  / price * 100;
-            double rp2Pct  = Math.abs(tp2 - price)  / price * 100;
-            double rp3Pct  = Math.abs(tp3 - price)  / price * 100;
 
-            // Формат числа
-            String fmt = price < 0.001 ? "%.6f" : price < 0.01 ? "%.5f" : price < 0.1 ? "%.4f" : price < 10 ? "%.4f" : "%.2f";
+            // ── R:R ──
+            String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
 
-            // Размер позиции
+            // ── Size (из flags) ──
             String sizeStr = "";
             for (String f : flags) {
                 if (f.startsWith("SIZE=")) { sizeStr = f; break; }
             }
 
-            // Funding rate warning
+            // ── Funding rate warning ──
             String frLine = "";
             if (Math.abs(fundingRate) > 0.0008) {
                 String frWarn = "";
                 if (isLong && fundingRate > 0.0005) frWarn = " ⚠️платишь FR";
                 if (!isLong && fundingRate < -0.0005) frWarn = " ⚠️платишь FR";
-                frLine = String.format("\n💸 Funding: %+.3f%%%s", fundingRate * 100, frWarn);
+                frLine = String.format("%n💸 FR: %+.3f%%%s", fundingRate * 100, frWarn);
             }
 
-            // Время
+            // ── Trader flags (compact, max 6) ──
+            List<String> tf = traderFlags();
+            String flagsLine = tf.isEmpty() ? "" : String.format("%n📌 %s", String.join(" | ", tf));
+
+            // ── Время ──
             String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
                     .toLocalTime().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
 
-            // R:R
-            String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
+            // ── TradingView тикер ──
+            String tvTicker = toTradingViewTicker(symbol);
 
-            return String.format(
-                    "%s *%s %s* %s | %s%n"
-                            + "📍 `%s` | %s%n"
-                            + "━━━━━━━━━━━━━━━━━━%n"
-                            + "💰 Вход: `" + fmt + "`%n"
-                            + "🛑 SL:   `" + fmt + "` (%.2f%%)%n"
-                            + "🟢 TP1:  `" + fmt + "` (+%.2f%%)%n"
-                            + "🔵 TP2:  `" + fmt + "` (+%.2f%%)%n"
-                            + "💎 TP3:  `" + fmt + "` (+%.2f%%)%n"
-                            + "━━━━━━━━━━━━━━━━━━%n"
-                            + "🎯 *%.0f%%* | R:R *%s*%s%s%n"
-                            + "%s%n"
-                            + "_⏰ %s_",
-                    confEmoji, sideEmoji, sideStr, catStr, sector,
-                    tvTicker, comparable,
-                    price,
-                    stop, riskPct,
-                    tp1, rp1Pct,
-                    tp2, rp2Pct,
-                    tp3, rp3Pct,
-                    probability, rrStr,
-                    sizeStr.isEmpty() ? "" : " | " + sizeStr,
-                    frLine,
-                    "", // reserved
-                    time);
+            // ── Unified body ──
+            StringBuilder sb = new StringBuilder();
+            sb.append(header).append('\n');
+            sb.append(sideEmoji).append(" НАПРАВЛЕНИЕ: *").append(sideStr).append("*\n");
+            sb.append("━━━━━━━━━━━━━━━━━━\n");
+            sb.append(String.format("💰 Вход: `" + fmt + "`%n", price));
+            sb.append(String.format("🛑 Стоп: `" + fmt + "` (%.2f%%)%n", stop, riskPct));
+            sb.append(String.format("🎯 Цели: `" + fmt + "` | `" + fmt + "` | `" + fmt + "`%n", tp1, tp2, tp3));
+            sb.append("━━━━━━━━━━━━━━━━━━\n");
+            sb.append(String.format("📊 Conf: *%.0f%%* | R:R: *%s*", probability, rrStr));
+            if (!sizeStr.isEmpty()) sb.append(" | ").append(sizeStr);
+            sb.append(frLine);
+            sb.append(flagsLine);
+            sb.append(String.format("%n📍 `%s`", tvTicker));
+            sb.append(String.format("%n_⏰ %s_", time));
+
+            return sb.toString();
         }
 
         @Override public String toString() { return toTelegramString(); }
