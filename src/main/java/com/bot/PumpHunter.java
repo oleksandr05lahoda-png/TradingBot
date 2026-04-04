@@ -9,14 +9,21 @@ public final class PumpHunter {
 
     private static final double PUMP_BODY_ATR_MULT = 2.2;
     private static final double MEGA_PUMP_BODY_ATR_MULT = 3.5;
-    private static final double VOLUME_SPIKE_MULT = 2.5;
+    // [v40.0] VOLUME_SPIKE_MULT raised 2.5→3.0: compensates for lower MIN_MOVE_PCT.
+    // Smaller price moves are OK only if volume is truly anomalous (3× avg, not 2.5×).
+    private static final double VOLUME_SPIKE_MULT = 3.0;
     private static final double MEGA_VOLUME_SPIKE_MULT = 4.0;
 
-    private static final double MIN_MOVE_PCT = 0.012;
-    private static final double STRONG_MOVE_PCT = 0.022;
+    // [v40.0] MIN_MOVE_PCT lowered 1.2%→0.9%: catches pumps 1-2 candles earlier.
+    // At 1.2% on 15m TF, the pump is already 50-70% done by the time PumpHunter fires.
+    // 0.9% with VOLUME_SPIKE_MULT=3.0 filters noise while catching the early phase.
+    // NOT 0.7% (Gemini suggestion) — that's pure noise for mid-cap alts with ATR=1.5%.
+    private static final double MIN_MOVE_PCT = 0.009;
+    // [v40.0] STRONG_MOVE_PCT lowered 2.2%→1.8%: aligns with new MIN scale.
+    private static final double STRONG_MOVE_PCT = 0.018;
     private static final double MEGA_MOVE_PCT = 0.035;
-    private static final double DUMP_MOVE_PCT = -0.012;
-    private static final double STRONG_DUMP_PCT = -0.022;
+    private static final double DUMP_MOVE_PCT = -0.009;
+    private static final double STRONG_DUMP_PCT = -0.018;
 
     private static final int VOLUME_LOOKBACK = 20;
     private static final int ATR_PERIOD = 14;

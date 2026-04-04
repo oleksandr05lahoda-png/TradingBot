@@ -118,6 +118,17 @@ public final class TelegramBotSender {
                 if (resp.statusCode() == 200) {
                     log("[OK] Message sent");
                     return;
+                } else if (resp.statusCode() == 400 && i == 1) {
+                    // [v40.0] MARKDOWN FALLBACK: TG returns 400 if Markdown is malformed.
+                    // Strip parse_mode and resend as plain text — message gets through ugly but intact.
+                    log("[WARN] Markdown parse error, retrying as plain text");
+                    HttpRequest plainReq = buildRequestPlain(message);
+                    HttpResponse<String> plainResp = client.send(plainReq, HttpResponse.BodyHandlers.ofString());
+                    if (plainResp.statusCode() == 200) {
+                        log("[OK] Message sent (plain fallback)");
+                        return;
+                    }
+                    log("[WARN] Plain fallback also failed: HTTP " + plainResp.statusCode());
                 } else {
                     String body = resp.body();
                     log("[WARN] HTTP " + resp.statusCode()
@@ -136,9 +147,25 @@ public final class TelegramBotSender {
 
     /** Создание запроса к Telegram API */
     private HttpRequest buildRequest(String message) throws Exception {
-        // POST is more robust than GET for long messages (avoids URL length limits).
         String url = "https://api.telegram.org/bot" + token + "/sendMessage";
         String body = "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
+                + "&parse_mode=Markdown"
+                + "&disable_web_page_preview=true"
+                + "&text=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
+
+        return HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+    }
+
+    /** [v40.0] Fallback: plain text without parse_mode — for malformed Markdown */
+    private HttpRequest buildRequestPlain(String message) throws Exception {
+        String url = "https://api.telegram.org/bot" + token + "/sendMessage";
+        String body = "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
+                + "&disable_web_page_preview=true"
                 + "&text=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
 
         return HttpRequest.newBuilder()

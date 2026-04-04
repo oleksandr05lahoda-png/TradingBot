@@ -874,67 +874,66 @@ public final class DecisionEngineMerged {
 
         public String toTelegramString() {
             // ╔══════════════════════════════════════════════════════════╗
-            // ║  [v39.0] SINGLE LOOK POLICY — unified signal format      ║
-            // ║  Header → Direction → Prices → Footer                    ║
-            // ║  Трейдер читает сигнал за 0.5 секунды                    ║
+            // ║  [v40.0] CLEAN PRO FORMAT — institutional grade           ║
+            // ║  Читается за 0.5 секунды. Ноль визуального мусора.       ║
+            // ║  Единый формат для крипты/нефти/газа/металлов/форекса.   ║
             // ╚══════════════════════════════════════════════════════════╝
-            boolean isLong   = side == com.bot.TradingCore.Side.LONG;
-            String sideEmoji = isLong ? "📈" : "📉";
-            String sideStr   = isLong ? "LONG" : "SHORT";
+            boolean isLong = side == com.bot.TradingCore.Side.LONG;
+            String icon    = isLong ? "🟢" : "🔴";
+            String sideStr = isLong ? "LONG" : "SHORT";
 
-            // ── Header: AssetType auto-detection ──
-            AssetType assetType = detectAssetType(symbol);
-            String header = String.format("%s %s | #%s", assetType.emoji, assetType.label, symbol);
+            // ── Очистка тикера: ARIAUSDT → ARIA/USDT ──
+            String cleanSymbol = symbol;
+            if (symbol.endsWith("USDT"))
+                cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/USDT";
+            else if (symbol.endsWith("BUSD"))
+                cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/BUSD";
+            else if (symbol.endsWith("USDC"))
+                cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/USDC";
 
             // ── Price format ──
             String fmt = price < 0.001 ? "%.6f" : price < 0.01 ? "%.5f"
                                                   : price < 0.1 ? "%.4f" : price < 10 ? "%.4f" : "%.2f";
             double riskPct = Math.abs(price - stop) / price * 100;
-
-            // ── R:R ──
             String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
 
-            // ── Size (из flags) ──
-            String sizeStr = "";
-            for (String f : flags) {
-                if (f.startsWith("SIZE=")) { sizeStr = f; break; }
-            }
-
-            // ── Funding rate warning ──
-            String frLine = "";
-            if (Math.abs(fundingRate) > 0.0008) {
-                String frWarn = "";
-                if (isLong && fundingRate > 0.0005) frWarn = " ⚠️платишь FR";
-                if (!isLong && fundingRate < -0.0005) frWarn = " ⚠️платишь FR";
-                frLine = String.format("%n💸 FR: %+.3f%%%s", fundingRate * 100, frWarn);
-            }
-
-            // ── Trader flags (compact, max 6) ──
+            // ── Drivers (compact, max 3) ──
             List<String> tf = traderFlags();
-            String flagsLine = tf.isEmpty() ? "" : String.format("%n📌 %s", String.join(" | ", tf));
+            int limit = Math.min(tf.size(), 3);
+            String driversLine = "";
+            if (!tf.isEmpty()) {
+                // Strip emoji for clean look
+                List<String> clean = new java.util.ArrayList<>();
+                for (int i = 0; i < limit; i++) {
+                    clean.add(tf.get(i).replaceAll("[⚡⚠️🔥🚀📈📉↔️⛽🌙🗽🧲📡🔴📐🔻]", "").trim());
+                }
+                driversLine = String.join(" · ", clean);
+            }
 
-            // ── Время ──
-            String time = java.time.ZonedDateTime.now(java.time.ZoneId.of("Europe/Warsaw"))
-                    .toLocalTime().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+            // ── Funding rate (only if significant) ──
+            String frWarning = "";
+            if (Math.abs(fundingRate) > 0.0008) {
+                boolean paysFR = (isLong && fundingRate > 0.0005) || (!isLong && fundingRate < -0.0005);
+                if (paysFR) frWarning = String.format("  ⚠ FR %+.3f%%", fundingRate * 100);
+            }
 
-            // ── TradingView тикер ──
-            String tvTicker = toTradingViewTicker(symbol);
-
-            // ── Unified body ──
+            // ── Build message ──
             StringBuilder sb = new StringBuilder();
-            sb.append(header).append('\n');
-            sb.append(sideEmoji).append(" НАПРАВЛЕНИЕ: *").append(sideStr).append("*\n");
-            sb.append("━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("💰 Вход: `" + fmt + "`%n", price));
-            sb.append(String.format("🛑 Стоп: `" + fmt + "` (%.2f%%)%n", stop, riskPct));
-            sb.append(String.format("🎯 Цели: `" + fmt + "` | `" + fmt + "` | `" + fmt + "`%n", tp1, tp2, tp3));
-            sb.append("━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("📊 Conf: *%.0f%%* | R:R: *%s*", probability, rrStr));
-            if (!sizeStr.isEmpty()) sb.append(" | ").append(sizeStr);
-            sb.append(frLine);
-            sb.append(flagsLine);
-            sb.append(String.format("%n📍 `%s`", tvTicker));
-            sb.append(String.format("%n_⏰ %s_", time));
+            sb.append(icon).append("  *").append(cleanSymbol).append("*  ·  ").append(sideStr).append('\n');
+            sb.append("━━━━━━━━━━━━━━━━━━━━━\n");
+            sb.append(String.format("Entry     `" + fmt + "`%n", price));
+            sb.append(String.format("Stop      `" + fmt + "`  (%.1f%%)%n", stop, riskPct));
+            sb.append(String.format("TP1       `" + fmt + "`%n", tp1));
+            sb.append(String.format("TP2       `" + fmt + "`%n", tp2));
+            sb.append(String.format("TP3       `" + fmt + "`%n", tp3));
+            sb.append("━━━━━━━━━━━━━━━━━━━━━\n");
+            sb.append(String.format("R:R  *%s*  ·  Conf  *%.0f%%*", rrStr, probability));
+            if (!frWarning.isEmpty()) sb.append(frWarning);
+            sb.append('\n');
+            if (!driversLine.isEmpty()) {
+                sb.append(driversLine).append('\n');
+            }
+            sb.append(String.format("`BINANCE:%s.P`", symbol));
 
             return sb.toString();
         }
@@ -1650,7 +1649,9 @@ public final class DecisionEngineMerged {
         // ════════════════════════════════════════════════════════
 
         EarlyReversalResult earlyRev = detectEarlyReversal(c1, c5, c15, rsi14, rsi7, price, atr14);
-        if (earlyRev.detected && earlyRev.strength > 0.35) {
+        // [v40.0] Threshold lowered 0.35→0.30: catches reversals 1 candle earlier.
+        // Volume confirmation via HTF OVERRIDE gate compensates for lower threshold.
+        if (earlyRev.detected && earlyRev.strength > 0.30) {
             double earlyScore = mctx.s(earlyRev.strength * 0.70);
             if (earlyRev.direction > 0) {
                 cEarly.addLong(earlyScore, "EARLY_BULL");
@@ -1717,30 +1718,58 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
-        // [FIX v32+] DUAL HTF DIRECTIONAL GATE
+        // [v40.0] DUAL HTF DIRECTIONAL GATE — with EARLY REVERSAL OVERRIDE
         // When BOTH 1H and 2H agree on direction, the counter-direction
         // candidate needs much higher conviction to override them.
-        // Dual HTF BEAR + LONG = "falling knife" = -65% score penalty.
-        // Dual HTF BULL + SHORT = "shorting strong trend" = -60% penalty.
-        // This is the single biggest cause of 0 LONG signals: without this patch
-        // the opposite is also true — it was NOT penalizing LONG properly, so
-        // LONGs in pure bear markets passed through with insufficient evidence.
+        //
+        // OVERRIDE: If EarlyReversal detected + strong volume confirmation
+        // (VSA absorption/stopping + CVD persistence), we soften the penalty.
+        // This lets the bot catch bottoms/tops BEFORE the HTF EMA flips —
+        // which is where the real edge lives (leading, not lagging).
+        //
+        // Without override: bot waits for 1H+2H to flip → price already moved 3-5%
+        // With override: bot enters on micro-structure reversal + volume intent
         // ════════════════════════════════════════════════════════
         com.bot.TradingCore.Side prelimSide = totalLong > totalShort
                 ? com.bot.TradingCore.Side.LONG
                 : com.bot.TradingCore.Side.SHORT;
 
+        // [v40.0] Detect strong leading (volume-based) reversal signals
+        boolean strongEarlyReversal = earlyRev.detected && earlyRev.strength > 0.50;
+        boolean strongVolumeLong  = cVolume.favorsLong()  && cVolume.longScore > 0.40;
+        boolean strongVolumeShort = cVolume.favorsShort() && cVolume.shortScore > 0.40;
+        // VSA institutional footprint flags
+        boolean vsaAbsorptionBull = allFlags.stream().anyMatch(f ->
+                f.startsWith("VSA_STOP_VOL_BULL") || f.startsWith("VSA_ABSORB_BULL")
+                        || f.equals("VSA_NO_SUPPLY"));
+        boolean vsaAbsorptionBear = allFlags.stream().anyMatch(f ->
+                f.startsWith("VSA_STOP_VOL_BEAR") || f.startsWith("VSA_ABSORB_BEAR")
+                        || f.equals("VSA_NO_DEMAND"));
+
         if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.LONG) {
-            // Both timeframes are bearish — LONG requires extraordinary conviction
-            totalLong *= 0.35;
-            allFlags.add("DUAL_HTF_BEAR_PENALTY");
+            boolean hasLeadingOverride = (strongEarlyReversal && strongVolumeLong)
+                    || (vsaAbsorptionBull && cVolume.longScore > 0.30);
+            if (hasLeadingOverride) {
+                // Soften: still penalise but don't kill — let confluence decide
+                totalLong *= 0.55;
+                allFlags.add("HTF_OVERRIDE_EARLY_VOL");
+            } else {
+                totalLong *= 0.35;
+                allFlags.add("DUAL_HTF_BEAR_PENALTY");
+            }
         }
         if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
-            // [Hole 2 FIX] Both timeframes are bullish — balanced from 0.40 to 0.35 to match bear side
-            totalShort *= 0.35;
-            allFlags.add("DUAL_HTF_BULL_PENALTY");
+            boolean hasLeadingOverride = (strongEarlyReversal && strongVolumeShort)
+                    || (vsaAbsorptionBear && cVolume.shortScore > 0.30);
+            if (hasLeadingOverride) {
+                totalShort *= 0.55;
+                allFlags.add("HTF_OVERRIDE_EARLY_VOL");
+            } else {
+                totalShort *= 0.35;
+                allFlags.add("DUAL_HTF_BULL_PENALTY");
+            }
         }
 
         // ════════════════════════════════════════════════════════
@@ -1829,7 +1858,7 @@ public final class DecisionEngineMerged {
 
         // [v19.0] HARD VETO: Если очень мощный разворотный сигнал идет ПРОТИВ тренда,
         // который набрал баллы на отстающих индикаторах (как 1H EMA), убиваем трендовый сигнал.
-        if (earlyRev.detected && earlyRev.strength > 0.35) {
+        if (earlyRev.detected && earlyRev.strength > 0.30) {
             com.bot.TradingCore.Side earlySide = earlyRev.direction > 0 ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
 
             boolean rsiSupportsEarly = (earlySide == com.bot.TradingCore.Side.LONG && rsi14 < 45) ||
