@@ -1431,10 +1431,13 @@ public final class BotMain {
 
 
     private static String buildStartMessage() {
-        return "*GodBot PRO v41*\n\n"
-                + "15M Futures · Crypto / Commodities\n"
-                + "EarlyRev · VSA · OFV · Forecast\n"
-                + "R:R 1:2 min";
+        return "⚡ *GodBot PRO* `v41`\n"
+                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                + "`15M` Futures  ·  Crypto / Commodities\n"
+                + "VSA  ·  OFV  ·  EarlyRev  ·  Forecast\n"
+                + "R:R min `1:2`  ·  Risk-first 🔒\n"
+                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                + "_Система активна. Торгуй с умом._";
     }
     private static String nowWarsawStr() {
         return ZonedDateTime.now(ZONE)

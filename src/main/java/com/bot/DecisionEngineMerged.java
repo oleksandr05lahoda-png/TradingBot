@@ -878,50 +878,74 @@ public final class DecisionEngineMerged {
             String sideStr = isLong ? "LONG" : "SHORT";
             AssetType assetType = detectAssetType(symbol);
 
-            String fmt = price < 0.001 ? "%.6f" : price < 0.01 ? "%.5f"
-                                                  : price < 0.1 ? "%.4f" : price < 10 ? "%.4f" : "%.2f";
+            // Strip USDT/BUSD suffix for a clean ticker: BTCUSDT → #BTC
+            String base = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4)
+                    : symbol.endsWith("BUSD") ? symbol.substring(0, symbol.length() - 4)
+                      : symbol;
+
+            // Price format — adapts to magnitude so decimals are always meaningful
+            String fmt = price < 0.0001 ? "%.7f"
+                    : price < 0.001  ? "%.6f"
+                      : price < 0.01   ? "%.5f"
+                        : price < 0.1    ? "%.4f"
+                          : price < 100    ? "%.4f"
+                            : price < 10000  ? "%.3f"
+                              : "%.2f";
+
             double riskPct = Math.abs(price - stop) / price * 100;
-            String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
+            String rrStr   = rr > 0 ? String.format("1:%.1f", rr) : "—";
 
-            // Drivers — top 2 reasons for the signal
-            List<String> tf = traderFlags();
-            String driversLine = "";
-            if (!tf.isEmpty()) {
-                List<String> clean = new java.util.ArrayList<>();
-                int lim = Math.min(tf.size(), 2);
-                for (int i = 0; i < lim; i++) {
-                    clean.add(tf.get(i).replaceAll("[⚡⚠️🔥🚀📈📉↔️⛽🌙🗽🧲📡🔴📐🔻🟢🟡]", "").trim());
-                }
-                driversLine = String.join(" · ", clean);
-            }
-
-            // Trend phase
-            String phaseStr = "";
+            // ── Trend phase label ───────────────────────────────────────────
+            String phaseTag = "";
             if (forecast != null && forecast.trendPhase != null) {
-                phaseStr = switch (forecast.trendPhase) {
-                    case EARLY      -> "Ранний тренд";
-                    case MID        -> "Середина тренда";
-                    case LATE       -> "Поздний тренд";
-                    case EXHAUSTION -> "Истощение";
+                phaseTag = switch (forecast.trendPhase) {
+                    case EARLY      -> "📈 Ранний тренд";
+                    case MID        -> "📊 Середина";
+                    case LATE       -> "📉 Поздний тренд";
+                    case EXHAUSTION -> "⚠️ Истощение";
                     default         -> "";
                 };
             }
 
-            StringBuilder sb = new StringBuilder();
-            sb.append(icon).append(" *").append(symbol).append("* · ").append(sideStr).append('\n');
-            sb.append("_").append(assetType.label).append("_\n\n");
-            sb.append(String.format("Вход: " + fmt + "%n", price));
-            sb.append(String.format("Стоп: " + fmt + " (%.1f%%)%n", stop, riskPct));
-            sb.append(String.format("TP1: " + fmt + "%n", tp1));
-            sb.append(String.format("TP2: " + fmt + "%n%n", tp2));
-            sb.append(String.format("*%.0f%%* уверенность · R:R *%s*", probability, rrStr));
+            // ── Top trader flags (max 3, keep their emojis) ─────────────────
+            List<String> tf = traderFlags();
+            String flagsLine = "";
+            if (!tf.isEmpty()) {
+                flagsLine = String.join(" · ", tf.subList(0, Math.min(tf.size(), 3)));
+            }
 
-            // Context line: phase + drivers
-            String context = "";
-            if (!phaseStr.isEmpty() && !driversLine.isEmpty()) context = phaseStr + " · " + driversLine;
-            else if (!phaseStr.isEmpty()) context = phaseStr;
-            else if (!driversLine.isEmpty()) context = driversLine;
-            if (!context.isEmpty()) sb.append("\n_").append(context).append("_");
+            // ── Context line: phase + flags (combined if both present) ───────
+            String contextLine = "";
+            if (!phaseTag.isEmpty() && !flagsLine.isEmpty()) contextLine = phaseTag + "  ·  " + flagsLine;
+            else if (!phaseTag.isEmpty())  contextLine = phaseTag;
+            else if (!flagsLine.isEmpty()) contextLine = flagsLine;
+
+            // ── Build message ───────────────────────────────────────────────
+            String div = "━━━━━━━━━━━━━━━━━━━━";
+            StringBuilder sb = new StringBuilder();
+
+            // Line 1: direction + ticker + asset type
+            sb.append(icon).append(" *#").append(base).append("*  ").append(sideStr)
+                    .append("   _").append(assetType.label).append("_\n");
+            sb.append(div).append('\n');
+
+            // Entry + Stop (monospace for easy copy)
+            sb.append("🎯  `").append(String.format(fmt, price)).append("`\n");
+            sb.append(String.format("🛑  `" + fmt + "`   -%.1f%%%n", stop, riskPct));
+            sb.append(div).append('\n');
+
+            // Take-profits
+            sb.append("💰 TP1   `").append(String.format(fmt, tp1)).append("`\n");
+            sb.append("💰 TP2   `").append(String.format(fmt, tp2)).append("`\n");
+            sb.append(div).append('\n');
+
+            // Confidence + R:R
+            sb.append(String.format("📊 *%.0f%%*   ·   R:R *%s*", probability, rrStr));
+
+            // Optional context (phase + flags)
+            if (!contextLine.isEmpty()) {
+                sb.append('\n').append("_").append(contextLine).append("_");
+            }
 
             return sb.toString();
         }
