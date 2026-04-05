@@ -17,17 +17,17 @@ public final class DecisionEngineMerged {
     // or it's a commodity/metal proxy that needs separate platform.
     // ══════════════════════════════════════════════════════════════
     public enum AssetType {
-        CRYPTO("📊", "Криптовалюта"),
-        PRECIOUS_METAL_GOLD("📊", "Золото"),
-        PRECIOUS_METAL_SILVER("📊", "Серебро"),
-        PRECIOUS_METAL_PLATINUM("📊", "Платина"),
-        PRECIOUS_METAL_OTHER("📊", "Драгоценный металл"),
-        COMMODITY_OIL("📊", "Нефть"),
-        COMMODITY_GAS("📊", "Природный газ"),
-        COMMODITY_OTHER("📊", "Сырьевой товар"),
-        FOREX("📊", "Форекс"),
-        INDEX("📊", "Индекс"),
-        UNKNOWN("📊", "Актив");
+        CRYPTO("", "Криптовалюта"),
+        PRECIOUS_METAL_GOLD("", "Золото"),
+        PRECIOUS_METAL_SILVER("", "Серебро"),
+        PRECIOUS_METAL_PLATINUM("", "Платина"),
+        PRECIOUS_METAL_OTHER("", "Драг. металл"),
+        COMMODITY_OIL("", "Нефть"),
+        COMMODITY_GAS("", "Природный газ"),
+        COMMODITY_OTHER("", "Сырьё"),
+        FOREX("", "Форекс"),
+        INDEX("", "Индекс"),
+        UNKNOWN("", "Актив");
 
         public final String emoji;
         public final String label;
@@ -873,56 +873,55 @@ public final class DecisionEngineMerged {
         }
 
         public String toTelegramString() {
-            // ╔══════════════════════════════════════════════════════════╗
-            // ║  [v41.0] USER-SPEC FORMAT                                ║
-            // ║  Line 1: asset type (words)                              ║
-            // ║  Line 2: SYMBOL/USDT → LONG/SHORT                       ║
-            // ║  Lines 3-6: Price, Stop, TP1, TP2 (plain text, no code) ║
-            // ║  Line 7: Confidence                                      ║
-            // ║  No TP3, no separator lines, no hardcoded time           ║
-            // ║  Time: Telegram shows message timestamp in each user's   ║
-            // ║  local timezone automatically — no need to hardcode.     ║
-            // ╚══════════════════════════════════════════════════════════╝
             boolean isLong = side == com.bot.TradingCore.Side.LONG;
+            String icon    = isLong ? "🟢" : "🔴";
             String sideStr = isLong ? "LONG" : "SHORT";
-            String arrow   = isLong ? "↗" : "↘";
-
-            // ── Asset type label ──
             AssetType assetType = detectAssetType(symbol);
 
-            // ── Clean symbol: ARIAUSDT → ARIA/USDT ──
-            String cleanSymbol = symbol;
-            if (symbol.endsWith("USDT"))
-                cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/USDT";
-            else if (symbol.endsWith("BUSD"))
-                cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/BUSD";
-            else if (symbol.endsWith("USDC"))
-                cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/USDC";
-
-            // ── Price format (plain text, no backticks) ──
             String fmt = price < 0.001 ? "%.6f" : price < 0.01 ? "%.5f"
                                                   : price < 0.1 ? "%.4f" : price < 10 ? "%.4f" : "%.2f";
             double riskPct = Math.abs(price - stop) / price * 100;
-
-            // ── Build message ──
-            StringBuilder sb = new StringBuilder();
-
-            // Line 1: asset type
-            sb.append(assetType.label).append('\n');
-
-            // Line 2: symbol → direction
-            sb.append("*").append(cleanSymbol).append("*  ").append(arrow).append("  *").append(sideStr).append("*\n\n");
-
-            // Prices — plain text, aligned
-            sb.append(String.format("Price    " + fmt + "%n", price));
-            sb.append(String.format("Stop     " + fmt + "  (%.1f%%)%n", stop, riskPct));
-            sb.append(String.format("TP1      " + fmt + "%n", tp1));
-            sb.append(String.format("TP2      " + fmt + "%n", tp2));
-
-            // Confidence + R:R
-            sb.append('\n');
             String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
-            sb.append(String.format("Conf *%.0f%%*  ·  R:R *%s*", probability, rrStr));
+
+            // Drivers — top 2 reasons for the signal
+            List<String> tf = traderFlags();
+            String driversLine = "";
+            if (!tf.isEmpty()) {
+                List<String> clean = new java.util.ArrayList<>();
+                int lim = Math.min(tf.size(), 2);
+                for (int i = 0; i < lim; i++) {
+                    clean.add(tf.get(i).replaceAll("[⚡⚠️🔥🚀📈📉↔️⛽🌙🗽🧲📡🔴📐🔻🟢🟡]", "").trim());
+                }
+                driversLine = String.join(" · ", clean);
+            }
+
+            // Trend phase
+            String phaseStr = "";
+            if (forecast != null && forecast.trendPhase != null) {
+                phaseStr = switch (forecast.trendPhase) {
+                    case EARLY      -> "Ранний тренд";
+                    case MID        -> "Середина тренда";
+                    case LATE       -> "Поздний тренд";
+                    case EXHAUSTION -> "Истощение";
+                    default         -> "";
+                };
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(icon).append(" *").append(symbol).append("* · ").append(sideStr).append('\n');
+            sb.append("_").append(assetType.label).append("_\n\n");
+            sb.append(String.format("Вход: " + fmt + "%n", price));
+            sb.append(String.format("Стоп: " + fmt + " (%.1f%%)%n", stop, riskPct));
+            sb.append(String.format("TP1: " + fmt + "%n", tp1));
+            sb.append(String.format("TP2: " + fmt + "%n%n", tp2));
+            sb.append(String.format("*%.0f%%* уверенность · R:R *%s*", probability, rrStr));
+
+            // Context line: phase + drivers
+            String context = "";
+            if (!phaseStr.isEmpty() && !driversLine.isEmpty()) context = phaseStr + " · " + driversLine;
+            else if (!phaseStr.isEmpty()) context = phaseStr;
+            else if (!driversLine.isEmpty()) context = driversLine;
+            if (!context.isEmpty()) sb.append("\n_").append(context).append("_");
 
             return sb.toString();
         }

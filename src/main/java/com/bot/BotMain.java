@@ -586,7 +586,7 @@ public final class BotMain {
                 it.remove();
                 isc.closeTrade(ts.symbol, ts.side, 0.0, "SCORE_EXIT");
                 telegram.sendMessageAsync(String.format(
-                        "*%s* — Score Exit\n\nScore %.2f (3+ losses)\nПозиция закрыта",
+                        "⚠ *%s* · score exit\nScore: %.2f",
                         ts.symbol, symScore));
                 LOG.info("[TR] SCORE EXIT: " + ts.symbol + " score=" + String.format("%.2f", symScore));
                 continue;
@@ -707,9 +707,10 @@ public final class BotMain {
                                 pnl > 0 ? "CHANDELIER_PROFIT" : "CHANDELIER_FLAT");
                         // [v38.0] Suppress noise: PnL ≈ 0% exits are breakeven, not worth notifying
                         if (Math.abs(pnl) >= 0.20) {
+                            String chE = pnl > 0 ? "✅" : "❌";
                             telegram.sendMessageAsync(String.format(
-                                    "*%s* — Trail  *%+.2f%%*\n\nTrail  %.4f",
-                                    ts.symbol, pnl, ts.trailingStop));
+                                    "%s *%s* · trail *%+.2f%%*\nTrail: %.4f",
+                                    chE, ts.symbol, pnl, ts.trailingStop));
                         }
                         LOG.info("[TR] CHANDELIER EXIT: " + ts.symbol
                                 + " pnl=" + String.format("%.2f%%", pnl));
@@ -750,7 +751,7 @@ public final class BotMain {
                 // Для ручного трейдера молчание хуже ложной точности: он не знает что позиция умерла.
                 // Дисклеймер добавлен в текст — трейдер понимает что это расчётный уровень, не факт.
                 telegram.sendMessageAsync(String.format(
-                        "*%s* — SL Hit  *%+.2f%%*\n\nStop  %.4f",
+                        "❌ *%s* · SL *%+.2f%%*\nСтоп: %.4f",
                         ts.symbol, pnl, ts.sl));
                 LOG.info("[TR] SL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 continue;
@@ -835,7 +836,7 @@ public final class BotMain {
                             : (ts.entry - ts.tp2) / ts.entry * 100;
                     // [v36-FIX Дыра6] TP2 алерт восстановлен — трейдер должен двигать стоп вручную.
                     telegram.sendMessageAsync(String.format(
-                            "*%s* — TP2  *+%.2f%%*\n\nЗакрой 30%% · Стоп → %.4f",
+                            "✅ *%s* · TP2 *+%.2f%%*\nЗакрой 30%%%% · стоп → %.4f",
                             ts.symbol, tp2PnlPct, ts.tp1));
                     LOG.info("[TR] TP2 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp2PnlPct));
                     // Перемещаем trailing до tp1 уровня
@@ -859,7 +860,7 @@ public final class BotMain {
                     markForecastRecord(ts.symbol + "_" + ts.side, "HIT_TP3");
                     // [v36-FIX Дыра6] TP3 алерт восстановлен — финальный выход, важно для трейдера.
                     telegram.sendMessageAsync(String.format(
-                            "*%s* — Закрыто  *+%.2f%%*\n\nПозиция полностью закрыта",
+                            "✅ *%s* · закрыто *+%.2f%%*",
                             ts.symbol, pnl));
                     LOG.info("[TR] TP3 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                     continue;
@@ -882,9 +883,10 @@ public final class BotMain {
                             pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
                     // [v38.0] Suppress breakeven noise (PnL ≈ 0)
                     if (Math.abs(pnl) >= 0.20) {
+                        String trE = pnl > 0 ? "✅" : "❌";
                         telegram.sendMessageAsync(String.format(
-                                "*%s* — Trail  *%+.2f%%*\n\nTrail  %.4f",
-                                ts.symbol, pnl, ts.trailingStop));
+                                "%s *%s* · trail *%+.2f%%*\nTrail: %.4f",
+                                trE, ts.symbol, pnl, ts.trailingStop));
                     }
                     LOG.info("[TR] TRAIL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
                 }
@@ -911,17 +913,15 @@ public final class BotMain {
             String status = ts.tp2Hit ? " TP2" : ts.tp1Hit ? " TP1" : "";
             if (ts.side == com.bot.TradingCore.Side.LONG) longCount++; else shortCount++;
 
-            String stopLevel;
+            String sl;
             if (ts.trailingStop > 0 && ts.tp1Hit) {
-                stopLevel = String.format("trail %.4f", ts.trailingStop);
+                sl = String.format("trail %.4f", ts.trailingStop);
             } else {
-                stopLevel = String.format("sl %.4f", ts.sl);
+                sl = String.format("sl %.4f", ts.sl);
             }
-
-            sb.append(String.format("%s  %s%s  %dm  %s\n",
-                    ts.symbol, dir, status, ageMin, stopLevel));
+            sb.append(String.format("%s · %s%s · %dm · %s\n",
+                    ts.symbol, dir, status, ageMin, sl));
         }
-
         sb.append(String.format("\nL %d · S %d · Total %d",
                 longCount, shortCount, trackedSignals.size()));
         telegram.sendMessageAsync(sb.toString());
@@ -1014,7 +1014,7 @@ public final class BotMain {
                     if (nowMs - lastForecastReportMs >= FORECAST_REPORT_INTERVAL_MS) {
                         lastForecastReportMs = nowMs;
                         telegram.sendMessageAsync(String.format(
-                                "*Forecast Accuracy*\n\nTotal %d · Hit %d · *%.1f%%*",
+                                "*Forecast*\n\nTotal %d · Hit %d · *%.1f%%*",
                                 total, correct2, acc));
                     }
                 }
@@ -1094,12 +1094,12 @@ public final class BotMain {
         double fcAcc   = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
 
         String msg = String.format(
-                "*Daily Report*\n\n"
-                        + "Up %dm · Cycles %d · Signals %d\n"
-                        + "PnL *%+.2f%%* · DD %.1f%%\n"
-                        + "BTC %s · Vol %s\n"
-                        + "WS %d · Bal $%.2f\n\n"
-                        + "Forecast *%.0f%%* (%d/%d)\n"
+                "*Daily Report*%n%n"
+                        + "Up %dm · Cycles %d · Signals %d%n"
+                        + "PnL *%+.2f%%* · DD %.1f%%%n"
+                        + "BTC %s · Vol %s%n"
+                        + "WS %d · Bal $%.2f%n%n"
+                        + "Forecast *%.0f%%* (%d/%d)%n"
                         + "Open %d",
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 isc.getDailyPnL(), isc.getDrawdownFromPeak(),
@@ -1365,14 +1365,8 @@ public final class BotMain {
         boolean bullish = score > 0;
         boolean strong  = Math.abs(score) >= AFC_STRONG_SCORE;
 
-        // ── Asset type ──
         com.bot.DecisionEngineMerged.AssetType assetType =
                 com.bot.DecisionEngineMerged.detectAssetType(pair);
-
-        // ── Clean symbol ──
-        String cleanSym = pair;
-        if (pair.endsWith("USDT"))
-            cleanSym = pair.substring(0, pair.length() - 4) + "/USDT";
 
         // ── Event type ──
         boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
@@ -1398,10 +1392,10 @@ public final class BotMain {
             eventType = bullish ? "Движение вверх" : "Движение вниз";
         }
 
-        // ── VSA ──
-        String vsaLine = "";
+        // ── VSA status line ──
+        String vsaStatus = "";
         if (vsa.hasSignal()) {
-            vsaLine = switch (vsa.signal) {
+            vsaStatus = switch (vsa.signal) {
                 case STOPPING_VOLUME_BULL  -> "Покупки поглотили продажи";
                 case STOPPING_VOLUME_BEAR  -> "Продажи поглотили покупки";
                 case EFFORT_TO_FALL_FAILED -> "Продажи провалились";
@@ -1416,20 +1410,21 @@ public final class BotMain {
         }
 
         double confPct = Math.abs(score) * 100;
+        String icon = bullish ? "🟢" : "🔴";
 
         StringBuilder body = new StringBuilder();
-        body.append(assetType.label).append('\n');
-        body.append("*").append(cleanSym).append("*  →  *").append(eventType).append("*  (прогноз)\n\n");
+        body.append(icon).append(" *").append(pair).append("* · ").append(eventType).append('\n');
+        body.append("_").append(assetType.label).append(" · прогноз_\n\n");
         if (fc.magnetLevel > 0) {
-            body.append(String.format("Магнит  %.4f%n", fc.magnetLevel));
+            body.append(String.format("Магнит: %.4f%n", fc.magnetLevel));
         }
         if (fc.projectedMovePct != 0) {
-            body.append(String.format("Движение  %+.2f%%%n", fc.projectedMovePct * 100));
+            body.append(String.format("Движение: %+.2f%%%n", fc.projectedMovePct * 100));
         }
-        if (!vsaLine.isEmpty()) {
-            body.append(String.format("VSA  %s%n", vsaLine));
+        if (!vsaStatus.isEmpty()) {
+            body.append(String.format("VSA: %s%n", vsaStatus));
         }
-        body.append(String.format("%nConf *%.0f%%* · Ожидание подтверждения", confPct));
+        body.append(String.format("%n*%.0f%%* уверенность · ожидание подтверждения", confPct));
 
         return body.toString();
     }
@@ -1439,10 +1434,8 @@ public final class BotMain {
         return "*GodBot PRO v41*\n\n"
                 + "15M Futures · Crypto / Commodities\n"
                 + "EarlyRev · VSA · OFV · Forecast\n"
-                + "Chandelier Trail · ISC · GIC\n"
                 + "R:R 1:2 min";
     }
-
     private static String nowWarsawStr() {
         return ZonedDateTime.now(ZONE)
                 .format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"));
