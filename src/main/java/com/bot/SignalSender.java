@@ -11,9 +11,17 @@ import java.util.concurrent.atomic.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  SignalSender — GODBOT PRO EDITION v36.0                                ║
+ * ║  SignalSender — GODBOT PRO EDITION v37.0                                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  [v34.0] Dynamic CoinCategory: volume-based TOP, keyword MEME          ║
+ * ║  [v37.0] SMALL-BALANCE FIX + SIGNAL QUALITY GATES:                     ║
+ * ║    · Balance floor removed: was Math.max(balance, 100.0) → now actual   ║
+ * ║      balance used. At $18, old code sized positions as if $100.         ║
+ * ║    · Small-balance risk scaling: <$50 → riskPct×0.5, <$150 → ×0.75    ║
+ * ║    · Min order size: was hardcoded $6.5 → now 3% of balance (adaptive) ║
+ * ║    · Max position cap: <$50 balance → 15% per trade (was 20%)          ║
+ * ║    · GARBAGE_COIN_BLOCKLIST: SIRENUSDT, GIGGLEUSDT, DUSDT etc. blocked ║
+ * ║    · MAX SL% GATE: SL>3% blocked for <$50 balance, SL>5% for larger   ║
+ * ║      Eliminated SOLVUSDT(-12% SL) and AIOTUSDT(-25% SL) signals        ║
  * ║  [v34.0] Extended detectSector: AI, RWA, DePin, Commodities, Metals    ║
  * ║  [v34.0] Category-aware EARLY_TICK velocity thresholds                  ║
  * ║  [v34.0] Category-aware event coin filter (TOP=5%, ALT=8%, MEME=12%)   ║
@@ -738,8 +746,31 @@ public final class SignalSender {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  GENERATE SIGNALS
+    //  [v17.0] GARBAGE COIN BLOCKLIST — micro-cap / rug-risk tokens
+    //
+    //  These coins have appeared in signals but are NOT tradeable:
+    //  · Extreme SL% (10-25%) = high risk, unsuitable for small balance
+    //  · Ultra-low liquidity = wide spreads, uncontrollable slippage
+    //  · High manipulation risk (GIGGLE, D, SIREN = typical pump&dump)
+    //
+    //  Add new coins here if they appear in signals with SL > 8%.
     // ══════════════════════════════════════════════════════════════
+    private static final java.util.Set<String> GARBAGE_COIN_BLOCKLIST = java.util.Set.of(
+            "SIRENUSDT", "GIGGLEUSDT", "DUSDT", "JCTUSDT", "BRUSDT",
+            "SOLVUSDT", "NIGHTUSDT", "BZUSDT", "AIOTUSDT",
+            "RIVERUSDT", "MONUSDT", "VVVUSDT", "PIXELUSDT"
+    );
+
+    // [v17.0] Max SL% gate: signals with stop-loss > this % of entry price are blocked.
+    // Reasoning: SL=12% means you need 13.7% gain to break even after 1 loss.
+    // At any balance, this is casino-level risk, not trading.
+    // For small accounts (<$50): max 3% SL. For normal accounts: max 5% SL.
+    private double getMaxSlPct() {
+        double balance = Math.max(accountBalance, 5.0);
+        return balance < 50.0 ? 0.030 : 0.050; // 3% small, 5% normal
+    }
+
+
 
     public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
 
@@ -944,7 +975,8 @@ public final class SignalSender {
 
     private com.bot.DecisionEngineMerged.TradeIdea processPair(String pair) {
         try {
-            // [v36-FIX Дыра1/2] m1 берётся из WS-буфера (aggTrade → MicroCandleBuilder).
+            // [v17.0] GARBAGE COIN BLOCKLIST — instant reject for known micro-cap / rug tokens
+            if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return null;
             // REST для 1m больше не вызывается в основном цикле — только холодный старт.
             // Экономия: ~50 REST запросов/мин × weight=5 = 250 weight/мин.
             List<com.bot.TradingCore.Candle> m1  = getM1FromWs(pair);
@@ -1038,7 +1070,18 @@ public final class SignalSender {
 
             if (idea == null) return null;
 
-            // [v16.0 FIX] qualityPenalty removed from confidence gate — it now affects SIZE ONLY.
+            // [v17.0] MAX SL% GATE — block signals with unreasonably wide stop-loss.
+            // Examples from live logs: SOLVUSDT SL=-12.11%, AIOTUSDT SL=-24.97%.
+            // These are not trading signals — they're lottery tickets.
+            // For small balance (<$50): max 3% SL. For normal balance: max 5% SL.
+            double signalSlPct = Math.abs(idea.price - idea.stop) / idea.price;
+            double maxSlPct = getMaxSlPct();
+            if (signalSlPct > maxSlPct) {
+                System.out.printf("[SL-GATE] %s BLOCKED: SL=%.2f%% > max=%.2f%% (balance=%.1f)%n",
+                        pair, signalSlPct * 100, maxSlPct * 100, Math.max(accountBalance, 5.0));
+                return null;
+            }
+
             // OLD: earlyMinConf = effConf + symbolBoost + qualityPenalty (could reach 80%+)
             // NEW: earlyMinConf = effConf + symbolBoost (max ~68+4=72%, actually achievable)
             // qualityPenalty still reduces position size in getPositionSizeUsdt() below.
@@ -1396,19 +1439,30 @@ public final class SignalSender {
      * Формула: рискСумма / стопПроцент = размерПозиции
      * рискСумма = баланс * рискПроцент (1-2% в зависимости от категории)
      *
-     * По мере роста баланса $100→$1000→$100000 позиции растут пропорционально.
-     * Это и есть механизм превращения $100 в $1,000,000.
+     * По мере роста баланса $18→$100→$1000→$100000 позиции растут пропорционально.
+     * Это и есть механизм превращения малого депозита в крупный.
      */
     public double getPositionSizeUsdt(com.bot.DecisionEngineMerged.TradeIdea idea,
                                       com.bot.DecisionEngineMerged.CoinCategory cat) {
-        double balance = Math.max(accountBalance, 100.0);
+        // [v17.0 FIX] Removed hardcoded floor $100. Now uses actual balance.
+        // OLD: Math.max(accountBalance, 100.0) → on $18 balance, bot sized for $100 → 36% risk per trade.
+        // NEW: actual balance used, with proportional risk scaling.
+        double balance = Math.max(accountBalance, 5.0); // floor at $5 only (min viable order)
 
         double riskPct = switch (cat) {
-            // [v10.0] Conservative risk until 100+ real trades prove the edge
-            case TOP  -> 0.010; // 1.0% (was 1.5%)
-            case ALT  -> 0.010; // 1.0% (was 2.0% — dangerous for unproven system)
-            case MEME -> 0.006; // 0.6% (was 1.0%)
+            case TOP  -> 0.010; // 1.0% of balance per trade
+            case ALT  -> 0.010; // 1.0% of balance per trade
+            case MEME -> 0.006; // 0.6% of balance per trade
         };
+
+        // [v17.0] Small-balance safety: under $50, cut risk in half.
+        // At $18 × 1% = $0.18 risk. With SL ~1% this gives $18 position — 100% of balance.
+        // Corrected: under $50, max 0.5% risk → max 10% balance per trade.
+        if (balance < 50.0) {
+            riskPct *= 0.50;
+        } else if (balance < 150.0) {
+            riskPct *= 0.75;
+        }
 
         // Высокая уверенность → чуть больше позиция
         if (idea.probability >= 80)      riskPct *= 1.30;
@@ -1418,17 +1472,15 @@ public final class SignalSender {
         double riskUsdt  = balance * riskPct;
         riskUsdt *= isc.getRiskSizeMultiplier();
 
-        // [v25.0] SESSION LIQUIDITY → size multiplier (was probability penalty — wrong approach).
-        // Low liquidity session = smaller position to compensate wider spreads & slippage.
-        // Probability is NOT modified — the SIGNAL is valid; only execution risk changes.
+        // [v25.0] SESSION LIQUIDITY → size multiplier
         double sessionW = getSessionWeight();
         if (sessionW < 0.85) {
-            riskUsdt *= Math.max(0.50, sessionW); // Asia/night: max 50% of normal size
+            riskUsdt *= Math.max(0.50, sessionW);
         } else if (sessionW >= 1.20) {
-            riskUsdt *= 1.10; // NY open: slight size boost — highest liquidity
+            riskUsdt *= 1.10;
         }
 
-        // [v25.0] LATE_ENTRY flag → reduce size 20% (signal is valid but half the move is done)
+        // [v25.0] LATE_ENTRY flag → reduce size 20%
         if (idea.flags.contains("LATE_ENTRY_SIZE_CUT")) {
             riskUsdt *= 0.80;
         }
@@ -1436,9 +1488,13 @@ public final class SignalSender {
         double stopPct   = Math.max(0.005, Math.abs(idea.price - idea.stop) / idea.price);
         double posSize   = riskUsdt / stopPct;
 
-        // Лимиты: не более 20% баланса, не менее $6.5
-        posSize = Math.min(posSize, balance * 0.20);
-        posSize = Math.max(posSize, 6.5);
+        // [v17.0 FIX] Balance-relative limits instead of hardcoded $6.5 min.
+        // OLD: Math.max(posSize, 6.5) → on $18 balance: min order = 36% of balance = catastrophic.
+        // NEW: min order = 3% of balance, max order = 15% of balance (conservative for small accounts).
+        double maxPosPct = balance < 50.0 ? 0.15 : 0.20; // 15% cap for small accounts, 20% for larger
+        double minPosAbs = Math.max(balance * 0.03, 1.0);  // min 3% of balance, floor $1
+        posSize = Math.min(posSize, balance * maxPosPct);
+        posSize = Math.max(posSize, minPosAbs);
 
         return Math.round(posSize * 100.0) / 100.0;
     }

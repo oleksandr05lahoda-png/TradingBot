@@ -8,35 +8,26 @@ import java.util.stream.Collectors;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════════╗
- * ║       InstitutionalSignalCore v16.0 — PORTFOLIO RISK CONTROLLER              ║
+ * ║       InstitutionalSignalCore v17.0 — PORTFOLIO RISK CONTROLLER              ║
  * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  v17.0 CRITICAL FIXES (BIPOLAR BLOCK ROOT CAUSE):                           ║
+ * ║    · [FIX ROOT] cleanupExpired() now calls activeSymbols.remove(symbol)     ║
+ * ║      on TIME_STOP. Without this, symbols locked in activeSymbols FOREVER.   ║
+ * ║      This was the ROOT CAUSE of:                                             ║
+ * ║        – "BIPOLAR BLOCK: X already active" spamming 100s of times/min      ║
+ * ║        – Signal drought growing worse the longer the bot ran                ║
+ * ║        – wr=0% because all closes were TIME_STOP, never real TP/SL         ║
+ * ║    · [FIX] Safety purge: stale activeSymbols entries > TIME_STOP+5min      ║
+ * ║      removed even if no matching activeSignal (handles race conditions).    ║
+ * ║    · [FIX LOG] BIPOLAR BLOCK log throttled: 1 log/symbol/60s              ║
+ * ║      was: every allowSignal() call → Railway log flood → $$ cost           ║
  * ║                                                                              ║
  * ║  v16.0 CRITICAL FIXES (SIGNAL DROUGHT FIX):                                 ║
  * ║    · [FIX ROOT] Removed hard return false in allowSignal() for daily loss   ║
- * ║      ROOT CAUSE: day=-9.11% → allowSignal()=false for ALL signals → 20h    ║
- * ║      drought. Risk now handled ONLY via position size (isCautiousMode).     ║
- * ║    · [FIX CONF] getEffectiveMinConfidence() daily loss penalty: +12→+3,    ║
- * ║      +6→+1.5. Was pushing threshold to 74%+, unachievable in practice.     ║
- * ║    · [FIX CONF] MAX_EFFECTIVE_MIN_CONF: 75→68. Upper cap now reachable     ║
- * ║      by bot's signals (68% vs 74% = 3-5× more signals pass filter).        ║
- * ║    · [FIX SYMBOL] getSymbolMinConfBoost(): +8/+5→+4/+3 — still punishes   ║
- * ║      bad symbols but doesn't quarantine them completely.                    ║
- * ║  v15.0 CRITICAL FIXES:                                                       ║
- * ║    · [FIX Дыра 1] ArrayDeque → ConcurrentLinkedDeque (thread-safe)          ║
- * ║    · [FIX Дыра 4] Asymmetric streak: win halves boost (was -1.5 only!)     ║
- * ║    · [FIX Дыра 4] Softer loss escalation: 1.0/2.5/4.5 (was 1.5/3.5/6.0)  ║
- * ║    · [FIX Дыра 4] Faster decay: 30% every 8min (was 20%/10min)            ║
- * ║                                                                              ║
- * ║  v11.0 IMPROVEMENTS:                                                         ║
- * ║    · [FIX-COMPILE] closeTrade 3-arg overload (BotMain compatibility)        ║
- * ║    · [NEW] Daily loss limit: max -3% per day → block all signals            ║
- * ║    · [NEW] Max drawdown circuit breaker: -8% from peak → pause 2h          ║
- * ║    · [NEW] Bayesian streak: loss streak uses weighted recency               ║
- * ║    · [NEW] Win/loss asymmetry: losses tighten 2× faster than wins loosen  ║
- * ║    · [NEW] Sector correlation guard with real exposure tracking             ║
- * ║    · [FIX] Streak decay: 20% every 10min (was 15%/15min — too slow)       ║
- * ║    · [FIX] Cap effective confidence at 70% (was 72% — still too high)      ║
- * ║    · History bounded, time stop = NEUTRAL, compounding risk                 ║
+ * ║    · [FIX CONF] getEffectiveMinConfidence() daily loss penalty: +12→+3     ║
+ * ║    · [FIX CONF] MAX_EFFECTIVE_MIN_CONF: 75→68                              ║
+ * ║    · [FIX SYMBOL] getSymbolMinConfBoost(): +8/+5→+4/+3                     ║
  * ║                                                                              ║
  * ╚══════════════════════════════════════════════════════════════════════════════╝
  */
@@ -451,6 +442,10 @@ public final class InstitutionalSignalCore {
     // 6 concurrent same-direction positions is still well within risk limits.
     private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 10);
 
+    // [v17.0] Rate-limit BIPOLAR BLOCK logs: one log per symbol per 60s to avoid Railway log flood.
+    private final Map<String, Long> bipolarLogThrottle = new ConcurrentHashMap<>();
+    private static final long BIPOLAR_LOG_THROTTLE_MS = 60_000L;
+
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
 
@@ -478,11 +473,17 @@ public final class InstitutionalSignalCore {
         // Единственная проверка: кулдаун / биполярная защита
         if (!isSymbolAvailable(signal.symbol)) {
             Long until = symbolCooldownUntil.get(signal.symbol);
-            if (activeSymbols.containsKey(signal.symbol)) {
-                log("🚫 BIPOLAR BLOCK: " + signal.symbol + " already active");
-            } else if (until != null) {
-                long remainSec = (until - System.currentTimeMillis()) / 1000;
-                log("⏳ COOLDOWN BLOCK: " + signal.symbol + " cooldown " + remainSec + "s left");
+            // [v17.0] Rate-limit log: max once per 60s per symbol (was every call = Railway spam)
+            long now2 = System.currentTimeMillis();
+            Long lastLog = bipolarLogThrottle.get(signal.symbol);
+            if (lastLog == null || (now2 - lastLog) > BIPOLAR_LOG_THROTTLE_MS) {
+                bipolarLogThrottle.put(signal.symbol, now2);
+                if (activeSymbols.containsKey(signal.symbol)) {
+                    log("🚫 BIPOLAR BLOCK: " + signal.symbol + " already active");
+                } else if (until != null) {
+                    long remainSec = (until - now2) / 1000;
+                    log("⏳ COOLDOWN BLOCK: " + signal.symbol + " cooldown " + remainSec + "s left");
+                }
             }
             return false;
         }
@@ -625,10 +626,25 @@ public final class InstitutionalSignalCore {
                 if (s.ageMs() > TIME_STOP_MS) {
                     currentHeat = Math.max(0, currentHeat - s.riskPct);
 
+                    // [v17.0 CRITICAL FIX] Release from activeSymbols on expiry.
+                    // BUG: activeSymbols was NEVER cleaned on TIME_STOP — only activeSignals was.
+                    // Result: every symbol that ever got a signal stayed in activeSymbols forever.
+                    // isSymbolAvailable() checks activeSymbols first → permanent BIPOLAR BLOCK.
+                    // This was the ROOT CAUSE of:
+                    //   1. Endless "BIPOLAR BLOCK: X already active" log spam
+                    //   2. Signal drought growing worse the longer the bot ran
+                    //   3. wr=0% cl=46 — all "closes" were TIME_STOP because signals never unlocked
+                    // Fix: apply TP_COOLDOWN after TIME_STOP (not SL_COOLDOWN — it wasn't a loss).
+                    activeSymbols.remove(s.symbol);
+                    symbolCooldownUntil.put(s.symbol,
+                            System.currentTimeMillis() + TP_COOLDOWN_MS); // 15min cooldown after expiry
+
                     // NEUTRAL — not loss, not win. Streak NOT affected.
                     Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(s.symbol, k -> new ConcurrentLinkedDeque<>());
                     hist.addLast(new ClosedTrade(s.symbol, s.side, 0.0, s.ageMs(), "TIME_STOP"));
                     while (hist.size() > MAX_HISTORY) hist.removeFirst();
+
+                    log("⏱ TIME_STOP: " + s.symbol + " " + s.side + " — unlocked, 15min cooldown");
 
                     if (timeStopCallback != null) {
                         try { timeStopCallback.accept(s.symbol, "TIME_STOP " + s.symbol + " " + s.side); }
@@ -640,6 +656,14 @@ public final class InstitutionalSignalCore {
             });
         }
         activeSignals.entrySet().removeIf(e -> e.getValue().isEmpty());
+
+        // [v17.0 FIX] Purge stale activeSymbols entries that have no matching activeSignal.
+        // Safety net: if a symbol ended up in activeSymbols without a signal (e.g. race condition),
+        // it stays locked forever. Remove any entry older than TIME_STOP_MS + 5min buffer.
+        long staleThreshold = TIME_STOP_MS + 5 * 60_000L;
+        activeSymbols.entrySet().removeIf(e ->
+                (now - e.getValue()) > staleThreshold &&
+                        !activeSignals.containsKey(e.getKey()));
     }
 
     // ══════════════════════════════════════════════════════════════
