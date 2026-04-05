@@ -6,6 +6,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public final class DecisionEngineMerged {
 
+    // ── Timezone: set at startup by BotMain via IP-geolocation (auto) ──
+    // Falls back to Europe/Warsaw if detection fails.
+    // Each bot instance detects its own server's location automatically.
+    public static volatile java.time.ZoneId USER_ZONE = java.time.ZoneId.of("Europe/Warsaw");
+
     // ── Enums ──────────────────────────────────────────────────────
     public enum CoinCategory { TOP, ALT, MEME }
     public enum MarketState  { STRONG_TREND, WEAK_TREND, RANGE }
@@ -873,17 +878,20 @@ public final class DecisionEngineMerged {
         }
 
         public String toTelegramString() {
-            boolean isLong = side == com.bot.TradingCore.Side.LONG;
-            String icon    = isLong ? "🟢" : "🔴";
-            String sideStr = isLong ? "LONG" : "SHORT";
+            boolean isLong  = side == com.bot.TradingCore.Side.LONG;
+            String  arrow   = isLong ? "⬆️" : "⬇️";
+            String  sideStr = isLong ? "LONG" : "SHORT";
             AssetType assetType = detectAssetType(symbol);
 
-            // Strip USDT/BUSD suffix for a clean ticker: BTCUSDT → #BTC
-            String base = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4)
-                    : symbol.endsWith("BUSD") ? symbol.substring(0, symbol.length() - 4)
-                      : symbol;
+            // Pair format: BTCUSDT → BTC/USDT,  ETHBUSD → ETH/BUSD
+            String quote = symbol.endsWith("USDT") ? "USDT"
+                    : symbol.endsWith("BUSD") ? "BUSD" : "";
+            String base  = !quote.isEmpty()
+                    ? symbol.substring(0, symbol.length() - quote.length())
+                    : symbol;
+            String pair  = !quote.isEmpty() ? base + "/" + quote : symbol;
 
-            // Price format — adapts to magnitude so decimals are always meaningful
+            // Adaptive price format — decimals are always meaningful
             String fmt = price < 0.0001 ? "%.7f"
                     : price < 0.001  ? "%.6f"
                       : price < 0.01   ? "%.5f"
@@ -892,60 +900,88 @@ public final class DecisionEngineMerged {
                             : price < 10000  ? "%.3f"
                               : "%.2f";
 
-            double riskPct = Math.abs(price - stop) / price * 100;
-            String rrStr   = rr > 0 ? String.format("1:%.1f", rr) : "—";
+            // Percentages: SL risk, TP gains
+            double slPct  = Math.abs(price - stop) / price * 100;
+            double tp1Pct = tp1 > 0 ? Math.abs(tp1 - price) / price * 100 : 0;
+            double tp2Pct = tp2 > 0 ? Math.abs(tp2 - price) / price * 100 : 0;
+            double tp3Pct = tp3 > 0 ? Math.abs(tp3 - price) / price * 100 : 0;
+            String rrStr  = rr > 0 ? String.format("1:%.1f", rr) : "—";
 
-            // ── Trend phase label ───────────────────────────────────────────
+            // ── Trend phase label ─────────────────────────────────────────
             String phaseTag = "";
             if (forecast != null && forecast.trendPhase != null) {
                 phaseTag = switch (forecast.trendPhase) {
                     case EARLY      -> "📈 Ранний тренд";
-                    case MID        -> "📊 Середина";
+                    case MID        -> "📊 Середина тренда";
                     case LATE       -> "📉 Поздний тренд";
                     case EXHAUSTION -> "⚠️ Истощение";
                     default         -> "";
                 };
             }
 
-            // ── Top trader flags (max 3, keep their emojis) ─────────────────
+            // ── Trader flags (max 3) ──────────────────────────────────────
             List<String> tf = traderFlags();
-            String flagsLine = "";
-            if (!tf.isEmpty()) {
-                flagsLine = String.join(" · ", tf.subList(0, Math.min(tf.size(), 3)));
+            String flagsLine = tf.isEmpty()
+                    ? "" : String.join(" · ", tf.subList(0, Math.min(tf.size(), 3)));
+
+            // ── Timestamp with auto-detected timezone ─────────────────────
+            java.time.ZonedDateTime now = java.time.ZonedDateTime.now(DecisionEngineMerged.USER_ZONE);
+            String timeStr = now.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
+            String utcTag;
+            try {
+                int totalMin = now.getOffset().getTotalSeconds() / 60;
+                int h = Math.abs(totalMin) / 60;
+                int m = Math.abs(totalMin) % 60;
+                String sign = totalMin >= 0 ? "+" : "-";
+                utcTag = m == 0
+                        ? "UTC" + sign + h
+                        : String.format("UTC%s%d:%02d", sign, h, m);
+            } catch (Exception e) {
+                utcTag = "UTC";
             }
 
-            // ── Context line: phase + flags (combined if both present) ───────
-            String contextLine = "";
-            if (!phaseTag.isEmpty() && !flagsLine.isEmpty()) contextLine = phaseTag + "  ·  " + flagsLine;
-            else if (!phaseTag.isEmpty())  contextLine = phaseTag;
-            else if (!flagsLine.isEmpty()) contextLine = flagsLine;
-
-            // ── Build message ───────────────────────────────────────────────
+            // ── Build message ─────────────────────────────────────────────
             String div = "━━━━━━━━━━━━━━━━━━━━";
             StringBuilder sb = new StringBuilder();
 
-            // Line 1: direction + ticker + asset type
-            sb.append(icon).append(" *#").append(base).append("*  ").append(sideStr)
+            // Header: asset icon + pair + category
+            sb.append(assetType.emoji).append(" *").append(pair).append("*")
                     .append("   _").append(assetType.label).append("_\n");
+
+            // Direction
+            sb.append(arrow).append(" *").append(sideStr).append("*\n");
             sb.append(div).append('\n');
 
-            // Entry + Stop (monospace for easy copy)
-            sb.append("🎯  `").append(String.format(fmt, price)).append("`\n");
-            sb.append(String.format("🛑  `" + fmt + "`   -%.1f%%%n", stop, riskPct));
+            // Entry price (current market price at signal time)
+            sb.append("💵 Цена входа:   `").append(String.format(fmt, price)).append("`\n");
             sb.append(div).append('\n');
 
-            // Take-profits
-            sb.append("💰 TP1   `").append(String.format(fmt, tp1)).append("`\n");
-            sb.append("💰 TP2   `").append(String.format(fmt, tp2)).append("`\n");
+            // Take-profits with percentage gain
+            if (tp1 > 0) sb.append(String.format("🎯 TP1   `" + fmt + "`   +%.2f%%%n", tp1, tp1Pct));
+            if (tp2 > 0) sb.append(String.format("🎯 TP2   `" + fmt + "`   +%.2f%%%n", tp2, tp2Pct));
+            if (tp3 > 0) sb.append(String.format("🎯 TP3   `" + fmt + "`   +%.2f%%%n", tp3, tp3Pct));
+
+            // Stop-loss with percentage loss
+            sb.append(String.format("🛑 SL      `" + fmt + "`   -%.2f%%%n", stop, slPct));
             sb.append(div).append('\n');
 
             // Confidence + R:R
-            sb.append(String.format("📊 *%.0f%%*   ·   R:R *%s*", probability, rrStr));
+            sb.append(String.format("📊 *%.0f%%* вероятность   R:R *%s*", probability, rrStr));
 
-            // Optional context (phase + flags)
-            if (!contextLine.isEmpty()) {
-                sb.append('\n').append("_").append(contextLine).append("_");
+            // Phase + flags
+            if (!phaseTag.isEmpty() || !flagsLine.isEmpty()) {
+                sb.append('\n');
+                if (!phaseTag.isEmpty() && !flagsLine.isEmpty()) {
+                    sb.append("_").append(phaseTag).append("  ·  ").append(flagsLine).append("_");
+                } else if (!phaseTag.isEmpty()) {
+                    sb.append("_").append(phaseTag).append("_");
+                } else {
+                    sb.append("_").append(flagsLine).append("_");
+                }
             }
+
+            // Timestamp
+            sb.append('\n').append("⏰ ").append(timeStr).append("  ").append(utcTag);
 
             return sb.toString();
         }

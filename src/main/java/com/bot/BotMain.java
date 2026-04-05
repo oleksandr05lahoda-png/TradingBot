@@ -44,7 +44,9 @@ public final class BotMain {
     // ── Конфигурация из env ───────────────────────────────────────────────
     private static final String TG_TOKEN  = System.getenv("TELEGRAM_TOKEN");
     private static final String CHAT_ID   = System.getenv().getOrDefault("CHAT_ID", "953233853");
-    private static final ZoneId ZONE      = ZoneId.of("Europe/Warsaw");
+    // Auto-detected at startup: env TIMEZONE → IP geolocation → Warsaw fallback.
+    // Each instance (yours in Warsaw, father's in Zaporizhzhia) detects its own timezone.
+    private static final ZoneId ZONE      = detectTimezone();
     private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 1);
     private static final int    KLINES    = envInt("KLINES_LIMIT", 220);
     // Hard cap to avoid Telegram queue backlog (which can make the bot
@@ -249,6 +251,9 @@ public final class BotMain {
         final com.bot.GlobalImpulseController gic = new com.bot.GlobalImpulseController();
         final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
         final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram, gic, isc);
+
+        // Pass auto-detected timezone to signal formatter
+        com.bot.DecisionEngineMerged.USER_ZONE = ZONE;
 
         // [BUG-FIX v33.1] panicCallback was routed to LOG only — trader never saw BTC CRASH alerts.
         // Now: GIC CRASH/PANIC events go to Telegram immediately (bypass normal queue, use offerFirst).
@@ -1447,6 +1452,67 @@ public final class BotMain {
     public static String formatLocalTime(long utcMillis) {
         return Instant.ofEpochMilli(utcMillis).atZone(ZONE)
                 .format(DateTimeFormatter.ofPattern("HH:mm"));
+    }
+
+    /**
+     * Auto-detects timezone for Telegram signal timestamps.
+     * Priority: 1) env TIMEZONE  2) IP geolocation (ip-api.com)  3) Europe/Warsaw
+     * Each bot instance detects the timezone of the machine it runs on automatically.
+     * To force a specific zone, set env variable: TIMEZONE=Europe/Zaporozhye
+     */
+    private static ZoneId detectTimezone() {
+        // 1. Manual override via environment variable
+        String envTz = System.getenv("TIMEZONE");
+        if (envTz != null && !envTz.isBlank()) {
+            try {
+                ZoneId z = ZoneId.of(envTz.trim());
+                System.out.println("[TIMEZONE] Using env override: " + z.getId());
+                return z;
+            } catch (Exception ignored) {
+                System.out.println("[TIMEZONE] Invalid env TIMEZONE value: " + envTz);
+            }
+        }
+        // 2. Auto-detect via IP geolocation (no API key required)
+        try {
+            java.net.URL url = new java.net.URL("http://ip-api.com/json?fields=timezone,city");
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(4000);
+            conn.setReadTimeout(4000);
+            conn.setRequestMethod("GET");
+            if (conn.getResponseCode() == 200) {
+                try (java.io.InputStream is = conn.getInputStream();
+                     java.util.Scanner sc = new java.util.Scanner(is, "UTF-8")) {
+                    String body = sc.useDelimiter("\\A").hasNext() ? sc.next() : "";
+                    // Parse "timezone":"Europe/Warsaw"
+                    int idx = body.indexOf("\"timezone\"");
+                    if (idx >= 0) {
+                        int q1 = body.indexOf('"', idx + 10) + 1;
+                        int q2 = body.indexOf('"', q1);
+                        if (q1 > 0 && q2 > q1) {
+                            String tz = body.substring(q1, q2);
+                            // Parse "city":"Warsaw"
+                            String city = "";
+                            int ci = body.indexOf("\"city\"");
+                            if (ci >= 0) {
+                                int c1 = body.indexOf('"', ci + 6) + 1;
+                                int c2 = body.indexOf('"', c1);
+                                if (c1 > 0 && c2 > c1) city = body.substring(c1, c2);
+                            }
+                            ZoneId z = ZoneId.of(tz);
+                            System.out.println("[TIMEZONE] Auto-detected: " + tz
+                                    + (city.isEmpty() ? "" : " (" + city + ")"));
+                            return z;
+                        }
+                    }
+                }
+            }
+            conn.disconnect();
+        } catch (Exception e) {
+            System.out.println("[TIMEZONE] IP geolocation failed: " + e.getMessage());
+        }
+        // 3. Default fallback
+        System.out.println("[TIMEZONE] Using default: Europe/Warsaw");
+        return ZoneId.of("Europe/Warsaw");
     }
 
     private static int envInt(String k, int d) {
