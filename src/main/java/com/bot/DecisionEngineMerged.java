@@ -17,17 +17,17 @@ public final class DecisionEngineMerged {
     // or it's a commodity/metal proxy that needs separate platform.
     // ══════════════════════════════════════════════════════════════
     public enum AssetType {
-        CRYPTO("🪙", "CRYPTO"),
-        PRECIOUS_METAL_GOLD("🌕", "ЗОЛОТО (XAU)"),
-        PRECIOUS_METAL_SILVER("🥈", "СЕРЕБРО (XAG)"),
-        PRECIOUS_METAL_PLATINUM("⚪", "ПЛАТИНА (XPT)"),
-        PRECIOUS_METAL_OTHER("💎", "ДРАГ.МЕТАЛЛ"),
-        COMMODITY_OIL("🛢", "НЕФТЬ"),
-        COMMODITY_GAS("🔥", "ГАЗ"),
-        COMMODITY_OTHER("📦", "СЫРЬЁ"),
-        FOREX("💱", "ФОРЕКС"),
-        INDEX("📊", "ИНДЕКС"),
-        UNKNOWN("❓", "UNKNOWN");
+        CRYPTO("📊", "Криптовалюта"),
+        PRECIOUS_METAL_GOLD("📊", "Золото"),
+        PRECIOUS_METAL_SILVER("📊", "Серебро"),
+        PRECIOUS_METAL_PLATINUM("📊", "Платина"),
+        PRECIOUS_METAL_OTHER("📊", "Драгоценный металл"),
+        COMMODITY_OIL("📊", "Нефть"),
+        COMMODITY_GAS("📊", "Природный газ"),
+        COMMODITY_OTHER("📊", "Сырьевой товар"),
+        FOREX("📊", "Форекс"),
+        INDEX("📊", "Индекс"),
+        UNKNOWN("📊", "Актив");
 
         public final String emoji;
         public final String label;
@@ -874,15 +874,23 @@ public final class DecisionEngineMerged {
 
         public String toTelegramString() {
             // ╔══════════════════════════════════════════════════════════╗
-            // ║  [v40.0] CLEAN PRO FORMAT — institutional grade           ║
-            // ║  Читается за 0.5 секунды. Ноль визуального мусора.       ║
-            // ║  Единый формат для крипты/нефти/газа/металлов/форекса.   ║
+            // ║  [v41.0] USER-SPEC FORMAT                                ║
+            // ║  Line 1: asset type (words)                              ║
+            // ║  Line 2: SYMBOL/USDT → LONG/SHORT                       ║
+            // ║  Lines 3-6: Price, Stop, TP1, TP2 (plain text, no code) ║
+            // ║  Line 7: Confidence                                      ║
+            // ║  No TP3, no separator lines, no hardcoded time           ║
+            // ║  Time: Telegram shows message timestamp in each user's   ║
+            // ║  local timezone automatically — no need to hardcode.     ║
             // ╚══════════════════════════════════════════════════════════╝
             boolean isLong = side == com.bot.TradingCore.Side.LONG;
-            String icon    = isLong ? "🟢" : "🔴";
             String sideStr = isLong ? "LONG" : "SHORT";
+            String arrow   = isLong ? "↗" : "↘";
 
-            // ── Очистка тикера: ARIAUSDT → ARIA/USDT ──
+            // ── Asset type label ──
+            AssetType assetType = detectAssetType(symbol);
+
+            // ── Clean symbol: ARIAUSDT → ARIA/USDT ──
             String cleanSymbol = symbol;
             if (symbol.endsWith("USDT"))
                 cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/USDT";
@@ -891,49 +899,30 @@ public final class DecisionEngineMerged {
             else if (symbol.endsWith("USDC"))
                 cleanSymbol = symbol.substring(0, symbol.length() - 4) + "/USDC";
 
-            // ── Price format ──
+            // ── Price format (plain text, no backticks) ──
             String fmt = price < 0.001 ? "%.6f" : price < 0.01 ? "%.5f"
                                                   : price < 0.1 ? "%.4f" : price < 10 ? "%.4f" : "%.2f";
             double riskPct = Math.abs(price - stop) / price * 100;
-            String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
-
-            // ── Drivers (compact, max 3) ──
-            List<String> tf = traderFlags();
-            int limit = Math.min(tf.size(), 3);
-            String driversLine = "";
-            if (!tf.isEmpty()) {
-                // Strip emoji for clean look
-                List<String> clean = new java.util.ArrayList<>();
-                for (int i = 0; i < limit; i++) {
-                    clean.add(tf.get(i).replaceAll("[⚡⚠️🔥🚀📈📉↔️⛽🌙🗽🧲📡🔴📐🔻]", "").trim());
-                }
-                driversLine = String.join(" · ", clean);
-            }
-
-            // ── Funding rate (only if significant) ──
-            String frWarning = "";
-            if (Math.abs(fundingRate) > 0.0008) {
-                boolean paysFR = (isLong && fundingRate > 0.0005) || (!isLong && fundingRate < -0.0005);
-                if (paysFR) frWarning = String.format("  ⚠ FR %+.3f%%", fundingRate * 100);
-            }
 
             // ── Build message ──
             StringBuilder sb = new StringBuilder();
-            sb.append(icon).append("  *").append(cleanSymbol).append("*  ·  ").append(sideStr).append('\n');
-            sb.append("━━━━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("Entry     `" + fmt + "`%n", price));
-            sb.append(String.format("Stop      `" + fmt + "`  (%.1f%%)%n", stop, riskPct));
-            sb.append(String.format("TP1       `" + fmt + "`%n", tp1));
-            sb.append(String.format("TP2       `" + fmt + "`%n", tp2));
-            sb.append(String.format("TP3       `" + fmt + "`%n", tp3));
-            sb.append("━━━━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("R:R  *%s*  ·  Conf  *%.0f%%*", rrStr, probability));
-            if (!frWarning.isEmpty()) sb.append(frWarning);
+
+            // Line 1: asset type
+            sb.append(assetType.label).append('\n');
+
+            // Line 2: symbol → direction
+            sb.append("*").append(cleanSymbol).append("*  ").append(arrow).append("  *").append(sideStr).append("*\n\n");
+
+            // Prices — plain text, aligned
+            sb.append(String.format("Price    " + fmt + "%n", price));
+            sb.append(String.format("Stop     " + fmt + "  (%.1f%%)%n", stop, riskPct));
+            sb.append(String.format("TP1      " + fmt + "%n", tp1));
+            sb.append(String.format("TP2      " + fmt + "%n", tp2));
+
+            // Confidence + R:R
             sb.append('\n');
-            if (!driversLine.isEmpty()) {
-                sb.append(driversLine).append('\n');
-            }
-            sb.append(String.format("`BINANCE:%s.P`", symbol));
+            String rrStr = rr > 0 ? String.format("1:%.1f", rr) : "—";
+            sb.append(String.format("Conf *%.0f%%*  ·  R:R *%s*", probability, rrStr));
 
             return sb.toString();
         }
