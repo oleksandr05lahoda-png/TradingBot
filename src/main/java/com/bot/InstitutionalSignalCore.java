@@ -454,86 +454,62 @@ public final class InstitutionalSignalCore {
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
 
-        // [v17.0 §1] BIPOLAR + COOLDOWN GUARD — first and hardest gate.
-        // If symbol already has an open trade (any direction) → DROP.
-        // If symbol is within post-SL cooldown window → DROP.
+        // ╔══════════════════════════════════════════════════════════════╗
+        // ║  [SCANNER MODE v2.0] allowSignal() — упрощён до минимума   ║
+        // ║                                                              ║
+        // ║  УДАЛЕНО (блокировало сигналы при ручной торговле):         ║
+        // ║  · Portfolio heat cap (currentHeat > maxPortfolioHeat)      ║
+        // ║  · Global signal limit (maxGlobalSignals)                   ║
+        // ║  · Same direction limit (MAX_SAME_DIRECTION)                ║
+        // ║  · Directional loss guard (consecutiveLongLosses)           ║
+        // ║  · Daily signal limit per symbol (symbolDailyLimitReached)  ║
+        // ║                                                              ║
+        // ║  ВСЕ ЭТИ ПРОВЕРКИ были для ВИРТУАЛЬНОГО ПОРТФЕЛЯ.          ║
+        // ║  При ручной торговле без автоисполнения — они блокировали   ║
+        // ║  сигналы основываясь на позициях, которых нет в реальности. ║
+        // ║                                                              ║
+        // ║  ОСТАВЛЕНО (защита качества сигналов):                      ║
+        // ║  · Bipolar guard — нет LONG→SHORT на одной монете           ║
+        // ║  · Cooldown guard — кулдаун 20 мин после сигнала            ║
+        // ║  Эти проверки работают от реального состояния (setSignalCooldown),
+        // ║  не от виртуального портфеля.                               ║
+        // ╚══════════════════════════════════════════════════════════════╝
+
+        // Единственная проверка: кулдаун / биполярная защита
         if (!isSymbolAvailable(signal.symbol)) {
             Long until = symbolCooldownUntil.get(signal.symbol);
             if (activeSymbols.containsKey(signal.symbol)) {
-                log("🚫 BIPOLAR BLOCK: " + signal.symbol + " already has active trade");
-            } else {
+                log("🚫 BIPOLAR BLOCK: " + signal.symbol + " already active");
+            } else if (until != null) {
                 long remainSec = (until - System.currentTimeMillis()) / 1000;
                 log("⏳ COOLDOWN BLOCK: " + signal.symbol + " cooldown " + remainSec + "s left");
             }
             return false;
         }
 
-        // [v34.0] DAILY SIGNAL LIMIT — max 4 signals per symbol per 8h window.
-        // Prevents "milking" one volatile coin all day with correlated entries.
-        if (symbolDailyLimitReached(signal.symbol)) {
-            log("🚫 DAILY LIMIT: " + signal.symbol + " exceeded "
-                    + MAX_SIGNALS_PER_SYMBOL_8H + " signals in 8h window");
-            return false;
-        }
-
-        // 1. Daily Loss Mode — update cautiousMode flag (affects position size in SignalSender)
-        if (dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT) {
-            cautiousMode = true;
-        } else {
-            cautiousMode = false;
-        }
-        // [v16.0 FIX ROOT CAUSE] REMOVED hard return false for survival mode.
-        // Old code: dailyPnLPct <= -6% → return false → ALL signals blocked → 20h drought.
-        // The -9.11% day caused 20 hours of complete silence (Watchdog #79-#105+).
-        // Risk management when losing is via position size (getRiskSizeMultiplier returns 0.25),
-        // NOT via silencing the bot entirely. The bot should keep finding recoverable setups.
-        if (dailyPnLPct <= DAILY_LOSS_SURVIVAL_PCT) {
-            log("⚠️ SURVIVAL MODE: day=" + String.format("%.2f", dailyPnLPct)
-                    + "% — signals allowed, position size ×0.25");
-            // NOTE: no return false here — we log and continue
-        }
-
-        // 2. Heat Check
-        double estRisk = estimateRisk(signal.probability, signal.category);
-        if (currentHeat + estRisk > maxPortfolioHeat) {
-            log("🛑 BLOCK: Portfolio heat cap reached (" + (currentHeat * 100) + "%)");
-            return false;
-        }
-
-        // 4. Same Symbol check
-        List<ActiveSignal> symSignals = activeSignals.get(signal.symbol);
-        if (symSignals != null && symSignals.size() >= maxSignalsPerSymbol) {
-            return false;
-        }
-
-        // 5. Direction limit
-        int sameDirCount = 0;
-        for (List<ActiveSignal> list : activeSignals.values()) {
-            for (ActiveSignal s : list) {
-                if (s.side == signal.side) {
-                    sameDirCount++;
-                }
-            }
-        }
-        if (sameDirCount >= MAX_SAME_DIRECTION) {
-            log("🛑 BLOCK: Max same direction limit reached (" + MAX_SAME_DIRECTION + ")");
-            return false;
-        }
-
-        int dirLosses = signal.side == com.bot.TradingCore.Side.LONG
-                ? consecutiveLongLosses
-                : consecutiveShortLosses;
-        if (dirLosses >= DIR_LOSS_PENALTY_THRESHOLD) {
-            double extraReq = Math.min(8.0, (dirLosses - DIR_LOSS_PENALTY_THRESHOLD + 1) * 3.0);
-            double requiredConf = Math.min(MAX_EFFECTIVE_MIN_CONF, getEffectiveMinConfidence() + extraReq);
-            if (signal.probability < requiredConf) {
-                log(String.format("BLOCK: directional loss guard %s losses=%d conf=%.1f<%.1f",
-                        signal.side, dirLosses, signal.probability, requiredConf));
-                return false;
-            }
-        }
+        // Daily loss mode — обновляем флаг (влияет только на размер позиции в будущей автоторговле)
+        cautiousMode = dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT;
 
         return true;
+    }
+
+    /**
+     * [SCANNER MODE v2.0] Устанавливает кулдаун на монету после отправки сигнала.
+     * Заменяет пару markSymbolActive() + (ждём TradeResolver) → markSymbolClosed().
+     *
+     * Механика:
+     *   1. Убираем символ из activeSymbols (больше не "в сделке")
+     *   2. Ставим кулдаун symbolCooldownUntil на durationMs вперёд
+     *   3. isSymbolAvailable() вернёт false пока кулдаун не истечёт
+     *
+     * @param symbol    Монета (напр. "BTCUSDT")
+     * @param durationMs Длительность кулдауна в мс (20 * 60_000L = 20 мин)
+     */
+    public synchronized void setSignalCooldown(String symbol, long durationMs) {
+        activeSymbols.remove(symbol); // снимаем "в активной сделке"
+        long until = System.currentTimeMillis() + durationMs;
+        symbolCooldownUntil.put(symbol, until);
+        log("⏱ SIGNAL_COOLDOWN: " + symbol + " → " + (durationMs / 60_000) + " мин");
     }
 
     public synchronized void registerSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {

@@ -904,7 +904,8 @@ public final class DecisionEngineMerged {
 
             // Сборка строгого вертикального сообщения
             StringBuilder sb = new StringBuilder();
-            sb.append(assetType.emoji).append(" *").append(symbol).append("*\n");
+            sb.append(assetType.emoji).append(" *").append(symbol).append("*")
+                    .append(" · ").append(assetType.label).append("\n");
             sb.append(isLong ? "🟢 *LONG*\n" : "🔴 *SHORT*\n");
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append("▫️ Вход:    `").append(String.format(fmt, price)).append("`\n");
@@ -915,6 +916,7 @@ public final class DecisionEngineMerged {
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.2f%%)%n", stop, slPct));
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
+            sb.append(String.format("📊 Уверенность: *%.0f%%*%n", probability));
             sb.append("⏱ ").append(timeStr).append(" · ").append(city);
 
             return sb.toString();

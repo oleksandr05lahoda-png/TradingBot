@@ -304,22 +304,30 @@ public final class BotMain {
                 safe("Watchdog", () -> runWatchdog(telegram, gic, isc, sender)),
                 60, 60, TimeUnit.SECONDS);
 
-        // ── TradeResolver каждые 45s ──────────────────────────────
-        auxSched.scheduleAtFixedRate(
-                safe("TradeResolver", () -> runTradeResolver(sender, isc, telegram)),
-                90, 45, TimeUnit.SECONDS);
+        // ── [SCANNER MODE v2.0] TradeResolver DISABLED ───────────────
+        // Бот работает в режиме чистого сканера сигналов.
+        // TradeResolver отслеживал виртуальные позиции и слал фантомные
+        // TP/SL уведомления по сделкам, которые трейдер не открывал.
+        // При ручной торговле это создаёт путаницу. Отключено до подключения автоисполнения.
+        //
+        // auxSched.scheduleAtFixedRate(
+        //         safe("TradeResolver", () -> runTradeResolver(sender, isc, telegram)),
+        //         90, 45, TimeUnit.SECONDS);
 
-        // ── [v36-FIX Дыра6] Position Status Report каждые 30 минут ──
-        // Трейдер видит где стоят позиции без постоянного спама.
-        // Отправляется только если есть открытые позиции.
-        auxSched.scheduleAtFixedRate(
-                safe("PositionStatus", () -> sendPositionStatus(telegram)),
-                15, 30, TimeUnit.MINUTES);
+        // ── [SCANNER MODE v2.0] PositionStatus DISABLED ──────────────
+        // Нет виртуальных позиций → нет смысла в отчёте о позициях.
+        //
+        // auxSched.scheduleAtFixedRate(
+        //         safe("PositionStatus", () -> sendPositionStatus(telegram)),
+        //         15, 30, TimeUnit.MINUTES);
 
-        // ── Forecast accuracy checker (каждые 15m) ────────────────
-        auxSched.scheduleAtFixedRate(
-                safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
-                16, 15, TimeUnit.MINUTES);
+        // ── [SCANNER MODE v2.0] ForecastChecker DISABLED ─────────────
+        // Точность прогноза считалась по виртуальным TP/SL.
+        // Без TradeResolver данные некорректны. Отключено.
+        //
+        // auxSched.scheduleAtFixedRate(
+        //         safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
+        //         16, 15, TimeUnit.MINUTES);
 
         // ── [MODULE 4 v33] ADVANCE FORECAST ALERTS — каждые 5 минут ──
         // Анализирует рыночную структуру и отправляет заблаговременные
@@ -460,17 +468,24 @@ public final class BotMain {
                 // [v35.0] CLEAN DISPATCH — toTelegramString() is self-contained now.
                 telegram.sendMessageAsync(s.toTelegramString());
 
-                // [v36-FIX Дыра3] AUTO EXECUTION
-                double autoSizeUsdt = sender.getPositionSizeUsdt(s, sender.getCoinCategory(s.symbol));
-                sender.executeOrderAsync(s, autoSizeUsdt);
+                // [SCANNER MODE v2.0] AUTO EXECUTION DISABLED — ручная торговля.
+                // executeOrderAsync() отключён до подключения биржевого API.
+                // double autoSizeUsdt = sender.getPositionSizeUsdt(s, sender.getCoinCategory(s.symbol));
+                // sender.executeOrderAsync(s, autoSizeUsdt);
 
                 LOG.info("► " + s.symbol + " " + s.side
                         + " conf=" + String.format("%.0f%%", s.probability)
                         + (s.forecast != null ? " fc=" + s.forecast.bias.name() : ""));
                 totalSignals.incrementAndGet();
                 sent++;
-                trackSignal(s);
-                isc.markSymbolActive(s.symbol);
+
+                // [SCANNER MODE v2.0] Вместо виртуального трекинга (trackSignal + markSymbolActive)
+                // ставим простой кулдаун на монету.
+                // TradeResolver отключён → markSymbolActive без markSymbolClosed = вечная блокировка.
+                // Решение: сразу кулдаун 20 мин. Монета заново доступна через 20 мин.
+                // Это даёт трейдеру время войти в сделку, а боту — не спамить одной монетой.
+                isc.setSignalCooldown(s.symbol, 20 * 60_000L); // 20 минут
+
                 lastSignalMs = System.currentTimeMillis();
                 dispatched = true;
             } catch (Exception ex) {
