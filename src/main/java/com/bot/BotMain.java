@@ -51,7 +51,7 @@ public final class BotMain {
     private static final int    KLINES    = envInt("KLINES_LIMIT", 220);
     // Hard cap to avoid Telegram queue backlog (which can make the bot
     // "silent" for hours/days under heavy signal load).
-    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 5); // [v38.0] 10→5: precision over frequency
+    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 50); // [v38.0] 10→5: precision over frequency
 
     // ── Секторальные лидеры для GIC ───────────────────────────────────────
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
@@ -434,56 +434,56 @@ public final class BotMain {
         int sent = 0;
         for (com.bot.DecisionEngineMerged.TradeIdea s : dispatchSignals) {
 
-            // [v17.0 §1] BIPOLAR GUARD — ISC.isSymbolAvailable() already runs inside
-            // allowSignal(), but processPair() is parallel and two threads can race to
-            // approve the same symbol before either registers it. This is the final,
-            // single-threaded check right before dispatch: absolutely no duplicates pass.
-            if (!isc.isSymbolAvailable(s.symbol)) {
-                LOG.info("[BIPOLAR SKIP] " + s.symbol + " already active or in cooldown — dropped");
-                continue;
+            // [v42.0 FIX] SLOT LEAK GUARD — every signal that reaches this loop
+            // was already registered via isc.registerSignal() inside processPair().
+            // If it gets rejected here (bipolar, R:R, exception), the slot MUST be freed.
+            // Without this, rejected signals permanently occupy ISC slots → "Max global signals".
+            boolean dispatched = false;
+            try {
+                // [v17.0 §1] BIPOLAR GUARD — final single-threaded check.
+                if (!isc.isSymbolAvailable(s.symbol)) {
+                    LOG.info("[BIPOLAR SKIP] " + s.symbol + " already active or in cooldown — dropped");
+                    continue; // finally → unregister
+                }
+
+                // [PATCH B4 v33] DISPATCH R:R GATE — final check before user sees the signal.
+                double _rrRiskDist = Math.abs(s.stop  - s.price);
+                double _rrTp2Dist  = Math.abs(s.tp2   - s.price);
+                double _rrActual   = _rrRiskDist > 1e-9 ? _rrTp2Dist / _rrRiskDist : 0;
+                if (_rrActual < 1.80) {
+                    LOG.info("[RR-DISPATCH-BLOCK] " + s.symbol + " " + s.side
+                            + " rr=" + String.format("%.2f", _rrActual)
+                            + " entry=" + s.price + " sl=" + s.stop + " tp2=" + s.tp2);
+                    continue; // finally → unregister
+                }
+
+                // [v35.0] CLEAN DISPATCH — toTelegramString() is self-contained now.
+                telegram.sendMessageAsync(s.toTelegramString());
+
+                // [v36-FIX Дыра3] AUTO EXECUTION
+                double autoSizeUsdt = sender.getPositionSizeUsdt(s, sender.getCoinCategory(s.symbol));
+                sender.executeOrderAsync(s, autoSizeUsdt);
+
+                LOG.info("► " + s.symbol + " " + s.side
+                        + " conf=" + String.format("%.0f%%", s.probability)
+                        + (s.forecast != null ? " fc=" + s.forecast.bias.name() : ""));
+                totalSignals.incrementAndGet();
+                sent++;
+                trackSignal(s);
+                isc.markSymbolActive(s.symbol);
+                lastSignalMs = System.currentTimeMillis();
+                dispatched = true;
+            } catch (Exception ex) {
+                LOG.warning("[DISPATCH] " + s.symbol + " failed: " + ex.getMessage());
+            } finally {
+                // [v42.0] If signal was NOT dispatched → free the ISC slot that
+                // processPair().registerSignal() occupied. This is the critical fix
+                // for the "coins blocked forever" bug.
+                if (!dispatched) {
+                    isc.unregisterSignal(s);
+                    LOG.info("[SLOT-FREE] " + s.symbol + " " + s.side + " — ISC slot released");
+                }
             }
-
-            // [PATCH B4 v33] DISPATCH R:R GATE — final check before user sees the signal.
-            // processPair() already filters, but rebuildIdea() and adaptive TP calibration
-            // run AFTER allowSignal() and can push TP2 closer to entry.
-            // This gate ensures every signal the trader sees has minimum 1:2 risk/reward.
-            // Measured against TP2 (the realistic partial-exit target, not the lottery TP3).
-            double _rrRiskDist = Math.abs(s.stop  - s.price);
-            double _rrTp2Dist  = Math.abs(s.tp2   - s.price);
-            double _rrActual   = _rrRiskDist > 1e-9 ? _rrTp2Dist / _rrRiskDist : 0;
-            if (_rrActual < 1.80) {
-                LOG.info("[RR-DISPATCH-BLOCK] " + s.symbol + " " + s.side
-                        + " rr=" + String.format("%.2f", _rrActual)
-                        + " entry=" + s.price + " sl=" + s.stop + " tp2=" + s.tp2);
-                continue;
-            }
-
-            // [v35.0] CLEAN DISPATCH — toTelegramString() is self-contained now.
-            telegram.sendMessageAsync(s.toTelegramString());
-
-            // [v36-FIX Дыра3] AUTO EXECUTION — если ENABLE_AUTO_TRADE=1
-            // Выставляет реальные ордера через встроенный OrderExecutor в SignalSender.
-            double autoSizeUsdt = sender.getPositionSizeUsdt(s, sender.getCoinCategory(s.symbol));
-            sender.executeOrderAsync(s, autoSizeUsdt);
-
-            // [v14.0 FIX #7] Безопасный доступ к forecast
-            String forecastInfo = "N/A";
-            String phaseInfo = "N/A";
-            if (s.forecast != null) {
-                forecastInfo = s.forecast.bias.name();
-                phaseInfo = s.forecast.trendPhase.name();
-            }
-
-            LOG.info("► " + s.symbol + " " + s.side
-                    + " conf=" + String.format("%.0f%%", s.probability)
-                    + " forecast=" + forecastInfo
-                    + " phase=" + phaseInfo);
-            totalSignals.incrementAndGet();
-            sent++;
-            trackSignal(s);
-            // [v17.0 §1] Mark symbol as active right after dispatch — blocks bipolar pairs
-            isc.markSymbolActive(s.symbol);
-            lastSignalMs = System.currentTimeMillis();
         }
 
         LOG.info("══ ЦИКЛ #" + cycle + " END ══ sent=" + sent
@@ -1533,7 +1533,7 @@ public final class BotMain {
                 @Override
                 public String format(LogRecord r) {
                     return String.format("[%s][%-7s] %s%n",
-                            ZonedDateTime.now(ZoneId.of("Europe/Warsaw")).format(fmt),
+                            ZonedDateTime.now(ZONE).format(fmt), // Используем динамическую ZONE
                             r.getLevel(), r.getMessage());
                 }
             });

@@ -500,12 +500,6 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        // 3. Global count check
-        if (getActiveCount() >= maxGlobalSignals) {
-            log("🛑 BLOCK: Max global signals limit reached (" + maxGlobalSignals + ")");
-            return false;
-        }
-
         // 4. Same Symbol check
         List<ActiveSignal> symSignals = activeSignals.get(signal.symbol);
         if (symSignals != null && symSignals.size() >= maxSignalsPerSymbol) {

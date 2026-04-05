@@ -22,17 +22,17 @@ public final class DecisionEngineMerged {
     // or it's a commodity/metal proxy that needs separate platform.
     // ══════════════════════════════════════════════════════════════
     public enum AssetType {
-        CRYPTO("", "Криптовалюта"),
-        PRECIOUS_METAL_GOLD("", "Золото"),
-        PRECIOUS_METAL_SILVER("", "Серебро"),
-        PRECIOUS_METAL_PLATINUM("", "Платина"),
-        PRECIOUS_METAL_OTHER("", "Драг. металл"),
-        COMMODITY_OIL("", "Нефть"),
-        COMMODITY_GAS("", "Природный газ"),
-        COMMODITY_OTHER("", "Сырьё"),
-        FOREX("", "Форекс"),
-        INDEX("", "Индекс"),
-        UNKNOWN("", "Актив");
+        CRYPTO("₿", "Криптовалюта"),
+        PRECIOUS_METAL_GOLD("🥇", "Золото"),
+        PRECIOUS_METAL_SILVER("🥈", "Серебро"),
+        PRECIOUS_METAL_PLATINUM("💎", "Платина"),
+        PRECIOUS_METAL_OTHER("⚙️", "Драг. металл"),
+        COMMODITY_OIL("🛢", "Нефть"),
+        COMMODITY_GAS("⛽", "Природный газ"),
+        COMMODITY_OTHER("🌾", "Сырьё"),
+        FOREX("💱", "Форекс"),
+        INDEX("📈", "Индекс"),
+        UNKNOWN("📊", "Актив");
 
         public final String emoji;
         public final String label;
@@ -879,109 +879,43 @@ public final class DecisionEngineMerged {
 
         public String toTelegramString() {
             boolean isLong  = side == com.bot.TradingCore.Side.LONG;
-            String  arrow   = isLong ? "⬆️" : "⬇️";
-            String  sideStr = isLong ? "LONG" : "SHORT";
             AssetType assetType = detectAssetType(symbol);
 
-            // Pair format: BTCUSDT → BTC/USDT,  ETHBUSD → ETH/BUSD
-            String quote = symbol.endsWith("USDT") ? "USDT"
-                    : symbol.endsWith("BUSD") ? "BUSD" : "";
-            String base  = !quote.isEmpty()
-                    ? symbol.substring(0, symbol.length() - quote.length())
-                    : symbol;
-            String pair  = !quote.isEmpty() ? base + "/" + quote : symbol;
-
-            // Adaptive price format — decimals are always meaningful
-            String fmt = price < 0.0001 ? "%.7f"
+            // Адаптивный формат цены (научная нотация исключена)
+            String fmt = price < 0.0001 ? "%.8f"
                     : price < 0.001  ? "%.6f"
                       : price < 0.01   ? "%.5f"
-                        : price < 0.1    ? "%.4f"
+                        : price < 1      ? "%.4f"
                           : price < 100    ? "%.4f"
-                            : price < 10000  ? "%.3f"
+                            : price < 10000  ? "%.2f"
                               : "%.2f";
 
-            // Percentages: SL risk, TP gains
-            double slPct  = Math.abs(price - stop) / price * 100;
-            double tp1Pct = tp1 > 0 ? Math.abs(tp1 - price) / price * 100 : 0;
-            double tp2Pct = tp2 > 0 ? Math.abs(tp2 - price) / price * 100 : 0;
-            double tp3Pct = tp3 > 0 ? Math.abs(tp3 - price) / price * 100 : 0;
-            String rrStr  = rr > 0 ? String.format("1:%.1f", rr) : "—";
+            // Честный расчет дистанций в процентах
+            double slPct  = (stop - price) / price * 100;
+            double tp1Pct = tp1 > 0 ? (tp1 - price) / price * 100 : 0;
+            double tp2Pct = tp2 > 0 ? (tp2 - price) / price * 100 : 0;
+            double tp3Pct = tp3 > 0 ? (tp3 - price) / price * 100 : 0;
 
-            // ── Trend phase label ─────────────────────────────────────────
-            String phaseTag = "";
-            if (forecast != null && forecast.trendPhase != null) {
-                phaseTag = switch (forecast.trendPhase) {
-                    case EARLY      -> "📈 Ранний тренд";
-                    case MID        -> "📊 Середина тренда";
-                    case LATE       -> "📉 Поздний тренд";
-                    case EXHAUSTION -> "⚠️ Истощение";
-                    default         -> "";
-                };
-            }
-
-            // ── Trader flags (max 3) ──────────────────────────────────────
-            List<String> tf = traderFlags();
-            String flagsLine = tf.isEmpty()
-                    ? "" : String.join(" · ", tf.subList(0, Math.min(tf.size(), 3)));
-
-            // ── Timestamp with auto-detected timezone ─────────────────────
+            // Локализация времени
             java.time.ZonedDateTime now = java.time.ZonedDateTime.now(DecisionEngineMerged.USER_ZONE);
-            String timeStr = now.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"));
-            String utcTag;
-            try {
-                int totalMin = now.getOffset().getTotalSeconds() / 60;
-                int h = Math.abs(totalMin) / 60;
-                int m = Math.abs(totalMin) % 60;
-                String sign = totalMin >= 0 ? "+" : "-";
-                utcTag = m == 0
-                        ? "UTC" + sign + h
-                        : String.format("UTC%s%d:%02d", sign, h, m);
-            } catch (Exception e) {
-                utcTag = "UTC";
-            }
+            String timeStr = now.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+            String zoneId = DecisionEngineMerged.USER_ZONE.getId();
+            String city = zoneId.contains("/") ? zoneId.substring(zoneId.lastIndexOf('/') + 1).replace('_', ' ') : zoneId;
 
-            // ── Build message ─────────────────────────────────────────────
-            String div = "━━━━━━━━━━━━━━━━━━━━";
+            // Сборка строгого вертикального сообщения
             StringBuilder sb = new StringBuilder();
-
-            // Header: asset icon + pair + category
-            sb.append(assetType.emoji).append(" *").append(pair).append("*")
-                    .append("   _").append(assetType.label).append("_\n");
-
-            // Direction
-            sb.append(arrow).append(" *").append(sideStr).append("*\n");
-            sb.append(div).append('\n');
-
-            // Entry price (current market price at signal time)
-            sb.append("💵 Цена входа:   `").append(String.format(fmt, price)).append("`\n");
-            sb.append(div).append('\n');
-
-            // Take-profits with percentage gain
-            if (tp1 > 0) sb.append(String.format("🎯 TP1   `" + fmt + "`   +%.2f%%%n", tp1, tp1Pct));
-            if (tp2 > 0) sb.append(String.format("🎯 TP2   `" + fmt + "`   +%.2f%%%n", tp2, tp2Pct));
-            if (tp3 > 0) sb.append(String.format("🎯 TP3   `" + fmt + "`   +%.2f%%%n", tp3, tp3Pct));
-
-            // Stop-loss with percentage loss
-            sb.append(String.format("🛑 SL      `" + fmt + "`   -%.2f%%%n", stop, slPct));
-            sb.append(div).append('\n');
-
-            // Confidence + R:R
-            sb.append(String.format("📊 *%.0f%%* вероятность   R:R *%s*", probability, rrStr));
-
-            // Phase + flags
-            if (!phaseTag.isEmpty() || !flagsLine.isEmpty()) {
-                sb.append('\n');
-                if (!phaseTag.isEmpty() && !flagsLine.isEmpty()) {
-                    sb.append("_").append(phaseTag).append("  ·  ").append(flagsLine).append("_");
-                } else if (!phaseTag.isEmpty()) {
-                    sb.append("_").append(phaseTag).append("_");
-                } else {
-                    sb.append("_").append(flagsLine).append("_");
-                }
-            }
-
-            // Timestamp
-            sb.append('\n').append("⏰ ").append(timeStr).append("  ").append(utcTag);
+            sb.append(assetType.emoji).append(" *").append(symbol).append("*\n");
+            sb.append(isLong ? "🟢 *LONG*\n" : "🔴 *SHORT*\n");
+            sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
+            sb.append("▫️ Вход:    `").append(String.format(fmt, price)).append("`\n");
+            sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
+            if (tp1 > 0) sb.append(String.format("🎯 TP1:    `" + fmt + "`  (%+.2f%%)%n", tp1, tp1Pct));
+            if (tp2 > 0) sb.append(String.format("🎯 TP2:    `" + fmt + "`  (%+.2f%%)%n", tp2, tp2Pct));
+            if (tp3 > 0) sb.append(String.format("🎯 TP3:    `" + fmt + "`  (%+.2f%%)%n", tp3, tp3Pct));
+            sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
+            sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.2f%%)%n", stop, slPct));
+            sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
+            sb.append("⏱ ").append(timeStr).append(" · ").append(city);
 
             return sb.toString();
         }
