@@ -109,15 +109,19 @@ public final class InstitutionalSignalCore {
     private static final long   SIGNAL_WINDOW_8H_MS       = 8 * 60 * 60_000L;
     private final Map<String, Deque<Long>> symbolSignalTimestamps = new ConcurrentHashMap<>();
 
+    /** Prune timestamps older than the 8h window from the deque. */
+    private void pruneOldSignalTimestamps(Deque<Long> timestamps) {
+        long cutoff = System.currentTimeMillis() - SIGNAL_WINDOW_8H_MS;
+        while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
+            timestamps.pollFirst();
+        }
+    }
+
     /** Check if symbol has exceeded its daily signal quota */
     private boolean symbolDailyLimitReached(String symbol) {
         Deque<Long> timestamps = symbolSignalTimestamps.get(symbol);
         if (timestamps == null) return false;
-        long cutoff = System.currentTimeMillis() - SIGNAL_WINDOW_8H_MS;
-        // Prune old timestamps
-        while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
-            timestamps.pollFirst();
-        }
+        pruneOldSignalTimestamps(timestamps); // [FIX #18] single prune location
         return timestamps.size() >= MAX_SIGNALS_PER_SYMBOL_8H;
     }
 
@@ -126,11 +130,7 @@ public final class InstitutionalSignalCore {
         Deque<Long> timestamps = symbolSignalTimestamps.computeIfAbsent(symbol,
                 k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         timestamps.addLast(System.currentTimeMillis());
-        // Prune to prevent memory leak
-        long cutoff = System.currentTimeMillis() - SIGNAL_WINDOW_8H_MS;
-        while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
-            timestamps.pollFirst();
-        }
+        pruneOldSignalTimestamps(timestamps); // [FIX #18] reuse same prune helper
     }
 
     /** SL cooldown: 2 × 15m candles = 30 minutes (prevents "falling knife" re-entry). */
@@ -445,6 +445,13 @@ public final class InstitutionalSignalCore {
     // [v17.0] Rate-limit BIPOLAR BLOCK logs: one log per symbol per 60s to avoid Railway log flood.
     private final Map<String, Long> bipolarLogThrottle = new ConcurrentHashMap<>();
     private static final long BIPOLAR_LOG_THROTTLE_MS = 60_000L;
+
+    /** [FIX #15] Periodic cleanup — call this from BotMain every cycle or every few minutes.
+     *  cleanupExpired() was previously only reachable inside allowSignal() (synchronized).
+     *  If no new signals arrive (signal drought), activeSymbols never gets cleaned → stuck symbols. */
+    public synchronized void periodicCleanup() {
+        cleanupExpired();
+    }
 
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();

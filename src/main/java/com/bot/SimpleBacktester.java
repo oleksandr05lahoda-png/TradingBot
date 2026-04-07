@@ -258,6 +258,14 @@ public final class SimpleBacktester {
         if (m15 == null || m15.size() < 200) return result;
 
         com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
+        // [v42.0 FIX #2] Tell the engine it is running in backtest mode.
+        // This disables RT-aggTrade reads (which would NPE in offline mode) but keeps
+        // ALL other scoring logic identical to live, so calibration is shared.
+        engine.setBacktestMode(true);
+        // [FIX #14] Backtest cannot replicate aggTrade-derived RT-CVD / VDA — by design,
+        // not by oversight. The engine handles this gracefully via backtestMode flag.
+        com.bot.GlobalImpulseController btGic = new com.bot.GlobalImpulseController();
+        engine.setGIC(btGic);
         double slippage = SLIPPAGE.getOrDefault(category, 0.0025);
         double balance = initialBalance;
 
@@ -604,8 +612,12 @@ public final class SimpleBacktester {
             slFirst = openPos > 0.65;
         }
 
-        // Default to SL_FIRST for ambiguous cases (conservative)
-        if (openPos > 0.35 && openPos < 0.65) slFirst = true;
+        // [FIX #16] Ambiguous case: open is mid-range (0.35–0.65) — both SL and TP plausible.
+        // OLD: always SL_FIRST → backtest was systematically pessimistic, artificially low WR.
+        // NEW: no default bias — return null (treat as "nothing resolved this bar"),
+        //      let the time-stop logic handle it if the position expires.
+        //      This matches reality: if we can't determine order from heuristics, skip the bar.
+        if (openPos > 0.35 && openPos < 0.65) return null;
 
         if (slFirst) {
             double exitPrice = sl;

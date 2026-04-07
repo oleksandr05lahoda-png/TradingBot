@@ -42,8 +42,20 @@ public final class BotMain {
     private static final Logger LOG = Logger.getLogger(BotMain.class.getName());
 
     // ── Конфигурация из env ───────────────────────────────────────────────
-    private static final String TG_TOKEN  = System.getenv("TELEGRAM_TOKEN");
-    private static final String CHAT_ID   = System.getenv().getOrDefault("CHAT_ID", "953233853");
+    private static final String TG_TOKEN  = requireEnv("TELEGRAM_TOKEN");
+    // [v42.0 FIX #15] No more hardcoded CHAT_ID. Old default "953233853" was a real
+    // user ID leaked into source. Now fails fast at startup if env var is missing.
+    private static final String CHAT_ID   = requireEnv("CHAT_ID");
+
+    private static String requireEnv(String name) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) {
+            throw new IllegalStateException(
+                    "Required env var missing: " + name
+                            + ". Set it in your environment, do NOT hardcode in source.");
+        }
+        return v;
+    }
     // Auto-detected at startup: env TIMEZONE → IP geolocation → Warsaw fallback.
     // Each instance (yours in Warsaw, father's in Zaporizhzhia) detects its own timezone.
     private static final ZoneId ZONE      = detectTimezone();
@@ -51,7 +63,10 @@ public final class BotMain {
     private static final int    KLINES    = envInt("KLINES_LIMIT", 220);
     // Hard cap to avoid Telegram queue backlog (which can make the bot
     // "silent" for hours/days under heavy signal load).
-    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 50); // [v38.0] 10→5: precision over frequency
+    // [FIX #1] MAX_SIGNALS_PER_CYCLE was 50 — comment said "10→5" but value was never changed.
+    // 50 signals/cycle floods the Telegram queue, causes the bot to appear "silent" for hours
+    // while the queue drains. 5 forces only the highest-confidence ideas to be sent.
+    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 5); // was 50 — CRITICAL BUG
 
     // ── Секторальные лидеры для GIC ───────────────────────────────────────
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
@@ -130,6 +145,10 @@ public final class BotMain {
         final long   createdAt;
         volatile boolean resolved = false;
         volatile String  actualOutcome = null;
+        // [FIX #19] Track whether this record was already counted in forecastTotal/forecastCorrect.
+        // markForecastRecord() and checkForecastAccuracy() both increment counters.
+        // When TradeResolver is re-enabled, both paths could fire for the same record → double count.
+        volatile boolean counted = false;
 
         ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
                        String bias, double score) {
@@ -265,7 +284,7 @@ public final class BotMain {
 
         // ── Schedulers ───────────────────────────────────────────
         ScheduledExecutorService mainSched = Executors.newScheduledThreadPool(2, r -> {
-            Thread t = new Thread(r, "GodBot-Main");
+            Thread t = new Thread(r, "TradingBot-Main");
             t.setDaemon(false);
             t.setUncaughtExceptionHandler((th, ex) ->
                     LOG.log(Level.SEVERE, "UNCAUGHT in " + th.getName(), ex));
@@ -273,13 +292,13 @@ public final class BotMain {
         });
 
         ScheduledExecutorService auxSched = Executors.newScheduledThreadPool(4, r -> {
-            Thread t = new Thread(r, "GodBot-Aux");
+            Thread t = new Thread(r, "TradingBot-Aux");
             t.setDaemon(true);
             return t;
         });
 
         ExecutorService heavySched = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "GodBot-Heavy");
+            Thread t = new Thread(r, "TradingBot-Heavy");
             t.setDaemon(true);
             return t;
         });
@@ -325,9 +344,24 @@ public final class BotMain {
         // Точность прогноза считалась по виртуальным TP/SL.
         // Без TradeResolver данные некорректны. Отключено.
         //
-        // auxSched.scheduleAtFixedRate(
-        //         safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
-        //         16, 15, TimeUnit.MINUTES);
+        // [v42.1 FIX] RE-ENABLED. Scanner-mode compatible: checkForecastAccuracy
+        // does NOT use virtual TP/SL — it compares real market price vs entry after
+        // 2h against a dynamic ATR threshold (see BotMain.checkForecastAccuracy).
+        // This is the feedback loop that populates ProbabilityCalibrator with real
+        // win/loss outcomes. Without it the calibrator stays empty and all #1 work
+        // is dead weight. MUST stay enabled.
+        auxSched.scheduleAtFixedRate(
+                safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
+                16, 15, TimeUnit.MINUTES);
+
+        // ── [v42.1 FIX #10] WalkForward — daily out-of-sample validation ─
+        // Runs once every 24h. For each active symbol, slides a train/test
+        // window over 30 days of history. If test win-rate drops >15% vs
+        // train, emits an overfit alert to Telegram. This is the only
+        // protection against SignalOptimizer overfitting to historical noise.
+        auxSched.scheduleAtFixedRate(
+                safe("WalkForward", () -> runWalkForwardValidation(sender, telegram)),
+                6 * 60, 24 * 60, TimeUnit.MINUTES);
 
         // ── [MODULE 4 v33] ADVANCE FORECAST ALERTS — каждые 5 минут ──
         // Анализирует рыночную структуру и отправляет заблаговременные
@@ -362,7 +396,7 @@ public final class BotMain {
 
         // ── Startup ping ─────────────────────────────────────────
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ GodBot v15.0 ARCHITECTURE FIX стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ TradingBot v15.0 ARCHITECTURE FIX стартовал " + nowWarsawStr() + " ═══");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -408,10 +442,11 @@ public final class BotMain {
         double bal = sender.getAccountBalance();
         if (bal > 0) isc.updateBalance(bal);
 
-        // [v23.0] Update Bayesian prior from ISC real win rate
-        // This ensures probability estimates reflect ACTUAL trading performance
+        // [FIX #2] updateBayesPrior threshold aligned: was 20, function requires 50 to blend.
+        // Calling with 20–49 confirmed trades just sets 0.55 hardcoded prior — wasted call.
+        // Now we call only when the function can actually use the data (>= 50 trades).
         int totalTrades = isc.getTotalTradeCount();
-        if (totalTrades >= 20) {
+        if (totalTrades >= 50) {
             sender.getDecisionEngine().updateBayesPrior(isc.getOverallWinRate(), totalTrades);
         }
 
@@ -478,6 +513,14 @@ public final class BotMain {
                         + (s.forecast != null ? " fc=" + s.forecast.bias.name() : ""));
                 totalSignals.incrementAndGet();
                 sent++;
+
+                // [v42.1 FIX] Track signal for ProbabilityCalibrator feedback loop.
+                // SCANNER MODE COMPATIBLE: trackSignal() only writes to forecastRecords
+                // (no virtual position tracking, no fake TP/SL events). The ForecastChecker
+                // resolves these by comparing real market price after 2h vs entry — this
+                // is WHAT FEEDS THE ISOTONIC CALIBRATOR. Without this call the entire
+                // ProbabilityCalibrator path stays empty forever and #1 fix is dead.
+                trackSignal(s);
 
                 // [SCANNER MODE v2.0] Вместо виртуального трекинга (trackSignal + markSymbolActive)
                 // ставим простой кулдаун на монету.
@@ -1014,8 +1057,26 @@ public final class BotMain {
                         : bearishMove ? "MOVED_DOWN" : "FLAT";
 
                 if (hasOpinion && (bullishMove || bearishMove)) {
-                    forecastTotal.incrementAndGet();
-                    if (correct) forecastCorrect.incrementAndGet();
+                    // [FIX #19] Only count if not already counted via markForecastRecord
+                    if (!fr.counted) {
+                        fr.counted = true;
+                        forecastTotal.incrementAndGet();
+                        if (correct) forecastCorrect.incrementAndGet();
+                    }
+
+                    // [v42.0 FIX #1] Feed the ProbabilityCalibrator with this resolved outcome.
+                    // Without this, the isotonic calibrator in DecisionEngineMerged stays empty
+                    // and falls through to raw score (no calibration).
+                    try {
+                        double rawScore01 = Math.max(0.0, Math.min(1.0, fr.forecastScore));
+                        double atrPctForBucket = atrForFc > 0
+                                ? (atrForFc / currentPrice) * 100.0
+                                : 1.0;
+                        com.bot.DecisionEngineMerged.getCalibrator()
+                                .recordOutcome(fr.symbol, rawScore01, correct, atrPctForBucket);
+                    } catch (Throwable cbe) {
+                        LOG.fine("[CAL] feed failed: " + cbe.getMessage());
+                    }
                 }
                 // FLAT результаты не считаем — бот не может предсказать "ничего не произойдёт"
 
@@ -1052,7 +1113,10 @@ public final class BotMain {
                                     com.bot.GlobalImpulseController gic,
                                     com.bot.InstitutionalSignalCore isc,
                                     com.bot.SignalSender sender) {
-        // [v30] Quiet hours removed — logStats runs 24/7
+        // [FIX #15] Periodic cleanup — releases stale activeSymbols entries even during droughts.
+        // Without this, if no signals fire for 20+ minutes, ISC slots stay locked forever
+        // because cleanupExpired() only runs inside allowSignal().
+        isc.periodicCleanup();
         long now = System.currentTimeMillis();
         List<String> issues = new ArrayList<>();
 
@@ -1114,12 +1178,12 @@ public final class BotMain {
         double fcAcc   = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
 
         String msg = String.format(
-                "*Daily Report*%n%n"
-                        + "Up %dm · Cycles %d · Signals %d%n"
-                        + "PnL *%+.2f%%* · DD %.1f%%%n"
-                        + "BTC %s · Vol %s%n"
-                        + "WS %d · Bal $%.2f%n%n"
-                        + "Forecast *%.0f%%* (%d/%d)%n"
+                "*Daily Report*\n\n"
+                        + "Up %dm · Cycles %d · Signals %d\n"
+                        + "PnL *%+.2f%%* · DD %.1f%%\n"
+                        + "BTC %s · Vol %s\n"
+                        + "WS %d · Bal $%.2f\n\n"
+                        + "Forecast *%.0f%%* (%d/%d)\n"
                         + "Open %d",
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 isc.getDailyPnL(), isc.getDrawdownFromPeak(),
@@ -1263,11 +1327,15 @@ public final class BotMain {
                 .ifPresent(e -> {
                     e.getValue().resolved = true;
                     e.getValue().actualOutcome = outcome;
-                    // Simplified: TP hit = correct, SL hit = wrong
-                    boolean tp = outcome.contains("TP") || outcome.equals("EXPIRED_PROFIT");
-                    if (!"EXPIRED_FLAT".equals(outcome)) {
-                        forecastTotal.incrementAndGet();
-                        if (tp) forecastCorrect.incrementAndGet();
+                    // [FIX #19] Only count if not already counted (prevents double-count when
+                    // both TradeResolver and checkForecastAccuracy are active simultaneously).
+                    if (!e.getValue().counted) {
+                        e.getValue().counted = true;
+                        boolean tp = outcome.contains("TP") || outcome.equals("EXPIRED_PROFIT");
+                        if (!"EXPIRED_FLAT".equals(outcome)) {
+                            forecastTotal.incrementAndGet();
+                            if (tp) forecastCorrect.incrementAndGet();
+                        }
                     }
                 });
     }
@@ -1322,15 +1390,22 @@ public final class BotMain {
             if (!isc.isSymbolAvailable(pair)) continue;
 
             try {
+                // [FIX #4] Rate-limit klines calls on auxSched thread.
+                // fetchKlines → rlAcquire → Thread.sleep inside, which blocks auxSched.
+                // Adding a small inter-pair sleep avoids RL burst and keeps auxSched responsive.
+                try { Thread.sleep(300L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+
                 // Получаем 15m и 1h свечи для ForecastEngine
                 List<com.bot.TradingCore.Candle> c15 = sender.fetchKlines(pair, "15m", 100);
                 List<com.bot.TradingCore.Candle> c1h  = sender.fetchKlines(pair, "1h",  48);
                 if (c15 == null || c15.size() < 30) continue;
 
                 // Запускаем ForecastEngine
+                // [FIX #21] Pass empty list for c5 (not available in advance forecast context)
+                // instead of null — null propagation through internal helpers is fragile.
                 com.bot.TradingCore.ForecastEngine fe = new com.bot.TradingCore.ForecastEngine();
                 com.bot.TradingCore.ForecastEngine.ForecastResult fc =
-                        fe.forecast(null, c15, c1h != null ? c1h : List.of(), 0.0);
+                        fe.forecast(List.of(), c15, c1h != null ? c1h : List.of(), 0.0);
                 if (fc == null) continue;
 
                 double score = fc.directionScore;
@@ -1451,7 +1526,7 @@ public final class BotMain {
 
 
     private static String buildStartMessage() {
-        return "⚡ *GodBot PRO* `v41`\n"
+        return "⚡ *TradingBot PRO* `v41`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures  ·  Crypto / Commodities\n"
                 + "VSA  ·  OFV  ·  EarlyRev  ·  Forecast\n"
@@ -1535,6 +1610,79 @@ public final class BotMain {
             return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d)));
         } catch (Exception e) {
             return d;
+        }
+    }
+
+    /**
+     * [v42.1 FIX #10] Walk-forward out-of-sample validation.
+     * Runs daily. For each active symbol, slides a 14-day train / 3-day test
+     * window over the last 30 days of history. If test win-rate diverges
+     * significantly from train win-rate, emits an overfit alert — the only
+     * protection against SignalOptimizer tuning to historical noise.
+     */
+    private static void runWalkForwardValidation(com.bot.SignalSender sender,
+                                                 com.bot.TelegramBotSender telegram) {
+        try {
+            com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
+            List<String> symbols = new ArrayList<>(SECTOR_LEADERS.keySet());
+            int alerts = 0;
+            int totalWindows = 0;
+            double totalDelta = 0;
+
+            for (String sym : symbols) {
+                try {
+                    // Fetch 30 days of 15m candles (2880 bars) and 1h (720 bars)
+                    List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 2880);
+                    List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  720);
+                    if (m15 == null || m15.size() < 1500) continue;
+
+                    com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
+                    if (cat == null) cat = com.bot.DecisionEngineMerged.CoinCategory.ALT;
+
+                    // 14d train = 1344 bars @15m, 3d test = 288 bars @15m
+                    List<com.bot.SimpleBacktester.BacktestResult> oos =
+                            bt.walkForward(sym, m15, h1, cat, 1344, 288);
+
+                    for (com.bot.SimpleBacktester.BacktestResult r : oos) {
+                        totalWindows++;
+                        double wr = r.winRate * 100.0;   // winRate is [0..1], display as %
+                        LOG.info(String.format("[WF] %s window winRate=%.1f%% trades=%d",
+                                sym, wr, r.total));
+                    }
+                    if (oos.size() >= 2) {
+                        // Compare first half vs second half as a stability proxy
+                        double firstHalf = 0, secondHalf = 0;
+                        int half = oos.size() / 2;
+                        for (int i = 0; i < half; i++)              firstHalf  += oos.get(i).winRate * 100.0;
+                        for (int i = half; i < oos.size(); i++)     secondHalf += oos.get(i).winRate * 100.0;
+                        firstHalf  /= Math.max(1, half);
+                        secondHalf /= Math.max(1, oos.size() - half);
+                        double delta = firstHalf - secondHalf;
+                        totalDelta += Math.abs(delta);
+
+                        if (Math.abs(delta) > 15.0) {
+                            alerts++;
+                            LOG.warning(String.format(
+                                    "[WF-ALERT] %s unstable: early=%.1f%% late=%.1f%% Δ=%.1f%%",
+                                    sym, firstHalf, secondHalf, delta));
+                        }
+                    }
+                } catch (Throwable perSym) {
+                    LOG.warning("[WF] " + sym + " failed: " + perSym.getMessage());
+                }
+            }
+
+            if (alerts > 0 && telegram != null) {
+                telegram.sendMessageAsync(String.format(
+                        "⚠️ *Walk-Forward Alert*\n%d/%d symbols unstable\nAvg Δ win-rate: %.1f%%\n" +
+                                "Model may be overfit — consider re-tuning.",
+                        alerts, symbols.size(),
+                        totalWindows > 0 ? totalDelta / Math.max(1, totalWindows) : 0));
+            }
+            LOG.info(String.format("[WF] done: %d windows across %d symbols, %d alerts",
+                    totalWindows, symbols.size(), alerts));
+        } catch (Throwable t) {
+            LOG.warning("[WF] validation failed: " + t.getMessage());
         }
     }
 

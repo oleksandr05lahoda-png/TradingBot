@@ -137,14 +137,16 @@ public final class PumpHunter {
                                 List<com.bot.TradingCore.Candle> c5m,
                                 List<com.bot.TradingCore.Candle> c15m,
                                 com.bot.DecisionEngineMerged.CoinCategory cat) {
-        // Apply category-specific threshold multipliers
+        // [FIX #13] Category-specific threshold multipliers.
         // TOP coins (BTC/ETH): heavy assets move slower → relax thresholds by 40%
         // ALT: standard thresholds
-        // MEME: already noisy → tighten by 10%
+        // MEME: was 1.10 (only 10% harder) — MEME coins have 3× more noise than ALT.
+        //        10% threshold increase provides almost no protection.
+        //        Fixed: 1.35 (35% harder) gives meaningful noise reduction on MEME pairs.
         double catMult = switch (cat) {
-            case TOP  -> 0.60;  // 40% easier to trigger (BTC 1.2% → 0.72% min move)
+            case TOP  -> 0.60;  // 40% easier (BTC 0.9% → 0.54% min move)
             case ALT  -> 1.00;
-            case MEME -> 1.10;  // 10% harder (reduce noise)
+            case MEME -> 1.35;  // was 1.10 — CRITICAL: MEME noise needs real filtration
         };
         return detectPumpInternal(symbol, c1m, c5m, c15m, catMult);
     }

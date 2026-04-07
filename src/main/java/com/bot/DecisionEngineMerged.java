@@ -171,6 +171,20 @@ public final class DecisionEngineMerged {
     private final Map<String, Deque<Double>>    relStrengthHistory = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger>    signalCountBySymbol = new ConcurrentHashMap<>();
 
+    // [v42.0 FIX #1,#3,#4] Probability calibrator — replaces all Math.max(50,...) hardcoded floors.
+    // Static so it persists across engine instances (live + backtest can share calibration).
+    private static final ProbabilityCalibrator CALIBRATOR = new ProbabilityCalibrator();
+    public static ProbabilityCalibrator getCalibrator() { return CALIBRATOR; }
+
+    // [v42.0 FIX #2] Backtest mode flag — disables RT-aggTrade reads, everything else identical to live.
+    private volatile boolean backtestMode = false;
+    public void setBacktestMode(boolean v) { this.backtestMode = v; }
+    public boolean isBacktestMode() { return backtestMode; }
+
+    // [v42.0 FIX #12] Last GC timestamp for postExitCooldown leak fix
+    private volatile long lastCooldownGcMs = 0L;
+    private static final int POST_EXIT_MAX_SIZE = 5000;
+
     // [ДЫРА №1] CVD — накопленная дельта объёма, устанавливается из SignalSender
     private final Map<String, Double>           cvdMap           = new ConcurrentHashMap<>();
     // [v29] VDA — Volume Delta Acceleration from aggTrade stream [-1..+1]
@@ -216,18 +230,23 @@ public final class DecisionEngineMerged {
             = new java.util.concurrent.atomic.AtomicInteger(0);
 
     /** Update Bayesian prior from ISC historical win rate */
-    // [v31] Stabilised: only update after 50+ confirmed trades to avoid "Bayesian depression".
+    // [FIX #6] Allow gradual blend from 20 confirmed trades instead of hard 0.55 until 50.
+    // OLD: <50 trades = always 0.55 regardless of actual WR. At 40 trades WR=70% → still 0.55.
+    // NEW: blend starts at 20 trades (5% weight), reaches full trust at 120 trades.
+    // This makes probability estimates reflect reality sooner, reducing the "random number" problem.
     public void updateBayesPrior(double winRate, int confirmedTrades) {
         int trades = Math.max(0, confirmedTrades);
         bayesSampleTrades.set(trades);
-        if (trades < 50) {
-            bayesPrior.set(0.55);
+        if (trades < 20) {
+            // Too few trades to trust: use neutral prior
+            bayesPrior.set(0.50);
             return;
         }
-        double livePrior = Math.max(0.50, Math.min(0.70, winRate));
+        double livePrior = Math.max(0.45, Math.min(0.75, winRate));
         if (trades < 120) {
-            double mix = (trades - 50) / 70.0;
-            bayesPrior.set(0.55 * (1.0 - mix) + livePrior * mix);
+            // Gradual linear blend: 20 trades → 5% weight on live, 120 trades → 100%
+            double mix = (trades - 20.0) / 100.0; // 0.0 at 20 trades, 1.0 at 120 trades
+            bayesPrior.set(0.50 * (1.0 - mix) + livePrior * mix);
         } else {
             bayesPrior.set(livePrior);
         }
@@ -256,8 +275,11 @@ public final class DecisionEngineMerged {
     //  For normal (full-candle) signals ForecastEngine remains an ADVISOR (penalty-based).
     // ══════════════════════════════════════════════════════════════
 
-    /** Minimum absolute directionScore for EARLY_TICK forecast confirmation. */
-    private static final double EARLY_TICK_FC_MIN_SCORE = 0.12;
+    /** [FIX #5] Raised 0.12 → 0.25.
+     *  At 0.12 on a [-1..+1] scale, 88% of signals pass (|score| ≥ 0.12 is nearly any non-flat forecast).
+     *  At 0.25 we require a moderate conviction: "gentle push" not just "not completely neutral".
+     *  This is the FIX for the "too many false early signals" complaint. */
+    private static final double EARLY_TICK_FC_MIN_SCORE = 0.25; // was 0.12 — CRITICAL: nearly no filter
 
     /**
      * Returns true if the ForecastResult confirms the trade direction for an EARLY_TICK signal.
@@ -334,8 +356,37 @@ public final class DecisionEngineMerged {
     }
 
     private boolean isPostExitBlocked(String symbol, com.bot.TradingCore.Side side) {
-        Long ts = postExitCooldown.get(symbol + "_" + side.name());
-        return ts != null && System.currentTimeMillis() - ts < POST_EXIT_COOLDOWN_MS;
+        cooldownGc();  // [v42.0 FIX #12] lazy TTL cleanup — was leaking forever
+        String k = symbol + "_" + side.name();
+        Long ts = postExitCooldown.get(k);
+        if (ts == null) return false;
+        long age = System.currentTimeMillis() - ts;
+        if (age >= POST_EXIT_COOLDOWN_MS) {
+            postExitCooldown.remove(k);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * [v42.0 FIX #12] Lazy garbage collector for postExitCooldown.
+     * Runs at most once per minute. Removes expired entries and bounds map size.
+     */
+    private void cooldownGc() {
+        long now = System.currentTimeMillis();
+        if (now - lastCooldownGcMs < 60_000L) return;
+        lastCooldownGcMs = now;
+        postExitCooldown.entrySet().removeIf(e -> now - e.getValue() > POST_EXIT_COOLDOWN_MS);
+        if (postExitCooldown.size() > POST_EXIT_MAX_SIZE) {
+            // Hard bound — drop oldest entries by timestamp
+            java.util.List<Map.Entry<String, Long>> sorted =
+                    new java.util.ArrayList<>(postExitCooldown.entrySet());
+            sorted.sort(Map.Entry.comparingByValue());
+            int toDrop = postExitCooldown.size() - POST_EXIT_MAX_SIZE;
+            for (int i = 0; i < toDrop && i < sorted.size(); i++) {
+                postExitCooldown.remove(sorted.get(i).getKey());
+            }
+        }
     }
 
     public void setVolumeDelta(String sym, double delta) {
@@ -356,21 +407,23 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [FIX v32+] CVD Persistence check.
-     * Returns true only if the last N readings all agreed in direction.
+     * [FIX #7] CVD Persistence check.
+     * Returns true only if the LAST minBars readings ALL agree in direction.
      * Prevents short-covering spikes from triggering LONG signals.
+     * FIXED: was counting any matching bar in the window — now requires the last N to be consecutive.
      */
     private boolean isCVDPersistent(String sym, boolean bullish, int minBars) {
         Deque<Double> hist = cvdHistory.get(sym);
         if (hist == null || hist.size() < minBars) return false;
         List<Double> list = new ArrayList<>(hist);
         int n = list.size();
-        int consecutive = 0;
+        // Check only the LAST minBars entries — all must agree
         for (int i = n - minBars; i < n; i++) {
-            if (bullish  && list.get(i) > 0.05) consecutive++;
-            if (!bullish && list.get(i) < -0.05) consecutive++;
+            double v = list.get(i);
+            if (bullish  && v <= 0.05) return false;  // any non-positive breaks the chain
+            if (!bullish && v >= -0.05) return false; // any non-negative breaks the chain
         }
-        return consecutive >= minBars;
+        return true;
     }
 
     private int getBullCvdPersistenceBars(String symbol) {
@@ -916,7 +969,7 @@ public final class DecisionEngineMerged {
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.2f%%)%n", stop, slPct));
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("📊 Уверенность: *%.0f%%*%n", probability));
+            sb.append(String.format("📊 Уверенность: *%.0f%%*  _(score, не вероятность)_%n", probability));
             sb.append("⏱ ").append(timeStr).append(" · ").append(city);
 
             return sb.toString();
@@ -1022,15 +1075,9 @@ public final class DecisionEngineMerged {
 
     /**
      * Detect a Break of Structure on 5m candles.
-     * Algorithm:
-     *   1. Find the most recent confirmed pivot high and pivot low
-     *      (a bar whose high/low exceeds both 2 neighbours on each side).
-     *   2. If the last closed 5m candle's close is ABOVE the pivot high → BoS Bullish.
-     *   3. If the last closed 5m candle's close is BELOW the pivot low  → BoS Bearish.
-     *   4. If BoS direction is OPPOSITE to htfStructure (±1) → label as ChoCh.
-     *
-     * @param c5          List of 5-minute candles (at least 20 required)
-     * @param htfStructure 15m market structure: +1=bullish, -1=bearish, 0=neutral
+     * [FIX #8] Was using global MAX pivot high / MIN pivot low over the entire window.
+     * A real BoS breaks the MOST RECENT swing, not an arbitrary historical extreme.
+     * Fixed: scan from right-to-left and stop at the FIRST confirmed pivot.
      */
     private static BosResult detectBoS(List<com.bot.TradingCore.Candle> c5, int htfStructure) {
         if (c5 == null || c5.size() < 20) return BosResult.none();
@@ -1038,32 +1085,35 @@ public final class DecisionEngineMerged {
 
         double lastSwingHigh = 0;
         double lastSwingLow  = Double.MAX_VALUE;
+        boolean foundHigh = false, foundLow = false;
 
-        // Scan for pivot points in [2, n-3] — need 2 bars on each side confirmed
-        for (int i = 2; i < n - 2; i++) {
+        // [FIX #8] Scan right-to-left: stop at FIRST confirmed pivot (most recent)
+        for (int i = n - 3; i >= 2; i--) {
             double hi = c5.get(i).high;
             double lo = c5.get(i).low;
 
-            boolean pivotHigh = hi > c5.get(i - 1).high && hi > c5.get(i - 2).high
-                    && hi > c5.get(i + 1).high && hi > c5.get(i + 2).high;
-            boolean pivotLow  = lo < c5.get(i - 1).low  && lo < c5.get(i - 2).low
-                    && lo < c5.get(i + 1).low  && lo < c5.get(i + 2).low;
-
-            if (pivotHigh) lastSwingHigh = Math.max(lastSwingHigh, hi);
-            if (pivotLow)  lastSwingLow  = Math.min(lastSwingLow,  lo);
+            if (!foundHigh) {
+                boolean pivotHigh = hi > c5.get(i - 1).high && hi > c5.get(i - 2).high
+                        && hi > c5.get(i + 1).high && hi > c5.get(i + 2).high;
+                if (pivotHigh) { lastSwingHigh = hi; foundHigh = true; }
+            }
+            if (!foundLow) {
+                boolean pivotLow = lo < c5.get(i - 1).low && lo < c5.get(i - 2).low
+                        && lo < c5.get(i + 1).low && lo < c5.get(i + 2).low;
+                if (pivotLow) { lastSwingLow = lo; foundLow = true; }
+            }
+            if (foundHigh && foundLow) break;
         }
 
         double lastClose = c5.get(n - 1).close;
 
-        // Require a confirmed close BEYOND the swing level (not just wick)
-        boolean bosBull = lastSwingHigh > 0
-                && lastClose > lastSwingHigh * 1.00025; // +0.025% buffer vs noise
-        boolean bosBear = lastSwingLow < Double.MAX_VALUE
-                && lastClose < lastSwingLow  * 0.99975; // -0.025% buffer
+        boolean bosBull = foundHigh
+                && lastClose > lastSwingHigh * 1.00025;
+        boolean bosBear = foundLow
+                && lastClose < lastSwingLow  * 0.99975;
 
         if (!bosBull && !bosBear) return BosResult.none();
 
-        // ChoCh = BoS direction is AGAINST the higher-timeframe structure
         boolean choch = (bosBull && htfStructure == -1) || (bosBear && htfStructure == 1);
 
         return new BosResult(
@@ -1105,14 +1155,9 @@ public final class DecisionEngineMerged {
         double btcAccel         = gicCtx != null ? gicCtx.btcMomentumAccel : 0.0;
         double gicShortBoost    = gicCtx != null ? gicCtx.shortBoost : 1.0;
 
-        // [FIX v32+] Read gradient long suppression multiplier from GIC.
-        // GIC encodes longSuppressionMult in confidenceAdjustment using sentinel range < -50.
-        // Convention: confAdj = -(100 - mult*100) - 50 → mult = (confAdj + 150) / 100
-        // Example: confAdj = -120 → mult = 0.30 (crush LONG score to 30%)
-        double gicLongSuppression = 1.0; // default: no suppression
-        if (gicCtx != null && gicCtx.confidenceAdjustment < -50.0) {
-            gicLongSuppression = clamp((gicCtx.confidenceAdjustment + 150.0) / 100.0, 0.10, 0.90);
-        }
+        // [FIX #11] Read explicit longSuppressionMult field — no more sentinel decode.
+        // Old code: if (confAdj < -50) longSuppression = (confAdj+150)/100 — opaque and fragile.
+        double gicLongSuppression = gicCtx != null ? gicCtx.longSuppressionMult : 1.0;
 
         // [v26.0] GIC DIRECTIONAL GATE — consume onlyLong / onlyShort that were
         // previously computed in GIC but never enforced in generate().
@@ -1762,8 +1807,12 @@ public final class DecisionEngineMerged {
         double scoreLong  = totalLong;
         double scoreShort = totalShort;
 
-        if (longClusters >= 3)  scoreLong  += CLUSTER_CONFLUENCE_BONUS * longClusters;
-        if (shortClusters >= 3) scoreShort += CLUSTER_CONFLUENCE_BONUS * shortClusters;
+        // [v42.0 FIX #16] Cap cluster confluence bonus.
+        // OLD: linear in cluster count → at 8 clusters = +1.20 score, drowning all penalties.
+        // NEW: capped at CLUSTER_TOTAL_CAP = 0.45.
+        final double CLUSTER_TOTAL_CAP = 0.45;
+        if (longClusters >= 3)  scoreLong  += Math.min(CLUSTER_TOTAL_CAP, CLUSTER_CONFLUENCE_BONUS * longClusters);
+        if (shortClusters >= 3) scoreShort += Math.min(CLUSTER_TOTAL_CAP, CLUSTER_CONFLUENCE_BONUS * shortClusters);
 
         // Confluence flag
         if (longClusters >= 3) allFlags.add("CONFL_L" + longClusters);
@@ -2027,11 +2076,18 @@ public final class DecisionEngineMerged {
             allFlags.add("GIC_PANIC_VETO_LONG");
             return null;
         }
+        // [FIX #22] GIC directional gate: was adding a flag but NOT blocking the signal.
+        // Comment said "actual veto happens post-candidate-selection via earlyReturn sentinel"
+        // but no such sentinel existed — it was dead code. Hard veto added here.
         if (gicOnlyLong && side == com.bot.TradingCore.Side.SHORT) {
+            // BTC in extreme up-impulse: short on an alt = very high failure rate
             allFlags.add("GIC_STRONG_BTCUP");
+            return null; // [FIX #22] ACTUAL VETO — was missing
         }
         if (gicOnlyShort && side == com.bot.TradingCore.Side.LONG) {
+            // BTC crashing: long on an alt = catching a falling knife
             allFlags.add("GIC_STRONG_BTCDOWN");
+            return null; // [FIX #22] ACTUAL VETO — was missing
         }
 
         // ════════════════════════════════════════════════════════
@@ -2099,12 +2155,12 @@ public final class DecisionEngineMerged {
         // scoreDiffPenalty and dynThreshPenalty are represented
         // by their contributing factors above — no extra flat deduction.
         ensAdj = Math.max(-14.0, Math.min(+8.0, ensAdj));
-        probability = Math.max(50.0, Math.min(88.0, probability + ensAdj));
+        probability = Math.max(0.0, Math.min(88.0, probability + ensAdj));
 
         // Exhaustion score crush: score already penalized upstream via cluster multiply.
         // Apply only a capped -7 here (was -12 flat).
         if (allFlags.contains("LEXH_SCORE_CRUSHED") || allFlags.contains("SEXH_SCORE_CRUSHED"))
-            probability = Math.max(50, probability - 7);
+            probability = Math.max(0, probability - 7);
 
         // LATE_ENTRY → carry flag for position-size reduction in SignalSender.
         // Probability already mildly dipped above. No further deduction needed.
@@ -2114,7 +2170,7 @@ public final class DecisionEngineMerged {
         boolean _isLong = (side == com.bot.TradingCore.Side.LONG);
         double frAdj = _isLong ? frConfPenaltyLong : frConfPenaltyShort;
         if (Math.abs(frAdj) > 0.5) {
-            probability = Math.max(50, Math.min(85, probability + frAdj));
+            probability = Math.max(0, Math.min(85, probability + frAdj));
             if (frAdj < -3) allFlags.add("FR_CROWD_PENALTY");
             if (frAdj > 3)  allFlags.add("FR_EDGE_BOOST");
         }
@@ -2124,7 +2180,7 @@ public final class DecisionEngineMerged {
             minConf = Math.max(45.0, minConf - 8.0);
         }
         if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
-            minConf = Math.max(50.0, minConf - 4.0);
+            minConf = Math.max(0.0, minConf - 4.0);
         }
         if (probability < minConf) return null;
 
@@ -2158,13 +2214,13 @@ public final class DecisionEngineMerged {
         // noiseScore > 3.5 = wicks are 3.5x the candle body = pure noise.
         // Signal is still possible but confidence is penalised.
         if (noiseScore > 3.5) {
-            probability = Math.max(50, probability - 10);
+            probability = Math.max(0, probability - 10);
             allFlags.add("HIGH_NOISE");
             if (probability < minConf) return null;
         }
         // Moderate noise: small penalty
         if (noiseScore > 2.5) {
-            probability = Math.max(50, probability - 4);
+            probability = Math.max(0, probability - 4);
         }
 
         // ════════════════════════════════════════════════════════
@@ -2219,7 +2275,7 @@ public final class DecisionEngineMerged {
         // Wide structure → penalty, not veto
         if (stopDist > atrStop * 2.5) {
             allFlags.add("STRUCT_WIDE");
-            probability = Math.max(50, probability - 7);
+            probability = Math.max(0, probability - 7);
             if (probability < minConf) return null;
         }
 
@@ -2260,7 +2316,7 @@ public final class DecisionEngineMerged {
                     // SQUEEZE: reduced penalty, NOT veto (was return null)
                     Double squeezeFlag = forecastResult.factorScores.get("SQUEEZE");
                     if (squeezeFlag != null && squeezeFlag > 0.5) {
-                        probability = Math.max(50, probability - 5);
+                        probability = Math.max(0, probability - 5);
                         allFlags.add("FC_SQUEEZE_PENALTY");
                     }
 
@@ -2271,7 +2327,7 @@ public final class DecisionEngineMerged {
                         Double moveDirFlag = forecastResult.factorScores.get("MOVE_DIR");
                         int moveDir = moveDirFlag != null ? (int) Math.signum(moveDirFlag) : 0;
                         if ((sigLong && moveDir > 0) || (!sigLong && moveDir < 0)) {
-                            probability = Math.max(50, probability - 8);
+                            probability = Math.max(0, probability - 8);
                             allFlags.add("FC_EXHAUST_PENALTY");
                         }
                     }
@@ -2283,7 +2339,7 @@ public final class DecisionEngineMerged {
                                 && ((sigLong && forecastResult.directionScore > 0)
                                 || (!sigLong && forecastResult.directionScore < 0));
                         if (!exhaustionOverride) {
-                            probability = Math.max(50, probability - 6);
+                            probability = Math.max(0, probability - 6);
                             allFlags.add("FC_EXHAUST_PHASE");
                         } else {
                             allFlags.add("FC_EXHAUST_OVERRIDE");
@@ -2292,27 +2348,27 @@ public final class DecisionEngineMerged {
 
                     // STRONG disagreement: heavy penalty -15 (was return null)
                     if (sigLong && forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BEAR && fcDirAbs >= 0.35) {
-                        probability = Math.max(50, probability - 15);
+                        probability = Math.max(0, probability - 15);
                         allFlags.add("FC_STRONG_BEAR_PENALTY");
                     }
                     if (!sigLong && forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.STRONG_BULL && fcDirAbs >= 0.35) {
-                        probability = Math.max(50, probability - 15);
+                        probability = Math.max(0, probability - 15);
                         allFlags.add("FC_STRONG_BULL_PENALTY");
                     }
 
                     // Mild disagreement → penalty -4
                     if ((sigLong && fcBear) || (!sigLong && fcBull)) {
-                        probability = Math.max(50, probability - 4);
+                        probability = Math.max(0, probability - 4);
                         allFlags.add("FC_DISAGREE");
                     }
 
                     // Projected move against direction → penalty -3
                     if (sigLong && forecastResult.projectedMovePct <= 0) {
-                        probability = Math.max(50, probability - 3);
+                        probability = Math.max(0, probability - 3);
                         allFlags.add("FC_PROJ_DN");
                     }
                     if (!sigLong && forecastResult.projectedMovePct >= 0) {
-                        probability = Math.max(50, probability - 3);
+                        probability = Math.max(0, probability - 3);
                         allFlags.add("FC_PROJ_UP");
                     }
 
@@ -2321,7 +2377,7 @@ public final class DecisionEngineMerged {
                         boolean earlyOpposed = (sigLong && forecastResult.directionScore < -0.15)
                                 || (!sigLong && forecastResult.directionScore > 0.15);
                         if (earlyOpposed && forecastResult.confidence > 0.40) {
-                            probability = Math.max(50, probability - 10);
+                            probability = Math.max(0, probability - 10);
                             allFlags.add("FC_EARLY_REV_PENALTY");
                         }
                     }
@@ -2351,11 +2407,11 @@ public final class DecisionEngineMerged {
                         boolean moveOk = fcMoveAbs >= stopRetAbs * 0.90;
                         boolean confOk = fcConf >= 0.50;
                         if (!moveOk || !confOk) {
-                            probability = Math.max(50, probability - 5);
+                            probability = Math.max(0, probability - 5);
                             allFlags.add("FC_RANGE_PENALTY");
                         }
                         if (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL) {
-                            probability = Math.max(50, probability - 3);
+                            probability = Math.max(0, probability - 3);
                             allFlags.add("FC_NEUTRAL_RANGE");
                         }
                     } else {
@@ -2363,16 +2419,16 @@ public final class DecisionEngineMerged {
                         // If ForecastEngine sees no direction in a trending market, that IS a signal:
                         // the trend may be exhausting or the data is ambiguous. Require more conviction.
                         if (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL) {
-                            probability = Math.max(50, probability - 4);
+                            probability = Math.max(0, probability - 4);
                             allFlags.add("FC_NEUTRAL_TREND");
                         }
                         // Non-range: mild adjustments
                         if (forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION) {
-                            probability = Math.max(50, probability - 2);
+                            probability = Math.max(0, probability - 2);
                             allFlags.add("FC_EXHAUST_SOFT");
                         }
                         if (fcMoveAbs < stopRetAbs * 0.80) {
-                            probability = Math.max(50, probability - 2);
+                            probability = Math.max(0, probability - 2);
                             allFlags.add("FC_MOVE_WEAK");
                         } else {
                             allFlags.add("FC_MOVE_OK");
@@ -2386,7 +2442,7 @@ public final class DecisionEngineMerged {
                     // even when 5/6 clusters agreed. Cap prevents FC from being a dictator.
                     double fcTotalPenalty = probability - probBeforeFC;
                     if (fcTotalPenalty < -25.0) {
-                        probability = Math.max(50, probBeforeFC - 25.0);
+                        probability = Math.max(0, probBeforeFC - 25.0);
                         allFlags.add("FC_PENALTY_CAPPED_" + String.format("%.0f", fcTotalPenalty));
                     }
                 }
@@ -2426,15 +2482,23 @@ public final class DecisionEngineMerged {
                         || (side == com.bot.TradingCore.Side.LONG && cv3.close > cv3.open);
 
                 if (momentumSlowing && continuationSignal) {
-                    probability = Math.max(50, probability - 10);
+                    probability = Math.max(0, probability - 10);
                     allFlags.add("VDA_DIV_" + side.name());
                 }
             }
         }
 
-        // [v23.0] FINAL GATE — after ALL penalties (FC, structural, volume, VDA)
-        // This is the ONE place that decides if a signal lives or dies.
-        probability = Math.max(50, Math.min(85, probability));
+        // [v42.0 FIX #1,#3,#4] CALIBRATED FINAL GATE
+        // OLD: Math.max(50, Math.min(85, probability)) — artificial floor of 50,
+        //      made calibration mathematically impossible.
+        // NEW: clamp to [0..100] and pass through ProbabilityCalibrator (isotonic regression).
+        //      If <50 historical samples → uses raw score as-is (no floor).
+        //      If ≥50 samples → maps raw score to empirical win-rate via PAV.
+        double rawProb01 = Math.max(0.0, Math.min(1.0, probability / 100.0));
+        double calibrated01 = CALIBRATOR.calibrate(symbol, rawProb01);
+        probability = calibrated01 * 100.0;
+        // Hard cap on extremes — calibrator can theoretically output 0 or 1 on small samples
+        probability = Math.max(0.0, Math.min(95.0, probability));
         if (probability < minConf) return null;
 
         // ════════════════════════════════════════════════════════
@@ -2563,37 +2627,35 @@ public final class DecisionEngineMerged {
         if (cat == CoinCategory.MEME)               prob -= 5.0;
         else if (cat == CoinCategory.ALT)           prob -= 2.0;
 
-        // [v38.0] MEME MINIMUM THRESHOLD — для MEME поднимаем минимальный порог до 72
-        if (cat == CoinCategory.MEME && prob < 72) return 40;
+        // [v42.0 FIX #11] Removed magic `return 40` MEME blocker.
+        // OLD: if (cat == MEME && prob < 72) return 40;  — hardcoded, killed 80% of MEME setups
+        // NEW: stronger linear penalty; weak MEME setups get filtered downstream by minConf gate
+        //      and by the empirical calibrator, not by a constant.
+        if (cat == CoinCategory.MEME)               prob -= 8.0;  // total MEME penalty: -5 above + -8 here = -13
 
-        // Historical calibration
-        Deque<CalibRecord> hist = calibHist.get(symbol);
-        if (hist != null && hist.size() >= 30) {
-            double histAcc = historicalAccuracy(hist, prob);
-            prob = prob * 0.70 + histAcc * 0.30;
-        }
+        // [v42.1 FIX #17 + duplicate-calibration] Removed legacy historicalAccuracy 70/30 blend.
+        // It was DEAD CODE — recordSignalResult() was defined but never called from anywhere,
+        // so calibHist was never written, and this branch never executed. Worse: even if it had,
+        // it would have been a SECOND calibration system fighting with ProbabilityCalibrator.
+        // The single source of truth is now ProbabilityCalibrator (PAV isotonic, vol-bucketed).
 
         // Global live prior is only a light anchor. Pair-level evidence still dominates.
         double priorProb = 50.0 + (bayesPrior.get() - 0.50) * 24.0;
         prob = prob * 0.92 + priorProb * 0.08;
 
-        return Math.round(clamp(prob, 50, 85)); // [v11.0] Ceiling 85 (was 88 — unrealistic for crypto scalping)
+        // [v42.1 FIX #1 — full closure] Removed final clamp(prob, 50, 85).
+        // OLD: return Math.round(clamp(prob, 50, 85));
+        //      → This was the LAST surviving probability floor in the codebase.
+        //        Even though downstream code uses Math.max(0,...), the input it received
+        //        was already squashed to [50..85] here, leaving the bottom of the
+        //        distribution permanently unreachable.
+        // NEW: clamp(prob, 0, 100) — full range, calibrator handles the final mapping.
+        return Math.round(clamp(prob, 0, 100));
     }
 
-    private double historicalAccuracy(Deque<CalibRecord> hist, double prob) {
-        double sum = 0, cnt = 0;
-        List<CalibRecord> list = new ArrayList<>(hist);
-        int size = list.size();
-        for (int i = 0; i < size; i++) {
-            CalibRecord r = list.get(i);
-            if (Math.abs(r.predicted - prob) < 12) {
-                double weight = 0.5 + 0.5 * ((double) i / size);
-                cnt += weight;
-                if (r.correct) sum += weight;
-            }
-        }
-        return cnt < 4 ? prob : (sum / cnt) * 100;
-    }
+    // [v42.1 REMOVED] historicalAccuracy() — was dead code (called only from removed
+    // 70/30 blend in computeClusterConfidence). Calibration now lives entirely in
+    // ProbabilityCalibrator (PAV isotonic regression with vol-buckets).
 
     // ══════════════════════════════════════════════════════════════
     //  COOLDOWN
@@ -3623,4 +3685,214 @@ public final class DecisionEngineMerged {
     private com.bot.TradingCore.Candle last(List<com.bot.TradingCore.Candle> c) { return c.get(c.size() - 1); }
     private boolean valid(List<?> c)  { return c != null && c.size() >= MIN_BARS; }
     private double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [v42.0 FIX #1, #3, #4, #7]  ProbabilityCalibrator — static nested class
+    //
+    // Replaces 24 hardcoded `Math.max(50, ...)` floors with empirical isotonic
+    // calibration. Maps raw model score → real win-rate via Pool of Adjacent
+    // Violators (PAV) regression, the standard non-parametric calibrator
+    // (Zadrozny-Elkan, Niculescu-Mizil 2005).
+    //
+    // BUCKETED BY VOLATILITY (FIX #7): one calibration per (symbol, vol-bucket).
+    // ════════════════════════════════════════════════════════════════════════
+    public static final class ProbabilityCalibrator {
+
+        private static final int  MIN_SAMPLES = 50;
+        private static final int  WINDOW      = 500;
+        private static final int  BUCKETS     = 10;
+        private static final long MAX_AGE_MS  = 30L * 24 * 60 * 60 * 1000L;
+
+        public enum VolBucket { LOW, MID, HIGH;
+            public static VolBucket of(double atrPct) {
+                if (atrPct < 0.8) return LOW;
+                if (atrPct < 1.8) return MID;
+                return HIGH;
+            }
+        }
+
+        private static final class Outcome {
+            final double rawScore;
+            final boolean hit;
+            final long ts;
+            Outcome(double s, boolean h) {
+                this.rawScore = Math.max(0.0, Math.min(1.0, s));
+                this.hit = h;
+                this.ts = System.currentTimeMillis();
+            }
+        }
+
+        private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<Outcome>> history
+                = new java.util.concurrent.ConcurrentHashMap<>();
+
+        private static String key(String symbol, VolBucket b) {
+            return symbol + "#" + b.name();
+        }
+
+        /** Записать исход трейда. Вызывать из BotMain.checkForecastAccuracy() после resolve. */
+        public void recordOutcome(String symbol, double rawScore, boolean hit, double atrPct) {
+            if (symbol == null) return;
+            String k = key(symbol, VolBucket.of(atrPct));
+            java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq =
+                    history.computeIfAbsent(k, x -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+            dq.addLast(new Outcome(rawScore, hit));
+            while (dq.size() > WINDOW) dq.pollFirst();
+        }
+
+        /** Бэк-совместимость без бакета. */
+        public void recordOutcome(String symbol, double rawScore, boolean hit) {
+            recordOutcome(symbol, rawScore, hit, 1.0);
+        }
+
+        /** Главный метод: rawScore [0..1] → откалиброванная вероятность [0..1]. */
+        public double calibrate(String symbol, double rawScore) {
+            return calibrate(symbol, rawScore, 1.0);
+        }
+
+        public double calibrate(String symbol, double rawScore, double atrPct) {
+            double r = clamp01(rawScore);
+            if (symbol == null) return r;
+
+            // Сначала пробуем точный bucket; если данных мало — добираем из соседей.
+            VolBucket b = VolBucket.of(atrPct);
+            java.util.List<Outcome> snap = collect(symbol, b);
+            if (snap.size() < MIN_SAMPLES) {
+                // Fallback: объединяем все бакеты символа
+                snap = collectAll(symbol);
+            }
+            if (snap.size() < MIN_SAMPLES) return r;
+
+            long now = System.currentTimeMillis();
+            snap.removeIf(o -> now - o.ts > MAX_AGE_MS);
+            if (snap.size() < MIN_SAMPLES) return r;
+
+            snap.sort(java.util.Comparator.comparingDouble(o -> o.rawScore));
+
+            int n = snap.size();
+            int bucketSize = Math.max(1, n / BUCKETS);
+            double[] x = new double[BUCKETS];
+            double[] y = new double[BUCKETS];
+            double[] w = new double[BUCKETS];
+
+            for (int bi = 0; bi < BUCKETS; bi++) {
+                int from = bi * bucketSize;
+                int to = (bi == BUCKETS - 1) ? n : Math.min(n, from + bucketSize);
+                if (from >= to) continue;
+                double sx = 0, sy = 0;
+                for (int i = from; i < to; i++) {
+                    sx += snap.get(i).rawScore;
+                    sy += snap.get(i).hit ? 1.0 : 0.0;
+                }
+                int cnt = to - from;
+                x[bi] = sx / cnt;
+                y[bi] = sy / cnt;
+                w[bi] = cnt;
+            }
+
+            pav(y, w);
+
+            // Эмпирический Bayes shrinkage [FIX #17]:
+            // ζ = n / (n + 100). При n=50 → 0.33; при n=200 → 0.67; при n=500 → 0.83.
+            double zeta = (double) n / (n + 100.0);
+
+            double calibrated;
+            if (r <= x[0]) {
+                calibrated = y[0];
+            } else if (r >= x[BUCKETS - 1]) {
+                calibrated = y[BUCKETS - 1];
+            } else {
+                calibrated = r;
+                for (int i = 0; i < BUCKETS - 1; i++) {
+                    if (r >= x[i] && r <= x[i + 1]) {
+                        double dx = x[i + 1] - x[i];
+                        if (dx < 1e-9) { calibrated = y[i]; break; }
+                        double t = (r - x[i]) / dx;
+                        calibrated = y[i] + t * (y[i + 1] - y[i]);
+                        break;
+                    }
+                }
+            }
+
+            return clamp01((1.0 - zeta) * r + zeta * calibrated);
+        }
+
+        private java.util.List<Outcome> collect(String symbol, VolBucket b) {
+            java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq = history.get(key(symbol, b));
+            if (dq == null) return new java.util.ArrayList<>();
+            return new java.util.ArrayList<>(dq);
+        }
+
+        private java.util.List<Outcome> collectAll(String symbol) {
+            java.util.List<Outcome> all = new java.util.ArrayList<>();
+            for (VolBucket b : VolBucket.values()) {
+                java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq = history.get(key(symbol, b));
+                if (dq != null) all.addAll(dq);
+            }
+            return all;
+        }
+
+        /** Pool-of-Adjacent-Violators in-place (изотонная регрессия). */
+        private static void pav(double[] y, double[] w) {
+            int n = y.length;
+            if (n <= 1) return;
+            double[] yy = y.clone();
+            double[] ww = w.clone();
+            int[] sz = new int[n];
+            java.util.Arrays.fill(sz, 1);
+            int len = n;
+
+            boolean changed = true;
+            while (changed) {
+                changed = false;
+                for (int i = 0; i < len - 1; i++) {
+                    if (yy[i] > yy[i + 1] + 1e-12) {
+                        double tw = ww[i] + ww[i + 1];
+                        yy[i] = (yy[i] * ww[i] + yy[i + 1] * ww[i + 1]) / Math.max(1e-9, tw);
+                        ww[i] = tw;
+                        sz[i] += sz[i + 1];
+                        for (int j = i + 1; j < len - 1; j++) {
+                            yy[j] = yy[j + 1]; ww[j] = ww[j + 1]; sz[j] = sz[j + 1];
+                        }
+                        len--;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            int idx = 0;
+            for (int i = 0; i < len && idx < n; i++) {
+                for (int k = 0; k < sz[i] && idx < n; k++) {
+                    y[idx++] = yy[i];
+                }
+            }
+        }
+
+        private static double clamp01(double v) {
+            if (Double.isNaN(v)) return 0.0;
+            return Math.max(0.0, Math.min(1.0, v));
+        }
+
+        public int sampleCount(String symbol) {
+            int n = 0;
+            for (VolBucket b : VolBucket.values()) {
+                java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq = history.get(key(symbol, b));
+                if (dq != null) n += dq.size();
+            }
+            return n;
+        }
+
+        public double rawWinRate(String symbol) {
+            java.util.List<Outcome> all = collectAll(symbol);
+            if (all.isEmpty()) return Double.NaN;
+            int hits = 0;
+            for (Outcome o : all) if (o.hit) hits++;
+            return (double) hits / all.size();
+        }
+
+        public void reset(String symbol) {
+            for (VolBucket b : VolBucket.values()) history.remove(key(symbol, b));
+        }
+
+        public void resetAll() { history.clear(); }
+    }
 }

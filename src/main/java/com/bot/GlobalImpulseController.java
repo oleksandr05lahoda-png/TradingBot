@@ -7,7 +7,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       GlobalImpulseController — GODBOT PRO EDITION v7.0                ║
+ * ║       GlobalImpulseController — TRADINGBOT PRO EDITION v7.0                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║                                                                          ║
  * ║  КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.0:                                           ║
@@ -162,11 +162,17 @@ public final class GlobalImpulseController {
         public final int              btcConsecutiveBearBars;
 
         // v6.0 NEW fields
-        public final double           btcMomentumAccel;   // > 0 = падение ускоряется
+        public final double           btcMomentumAccel;   // signed: >0 = accelerating in current direction
         public final double           btcCrashScore;      // [0..1] агрегированный краш риск
         public final CascadeLevel     cascadeLevel;       // текущий уровень каскада
         public final boolean          panicMode;          // true = паника активна
         public final double           shortBoost;         // бустер для SHORT сигналов при краше
+
+        // [FIX #11] Explicit field — was encoded as sentinel in confidenceAdjustment < -50.
+        // Sentinel encoding is fragile: any future adjustment that legitimately uses negative confAdj
+        // (e.g., -20 = "reduce conf by 20") will be misinterpreted as longSuppression.
+        // Direct field is unambiguous: 1.0 = no suppression, 0.30 = crush LONG score to 30%.
+        public final double           longSuppressionMult; // [0.10..1.0], 1.0 = no effect
 
         public GlobalContext(GlobalRegime regime, double impulseStrength,
                              double volatilityExpansion, boolean strongPressure,
@@ -176,6 +182,21 @@ public final class GlobalImpulseController {
                              double btcMomentumAccel, double btcCrashScore,
                              CascadeLevel cascadeLevel, boolean panicMode,
                              double shortBoost) {
+            this(regime, impulseStrength, volatilityExpansion, strongPressure,
+                    onlyLong, onlyShort, btcTrend, volRegime, confidenceAdjustment,
+                    btcDropVelocity, btcConsecutiveBearBars, btcMomentumAccel, btcCrashScore,
+                    cascadeLevel, panicMode, shortBoost, 1.0);
+        }
+
+        /** Full constructor with explicit longSuppressionMult [FIX #11] */
+        public GlobalContext(GlobalRegime regime, double impulseStrength,
+                             double volatilityExpansion, boolean strongPressure,
+                             boolean onlyLong, boolean onlyShort, double btcTrend,
+                             VolatilityRegime volRegime, double confidenceAdjustment,
+                             double btcDropVelocity, int btcConsecutiveBearBars,
+                             double btcMomentumAccel, double btcCrashScore,
+                             CascadeLevel cascadeLevel, boolean panicMode,
+                             double shortBoost, double longSuppressionMult) {
             this.regime               = regime;
             this.impulseStrength      = impulseStrength;
             this.volatilityExpansion  = volatilityExpansion;
@@ -192,6 +213,7 @@ public final class GlobalImpulseController {
             this.cascadeLevel         = cascadeLevel;
             this.panicMode            = panicMode;
             this.shortBoost           = shortBoost;
+            this.longSuppressionMult  = Math.max(0.10, Math.min(1.0, longSuppressionMult));
         }
 
         /** Обратная совместимость */
@@ -203,7 +225,7 @@ public final class GlobalImpulseController {
             this(regime, impulseStrength, volatilityExpansion, strongPressure,
                     onlyLong, onlyShort, btcTrend, volRegime, confidenceAdjustment,
                     btcDropVelocity, btcConsecutiveBearBars,
-                    0.0, 0.0, CascadeLevel.NONE, false, 1.0);
+                    0.0, 0.0, CascadeLevel.NONE, false, 1.0, 1.0);
         }
 
         /** Минимальный конструктор */
@@ -338,12 +360,24 @@ public final class GlobalImpulseController {
                 : move3;
 
         // ── Momentum acceleration (вторая производная) ──────────
-        // > 0 при падении = падение ускоряется (ОПАСНО для лонгов)
-        btcMomentumAccel = move3 < 0
-                ? Math.max(0, Math.abs(move3) - Math.abs(prevMove3))
-                : move3 > 0
-                  ? Math.max(0, Math.abs(move3) - Math.abs(prevMove3))
-                  : 0;
+        // [FIX #10] Was always Math.max(0, ...) for BOTH up and down moves — lost sign.
+        // This meant a rising BTC and a crashing BTC both produced positive accel values,
+        // making it impossible to distinguish bull momentum from bear momentum.
+        //
+        // NEW: signed acceleration.
+        //   Positive = move is getting BIGGER in its current direction (trend strengthening)
+        //   Negative = move is getting SMALLER (trend decelerating / reversing)
+        //   Used by DecisionEngine: falling AND accelerating = crash flag, rising AND accelerating = bull boost
+        double rawAccel = Math.abs(move3) - Math.abs(prevMove3);
+        if (move3 < 0) {
+            // Falling: positive rawAccel means fall is accelerating = DANGER for longs
+            btcMomentumAccel = rawAccel; // positive = accelerating down, negative = decelerating
+        } else if (move3 > 0) {
+            // Rising: positive rawAccel means rally is accelerating = BULLISH
+            btcMomentumAccel = rawAccel; // positive = accelerating up, negative = decelerating
+        } else {
+            btcMomentumAccel = 0;
+        }
 
         // ── BTC move history ─────────────────────────────────────
         btcMoveHistory.addLast(move1);
@@ -371,8 +405,23 @@ public final class GlobalImpulseController {
         double crashScore = computeCrashScore(move3, move5, atr14, price);
         crashScoreHistory.addLast(crashScore);
         if (crashScoreHistory.size() > CRASH_SCORE_WINDOW) crashScoreHistory.removeFirst();
-        // Берём максимум из последних N значений (sticky — краш не исчезает мгновенно)
-        double stickycrashScore = crashScoreHistory.stream().mapToDouble(Double::doubleValue).max().orElse(0);
+        // [FIX #12] stickycrashScore: was MAX over CRASH_SCORE_WINDOW=5 bars.
+        // One anomalous spike (API error, flash wick) triggered crash mode for 5×15m = 75 min.
+        // NEW: exponential weighted average — recent bars have more weight, but a single spike
+        // cannot dominate. Sticky effect preserved: decay is slow (0.7 per bar = ~45min half-life).
+        double stickycrashScore;
+        if (crashScoreHistory.isEmpty()) {
+            stickycrashScore = 0;
+        } else {
+            List<Double> snapList = new ArrayList<>(crashScoreHistory);
+            double weighted = 0, wSum = 0, w = 1.0;
+            for (int idx = snapList.size() - 1; idx >= 0; idx--) {
+                weighted += snapList.get(idx) * w;
+                wSum += w;
+                w *= 0.70; // each older bar counts 30% less
+            }
+            stickycrashScore = wSum > 0 ? weighted / wSum : 0;
+        }
         btcCrashScore = stickycrashScore;
 
         // ── Cascade Level ─────────────────────────────────────────
@@ -511,18 +560,8 @@ public final class GlobalImpulseController {
         // ── SHORT Boost — усиление шортов при краше ──────────────
         double shortBoost = computeShortBoost(cascadeLevel, btcCrashScore, btcDropVelocity, btcMomentumAccel);
 
-        // [FIX v32+] Store longSuppressionMult in confAdj as negative sentinel.
-        // DecisionEngine reads confidenceAdjustment — negative values < -1.0 signal
-        // gradient suppression rather than a flat confidence delta.
-        // Convention: confAdj < -10 → longSuppressionMult = (confAdj + 100) / 100
-        // Example: longSuppressionMult=0.30 → confAdj = -70.0
-        // This avoids adding a new field to GlobalContext for backward compatibility.
-        double finalConfAdj = confAdj;
-        if (longSuppressionMult < 1.0) {
-            finalConfAdj = -(100.0 - longSuppressionMult * 100.0) - 50.0;
-            // range: mult=0.30 → -120, mult=0.55 → -95, mult=0.75 → -75
-            // DecisionEngine checks: if (confAdj < -50) longSuppressionMult = (confAdj+150)/100
-        }
+        // [FIX #11] longSuppressionMult now passed directly as explicit field.
+        // Removed sentinel encoding (confAdj < -50) which was fragile and opaque.
 
         // ── Обновляем multi-window BTC return history ─────────────
         btcReturnHistory5.addLast(move1);
@@ -535,11 +574,11 @@ public final class GlobalImpulseController {
         currentContext = new GlobalContext(
                 regime, rawStrength, volExpansion, strongPressure,
                 onlyLong, onlyShort, clamp(btcTrend, -1, 1),
-                volRegime, finalConfAdj,
+                volRegime, confAdj,
                 btcDropVelocity, btcConsecutiveBearBars,
                 btcMomentumAccel, btcCrashScore,
                 cascadeLevel, panicMode.get(),
-                shortBoost
+                shortBoost, longSuppressionMult  // [FIX #11] explicit field, no more sentinel
         );
     }
 

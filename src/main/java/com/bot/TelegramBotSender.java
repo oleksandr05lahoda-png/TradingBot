@@ -51,18 +51,16 @@ public final class TelegramBotSender {
     public void sendMessageAsync(String message) {
         if (!running.get()) return;
 
-        // [v32] Priority Queueing
-        boolean isHighPriority = message.contains("UDS CLOSED") || message.contains("TP")
-                || message.contains("SL") || message.contains("🚨");
-
-        boolean added = isHighPriority ? queue.offerFirst(message) : queue.offerLast(message);
+        // [v32] Priority Queueing — [FIX #20] reuse isHighPriority helper
+        boolean isHighPri = isHighPriority(message);
+        boolean added = isHighPri ? queue.offerFirst(message) : queue.offerLast(message);
 
         if (!added) {
             // Queue full. Drop the newest low-priority message (at the tail) to make room.
             String dropped = queue.pollLast();
             log("[WARN] Очередь переполнена. Удалили сообщение. msgLen="
                     + (dropped != null ? dropped.length() : -1));
-            if (isHighPriority) queue.offerFirst(message);
+            if (isHighPri) queue.offerFirst(message);
             else queue.offerLast(message);
         }
     }
@@ -95,9 +93,22 @@ public final class TelegramBotSender {
                 if (msg != null) {
                     List<String> parts = splitForTelegram(msg);
                     for (int i = 0; i < parts.size(); i++) {
-                        // Keep original text; just chunk it to fit Telegram limits.
                         sendWithRetry(parts.get(i));
                         Thread.sleep(RATE_LIMIT_MS);
+                        // [FIX #20] After each part of a multipart message, check if a
+                        // high-priority message arrived (SL/TP/PANIC). If so, pause the
+                        // current multipart send and deliver the urgent message first.
+                        // High-priority items sit at the HEAD of the deque (offerFirst).
+                        if (i < parts.size() - 1) { // don't peek after the last part
+                            String head = queue.peek();
+                            if (head != null && isHighPriority(head)) {
+                                String urgent = queue.pollFirst();
+                                if (urgent != null) {
+                                    sendWithRetry(urgent);
+                                    Thread.sleep(RATE_LIMIT_MS);
+                                }
+                            }
+                        }
                     }
                 }
             } catch (Throwable t) {
@@ -105,6 +116,11 @@ public final class TelegramBotSender {
                 t.printStackTrace();
             }
         }, 0, 500, TimeUnit.MILLISECONDS);
+    }
+
+    private static boolean isHighPriority(String message) {
+        return message.contains("UDS CLOSED") || message.contains("TP")
+                || message.contains("SL") || message.contains("🚨");
     }
 
     /** Отправка сообщения с повтором в случае ошибок */

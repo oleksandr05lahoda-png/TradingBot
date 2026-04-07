@@ -5,7 +5,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════╗
- * ║        SignalOptimizer — GODBOT EDITION v5.0                        ║
+ * ║        SignalOptimizer — TRADINGBOT EDITION v5.0                        ║
  * ╠══════════════════════════════════════════════════════════════════════╣
  * ║  ИСПРАВЛЕНИЯ v5.0:                                                   ║
  * ║                                                                      ║
@@ -149,6 +149,27 @@ public final class SignalOptimizer {
             double medianAtr = sorted.get(sorted.size() / 2);
             // Кап = 4× медианный ATR (было захардкоджено 1% = 1× ATR для большинства монет)
             return Math.max(IMPULSE_CAP_MIN, Math.min(IMPULSE_CAP_PUMP, medianAtr * 4.0));
+        }
+
+        // [FIX #17] Cold-start: no ATR history yet for this symbol.
+        // IMPULSE_CAP_BASE = 0.040 (4%) which could be too large for a low-vol coin
+        // or too small for a volatile one on first-ever detection.
+        // Use the tick price deque range as a temporary proxy if available.
+        Deque<Double> ticks = tickPriceDeque.get(symbol);
+        if (ticks != null && ticks.size() >= 10) {
+            // Quick range estimate from recent ticks as cold-start ATR proxy
+            Object[] snap = ticks.toArray();
+            double minP = Double.MAX_VALUE, maxP = Double.NEGATIVE_INFINITY;
+            for (Object o : snap) {
+                double p = (Double) o;
+                minP = Math.min(minP, p);
+                maxP = Math.max(maxP, p);
+            }
+            double lastP = (Double) snap[snap.length - 1];
+            if (lastP > 0 && maxP > minP) {
+                double rangePct = (maxP - minP) / lastP;
+                return Math.max(IMPULSE_CAP_MIN, Math.min(IMPULSE_CAP_PUMP, rangePct * 3.0));
+            }
         }
 
         return IMPULSE_CAP_BASE;

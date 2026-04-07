@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  SignalSender — GODBOT PRO EDITION v37.0                                ║
+ * ║  SignalSender — TRADINGBOT PRO EDITION v37.0                                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  [v37.0] SMALL-BALANCE FIX + SIGNAL QUALITY GATES:                     ║
  * ║    · Balance floor removed: was Math.max(balance, 100.0) → now actual   ║
