@@ -6,15 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TelegramBotSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TelegramBotSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -689,7 +680,7 @@
       <workItem from="1775523414943" duration="5000" />
       <workItem from="1775523428145" duration="6000" />
       <workItem from="1775523443672" duration="9000" />
-      <workItem from="1775523472009" duration="2841000" />
+      <workItem from="1775523472009" duration="3547000" />
     </task>
     <servers />
   </component>

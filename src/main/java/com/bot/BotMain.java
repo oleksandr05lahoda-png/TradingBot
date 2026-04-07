@@ -43,9 +43,7 @@ public final class BotMain {
 
     // ── Конфигурация из env ───────────────────────────────────────────────
     private static final String TG_TOKEN  = requireEnv("TELEGRAM_TOKEN");
-    // [v42.0 FIX #15] No more hardcoded CHAT_ID. Old default "953233853" was a real
-    // user ID leaked into source. Now fails fast at startup if env var is missing.
-    private static final String CHAT_ID   = requireEnv("CHAT_ID");
+    private static final String CHAT_ID   = requireEnv("953233853");
 
     private static String requireEnv(String name) {
         String v = System.getenv(name);
