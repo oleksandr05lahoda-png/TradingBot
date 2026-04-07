@@ -43,7 +43,7 @@ public final class BotMain {
 
     // ── Конфигурация из env ───────────────────────────────────────────────
     private static final String TG_TOKEN  = requireEnv("TELEGRAM_TOKEN");
-    private static final String CHAT_ID   = requireEnv("953233853");
+    private static final String CHAT_ID   = requireEnv("CHAT_ID");
 
     private static String requireEnv(String name) {
         String v = System.getenv(name);
