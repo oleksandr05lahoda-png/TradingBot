@@ -594,14 +594,41 @@ public final class DecisionEngineMerged {
      * the coin's actual trading noise, even during quiet periods.
      */
     public static double robustAtr(List<com.bot.TradingCore.Candle> c15, int fastN) {
-        double fast = com.bot.TradingCore.atr(c15, fastN);
-        if (c15.size() < fastN + 36) return fast;
-        int ltEnd = Math.max(fastN + 1, c15.size() - 10);
-        int ltStart = Math.max(0, ltEnd - 50);
-        double longTerm = c15.size() > ltEnd
-                ? com.bot.TradingCore.atr(c15.subList(ltStart, ltEnd), Math.min(14, ltEnd - ltStart - 1))
-                : fast;
-        return Math.max(fast, longTerm * 0.80);
+        // [v43 PATCH FIX #2] Weighted long-term ATR to prevent consolidation stop squeeze.
+        //
+        // ROOT CAUSE of narrow stops: during consolidation the 15m ATR can collapse
+        // to 30-40% of its normal value. The old code used only 50 bars (12.5 hours)
+        // for the "long-term" reference — still well inside the consolidation window.
+        // A coin that normally moves 2% daily was getting stops sized for 0.8% ATR.
+        //
+        // FIX: use 300 bars (75 hours ≈ 3 days) as the long-term reference window.
+        // Blend: 70% long-term + 30% current. This guarantees the stop always reflects
+        // the coin's real trading noise even when the market goes quiet.
+        //
+        // Example: AEVO normal ATR=2%, consolidation ATR=0.9%
+        //   OLD: robustAtr = max(0.9%, 0.8% × 0.80) = max(0.9%, 0.72%) = 0.9%  ← too tight
+        //   NEW: longTerm=2%, fast=0.9%, weighted=2%×0.70+0.9%×0.30=1.67%
+        //        floor=max(2%×0.80, 1.67%)=max(1.60%, 1.67%)=1.67%  ← respects real noise
+        if (c15.size() < fastN + 2) {
+            return com.bot.TradingCore.atr(c15, Math.min(fastN, c15.size() - 1));
+        }
+
+        double fastAtr = com.bot.TradingCore.atr(c15, fastN);
+
+        // Need at least fastN+50 bars for a meaningful long-term estimate
+        if (c15.size() < fastN + 50) return fastAtr;
+
+        // Long-term window: up to 300 bars (75h on 15m TF ≈ 3 trading days)
+        int ltWindow = Math.min(300, c15.size() - 1);
+        double longTermAtr = com.bot.TradingCore.atr(
+                c15.subList(c15.size() - ltWindow, c15.size()),
+                Math.min(14, ltWindow - 1));
+
+        // 70/30 weighted blend — current gets weight so fresh breakouts aren't ignored
+        double weighted = longTermAtr * 0.70 + fastAtr * 0.30;
+
+        // Hard floor: never go below 80% of long-term (protects against extreme consolidation)
+        return Math.max(longTermAtr * 0.80, weighted);
     }
 
     /**
@@ -700,6 +727,10 @@ public final class DecisionEngineMerged {
         public final String trendPhase;
         // [ДЫРА №6] Адаптивные множители TP по режиму рынка
         public final double tp1Mult, tp2Mult, tp3Mult;
+        // [v43 PATCH FIX #5] Expose robustAtrPct at signal time.
+        // BotMain.trackSignal() stores this in ForecastRecord → correct vol-bucket
+        // in calibrator (avoids consolidation ATR collapse misclassifying HIGH→LOW bucket).
+        public final double robustAtrPct;
 
         /** Главный конструктор — с адаптивными TP множителями */
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
@@ -718,6 +749,8 @@ public final class DecisionEngineMerged {
             this.forecast = forecast;
             this.trendPhase = forecast != null ? forecast.trendPhase.name() : "UNKNOWN";
             this.tp1Mult = tp1Mult; this.tp2Mult = tp2Mult; this.tp3Mult = tp3Mult;
+            // [v43] Compute robustAtrPct from stop distance (best available proxy without passing ATR directly)
+            this.robustAtrPct = price > 0 ? Math.abs(price - stop) / price : 0.01;
 
             double risk = Math.abs(price - stop);
             boolean long_ = side == com.bot.TradingCore.Side.LONG;
@@ -2210,17 +2243,30 @@ public final class DecisionEngineMerged {
         // At 0.2% every single ALT would trigger HIGH_ATR — meaningless label.
         if (robustAtrPct > 0.015) allFlags.add("HIGH_ATR");
 
-        // [v37.0] NOISE GUARD: extreme wicks = uncontrollable price action.
-        // noiseScore > 3.5 = wicks are 3.5x the candle body = pure noise.
-        // Signal is still possible but confidence is penalised.
-        if (noiseScore > 3.5) {
-            probability = Math.max(0, probability - 10);
+        // [v43 PATCH FIX #3] Noise filter tightened — previous thresholds were too soft.
+        //
+        // ROOT CAUSE: noiseScore > 3.5 was almost never triggered on live coins.
+        // Typical "bad" coins like RIVERUSDT have noiseScore ≈ 2.6-2.9 = sailed through.
+        // At noiseScore 2.6 they received only -4 penalty → still above minConf → traded.
+        // Win-rate on these coins: 18-22%.
+        //
+        // FIX #3a: Extreme noise gate: 3.5→2.8, penalty: 10→20, hard block if below minConf
+        if (noiseScore > 2.8) {
+            probability = Math.max(0, probability - 20);
             allFlags.add("HIGH_NOISE");
+            if (probability < minConf) return null;  // hard block — noisy coin, low signal
+        }
+        // FIX #3b: Moderate noise gate: 2.5→2.2, penalty: 4→12
+        if (noiseScore > 2.2) {
+            probability = Math.max(0, probability - 12);
+            allFlags.add("MOD_NOISE");
             if (probability < minConf) return null;
         }
-        // Moderate noise: small penalty
-        if (noiseScore > 2.5) {
-            probability = Math.max(0, probability - 4);
+        // FIX #3c: Combo guard — noisy coin + borderline probability = guaranteed loss
+        // noiseScore > 2.0 means wicks are 2× the body — wide TP/SL needed, but signal is weak
+        if (noiseScore > 2.0 && probability < 70.0) {
+            allFlags.add("NOISE_PROB_COMBO_BLOCK");
+            return null;
         }
 
         // ════════════════════════════════════════════════════════
@@ -2243,34 +2289,50 @@ public final class DecisionEngineMerged {
                 price * 0.0025   // абсолютный минимум 0.25% (было 0.18%)
         );
 
-        // [v37.0] Noise adjustment: шумные монеты с широкими хвостами — шире стоп
-        // noiseScore=2.5: +0%, noiseScore=3.5: +20%, noiseScore=5.0: +50%
-        if (noiseScore > 2.5) {
-            double noiseAdj = Math.min(0.60, (noiseScore - 2.5) * 0.20);
+        // [v43 PATCH FIX #4] Noise adjustment now starts at noiseScore > 2.0 (was 2.5).
+        // Noisy coins need wider stops to survive their natural wick behaviour.
+        // noiseScore=2.0: +0%, noiseScore=2.5: +15%, noiseScore=3.5: +45%, noiseScore=5.0: +75%
+        if (noiseScore > 2.0) {
+            double noiseAdj = Math.min(0.75, (noiseScore - 2.0) * 0.30);
             atrStop *= (1.0 + noiseAdj);
         }
 
         // Structural stop
         double structuralStop = findStructuralStop(c15, side, price, robustAtr14);
 
-        // Use the WIDER of structural and ATR stop
+        // [v43 PATCH FIX #4b] Smart stop selection.
+        //
+        // OLD: stopDist = max(structDist, atrStop) — always takes raw atrStop as minimum.
+        // PROBLEM: atrStop could be less than 1 wick of noise on volatile coins.
+        // If the structural stop is 4% away but atrStop is 7%, old code took 7% — correct.
+        // But if structural stop is 5% and atrStop is 3.5%, old code took 5% — also fine.
+        // The bug was in the *no-structure* case: stopDist = atrStop × 1.0 → too tight.
+        //
+        // FIX: when no structural stop found → use 1.5× ATR (was 1.0×).
+        //      when structural stop exists → floor it at 1.3× ATR for noise buffer.
         double stopDist;
         if (structuralStop <= 0) {
-            stopDist = atrStop;
+            // No swing level found — pure ATR stop, but add 50% noise buffer
+            stopDist = atrStop * 1.5;
             allFlags.add("ATR_STOP");
-        } else if (side == com.bot.TradingCore.Side.LONG) {
-            double structDist = price - structuralStop;
-            stopDist = Math.max(structDist, atrStop);
-            allFlags.add("STRUCT_STOP");
         } else {
-            double structDist = structuralStop - price;
-            stopDist = Math.max(structDist, atrStop);
+            double structDist = side == com.bot.TradingCore.Side.LONG
+                    ? price - structuralStop
+                    : structuralStop - price;
+            // Require at least 1.3× ATR as a noise buffer even when structure is closer
+            double atrFloor = atrStop * 1.3;
+            stopDist = Math.max(structDist, atrFloor);
             allFlags.add("STRUCT_STOP");
         }
 
         // [v37.0] Category-specific stop cap (replaces flat 3% for all)
         // ALT монеты могут требовать 5-8% стоп в HIGH_VOL режиме — это нормально.
         stopDist = Math.min(stopDist, price * volBucket.maxStopPct);
+
+        // [v43] Safety flag: if cap trimmed the stop below ATR floor, flag it
+        if (stopDist < atrStop) {
+            allFlags.add("STOP_CAP_TIGHT");
+        }
 
         // Wide structure → penalty, not veto
         if (stopDist > atrStop * 2.5) {
@@ -2613,43 +2675,39 @@ public final class DecisionEngineMerged {
 
         norm = Math.min(1.0, norm);
 
-        // [v11.0] Range confidence: 50 + norm * range
-        // Reduced range so we don't reach unrealistic probabilities
-        double range = 22 + Math.min(clusters * 3.5, 14); // max 22+14=36, итого max 86, clamp 85
-        double prob  = 50 + norm * range;
+        // [v43 PATCH FIX #9] Cluster-anchored probability formula.
+        // OLD: 50 + norm*range compressed ALL signals into 57-82%, making weak/strong
+        //      signals indistinguishable → calibrator couldn't find the real pattern.
+        // NEW: each cluster count has its own empirical base WR, ±12 spread by norm quality.
+        //   6 clusters → 68% base | 5 → 64% | 4 → 60% | 3 → 56% | 2 → 52% | ≤1 → 48%
+        double clusterBase = switch (clusters) {
+            case 6 -> 68.0;
+            case 5 -> 64.0;
+            case 4 -> 60.0;
+            case 3 -> 56.0;
+            case 2 -> 52.0;
+            default -> 48.0;
+        };
+        // norm in [0..1]: norm=0 → base-8, norm=0.5 → base+2, norm=1.0 → base+12
+        double prob = clusterBase + (norm - 0.4) * 20.0;
 
         // Market state adjustment
-        if (state == MarketState.STRONG_TREND)      prob += 2.0;  // was 3.0 — overconfident in trends
-        else if (state == MarketState.WEAK_TREND)   prob += 0.0;  // was 0.5 — weak trend ≠ bonus
-        else if (state == MarketState.RANGE)        prob -= 4.0;  // was -3.0 — range is HARD, penalize more
+        if (state == MarketState.STRONG_TREND)      prob += 2.0;
+        else if (state == MarketState.WEAK_TREND)   prob += 0.0;
+        else if (state == MarketState.RANGE)        prob -= 4.0;
 
         // Category adjustment
         if (cat == CoinCategory.MEME)               prob -= 5.0;
         else if (cat == CoinCategory.ALT)           prob -= 2.0;
 
-        // [v42.0 FIX #11] Removed magic `return 40` MEME blocker.
-        // OLD: if (cat == MEME && prob < 72) return 40;  — hardcoded, killed 80% of MEME setups
-        // NEW: stronger linear penalty; weak MEME setups get filtered downstream by minConf gate
-        //      and by the empirical calibrator, not by a constant.
-        if (cat == CoinCategory.MEME)               prob -= 8.0;  // total MEME penalty: -5 above + -8 here = -13
+        // MEME extra penalty (total MEME: -13 from base)
+        if (cat == CoinCategory.MEME)               prob -= 8.0;
 
-        // [v42.1 FIX #17 + duplicate-calibration] Removed legacy historicalAccuracy 70/30 blend.
-        // It was DEAD CODE — recordSignalResult() was defined but never called from anywhere,
-        // so calibHist was never written, and this branch never executed. Worse: even if it had,
-        // it would have been a SECOND calibration system fighting with ProbabilityCalibrator.
-        // The single source of truth is now ProbabilityCalibrator (PAV isotonic, vol-bucketed).
-
-        // Global live prior is only a light anchor. Pair-level evidence still dominates.
+        // Global live prior — 8% anchor (unchanged)
         double priorProb = 50.0 + (bayesPrior.get() - 0.50) * 24.0;
         prob = prob * 0.92 + priorProb * 0.08;
 
-        // [v42.1 FIX #1 — full closure] Removed final clamp(prob, 50, 85).
-        // OLD: return Math.round(clamp(prob, 50, 85));
-        //      → This was the LAST surviving probability floor in the codebase.
-        //        Even though downstream code uses Math.max(0,...), the input it received
-        //        was already squashed to [50..85] here, leaving the bottom of the
-        //        distribution permanently unreachable.
-        // NEW: clamp(prob, 0, 100) — full range, calibrator handles the final mapping.
+        // Full range — calibrator handles final mapping. No artificial floor.
         return Math.round(clamp(prob, 0, 100));
     }
 

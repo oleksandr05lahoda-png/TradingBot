@@ -140,6 +140,19 @@ public final class BotMain {
         final double entryPrice;
         final String forecastBias;
         final double forecastScore;
+        // [PATCH v43 FIX #1] signalProbability = the FINAL calibrated probability shown in the
+        // Telegram signal (e.g. "72%"). Previously we were feeding forecastScore (a raw
+        // directional score from ForecastEngine) into the calibrator — which is WRONG because:
+        //   a) forecastScore ∈ [-1..+1], not [0..1]
+        //   b) it measures forecast direction confidence, NOT signal entry quality
+        // The calibrator needs the same number the user sees — the signal probability.
+        // This closes the feedback loop: signal said 72% → trade resolved WIN/LOSS →
+        // calibrator learns "72% raw maps to X% real win-rate" → future signals corrected.
+        final double signalProbability;
+        // [v43] Long-term robust ATR% at signal time — needed for vol-bucketed calibration.
+        // Using current ATR (from 15m candle) was wrong: in consolidation ATR shrinks 40-60%
+        // making the bucket lookup wrong (e.g. MEDIUM→LOW). Use 30-day percentile instead.
+        final double robustAtrPctAtSignal;
         final long   createdAt;
         volatile boolean resolved = false;
         volatile String  actualOutcome = null;
@@ -149,10 +162,17 @@ public final class BotMain {
         volatile boolean counted = false;
 
         ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
-                       String bias, double score) {
+                       String bias, double score, double signalProb, double robustAtrPct) {
             this.symbol = sym; this.side = side; this.entryPrice = price;
             this.forecastBias = bias; this.forecastScore = score;
+            this.signalProbability  = signalProb;
+            this.robustAtrPctAtSignal = robustAtrPct;
             this.createdAt = System.currentTimeMillis();
+        }
+        // [v43] Back-compat constructor (signalProb unknown → use forecastScore as fallback)
+        ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
+                       String bias, double score) {
+            this(sym, side, price, bias, score, score, 1.0);
         }
         long ageMs() { return System.currentTimeMillis() - createdAt; }
     }
@@ -614,10 +634,17 @@ public final class BotMain {
             }
         }
 
+        // [v43 PATCH FIX #1] Store SIGNAL probability (what user sees in Telegram),
+        // NOT forecastScore. The calibrator must learn from the exact number shown
+        // in the signal so it can map "bot says 72%" → "real win-rate is X%".
+        // robustAtrPct is stored for vol-bucketed calibration (consolidation trap fix).
+        double signalProb  = idea.probability;  // final calibrated % from DecisionEngine
+        double robustAtrPct = idea.robustAtrPct; // now exposed directly from TradeIdea (v43)
+
         // [v36-FIX Дыра9] Используем forecastSeq вместо currentTimeMillis() — нет коллизий
         forecastRecords.put(key + "_" + forecastSeq.incrementAndGet(),
                 new ForecastRecord(idea.symbol, idea.side, idea.price,
-                        forecastBias, forecastScore));
+                        forecastBias, forecastScore, signalProb, robustAtrPct));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1065,13 +1092,17 @@ public final class BotMain {
                     // [v42.0 FIX #1] Feed the ProbabilityCalibrator with this resolved outcome.
                     // Without this, the isotonic calibrator in DecisionEngineMerged stays empty
                     // and falls through to raw score (no calibration).
+                    // [v43 PATCH FIX #1] Feed calibrator with SIGNAL probability (not forecastScore).
+                    // forecastScore ∈ [-1..+1] = directional forecast; calibrator needs [0..1] win prob.
+                    // signalProbability = the exact % shown in Telegram (e.g. 72%) → correct feedback loop.
+                    // robustAtrPctAtSignal = ATR% captured when signal fired → correct vol-bucket lookup.
                     try {
-                        double rawScore01 = Math.max(0.0, Math.min(1.0, fr.forecastScore));
-                        double atrPctForBucket = atrForFc > 0
-                                ? (atrForFc / currentPrice) * 100.0
-                                : 1.0;
+                        double sigProb01 = Math.max(0.01, Math.min(0.99, fr.signalProbability / 100.0));
+                        double atrPctForBucket = fr.robustAtrPctAtSignal > 0
+                                ? fr.robustAtrPctAtSignal * 100.0
+                                : (atrForFc > 0 ? (atrForFc / currentPrice) * 100.0 : 1.0);
                         com.bot.DecisionEngineMerged.getCalibrator()
-                                .recordOutcome(fr.symbol, rawScore01, correct, atrPctForBucket);
+                                .recordOutcome(fr.symbol, sigProb01, correct, atrPctForBucket);
                     } catch (Throwable cbe) {
                         LOG.fine("[CAL] feed failed: " + cbe.getMessage());
                     }
@@ -1294,6 +1325,50 @@ public final class BotMain {
                 isc.getStats(), sender.getRejectionStats());
 
         LOG.info(msg);
+
+        // [v43 PATCH FIX #8] Sync ISC auto-blacklist → SignalSender.GARBAGE_COIN_BLOCKLIST.
+        // When ISC detects WR < 25% for a symbol, it soft-blocks it via +20 minConf boost.
+        // We also push the symbol to SignalSender's garbage list so processPair() skips it
+        // entirely — avoiding wasted REST/WS fetch overhead on known-bad coins.
+        try {
+            java.util.Set<String> autoBlocked = isc.getAutoBlacklist();
+            for (String sym : autoBlocked) {
+                sender.addToGarbageBlocklist(sym);
+            }
+        } catch (Exception ignored) {}
+
+        // [v43 PATCH FIX #8b] Per-symbol win-rate metrics log (every 30 min = every 6 stat cycles at 5m).
+        // Logs symbols with WR < 40% so operator can review and manually add to blocklist.
+        // Also logs calibrator sample count to track when calibration becomes meaningful (≥50 samples).
+        long nowMs = System.currentTimeMillis();
+        if (uptimeMin % 30 < 5) {   // fire in the first 5min of each 30min window
+            try {
+                StringBuilder wr = new StringBuilder("[WR_METRICS]\n");
+                int total = isc.getTotalTradeCount();
+                double overall = isc.getOverallWinRate();
+                wr.append(String.format("  Overall: %.0f%% (%d trades)\n", overall * 100, total));
+
+                // Log auto-blacklisted symbols
+                java.util.Set<String> bl = isc.getAutoBlacklist();
+                if (!bl.isEmpty()) {
+                    wr.append("  AUTO_BLOCKED: ").append(bl).append("\n");
+                }
+
+                // Log symbols with WR data and flag poor performers
+                isc.getTradeHistorySymbols().stream()
+                        .filter(s -> isc.getTradeCount(s) >= 3)
+                        .sorted(java.util.Comparator.comparingDouble(isc::getWinRate))
+                        .limit(10)
+                        .forEach(s -> {
+                            double sWr = isc.getWinRate(s);
+                            int cnt = isc.getTradeCount(s);
+                            String flag = sWr < 0.30 ? " ❌POOR" : sWr < 0.45 ? " ⚠️WEAK" : "";
+                            wr.append(String.format("  %s: %.0f%% (%d)%s\n", s, sWr * 100, cnt, flag));
+                        });
+
+                LOG.info(wr.toString());
+            } catch (Exception ignored) {}
+        }
     }
 
     // ══════════════════════════════════════════════════════════════

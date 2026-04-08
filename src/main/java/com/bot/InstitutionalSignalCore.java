@@ -422,14 +422,7 @@ public final class InstitutionalSignalCore {
     // [v16.0 FIX] Penalties halved: +8/+5 → +4/+3. Old values on top of raised daily-loss
     // thresholds pushed total required confidence to 80%+, making some symbols untradeable.
     // Still penalises bad symbols — just doesn't completely quarantine them.
-    public double getSymbolMinConfBoost(String symbol) {
-        Double ev = symbolOosEV.get(symbol);
-        if (ev == null) return 0.0; // no data yet = no adjustment
-        if (ev < -0.03) return +4.0;  // was +8.0
-        if (ev < 0.00)  return +3.0;  // was +5.0
-        if (ev > 0.03)  return -2.0;
-        return 0.0;
-    }
+    // [v43] getSymbolMinConfBoost() moved to auto-blacklist section below (includes WR-based blocking)
 
     // ══════════════════════════════════════════════════════════════
     //  SIGNAL FILTERING
@@ -707,6 +700,11 @@ public final class InstitutionalSignalCore {
         return tradeHistory.values().stream().mapToInt(Deque::size).sum();
     }
 
+    /** [v43] Returns all symbols that have trade history — used for WR metrics logging in BotMain. */
+    public java.util.Set<String> getTradeHistorySymbols() {
+        return java.util.Collections.unmodifiableSet(tradeHistory.keySet());
+    }
+
     // [v28.0] PATCH #12: Expose per-symbol average realized R:R for TP calibration.
     // Returns average PnL of winning trades / average PnL magnitude of losing trades.
     // If symbol has insufficient data, returns 0 (= use market-state defaults).
@@ -851,6 +849,70 @@ public final class InstitutionalSignalCore {
         double delta = pnl > 0.5 ? 0.015 : pnl < -0.5 ? -0.018 : -0.003;
         symbolScore.merge(symbol, delta, Double::sum);
         symbolScore.compute(symbol, (k, v) -> com.bot.TradingCore.clamp(v == null ? 0 : v, -0.40, 0.40));
+
+        // [v43 PATCH FIX #6] Auto-soft-blacklist: symbols with persistent low win-rate
+        // get a hard confidence boost, making them functionally un-tradeable.
+        //
+        // Why soft-blacklist instead of hard block?
+        //   Hard block in ISC = no override possible. Soft block via minConf boost means:
+        //   - if the symbol genuinely recovers WR (regime change), it can re-qualify
+        //   - the boost applies per-symbol, not globally
+        //   - getSymbolMinConfBoost() already exists and is checked in allowSignal()
+        //
+        // Trigger: win-rate < 25% AND at least 5 trades (statistically meaningful).
+        // Effect: +20 minConf boost → effectively requires 80%+ signal confidence → untradeable.
+        // Recovery: boost removed when WR recovers above 40%.
+        checkAutoBlacklist(symbol);
+    }
+
+    // [v43] Thread-safe auto-blacklist registry (symbol → soft-blocked)
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> autoBlacklist
+            = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final double AUTO_BLACKLIST_WR_THRESHOLD  = 0.25; // < 25% WR → block
+    private static final double AUTO_BLACKLIST_WR_RECOVERY   = 0.40; // > 40% WR → unblock
+    private static final int    AUTO_BLACKLIST_MIN_TRADES     = 5;    // need at least 5 trades
+    private static final double AUTO_BLACKLIST_CONF_BOOST     = 20.0; // +20% minConf = untradeable
+
+    private void checkAutoBlacklist(String symbol) {
+        int count = getTradeCount(symbol);
+        if (count < AUTO_BLACKLIST_MIN_TRADES) return;
+
+        double wr = getWinRate(symbol);
+        boolean currentlyBlocked = autoBlacklist.getOrDefault(symbol, false);
+
+        if (!currentlyBlocked && wr < AUTO_BLACKLIST_WR_THRESHOLD) {
+            autoBlacklist.put(symbol, true);
+            log(String.format("[AUTO_BLACKLIST] %s WR=%.0f%% after %d trades → soft-blocked (+%.0f conf required)",
+                    symbol, wr * 100, count, AUTO_BLACKLIST_CONF_BOOST));
+        } else if (currentlyBlocked && wr > AUTO_BLACKLIST_WR_RECOVERY) {
+            autoBlacklist.remove(symbol);
+            log(String.format("[AUTO_BLACKLIST] %s WR=%.0f%% recovered → unblocked",
+                    symbol, wr * 100));
+        }
+    }
+
+    /** [v43] Returns extra minConf boost for a symbol. Combines OOS EV penalty + auto-blacklist. */
+    public double getSymbolMinConfBoost(String symbol) {
+        // Auto-blacklist takes priority — return massive boost to block all signals
+        if (autoBlacklist.getOrDefault(symbol, false)) {
+            return AUTO_BLACKLIST_CONF_BOOST;
+        }
+        Double ev = symbolOosEV.get(symbol);
+        if (ev == null) return 0.0;
+        if (ev < -0.03) return +4.0;
+        if (ev < 0.00)  return +3.0;
+        if (ev > 0.03)  return -2.0;
+        return 0.0;
+    }
+
+    /** [v43] Expose auto-blacklist status for logging/metrics */
+    public boolean isAutoBlacklisted(String symbol) {
+        return autoBlacklist.getOrDefault(symbol, false);
+    }
+
+    /** [v43] Get full auto-blacklist for reporting */
+    public java.util.Set<String> getAutoBlacklist() {
+        return java.util.Collections.unmodifiableSet(autoBlacklist.keySet());
     }
 
     // ══════════════════════════════════════════════════════════════

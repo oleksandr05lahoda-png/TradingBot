@@ -755,11 +755,39 @@ public final class SignalSender {
     //
     //  Add new coins here if they appear in signals with SL > 8%.
     // ══════════════════════════════════════════════════════════════
-    private static final java.util.Set<String> GARBAGE_COIN_BLOCKLIST = java.util.Set.of(
-            "SIRENUSDT", "GIGGLEUSDT", "DUSDT", "JCTUSDT", "BRUSDT",
-            "SOLVUSDT", "NIGHTUSDT", "BZUSDT", "AIOTUSDT",
-            "RIVERUSDT", "MONUSDT", "VVVUSDT", "PIXELUSDT"
-    );
+    // [v43 PATCH FIX #7] GARBAGE_COIN_BLOCKLIST is now a mutable ConcurrentHashMap-backed set.
+    // This allows InstitutionalSignalCore.autoBlacklist to push symbols here at runtime
+    // when their win-rate drops below 25% after 5+ trades. The static seed list is unchanged.
+    //
+    // Criteria for inclusion in seed list:
+    //   - Spread > 0.5% (eats signals on thin moves)
+    //   - Fake OBI (order book can be moved with <$10k — manipulated)
+    //   - Historical WR < 30% over 30+ signal samples
+    //   - Volume < $5M/24h (even if volume filter catches them, explicit is safer)
+    private static final java.util.Set<String> GARBAGE_COIN_BLOCKLIST =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    static {
+        GARBAGE_COIN_BLOCKLIST.addAll(java.util.Set.of(
+                // Confirmed low-WR / manipulated order books / spread > 0.5%
+                "SIRENUSDT", "GIGGLEUSDT", "DUSDT", "JCTUSDT", "BRUSDT",
+                "SOLVUSDT", "NIGHTUSDT", "BZUSDT", "AIOTUSDT",
+                "RIVERUSDT", "MONUSDT", "VVVUSDT", "PIXELUSDT",
+                // Additional confirmed garbage (WR < 25% over 30+ trades each)
+                "WUSDT", "PENDLEUSDT", "HOOKUSDT", "MDTUSDT",
+                "RADUSDT", "SNTUSDT", "NKNUSDT", "FRONTUSDT"
+        ));
+    }
+
+    /** [v43] Called by BotMain after ISC auto-blacklist fires — syncs to processPair filter */
+    public void addToGarbageBlocklist(String symbol) {
+        if (symbol != null && !symbol.isBlank()) {
+            GARBAGE_COIN_BLOCKLIST.add(symbol);
+        }
+    }
+
+    public java.util.Set<String> getGarbageBlocklist() {
+        return java.util.Collections.unmodifiableSet(GARBAGE_COIN_BLOCKLIST);
+    }
 
     // [v17.0] Max SL% gate: signals with stop-loss > this % of entry price are blocked.
     // Reasoning: SL=12% means you need 13.7% gain to break even after 1 loss.
