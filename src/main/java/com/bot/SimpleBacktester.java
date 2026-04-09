@@ -60,13 +60,20 @@ public final class SimpleBacktester {
         public double totalFees, totalSlippage, totalFunding;
         public double ev;                 // correct: winRate * avgWin - lossRate * avgLoss
         public double sharpeDaily;        // annualized from daily returns
+        public double sortinoDaily;       // [PATCH #2] annualized, downside-only deviation
         public double maxDrawdownPct;
+        public double maxDDDurationBars;  // [PATCH #2] how long the worst DD lasted
         public double calmarRatio;
         public double profitFactor;
         public double expectancy;         // avg $ per trade
         public double finalBalance;
         // [v11.0] Reliability score: how much to trust these results
         public double reliabilityScore;  // 0..1 based on trade count + Sharpe consistency
+        // [PATCH #2] Trade quality distribution
+        public int    longestLossStreak;
+        public int    longestWinStreak;
+        public double medianPnlPct;
+        public double stdPnlPct;          // std of single-trade pnl
 
         // Detailed trade log
         public final List<TradeRecord> trades = new ArrayList<>();
@@ -109,19 +116,60 @@ public final class SimpleBacktester {
                 double varDaily  = dailyReturns.stream().mapToDouble(r -> Math.pow(r - meanDaily, 2)).average().orElse(0);
                 double stdDaily  = Math.sqrt(varDaily);
                 sharpeDaily = stdDaily > 0 ? (meanDaily / stdDaily) * Math.sqrt(365) : 0;
+
+                // [PATCH #2] Sortino: downside deviation only (штрафует только потери)
+                double downsideVar = dailyReturns.stream()
+                        .filter(r -> r < 0)
+                        .mapToDouble(r -> r * r)
+                        .average().orElse(0);
+                double downsideStd = Math.sqrt(downsideVar);
+                sortinoDaily = downsideStd > 0 ? (meanDaily / downsideStd) * Math.sqrt(365) : 0;
             }
 
-            // Max drawdown
+            // Max drawdown + DD duration
             double peak = initialBal;
             double maxDD = 0;
             double equity = initialBal;
+            int currentDDBars = 0, maxDDBars = 0;
             for (TradeRecord t : trades) {
                 equity += equity * t.pnlPct / 100.0;
-                peak = Math.max(peak, equity);
+                if (equity >= peak) {
+                    peak = equity;
+                    currentDDBars = 0;
+                } else {
+                    currentDDBars++;
+                    maxDDBars = Math.max(maxDDBars, currentDDBars);
+                }
                 double dd = (peak - equity) / peak;
                 maxDD = Math.max(maxDD, dd);
             }
             maxDrawdownPct = maxDD * 100;
+            maxDDDurationBars = maxDDBars;
+
+            // [PATCH #2] Trade distribution — longest streaks
+            int curLossStreak = 0, curWinStreak = 0;
+            for (TradeRecord t : trades) {
+                if (t.pnlPct > 0.05) {
+                    curWinStreak++; curLossStreak = 0;
+                    longestWinStreak = Math.max(longestWinStreak, curWinStreak);
+                } else if (t.pnlPct < -0.05) {
+                    curLossStreak++; curWinStreak = 0;
+                    longestLossStreak = Math.max(longestLossStreak, curLossStreak);
+                }
+            }
+
+            // [PATCH #2] Median + std of single-trade pnl
+            double[] pnls = trades.stream().mapToDouble(t -> t.pnlPct).sorted().toArray();
+            if (pnls.length > 0) {
+                medianPnlPct = pnls.length % 2 == 0
+                        ? (pnls[pnls.length / 2 - 1] + pnls[pnls.length / 2]) / 2.0
+                        : pnls[pnls.length / 2];
+                double meanPnl = java.util.Arrays.stream(pnls).average().orElse(0);
+                double var = java.util.Arrays.stream(pnls)
+                        .map(p -> (p - meanPnl) * (p - meanPnl))
+                        .average().orElse(0);
+                stdPnlPct = Math.sqrt(var);
+            }
 
             // Calmar ratio
             double annualReturn = dailyReturns.isEmpty() ? 0 :
@@ -144,16 +192,18 @@ public final class SimpleBacktester {
                             "║ WinRate: %.1f%% | AvgWin: %.2f%% | AvgLoss: %.2f%% | AvgRR: %.2f\n" +
                             "║ Gross: %+.2f%% | Net: %+.2f%% | Final: $%.2f\n" +
                             "║ Fees: -%.3f%% | Slip: -%.3f%% | Fund: -%.3f%%\n" +
-                            "║ EV: %+.4f | Sharpe: %.2f | PF: %.2f\n" +
-                            "║ MaxDD: %.1f%% | Calmar: %.2f | Expectancy: %+.3f%%\n" +
+                            "║ EV: %+.4f | Sharpe: %.2f | Sortino: %.2f | PF: %.2f\n" +
+                            "║ MaxDD: %.1f%% (%d bars) | Calmar: %.2f | Expectancy: %+.3f%%\n" +
+                            "║ Median: %+.3f%% | StdDev: %.3f%% | Streak: +%d/-%d\n" +
                             "║ Reliability: %.0f%% %s\n" +
                             "╚══════════════════════════════════════════════════╝",
                     symbol, total, wins, losses, breakEvens, timeStops,
                     winRate * 100, avgWinPct, avgLossPct, avgRR,
                     grossPnL, netPnL, finalBalance,
                     totalFees * 100, totalSlippage * 100, totalFunding * 100,
-                    ev, sharpeDaily, profitFactor,
-                    maxDrawdownPct, calmarRatio, expectancy,
+                    ev, sharpeDaily, sortinoDaily, profitFactor,
+                    maxDrawdownPct, (int) maxDDDurationBars, calmarRatio, expectancy,
+                    medianPnlPct, stdPnlPct, longestWinStreak, longestLossStreak,
                     reliabilityScore * 100,
                     total < 30 ? "⚠️ LOW SAMPLE" : total < 50 ? "⚠️ MODERATE" : "✅");
         }
@@ -183,6 +233,7 @@ public final class SimpleBacktester {
     /** Portfolio-level result aggregating multiple symbols */
     public static final class PortfolioResult {
         public final List<BacktestResult> symbolResults = new ArrayList<>();
+        public final List<String> warnings = new ArrayList<>();   // [PATCH #3]
         public double totalNetPnL, portfolioSharpe, portfolioMaxDD;
         public double avgWinRate, avgEV, avgPF;
         public int totalTrades;
@@ -326,27 +377,51 @@ public final class SimpleBacktester {
             }
 
             // Generate signal if no position
-            if (currentPos == null) {
+            // [PATCH #1] LOOK-AHEAD FIX
+            // Old: slice до i+1 (включая текущий бар) + entry = idea.price (close бара i).
+            // Problem: close бара i известен только в НАЧАЛЕ бара i+1. Вход по close i
+            //          даёт нереалистичный winrate (+5..15%).
+            // New: slice до i (бар i НЕ включён — он ещё не закрыт в момент решения);
+            //      entry = m15[i].open (open текущего бара = момент когда в live
+            //      бот реально получит сигнал и войдёт).
+            // Правило: НИКОГДА не использовать close текущего бара как entry price.
+            if (currentPos == null && i + 1 < m15.size()) {
                 int fromBar = Math.max(0, i - 200);
-                List<com.bot.TradingCore.Candle> slice15 = m15.subList(fromBar, i + 1);
-                List<com.bot.TradingCore.Candle> sliceH1 = getTimeframeSlice(h1, m15.get(fromBar).openTime, bar.openTime);
+                // slice EXCLUDES current bar i
+                List<com.bot.TradingCore.Candle> slice15 = m15.subList(fromBar, i);
+                if (slice15.size() < 160) { i++; continue; }
+
+                long decisionTime = m15.get(i - 1).closeTime; // момент принятия решения
+                List<com.bot.TradingCore.Candle> sliceH1 = getTimeframeSlice(
+                        h1, m15.get(fromBar).openTime, decisionTime);
 
                 List<com.bot.TradingCore.Candle> sliceM1 = null, sliceM5 = null;
-                if (m1 != null && !m1.isEmpty()) sliceM1 = getTimeframeSlice(m1, m15.get(Math.max(0, i - 20)).openTime, bar.openTime);
-                if (m5 != null && !m5.isEmpty()) sliceM5 = getTimeframeSlice(m5, m15.get(Math.max(0, i - 40)).openTime, bar.openTime);
+                if (m1 != null && !m1.isEmpty())
+                    sliceM1 = getTimeframeSlice(m1, m15.get(Math.max(0, i - 20)).openTime, decisionTime);
+                if (m5 != null && !m5.isEmpty())
+                    sliceM5 = getTimeframeSlice(m5, m15.get(Math.max(0, i - 40)).openTime, decisionTime);
 
                 com.bot.DecisionEngineMerged.TradeIdea idea = engine.analyze(
                         symbol, sliceM1, sliceM5, slice15, sliceH1, category);
 
                 if (idea != null) {
-                    double entryPrice = idea.price;
-                    // Apply slippage to entry
+                    // ENTRY = open текущего бара i (в live именно в этот момент бот входит)
+                    com.bot.TradingCore.Candle entryBar = m15.get(i);
+                    double entryPrice = entryBar.open;
+                    // Slippage применяем к фактической цене входа
                     if (idea.side == com.bot.TradingCore.Side.LONG) entryPrice *= (1 + slippage);
                     else entryPrice *= (1 - slippage);
 
+                    // SL/TP пересчитываем относительно нового entry
+                    // (idea.stop/tp1/tp2 были рассчитаны от close бара i-1)
+                    double slShift     = (entryPrice - idea.price);
+                    double adjustedSL  = idea.stop + slShift;
+                    double adjustedTP1 = idea.tp1  + slShift;
+                    double adjustedTP2 = idea.tp2  + slShift;
+
                     currentPos = new ActivePosition(
-                            idea.side, entryPrice, idea.stop, idea.tp1, idea.tp2,
-                            idea.probability, bar.openTime, i);
+                            idea.side, entryPrice, adjustedSL, adjustedTP1, adjustedTP2,
+                            idea.probability, entryBar.openTime, i);
                 }
             }
 
@@ -365,8 +440,21 @@ public final class SimpleBacktester {
     //  PORTFOLIO BACKTEST (multiple symbols simultaneously)
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * [PATCH #3] Portfolio backtest — per-symbol isolated, NO cross-symbol concurrency.
+     *
+     * WARNING: this is NOT a true portfolio simulation. Each symbol runs independently,
+     * which means the total may show 50 concurrent positions even though live CorrelationGuard
+     * limits to 5-6. Per-symbol metrics are trustworthy; aggregate P&L is NOT a live-realistic
+     * number (it ignores maxConcurrent and cross-symbol correlation).
+     *
+     * For a proper portfolio simulation you need to merge all symbols into a single timeline
+     * with shared equity and max-concurrent cap. That's a separate refactor.
+     */
     public PortfolioResult runPortfolio(Map<String, SymbolData> allData) {
         PortfolioResult portfolio = new PortfolioResult();
+        portfolio.warnings.add("[WARN] runPortfolio() is per-symbol isolated. Aggregate P&L "
+                + "ignores maxConcurrent and cross-symbol correlation. Use per-symbol results only.");
 
         for (Map.Entry<String, SymbolData> entry : allData.entrySet()) {
             SymbolData data = entry.getValue();

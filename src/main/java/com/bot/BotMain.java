@@ -182,6 +182,83 @@ public final class BotMain {
     private static final AtomicInteger forecastCorrect = new AtomicInteger(0);
 
     // ══════════════════════════════════════════════════════════════
+    //  [PATCH #10] SIGNAL QUALITY TRACKING
+    // ══════════════════════════════════════════════════════════════
+    // Rolling window of recent signal outcomes, split by confidence bucket.
+    // Gives visibility into "does the bot's 80% really mean 80%?" — the
+    // key question for signal-only (manual trading) mode.
+    //
+    // Reports every 60 min via logStats / buildSignalQualityReport.
+    // ══════════════════════════════════════════════════════════════
+
+    private static final class SignalOutcome {
+        final String symbol;
+        final double confidence;   // 0..100
+        final String category;     // TOP/ALT/MEME
+        final boolean hit;
+        final long ts;
+        SignalOutcome(String sym, double conf, String cat, boolean hit) {
+            this.symbol = sym; this.confidence = conf;
+            this.category = cat; this.hit = hit;
+            this.ts = System.currentTimeMillis();
+        }
+    }
+
+    private static final java.util.concurrent.ConcurrentLinkedDeque<SignalOutcome> signalOutcomes
+            = new java.util.concurrent.ConcurrentLinkedDeque<>();
+    private static final int SIGNAL_OUTCOME_WINDOW = 200;
+    private static final AtomicLong lastSignalQualityReport = new AtomicLong(0);
+    private static final long SIGNAL_QUALITY_REPORT_MS = 60 * 60_000L;
+
+    /** Вызывается из checkForecastAccuracy когда известен исход прогноза */
+    public static void recordSignalOutcome(String sym, double conf, String cat, boolean hit) {
+        signalOutcomes.addLast(new SignalOutcome(sym, conf, cat, hit));
+        while (signalOutcomes.size() > SIGNAL_OUTCOME_WINDOW) signalOutcomes.pollFirst();
+    }
+
+    /** Формирует текст отчёта по качеству сигналов */
+    private static String buildSignalQualityReport() {
+        if (signalOutcomes.isEmpty()) return "📊 *SIGNAL QUALITY*\nNo signals tracked yet";
+
+        java.util.List<SignalOutcome> snap = new java.util.ArrayList<>(signalOutcomes);
+        int total = snap.size();
+        long hits = snap.stream().filter(o -> o.hit).count();
+        double overallAcc = (double) hits / total;
+
+        // По уверенности
+        int[] b60 = new int[2], b70 = new int[2], b80 = new int[2];
+        for (SignalOutcome o : snap) {
+            int[] bucket = o.confidence < 70 ? b60 : o.confidence < 80 ? b70 : b80;
+            bucket[0]++;
+            if (o.hit) bucket[1]++;
+        }
+
+        // По категории
+        java.util.Map<String, int[]> byCat = new java.util.LinkedHashMap<>();
+        for (SignalOutcome o : snap) {
+            int[] pair = byCat.computeIfAbsent(o.category == null ? "?" : o.category, k -> new int[2]);
+            pair[0]++;
+            if (o.hit) pair[1]++;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("📊 *SIGNAL QUALITY* (last %d)%n", total));
+        sb.append(String.format("Overall: %.1f%% (%d/%d)%n", overallAcc * 100, hits, total));
+        sb.append("━━━ by Confidence ━━━\n");
+        if (b60[0] > 0) sb.append(String.format("60-70%%: %.0f%% (%d/%d)%n", 100.0 * b60[1] / b60[0], b60[1], b60[0]));
+        if (b70[0] > 0) sb.append(String.format("70-80%%: %.0f%% (%d/%d)%n", 100.0 * b70[1] / b70[0], b70[1], b70[0]));
+        if (b80[0] > 0) sb.append(String.format("80%%+:   %.0f%% (%d/%d)%n", 100.0 * b80[1] / b80[0], b80[1], b80[0]));
+        sb.append("━━━ by Category ━━━\n");
+        for (var e : byCat.entrySet()) {
+            int[] p = e.getValue();
+            if (p[0] == 0) continue;
+            sb.append(String.format("%s: %.0f%% (%d/%d)%n",
+                    e.getKey(), 100.0 * p[1] / p[0], p[1], p[0]));
+        }
+        return sb.toString();
+    }
+
+    // ══════════════════════════════════════════════════════════════
     //  TrackedSignal — v14: tp2Hit + synchronized extremes
     // ══════════════════════════════════════════════════════════════
 
@@ -289,6 +366,23 @@ public final class BotMain {
         final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
         final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram, gic, isc);
 
+        // [PATCH #6] Load persisted calibrator state
+        final String calibratorFile = System.getenv()
+                .getOrDefault("CALIBRATOR_FILE", "./data/calibrator.csv");
+        try {
+            com.bot.DecisionEngineMerged.getCalibrator().loadFromFile(calibratorFile);
+        } catch (Throwable t) {
+            LOG.warning("[Calibrator] load failed: " + t.getMessage());
+        }
+
+        // [PATCH #6] Save on shutdown
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
+                System.out.println("[Calibrator] final save on shutdown");
+            } catch (Throwable t) { /* best effort */ }
+        }, "calibrator-shutdown"));
+
         // Pass auto-detected timezone to signal formatter
         com.bot.DecisionEngineMerged.USER_ZONE = ZONE;
 
@@ -340,6 +434,20 @@ public final class BotMain {
         auxSched.scheduleAtFixedRate(
                 safe("Watchdog", () -> runWatchdog(telegram, gic, isc, sender)),
                 60, 60, TimeUnit.SECONDS);
+
+        // [PATCH #6] Periodic calibrator save (every 10 min)
+        auxSched.scheduleAtFixedRate(
+                safe("CalibratorSave", () -> {
+                    com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
+                    int cnt = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+                    LOG.info("[Calibrator] auto-saved, total outcomes: " + cnt);
+                }),
+                10, 10, TimeUnit.MINUTES);
+
+        // [PATCH #7] Periodic Binance server time sync (every 30 min)
+        auxSched.scheduleAtFixedRate(
+                safe("TimeSync", sender::syncServerTime),
+                5, 30, TimeUnit.MINUTES);
 
         // ── [SCANNER MODE v2.0] TradeResolver DISABLED ───────────────
         // Бот работает в режиме чистого сканера сигналов.
@@ -1132,6 +1240,10 @@ public final class BotMain {
                                 : (atrForFc > 0 ? (atrForFc / currentPrice) * 100.0 : 1.0);
                         com.bot.DecisionEngineMerged.getCalibrator()
                                 .recordOutcome(fr.symbol, sigProb01, correct, atrPctForBucket);
+
+                        // [PATCH #10] Also track for the signal quality report
+                        String cat = com.bot.DecisionEngineMerged.detectAssetType(fr.symbol).label;
+                        recordSignalOutcome(fr.symbol, fr.signalProbability, cat, correct);
                     } catch (Throwable cbe) {
                         LOG.fine("[CAL] feed failed: " + cbe.getMessage());
                     }
@@ -1153,6 +1265,11 @@ public final class BotMain {
                         telegram.sendMessageAsync(String.format(
                                 "*Forecast*\n\nTotal %d · Hit %d · *%.1f%%*",
                                 total, correct2, acc));
+                        // [PATCH #10] Also send the detailed signal quality breakdown
+                        if (nowMs - lastSignalQualityReport.get() >= SIGNAL_QUALITY_REPORT_MS) {
+                            lastSignalQualityReport.set(nowMs);
+                            telegram.sendMessageAsync(buildSignalQualityReport());
+                        }
                     }
                 }
             } catch (Exception ex) {

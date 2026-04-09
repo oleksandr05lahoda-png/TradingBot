@@ -1020,6 +1020,23 @@ public final class SignalSender {
 
             if (m15 == null || m15.size() < 160 || h1 == null || h1.size() < 160) return null;
 
+            // [PATCH #4] STALE DATA GUARD
+            // Если последний 15m бар закрыт более 20 минут назад — данные устарели.
+            // Причины: WS разрыв + REST кеш не обновился, Binance maintenance, локальный freeze.
+            // Лучше пропустить сигнал чем войти на старых данных.
+            long nowMs = System.currentTimeMillis();
+            long lastBarAge = nowMs - m15.get(m15.size() - 1).closeTime;
+            if (lastBarAge > 20 * 60_000L) {
+                cyclePairsStale.incrementAndGet();
+                return null;
+            }
+            // 1h бар старше 2 часов → HTF bias будет неверный
+            long lastH1Age = nowMs - h1.get(h1.size() - 1).closeTime;
+            if (lastH1Age > 2 * 60 * 60_000L) {
+                cyclePairsStale.incrementAndGet();
+                return null;
+            }
+
             // [v34.0] Categorize early — needed for event filter and all downstream logic
             com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
             String sector = detectSector(pair);
@@ -2218,19 +2235,21 @@ public final class SignalSender {
             }
 
             List<com.bot.TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
-            if (!fresh.isEmpty()) {
+            // [PATCH #5] fresh == null → HARD fetch failure; fresh.isEmpty() → валидный empty (новая пара)
+            if (fresh != null && !fresh.isEmpty()) {
                 candleCache.put(key, new CachedCandles(fresh));
                 lastFetchTime.put(key, System.currentTimeMillis());
                 return fresh;
             }
-            // [v24.0 FIX WEAK-5] Staleness guard
+            // Hard fail OR empty — пробуем отдать старый кеш если он ещё не слишком тухлый
             if (cached != null && !cached.isStale(ttl * 3)) return cached.candles;
             if (cached != null) {
                 System.out.printf("[STALE] %s cache too old (%ds), skipping%n",
                         key, (System.currentTimeMillis() - cached.fetchedAt) / 1000);
                 return Collections.emptyList();
             }
-            return fresh;
+            // Новая пара без кеша + hard fail → возвращаем пустой список, upstream отсечёт
+            return fresh != null ? fresh : Collections.emptyList();
         }
     }
 
@@ -2238,29 +2257,131 @@ public final class SignalSender {
         return getCached(symbol, interval, limit);
     }
 
-    private List<com.bot.TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
-        try {
-            String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
-                    symbol, interval, limit);
-            HttpResponse<String> resp = sendBinanceRequest(
-                    HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build(),
-                    BINANCE_WEIGHT_KLINES);
-            if (resp == null) return Collections.emptyList();
+    // [PATCH #5] Fetch error counter — exposed via stats
+    private final AtomicLong klineFetchErrors = new AtomicLong(0);
+    public long getKlineFetchErrors() { return klineFetchErrors.get(); }
 
-            String body = resp.body();
-            if (!body.trim().startsWith("[")) return Collections.emptyList();
-            JSONArray arr = new JSONArray(body);
-            List<com.bot.TradingCore.Candle> list = new ArrayList<>(arr.length());
-            for (int i = 0; i < arr.length(); i++) {
-                JSONArray k = arr.getJSONArray(i);
-                list.add(new com.bot.TradingCore.Candle(
-                        k.getLong(0), Double.parseDouble(k.getString(1)),
-                        Double.parseDouble(k.getString(2)), Double.parseDouble(k.getString(3)),
-                        Double.parseDouble(k.getString(4)), Double.parseDouble(k.getString(5)),
-                        k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0, k.getLong(6)));
+    private List<com.bot.TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
+        // [PATCH #5] Retry with exponential backoff.
+        // Return null on HARD failure (so upstream can distinguish "stale" from "empty history").
+        // Return empty list ONLY when Binance returned a valid empty JSON array [].
+        Exception lastEx = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                String url = String.format("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
+                        symbol, interval, limit);
+                HttpResponse<String> resp = sendBinanceRequest(
+                        HttpRequest.newBuilder().uri(URI.create(url))
+                                .timeout(Duration.ofSeconds(10)).GET().build(),
+                        BINANCE_WEIGHT_KLINES);
+                if (resp == null) {
+                    lastEx = new RuntimeException("sendBinanceRequest returned null (rate-limited?)");
+                    Thread.sleep(500L * (1L << attempt));
+                    continue;
+                }
+                if (resp.statusCode() != 200) {
+                    lastEx = new RuntimeException("HTTP " + resp.statusCode());
+                    if (resp.statusCode() == 429 || resp.statusCode() == 418) {
+                        Thread.sleep(2000L * (1L << attempt));
+                    } else {
+                        Thread.sleep(300L * (1L << attempt));
+                    }
+                    continue;
+                }
+
+                String body = resp.body();
+                if (body == null || body.isBlank()) {
+                    lastEx = new RuntimeException("empty body");
+                    continue;
+                }
+                if (!body.trim().startsWith("[")) {
+                    lastEx = new RuntimeException("non-array response: "
+                            + body.substring(0, Math.min(200, body.length())));
+                    continue;
+                }
+
+                JSONArray arr = new JSONArray(body);
+                List<com.bot.TradingCore.Candle> list = new ArrayList<>(arr.length());
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONArray k = arr.getJSONArray(i);
+                    long openT = k.getLong(0);
+                    double o = Double.parseDouble(k.getString(1));
+                    double h = Double.parseDouble(k.getString(2));
+                    double l = Double.parseDouble(k.getString(3));
+                    double c = Double.parseDouble(k.getString(4));
+                    double v = Double.parseDouble(k.getString(5));
+                    double qv = k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0;
+                    long closeT = k.getLong(6);
+
+                    // [PATCH #5] Sanity check — skip malformed candles
+                    if (h < l || o <= 0 || c <= 0 || Double.isNaN(o) || Double.isNaN(c)) {
+                        continue;
+                    }
+                    list.add(new com.bot.TradingCore.Candle(openT, o, h, l, c, v, qv, closeT));
+                }
+                return list; // success — may be empty if Binance really returned []
+
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (Exception e) {
+                lastEx = e;
             }
-            return list;
-        } catch (Exception e) { return Collections.emptyList(); }
+        }
+        // All retries failed
+        klineFetchErrors.incrementAndGet();
+        System.out.println("[fetchKlines] HARD FAIL " + symbol + " " + interval
+                + " after 3 attempts: " + (lastEx != null ? lastEx.getMessage() : "unknown"));
+        return null; // NULL = hard failure, distinguished from empty list
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [PATCH #7] SERVER TIME SYNC
+    // ══════════════════════════════════════════════════════════════
+    // Binance требует `timestamp` в пределах `recvWindow` (5000ms по дефолту).
+    // Дрейф локальных часов на 1-2 сек → массовые -1021 ошибки.
+    // Offset обновляется при старте + раз в 30 минут из BotMain.
+    //
+    // Использование: в signed requests вместо System.currentTimeMillis() — binanceTimestamp().
+    // Сейчас авто-торговля выключена, но правка превентивная на будущее.
+    // ══════════════════════════════════════════════════════════════
+
+    private volatile long serverTimeOffset = 0L;
+    private volatile long lastTimeSync = 0L;
+
+    public void syncServerTime() {
+        try {
+            long t0 = System.currentTimeMillis();
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create("https://fapi.binance.com/fapi/v1/time"))
+                            .timeout(Duration.ofSeconds(5))
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            long t1 = System.currentTimeMillis();
+            if (resp.statusCode() != 200) return;
+
+            JSONObject j = new JSONObject(resp.body());
+            long serverTime = j.getLong("serverTime");
+            long roundTrip = t1 - t0;
+            // Assume server time = middle of round trip
+            long localMid = t0 + roundTrip / 2;
+            long newOffset = serverTime - localMid;
+
+            // Sanity: не принимаем offset > 10 сек (защита от мусорного ответа)
+            if (Math.abs(newOffset) < 10_000L) {
+                serverTimeOffset = newOffset;
+                lastTimeSync = t1;
+                System.out.println("[TimeSync] offset=" + newOffset + "ms rtt=" + roundTrip + "ms");
+            }
+        } catch (Exception e) {
+            System.out.println("[TimeSync] failed: " + e.getMessage());
+        }
+    }
+
+    /** Использовать в signed requests вместо System.currentTimeMillis() */
+    public long binanceTimestamp() {
+        return System.currentTimeMillis() + serverTimeOffset;
     }
 
     public CompletableFuture<List<com.bot.TradingCore.Candle>> fetchKlinesAsync(String symbol, String interval, int limit) {

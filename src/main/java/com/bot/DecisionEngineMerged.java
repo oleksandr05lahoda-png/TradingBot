@@ -2555,8 +2555,22 @@ public final class DecisionEngineMerged {
                         allFlags.add("FC_PENALTY_CAPPED_" + String.format("%.0f", fcTotalPenalty));
                     }
                 }
+            } catch (OutOfMemoryError oom) {
+                throw oom; // не глотаем
+            } catch (RuntimeException e) {
+                // [PATCH #8] ForecastEngine hard-failed. Это НЕ нормально —
+                // раньше мы просто игнорировали, теперь применяем conservative penalty
+                // чтобы сигнал не прошёл "втихую" без FC-проверки.
+                System.out.printf("[FC-ERROR] %s %s: %s%n",
+                        symbol, e.getClass().getSimpleName(), e.getMessage());
+                probability = Math.max(0, probability - 8);
+                allFlags.add("FC_ERROR_PENALTY");
+                forecastResult = null;
             } catch (Exception e) {
                 System.out.printf("[FC] %s forecast error: %s%n", symbol, e.getMessage());
+                probability = Math.max(0, probability - 8);
+                allFlags.add("FC_ERROR_PENALTY");
+                forecastResult = null;
             }
         }
 
@@ -3819,7 +3833,7 @@ public final class DecisionEngineMerged {
         private static final class Outcome {
             final double rawScore;
             final boolean hit;
-            final long ts;
+            long ts;  // [PATCH #6] no longer final — reassigned on loadFromFile
             Outcome(double s, boolean h) {
                 this.rawScore = Math.max(0.0, Math.min(1.0, s));
                 this.hit = h;
@@ -3999,5 +4013,88 @@ public final class DecisionEngineMerged {
         }
 
         public void resetAll() { history.clear(); }
+
+        // ════════════════════════════════════════════════════════
+        // [PATCH #6] PERSISTENT STATE — save/load to disk
+        // ════════════════════════════════════════════════════════
+
+        /**
+         * Сохраняет всё состояние калибратора в текстовый файл.
+         * Формат: по одной строке на outcome:
+         *   symbol#bucket;rawScore;hit;timestamp
+         * Простой формат чтобы не тащить Jackson/Gson.
+         */
+        public synchronized void saveToFile(String path) {
+            try {
+                java.io.File f = new java.io.File(path);
+                java.io.File parent = f.getParentFile();
+                if (parent != null && !parent.exists()) parent.mkdirs();
+
+                try (java.io.PrintWriter pw = new java.io.PrintWriter(
+                        new java.io.BufferedWriter(new java.io.FileWriter(f)))) {
+                    pw.println("# ProbabilityCalibrator state v1");
+                    pw.println("# format: key;rawScore;hit;ts");
+                    long now = System.currentTimeMillis();
+                    for (java.util.Map.Entry<String, java.util.concurrent.ConcurrentLinkedDeque<Outcome>> e
+                            : history.entrySet()) {
+                        for (Outcome o : e.getValue()) {
+                            // Пропускаем слишком старые (чтобы файл не рос бесконечно)
+                            if (now - o.ts > MAX_AGE_MS) continue;
+                            pw.printf("%s;%.6f;%d;%d%n",
+                                    e.getKey(), o.rawScore, o.hit ? 1 : 0, o.ts);
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                System.out.println("[Calibrator] save failed: " + ex.getMessage());
+            }
+        }
+
+        /** Загружает состояние при старте. Silent no-op если файла нет. */
+        public synchronized void loadFromFile(String path) {
+            try {
+                java.io.File f = new java.io.File(path);
+                if (!f.exists()) return;
+
+                long now = System.currentTimeMillis();
+                int loaded = 0, skipped = 0;
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.FileReader(f))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        if (line.startsWith("#") || line.isBlank()) continue;
+                        String[] p = line.split(";");
+                        if (p.length != 4) { skipped++; continue; }
+                        try {
+                            String k = p[0];
+                            double score = Double.parseDouble(p[1]);
+                            boolean hit = "1".equals(p[2]);
+                            long ts = Long.parseLong(p[3]);
+                            if (now - ts > MAX_AGE_MS) { skipped++; continue; }
+
+                            Outcome o = new Outcome(score, hit);
+                            o.ts = ts; // [PATCH #6] restore original timestamp
+
+                            history.computeIfAbsent(k, x ->
+                                    new java.util.concurrent.ConcurrentLinkedDeque<>()).addLast(o);
+                            loaded++;
+                        } catch (Exception parseEx) { skipped++; }
+                    }
+                }
+                System.out.println("[Calibrator] loaded " + loaded + " outcomes from " + path
+                        + " (skipped " + skipped + ")");
+            } catch (Exception ex) {
+                System.out.println("[Calibrator] load failed: " + ex.getMessage());
+            }
+        }
+
+        /** Сколько всего outcome'ов в памяти. */
+        public int totalOutcomeCount() {
+            int n = 0;
+            for (java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq : history.values()) {
+                n += dq.size();
+            }
+            return n;
+        }
     }
 }
