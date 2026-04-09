@@ -1761,17 +1761,17 @@ public final class TradingCore {
             // Swing structure — HH/HL vs LL/LH
             double swingScore = com.bot.DecisionEngineMerged.marketStructure(c15) * 0.50;
             f.put("SWING", swingScore);
-            trendDir += swingScore * 0.22; // повышен с 0.15
+            trendDir += swingScore * 0.22;
 
             // Orderflow — CVD исторический
             double ofScore = calcOrderflow(c15, volumeDelta);
             f.put("OF", ofScore);
-            trendDir += ofScore * 0.20; // повышен с 0.15
+            trendDir += ofScore * 0.18;
 
-            // HTF alignment (1h) — наиболее надёжный
+            // HTF alignment (1h) — [BUG A] weight reduced, slope-based fix in calcHTF
             double htfScore = calcHTF(c15, c1h);
             f.put("HTF", htfScore);
-            trendDir += htfScore * 0.20; // повышен с 0.15
+            trendDir += htfScore * 0.15;
 
             // ═══════════════════════════════════════════════════════
             // [v38.0] LEADING FACTORS — опережающие индикаторы
@@ -1781,7 +1781,7 @@ public final class TradingCore {
             // RT-CVD — реальное соотношение покупок/продаж
             double cvdRt = clamp(volumeDelta * 1.8, -0.85, 0.85);
             f.put("CVD_RT", cvdRt);
-            trendDir += cvdRt * 0.22; // повышен с 0.18 — это самый опережающий фактор
+            trendDir += cvdRt * 0.25; // most leading factor
 
             // Price Acceleration — скорость изменения скорости цены
             int nc = c15.size();
@@ -1789,19 +1789,17 @@ public final class TradingCore {
                 double mom1 = (c15.get(nc-1).close - c15.get(nc-4).close) / (price + 1e-9);
                 double mom2 = (c15.get(nc-4).close - c15.get(nc-7).close) / (c15.get(nc-4).close + 1e-9);
                 double accelScore = 0;
-                // Ускорение вверх: оба момента позитивные И последний > предыдущий
                 if (mom1 > 0 && mom2 > 0 && mom1 > mom2 * 1.25) {
                     accelScore = clamp((mom1 - mom2) / Math.max(1e-6, Math.abs(mom2)), 0, 0.60);
-                    // Ускорение вниз: оба момента негативные И последний < предыдущего
                 } else if (mom1 < 0 && mom2 < 0 && mom1 < mom2 * 1.25) {
                     accelScore = clamp((mom1 - mom2) / Math.max(1e-6, Math.abs(mom2)), -0.60, 0);
-                    // Смена направления: коррекция закончилась, основной тренд возобновляется
                 } else if (Math.signum(mom1) != Math.signum(mom2) && Math.abs(mom1) > atr14 * 0.3 / (price + 1e-9)) {
                     accelScore = clamp(mom1 * 15, -0.35, 0.35);
                 }
                 f.put("ACCEL", accelScore);
-                trendDir += accelScore * 0.12;
+                trendDir += accelScore * 0.20; // [BUG B] raised from 0.12
             }
+            // [BUG B] Sum of weights: 0.22 + 0.18 + 0.15 + 0.25 + 0.20 = 1.00 (normalized)
 
             trendDir = clamp(trendDir, -1.0, 1.0);
 
@@ -1929,30 +1927,81 @@ public final class TradingCore {
             }
         }
 
+        /**
+         * [FIX #1 + BUG D] Swing-pivot approach — O(n), no EMA5 lag.
+         *
+         * Problem with old version:
+         *   1) EMA5 lags 2-3 bars → after pump peak, method still reports dir=+1
+         *      because price > EMA5 for several bars after reversal.
+         *   2) Quadratic complexity: fcEma() recomputed from scratch each iteration.
+         *
+         * New logic: find last confirmed pivot high/low (strength=2 on both sides).
+         * Whichever pivot is more recent defines the current move:
+         *   - last pivot was HIGH → current move is DOWN from that high
+         *   - last pivot was LOW  → current move is UP from that low
+         * This matches how structure is actually read by traders and lags zero bars
+         * once the pivot is confirmed (2 bars after the pivot itself).
+         */
         private MoveInfo identifyCurrentMove(List<Candle> c, double atr) {
             int n = c.size();
-            double price = c.get(n - 1).close;
-            // Walk backwards to find where the current directional move started
-            // A "reversal" = close crosses EMA5 in opposite direction with body > 0.3*ATR
-            double ema5 = fcEma(c, 5);
-            boolean currentBull = price > ema5;
+            if (n < 5) return new MoveInfo(0, 0, 0, n - 1, c.get(n - 1).close);
 
-            int origin = n - 1;
-            for (int i = n - 2; i >= Math.max(0, n - 30); i--) {
-                boolean barBull = c.get(i).close > fcEma(c.subList(0, i + 1), 5);
-                if (barBull != currentBull) {
-                    origin = i + 1;
-                    break;
+            double price = c.get(n - 1).close;
+
+            int lastPivotHigh = -1, lastPivotLow = -1;
+            double pivotHighPrice = 0, pivotLowPrice = 0;
+
+            // Scan backward up to 25 bars, strength=2 on both sides
+            // i-2..i+2 must all exist → i in [2, n-3]
+            for (int i = n - 3; i >= Math.max(2, n - 25); i--) {
+                double hi = c.get(i).high;
+                double lo = c.get(i).low;
+                boolean isPH = hi > c.get(i - 1).high && hi > c.get(i - 2).high
+                        && hi > c.get(i + 1).high && hi > c.get(i + 2).high;
+                boolean isPL = lo < c.get(i - 1).low && lo < c.get(i - 2).low
+                        && lo < c.get(i + 1).low && lo < c.get(i + 2).low;
+                if (isPH && lastPivotHigh < 0) { lastPivotHigh = i; pivotHighPrice = hi; }
+                if (isPL && lastPivotLow  < 0) { lastPivotLow  = i; pivotLowPrice  = lo; }
+                if (lastPivotHigh >= 0 && lastPivotLow >= 0) break;
+            }
+
+            int dir;
+            int origin;
+            double originPrice;
+
+            if (lastPivotHigh >= 0 && lastPivotLow >= 0) {
+                if (lastPivotHigh > lastPivotLow) {
+                    // Most recent pivot is HIGH → move is DOWN from it
+                    dir = -1; origin = lastPivotHigh; originPrice = pivotHighPrice;
+                } else {
+                    // Most recent pivot is LOW → move is UP from it
+                    dir = 1; origin = lastPivotLow; originPrice = pivotLowPrice;
                 }
-                origin = i;
+            } else if (lastPivotHigh >= 0) {
+                dir = -1; origin = lastPivotHigh; originPrice = pivotHighPrice;
+            } else if (lastPivotLow >= 0) {
+                dir = 1; origin = lastPivotLow; originPrice = pivotLowPrice;
+            } else {
+                // Fallback: compare current price to mid of last 10-bar range
+                int from = Math.max(0, n - 10);
+                double hi = Double.NEGATIVE_INFINITY, lo = Double.POSITIVE_INFINITY;
+                for (int i = from; i < n; i++) {
+                    hi = Math.max(hi, c.get(i).high);
+                    lo = Math.min(lo, c.get(i).low);
+                }
+                double mid = (hi + lo) / 2.0;
+                dir = price > mid ? 1 : -1;
+                origin = from;
+                originPrice = c.get(from).close;
             }
 
             int age = n - 1 - origin;
-            double depth = Math.abs(price - c.get(origin).close) / (atr + 1e-12);
-            int dir = currentBull ? 1 : -1;
+            double depth = Math.abs(price - originPrice) / (atr + 1e-12);
+
+            // Flat zone: very young move with tiny depth → undefined direction
             if (age <= 1 && depth < 0.3) dir = 0;
 
-            return new MoveInfo(dir, age, depth, origin, c.get(origin).close);
+            return new MoveInfo(dir, age, depth, origin, originPrice);
         }
 
         // ═══════════════════════════════════════════════════════
@@ -1962,77 +2011,111 @@ public final class TradingCore {
         /** Volume Fade: average volume of last 3 bars vs first 3 bars of move.
          *  If later bars have less volume → move losing fuel. Returns [0..1]. */
         private double calcVolumeFade(List<Candle> c, MoveInfo move) {
-            if (move.ageBars < 4) return 0;
+            // [FIX #2] Old: ageBars<4 → 60min lag. New: adaptive window, works from 2 bars.
+            if (move.ageBars < 2) return 0;
             int n = c.size();
             int start = move.originIdx;
-            // Average volume of first 3 bars of move
+            int moveLen = n - start; // total bars in current move (inclusive of origin)
+
+            // Adaptive window: for short moves use 1 bar each side (no overlap),
+            // for longer moves use up to 3 bars each side.
+            int w = Math.min(3, Math.max(1, moveLen / 2));
+
             double volStart = 0;
-            int cnt1 = 0;
-            for (int i = start; i < Math.min(start + 3, n); i++) {
-                volStart += c.get(i).volume; cnt1++;
-            }
-            volStart = cnt1 > 0 ? volStart / cnt1 : 1;
-            // Average volume of last 3 bars
+            int c1 = 0;
+            for (int i = start; i < start + w && i < n; i++) { volStart += c.get(i).volume; c1++; }
+            if (c1 == 0) return 0;
+            volStart /= c1;
+
             double volEnd = 0;
-            int cnt2 = 0;
-            for (int i = n - 3; i < n; i++) {
-                volEnd += c.get(i).volume; cnt2++;
-            }
-            volEnd = cnt2 > 0 ? volEnd / cnt2 : 1;
+            int c2 = 0;
+            for (int i = n - w; i < n; i++) { volEnd += c.get(i).volume; c2++; }
+            if (c2 == 0) return 0;
+            volEnd /= c2;
+
             if (volStart < 1e-12) return 0;
             double ratio = volEnd / volStart;
-            // ratio < 1 = volume fading. Map: ratio 0.3→1.0, ratio 0.7→0.3, ratio 1.0→0
             return clamp((1.0 - ratio) * 1.5, 0, 1);
         }
 
-        /** Momentum Decay: body size of last 3 bars vs first 3 bars.
+        /** Momentum Decay: body size of last window vs first window.
          *  If each bar is smaller → momentum dying. Returns [0..1]. */
         private double calcMomentumDecay(List<Candle> c, MoveInfo move, double atr) {
-            if (move.ageBars < 4) return 0;
+            // [FIX #2] Old: ageBars<4. New: adaptive window from 2 bars.
+            if (move.ageBars < 2) return 0;
             int n = c.size();
             int start = move.originIdx;
-            // Directional body size (in trend direction) of first 3
+            int moveLen = n - start;
+            int w = Math.min(3, Math.max(1, moveLen / 2));
+
             double bodyStart = 0;
             int cnt = 0;
-            for (int i = start; i < Math.min(start + 3, n); i++) {
+            for (int i = start; i < start + w && i < n; i++) {
                 double body = (c.get(i).close - c.get(i).open) * move.direction;
                 bodyStart += Math.max(0, body);
                 cnt++;
             }
             bodyStart = cnt > 0 ? bodyStart / cnt : 0;
-            // Last 3
+
             double bodyEnd = 0;
             cnt = 0;
-            for (int i = n - 3; i < n; i++) {
+            for (int i = n - w; i < n; i++) {
                 double body = (c.get(i).close - c.get(i).open) * move.direction;
                 bodyEnd += Math.max(0, body);
                 cnt++;
             }
             bodyEnd = cnt > 0 ? bodyEnd / cnt : 0;
+
             if (bodyStart < atr * 0.05) return 0;
             double ratio = bodyEnd / (bodyStart + 1e-12);
-            // Also check: are recent bars going AGAINST the trend?
+
+            // Counter-trend last bar = extra exhaustion signal
             double lastBody = (c.get(n - 1).close - c.get(n - 1).open) * move.direction;
-            double counterPenalty = lastBody < 0 ? 0.3 : 0; // Last bar is counter-trend
+            double counterPenalty = lastBody < 0 ? 0.3 : 0;
+
             return clamp((1.0 - ratio) * 1.3 + counterPenalty, 0, 1);
         }
 
         /** Wick Rejection: wicks against the move growing = opposition forming.
-         *  In bullish move: upper wicks growing = sellers pushing back. Returns [0..1]. */
+         *  [FIX #2] Added early (1-2 bar) wick detection for fast reversals. */
         private double calcWickRejection(List<Candle> c, MoveInfo move) {
             int n = c.size();
-            if (move.ageBars < 3 || n < 5) return 0;
+            if (move.ageBars < 1 || n < 3 || move.direction == 0) return 0;
+
+            // ── Early wick rejection: last 1-2 bars with >55% wick against move ──
+            // This catches fast reversals where 15-30 min warning is enough.
+            {
+                int look = Math.min(2, move.ageBars + 1);
+                double wickSum = 0;
+                int cnt = 0;
+                for (int i = n - look; i < n; i++) {
+                    Candle bar = c.get(i);
+                    double range = bar.high - bar.low;
+                    if (range < 1e-12) continue;
+                    double wickFrac;
+                    if (move.direction > 0) {
+                        wickFrac = (bar.high - Math.max(bar.open, bar.close)) / range;
+                    } else {
+                        wickFrac = (Math.min(bar.open, bar.close) - bar.low) / range;
+                    }
+                    wickSum += wickFrac;
+                    cnt++;
+                }
+                if (cnt > 0 && wickSum / cnt > 0.55) return 0.55; // strong early rejection
+            }
+
+            // ── Standard 3-bar aggregate (legacy, for older moves) ──
+            if (move.ageBars < 2) return 0;
             double wickScore = 0;
-            for (int i = n - 3; i < n; i++) {
+            int from = Math.max(0, n - 3);
+            for (int i = from; i < n; i++) {
                 Candle bar = c.get(i);
                 double body = Math.abs(bar.close - bar.open) + 1e-12;
                 if (move.direction > 0) {
-                    // Bullish move → upper wicks = rejection from above
                     double uw = bar.high - Math.max(bar.close, bar.open);
                     if (uw > body * 1.5) wickScore += 0.35;
                     else if (uw > body) wickScore += 0.15;
                 } else {
-                    // Bearish move → lower wicks = rejection from below (buyers)
                     double lw = Math.min(bar.close, bar.open) - bar.low;
                     if (lw > body * 1.5) wickScore += 0.35;
                     else if (lw > body) wickScore += 0.15;
@@ -2041,39 +2124,63 @@ public final class TradingCore {
             return clamp(wickScore, 0, 1);
         }
 
-        /** RSI Exhaustion: RSI in extreme zone + RSI deceleration.
-         *  Returns [0..1], higher = more exhausted. */
+        /** RSI Exhaustion: RSI extreme + RSI deceleration + price/RSI divergence.
+         *  [BUG E FIX] Added classic bearish/bullish divergence (price HH + RSI LH). */
         private double calcRsiExhaustion(List<Candle> c, MoveInfo move) {
             int n = c.size();
             if (n < 20) return 0;
             double rsi14 = rsi(c, 14);
             double rsi14_prev = rsi(c.subList(0, n - 3), 14);
             double score = 0;
+
             if (move.direction > 0) {
-                // Bullish move: RSI > 70 = overbought
                 if (rsi14 > 75) score += 0.40;
                 else if (rsi14 > 68) score += 0.20;
-                // RSI declining while price still up = bearish divergence
                 if (rsi14 < rsi14_prev - 2 && rsi14 > 55) score += 0.35;
+
+                // Classic bearish divergence: price makes new high, RSI does not
+                double priceNow = c.get(n - 1).high;
+                double priceThen = 0;
+                for (int i = Math.max(0, n - 10); i < n - 3; i++) {
+                    priceThen = Math.max(priceThen, c.get(i).high);
+                }
+                if (priceNow > priceThen && rsi14 < rsi14_prev - 1 && rsi14 > 60) {
+                    score += 0.45; // strong divergence signal
+                }
             } else if (move.direction < 0) {
-                // Bearish move: RSI < 30 = oversold
                 if (rsi14 < 25) score += 0.40;
                 else if (rsi14 < 32) score += 0.20;
-                // RSI rising while price still down = bullish divergence
                 if (rsi14 > rsi14_prev + 2 && rsi14 < 45) score += 0.35;
+
+                // Classic bullish divergence: price makes new low, RSI does not
+                double priceNow = c.get(n - 1).low;
+                double priceThen = Double.POSITIVE_INFINITY;
+                for (int i = Math.max(0, n - 10); i < n - 3; i++) {
+                    priceThen = Math.min(priceThen, c.get(i).low);
+                }
+                if (priceNow < priceThen && rsi14 > rsi14_prev + 1 && rsi14 < 40) {
+                    score += 0.45;
+                }
             }
             return clamp(score, 0, 1);
         }
 
         /** Overextension: has the move gone too far too fast?
-         *  Price > move_origin + 3*ATR in <6 bars = extended. Returns [0..1]. */
+         *  [BUG C FIX] Now triggers on fast 2-bar pumps (high depth, low age). */
         private double calcOverextension(MoveInfo move, double atr) {
-            if (move.ageBars < 2 || atr <= 0) return 0;
-            // depth per bar — how fast is price moving
+            if (move.direction == 0 || atr <= 0) return 0;
+
+            // Fast short pump/dump: 2 bars but depth > 1.5 ATR = parabolic
+            if (move.ageBars <= 2 && move.depthAtr > 1.5) {
+                return clamp((move.depthAtr - 1.0) * 0.35, 0.30, 0.85);
+            }
+            if (move.ageBars < 2) return 0;
+
+            // Speed (ATR per bar): > 0.6 over 3+ bars = extended
             double speedAtr = move.depthAtr / (move.ageBars + 1e-6);
-            // >0.6 ATR per bar over 3+ bars = extended
             if (speedAtr > 0.6 && move.ageBars >= 3) return clamp(speedAtr * 0.8, 0, 1);
-            // Absolute depth: > 4 ATR moved = stretched rubber band
+
+            // Absolute depth: stretched rubber band
             if (move.depthAtr > 4.0) return clamp((move.depthAtr - 3.0) * 0.3, 0, 1);
             if (move.depthAtr > 2.5) return clamp((move.depthAtr - 2.0) * 0.2, 0, 0.5);
             return 0;
@@ -2146,17 +2253,65 @@ public final class TradingCore {
             return clamp(s * 0.50, -0.6, 0.6);
         }
 
+        /**
+         * [FIX #3 + BUG A] Slope-based HTF — no EMA lag.
+         *
+         * Problem with old version: EMA9>EMA21 on 1h persists 5-9 hours after a pump.
+         * Document's fix (EMA delta over 1 hourly bar) is still EMA-based and lagged.
+         *
+         * New logic: compare close-to-close slope of last 3 hourly bars against the
+         * prior 3 hourly bars. This is forward-neutral — reacts within 2 hourly bars
+         * of an actual reversal, not 5-9.
+         *
+         * Weights: 30% static EMA stack (for trend regimes), 70% recent slope (for
+         * reversal detection). Combined so calcHTF returns a reversal signal when
+         * price has objectively changed direction on the hourly, regardless of what
+         * the EMA stack still says.
+         */
         private double calcHTF(List<Candle> c15, List<Candle> c1h) {
-            int v = 0;
-            if (c1h.size() >= 25) {
-                if (fcEma(c1h, 9) > fcEma(c1h, 21)) v++; else v--;
+            if (c1h == null || c1h.size() < 8) return 0;
+            int hn = c1h.size();
+
+            // --- Static component: EMA stack (30% weight) ---
+            double staticScore = 0;
+            if (hn >= 25) {
+                double e9 = fcEma(c1h, 9);
+                double e21 = fcEma(c1h, 21);
+                double hPrice = c1h.get(hn - 1).close;
+                if (hPrice > e9 && e9 > e21)      staticScore =  0.80;
+                else if (hPrice < e9 && e9 < e21) staticScore = -0.80;
+                else if (e9 > e21)                staticScore =  0.35;
+                else                               staticScore = -0.35;
             }
-            if (c15.size() >= 50) {
-                // Use EMA50 on 15m as "HTF" context
+
+            // --- Dynamic component: last-3 vs prior-3 hourly slope (70% weight) ---
+            // This is the anti-lag fix. Reacts within 2 hourly bars of reversal.
+            double recentSlope = c1h.get(hn - 1).close - c1h.get(hn - 4).close;
+            double priorSlope  = c1h.get(hn - 4).close - c1h.get(hn - 7 >= 0 ? hn - 7 : 0).close;
+            double basis = Math.max(1e-9, Math.abs(c1h.get(hn - 1).close));
+            double recentPct = recentSlope / basis;
+            double priorPct  = priorSlope  / basis;
+
+            double dynamicScore;
+            // Divergence: price reversing vs prior direction = strong reversal signal
+            if (recentPct < -0.004 && priorPct > 0.002) {
+                dynamicScore = -0.80; // price turning DOWN after being up
+            } else if (recentPct > 0.004 && priorPct < -0.002) {
+                dynamicScore =  0.80; // price turning UP after being down
+            } else {
+                // Trend continuation — sign of recent slope, magnitude scaled
+                dynamicScore = clamp(recentPct * 50.0, -0.80, 0.80);
+            }
+
+            // Secondary check on 15m EMA21/EMA50 stack (small weight, sanity)
+            double m15Score = 0;
+            if (c15 != null && c15.size() >= 50) {
                 double e21 = fcEma(c15, 21), e50 = fcEma(c15, 50);
-                if (e21 > e50) v++; else v--;
+                m15Score = (e21 > e50) ? 0.20 : -0.20;
             }
-            return switch (v) { case 2 -> 0.50; case -2 -> -0.50; default -> v * 0.15; };
+
+            double result = staticScore * 0.30 + dynamicScore * 0.60 + m15Score * 0.10;
+            return clamp(result, -1.0, 1.0);
         }
 
         private double calcFisher(List<Candle> c, int p) {

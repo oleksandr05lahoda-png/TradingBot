@@ -1029,7 +1029,10 @@ public final class BotMain {
     private static void checkForecastAccuracy(com.bot.SignalSender sender,
                                               com.bot.TelegramBotSender telegram) {
         long now = System.currentTimeMillis();
-        long minAgeMs = 120 * 60_000L;
+        // [FIX #5] 120→45 min. On 15m TF, 3 bars (45m) is enough to resolve
+        // TP1 (1.0×ATR) or SL (0.8×ATR) in the vast majority of cases.
+        // Waiting 2 hours meant calibrator was learning from stale market regimes.
+        long minAgeMs = 45 * 60_000L;
 
         for (Iterator<Map.Entry<String, ForecastRecord>> it =
              forecastRecords.entrySet().iterator(); it.hasNext(); ) {
@@ -1044,60 +1047,86 @@ public final class BotMain {
                 continue;
             }
 
-            // [v14.0 FIX #5] Удаляем слишком старые неразрешённые записи (>4 часа)
+            // Remove unresolved records older than 4h
             if (fr.ageMs() > 4 * 60 * 60_000L) {
                 it.remove();
                 continue;
             }
 
             try {
-                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", 20);
+                // [FIX #5] Fetch enough candles to cover the full signal lifetime.
+                int barsNeeded = (int) Math.ceil(fr.ageMs() / (15.0 * 60_000L)) + 2;
+                barsNeeded = Math.max(5, Math.min(30, barsNeeded));
+                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", barsNeeded);
                 if (c == null || c.isEmpty()) continue;
                 double currentPrice = c.get(c.size() - 1).close;
 
-                // [v28.0] PATCH #17: Dynamic forecast accuracy threshold.
-                // OLD: static 0.3% — for ALT with ATR=1.5%, 0.3% is pure noise (20% of ATR).
-                //      Forecast was marked "correct" even on random micro-moves.
-                // NEW: threshold = max(0.3%, ATR(15m,14) * 0.25)
-                //      At ATR=1.5%: threshold = 0.375%. At ATR=2%: threshold = 0.5%.
-                double atrForFc = c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0;
-                double fcThreshold = atrForFc > 0
-                        ? Math.max(0.3, (atrForFc / currentPrice) * 100.0 * 0.25)
-                        : 0.3;
-
-                double changePct = (currentPrice - fr.entryPrice) / fr.entryPrice * 100.0;
-                boolean bullishMove = changePct > fcThreshold;
-                boolean bearishMove = changePct < -fcThreshold;
+                // ── [FIX #5] Path-based TP1/SL outcome detection ────────────
+                // Reconstruct approximate TP1/SL from ATR% at signal time.
+                // Default geometry: TP1 = entry ± 1.0×ATR, SL = entry ∓ 0.8×ATR.
+                double atrAbs = fr.robustAtrPctAtSignal > 0
+                        ? fr.robustAtrPctAtSignal * fr.entryPrice
+                        : (c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0);
 
                 boolean bullishBias = fr.forecastBias.contains("BULL");
                 boolean bearishBias = fr.forecastBias.contains("BEAR");
-
-                // [v14.0 FIX #9] Упрощённая и корректная логика:
-                // Correct = bias совпал с реальным направлением
-                boolean correct = (bullishBias && bullishMove) || (bearishBias && bearishMove);
                 boolean hasOpinion = bullishBias || bearishBias;
 
-                fr.resolved = true;
-                fr.actualOutcome = bullishMove ? "MOVED_UP"
-                        : bearishMove ? "MOVED_DOWN" : "FLAT";
+                boolean hitTP1 = false, hitSL = false;
 
-                if (hasOpinion && (bullishMove || bearishMove)) {
-                    // [FIX #19] Only count if not already counted via markForecastRecord
+                if (hasOpinion && atrAbs > 0) {
+                    boolean longSide = bullishBias;
+                    double tp1 = longSide ? fr.entryPrice + atrAbs * 1.0
+                            : fr.entryPrice - atrAbs * 1.0;
+                    double sl  = longSide ? fr.entryPrice - atrAbs * 0.8
+                            : fr.entryPrice + atrAbs * 0.8;
+
+                    // Walk candles in chronological order from signal creation.
+                    for (com.bot.TradingCore.Candle bar : c) {
+                        if (bar.openTime + 15 * 60_000L < fr.createdAt) continue;
+                        boolean tpHere = longSide ? bar.high >= tp1 : bar.low  <= tp1;
+                        boolean slHere = longSide ? bar.low  <= sl  : bar.high >= sl;
+                        // Both in same bar → conservative (assume SL hit first).
+                        if (tpHere && slHere) { hitSL = true; break; }
+                        if (tpHere) { hitTP1 = true; break; }
+                        if (slHere) { hitSL  = true; break; }
+                    }
+                }
+
+                // ── Outcome classification ─────────────────────────────────
+                boolean correct;
+                String outcome;
+                if (hitTP1) {
+                    correct = true; outcome = "TP1";
+                } else if (hitSL) {
+                    correct = false; outcome = "SL";
+                } else {
+                    // Neither hit — fall back to direction at check time.
+                    double atrForFc = c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0;
+                    double fcThreshold = atrForFc > 0
+                            ? Math.max(0.3, (atrForFc / currentPrice) * 100.0 * 0.25)
+                            : 0.3;
+                    double changePct = (currentPrice - fr.entryPrice) / fr.entryPrice * 100.0;
+                    boolean bullishMove = changePct > fcThreshold;
+                    boolean bearishMove = changePct < -fcThreshold;
+                    correct = (bullishBias && bullishMove) || (bearishBias && bearishMove);
+                    outcome = bullishMove ? "MOVED_UP" : bearishMove ? "MOVED_DOWN" : "FLAT";
+                }
+
+                fr.resolved = true;
+                fr.actualOutcome = outcome;
+
+                boolean decisive = hitTP1 || hitSL || !"FLAT".equals(outcome);
+                if (hasOpinion && decisive) {
                     if (!fr.counted) {
                         fr.counted = true;
                         forecastTotal.incrementAndGet();
                         if (correct) forecastCorrect.incrementAndGet();
                     }
 
-                    // [v42.0 FIX #1] Feed the ProbabilityCalibrator with this resolved outcome.
-                    // Without this, the isotonic calibrator in DecisionEngineMerged stays empty
-                    // and falls through to raw score (no calibration).
-                    // [v43 PATCH FIX #1] Feed calibrator with SIGNAL probability (not forecastScore).
-                    // forecastScore ∈ [-1..+1] = directional forecast; calibrator needs [0..1] win prob.
-                    // signalProbability = the exact % shown in Telegram (e.g. 72%) → correct feedback loop.
-                    // robustAtrPctAtSignal = ATR% captured when signal fired → correct vol-bucket lookup.
                     try {
                         double sigProb01 = Math.max(0.01, Math.min(0.99, fr.signalProbability / 100.0));
+                        double atrForFc = c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0;
                         double atrPctForBucket = fr.robustAtrPctAtSignal > 0
                                 ? fr.robustAtrPctAtSignal * 100.0
                                 : (atrForFc > 0 ? (atrForFc / currentPrice) * 100.0 : 1.0);
@@ -1107,19 +1136,17 @@ public final class BotMain {
                         LOG.fine("[CAL] feed failed: " + cbe.getMessage());
                     }
                 }
-                // FLAT результаты не считаем — бот не может предсказать "ничего не произойдёт"
 
                 int total   = forecastTotal.get();
                 int correct2 = forecastCorrect.get();
                 double acc  = total > 0 ? (double) correct2 / total * 100 : 0;
 
-                LOG.info(String.format("[FC] %s bias=%s actual=%s %s | Accuracy: %.0f%% (%d/%d)",
-                        fr.symbol, fr.forecastBias, fr.actualOutcome,
+                LOG.info(String.format("[FC] %s bias=%s outcome=%s %s | Accuracy: %.0f%% (%d/%d)",
+                        fr.symbol, fr.forecastBias, outcome,
                         correct ? "✅" : "❌",
                         acc, correct2, total));
 
                 if (total > 0 && total % 20 == 0) {
-                    // [FIX v32+] Rate-gate: max 1 Forecast report per hour
                     long nowMs = System.currentTimeMillis();
                     if (nowMs - lastForecastReportMs >= FORECAST_REPORT_INTERVAL_MS) {
                         lastForecastReportMs = nowMs;

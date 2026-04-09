@@ -1262,14 +1262,17 @@ public final class DecisionEngineMerged {
         int n15 = c15.size();
         double move4bars = last(c15).close - c15.get(n15 - 5).close;
         boolean lateEntryLong = false, lateEntryShort = false;
+        double lateMoveAtrMul = 0; // [FIX #4] tracked for hard veto below
         if (Math.abs(move4bars) > atr14 * 2.0) {
             int consec = 0;
             boolean up = move4bars > 0;
             for (int i = n15 - 1; i >= Math.max(0, n15 - 6); i--) {
                 if ((c15.get(i).close > c15.get(i).open) == up) consec++; else break;
             }
-            if (consec >= 3 && up) lateEntryLong = true;
-            if (consec >= 3 && !up) lateEntryShort = true;
+            // [FIX #4] 3→2: catch late entries one bar earlier
+            if (consec >= 2 && up) lateEntryLong = true;
+            if (consec >= 2 && !up) lateEntryShort = true;
+            lateMoveAtrMul = Math.abs(move4bars) / (atr14 + 1e-12);
         }
 
         // ════════════════════════════════════════════════════════
@@ -1539,6 +1542,39 @@ public final class DecisionEngineMerged {
             boolean cvdBullPersistent = isCVDPersistent(symbol, true, bullPersistBars);
             boolean volBull = (vd != null && vd > 0 && vdRatio > 1.5) || (cvdVal > 0.10 && cvdBullPersistent);
             boolean volBear = (vd != null && vd < 0 && vdRatio > 1.5) || cvdVal < -0.10; // bear: instant
+
+            // [FIX #6] DISTRIBUTION DETECTOR
+            // Classic distribution: volume expanding on last 3 bars, but price gain
+            // decelerating > 50% vs prior 3 bars. Institutions offloading to retail —
+            // CVD still positive (retail hitting ask) but price can no longer advance.
+            // When detected → volBull is suppressed so LONG loses its CVD confirmation.
+            boolean distributionPattern = false;
+            if (volBull && n15 >= 8) {
+                double prevAvgGain = 0, currAvgGain = 0;
+                double prevVolSum = 0, currVolSum = 0;
+                for (int i = n15 - 7; i < n15 - 4; i++) {
+                    prevAvgGain += Math.max(0, c15.get(i).close - c15.get(i - 1).close);
+                    prevVolSum += c15.get(i).volume;
+                }
+                for (int i = n15 - 3; i < n15; i++) {
+                    currAvgGain += Math.max(0, c15.get(i).close - c15.get(i - 1).close);
+                    currVolSum += c15.get(i).volume;
+                }
+                prevAvgGain /= 3.0; currAvgGain /= 3.0;
+                double prevAvgVol = prevVolSum / 3.0;
+                double currAvgVol = currVolSum / 3.0;
+
+                boolean volumeExpanding = currAvgVol > prevAvgVol * 1.2;
+                boolean momentumDecelerating = prevAvgGain > 0 && currAvgGain < prevAvgGain * 0.5;
+                distributionPattern = volumeExpanding && momentumDecelerating;
+
+                if (distributionPattern) {
+                    volBull = false; // block CVD-based LONG confirmation
+                    allFlags.add("DISTRIBUTION_PATTERN");
+                    // Also add a soft short hint — effort-fail at top is bearish
+                    cVolume.addShort(mctx.s(0.35), "DIST_EFFORT_FAIL");
+                }
+            }
 
             if (volBull && bestScore > 0) cVolume.addLong(bestScore,  cvdScore >= vdScore ? "CVD_BUY" : "VD_BUY");
             if (volBear && bestScore > 0) cVolume.addShort(bestScore, cvdScore >= vdScore ? "CVD_SELL" : "VD_SELL");
@@ -2049,6 +2085,17 @@ public final class DecisionEngineMerged {
             lateEntryPenalty = true;
             allFlags.add("LATE_ENTRY_S");
         }
+
+        // [FIX #4] HARD ATR VETO for extended late entries.
+        // If price has already moved > 2.8×ATR over last 4 bars, EARLY_SOLO is the
+        // only acceptable override. BOS_UP_5M / ANTI_LAG_UP etc. fire too easily
+        // on the retrace of a completed pump → they enable LONG chasing into
+        // distribution. EARLY_SOLO is stricter and harder to spoof.
+        if (lateEntryPenalty && lateMoveAtrMul > 2.8 && !allFlags.contains("EARLY_SOLO")) {
+            allFlags.add(String.format("LATE_HARD_BLOCK_%.1fx", lateMoveAtrMul));
+            return null; // hard reject — do not let leadBreakoutOverride save this
+        }
+
         boolean leadBreakoutOverride = lateEntryPenalty && (
                 allFlags.contains("EARLY_SOLO")
                         || (side == com.bot.TradingCore.Side.LONG && (
