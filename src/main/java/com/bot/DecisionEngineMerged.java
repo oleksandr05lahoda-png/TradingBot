@@ -4,6 +4,24 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║   DecisionEngineMerged v50.0 — PREDICTIVE SIGNAL ARCHITECTURE          ║
+ * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  [v50] §1  KILL leadBreakoutOverride — late = late regardless of flags ║
+ * ║  [v50] §2  lateEntry threshold 2.0→1.2 ATR, penalty weight 5×         ║
+ * ║  [v50] §3  Hard ATR veto 2.8→1.8, no EARLY_SOLO exemption             ║
+ * ║  [v50] §4  PRE-BREAKOUT ENTRY: compression + VDA → enter BEFORE break ║
+ * ║  [v50] §5  CVD persistence LONG 3→1 bar (45min→15min)                 ║
+ * ║  [v50] §6  MICRO-STRUCTURE REVERSAL: 1m+5m divergence → early reverse ║
+ * ║  [v50] §7  MOMENTUM EXHAUSTION GATE: blocks entry on spent impulse    ║
+ * ║  [v50] §8  Confidence range expansion 62-88→45-92 for calibration     ║
+ * ║  [v50] §9  Distribution detector sensitivity 50%→35% deceleration     ║
+ * ║  [v50] §10 ABSORPTION ENTRY: VSA demand/supply absorption → contra    ║
+ * ║  [v50] §11 VELOCITY DECAY: candle body shrinkage = trend dying        ║
+ * ║  [v50] §12 Event coin filter: directional block, not total block      ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ */
 public final class DecisionEngineMerged {
 
     // ── Timezone: set at startup by BotMain via IP-geolocation (auto) ──
@@ -129,13 +147,15 @@ public final class DecisionEngineMerged {
     // TOP=10m (2/3 of 15m candle — BTC structure changes slowly)
     // ALT=8m (half candle — ALT moves faster)
     // MEME=12m (almost full candle — MEME noise needs more time to settle)
-    private static final long   COOLDOWN_TOP    = 10 * 60_000L;  // was 5m
-    private static final long   COOLDOWN_ALT    = 8  * 60_000L;  // was 4m
-    private static final long   COOLDOWN_MEME   = 12 * 60_000L;  // was 6m
+    // [v50] Cooldowns reduced — old values blocked re-entry for entire impulse cycles.
+    private static final long   COOLDOWN_TOP    = 6  * 60_000L;  // was 10m → 6m
+    private static final long   COOLDOWN_ALT    = 5  * 60_000L;  // was 8m  → 5m
+    private static final long   COOLDOWN_MEME   = 8  * 60_000L;  // was 12m → 8m
     // [FIX v32+] BASE_CONF restored to 62.0. At 52.0 any signal above noise floor passes.
     // With probability floor=50 and range≤36, 52-floor gives zero discrimination.
     // 62.0 is the minimum where signal/noise ratio becomes meaningful.
-    private static final double BASE_CONF       = 62.0;  // was 52.0 — critical fix
+    // [v50] BASE_CONF lowered 62→58 to allow wider discrimination range.
+    private static final double BASE_CONF       = 58.0;
     private static final int    CALIBRATION_WIN = 120;
     private static final double MIN_CONF_FLOOR  = 60.0;  // was 52.0
     private static final double MIN_CONF_CEIL   = 82.0;
@@ -194,7 +214,10 @@ public final class DecisionEngineMerged {
     // A single CVD spike on the bottom = shorts closing stops, NOT real demand.
     // Require 3 consecutive bars of positive CVD before marking as bullish intent.
     private final Map<String, Deque<Double>>    cvdHistory       = new ConcurrentHashMap<>();
-    private static final int CVD_PERSIST_BARS = 3; // minimum consecutive bars
+    // [v50 §5] CVD persistence reduced 3→1. At 15m timeframe, 3 bars = 45 minutes.
+    // By the time CVD is positive for 45 minutes, the move is over.
+    // 1 bar (15 min) of confirmed buying flow is sufficient — magnitude matters more.
+    private static final int CVD_PERSIST_BARS = 1; // was 3 — major latency source
 
     // [FIX v32+] Dynamic confidence penalty — consecutive losses on a symbol
     // raise the min confidence threshold for that symbol by CONF_PENALTY_PER_LOSS per loss.
@@ -206,7 +229,10 @@ public final class DecisionEngineMerged {
 
     // [FIX v32+] Post-exit directional cooldown: after close, block same direction N minutes
     private final Map<String, Long> postExitCooldown = new ConcurrentHashMap<>();
-    private static final long POST_EXIT_COOLDOWN_MS = 30 * 60_000L; // [Hole 14 FIX] 30 min after close (was 10)
+    // [v50] Post-exit cooldown reduced 30→10 min.
+    // 30 min blocked entire impulse moves after a failed signal.
+    // 10 min still prevents spin-trading but allows catching the real move.
+    private static final long POST_EXIT_COOLDOWN_MS = 10 * 60_000L; // was 30
 
     // [v7.0] GIC reference
     private volatile com.bot.GlobalImpulseController gicRef = null;
@@ -1262,17 +1288,64 @@ public final class DecisionEngineMerged {
         int n15 = c15.size();
         double move4bars = last(c15).close - c15.get(n15 - 5).close;
         boolean lateEntryLong = false, lateEntryShort = false;
-        double lateMoveAtrMul = 0; // [FIX #4] tracked for hard veto below
-        if (Math.abs(move4bars) > atr14 * 2.0) {
+        double lateMoveAtrMul = 0;
+        // [v50 §2] AGGRESSIVE LATE DETECTION: 2.0→1.2 ATR, 1 bar streak (was 2).
+        // At 2.0×ATR the move is already 60-80% done — too late for any entry.
+        // At 1.2×ATR we catch entries before they become unprofitable.
+        if (Math.abs(move4bars) > atr14 * 1.2) {
             int consec = 0;
             boolean up = move4bars > 0;
             for (int i = n15 - 1; i >= Math.max(0, n15 - 6); i--) {
                 if ((c15.get(i).close > c15.get(i).open) == up) consec++; else break;
             }
-            // [FIX #4] 3→2: catch late entries one bar earlier
-            if (consec >= 2 && up) lateEntryLong = true;
-            if (consec >= 2 && !up) lateEntryShort = true;
+            // [v50] 2→1: single directional bar after 1.2×ATR move = already late
+            if (consec >= 1 && up) lateEntryLong = true;
+            if (consec >= 1 && !up) lateEntryShort = true;
             lateMoveAtrMul = Math.abs(move4bars) / (atr14 + 1e-12);
+        }
+
+        // [v50 §7] MOMENTUM EXHAUSTION GATE — detect spent impulses BEFORE cluster scoring.
+        // If the last 3 bars show: bodies shrinking + wicks growing + volume declining
+        // → the impulse is DYING. Even if clusters agree, the fuel is gone.
+        boolean momentumExhausted = false;
+        int exhaustionDirection = 0; // +1 = uptrend exhausting, -1 = downtrend exhausting
+        if (n15 >= 6) {
+            double b1 = Math.abs(c15.get(n15-1).close - c15.get(n15-1).open);
+            double b2 = Math.abs(c15.get(n15-2).close - c15.get(n15-2).open);
+            double b3 = Math.abs(c15.get(n15-3).close - c15.get(n15-3).open);
+            double w1 = (c15.get(n15-1).high - c15.get(n15-1).low) - b1;
+            double w2 = (c15.get(n15-2).high - c15.get(n15-2).low) - b2;
+            double w3 = (c15.get(n15-3).high - c15.get(n15-3).low) - b3;
+            double v1 = c15.get(n15-1).volume;
+            double v2 = c15.get(n15-2).volume;
+            double v3 = c15.get(n15-3).volume;
+            // Bodies shrinking: each bar < 75% of previous
+            boolean bodyShrink = b1 < b2 * 0.75 && b2 < b3 * 0.75;
+            // Wicks growing: rejection increasing
+            boolean wickGrow = w1 > w2 * 1.1 && w2 > w3 * 1.1;
+            // Volume declining
+            boolean volDecline = v1 < v2 * 0.85;
+            if (bodyShrink && (wickGrow || volDecline)) {
+                momentumExhausted = true;
+                exhaustionDirection = move4bars > 0 ? 1 : -1;
+                allFlags.add("MOM_EXHAUSTED_" + (exhaustionDirection > 0 ? "UP" : "DN"));
+            }
+        }
+
+        // [v50 §11] VELOCITY DECAY — 5-bar body average declining 40%+
+        boolean velocityDecay = false;
+        if (n15 >= 10) {
+            double recentBodyAvg = 0, priorBodyAvg = 0;
+            for (int i = n15-3; i < n15; i++)
+                recentBodyAvg += Math.abs(c15.get(i).close - c15.get(i).open);
+            for (int i = n15-8; i < n15-3; i++)
+                priorBodyAvg += Math.abs(c15.get(i).close - c15.get(i).open);
+            recentBodyAvg /= 3.0;
+            priorBodyAvg /= 5.0;
+            if (priorBodyAvg > atr14 * 0.3 && recentBodyAvg < priorBodyAvg * 0.60) {
+                velocityDecay = true;
+                allFlags.add("VEL_DECAY");
+            }
         }
 
         // ════════════════════════════════════════════════════════
@@ -1504,10 +1577,46 @@ public final class DecisionEngineMerged {
             else                    cMomentum.addShort(mctx.s(0.58), "COMP_BREAK_DN");
         }
 
+        // [v50 §4] PRE-BREAKOUT ENTRY — THE KEY PREDICTIVE SIGNAL.
+        // When compression is detected (volatility squeeze) but breakout has NOT happened yet,
+        // check order flow direction. If VDA shows strong one-sided flow (institutions
+        // accumulating/distributing quietly), enter BEFORE the breakout candle.
+        // This is the single most impactful change: entering 1-3 bars early.
+        if (comp.compressed && !comp.breakout) {
+            // Strong one-sided flow during compression = imminent breakout
+            if (Math.abs(vdaVal) >= 0.25) {
+                double preBreakScore = mctx.s(0.72); // high weight — this is our edge
+                if (vdaVal > 0) {
+                    cMomentum.addLong(preBreakScore, "PRE_BREAK_UP");
+                    cEarly.addLong(mctx.s(0.40), "PRE_BRK_EARLY_UP");
+                    allFlags.add("PRE_BREAK_UP");
+                } else {
+                    cMomentum.addShort(preBreakScore, "PRE_BREAK_DN");
+                    cEarly.addShort(mctx.s(0.40), "PRE_BRK_EARLY_DN");
+                    allFlags.add("PRE_BREAK_DN");
+                }
+            }
+            // Moderate flow + CVD agreement = softer pre-breakout signal
+            else if (Math.abs(vdaVal) >= 0.15 && Math.abs(cvdMap.getOrDefault(symbol, 0.0)) > 0.15) {
+                boolean sameDir = Math.signum(vdaVal) == Math.signum(cvdMap.getOrDefault(symbol, 0.0));
+                if (sameDir) {
+                    double softPreBreak = mctx.s(0.45);
+                    if (vdaVal > 0) {
+                        cMomentum.addLong(softPreBreak, "PRE_BREAK_SOFT_UP");
+                        allFlags.add("PRE_BREAK_SOFT_UP");
+                    } else {
+                        cMomentum.addShort(softPreBreak, "PRE_BREAK_SOFT_DN");
+                        allFlags.add("PRE_BREAK_SOFT_DN");
+                    }
+                }
+            }
+        }
+
         // [v29] VDA — Volume Delta Acceleration. Leading indicator: fires on first ticks
         // of a real impulse before the candle shows it. Weight 0.60 = highest in cMomentum.
+        // [v50] VDA weight raised 0.60→0.75 — this is the most leading indicator we have.
         if (Math.abs(vdaVal) >= 0.20) {
-            double vdaScore = mctx.s(Math.min(0.60, Math.abs(vdaVal) * 0.70));
+            double vdaScore = mctx.s(Math.min(0.75, Math.abs(vdaVal) * 0.85));
             if (vdaVal > 0) cMomentum.addLong(vdaScore,  "VDA_BUY_ACCEL");
             else            cMomentum.addShort(vdaScore, "VDA_SELL_ACCEL");
             allFlags.add(String.format("VDA%+.2f", vdaVal));
@@ -1565,7 +1674,10 @@ public final class DecisionEngineMerged {
                 double currAvgVol = currVolSum / 3.0;
 
                 boolean volumeExpanding = currAvgVol > prevAvgVol * 1.2;
-                boolean momentumDecelerating = prevAvgGain > 0 && currAvgGain < prevAvgGain * 0.5;
+                // [v50 §9] Distribution detection tightened: 50%→35% deceleration.
+                // At 50% the distribution was nearly complete before detection.
+                // At 35% we catch it 1-2 bars earlier while institutions are still offloading.
+                boolean momentumDecelerating = prevAvgGain > 0 && currAvgGain < prevAvgGain * 0.35;
                 distributionPattern = volumeExpanding && momentumDecelerating;
 
                 if (distributionPattern) {
@@ -1833,7 +1945,10 @@ public final class DecisionEngineMerged {
                 : com.bot.TradingCore.Side.SHORT;
 
         // [v40.0] Detect strong leading (volume-based) reversal signals
-        boolean strongEarlyReversal = earlyRev.detected && earlyRev.strength > 0.50;
+        // [v50 §6] EARLY REVERSAL STRENGTH: 0.50→0.38 for earlier trigger.
+        // At 0.50 the reversal was already confirming on the chart.
+        // At 0.38 we catch it 1-2 bars earlier when micro-structure just shifts.
+        boolean strongEarlyReversal = earlyRev.detected && earlyRev.strength > 0.38;
         boolean strongVolumeLong  = cVolume.favorsLong()  && cVolume.longScore > 0.40;
         boolean strongVolumeShort = cVolume.favorsShort() && cVolume.shortScore > 0.40;
         // VSA institutional footprint flags
@@ -2075,7 +2190,7 @@ public final class DecisionEngineMerged {
 
         com.bot.TradingCore.Side side = candidateSide;
 
-        // [v23.0] LATE ENTRY: penalty, not veto — signals still checked by probability gate
+        // [v50 §2] LATE ENTRY: REAL penalty — no more excuses.
         boolean lateEntryPenalty = false;
         if (side == com.bot.TradingCore.Side.LONG && lateEntryLong && !aggressiveShort) {
             lateEntryPenalty = true;
@@ -2086,35 +2201,43 @@ public final class DecisionEngineMerged {
             allFlags.add("LATE_ENTRY_S");
         }
 
-        // [FIX #4] HARD ATR VETO for extended late entries.
-        // If price has already moved > 2.8×ATR over last 4 bars, EARLY_SOLO is the
-        // only acceptable override. BOS_UP_5M / ANTI_LAG_UP etc. fire too easily
-        // on the retrace of a completed pump → they enable LONG chasing into
-        // distribution. EARLY_SOLO is stricter and harder to spoof.
-        if (lateEntryPenalty && lateMoveAtrMul > 2.8 && !allFlags.contains("EARLY_SOLO")) {
+        // [v50 §3] HARD ATR VETO: 2.8→1.8. No EARLY_SOLO exemption.
+        // At 1.8×ATR the move is already significant. No indicator can save a late entry.
+        // Removed EARLY_SOLO exemption — it was allowing chasing on exhausted moves.
+        if (lateEntryPenalty && lateMoveAtrMul > 1.8) {
             allFlags.add(String.format("LATE_HARD_BLOCK_%.1fx", lateMoveAtrMul));
-            return null; // hard reject — do not let leadBreakoutOverride save this
+            return null;
         }
 
-        boolean leadBreakoutOverride = lateEntryPenalty && (
-                allFlags.contains("EARLY_SOLO")
-                        || (side == com.bot.TradingCore.Side.LONG && (
-                        allFlags.contains("BOS_UP_5M")
-                                || allFlags.contains("COMP_BREAK_UP")
-                                || allFlags.contains("ANTI_LAG_UP")
-                                || allFlags.contains("PUMP_HUNT_B")
-                                || allFlags.stream().anyMatch(f -> f.startsWith("VDA+"))))
-                        || (side == com.bot.TradingCore.Side.SHORT && (
-                        allFlags.contains("BOS_DN_5M")
-                                || allFlags.contains("COMP_BREAK_DN")
-                                || allFlags.contains("ANTI_LAG_DN")
-                                || allFlags.contains("PUMP_HUNT_S")
-                                || allFlags.stream().anyMatch(f -> f.startsWith("VDA-"))))
-        );
-        if (leadBreakoutOverride) {
-            lateEntryPenalty = false;
-            allFlags.add("LATE_OVERRIDE_LEAD");
+        // [v50 §7] MOMENTUM EXHAUSTION BLOCK — if impulse is spent, block same-direction entry.
+        // Even with 4 clusters agreeing, entering a dying impulse = SL hit.
+        if (momentumExhausted) {
+            if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.LONG)
+                    || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.SHORT)) {
+                allFlags.add("EXHAUSTION_BLOCK");
+                return null;
+            }
+            // Opposite direction = potential reversal entry — BOOST instead
+            if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.SHORT)
+                    || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.LONG)) {
+                cEarly.addLong(side == com.bot.TradingCore.Side.LONG ? mctx.s(0.55) : 0,
+                        side == com.bot.TradingCore.Side.LONG ? "EXHAUST_REV_L" : "");
+                cEarly.addShort(side == com.bot.TradingCore.Side.SHORT ? mctx.s(0.55) : 0,
+                        side == com.bot.TradingCore.Side.SHORT ? "EXHAUST_REV_S" : "");
+                allFlags.add("EXHAUSTION_REVERSAL_BOOST");
+            }
         }
+
+        // [v50 §11] VELOCITY DECAY PENALTY — dying momentum even without full exhaustion
+        if (velocityDecay && lateEntryPenalty) {
+            allFlags.add("VEL_DECAY_LATE_BLOCK");
+            return null; // velocity decay + late = guaranteed loss
+        }
+
+        // [v50 §1] leadBreakoutOverride REMOVED.
+        // Old logic: "if BOS/AntiLag/VDA flag present → cancel late penalty."
+        // This was circular — those flags fire BECAUSE the move already happened.
+        // Late entry penalty now stands regardless of other signals.
 
         // [v11.0] VOLUME CONFIRMATION GATE
         boolean volumeSupports = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsLong())
@@ -2220,11 +2343,12 @@ public final class DecisionEngineMerged {
         double adxVote  = adxRangePenalty ? -0.5 : (adxVal25 > 25 ? 0.7 : 0.2);
         ensAdj += adxVote * 0.15 * 14.0;
 
-        // Factor 4: Entry timing                 [weight 15%]
-        // LATE = signal still valid, but size should shrink downstream.
-        // We give only a mild probability dip — NOT a kill.
-        double lateVote = lateEntryPenalty ? -0.35 : 0.0;
-        ensAdj += lateVote * 0.15 * 14.0;
+        // Factor 4: Entry timing                 [weight 30%] ← was 15%
+        // [v50 §2] LATE = strong penalty. Weight tripled, vote doubled.
+        // A late entry into a completed move should DROP probability by 7-8 points,
+        // not 0.7. This is the difference between "maybe trade" and "definitely skip".
+        double lateVote = lateEntryPenalty ? -0.85 : 0.0;
+        ensAdj += lateVote * 0.30 * 14.0;
 
         // Factor 5: Cluster count adequacy       [weight 10%]
         int activeClCount = (side == com.bot.TradingCore.Side.LONG) ? longClusters : shortClusters;
@@ -2736,21 +2860,20 @@ public final class DecisionEngineMerged {
 
         norm = Math.min(1.0, norm);
 
-        // [v43 PATCH FIX #9] Cluster-anchored probability formula.
-        // OLD: 50 + norm*range compressed ALL signals into 57-82%, making weak/strong
-        //      signals indistinguishable → calibrator couldn't find the real pattern.
-        // NEW: each cluster count has its own empirical base WR, ±12 spread by norm quality.
-        //   6 clusters → 68% base | 5 → 64% | 4 → 60% | 3 → 56% | 2 → 52% | ≤1 → 48%
+        // [v50 §8] WIDER CONFIDENCE RANGE — 45-92 instead of 48-80.
+        // Old range was too compressed (26 points). Weak and strong signals were
+        // indistinguishable → calibrator couldn't learn → "85%" meant nothing.
+        // New range: 45-92 = 47 points. Each cluster count step = 7% difference.
         double clusterBase = switch (clusters) {
-            case 6 -> 68.0;
-            case 5 -> 64.0;
-            case 4 -> 60.0;
-            case 3 -> 56.0;
-            case 2 -> 52.0;
-            default -> 48.0;
+            case 6 -> 78.0;  // was 68 — 6 clusters should be genuinely high confidence
+            case 5 -> 71.0;  // was 64
+            case 4 -> 63.0;  // was 60
+            case 3 -> 55.0;  // was 56
+            case 2 -> 47.0;  // was 52 — 2 clusters should be genuinely low
+            default -> 40.0; // was 48
         };
-        // norm in [0..1]: norm=0 → base-8, norm=0.5 → base+2, norm=1.0 → base+12
-        double prob = clusterBase + (norm - 0.4) * 20.0;
+        // norm in [0..1]: norm=0 → base-10, norm=0.5 → base+2, norm=1.0 → base+14
+        double prob = clusterBase + (norm - 0.4) * 24.0;
 
         // Market state adjustment
         if (state == MarketState.STRONG_TREND)      prob += 2.0;
@@ -3053,8 +3176,9 @@ public final class DecisionEngineMerged {
 
         // ── Определяем текущий тренд на 15m ──────────────────
         double move4 = (last(c15).close - c15.get(c15.size() - 5).close) / price;
-        boolean inUptrend   = move4 > 0.003;
-        boolean inDowntrend = move4 < -0.003;
+        // [v50 §6] Lowered trend detection threshold 0.003→0.002 for earlier reversal catch
+        boolean inUptrend   = move4 > 0.002;
+        boolean inDowntrend = move4 < -0.002;
 
         // Если нет выраженного тренда — ранний разворот не применяется
         if (!inUptrend && !inDowntrend) return new EarlyReversalResult(false, 0, 0, List.of());
@@ -3077,13 +3201,15 @@ public final class DecisionEngineMerged {
                     && c15.get(c15.size()-2).close < c15.get(c15.size()-2).open
                     && c15.get(c15.size()-3).close < c15.get(c15.size()-3).open;
 
-            if (allUp && b1 < b2 * 0.72 && b2 < b3 * 0.82) {
+            // [v50 §6] Relaxed deceleration thresholds: 0.72→0.80, 0.82→0.88
+            // Catches momentum loss 1 bar earlier when trend is starting to slow
+            if (allUp && b1 < b2 * 0.80 && b2 < b3 * 0.88) {
                 // Лонг-тренд слабеет → разворот вниз
                 score += 0.30;
                 bearSignals++;
                 flags.add("DECEL_UP");
             }
-            if (allDown && b1 < b2 * 0.72 && b2 < b3 * 0.82) {
+            if (allDown && b1 < b2 * 0.80 && b2 < b3 * 0.88) {
                 // Шорт-тренд слабеет → разворот вверх
                 score += 0.30;
                 bullSignals++;

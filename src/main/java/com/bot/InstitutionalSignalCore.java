@@ -386,8 +386,11 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [v28.0] PATCH #2: MIN_CONF floor raised 52→62 until 200+ trades verify edge.
-        double floor = getTotalTradeCount() >= 200 ? 52.0 : 62.0;
+        // [v50] Floor lowered 62→58 to match expanded confidence range.
+        // With the new wider cluster-base scores (40-78), 62 floor was blocking
+        // valid 3-cluster signals. At 58 we let through moderate-conviction setups
+        // that can still have positive EV due to better entry timing.
+        double floor = getTotalTradeCount() >= 200 ? 50.0 : 58.0;
 
         double base = Math.max(baseMinConfidence, floor);
 

@@ -7,29 +7,31 @@ public final class PumpHunter {
 
     // ======================= CONFIG =======================
 
-    private static final double PUMP_BODY_ATR_MULT = 2.2;
-    private static final double MEGA_PUMP_BODY_ATR_MULT = 3.5;
-    // [v40.0] VOLUME_SPIKE_MULT raised 2.5→3.0: compensates for lower MIN_MOVE_PCT.
-    // Smaller price moves are OK only if volume is truly anomalous (3× avg, not 2.5×).
-    private static final double VOLUME_SPIKE_MULT = 3.0;
-    private static final double MEGA_VOLUME_SPIKE_MULT = 4.0;
+    // [v50] Body-to-ATR thresholds lowered for earlier pump detection.
+    // At 2.2× the pump candle was already fully formed. At 1.6× we catch it forming.
+    private static final double PUMP_BODY_ATR_MULT = 1.6;       // was 2.2
+    private static final double MEGA_PUMP_BODY_ATR_MULT = 2.8;  // was 3.5
+    // [v50] Volume spike thresholds also lowered to catch institutional accumulation earlier.
+    // Institutional buying often comes in waves: first wave is 2× avg, main wave is 3×+.
+    // At 3.0 we missed the first wave entirely. At 2.2 we catch the start.
+    private static final double VOLUME_SPIKE_MULT = 2.2;      // was 3.0
+    private static final double MEGA_VOLUME_SPIKE_MULT = 3.5;  // was 4.0
 
-    // [v40.0] MIN_MOVE_PCT lowered 1.2%→0.9%: catches pumps 1-2 candles earlier.
-    // At 1.2% on 15m TF, the pump is already 50-70% done by the time PumpHunter fires.
-    // 0.9% with VOLUME_SPIKE_MULT=3.0 filters noise while catching the early phase.
-    // NOT 0.7% (Gemini suggestion) — that's pure noise for mid-cap alts with ATR=1.5%.
-    private static final double MIN_MOVE_PCT = 0.009;
-    // [v40.0] STRONG_MOVE_PCT lowered 2.2%→1.8%: aligns with new MIN scale.
-    private static final double STRONG_MOVE_PCT = 0.018;
-    private static final double MEGA_MOVE_PCT = 0.035;
-    private static final double DUMP_MOVE_PCT = -0.009;
-    private static final double STRONG_DUMP_PCT = -0.018;
+    // [v50] MIN_MOVE_PCT lowered 0.9%→0.6%: catches pumps 2-3 candles earlier.
+    // Combined with lower volume spike requirement, this catches the institutional
+    // accumulation phase before retail FOMO kicks in.
+    private static final double MIN_MOVE_PCT = 0.006;    // was 0.009
+    private static final double STRONG_MOVE_PCT = 0.014;  // was 0.018
+    private static final double MEGA_MOVE_PCT = 0.028;    // was 0.035
+    private static final double DUMP_MOVE_PCT = -0.006;   // was -0.009
+    private static final double STRONG_DUMP_PCT = -0.014; // was -0.018
 
     private static final int VOLUME_LOOKBACK = 20;
     private static final int ATR_PERIOD = 14;
     private static final int PUMP_CONFIRM_BARS = 3;
 
-    private static final long PUMP_COOLDOWN_MS = 10 * 60_000;
+    // [v50] Pump cooldown reduced 10→6 min
+    private static final long PUMP_COOLDOWN_MS = 6 * 60_000;  // was 10
 
     // ======================= STATE =======================
 

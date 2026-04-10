@@ -951,11 +951,14 @@ public final class GlobalImpulseController {
             }
         }
 
-        // [v38.0] CHOPPY MARKET — suppress ALL new entries (both LONG and SHORT)
-        // BTC is alternating direction rapidly with no structure.
-        // No edge exists in either direction — sitting out is the correct trade.
+        // [v50] CHOPPY MARKET — penalize but don't kill.
+        // Old: 0.05 = effectively blocked everything.
+        // Problem: individual coins can have clean setups even when BTC chops.
+        // New: 0.40 = significant penalty (-15 to -20 probability) but allows
+        // high-conviction signals through. Pre-breakout and reversal setups
+        // on strong RS coins still deserve evaluation.
         if (ctx.regime == GlobalRegime.BTC_CHOPPY) {
-            return 0.05; // effectively blocked by GIC weight gate in SignalSender
+            return 0.40;
         }
 
         // ── Уровень каскада определяет вес ──────────────────────

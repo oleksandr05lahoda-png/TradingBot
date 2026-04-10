@@ -122,12 +122,13 @@ public final class BotMain {
     // Cooldown: один прогноз по одной паре не чаще раза в 20 минут
     private static final java.util.concurrent.ConcurrentHashMap<String, Long>
             forecastCooldown = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 20 * 60_000L;
-    // Порог значимости прогноза: слабые сигналы не отправляем
-    private static final double AFC_MIN_DIRECTION_SCORE = 0.28; // |score| >= 0.28 (умеренный)
-    private static final double AFC_STRONG_SCORE        = 0.55; // |score| >= 0.55 (сильный)
-    // Максимум прогнозов за один запуск (не спамим)
-    private static final int AFC_MAX_PER_RUN = 4;
+    // [v50] Advance forecast cooldown reduced 20→12 min
+    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 12 * 60_000L;
+    // [v50] Direction score thresholds lowered for earlier forecast
+    private static final double AFC_MIN_DIRECTION_SCORE = 0.20; // was 0.28
+    private static final double AFC_STRONG_SCORE        = 0.42; // was 0.55
+    // Максимум прогнозов за один запуск
+    private static final int AFC_MAX_PER_RUN = 5; // was 4
 
     // ── Forecast accuracy tracker ─────────────────────────────────────────
     // [v14.0 FIX #5] MAX_FORECAST_RECORDS предотвращает утечку памяти

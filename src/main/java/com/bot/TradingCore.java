@@ -1716,30 +1716,34 @@ public final class TradingCore {
             double exhaustionScore = 0;
             int exhaustionSignals = 0;
 
+            // [v50] All exhaustion factor thresholds lowered 0.3→0.2.
+            // At 0.3 exhaustion was only detected when the move was nearly done.
+            // At 0.2 we catch the early signs 1-2 bars sooner.
+
             // Factor E1: Volume Fade — volume declining during the move
             double volFade = calcVolumeFade(c15, move);
             f.put("VOL_FADE", volFade);
-            if (volFade > 0.3) { exhaustionScore += volFade * 0.25; exhaustionSignals++; }
+            if (volFade > 0.2) { exhaustionScore += volFade * 0.28; exhaustionSignals++; }
 
             // Factor E2: Momentum Decay — each bar getting smaller
             double momDecay = calcMomentumDecay(c15, move, atr14);
             f.put("MOM_DECAY", momDecay);
-            if (momDecay > 0.3) { exhaustionScore += momDecay * 0.25; exhaustionSignals++; }
+            if (momDecay > 0.2) { exhaustionScore += momDecay * 0.28; exhaustionSignals++; }
 
             // Factor E3: Wick Rejection — opposition forming
             double wickReject = calcWickRejection(c15, move);
             f.put("WICK_REJ", wickReject);
-            if (wickReject > 0.3) { exhaustionScore += wickReject * 0.20; exhaustionSignals++; }
+            if (wickReject > 0.2) { exhaustionScore += wickReject * 0.22; exhaustionSignals++; }
 
             // Factor E4: RSI Extreme + Divergence
             double rsiExhaust = calcRsiExhaustion(c15, move);
             f.put("RSI_EXH", rsiExhaust);
-            if (rsiExhaust > 0.3) { exhaustionScore += rsiExhaust * 0.20; exhaustionSignals++; }
+            if (rsiExhaust > 0.2) { exhaustionScore += rsiExhaust * 0.22; exhaustionSignals++; }
 
             // Factor E5: Move overextended (moved too far too fast)
             double overext = calcOverextension(move, atr14);
             f.put("OVEREXT", overext);
-            if (overext > 0.3) { exhaustionScore += overext * 0.15; exhaustionSignals++; }
+            if (overext > 0.2) { exhaustionScore += overext * 0.18; exhaustionSignals++; }
 
             // Factor E6: VPOC Rubber Band — price far from volume magnet
             double vpocPull = calcVpocPull(c15, price, atr14);
@@ -1830,17 +1834,17 @@ public final class TradingCore {
                     squeezeBias += move.direction * 0.08;
                 }
                 dir = squeezeBias;
-            } else if (exhaustionScore > 0.50 && exhaustionSignals >= 2) {
-                // [v19.0] STRONG exhaustion: forecast REVERSAL (opposite to current move)
-                // Lowered from 0.55 / 3 signals to make it catch bottoms/tops faster
-                dir = -move.direction * exhaustionScore * 0.85;
-                // Trend brain can barely whisper
-                dir += trendDir * 0.05;
-            } else if (exhaustionScore > 0.30 && exhaustionSignals >= 1) {
-                // [v19.0] Moderate exhaustion: heavily reduce trend conviction
-                dir = trendDir * 0.25 + vpocPull * 0.25;
-                // Stronger counter-move bias
-                dir -= move.direction * exhaustionScore * 0.35;
+            } else if (exhaustionScore > 0.38 && exhaustionSignals >= 2) {
+                // [v50] STRONG exhaustion lowered 0.50→0.38, signals 2 (kept).
+                // At 0.50 the reversal was already confirmed on chart.
+                // At 0.38 we forecast it 1-2 bars earlier.
+                dir = -move.direction * exhaustionScore * 0.90;
+                dir += trendDir * 0.03;
+            } else if (exhaustionScore > 0.22 && exhaustionSignals >= 1) {
+                // [v50] Moderate exhaustion lowered 0.30→0.22.
+                // Single exhaustion signal = early warning, not full reversal.
+                dir = trendDir * 0.20 + vpocPull * 0.30;
+                dir -= move.direction * exhaustionScore * 0.45;
             } else if (phase == TrendPhase.EARLY) {
                 // Early in move: trend brain speaks louder
                 dir = trendDir * 0.70 + vpocPull * 0.10;

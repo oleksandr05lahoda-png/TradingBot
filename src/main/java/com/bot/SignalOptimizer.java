@@ -32,11 +32,11 @@ public final class SignalOptimizer {
     private static final int    MAX_TICKS  = 200;
     private static final double EMA_ALPHA  = 0.45;
 
-    private static final double STRONG_IMPULSE = 0.0025;
-    private static final double WEAK_IMPULSE   = 0.0002;
+    private static final double STRONG_IMPULSE = 0.0018;   // [v50] was 0.0025
+    private static final double WEAK_IMPULSE   = 0.0001;  // [v50] was 0.0002
 
-    private static final double MAX_CONF = 85.0;  // [v11.0] was 88 — unrealistic
-    private static final double MIN_CONF = 50.0;
+    private static final double MAX_CONF = 92.0;  // [v50] expanded from 85
+    private static final double MIN_CONF = 45.0;  // [v50] expanded from 50
 
     // [FIX-BUG-2] Убран хардкодный кап 0.010 (1%).
     // Теперь кап динамический — задаётся в computeAdaptiveImpulseCap()
@@ -45,12 +45,12 @@ public final class SignalOptimizer {
     private static final double IMPULSE_CAP_PUMP   = 0.080;  // при активном пампе
     private static final double IMPULSE_CAP_MIN    = 0.020;  // минимальный (тихий рынок)
 
-    private static final double MOMENTUM_THRESHOLD     = 0.0020;
-    private static final double ACCELERATION_THRESHOLD = 0.0005;
+    private static final double MOMENTUM_THRESHOLD     = 0.0015; // [v50] was 0.0020
+    private static final double ACCELERATION_THRESHOLD = 0.0003; // [v50] was 0.0005
     private static final int    MOMENTUM_WINDOW        = 15;
 
-    private static final double EARLY_DETECTION_SENSITIVITY = 1.5;
-    private static final double REVERSAL_SENSITIVITY        = 1.3;
+    private static final double EARLY_DETECTION_SENSITIVITY = 1.8; // [v50] was 1.5
+    private static final double REVERSAL_SENSITIVITY        = 1.5; // [v50] was 1.3
 
     private final Map<String, Deque<Double>> tickPriceDeque;
     private final Map<String, MicroTrendResult> microTrendCache = new ConcurrentHashMap<>();

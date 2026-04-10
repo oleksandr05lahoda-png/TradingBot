@@ -33,6 +33,17 @@ import java.util.concurrent.atomic.*;
  * ║  [FIX-COMP]   Размер позиции масштабируется с балансом $100→$1M        ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  */
+/**
+ * ╔══════════════════════════════════════════════════════════════════════╗
+ * ║   SignalSender v50.0 — PREDICTIVE SIGNAL ARCHITECTURE               ║
+ * ╠══════════════════════════════════════════════════════════════════════╣
+ * ║  [v50] §1  15m blind spot: 120s→15s (assembleLive15mCandle)         ║
+ * ║  [v50] §2  Event coin filter: directional block, not total          ║
+ * ║  [v50] §3  EARLY_TICK: velocity/accel/volume thresholds lowered     ║
+ * ║  [v50] §4  Cache TTL 15m: 14min→8min for fresher data               ║
+ * ║  [v50] §5  EARLY_TICK exhaustion guard: 2.5→2.0 ATR                 ║
+ * ╚══════════════════════════════════════════════════════════════════════╝
+ */
 public final class SignalSender {
 
     private final com.bot.TelegramBotSender bot;
@@ -210,10 +221,10 @@ public final class SignalSender {
 
     private static final Map<String, Long> CACHE_TTL = Map.of(
             "1m",  55_000L,
-            "5m",  4  * 60_000L,
-            "15m", 14 * 60_000L,   // исторические свечи ок, последняя пересобирается live
-            "1h",  59 * 60_000L,
-            "2h",  119 * 60_000L
+            "5m",  3  * 60_000L,  // was 4min
+            "15m", 8  * 60_000L,  // [v50] was 14min — stale data for half the candle period
+            "1h",  55 * 60_000L,  // was 59min
+            "2h",  110 * 60_000L  // was 119min
     );
 
     private static final class CachedCandles {
@@ -664,8 +675,8 @@ public final class SignalSender {
         // кандидатов до ~35-50 активных пар. CallerRunsPolicy на fetchPool гарантирует
         // что перегрузка Binance API вызовет backpressure, не OOM.
         this.TOP_N            = envInt("TOP_N", 100);
-        // MIN_CONF 62.0 — выровнен с BASE_CONF в DecisionEngineMerged
-        this.MIN_CONF         = envDouble("MIN_CONF", 62.0);
+        // [v50] MIN_CONF lowered 62→58 to match expanded confidence range.
+        this.MIN_CONF         = envDouble("MIN_CONF", 58.0);
         this.KLINES_LIMIT     = envInt("KLINES", 220);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
         this.TICK_HISTORY     = envInt("TICK_HISTORY", 120);
@@ -1047,6 +1058,13 @@ public final class SignalSender {
             // ALT: 8% = event
             // MEME: 12% = event (they routinely move 5-8%)
             // ═══════════════════════════════════════════════════════
+            // [v50 §12] EVENT COIN FILTER — DIRECTIONAL BLOCK.
+            // Old: blocked ALL signals on coins with >5-8% daily move.
+            // Problem: this blocked counter-trend entries (reversals/pullbacks)
+            // which are often the BEST setups after a large move.
+            // New: store event direction, block only same-direction signals later.
+            // Counter-trend (reversal) signals are ALLOWED through.
+            boolean eventCoinUp = false, eventCoinDown = false;
             {
                 int n15 = m15.size();
                 int dayBarsAgo = Math.min(96, n15 - 1);
@@ -1054,18 +1072,18 @@ public final class SignalSender {
                 double dayCurrent = m15.get(n15 - 1).close;
                 double dailyChangePct = Math.abs(dayCurrent - dayOpen) / (dayOpen + 1e-9);
 
-                // [v34.0] Category-aware event threshold
                 double eventThreshold = switch (cat) {
-                    case TOP  -> 0.05;   // 5% for BTC/ETH = massive event
-                    case ALT  -> 0.08;   // 8% for ALT = event
-                    case MEME -> 0.12;   // 12% for MEME = event (they're volatile by nature)
+                    case TOP  -> 0.05;
+                    case ALT  -> 0.08;
+                    case MEME -> 0.12;
                 };
                 if (dailyChangePct > eventThreshold) {
-                    return null;
+                    if (dayCurrent > dayOpen) eventCoinUp = true;
+                    else eventCoinDown = true;
+                    // NOT returning null — allow counter-trend entries
                 }
 
-                // Volume anomaly: compare last 4 bars avg volume to 96-bar avg
-                // [v34.0] Category-aware: TOP 4x spike = event, MEME needs 8x
+                // Volume anomaly: also directional, not total block
                 if (n15 > 100) {
                     double recentVol = 0;
                     for (int vi = n15 - 4; vi < n15; vi++) recentVol += m15.get(vi).volume;
@@ -1076,12 +1094,14 @@ public final class SignalSender {
                     histVol /= 96;
 
                     double volEventMult = switch (cat) {
-                        case TOP  -> 4.0;  // BTC 4x volume = serious event
-                        case ALT  -> 5.0;  // ALT 5x = event
-                        case MEME -> 8.0;  // MEME 8x = event (they spike routinely)
+                        case TOP  -> 4.0;
+                        case ALT  -> 5.0;
+                        case MEME -> 8.0;
                     };
                     if (histVol > 0 && recentVol > histVol * volEventMult) {
-                        return null;
+                        double recentMove = m15.get(n15-1).close - m15.get(n15-5).close;
+                        if (recentMove > 0) eventCoinUp = true;
+                        else eventCoinDown = true;
                     }
                 }
             }
@@ -1114,6 +1134,18 @@ public final class SignalSender {
                     decisionEngine.analyze(pair, m1, m5, m15, h1, h2, cat);
 
             if (idea == null) return null;
+
+            // [v50 §12] EVENT COIN DIRECTIONAL GATE — block same-direction entry on event coins.
+            // If coin moved +7% today, block LONG but allow SHORT (reversal/pullback).
+            // If coin moved -7% today, block SHORT but allow LONG (bounce/reversal).
+            if (eventCoinUp && idea.side == com.bot.TradingCore.Side.LONG) {
+                System.out.printf("[EVENT-DIR] %s LONG blocked: coin already up significantly today%n", pair);
+                return null;
+            }
+            if (eventCoinDown && idea.side == com.bot.TradingCore.Side.SHORT) {
+                System.out.printf("[EVENT-DIR] %s SHORT blocked: coin already down significantly today%n", pair);
+                return null;
+            }
 
             // [v17.0] MAX SL% GATE — block signals with unreasonably wide stop-loss.
             // Examples from live logs: SOLVUSDT SL=-12.11%, AIOTUSDT SL=-24.97%.
@@ -1422,9 +1454,13 @@ public final class SignalSender {
         long now = System.currentTimeMillis();
         long current15mStart = (now / (15 * 60_000L)) * (15 * 60_000L);
 
-        // [v36-FIX Дыра2] Если текущая 15m свеча только началась (<2 мин WS-данных),
-        // не отдаём "урезанную" свечу в индикаторы — она исказит ATR и RSI.
-        if (now - current15mStart < 120_000L) return null;
+        // [v50] BLIND SPOT FIX: 120s→15s.
+        // Old logic: first 2 minutes of every 15m candle were INVISIBLE.
+        // This caused the bot to miss breakouts at candle boundaries.
+        // 15 seconds is enough for at least 1 aggTrade tick to establish direction.
+        // ATR/RSI use the PREVIOUS closed candle, not this live one.
+        // This live candle only provides: current price, intra-bar high/low, live volume.
+        if (now - current15mStart < 15_000L) return null;
 
         double open = Double.NaN, high = Double.NEGATIVE_INFINITY,
                 low  = Double.POSITIVE_INFINITY, close = Double.NaN;
@@ -2634,10 +2670,12 @@ public final class SignalSender {
         // Old: flat 0.0018 → BTC almost never triggered
         // New: TOP=0.0008, ALT=0.0015, MEME=0.0020
         com.bot.DecisionEngineMerged.CoinCategory etCat = categorizePair(symbol);
+        // [v50] Velocity thresholds lowered for earlier detection.
+        // Old: ALT 0.0015 = move already visible on chart. New: 0.0010.
         double velThreshold = switch (etCat) {
-            case TOP  -> 0.0008;  // BTC 0.08% move = significant
-            case ALT  -> 0.0015;  // ALT 0.15% = meaningful
-            case MEME -> 0.0020;  // MEME needs stronger signal (noisy)
+            case TOP  -> 0.0005;  // was 0.0008 — BTC 0.05% micro-move
+            case ALT  -> 0.0010;  // was 0.0015 — catch earlier
+            case MEME -> 0.0015;  // was 0.0020
         };
         if (vel < velThreshold) return null;
         boolean up = move > 0;
@@ -2654,11 +2692,15 @@ public final class SignalSender {
         double tickRangeHigh = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).max().orElse(price);
         double tickRangeLow  = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).min().orElse(price);
         double exhaustThresh = Math.max(atrV, (tickRangeHigh - tickRangeLow) * 0.60);
-        if (moveFromBase > exhaustThresh * 2.5) return null;
+        // [v50] Exhaustion guard lowered 2.5→2.0 — was letting through late entries
+        if (moveFromBase > exhaustThresh * 2.0) return null;
 
         // Acceleration check
         // [v34.0] TOP coins have smoother moves — lower acceleration threshold
-        double accelThreshold = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.15 : 1.35;
+        // [v50] Acceleration threshold lowered: 1.35→1.15 for ALT.
+        // At 1.35 the second half must be 35% faster = move already obvious.
+        // At 1.15 we catch the acceleration 1-2 ticks earlier.
+        double accelThreshold = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.08 : 1.15;
         double m1 = buf.get(n / 2 - 1) - buf.get(0);
         double m2 = buf.get(n - 1) - buf.get(n / 2);
         if (!(Math.abs(m2) > Math.abs(m1) * accelThreshold)) return null;
@@ -2669,7 +2711,8 @@ public final class SignalSender {
 
         // Volume spike
         // [v34.0] TOP coins: lower volume spike threshold (institutional flow is steadier)
-        double volSpikeThresh = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.15 : 1.35;
+        // [v50] Volume spike threshold lowered for earlier detection.
+        double volSpikeThresh = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.08 : 1.18;
         int vw = Math.min(30, volBuf.size());
         double avgVol = volBuf.subList(0, vw - 5).stream().mapToDouble(Double::doubleValue).average().orElse(0.001);
         double recVol = volBuf.subList(vw - 5, vw).stream().mapToDouble(Double::doubleValue).average().orElse(0);

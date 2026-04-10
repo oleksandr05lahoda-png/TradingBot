@@ -118,9 +118,12 @@ public final class TelegramBotSender {
         }, 0, 500, TimeUnit.MILLISECONDS);
     }
 
+    // [v50] Added PRE_BREAK and EARLY_TICK to high priority — time-sensitive signals
     private static boolean isHighPriority(String message) {
         return message.contains("UDS CLOSED") || message.contains("TP")
-                || message.contains("SL") || message.contains("🚨");
+                || message.contains("SL") || message.contains("🚨")
+                || message.contains("PRE_BREAK") || message.contains("EARLY_TICK")
+                || message.contains("EXHAUST_REV");
     }
 
     /** Отправка сообщения с повтором в случае ошибок */
