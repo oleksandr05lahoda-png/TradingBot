@@ -1328,7 +1328,7 @@ public final class DecisionEngineMerged {
             if (bodyShrink && (wickGrow || volDecline)) {
                 momentumExhausted = true;
                 exhaustionDirection = move4bars > 0 ? 1 : -1;
-                allFlags.add("MOM_EXHAUSTED_" + (exhaustionDirection > 0 ? "UP" : "DN"));
+                // allFlags.add moved below after allFlags is declared
             }
         }
 
@@ -1344,7 +1344,7 @@ public final class DecisionEngineMerged {
             priorBodyAvg /= 5.0;
             if (priorBodyAvg > atr14 * 0.3 && recentBodyAvg < priorBodyAvg * 0.60) {
                 velocityDecay = true;
-                allFlags.add("VEL_DECAY");
+                // allFlags.add moved below after allFlags is declared
             }
         }
 
@@ -1359,6 +1359,9 @@ public final class DecisionEngineMerged {
         ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
         List<String> allFlags = new ArrayList<>();
         if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
+        // [v50] Deferred flag additions from momentum exhaustion & velocity decay
+        if (momentumExhausted) allFlags.add("MOM_EXHAUSTED_" + (exhaustionDirection > 0 ? "UP" : "DN"));
+        if (velocityDecay) allFlags.add("VEL_DECAY");
 
         // ════════════════════════════════════════════════════════
         // [v25.0] 5m BREAK OF STRUCTURE — PRIMARY ENTRY TRIGGER
@@ -1582,7 +1585,10 @@ public final class DecisionEngineMerged {
         // check order flow direction. If VDA shows strong one-sided flow (institutions
         // accumulating/distributing quietly), enter BEFORE the breakout candle.
         // This is the single most impactful change: entering 1-3 bars early.
-        if (comp.compressed && !comp.breakout) {
+        // [v50 §4] PRE-BREAKOUT ENTRY — THE KEY PREDICTIVE SIGNAL.
+        // atrSqueeze = volatility compressed. !comp.breakout = breakout hasn't happened yet.
+        // If VDA shows strong one-sided flow → institutions accumulating → enter BEFORE breakout.
+        if (atrSqueeze && !comp.breakout) {
             // Strong one-sided flow during compression = imminent breakout
             if (Math.abs(vdaVal) >= 0.25) {
                 double preBreakScore = mctx.s(0.72); // high weight — this is our edge
@@ -2220,10 +2226,11 @@ public final class DecisionEngineMerged {
             // Opposite direction = potential reversal entry — BOOST instead
             if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.SHORT)
                     || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.LONG)) {
-                cEarly.addLong(side == com.bot.TradingCore.Side.LONG ? mctx.s(0.55) : 0,
-                        side == com.bot.TradingCore.Side.LONG ? "EXHAUST_REV_L" : "");
-                cEarly.addShort(side == com.bot.TradingCore.Side.SHORT ? mctx.s(0.55) : 0,
-                        side == com.bot.TradingCore.Side.SHORT ? "EXHAUST_REV_S" : "");
+                if (side == com.bot.TradingCore.Side.LONG) {
+                    cEarly.addLong(mctx.s(0.55), "EXHAUST_REV_L");
+                } else {
+                    cEarly.addShort(mctx.s(0.55), "EXHAUST_REV_S");
+                }
                 allFlags.add("EXHAUSTION_REVERSAL_BOOST");
             }
         }
