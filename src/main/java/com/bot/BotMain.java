@@ -122,11 +122,13 @@ public final class BotMain {
     // Cooldown: один прогноз по одной паре не чаще раза в 20 минут
     private static final java.util.concurrent.ConcurrentHashMap<String, Long>
             forecastCooldown = new java.util.concurrent.ConcurrentHashMap<>();
-    // [v50] Advance forecast cooldown reduced 20→12 min
-    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 12 * 60_000L;
-    // [v50] Direction score thresholds lowered for earlier forecast
-    private static final double AFC_MIN_DIRECTION_SCORE = 0.20; // was 0.28
-    private static final double AFC_STRONG_SCORE        = 0.42; // was 0.55
+    // [PATCH-AFC] Cooldown raised 12→20 min: 12 min caused spam pairs to repeat 3x/hour.
+    // In choppy markets the forecast "changes" every 12 min due to noise → endless alerts.
+    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 20 * 60_000L;
+    // [PATCH-AFC] Thresholds raised: 0.20 was too permissive — fired on any micro-fluctuation.
+    // 0.35 = genuine directional momentum. 0.55 = strong conviction (was 0.42).
+    private static final double AFC_MIN_DIRECTION_SCORE = 0.35; // was 0.20
+    private static final double AFC_STRONG_SCORE        = 0.55; // was 0.42
     // Максимум прогнозов за один запуск
     private static final int AFC_MAX_PER_RUN = 5; // was 4
 
@@ -495,9 +497,15 @@ public final class BotMain {
         // прогнозы о готовящихся пампах/дампах/разворотах — ДО сигнала входа.
         // Это даёт трейдеру время подготовиться: поставить лимитник, убрать стоп,
         // уменьшить позицию — до того как движение начнётся.
-        auxSched.scheduleAtFixedRate(
-                safe("AdvanceForecast", () -> runAdvanceForecast(sender, gic, isc, telegram)),
-                3, 5, TimeUnit.MINUTES);
+        // [PATCH-AFC-DISABLED] Advance Forecast полностью отключён.
+        // Причина: в боковом рынке генерирует шумовые пре-прогнозы с 41-61% уверенностью,
+        // которые противоречат или дублируют боевые сигналы — создаёт путаницу для трейдера.
+        // Оставлен ТОЛЬКО один формат сообщений: боевой сигнал с TP/SL.
+        // Для повторного включения — раскомментировать блок ниже.
+        //
+        // auxSched.scheduleAtFixedRate(
+        //         safe("AdvanceForecast", () -> runAdvanceForecast(sender, gic, isc, telegram)),
+        //         3, 5, TimeUnit.MINUTES);
 
         // ── Backtest каждые 2 часа в изолированном потоке ─────────
         auxSched.scheduleAtFixedRate(

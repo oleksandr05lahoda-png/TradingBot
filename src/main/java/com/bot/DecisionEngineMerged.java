@@ -4,34 +4,8 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║   DecisionEngineMerged v51.0 — REGIME-ADAPTIVE PREDICTIVE                ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  v50 fixes (PREDICTIVE) +                                                ║
- * ║  [v51] §13 Regime-adaptive riskMult/rrRatio (TREND vs RANGE vs WEAK)    ║
- * ║  [v51] §14 Regime-adaptive stop floor (1.2× trend, 1.8× range)          ║
- * ║  [v51] §15 Regime-adaptive TP multipliers (tight in range, wide trend)  ║
- * ║  [v51] §16 Volume-profile structural stop (defends behind volume node)  ║
- * ║  [v51] §17 Wider swing window (8→10 bars), wider price range (5%→7%)    ║
- * ╚══════════════════════════════════════════════════════════════════════════╝
- */
-/**
- * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║   DecisionEngineMerged v51.0 — REGIME-ADAPTIVE + STRUCTURAL              ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  [v51] §1  Regime-adaptive riskMult/rrRatio: TREND/RANGE/WEAK            ║
- * ║  [v51] §2  Regime-adaptive stop floor (1.2× TREND, 1.8× RANGE)           ║
- * ║  [v51] §3  Tightened TP multipliers per regime                           ║
- * ║  [v51] §4  Volume-profile structural stop (volume node defence)          ║
- * ║  [v50] All v50 patches preserved                                         ║
- * ╚══════════════════════════════════════════════════════════════════════════╝
- */
 public final class DecisionEngineMerged {
 
-    // ── Timezone: set at startup by BotMain via IP-geolocation (auto) ──
-    // Falls back to Europe/Warsaw if detection fails.
-    // Each bot instance detects its own server's location automatically.
     public static volatile java.time.ZoneId USER_ZONE = java.time.ZoneId.of("Europe/Warsaw");
 
     // ── Enums ──────────────────────────────────────────────────────
@@ -39,11 +13,6 @@ public final class DecisionEngineMerged {
     public enum MarketState  { STRONG_TREND, WEAK_TREND, RANGE }
     public enum HTFBias      { BULL, BEAR, NONE }
 
-    // ══════════════════════════════════════════════════════════════
-    // [v34.0] ASSET TYPE — auto-classification for Telegram display
-    // Trader instantly sees whether the signal is tradeable on Binance,
-    // or it's a commodity/metal proxy that needs separate platform.
-    // ══════════════════════════════════════════════════════════════
     public enum AssetType {
         CRYPTO("₿", "Криптовалюта"),
         PRECIOUS_METAL_GOLD("🥇", "Золото"),
@@ -65,14 +34,9 @@ public final class DecisionEngineMerged {
         }
     }
 
-    // ── Keywords for auto-detection (case-insensitive) ──────────
-    // These are checked against the BASE symbol (without USDT suffix).
-    // Any new asset that appears in top-100 and contains these keywords
-    // will be automatically classified — NO manual updates needed.
     private static final java.util.Map<String, AssetType> ASSET_KEYWORD_MAP;
     static {
         java.util.Map<String, AssetType> m = new java.util.LinkedHashMap<>();
-        // ── Precious Metals ──
         m.put("XAU",     AssetType.PRECIOUS_METAL_GOLD);
         m.put("GOLD",    AssetType.PRECIOUS_METAL_GOLD);
         m.put("PAXG",    AssetType.PRECIOUS_METAL_GOLD);    // PAX Gold token
@@ -116,12 +80,6 @@ public final class DecisionEngineMerged {
         ASSET_KEYWORD_MAP = Collections.unmodifiableMap(m);
     }
 
-    /**
-     * [v34.0] Auto-detect asset type from symbol name.
-     * Checks keyword map first (contains/startsWith), then defaults to CRYPTO.
-     * No manual updates needed — new commodity/metal tokens are detected automatically
-     * as they appear on Binance Futures.
-     */
     public static AssetType detectAssetType(String symbol) {
         if (symbol == null || symbol.isEmpty()) return AssetType.UNKNOWN;
         String base = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4)
@@ -145,21 +103,11 @@ public final class DecisionEngineMerged {
 
     // ── Константы ─────────────────────────────────────────────────
     private static final int    MIN_BARS        = 150;
-    // [v34.0 FIX] Cooldowns increased to meaningful levels.
-    // On 15m TF, minimum 1 full candle between signals on same pair.
-    // This is the ROOT CAUSE of "same coin spam" — short cooldowns
-    // let the bot re-enter the same move 3-5 times.
-    // TOP=10m (2/3 of 15m candle — BTC structure changes slowly)
-    // ALT=8m (half candle — ALT moves faster)
-    // MEME=12m (almost full candle — MEME noise needs more time to settle)
-    // [v50] Cooldowns reduced — old values blocked re-entry for entire impulse cycles.
+
     private static final long   COOLDOWN_TOP    = 6  * 60_000L;  // was 10m → 6m
     private static final long   COOLDOWN_ALT    = 5  * 60_000L;  // was 8m  → 5m
     private static final long   COOLDOWN_MEME   = 8  * 60_000L;  // was 12m → 8m
-    // [FIX v32+] BASE_CONF restored to 62.0. At 52.0 any signal above noise floor passes.
-    // With probability floor=50 and range≤36, 52-floor gives zero discrimination.
-    // 62.0 is the minimum where signal/noise ratio becomes meaningful.
-    // [v50] BASE_CONF lowered 62→58 to allow wider discrimination range.
+
     private static final double BASE_CONF       = 58.0;
     private static final int    CALIBRATION_WIN = 120;
     private static final double MIN_CONF_FLOOR  = 60.0;  // was 52.0
@@ -180,10 +128,7 @@ public final class DecisionEngineMerged {
 
     // ── State ─────────────────────────────────────────────────────
     private final Map<String, Double>           symbolMinConf    = new ConcurrentHashMap<>();
-    // [v28.0 FIX] AtomicReference replaces volatile double.
-    // volatile guarantees visibility but NOT atomicity of read-modify-write.
-    // With 25 parallel fetchPool threads calling adaptGlobalMinConf(), concurrent
-    // reads of globalMinConf.get() are now always consistent with the last write.
+
     private final java.util.concurrent.atomic.AtomicReference<Double> globalMinConf
             = new java.util.concurrent.atomic.AtomicReference<>(BASE_CONF);
     private final Map<String, Long>             cooldownMap      = new ConcurrentHashMap<>();
@@ -196,8 +141,6 @@ public final class DecisionEngineMerged {
     private final Map<String, Deque<Double>>    relStrengthHistory = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger>    signalCountBySymbol = new ConcurrentHashMap<>();
 
-    // [v42.0 FIX #1,#3,#4] Probability calibrator — replaces all Math.max(50,...) hardcoded floors.
-    // Static so it persists across engine instances (live + backtest can share calibration).
     private static final ProbabilityCalibrator CALIBRATOR = new ProbabilityCalibrator();
     public static ProbabilityCalibrator getCalibrator() { return CALIBRATOR; }
 
@@ -210,49 +153,28 @@ public final class DecisionEngineMerged {
     private volatile long lastCooldownGcMs = 0L;
     private static final int POST_EXIT_MAX_SIZE = 5000;
 
-    // [ДЫРА №1] CVD — накопленная дельта объёма, устанавливается из SignalSender
     private final Map<String, Double>           cvdMap           = new ConcurrentHashMap<>();
-    // [v29] VDA — Volume Delta Acceleration from aggTrade stream [-1..+1]
     private final Map<String, Double>           vdaMap           = new ConcurrentHashMap<>();
 
-    // [FIX v32+] CVD PERSISTENCE — prevents short-covering bounce from triggering LONG.
-    // A single CVD spike on the bottom = shorts closing stops, NOT real demand.
-    // Require 3 consecutive bars of positive CVD before marking as bullish intent.
     private final Map<String, Deque<Double>>    cvdHistory       = new ConcurrentHashMap<>();
-    // [v50 §5] CVD persistence reduced 3→1. At 15m timeframe, 3 bars = 45 minutes.
-    // By the time CVD is positive for 45 minutes, the move is over.
-    // 1 bar (15 min) of confirmed buying flow is sufficient — magnitude matters more.
+
     private static final int CVD_PERSIST_BARS = 1; // was 3 — major latency source
 
-    // [FIX v32+] Dynamic confidence penalty — consecutive losses on a symbol
-    // raise the min confidence threshold for that symbol by CONF_PENALTY_PER_LOSS per loss.
-    // After a win, penalty decays by one step. Max penalty = CONF_PENALTY_MAX.
     private final Map<String, Integer> consecutiveLossMap = new ConcurrentHashMap<>();
     private static final double CONF_PENALTY_PER_LOSS = 3.0;
     private static final double CONF_PENALTY_MAX      = 15.0;
     private static final int    CONF_PENALTY_THRESHOLD = 3; // start penalizing after 3rd loss
 
-    // [FIX v32+] Post-exit directional cooldown: after close, block same direction N minutes
     private final Map<String, Long> postExitCooldown = new ConcurrentHashMap<>();
-    // [v50] Post-exit cooldown reduced 30→10 min.
-    // 30 min blocked entire impulse moves after a failed signal.
-    // 10 min still prevents spin-trading but allows catching the real move.
+
     private static final long POST_EXIT_COOLDOWN_MS = 10 * 60_000L; // was 30
 
-    // [v7.0] GIC reference
     private volatile com.bot.GlobalImpulseController gicRef = null;
     private com.bot.PumpHunter pumpHunter;
-    // [v14.0] ForecastEngine integration
     private volatile com.bot.TradingCore.ForecastEngine forecastEngine = null;
 
     public DecisionEngineMerged() {}
 
-    // [v23.0] Bayesian prior — updated from ISC real win rate
-    // [v17.0 FIX §5] bayesPrior: volatile double → AtomicReference<Double>.
-    // Problem: fetchPool runs up to 25 parallel threads, each calling updateBayesPrior().
-    // volatile guarantees visibility but NOT atomicity of the read-modify-write sequence:
-    //   thread A reads 0.55, thread B reads 0.55, both compute new value, last write wins.
-    // AtomicReference makes every update CAS-based — consistent across all threads.
     private final java.util.concurrent.atomic.AtomicReference<Double> bayesPrior
             = new java.util.concurrent.atomic.AtomicReference<>(0.50);
 
@@ -260,11 +182,7 @@ public final class DecisionEngineMerged {
     private final java.util.concurrent.atomic.AtomicInteger bayesSampleTrades
             = new java.util.concurrent.atomic.AtomicInteger(0);
 
-    /** Update Bayesian prior from ISC historical win rate */
-    // [FIX #6] Allow gradual blend from 20 confirmed trades instead of hard 0.55 until 50.
-    // OLD: <50 trades = always 0.55 regardless of actual WR. At 40 trades WR=70% → still 0.55.
-    // NEW: blend starts at 20 trades (5% weight), reaches full trust at 120 trades.
-    // This makes probability estimates reflect reality sooner, reducing the "random number" problem.
+
     public void updateBayesPrior(double winRate, int confirmedTrades) {
         int trades = Math.max(0, confirmedTrades);
         bayesSampleTrades.set(trades);
@@ -290,36 +208,9 @@ public final class DecisionEngineMerged {
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v17.0 §3] STRICT FORECAST GATE — used by SignalSender for EARLY_TICK signals
-    //
-    //  Philosophy: for signals generated mid-candle (EARLY_TICK), the ForecastEngine
-    //  is the ONLY macro context we have (no full 15m candle yet).
-    //  Therefore: EARLY_TICK MUST be confirmed by Forecast direction.
-    //
-    //  Rules:
-    //    LONG  → forecastResult.directionScore > EARLY_TICK_FC_MIN_SCORE  (default +0.12)
-    //    SHORT → forecastResult.directionScore < -EARLY_TICK_FC_MIN_SCORE
-    //    NEUTRAL (|score| < threshold) → REJECT
-    //    OPPOSITE strong signal → REJECT
-    //
-    //  For normal (full-candle) signals ForecastEngine remains an ADVISOR (penalty-based).
-    // ══════════════════════════════════════════════════════════════
-
-    /** [FIX #5] Raised 0.12 → 0.25.
-     *  At 0.12 on a [-1..+1] scale, 88% of signals pass (|score| ≥ 0.12 is nearly any non-flat forecast).
-     *  At 0.25 we require a moderate conviction: "gentle push" not just "not completely neutral".
-     *  This is the FIX for the "too many false early signals" complaint. */
     private static final double EARLY_TICK_FC_MIN_SCORE = 0.25; // was 0.12 — CRITICAL: nearly no filter
 
-    /**
-     * Returns true if the ForecastResult confirms the trade direction for an EARLY_TICK signal.
-     * Called from SignalSender.filterEarlySignal() BEFORE ISC check.
-     *
-     * @param forecast  result from ForecastEngine (may be null → pass-through, no hard block)
-     * @param isLong    true for LONG signal
-     * @return true = forecast confirms or is unavailable; false = forecast contradicts → REJECT
-     */
+
     public static boolean forecastPassesEarlyTickGate(
             com.bot.TradingCore.ForecastEngine.ForecastResult forecast,
             boolean isLong) {
@@ -350,10 +241,7 @@ public final class DecisionEngineMerged {
         registerSignal(symbol, side, now);
     }
 
-    /**
-     * [FIX v32+] Record loss for a symbol — increases min confidence threshold.
-     * Call from BotMain TradeResolver after SL hit or Chandelier flat exit.
-     */
+
     public void recordLoss(String symbol, com.bot.TradingCore.Side side) {
         int losses = consecutiveLossMap.merge(symbol, 1, Integer::sum);
         if (losses >= CONF_PENALTY_THRESHOLD) {

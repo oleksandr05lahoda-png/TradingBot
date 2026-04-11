@@ -174,6 +174,11 @@ public final class SignalSender {
     /** Accumulates the best (highest probability) EARLY_TICK candidate per pair per flush window. */
     private final Map<String, com.bot.DecisionEngineMerged.TradeIdea> earlyTickBuffer
             = new ConcurrentHashMap<>();
+    // [PATCH-WS-WARMUP] Tracks last time a full WS reconnect happened.
+    // After reconnect, suppress earlyTickBuffer dispatch for 30s to prevent
+    // stale-data signal flood (the "5 signals in 3 minutes" problem).
+    private volatile long wsLastReconnectMs = 0;
+    private static final long WS_WARMUP_MS  = 30_000L; // 30 seconds
 
     // [v34.0] EARLY_TICK hourly rate limit per pair.
     // Problem: volatile ALT fires 8 EARLY_TICK signals in 30 min — all same move.
@@ -203,6 +208,9 @@ public final class SignalSender {
     // [FIX-UDS] User Data Stream
     private volatile String    udsListenKey   = null;
     private volatile WebSocket udsWebSocket   = null;
+    // [PATCH-UDS-HEARTBEAT] Tracks last time any UDS event arrived.
+    // If no event in 5 min → socket silently died → force reconnect.
+    private volatile long      udsLastEventMs = System.currentTimeMillis();
     private final ScheduledExecutorService udsExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "uds-listener"); t.setDaemon(true); return t;
     });
@@ -1810,6 +1818,8 @@ public final class SignalSender {
     }
 
     private void processUserDataEvent(JSONObject event) {
+        // [PATCH-UDS-HEARTBEAT] Any event = socket is alive
+        udsLastEventMs = System.currentTimeMillis();
         String type = event.optString("e", "");
         switch (type) {
             case "ORDER_TRADE_UPDATE" -> {
@@ -1892,6 +1902,17 @@ public final class SignalSender {
 
     private void renewListenKey() {
         if (API_KEY.isBlank() || udsListenKey == null) return;
+
+        // [PATCH-UDS-HEARTBEAT] If no event arrived in 5 min, socket silently died.
+        // Renewing the key alone won't help — we need a full reconnect.
+        long silentMs = System.currentTimeMillis() - udsLastEventMs;
+        if (udsWebSocket != null && silentMs > 5 * 60_000L) {
+            System.out.printf("[UDS] ⚠️ No event in %.1f min — forcing full reconnect%n", silentMs / 60_000.0);
+            udsWebSocket = null;
+            initUserDataStream();
+            return;
+        }
+
         try {
             HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder()
@@ -2548,6 +2569,7 @@ public final class SignalSender {
 
     private void reconnectWs(String pair) {
         if (!reconnectingPairs.add(pair)) return; // already reconnecting
+        wsLastReconnectMs = System.currentTimeMillis(); // [PATCH-WS-WARMUP]
         WebSocket old = wsMap.remove(pair);
         if (old != null) {
             try { old.sendClose(WebSocket.NORMAL_CLOSURE, "reconnecting"); } catch (Exception ignored) {}
@@ -2879,6 +2901,13 @@ public final class SignalSender {
     private void flushEarlyTickBuffer() {
         if (earlyTickBuffer.isEmpty()) return;
 
+        // [PATCH-WS-WARMUP] After WS reconnect, velocity data is stale — suppress dispatch.
+        // Prevents "5 signals in 3 minutes" flood that happens on reconnect.
+        if (System.currentTimeMillis() - wsLastReconnectMs < WS_WARMUP_MS) {
+            earlyTickBuffer.clear(); // Discard stale pre-reconnect candidates
+            return;
+        }
+
         // Drain atomically — swap out the entire map contents
         List<com.bot.DecisionEngineMerged.TradeIdea> candidates = new ArrayList<>();
         for (String pair : new ArrayList<>(earlyTickBuffer.keySet())) {
@@ -2941,6 +2970,17 @@ public final class SignalSender {
                 }
                 nf.add(String.format("SIZE=%.1f$ %s", baseSize * rrMult, rrFlag));
                 finalEt = rebuildIdea(et, et.probability, nf);
+            }
+
+            // [PATCH-SL-GATE] Same MAX SL% check as processPair() — closes the EARLY_TICK backdoor.
+            // Without this, EARLY_TICK signals bypassed the 3-5% SL cap entirely.
+            // This is why ARIAUSDT (SL=18%) and LABUSDT (SL=11%) reached Telegram.
+            double etSlPct = Math.abs(et.price - et.stop) / et.price;
+            double etMaxSlPct = getMaxSlPct();
+            if (etSlPct > etMaxSlPct) {
+                System.out.printf("[EARLY-SL-GATE] %s BLOCKED: SL=%.2f%% > max=%.2f%%%n",
+                        et.symbol, etSlPct * 100, etMaxSlPct * 100);
+                continue;
             }
 
             // [v35.0] CLEAN DISPATCH — toTelegramString() is now self-contained.
