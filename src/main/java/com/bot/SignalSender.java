@@ -1016,6 +1016,8 @@ public final class SignalSender {
         try {
             // [v17.0] GARBAGE COIN BLOCKLIST — instant reject for known micro-cap / rug tokens
             if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return null;
+            // [v51] Hard blacklist check — symbols with WR < 25% after 20 trades
+            if (isc.isHardBlacklisted(pair)) return null;
             // REST для 1m больше не вызывается в основном цикле — только холодный старт.
             // Экономия: ~50 REST запросов/мин × weight=5 = 250 weight/мин.
             List<com.bot.TradingCore.Candle> m1  = getM1FromWs(pair);
@@ -1370,6 +1372,36 @@ public final class SignalSender {
             //          reaches avgRR=1.3, those wide TPs are wishful thinking.
             //          Bot waited for TP3 that never came, missing TP1 exits.
             // Fix: if real avgRR < 70% of assumed tp3Mult → compress all TP multipliers.
+
+            // [v51] ORDERBOOK WALL TP GUARD — if a strong wall sits in TP direction,
+            // the TP probably won't be reached. Detect via L1-L5 depth imbalance.
+            // OrderbookSnapshot doesn't store individual price levels, so we use
+            // total depth5 as a proxy: if the OPPOSING side (where TP1 sits) has
+            // very heavy depth, there's a wall blocking the move.
+            OrderbookSnapshot wallCheck = orderbookMap.get(pair);
+            if (wallCheck != null && wallCheck.isFresh()) {
+                // [v51] Reuse outer isLong (declared at line 1175)
+                // For LONG: TP is above price → ask side is the obstacle
+                // For SHORT: TP is below price → bid side is the obstacle
+                double obstacleDepth = isLong ? wallCheck.askDepth5 : wallCheck.bidDepth5;
+                double supportDepth  = isLong ? wallCheck.bidDepth5 : wallCheck.askDepth5;
+                // Wall = obstacle 2.5× heavier than support side
+                if (obstacleDepth > supportDepth * 2.5 && supportDepth > 0) {
+                    // Strong wall detected — compress TP1/TP2 by 30% to take profit before wall
+                    double newTp1 = Math.max(0.60, idea.tp1Mult * 0.70);
+                    double newTp2 = Math.max(1.00, idea.tp2Mult * 0.75);
+                    double newTp3 = Math.max(1.50, idea.tp3Mult * 0.85);
+                    List<String> wf = new ArrayList<>(idea.flags);
+                    wf.add(String.format("OB_WALL%.1fx", obstacleDepth / supportDepth));
+                    idea = new com.bot.DecisionEngineMerged.TradeIdea(
+                            idea.symbol, idea.side, idea.price, idea.stop, idea.take,
+                            idea.rr, idea.probability, wf,
+                            idea.fundingRate, idea.fundingDelta, idea.oiChange,
+                            idea.htfBias, idea.category, idea.forecast,
+                            newTp1, newTp2, newTp3);
+                }
+            }
+
             double realRR = isc.getAvgRealizedRR(pair);
             if (realRR > 0 && idea.tp3Mult > 0 && realRR < idea.tp3Mult * 0.70) {
                 // Symbol's real edge is weaker than the TP targets assume.
@@ -1545,10 +1577,26 @@ public final class SignalSender {
             riskPct *= 0.75;
         }
 
-        // Высокая уверенность → чуть больше позиция
-        if (idea.probability >= 80)      riskPct *= 1.30;
+        // [v51] Confidence-based position sizing — wider gradient.
+        if (idea.probability >= 85)      riskPct *= 1.50;  // very high conf → biggest
+        else if (idea.probability >= 78) riskPct *= 1.30;
         else if (idea.probability >= 70) riskPct *= 1.15;
-        else if (idea.probability < 58)  riskPct *= 0.75;
+        else if (idea.probability >= 62) riskPct *= 1.00;
+        else if (idea.probability >= 55) riskPct *= 0.80;
+        else                              riskPct *= 0.60;  // low conf → smaller
+
+        // [v51] PRE_BREAK signals are predictive — slightly larger size
+        if (idea.flags.contains("PRE_BREAK_UP") || idea.flags.contains("PRE_BREAK_DN")) {
+            riskPct *= 1.15;
+        }
+        // [v51] EARLY_TICK is faster but less reliable — smaller size
+        if (idea.flags.contains("EARLY_TICK")) {
+            riskPct *= 0.85;
+        }
+        // [v51] Exhaustion reversal entries — smaller (counter-trend, higher fail rate)
+        if (idea.flags.contains("EXHAUSTION_REVERSAL_BOOST")) {
+            riskPct *= 0.80;
+        }
 
         double riskUsdt  = balance * riskPct;
         riskUsdt *= isc.getRiskSizeMultiplier();
@@ -3474,6 +3522,38 @@ public final class SignalSender {
         }
 
         public boolean isFresh() { return System.currentTimeMillis() - timestamp < 30_000; }
+    }
+
+    /**
+     * [v51] Find liquidity wall direction relative to entry price.
+     * Returns price level where the wall sits, or -1 if no significant wall detected.
+     *
+     * Logic: with only L1/L5 aggregated depth available, we use OBI imbalance
+     * as proxy. If LONG and ask depth >> bid depth → wall above price (sellers stacking).
+     * That wall blocks TP. We estimate wall distance proportional to imbalance strength.
+     *
+     * For a real implementation with full L2 data, this would scan price levels.
+     * With aggregated data, we approximate: strong imbalance → wall close to price.
+     */
+    private double findLiquidityWall(OrderbookSnapshot obs, com.bot.TradingCore.Side side, double entry) {
+        if (obs == null || !obs.isFresh()) return -1;
+        double bid = obs.bidDepth5 > obs.bidVolume ? obs.bidDepth5 : obs.bidVolume;
+        double ask = obs.askDepth5 > obs.askVolume ? obs.askDepth5 : obs.askVolume;
+        if (bid + ask < 1e-9) return -1;
+        double imbalance = (bid - ask) / (bid + ask);
+
+        // For LONG: wall = sellers above. ask >> bid means strong wall.
+        // For SHORT: wall = buyers below. bid >> ask means strong wall.
+        if (side == com.bot.TradingCore.Side.LONG) {
+            if (imbalance > -0.30) return -1; // no significant ask wall
+            // Wall strength: -0.30 → 1.5% above, -0.60 → 0.8% above, -0.90 → 0.4% above
+            double wallDistPct = Math.max(0.004, 0.018 + imbalance * 0.020);
+            return entry * (1.0 + wallDistPct);
+        } else {
+            if (imbalance < 0.30) return -1; // no significant bid wall
+            double wallDistPct = Math.max(0.004, 0.018 - imbalance * 0.020);
+            return entry * (1.0 - wallDistPct);
+        }
     }
 
     public static final class MicroCandleBuilder {

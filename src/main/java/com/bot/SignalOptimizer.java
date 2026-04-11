@@ -364,23 +364,25 @@ public final class SignalOptimizer {
         boolean impulseAligned = (isLong && mt.smoothSpeed > 0) || (!isLong && mt.smoothSpeed < 0);
         boolean impulseOpposed = (isLong && mt.smoothSpeed < 0) || (!isLong && mt.smoothSpeed > 0);
 
-        // Aligned micro-momentum → small boost (max +5)
+        // [v51] Boosted aligned micro-momentum: max +7 (was +5).
+        // Real-time tick alignment is the strongest predictor at trade entry.
         if (impulseAligned && mt.impulse > STRONG_IMPULSE) {
-            double boost = Math.min(5.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 3.0);
+            double boost = Math.min(7.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 4.0);
             conf += boost;
         }
-        // Opposed micro-momentum → penalty (max -8)
+        // [v51] Opposed micro-momentum → harsher penalty (max -10, was -8).
+        // If ticks are going against the signal direction, the entry is wrong.
         if (impulseOpposed && mt.impulse > STRONG_IMPULSE) {
-            double penalty = Math.min(8.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 4.0);
+            double penalty = Math.min(10.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 5.0);
             conf -= penalty;
         }
-        // Acceleration bonus: price accelerating in our direction
+        // [v51] Stronger acceleration bonus
         if (impulseAligned && Math.abs(mt.accel) > ACCELERATION_THRESHOLD) {
-            conf += Math.min(3.0, Math.abs(mt.accel) / ACCELERATION_THRESHOLD * 1.5);
+            conf += Math.min(5.0, Math.abs(mt.accel) / ACCELERATION_THRESHOLD * 2.0);
         }
-        // Exhaustion penalty: micro-trend is exhausted
+        // Exhaustion penalty
         if (mt.isExhausted && impulseAligned) {
-            conf -= 4.0;
+            conf -= 5.0;
         }
 
         return Math.max(MIN_CONF, Math.min(MAX_CONF, conf));

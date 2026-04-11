@@ -6,20 +6,25 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║   DecisionEngineMerged v50.0 — PREDICTIVE SIGNAL ARCHITECTURE          ║
+ * ║   DecisionEngineMerged v51.0 — REGIME-ADAPTIVE PREDICTIVE                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  [v50] §1  KILL leadBreakoutOverride — late = late regardless of flags ║
- * ║  [v50] §2  lateEntry threshold 2.0→1.2 ATR, penalty weight 5×         ║
- * ║  [v50] §3  Hard ATR veto 2.8→1.8, no EARLY_SOLO exemption             ║
- * ║  [v50] §4  PRE-BREAKOUT ENTRY: compression + VDA → enter BEFORE break ║
- * ║  [v50] §5  CVD persistence LONG 3→1 bar (45min→15min)                 ║
- * ║  [v50] §6  MICRO-STRUCTURE REVERSAL: 1m+5m divergence → early reverse ║
- * ║  [v50] §7  MOMENTUM EXHAUSTION GATE: blocks entry on spent impulse    ║
- * ║  [v50] §8  Confidence range expansion 62-88→45-92 for calibration     ║
- * ║  [v50] §9  Distribution detector sensitivity 50%→35% deceleration     ║
- * ║  [v50] §10 ABSORPTION ENTRY: VSA demand/supply absorption → contra    ║
- * ║  [v50] §11 VELOCITY DECAY: candle body shrinkage = trend dying        ║
- * ║  [v50] §12 Event coin filter: directional block, not total block      ║
+ * ║  v50 fixes (PREDICTIVE) +                                                ║
+ * ║  [v51] §13 Regime-adaptive riskMult/rrRatio (TREND vs RANGE vs WEAK)    ║
+ * ║  [v51] §14 Regime-adaptive stop floor (1.2× trend, 1.8× range)          ║
+ * ║  [v51] §15 Regime-adaptive TP multipliers (tight in range, wide trend)  ║
+ * ║  [v51] §16 Volume-profile structural stop (defends behind volume node)  ║
+ * ║  [v51] §17 Wider swing window (8→10 bars), wider price range (5%→7%)    ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ */
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║   DecisionEngineMerged v51.0 — REGIME-ADAPTIVE + STRUCTURAL              ║
+ * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  [v51] §1  Regime-adaptive riskMult/rrRatio: TREND/RANGE/WEAK            ║
+ * ║  [v51] §2  Regime-adaptive stop floor (1.2× TREND, 1.8× RANGE)           ║
+ * ║  [v51] §3  Tightened TP multipliers per regime                           ║
+ * ║  [v51] §4  Volume-profile structural stop (volume node defence)          ║
+ * ║  [v50] All v50 patches preserved                                         ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  */
 public final class DecisionEngineMerged {
@@ -2456,8 +2461,31 @@ public final class DecisionEngineMerged {
         // 3. Noise adjustment: шумные монеты получают +20-40% к стопу
         // 4. Cap: category-specific max stop % (не более maxStopPct)
         // ════════════════════════════════════════════════════════
-        double riskMult = cat == CoinCategory.MEME ? 1.40 : cat == CoinCategory.ALT ? 1.10 : 0.88;
-        double rrRatio  = scoreDiff > 1.2 ? 3.4 : scoreDiff > 0.9 ? 3.0 : scoreDiff > 0.6 ? 2.7 : 2.3;
+        // [v51] REGIME-ADAPTIVE RISK PARAMETERS.
+        // TREND: tight stop (1.2× ATR floor), wide TP (rrRatio boosted).
+        //        Trend moves are directional — tight stop survives, wide TP captures the move.
+        // RANGE: wide stop (1.8× ATR floor) behind channel boundary, tight TP to opposite wall.
+        //        Range = mean-reversion. Wide stop avoids wick sweeps, tight TP = take profit at wall.
+        // WEAK_TREND: balanced defaults.
+        double riskMult;
+        double rrRatio;
+        double stopFloorMult; // multiplier for ATR stop minimum
+        if (state == MarketState.STRONG_TREND) {
+            riskMult = cat == CoinCategory.MEME ? 1.10 : cat == CoinCategory.ALT ? 0.85 : 0.70;
+            rrRatio  = scoreDiff > 1.2 ? 3.8 : scoreDiff > 0.9 ? 3.4 : scoreDiff > 0.6 ? 3.0 : 2.6;
+            stopFloorMult = 1.2; // tight stop in trend — noise is directional
+            allFlags.add("REGIME_TREND");
+        } else if (state == MarketState.RANGE) {
+            riskMult = cat == CoinCategory.MEME ? 1.65 : cat == CoinCategory.ALT ? 1.35 : 1.10;
+            rrRatio  = scoreDiff > 1.2 ? 2.2 : scoreDiff > 0.9 ? 1.9 : 1.6;
+            stopFloorMult = 1.8; // wide stop in range — avoid wick sweeps
+            allFlags.add("REGIME_RANGE");
+        } else {
+            // WEAK_TREND — balanced
+            riskMult = cat == CoinCategory.MEME ? 1.40 : cat == CoinCategory.ALT ? 1.10 : 0.88;
+            rrRatio  = scoreDiff > 1.2 ? 3.4 : scoreDiff > 0.9 ? 3.0 : scoreDiff > 0.6 ? 2.7 : 2.3;
+            stopFloorMult = 1.5; // default
+        }
 
         // [v37.0] ATR floor: uses robustAtr + VolatilityBucket multiplier.
         // БЫЛО: atr14 * 1.85 * riskMult → на RIVER в консолидации = 0.70%.
@@ -2490,15 +2518,15 @@ public final class DecisionEngineMerged {
         //      when structural stop exists → floor it at 1.3× ATR for noise buffer.
         double stopDist;
         if (structuralStop <= 0) {
-            // No swing level found — pure ATR stop, but add 50% noise buffer
-            stopDist = atrStop * 1.5;
+            // No swing level — ATR stop with regime-adaptive buffer
+            stopDist = atrStop * stopFloorMult;
             allFlags.add("ATR_STOP");
         } else {
             double structDist = side == com.bot.TradingCore.Side.LONG
                     ? price - structuralStop
                     : structuralStop - price;
-            // Require at least 1.3× ATR as a noise buffer even when structure is closer
-            double atrFloor = atrStop * 1.3;
+            // [v51] Regime-aware floor: trend needs tight (1.1×), range needs wide (1.5×)
+            double atrFloor = atrStop * Math.max(1.1, stopFloorMult * 0.85);
             stopDist = Math.max(structDist, atrFloor);
             allFlags.add("STRUCT_STOP");
         }
@@ -2773,18 +2801,24 @@ public final class DecisionEngineMerged {
                 && forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
 
         if (isExhaustPhase) {
-            tp1Mult = 0.70; tp2Mult = 1.20; tp3Mult = 1.80;
+            // Exhaustion: scalp mode — take quick profits before reversal completes
+            tp1Mult = 0.60; tp2Mult = 1.00; tp3Mult = 1.50;
             allFlags.add("TP_EXHAUST");
         } else if (isRangeState) {
-            tp1Mult = 0.80; tp2Mult = 1.40; tp3Mult = 2.20;
+            // [v51] RANGE: tight TPs — aim for opposite wall, not beyond.
+            // Range = mean-reversion. Taking 2× risk is greedy when price bounces in a box.
+            tp1Mult = 0.65; tp2Mult = 1.10; tp3Mult = 1.60;
             allFlags.add("TP_RANGE");
         } else if (isTrendState && isEarlyPhase) {
-            tp1Mult = 1.30; tp2Mult = 2.60; tp3Mult = 4.20;
+            // [v51] EARLY TREND: widest TPs — the move has just started, let it run.
+            tp1Mult = 1.40; tp2Mult = 2.80; tp3Mult = 4.50;
             allFlags.add("TP_TREND_EARLY");
         } else if (isTrendState) {
-            tp1Mult = 1.15; tp2Mult = 2.30; tp3Mult = 3.60;
+            // [v51] MID TREND: still wide, but not as aggressive as early.
+            tp1Mult = 1.20; tp2Mult = 2.40; tp3Mult = 3.80;
             allFlags.add("TP_TREND");
         } else {
+            // WEAK_TREND: balanced defaults
             tp1Mult = 1.00; tp2Mult = 2.00; tp3Mult = 3.20;
         }
 
@@ -3707,54 +3741,134 @@ public final class DecisionEngineMerged {
     private double findStructuralStop(List<com.bot.TradingCore.Candle> c15,
                                       com.bot.TradingCore.Side side,
                                       double price, double atr14) {
-        if (c15.size() < 20) return -1; // [v12.0] -1 = use ATR fallback
+        if (c15.size() < 20) return -1;
 
         double buffer = atr14 * 0.25;
+        int n = c15.size();
+
+        // [v51] VOLUME-PROFILE STOP: find the nearest high-volume zone behind price.
+        // Market makers defend volume nodes — placing SL behind one means
+        // price must break through institutional defence to hit your stop.
+        //
+        // Algorithm: bucket last 30 bars into price zones, find zone with most volume.
+        // SL goes behind the nearest high-volume zone below (LONG) or above (SHORT) price.
+        double volProfileStop = findVolumeProfileStop(c15, side, price, atr14);
 
         if (side == com.bot.TradingCore.Side.LONG) {
-            // Find nearest swing low below current price
+            // 1. Try volume profile stop first (most reliable)
+            if (volProfileStop > 0 && volProfileStop < price) {
+                return volProfileStop - buffer;
+            }
+            // 2. Swing low fallback
             List<Integer> lows = swingLows(c15, 3);
             double bestStop = -1;
-            for (int idx = lows.size() - 1; idx >= 0 && idx >= lows.size() - 4; idx--) {
+            for (int idx = lows.size() - 1; idx >= 0 && idx >= lows.size() - 6; idx--) {
                 double swLow = c15.get(lows.get(idx)).low;
-                if (swLow < price && swLow > price * 0.95) {
+                if (swLow < price && swLow > price * 0.93) {
                     bestStop = swLow - buffer;
                     break;
                 }
             }
-            // Fallback: recent 8-bar low
+            // 3. Recent 10-bar low fallback (was 8)
             if (bestStop <= 0) {
                 double recentLow = Double.MAX_VALUE;
-                for (int i = Math.max(0, c15.size() - 8); i < c15.size() - 1; i++) {
+                for (int i = Math.max(0, n - 10); i < n - 1; i++) {
                     recentLow = Math.min(recentLow, c15.get(i).low);
                 }
-                if (recentLow < price && recentLow > price * 0.95) {
+                if (recentLow < price && recentLow > price * 0.93) {
                     bestStop = recentLow - buffer;
                 }
             }
-            // [v12.0] If still nothing found, return -1 to use ATR stop
             return bestStop > 0 ? bestStop : -1;
         } else {
+            // SHORT side
+            if (volProfileStop > 0 && volProfileStop > price) {
+                return volProfileStop + buffer;
+            }
             List<Integer> highs = swingHighs(c15, 3);
             double bestStop = -1;
-            for (int idx = highs.size() - 1; idx >= 0 && idx >= highs.size() - 4; idx--) {
+            for (int idx = highs.size() - 1; idx >= 0 && idx >= highs.size() - 6; idx--) {
                 double swHigh = c15.get(highs.get(idx)).high;
-                if (swHigh > price && swHigh < price * 1.05) {
+                if (swHigh > price && swHigh < price * 1.07) {
                     bestStop = swHigh + buffer;
                     break;
                 }
             }
             if (bestStop <= 0) {
                 double recentHigh = Double.NEGATIVE_INFINITY;
-                for (int i = Math.max(0, c15.size() - 8); i < c15.size() - 1; i++) {
+                for (int i = Math.max(0, n - 10); i < n - 1; i++) {
                     recentHigh = Math.max(recentHigh, c15.get(i).high);
                 }
-                if (recentHigh > price && recentHigh < price * 1.05) {
+                if (recentHigh > price && recentHigh < price * 1.07) {
                     bestStop = recentHigh + buffer;
                 }
             }
             return bestStop > 0 ? bestStop : -1;
         }
+    }
+
+    /**
+     * [v51] VOLUME PROFILE STOP — find nearest high-volume price zone.
+     * Divides recent price range into 20 buckets, counts volume per bucket.
+     * Returns the center of the nearest high-volume bucket behind price.
+     * High-volume = top 30% by volume. "Behind" = below for LONG, above for SHORT.
+     */
+    private double findVolumeProfileStop(List<com.bot.TradingCore.Candle> c15,
+                                         com.bot.TradingCore.Side side,
+                                         double price, double atr14) {
+        int n = c15.size();
+        int lookback = Math.min(30, n - 1);
+        if (lookback < 15) return -1;
+
+        // Find price range over lookback period
+        double hi = Double.NEGATIVE_INFINITY, lo = Double.POSITIVE_INFINITY;
+        for (int i = n - lookback; i < n; i++) {
+            hi = Math.max(hi, c15.get(i).high);
+            lo = Math.min(lo, c15.get(i).low);
+        }
+        double range = hi - lo;
+        if (range < atr14 * 0.5) return -1; // too compressed
+
+        int BUCKETS = 20;
+        double bucketSize = range / BUCKETS;
+        double[] bucketVol = new double[BUCKETS];
+
+        // Distribute volume into buckets
+        for (int i = n - lookback; i < n; i++) {
+            com.bot.TradingCore.Candle c = c15.get(i);
+            double mid = (c.high + c.low) / 2.0;
+            int bucket = (int) Math.min(BUCKETS - 1, Math.max(0, (mid - lo) / bucketSize));
+            bucketVol[bucket] += c.volume;
+        }
+
+        // Find volume threshold (top 30%)
+        double[] sorted = bucketVol.clone();
+        java.util.Arrays.sort(sorted);
+        double threshold = sorted[(int) (BUCKETS * 0.70)];
+
+        // Find nearest high-volume zone behind price
+        if (side == com.bot.TradingCore.Side.LONG) {
+            // Look for high-volume zone BELOW price
+            for (int b = Math.min(BUCKETS - 1, (int) ((price - lo) / bucketSize)) - 1; b >= 0; b--) {
+                if (bucketVol[b] >= threshold) {
+                    double zoneCenter = lo + (b + 0.5) * bucketSize;
+                    if (zoneCenter < price && zoneCenter > price - atr14 * 4) {
+                        return zoneCenter;
+                    }
+                }
+            }
+        } else {
+            // Look for high-volume zone ABOVE price
+            for (int b = Math.max(0, (int) ((price - lo) / bucketSize)) + 1; b < BUCKETS; b++) {
+                if (bucketVol[b] >= threshold) {
+                    double zoneCenter = lo + (b + 0.5) * bucketSize;
+                    if (zoneCenter > price && zoneCenter < price + atr14 * 4) {
+                        return zoneCenter;
+                    }
+                }
+            }
+        }
+        return -1;
     }
 
     // ══════════════════════════════════════════════════════════════

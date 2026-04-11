@@ -1668,25 +1668,27 @@ public final class TradingCore {
             }
         }
 
-        // [v37.0] Static factor weight maps — включают новые forward-looking факторы.
-        // CVD_RT (реальное время) и ACCEL (ускорение) дают опережение на 3-5 свечей.
+        // [v51] Factor weights rebalanced — leading indicators get higher weight.
+        // CVD_RT (real-time order flow) and ACCEL (price velocity change) are
+        // the only TRULY leading indicators. SWING/HTF/OF lag by 1-3 bars.
+        // Boosting CVD_RT 3.5→4.5 and ACCEL 2.0→3.0 for earlier prediction.
         private static final Map<String, Double> FW_BASE = Map.of(
-                "HTF",        3.0,  // часовой тренд — наиболее надёжный
-                "OF",         2.5,  // orderflow / CVD исторический
-                "CVD_RT",     3.5,  // [v37] RT-CVD из aggTrade — самый опережающий
-                "SWING",      2.0,  // рыночная структура HH/HL
-                "EXHAUSTION", 2.0,  // истощение движения
-                "ACCEL",      2.0,  // [v37] ускорение цены — ранний сигнал
-                "VPOC_PULL",  1.5   // объёмный профиль
+                "HTF",        2.5,  // was 3.0 — slightly less weight on lagging trend
+                "OF",         2.5,
+                "CVD_RT",     4.5,  // was 3.5 — most leading factor
+                "SWING",      1.8,  // was 2.0
+                "EXHAUSTION", 2.0,
+                "ACCEL",      3.0,  // was 2.0 — early acceleration signals
+                "VPOC_PULL",  1.5
         );
-        // В режиме сжатия (squeeze) пробой + поток ордеров важнее трендовых
+        // [v51] Squeeze mode: SWING (breakout direction) is critical, but CVD_RT still leads
         private static final Map<String, Double> FW_SQUEEZE = Map.of(
                 "HTF",        1.0,
                 "OF",         1.5,
-                "CVD_RT",     3.0,  // [v37] RT-CVD критичен при пробое сквиза
-                "SWING",      4.0,  // пробой структуры = главный сигнал
+                "CVD_RT",     3.5,  // was 3.0
+                "SWING",      4.0,
                 "EXHAUSTION", 1.0,
-                "ACCEL",      2.5,  // [v37] ускорение при пробое = ранний вход
+                "ACCEL",      3.0,  // was 2.5
                 "VPOC_PULL",  1.0
         );
 

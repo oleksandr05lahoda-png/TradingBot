@@ -871,10 +871,26 @@ public final class InstitutionalSignalCore {
     // [v43] Thread-safe auto-blacklist registry (symbol → soft-blocked)
     private final java.util.concurrent.ConcurrentHashMap<String, Boolean> autoBlacklist
             = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final double AUTO_BLACKLIST_WR_THRESHOLD  = 0.25; // < 25% WR → block
-    private static final double AUTO_BLACKLIST_WR_RECOVERY   = 0.40; // > 40% WR → unblock
-    private static final int    AUTO_BLACKLIST_MIN_TRADES     = 5;    // need at least 5 trades
-    private static final double AUTO_BLACKLIST_CONF_BOOST     = 20.0; // +20% minConf = untradeable
+    // [v51] TIGHTER DYNAMIC BLACKLIST — multi-tier WR enforcement.
+    // Old: single 25% threshold after 5 trades = too lenient (lost capital before block).
+    // New: 3 tiers based on trade count for early intervention.
+    // [v51] Three-tier auto-blacklist for early intervention.
+    // Tier 1: 5+ trades, WR < 30% → soft block (confidence boost)
+    // Tier 2: 15+ trades, WR < 35% → soft block continues
+    // Tier 3: 20+ trades, WR < 25% → HARD block (no signals at all)
+    private static final double AUTO_BLACKLIST_WR_THRESHOLD  = 0.30;
+    private static final double AUTO_BLACKLIST_WR_RECOVERY   = 0.45;
+    private static final int    AUTO_BLACKLIST_MIN_TRADES    = 5;
+    private static final int    AUTO_BLACKLIST_TIGHT_TRADES  = 15;
+    private static final double AUTO_BLACKLIST_TIGHT_WR      = 0.35;
+    private static final int    AUTO_BLACKLIST_HARD_TRADES   = 20;
+    private static final double AUTO_BLACKLIST_HARD_WR       = 0.25;
+    private static final double AUTO_BLACKLIST_CONF_BOOST    = 20.0;
+
+    // [v51] Hard blacklist — completely blocks signal generation for the symbol.
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> hardBlacklist
+            = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long HARD_BLACKLIST_DURATION_MS = 48L * 60 * 60 * 1000L;
 
     private void checkAutoBlacklist(String symbol) {
         int count = getTradeCount(symbol);
@@ -883,28 +899,55 @@ public final class InstitutionalSignalCore {
         double wr = getWinRate(symbol);
         boolean currentlyBlocked = autoBlacklist.getOrDefault(symbol, false);
 
-        if (!currentlyBlocked && wr < AUTO_BLACKLIST_WR_THRESHOLD) {
+        // [v51] Three-tier blocking
+        boolean shouldHardBlock = count >= AUTO_BLACKLIST_HARD_TRADES && wr < AUTO_BLACKLIST_HARD_WR;
+        boolean shouldSoftBlock;
+        if (count >= AUTO_BLACKLIST_TIGHT_TRADES) {
+            shouldSoftBlock = wr < AUTO_BLACKLIST_TIGHT_WR;
+        } else {
+            shouldSoftBlock = wr < AUTO_BLACKLIST_WR_THRESHOLD;
+        }
+
+        if (shouldHardBlock) {
+            hardBlacklist.put(symbol, System.currentTimeMillis() + HARD_BLACKLIST_DURATION_MS);
             autoBlacklist.put(symbol, true);
-            log(String.format("[AUTO_BLACKLIST] %s WR=%.0f%% after %d trades → soft-blocked (+%.0f conf required)",
-                    symbol, wr * 100, count, AUTO_BLACKLIST_CONF_BOOST));
-        } else if (currentlyBlocked && wr > AUTO_BLACKLIST_WR_RECOVERY) {
+            log(String.format("[AUTO_BLACKLIST_HARD] %s WR=%.0f%% after %d trades → HARD-blocked 48h",
+                    symbol, wr * 100, count));
+        } else if (!currentlyBlocked && shouldSoftBlock) {
+            autoBlacklist.put(symbol, true);
+            log(String.format("[AUTO_BLACKLIST] %s WR=%.0f%% after %d trades → soft-blocked",
+                    symbol, wr * 100, count));
+        } else if (currentlyBlocked && wr > AUTO_BLACKLIST_WR_RECOVERY && !isHardBlacklisted(symbol)) {
             autoBlacklist.remove(symbol);
             log(String.format("[AUTO_BLACKLIST] %s WR=%.0f%% recovered → unblocked",
                     symbol, wr * 100));
         }
     }
 
-    /** [v43] Returns extra minConf boost for a symbol. Combines OOS EV penalty + auto-blacklist. */
+    /** [v51] Hard blacklist check — completely blocks signal generation. */
+    public boolean isHardBlacklisted(String symbol) {
+        Long until = hardBlacklist.get(symbol);
+        if (until == null) return false;
+        if (System.currentTimeMillis() > until) {
+            hardBlacklist.remove(symbol);
+            autoBlacklist.remove(symbol);
+            return false;
+        }
+        return true;
+    }
+
+    /** [v51] Stricter OOS EV-based confidence boost. */
     public double getSymbolMinConfBoost(String symbol) {
-        // Auto-blacklist takes priority — return massive boost to block all signals
         if (autoBlacklist.getOrDefault(symbol, false)) {
             return AUTO_BLACKLIST_CONF_BOOST;
         }
         Double ev = symbolOosEV.get(symbol);
         if (ev == null) return 0.0;
-        if (ev < -0.03) return +4.0;
+        if (ev < -0.05) return +8.0;  // strong negative EV → strong penalty
+        if (ev < -0.02) return +5.0;  // was +4
         if (ev < 0.00)  return +3.0;
-        if (ev > 0.03)  return -2.0;
+        if (ev > 0.04)  return -3.0;  // strong positive → small bonus
+        if (ev > 0.02)  return -2.0;
         return 0.0;
     }
 
