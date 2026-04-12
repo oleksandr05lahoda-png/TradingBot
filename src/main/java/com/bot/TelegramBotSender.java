@@ -118,12 +118,22 @@ public final class TelegramBotSender {
         }, 0, 500, TimeUnit.MILLISECONDS);
     }
 
-    // [v50] Added PRE_BREAK and EARLY_TICK to high priority — time-sensitive signals
+    // [PATCH v1.0] Precise high-priority marker detection.
+    // Old version triggered on any message containing "TP" or "SL" as substrings — but every
+    // normal signal contains "TP1:", "TP2:", "SL:" → ALL signals were high-priority, priority
+    // queue had no effect. Now matches exact event markers only.
     private static boolean isHighPriority(String message) {
-        return message.contains("UDS CLOSED") || message.contains("TP")
-                || message.contains("SL") || message.contains("🚨")
-                || message.contains("PRE_BREAK") || message.contains("EARLY_TICK")
-                || message.contains("EXHAUST_REV");
+        if (message == null) return false;
+        return message.contains("UDS CLOSED")
+                || message.contains("🚨")
+                || message.contains("TP HIT") || message.contains("SL HIT")
+                || message.contains("TP_HIT") || message.contains("SL_HIT")
+                || message.contains("TP1 HIT") || message.contains("TP2 HIT") || message.contains("TP3 HIT")
+                || message.contains("PRE_BREAK")
+                || message.contains("EARLY_TICK")
+                || message.contains("EXHAUST_REV")
+                || message.contains("PANIC")
+                || message.contains("FORCE_CLOSE");
     }
 
     /** Отправка сообщения с повтором в случае ошибок */

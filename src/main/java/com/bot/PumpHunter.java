@@ -257,19 +257,42 @@ public final class PumpHunter {
             return null;
         }
 
-        SqueezeResult squeeze = detectSqueeze(c5m);
+        // [PATCH v1.0] Snapshot original direction BEFORE squeeze/breakout can overwrite.
+        // Prevents dead-cat bounce (3 green bars after MEGA_PUMP_DOWN) from being
+        // misclassified as SQUEEZE_UP / BREAKOUT_UP → false LONG signal.
+        final boolean origIsBullish = type == PumpType.PUMP_UP || type == PumpType.MEGA_PUMP_UP;
+        final boolean origIsBearish = type == PumpType.PUMP_DOWN || type == PumpType.MEGA_PUMP_DOWN;
+
+        SqueezeResult squeeze = detectSqueeze(c5m, c15m);
         if (squeeze.detected) {
-            type = squeeze.isUp ? PumpType.SQUEEZE_UP : PumpType.SQUEEZE_DOWN;
-            strength = Math.min(1.0, strength + 0.15);
-            flags.add("SQUEEZE");
+            boolean conflict = (origIsBearish && squeeze.isUp)
+                    || (origIsBullish && !squeeze.isUp);
+            if (conflict) {
+                // Opposite direction on secondary signal = dead-cat bounce, not a real squeeze.
+                // Keep original type, halve strength, flag it.
+                flags.add("CONFLICT_SQUEEZE_BOUNCE");
+                strength *= 0.50;
+            } else {
+                type = squeeze.isUp ? PumpType.SQUEEZE_UP : PumpType.SQUEEZE_DOWN;
+                // [PATCH] Reset strength to squeeze-base, do not inherit from canceled pump
+                strength = Math.min(0.85, 0.55 + squeeze.intensity * 0.3);
+                flags.add("SQUEEZE");
+            }
         }
 
         BreakoutResult breakout = detectBreakout(c15m);
         if (breakout.detected) {
-            type = breakout.isUp ? PumpType.BREAKOUT_UP : PumpType.BREAKOUT_DOWN;
-            strength = Math.min(1.0, strength + 0.10);
-            flags.add("BREAKOUT");
-            flags.add("level=" + String.format("%.6f", breakout.level));
+            boolean conflict = (origIsBearish && breakout.isUp)
+                    || (origIsBullish && !breakout.isUp);
+            if (conflict) {
+                flags.add("CONFLICT_BREAKOUT_BOUNCE");
+                strength *= 0.50;
+            } else {
+                type = breakout.isUp ? PumpType.BREAKOUT_UP : PumpType.BREAKOUT_DOWN;
+                strength = Math.min(0.90, 0.60 + strength * 0.3);
+                flags.add("BREAKOUT");
+                flags.add("level=" + String.format("%.6f", breakout.level));
+            }
         }
 
         if (isVolumeClimaxing(c1m)) {
@@ -281,6 +304,12 @@ public final class PumpHunter {
         if (confirmed) {
             strength = Math.min(1.0, strength + 0.05);
             flags.add("CONFIRMED");
+        }
+
+        // [PATCH v1.0] If conflict-downgrades pushed strength too low, drop the event.
+        // Prevents noise events with strength 0.1 from polluting the flag stream.
+        if (strength < 0.20) {
+            return null;
         }
 
         PumpEvent event = new PumpEvent(
@@ -454,37 +483,67 @@ public final class PumpHunter {
 
     // ======================= SQUEEZE DETECTION =======================
 
+    // [PATCH v1.0] Added intensity for confidence scaling
     private static class SqueezeResult {
         boolean detected;
         boolean isUp;
+        double intensity;
     }
 
-    private SqueezeResult detectSqueeze(List<com.bot.TradingCore.Candle> c5m) {
+    // [PATCH v1.0] detectSqueeze now requires:
+    //   1. prevTrend SIGNIFICANT (>0.6% of price) — filters noise
+    //   2. currentMove > 0.6 × prevTrend (same as before)
+    //   3. recent volume >= 1.3 × previous volume average (real flow, not noise)
+    //   4. last 15m candle body aligns with the reversal direction (HTF confirmation)
+    // Also returns intensity ∈ [0..1] for proportional confidence scaling.
+    private SqueezeResult detectSqueeze(List<com.bot.TradingCore.Candle> c5m,
+                                        List<com.bot.TradingCore.Candle> c15m) {
         SqueezeResult result = new SqueezeResult();
         if (c5m == null || c5m.size() < 20) return result;
+        if (c15m == null || c15m.size() < 10) return result;
 
         int n = c5m.size();
 
         double prevTrend = 0;
+        double prevVol = 0;
         for (int i = n - 15; i < n - 3; i++) {
             prevTrend += c5m.get(i).close - c5m.get(i).open;
+            prevVol   += c5m.get(i).volume;
         }
+        double prevVolAvg = prevVol / 12.0;
 
         double currentMove = 0;
+        double currentVol = 0;
         for (int i = n - 3; i < n; i++) {
             currentMove += c5m.get(i).close - c5m.get(i).open;
+            currentVol  += c5m.get(i).volume;
         }
+        double currentVolAvg = currentVol / 3.0;
 
-        if (prevTrend < 0 && currentMove > 0 && Math.abs(currentMove) > Math.abs(prevTrend) * 0.6) {
-            result.detected = true;
-            result.isUp = true;
-        }
+        double refPrice = c5m.get(n - 1).close;
+        double prevTrendPct = Math.abs(prevTrend) / (refPrice + 1e-9);
+        if (prevTrendPct < 0.006) return result;  // no significant prior move → no squeeze
 
-        if (prevTrend > 0 && currentMove < 0 && Math.abs(currentMove) > Math.abs(prevTrend) * 0.6) {
-            result.detected = true;
-            result.isUp = false;
-        }
+        boolean reversalUp = prevTrend < 0 && currentMove > 0
+                && Math.abs(currentMove) > Math.abs(prevTrend) * 0.6
+                && currentVolAvg >= prevVolAvg * 1.3;
 
+        boolean reversalDn = prevTrend > 0 && currentMove < 0
+                && Math.abs(currentMove) > Math.abs(prevTrend) * 0.6
+                && currentVolAvg >= prevVolAvg * 1.3;
+
+        if (!reversalUp && !reversalDn) return result;
+
+        // HTF confirmation: last 15m candle body must align with reversal direction
+        int n15 = c15m.size();
+        com.bot.TradingCore.Candle last15 = c15m.get(n15 - 1);
+        double body15 = last15.close - last15.open;
+        if (reversalUp && body15 <= 0) return result;
+        if (reversalDn && body15 >= 0) return result;
+
+        result.detected = true;
+        result.isUp = reversalUp;
+        result.intensity = Math.min(1.0, Math.abs(currentMove) / (Math.abs(prevTrend) + 1e-9));
         return result;
     }
 
@@ -496,6 +555,8 @@ public final class PumpHunter {
         double level;
     }
 
+    // [PATCH v1.0] Breakout now requires volume >= 1.5× median of lookback window.
+    // A close past prior high/low WITHOUT volume is a classic fake breakout on alts.
     private BreakoutResult detectBreakout(List<com.bot.TradingCore.Candle> c15m) {
         BreakoutResult result = new BreakoutResult();
         if (c15m == null || c15m.size() < 30) return result;
@@ -505,19 +566,25 @@ public final class PumpHunter {
 
         double recentHigh = Double.NEGATIVE_INFINITY;
         double recentLow = Double.MAX_VALUE;
+        double volSum = 0;
+        int volCount = 0;
 
         for (int i = n - 23; i < n - 3; i++) {
             recentHigh = Math.max(recentHigh, c15m.get(i).high);
             recentLow = Math.min(recentLow, c15m.get(i).low);
+            volSum    += c15m.get(i).volume;
+            volCount++;
         }
+        double medianVol = volCount > 0 ? volSum / volCount : 0;
+        boolean volumeConfirmed = last.volume >= medianVol * 1.5;
 
-        if (last.close > recentHigh * 1.002 && last.close > last.open) {
+        if (last.close > recentHigh * 1.002 && last.close > last.open && volumeConfirmed) {
             result.detected = true;
             result.isUp = true;
             result.level = recentHigh;
         }
 
-        if (last.close < recentLow * 0.998 && last.close < last.open) {
+        if (last.close < recentLow * 0.998 && last.close < last.open && volumeConfirmed) {
             result.detected = true;
             result.isUp = false;
             result.level = recentLow;
@@ -544,11 +611,17 @@ public final class PumpHunter {
 
     // ======================= CONFIRMATION =======================
 
+    // [PATCH v1.0] Confirmation now requires ≥2 of PUMP_CONFIRM_BARS bars both:
+    //   (a) close past pumpBar's level (within tight tolerance), AND
+    //   (b) candle direction aligned with pump direction.
+    // This rejects weak dead-cat continuations that previously passed on a single bar.
     private boolean checkConfirmation(List<com.bot.TradingCore.Candle> c1m, PumpType type) {
         if (c1m == null || c1m.size() < PUMP_CONFIRM_BARS + 2) return false;
+        if (type == PumpType.NONE) return false;
 
         int n = c1m.size();
         com.bot.TradingCore.Candle pumpBar = c1m.get(n - PUMP_CONFIRM_BARS - 1);
+        double pumpClose = pumpBar.close;
 
         boolean isUp = type == PumpType.PUMP_UP || type == PumpType.MEGA_PUMP_UP ||
                 type == PumpType.SQUEEZE_UP || type == PumpType.BREAKOUT_UP;
@@ -556,8 +629,9 @@ public final class PumpHunter {
         int confirmCount = 0;
         for (int i = n - PUMP_CONFIRM_BARS; i < n; i++) {
             com.bot.TradingCore.Candle c = c1m.get(i);
-            if (isUp && c.close >= pumpBar.close * 0.998) confirmCount++;
-            if (!isUp && c.close <= pumpBar.close * 1.002) confirmCount++;
+            // [PATCH] both price AND candle direction must align
+            if (isUp  && c.close >= pumpClose * 0.9985 && c.close >= c.open) confirmCount++;
+            if (!isUp && c.close <= pumpClose * 1.0015 && c.close <= c.open) confirmCount++;
         }
 
         return confirmCount >= 2;

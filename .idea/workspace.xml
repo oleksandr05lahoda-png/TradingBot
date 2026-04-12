@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -693,7 +692,8 @@
       <workItem from="1775818345678" duration="949000" />
       <workItem from="1775828699319" duration="1243000" />
       <workItem from="1775905998251" duration="6314000" />
-      <workItem from="1775931045260" duration="2455000" />
+      <workItem from="1775931045260" duration="6334000" />
+      <workItem from="1776003636167" duration="679000" />
     </task>
     <servers />
   </component>

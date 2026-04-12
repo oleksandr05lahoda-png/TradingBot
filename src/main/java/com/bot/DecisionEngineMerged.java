@@ -1140,6 +1140,11 @@ public final class DecisionEngineMerged {
 
         adaptGlobalMinConf(state, atr14, price);
 
+        // [PATCH v1.0] LOCAL EXHAUSTION — detect per-pair dumps/pumps independent of BTC GIC.
+        // Critical for altcoins that dump alone while BTC stays flat.
+        // Applied AFTER candidateSide is known (see veto below).
+        LocalExhaustion localExh = detectLocalExhaustion(c15, atr14);
+
         // [v23.0] ADX low in RANGE: penalty, not veto
         boolean adxRangePenalty = false;
         if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) {
@@ -1858,30 +1863,34 @@ public final class DecisionEngineMerged {
                 f.startsWith("VSA_STOP_VOL_BEAR") || f.startsWith("VSA_ABSORB_BEAR")
                         || f.equals("VSA_NO_DEMAND"));
 
+        // [PATCH v1.0] DUAL-HTF HARD VETO (was soft multiplier *0.35, which signals could
+        // still clear via cluster confluence). hasLeadingOverride removed — too many
+        // dead-cat bounces were sneaking through after a long BEAR move.
         if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.LONG) {
-            boolean hasLeadingOverride = (strongEarlyReversal && strongVolumeLong)
-                    || (vsaAbsorptionBull && cVolume.longScore > 0.30);
-            if (hasLeadingOverride) {
-                // Soften: still penalise but don't kill — let confluence decide
-                totalLong *= 0.55;
-                allFlags.add("HTF_OVERRIDE_EARLY_VOL");
-            } else {
-                totalLong *= 0.35;
-                allFlags.add("DUAL_HTF_BEAR_PENALTY");
-            }
+            allFlags.add("DUAL_HTF_BEAR_VETO");
+            return null;
         }
         if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
-            boolean hasLeadingOverride = (strongEarlyReversal && strongVolumeShort)
-                    || (vsaAbsorptionBear && cVolume.shortScore > 0.30);
-            if (hasLeadingOverride) {
-                totalShort *= 0.55;
-                allFlags.add("HTF_OVERRIDE_EARLY_VOL");
-            } else {
-                totalShort *= 0.35;
-                allFlags.add("DUAL_HTF_BULL_PENALTY");
-            }
+            allFlags.add("DUAL_HTF_BULL_VETO");
+            return null;
+        }
+
+        // [PATCH v1.0] SINGLE-HTF penalty (new): one HTF against direction + other not
+        // supporting → -25% score. Previously no penalty here — signals proceeded
+        // even with one HTF actively against them.
+        if (prelimSide == com.bot.TradingCore.Side.LONG
+                && (bias1h == HTFBias.BEAR || bias2h == HTFBias.BEAR)
+                && bias1h != HTFBias.BULL && bias2h != HTFBias.BULL) {
+            totalLong *= 0.75;
+            allFlags.add("SINGLE_HTF_BEAR_PENALTY");
+        }
+        if (prelimSide == com.bot.TradingCore.Side.SHORT
+                && (bias1h == HTFBias.BULL || bias2h == HTFBias.BULL)
+                && bias1h != HTFBias.BEAR && bias2h != HTFBias.BEAR) {
+            totalShort *= 0.75;
+            allFlags.add("SINGLE_HTF_BULL_PENALTY");
         }
 
         // ════════════════════════════════════════════════════════
@@ -2088,6 +2097,21 @@ public final class DecisionEngineMerged {
         }
 
         com.bot.TradingCore.Side side = candidateSide;
+
+        // [PATCH v1.0] LOCAL EXHAUSTION VETO — applied after side is finalized.
+        // Blocks counter-trend entries against isolated pair moves where GIC didn't trigger.
+        if (localExh != null && !aggressiveShort) {
+            if (localExh.direction == -1 && side == com.bot.TradingCore.Side.LONG) {
+                allFlags.add("LOCAL_EXHAUST_DOWN_VETO_"
+                        + String.format("%.1fATR", localExh.moveAtr));
+                return null;
+            }
+            if (localExh.direction == +1 && side == com.bot.TradingCore.Side.SHORT) {
+                allFlags.add("LOCAL_EXHAUST_UP_VETO_"
+                        + String.format("%.1fATR", localExh.moveAtr));
+                return null;
+            }
+        }
 
         // [v50 §2] LATE ENTRY: REAL penalty — no more excuses.
         boolean lateEntryPenalty = false;
@@ -3508,38 +3532,56 @@ public final class DecisionEngineMerged {
      * With only 1-2 factors → NONE (neutral = no bias penalty).
      * This prevents false BEAR lock that kills all LONG opportunities.
      */
+    /**
+     * [PATCH v1.0] Weighted HTFBias instead of vote-counting.
+     * Old version: 4 binary votes, threshold 3/4. RSI=47 → bear; RSI=48 → NONE.
+     * Single noisy factor could flip the bias.
+     * New version: each factor contributes proportionally; sum compared to 3.0.
+     * Plus margin requirement (winner must exceed loser by 0.5) prevents razor-edge flips.
+     */
     private HTFBias detectBias1H(List<com.bot.TradingCore.Candle> c) {
         if (!valid(c)) return HTFBias.NONE;
 
-        int bullScore = 0;
-        int bearScore = 0;
+        double bullWeight = 0;
+        double bearWeight = 0;
 
-        // Factor 1: Fast EMA alignment (EMA9 vs EMA21) — reacts in hours, not days
+        // Factor 1: Fast EMA alignment (EMA9 vs EMA21), up to 1.5
         double e9  = ema(c, 9);
         double e21 = ema(c, 21);
         double e50 = ema(c, 50);
-        if (e9 > e21 * 1.0005) bullScore++;
-        else if (e9 < e21 * 0.9995) bearScore++;
+        double emaRatio = (e9 - e21) / (e21 + 1e-9);
+        if (emaRatio > 0.0005)       bullWeight += Math.min(1.5, emaRatio / 0.003 * 1.5);
+        else if (emaRatio < -0.0005) bearWeight += Math.min(1.5, -emaRatio / 0.003 * 1.5);
 
-        // Factor 2: Price vs EMA50 (institutional baseline)
+        // Factor 2: Price vs EMA50 (institutional baseline), up to 1.5
         double price1h = last(c).close;
-        if (price1h > e50 * 1.001) bullScore++;
-        else if (price1h < e50 * 0.999) bearScore++;
+        double price50Ratio = (price1h - e50) / (e50 + 1e-9);
+        if (price50Ratio > 0.001)       bullWeight += Math.min(1.5, price50Ratio / 0.01 * 1.5);
+        else if (price50Ratio < -0.001) bearWeight += Math.min(1.5, -price50Ratio / 0.01 * 1.5);
 
-        // Factor 3: RSI zone — above 50 = bullish momentum, below 50 = bearish
+        // Factor 3: RSI zone, up to 1.2 — smooth contribution
         double rsi1h = rsi(c, 14);
-        if (rsi1h > 53) bullScore++;
-        else if (rsi1h < 47) bearScore++;
+        if (rsi1h > 52)      bullWeight += Math.min(1.2, (rsi1h - 50) / 20.0 * 1.2);
+        else if (rsi1h < 48) bearWeight += Math.min(1.2, (50 - rsi1h) / 20.0 * 1.2);
 
-        // Factor 4: Recent swing structure (HH/HL vs LL/LH on last 20 bars)
+        // Factor 4: Recent swing structure, up to 1.3
         if (c.size() >= 20) {
-            if (checkHH_HL(c)) bullScore++;
-            else if (checkLL_LH(c)) bearScore++;
+            if (checkHH_HL(c))      bullWeight += 1.3;
+            else if (checkLL_LH(c)) bearWeight += 1.3;
         }
 
-        // Require 3/4 factors to assign a bias. 1-2 factors = NONE.
-        if (bullScore >= 3) return HTFBias.BULL;
-        if (bearScore >= 3) return HTFBias.BEAR;
+        // Factor 5: Price slope over last 10 bars (early divergence capture), up to 0.8
+        int n = c.size();
+        if (n >= 15) {
+            double priceChangePct = (c.get(n - 1).close - c.get(n - 10).close)
+                    / (c.get(n - 10).close + 1e-9);
+            if (priceChangePct > 0.008)       bullWeight += Math.min(0.8, priceChangePct / 0.03 * 0.8);
+            else if (priceChangePct < -0.008) bearWeight += Math.min(0.8, -priceChangePct / 0.03 * 0.8);
+        }
+
+        // Threshold 3.0 out of max ~6.3, plus margin requirement
+        if (bullWeight >= 3.0 && bullWeight > bearWeight + 0.5) return HTFBias.BULL;
+        if (bearWeight >= 3.0 && bearWeight > bullWeight + 0.5) return HTFBias.BEAR;
         return HTFBias.NONE;
     }
 
@@ -3547,6 +3589,10 @@ public final class DecisionEngineMerged {
      * [FIX v32+] detectBias2H uses EMA12/26/50 — already faster than 1H version,
      * but still biased to slow cross. Add RSI and swing structure confirmation.
      * Same 3/4 factors threshold to avoid BEAR lock during corrections.
+     */
+    /**
+     * [PATCH v1.0] detectBias2H — same weighted approach as 1H.
+     * Weights slightly higher since 2H is slower/more significant than 1H.
      */
     private HTFBias detectBias2H(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 30) return HTFBias.NONE;
@@ -3556,30 +3602,49 @@ public final class DecisionEngineMerged {
         double ema50 = c.size() >= 50 ? ema(c, 50) : ema26;
         double price = last(c).close;
 
-        int bullScore = 0;
-        int bearScore = 0;
+        double bullWeight = 0;
+        double bearWeight = 0;
 
-        // Factor 1: EMA alignment
+        // Factor 1: EMA alignment (up to 1.6)
         boolean bullEMA = ema12 > ema26 && ema26 > ema50 * 0.998;
         boolean bearEMA = ema12 < ema26 && ema26 < ema50 * 1.002;
-        if (bullEMA) bullScore++;
-        else if (bearEMA) bearScore++;
+        if (bullEMA) {
+            double strength = (ema12 - ema26) / (ema26 + 1e-9);
+            bullWeight += Math.min(1.6, strength / 0.005 * 1.6);
+        } else if (bearEMA) {
+            double strength = (ema26 - ema12) / (ema26 + 1e-9);
+            bearWeight += Math.min(1.6, strength / 0.005 * 1.6);
+        }
 
-        // Factor 2: Price vs EMAs
-        if (price > ema12 && price > ema26) bullScore++;
-        else if (price < ema12 && price < ema26) bearScore++;
+        // Factor 2: Price vs EMAs (up to 1.5)
+        if (price > ema12 && price > ema26) {
+            double r = (price - ema26) / (ema26 + 1e-9);
+            bullWeight += Math.min(1.5, r / 0.015 * 1.5);
+        } else if (price < ema12 && price < ema26) {
+            double r = (ema26 - price) / (ema26 + 1e-9);
+            bearWeight += Math.min(1.5, r / 0.015 * 1.5);
+        }
 
-        // Factor 3: RSI
+        // Factor 3: RSI (up to 1.1)
         double rsi2h = rsi(c, 14);
-        if (rsi2h > 52) bullScore++;
-        else if (rsi2h < 48) bearScore++;
+        if (rsi2h > 52)      bullWeight += Math.min(1.1, (rsi2h - 50) / 20.0 * 1.1);
+        else if (rsi2h < 48) bearWeight += Math.min(1.1, (50 - rsi2h) / 20.0 * 1.1);
 
-        // Factor 4: Swing structure
-        if (checkHH_HL(c)) bullScore++;
-        else if (checkLL_LH(c)) bearScore++;
+        // Factor 4: Swing structure (up to 1.4)
+        if (checkHH_HL(c))      bullWeight += 1.4;
+        else if (checkLL_LH(c)) bearWeight += 1.4;
 
-        if (bullScore >= 3) return HTFBias.BULL;
-        if (bearScore >= 3) return HTFBias.BEAR;
+        // Factor 5: Price slope over last 15 bars (up to 0.9)
+        int n = c.size();
+        if (n >= 20) {
+            double priceChangePct = (c.get(n - 1).close - c.get(n - 15).close)
+                    / (c.get(n - 15).close + 1e-9);
+            if (priceChangePct > 0.015)       bullWeight += Math.min(0.9, priceChangePct / 0.05 * 0.9);
+            else if (priceChangePct < -0.015) bearWeight += Math.min(0.9, -priceChangePct / 0.05 * 0.9);
+        }
+
+        if (bullWeight >= 3.0 && bullWeight > bearWeight + 0.5) return HTFBias.BULL;
+        if (bearWeight >= 3.0 && bearWeight > bullWeight + 0.5) return HTFBias.BEAR;
         return HTFBias.NONE;
     }
 
@@ -4231,5 +4296,61 @@ public final class DecisionEngineMerged {
             }
             return n;
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // [PATCH v1.0] LOCAL EXHAUSTION — per-pair dump/pump detection.
+    //
+    // Returns:
+    //   direction = +1  →  strong UP move   (blocks SHORT entries)
+    //   direction = -1  →  strong DOWN move (blocks LONG  entries)
+    //   direction =  0  →  no outlier move  (returns null)
+    //
+    // Criteria (both required):
+    //   1. Accumulated close-to-close move over last 4 bars ≥ 2.5 × ATR(14)
+    //   2. Mean volume of those 4 bars ≥ 1.5 × median volume of preceding 20 bars
+    //
+    // This catches isolated alt dumps (e.g. DOT dumps, BTC flat) that GIC misses
+    // because GIC only watches BTC-driven global panics.
+    // ═══════════════════════════════════════════════════════════════════════
+    private static final class LocalExhaustion {
+        final int direction;   // -1, 0, +1
+        final double moveAtr;  // magnitude in ATR units
+        LocalExhaustion(int d, double m) { direction = d; moveAtr = m; }
+    }
+
+    private LocalExhaustion detectLocalExhaustion(List<com.bot.TradingCore.Candle> c15,
+                                                  double atr14) {
+        if (c15 == null || c15.size() < 25) return null;
+        if (atr14 <= 0) return null;
+
+        int n = c15.size();
+        final int lookback = 4;
+
+        // Accumulated close-to-close move
+        double move = c15.get(n - 1).close - c15.get(n - 1 - lookback).close;
+        double moveAtr = Math.abs(move) / atr14;
+        if (moveAtr < 2.5) return null;
+
+        // Recent volume average
+        double recentVol = 0;
+        for (int i = n - lookback; i < n; i++) {
+            recentVol += c15.get(i).volume;
+        }
+        double recentAvg = recentVol / lookback;
+
+        // Median volume over preceding 20 bars
+        double[] hist = new double[20];
+        for (int i = 0; i < 20; i++) {
+            hist[i] = c15.get(n - lookback - 20 + i).volume;
+        }
+        java.util.Arrays.sort(hist);
+        double medianVol = hist[10];
+
+        if (medianVol <= 0) return null;
+        if (recentAvg < medianVol * 1.5) return null;  // volume not confirming = not exhaustion
+
+        int direction = move > 0 ? +1 : -1;
+        return new LocalExhaustion(direction, moveAtr);
     }
 }
