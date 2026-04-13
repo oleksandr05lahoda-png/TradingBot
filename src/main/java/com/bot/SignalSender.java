@@ -217,7 +217,7 @@ public final class SignalSender {
 
     // [FIX-BLIND] Буфер 1m свечей для LiveCandleAssembler
     private final Map<String, List<com.bot.TradingCore.Candle>> liveM1Buffer = new ConcurrentHashMap<>();
-    private static final int LIVE_M1_BUFFER_SIZE = 240; // [v36-FIX] 4h of 1m bars from WS ticks
+    private static final int LIVE_M1_BUFFER_SIZE = 180; // [v36-FIX] 4h of 1m bars from WS ticks
 
     private final Map<String, Long> lastFetchTime = new ConcurrentHashMap<>();
 
@@ -682,18 +682,18 @@ public final class SignalSender {
         // Реальный пропуск через volume filter ($30M ALT / $10M MEME) ограничивает
         // кандидатов до ~35-50 активных пар. CallerRunsPolicy на fetchPool гарантирует
         // что перегрузка Binance API вызовет backpressure, не OOM.
-        this.TOP_N            = envInt("TOP_N", 100);
+        this.TOP_N            = envInt("TOP_N", 50);
         // [v50] MIN_CONF lowered 62→58 to match expanded confidence range.
         this.MIN_CONF         = envDouble("MIN_CONF", 58.0);
-        this.KLINES_LIMIT     = envInt("KLINES", 220);
+        this.KLINES_LIMIT     = envInt("KLINES", 160);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
-        this.TICK_HISTORY     = envInt("TICK_HISTORY", 120);
+        this.TICK_HISTORY     = envInt("TICK_HISTORY", 90);
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
         this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1;
-        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 100);
+        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 50);
         this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 10); // [v36-FIX Дыра10] was 100 → 10 (bookTicker WS covers L1)
-        this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 40);
+        this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 25);
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();

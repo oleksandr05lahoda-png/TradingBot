@@ -58,7 +58,7 @@ public final class BotMain {
     // Each instance (yours in Warsaw, father's in Zaporizhzhia) detects its own timezone.
     private static final ZoneId ZONE      = detectTimezone();
     private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 1);
-    private static final int    KLINES    = envInt("KLINES_LIMIT", 220);
+    private static final int    KLINES    = envInt("KLINES_LIMIT", 160);
     // Hard cap to avoid Telegram queue backlog (which can make the bot
     // "silent" for hours/days under heavy signal load).
     // [FIX #1] MAX_SIGNALS_PER_CYCLE was 50 — comment said "10→5" but value was never changed.
