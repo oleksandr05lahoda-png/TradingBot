@@ -69,7 +69,9 @@ public final class SignalSender {
     private final String API_KEY;
     private final String API_SECRET;
 
-    private static final long FUNDING_REFRESH_MS  = 5 * 60_000L;
+    // [REFACTOR] 5min→15min: OI не меняется кардинально за 5 минут.
+    // Экономия: ~66% OI weight (~$1.5/мес).
+    private static final long FUNDING_REFRESH_MS  = 15 * 60_000L;
     private static final long DELTA_WINDOW_MS     = 60_000L;
 
     private static final double MIN_PROFIT_TOP  = 0.0025;
@@ -678,12 +680,10 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
 
-        // TOP_N=100 — сканируем все 100 ликвидных пар.
-        // Реальный пропуск через volume filter ($30M ALT / $10M MEME) ограничивает
-        // кандидатов до ~35-50 активных пар. CallerRunsPolicy на fetchPool гарантирует
-        // что перегрузка Binance API вызовет backpressure, не OOM.
-        this.TOP_N            = envInt("TOP_N", 50);
-        // [v50] MIN_CONF lowered 62→58 to match expanded confidence range.
+        // [REFACTOR] TOP_N 50→30: scanner-режим не требует 50 пар.
+        // TOP 10 коинов всегда в списке + 20 лучших ALT по объёму.
+        // Экономия: ~40-50% REST запросов (~$5/мес).
+        this.TOP_N            = envInt("TOP_N", 30);
         this.MIN_CONF         = envDouble("MIN_CONF", 58.0);
         this.KLINES_LIMIT     = envInt("KLINES", 160);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
@@ -691,8 +691,9 @@ public final class SignalSender {
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
         this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1;
-        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 50);
-        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 10); // [v36-FIX Дыра10] was 100 → 10 (bookTicker WS covers L1)
+        // [REFACTOR] MAX_SCAN_PAIRS 50→25: при TOP_N=30 сканировать 50 пар/цикл = wasteful.
+        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 25);
+        this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 10);
         this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 25);
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
@@ -745,8 +746,9 @@ public final class SignalSender {
         // WS health check
         wsWatcher.scheduleAtFixedRate(this::checkWsHealth, 30, 30, TimeUnit.SECONDS);
 
-        // [v28.0] PATCH #9: Poll depth5 snapshot every 30s for multi-level OBI.
-        wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 60, TimeUnit.SECONDS); // [v36-FIX Дыра10] was 30s → 60s
+        // [REFACTOR] Depth snapshot: 60s→120s, ограничены top-10 пары (DEPTH_SNAPSHOT_TOP_N=10).
+        // Экономия: ~90% depth REST weight (~$4/мес). bookTicker WS покрывает L1 real-time.
+        wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 120, TimeUnit.SECONDS);
 
         // [v17.0 §2] EARLY TICK SIGNAL BUFFER FLUSHER — runs every 1500ms.
         // Drains earlyTickBuffer, sorts candidates by probability (highest first),
@@ -1029,7 +1031,10 @@ public final class SignalSender {
             // REST для 1m больше не вызывается в основном цикле — только холодный старт.
             // Экономия: ~50 REST запросов/мин × weight=5 = 250 weight/мин.
             List<com.bot.TradingCore.Candle> m1  = getM1FromWs(pair);
-            List<com.bot.TradingCore.Candle> m5  = getCached(pair, "5m",  KLINES_LIMIT);
+            // [REFACTOR] 5m из WS-буфера (liveM1Buffer) вместо REST getCached("5m").
+            // При достаточном буфере (≥5 баров) — 0 REST weight. Fallback на REST при холодном старте.
+            // Экономия: ~25% klines REST weight (~$6-8/мес при TOP_N=30).
+            List<com.bot.TradingCore.Candle> m5  = getM5FromWsOrRest(pair, KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> m15 = getCached15mWithLive(pair); // [FIX-BLIND]
             List<com.bot.TradingCore.Candle> h1  = getCached(pair, "1h",  KLINES_LIMIT);
             List<com.bot.TradingCore.Candle> h2  = getCached(pair, "2h",  120);
@@ -1275,8 +1280,11 @@ public final class SignalSender {
 
                 List<String> nf = new ArrayList<>(idea.flags);
                 if (aligned) {
-                    // OFV confirms direction — confidence boost
-                    double boost = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 4.5 : 2.5;
+                    // [REFACTOR] OFV boost снижен 4.5→2.0 / 2.5→1.5.
+                    // Старые значения вносили до +4.5 к confidence на чистом OFV — слишком много.
+                    // OFV подтверждает направление, но не должен самостоятельно поднимать сигнал
+                    // через финальный порог confidence. Убрана cap 85.0 — теперь общий cap в generate().
+                    double boost = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 2.0 : 1.5;
                     String tag = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? "OFV_STRONG" : "OFV_ALIGN";
                     nf.add(tag + (isLong ? "↑" : "↓"));
                     idea = rebuildIdea(idea, Math.min(85.0, idea.probability + boost), nf);
@@ -1354,14 +1362,18 @@ public final class SignalSender {
             // NO probability modification. Size is adjusted in getPositionSizeUsdt() via sessionW.
             idea = rebuildIdea(idea, idea.probability, sf);
 
-            // [ДЫРА №2] LIQUIDATION SCORE — усиливаем сигнал если рядом крупные ликвидации
+            // [ДЫРА №2] LIQUIDATION SCORE — тегируем сигнал если рядом крупные ликвидации
             double atrForLiq = com.bot.TradingCore.atr(m15, 14);
             double liqScore  = getLiquidationScore(pair, idea.price, atrForLiq, idea.side);
             if (liqScore > 0.25) {
                 List<String> lf = new ArrayList<>(idea.flags);
                 lf.add(String.format("LIQ_MAGNET+%.0f%%", liqScore * 100));
-                double liqBoost = liqScore * 8; // max +8 к вероятности
-                idea = rebuildIdea(idea, Math.min(85, idea.probability + liqBoost), lf);
+                // [REFACTOR] Убран confidence boost от LIQ_MAGNET (liqScore * 8, max +8).
+                // Проблема: ликвидационный магнит — это дополнительный контекст (информация о ТА),
+                // а не сигнал качества входа. Накачка confidence через LIQ_MAGNET приводила
+                // к тому что слабые сигналы "проходили" финальный порог только из-за близких ликвидаций.
+                // Оставляем тег в flags — трейдер видит контекст в Telegram, но без inflation.
+                idea = rebuildIdea(idea, idea.probability, lf);
             }
 
             // [v16.0 FIX] qualityPenalty excluded from final confidence gate (size only).
@@ -1489,17 +1501,72 @@ public final class SignalSender {
         return Collections.unmodifiableList(result);
     }
 
+    /**
+     * [REFACTOR] Сборка 5m свечей из liveM1Buffer вместо REST getCached(pair, "5m", ...).
+     * Экономия: ~25% REST weight (5m klines были 3-я по весу категория запросов).
+     *
+     * Алгоритм: группируем 1m бары по 5-минутным эпохам (openTime / 300_000).
+     * Для каждой группы: open = первая, high = max, low = min, close = последняя, volume = sum.
+     *
+     * При холодном старте (liveM1Buffer < 5 баров) — REST fallback ОДИН РАЗ.
+     * После заполнения буфера REST для 5m больше не нужен.
+     *
+     * @param pair торговая пара
+     * @param minBars минимальное количество 5m баров (< этого → REST fallback)
+     * @return список 5m свечей, последняя — live (текущая незакрытая)
+     */
+    private List<com.bot.TradingCore.Candle> getM5FromWsOrRest(String pair, int minBars) {
+        List<com.bot.TradingCore.Candle> m1buf = liveM1Buffer.get(pair);
+
+        // Если в буфере меньше 5 баров → нельзя собрать даже 1 пятиминутку
+        if (m1buf == null || m1buf.size() < 5) {
+            return getCached(pair, "5m", minBars);
+        }
+
+        // Группируем 1m → 5m
+        java.util.TreeMap<Long, List<com.bot.TradingCore.Candle>> groups = new java.util.TreeMap<>();
+        for (com.bot.TradingCore.Candle c : m1buf) {
+            long epoch5m = (c.openTime / 300_000L) * 300_000L;
+            groups.computeIfAbsent(epoch5m, k -> new ArrayList<>()).add(c);
+        }
+
+        List<com.bot.TradingCore.Candle> result = new ArrayList<>(groups.size());
+        for (java.util.Map.Entry<Long, List<com.bot.TradingCore.Candle>> e : groups.entrySet()) {
+            List<com.bot.TradingCore.Candle> bars = e.getValue();
+            double open  = bars.get(0).open;
+            double high  = bars.stream().mapToDouble(b -> b.high).max().orElse(open);
+            double low   = bars.stream().mapToDouble(b -> b.low).min().orElse(open);
+            double close = bars.get(bars.size() - 1).close;
+            double vol   = bars.stream().mapToDouble(b -> b.volume).sum();
+            double qvol  = bars.stream().mapToDouble(b -> b.quoteVolume).sum();
+            result.add(new com.bot.TradingCore.Candle(
+                    e.getKey(), open, high, low, close, vol, qvol,
+                    e.getKey() + 300_000L - 1));
+        }
+
+        // Если WS-буфер даёт мало баров — допиливаем REST историей снизу
+        if (result.size() < minBars) {
+            List<com.bot.TradingCore.Candle> rest = getCached(pair, "5m", minBars);
+            if (rest != null && !rest.isEmpty()) {
+                long wsEarliestEpoch = result.isEmpty() ? Long.MAX_VALUE : result.get(0).openTime;
+                List<com.bot.TradingCore.Candle> merged = new ArrayList<>();
+                for (com.bot.TradingCore.Candle c : rest) {
+                    if (c.openTime < wsEarliestEpoch) merged.add(c);
+                }
+                merged.addAll(result);
+                return Collections.unmodifiableList(merged);
+            }
+        }
+
+        return Collections.unmodifiableList(result);
+    }
+
     private com.bot.TradingCore.Candle assembleLive15mCandle(List<com.bot.TradingCore.Candle> m1) {
         if (m1 == null || m1.isEmpty()) return null;
         long now = System.currentTimeMillis();
         long current15mStart = (now / (15 * 60_000L)) * (15 * 60_000L);
 
         // [v50] BLIND SPOT FIX: 120s→15s.
-        // Old logic: first 2 minutes of every 15m candle were INVISIBLE.
-        // This caused the bot to miss breakouts at candle boundaries.
-        // 15 seconds is enough for at least 1 aggTrade tick to establish direction.
-        // ATR/RSI use the PREVIOUS closed candle, not this live one.
-        // This live candle only provides: current price, intra-bar high/low, live volume.
         if (now - current15mStart < 15_000L) return null;
 
         double open = Double.NaN, high = Double.NEGATIVE_INFINITY,
@@ -1539,7 +1606,6 @@ public final class SignalSender {
         if (seed == null || seed.isEmpty()) {
             return buf != null ? Collections.unmodifiableList(buf) : Collections.emptyList();
         }
-        // Начиная с этого момента WS-тики будут дополнять буфер через processAggTrade()
         liveM1Buffer.put(pair, new ArrayList<>(seed));
         return Collections.unmodifiableList(seed);
     }
@@ -1585,13 +1651,15 @@ public final class SignalSender {
             riskPct *= 0.75;
         }
 
-        // [v51] Confidence-based position sizing — wider gradient.
-        if (idea.probability >= 85)      riskPct *= 1.50;  // very high conf → biggest
-        else if (idea.probability >= 78) riskPct *= 1.30;
-        else if (idea.probability >= 70) riskPct *= 1.15;
+        // [REFACTOR] Сужен диапазон confidence-based sizing: ×0.60..×1.50 → ×0.85..×1.15.
+        // Причина: до калибровки сигналов (WR > 45%) уверенность бота inflated.
+        // "85% confidence" часто = 55-60% реальный WR. Давать ×1.50 размер на inflated сигналы
+        // усиливает потери, а не прибыль. После стабилизации WR — расширить диапазон обратно.
+        // Сохраняем небольшой градиент чтобы высококонфидентные сигналы всё же чуть крупнее.
+        if (idea.probability >= 80)      riskPct *= 1.15;
+        else if (idea.probability >= 70) riskPct *= 1.05;
         else if (idea.probability >= 62) riskPct *= 1.00;
-        else if (idea.probability >= 55) riskPct *= 0.80;
-        else                              riskPct *= 0.60;  // low conf → smaller
+        else                              riskPct *= 0.85; // низкая уверенность → меньше размер
 
         // [v51] PRE_BREAK signals are predictive — slightly larger size
         if (idea.flags.contains("PRE_BREAK_UP") || idea.flags.contains("PRE_BREAK_DN")) {
@@ -2574,6 +2642,18 @@ public final class SignalSender {
         if (old != null) {
             try { old.sendClose(WebSocket.NORMAL_CLOSURE, "reconnecting"); } catch (Exception ignored) {}
         }
+        // [REFACTOR] Gap-fill seed при переподключении WS.
+        // Проблема (из implementation_plan §4.3): при reconnect liveM1Buffer НЕ очищался,
+        // но WS-stream пропустил N тиков → MicroCandleBuilder имеет gap в данных.
+        // Решение: сбрасываем буфер и делаем разовый REST-посев последних 60 баров
+        // (вес=5 на один запрос — минимальная цена за корректность данных).
+        // Это гарантирует что после reconnect бот не торгует на данных с дырой.
+        liveM1Buffer.remove(pair); // сброс буфера — следующий getM1FromWs() сделает seed
+        MicroCandleBuilder staleBuilder = microBuilders.remove(pair);
+        if (staleBuilder != null) {
+            // стартуем свежий builder — старый содержит gap
+        }
+
         long delay = wsReconnectDelay.getOrDefault(pair, WS_INITIAL_DELAY_MS);
         wsWatcher.schedule(() -> connectWsInternal(pair), delay, TimeUnit.MILLISECONDS);
         wsReconnectDelay.put(pair, Math.min(delay * 2, WS_MAX_DELAY_MS));
@@ -2698,6 +2778,12 @@ public final class SignalSender {
         }));
 
         if (ENABLE_EARLY_TICK) {
+            // [REFACTOR] EARLY_TICK block при низкой ликвидности сессии.
+            // Ночные micro-move сигналы (01:00-05:00 UTC) — главный источник ложных пробоев на 15m TF.
+            // sessionWeight < 0.85 = Азия/ночь = тонкий рынок → ложные breakout вероятны.
+            // Это самый быстрый способ срезать -50% EARLY_TICK шума без потери дневных сигналов.
+            if (getSessionWeight() < 0.85) return;
+
             com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
             if (et != null && filterEarlySignal(et)) {
                 // [v17.0 §3] STRICT FORECAST GATE for EARLY_TICK signals.

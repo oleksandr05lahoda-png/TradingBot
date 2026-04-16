@@ -103,6 +103,16 @@ public final class GlobalImpulseController {
     private volatile double btcMomentumAccel     = 0.0; // [NEW] вторая производная
     private volatile double btcCrashScore        = 0.0; // [NEW] агрегированный crash score [0..1]
 
+    // [PATCH v-MILLION #5] TIME-BASED BEAR REGIME TRACKING
+    // Время начала медвежьего режима BTC_IMPULSE_DOWN / BTC_STRONG_DOWN.
+    // Нужно для time-decay подавления лонгов:
+    //   - Первые 15 минут: полное подавление (0.55)
+    //   - После 20 минут без ускорения: мягкое подавление (0.78) — рынок адаптировался
+    //   - Если BTC начинает восстанавливаться (2+ бычьих бара): немедленное смягчение (0.88)
+    // Без этого GIC держал 45-70% штраф к LONG часами после импульса, пропуская отскоки.
+    private volatile long bearRegimeStartMs = 0L;
+    private volatile int  priorCascadeOrdinal = 0; // для детекции перехода в медвежий режим
+
     // Panic state
     private final AtomicBoolean panicMode = new AtomicBoolean(false);
     private volatile long panicStartMs = 0;
@@ -385,10 +395,18 @@ public final class GlobalImpulseController {
 
         // ── Consecutive bear/bull bars ───────────────────────────
         if (last.close < last.open) {
+            if (btcConsecutiveBearBars == 0) {
+                // [PATCH v-MILLION #5] Первая медвежья свеча — запоминаем время
+                bearRegimeStartMs = System.currentTimeMillis();
+            }
             btcConsecutiveBearBars = Math.min(btcConsecutiveBearBars + 1, 12);
             btcConsecutiveBullBars = 0;
         } else if (last.close > last.open) {
             btcConsecutiveBullBars = Math.min(btcConsecutiveBullBars + 1, 12);
+            if (btcConsecutiveBullBars >= 2) {
+                // 2+ бычьих бара = режим восстановления начался
+                bearRegimeStartMs = 0L;
+            }
             btcConsecutiveBearBars = 0;
         }
 
@@ -540,20 +558,59 @@ public final class GlobalImpulseController {
                 && rawStrength > 0.65
                 && btcDropVelocity > VELOCITY_WATCH);
 
-        // Expose gradient suppression multipliers via shortBoost/confidenceAdj fields
-        // so DecisionEngine can apply proportional penalty instead of binary block.
-        // longSuppressionMult stored in confidenceAdjustment (negative = suppress LONG).
-        // Values: 1.0 = no effect, 0.30 = crush LONG score to 30%, etc.
+        // [PATCH v-MILLION #5] TIME-DECAY LONG SUPPRESSION
+        // Старая логика: фиксированные коэффициенты (0.30 / 0.55 / 0.45) держались
+        // БЕСКОНЕЧНО пока режим не менялся — иногда часами после первоначального импульса.
+        // Это блокировало хорошие лонговые сигналы на отскоках внутри медвежьего тренда.
+        //
+        // Новая логика: 3 фазы подавления:
+        //   Фаза 1 (0-15 мин): полное подавление (исходный коэффициент)
+        //   Фаза 2 (15-40 мин без ускорения): мягкое подавление (+0.20 к коэф)
+        //   Фаза 3 (40+ мин или BTC восстанавливается): минимальное подавление (0.85+)
+        //
+        //   + Триггер восстановления: если btcConsecutiveBullBars >= 2 →
+        //     немедленный переход в Фазу 3 (рынок разворачивается, не упираемся)
         double longSuppressionMult = 1.0;
         if (!onlyShort) {
+            long bearAgeMs = bearRegimeStartMs > 0
+                    ? (System.currentTimeMillis() - bearRegimeStartMs)
+                    : 0L;
+            boolean btcRecovering  = btcConsecutiveBullBars >= 2;
+            boolean accelAbating   = btcMomentumAccel < 0.002; // ускорение падения угасает
+
             if (regime == GlobalRegime.BTC_STRONG_DOWN && rawStrength >= 0.60) {
-                longSuppressionMult = 0.30;
+                // BTC_STRONG_DOWN — самый жёсткий режим
+                if (btcRecovering) {
+                    longSuppressionMult = 0.70; // Начало разворота — смягчаем
+                } else if (bearAgeMs > 40 * 60_000L && accelAbating) {
+                    longSuppressionMult = 0.55; // Старый импульс затухает
+                } else if (bearAgeMs > 20 * 60_000L && accelAbating) {
+                    longSuppressionMult = 0.40; // Рынок адаптировался
+                } else {
+                    longSuppressionMult = 0.30; // Свежий сильный медвежий импульс
+                }
+
             } else if (regime == GlobalRegime.BTC_IMPULSE_DOWN && rawStrength >= 0.50) {
-                longSuppressionMult = 0.55;
+                // BTC_IMPULSE_DOWN — умеренное давление
+                if (btcRecovering) {
+                    longSuppressionMult = 0.88; // Восстановление — почти не мешаем
+                } else if (bearAgeMs > 20 * 60_000L && accelAbating) {
+                    longSuppressionMult = 0.78; // Импульс старый, не ускоряется — отпускаем
+                } else {
+                    longSuppressionMult = 0.55; // Свежий медвежий импульс
+                }
+
             } else if (cascadeLevel == CascadeLevel.DANGER) {
-                longSuppressionMult = 0.45;
+                if (btcRecovering) {
+                    longSuppressionMult = 0.70;
+                } else if (bearAgeMs > 15 * 60_000L && accelAbating) {
+                    longSuppressionMult = 0.60;
+                } else {
+                    longSuppressionMult = 0.45;
+                }
+
             } else if (cascadeLevel == CascadeLevel.WATCH) {
-                longSuppressionMult = 0.75;
+                longSuppressionMult = btcRecovering ? 0.90 : 0.75;
             }
         }
 

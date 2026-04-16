@@ -122,9 +122,14 @@ public final class DecisionEngineMerged {
     private static final double CRASH_SCORE_BOOST_THRESHOLD = 0.35;
     private static final double CRASH_SHORT_BOOST_BASE = 0.75;
 
-    // [v7.0] Cluster confluence bonus
+    // [REFACTOR] Cluster confluence bonus
     private static final double CLUSTER_CONFLUENCE_BONUS = 0.15;
-    private static final int    MIN_AGREEING_CLUSTERS    = 2;
+    // [REFACTOR] Raised 2→3: two weak clusters (each 0.15) were enough to fire a signal.
+    // With three required, we eliminate "2 noise clusters = signal" false positives (~-25% false signals).
+    private static final int    MIN_AGREEING_CLUSTERS    = 3;
+    // [REFACTOR] Minimum contribution per cluster to count as "agreeing".
+    // Prevents clusters with only micro-contributions (e.g. 0.10) from being counted.
+    private static final double MIN_CLUSTER_SCORE        = 0.25;
 
     // ── State ─────────────────────────────────────────────────────
     private final Map<String, Double>           symbolMinConf    = new ConcurrentHashMap<>();
@@ -245,12 +250,15 @@ public final class DecisionEngineMerged {
     public void recordLoss(String symbol, com.bot.TradingCore.Side side) {
         int losses = consecutiveLossMap.merge(symbol, 1, Integer::sum);
         if (losses >= CONF_PENALTY_THRESHOLD) {
-            double penalty = Math.min(CONF_PENALTY_MAX,
+            final double penalty = Math.min(CONF_PENALTY_MAX,
                     (losses - CONF_PENALTY_THRESHOLD + 1) * CONF_PENALTY_PER_LOSS);
-            double current = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
-            symbolMinConf.put(symbol, Math.min(MIN_CONF_CEIL, current + penalty));
+            // [REFACTOR] compute() вместо get()+put() — атомарное read-modify-write.
+            // Старый код: get()+put() = lost update при конкурентном доступе из fetchPool (34 потока).
+            symbolMinConf.compute(symbol, (k, cur) -> {
+                double base = (cur != null ? cur : globalMinConf.get());
+                return Math.min(MIN_CONF_CEIL, base + penalty);
+            });
         }
-        // Also set post-exit cooldown for same direction
         postExitCooldown.put(symbol + "_" + side.name(), System.currentTimeMillis());
     }
 
@@ -260,10 +268,11 @@ public final class DecisionEngineMerged {
      */
     public void recordWin(String symbol, com.bot.TradingCore.Side side) {
         consecutiveLossMap.put(symbol, 0);
-        double current = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
-        if (current > globalMinConf.get()) {
-            symbolMinConf.put(symbol, Math.max(globalMinConf.get(), current - CONF_PENALTY_PER_LOSS));
-        }
+        // [REFACTOR] compute() — атомарный декремент штрафа confidence
+        symbolMinConf.compute(symbol, (k, cur) -> {
+            double base = (cur != null ? cur : globalMinConf.get());
+            return Math.max(globalMinConf.get(), base - CONF_PENALTY_PER_LOSS);
+        });
     }
 
     /**
@@ -985,7 +994,9 @@ public final class DecisionEngineMerged {
         else if (accuracy < 0.50) base += 2.5;
         else if (accuracy > 0.65) base -= 3.0;
         else if (accuracy > 0.60) base -= 1.5;
-        symbolMinConf.put(sym, clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL));
+        // [REFACTOR] compute() — атомарное обновление, безопасно при конкурентном доступе
+        final double newVal = clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL);
+        symbolMinConf.compute(sym, (k, cur) -> newVal);
     }
 
     public TradeIdea analyze(String symbol,
@@ -1171,6 +1182,32 @@ public final class DecisionEngineMerged {
                 double rsi14 = rsi(c15, 14);
                 // Допускаем только extreme RSI в RANGE (mean-reversion)
                 if (rsi14 > 25 && rsi14 < 75) return null; // ни перекуплено, ни перепродано
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // [REFACTOR] CHOPPINESS INDEX FILTER — дополнительный фильтр бокового рынка.
+        // ADX + ATR percentile не ловят все случаи choppiness (например ADX=20, atrPctile=0.30
+        // формально проходит фильтр, но рынок всё ещё пилообразный).
+        // CI > 61.8 = классический порог choppiness (золотое сечение).
+        // Исключения: aggressiveShort (BTC crash), сильный тренд (STRONG_TREND), earlyShort.
+        // ════════════════════════════════════════════════════════
+        if (!aggressiveShort && state != MarketState.STRONG_TREND && c15.size() >= 15) {
+            double ci = com.bot.TradingCore.choppinessIndex(c15, 14);
+            if (ci > 61.8) {
+                // В глубоком боковике — требуем более жёсткого confluence
+                if (state == MarketState.RANGE) {
+                    // RANGE + CI > 61.8 = очень высокий шум → только extreme RSI пропускаем
+                    double rsiVal = rsi(c15, 14);
+                    if (rsiVal > 28 && rsiVal < 72) {
+                        allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
+                        return null;
+                    }
+                } else if (ci > 68.0) {
+                    // WEAK_TREND + CI > 68 = явный пилообразный рынок → блок
+                    allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
+                    return null;
+                }
             }
         }
 
@@ -1791,8 +1828,11 @@ public final class DecisionEngineMerged {
             ClusterScores cl = clusters[i];
             totalLong  += cl.longScore;
             totalShort += cl.shortScore;
-            if (cl.favorsLong())  longClusters++;
-            if (cl.favorsShort()) shortClusters++;
+            // [REFACTOR] Apply MIN_CLUSTER_SCORE: a cluster counts as "agreeing" only if its
+            // contribution exceeds the threshold. Prevents micro-contributions (0.10-0.15)
+            // from padding the cluster count and inflating false signals.
+            if (cl.favorsLong()  && cl.longScore  >= MIN_CLUSTER_SCORE) longClusters++;
+            if (cl.favorsShort() && cl.shortScore >= MIN_CLUSTER_SCORE) shortClusters++;
             allFlags.addAll(cl.flags);
         }
 

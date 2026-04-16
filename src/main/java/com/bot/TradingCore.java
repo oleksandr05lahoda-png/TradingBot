@@ -1076,6 +1076,45 @@ public final class TradingCore {
         return count > 0 ? (double) rank / count : 0.5;
     }
 
+    /**
+     * Choppiness Index (CI) — measures whether the market is trending or ranging.
+     *
+     * Formula: CI(n) = 100 × log10(Σ ATR(1) over n bars / (highest_high - lowest_low over n bars)) / log10(n)
+     *
+     * Interpretation:
+     *   CI > 61.8 → choppy / consolidating (avoid trend-following signals)
+     *   CI < 38.2 → strong trend (high edge for trend-following)
+     *   38.2–61.8 → transitional zone
+     *
+     * @param candles price bars (needs at least period+1)
+     * @param period  lookback window (typically 14)
+     * @return CI value in [0..100], or 50 if insufficient data
+     */
+    public static double choppinessIndex(List<Candle> candles, int period) {
+        if (candles == null || candles.size() < period + 1) return 50.0;
+
+        int end = candles.size() - 1;
+        int start = end - period + 1;
+        if (start < 1) return 50.0; // need at least 1 bar before start for TR
+
+        double highestHigh = Double.NEGATIVE_INFINITY;
+        double lowestLow   = Double.MAX_VALUE;
+        double sumAtr1     = 0.0;
+
+        for (int i = start; i <= end; i++) {
+            Candle cur  = candles.get(i);
+            Candle prev = candles.get(i - 1);
+            highestHigh = Math.max(highestHigh, cur.high);
+            lowestLow   = Math.min(lowestLow,   cur.low);
+            sumAtr1    += trueRange(cur, prev);
+        }
+
+        double totalRange = highestHigh - lowestLow;
+        if (totalRange < 1e-12 || sumAtr1 < 1e-12) return 50.0;
+
+        return 100.0 * Math.log10(sumAtr1 / totalRange) / Math.log10(period);
+    }
+
     /* ════════════════════════════════════════════════════════════════
        DIVERGENCE DETECTION
        ════════════════════════════════════════════════════════════════ */

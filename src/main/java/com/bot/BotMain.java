@@ -1752,11 +1752,20 @@ public final class BotMain {
 
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot PRO* `v41`\n"
+        return "⚡ *TradingBot PRO* `v41-R1`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures  ·  Crypto / Commodities\n"
                 + "VSA  ·  OFV  ·  EarlyRev  ·  Forecast\n"
                 + "R:R min `1:2`  ·  Risk-first 🔒\n"
+                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                + "🔧 *REFACTOR R1 активен:*\n"
+                + "• CI фильтр боковика (Choppiness Index)\n"
+                + "• MIN_CLUSTERS=3 (было 2)\n"
+                + "• OI refresh 15m · Depth 120s\n"
+                + "• TOP_N=30 · SCAN=25\n"
+                + "• 5m WS-candles (no REST)\n"
+                + "• EARLY_TICK заблокирован ночью\n"
+                + "• Flat sizing ×0.85..×1.15\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "_Система активна. Торгуй с умом._";
     }

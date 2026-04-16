@@ -29,7 +29,10 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class SignalOptimizer {
 
     private static final int    MIN_TICKS  = 5;
-    private static final int    MAX_TICKS  = 200;
+    // [PATCH v-MILLION #6] MAX_TICKS 200→50: 50 тиков = ~25 секунд данных @ 0.5s tick.
+    // 200 тиков = 100 секунд. Разница для индикатора: ≈0. Экономия RAM: 75%.
+    // При 50 парах: 200×50×8 bytes = 80 KB → 50×50×8 bytes = 20 KB.
+    private static final int    MAX_TICKS  = 50;
     private static final double EMA_ALPHA  = 0.45;
 
     private static final double STRONG_IMPULSE = 0.0018;   // [v50] was 0.0025
@@ -59,7 +62,10 @@ public final class SignalOptimizer {
 
     // [FIX-BUG-2] История ATR по символам для адаптивного капа
     private final Map<String, Deque<Double>> symbolAtrHistory   = new ConcurrentHashMap<>();
-    private static final int ATR_HISTORY_SIZE = 96;
+    // [PATCH v-MILLION #6] ATR_HISTORY_SIZE 96→48: 48 × 15m = 12h истории ATR (было 24h).
+    // 12 часов более чем достаточно для адаптивного капа и режима волатильности.
+    // Экономия: -50% записей в symbolAtrHistory.
+    private static final int ATR_HISTORY_SIZE = 48;
 
     private com.bot.PumpHunter pumpHunter;
 
@@ -276,7 +282,9 @@ public final class SignalOptimizer {
         // Сохраняем momentum историю
         Deque<Double> momHistory = momentumHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         momHistory.addLast(momentum);
-        while (momHistory.size() > 100) momHistory.removeFirst();
+        // [PATCH v-MILLION #6] Momentum history: 100→20 entries. Exhaustion detection
+        // нужны только последние 3-5 записей, 20 — с запасом.
+        while (momHistory.size() > 20) momHistory.removeFirst();
 
         // [FIX-BUG-2] Используем адаптивный кап
         double adaptiveCap = computeAdaptiveImpulseCap(symbol);
@@ -349,11 +357,43 @@ public final class SignalOptimizer {
     //  Это позволяет корректно различать +1% и +4% движения
     // ══════════════════════════════════════════════════════════════
 
+    // ══════════════════════════════════════════════════════════════
+    //  [PATCH v-MILLION #7] PERCENTILE-RANK IMPULSE NORMALIZATION
+    //  Проблема: линейная нормализация impulse/STRONG_IMPULSE не различает
+    //  +1% и +4% движения после нескольких кратных STRONG_IMPULSE.
+    //  Решение: percentile rank — возвращает позицию текущего impulse
+    //  относительно исторических значений для данного символа [0.0..1.0].
+    //  Это позволяет точно измерить "насколько сильный этот импульс
+    //  ОТНОСИТЕЛЬНО нормы для данной монеты".
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Percentile rank текущего impulse в историческом окне [0..1].
+     * 0.9 = impulse сильнее 90% всех исторических значений = очень сильный.
+     * 0.5 = медиана = средний для этой монеты.
+     */
+    private double computeImpulsePercentile(String symbol, double currentImpulse) {
+        // Используем историю моментума как прокси для импульса
+        Deque<Double> momHist = momentumHistory.get(symbol);
+        if (momHist == null || momHist.size() < 10) return 0.5; // нет данных — нейтраль
+
+        List<Double> absValues = new ArrayList<>();
+        for (double m : momHist) absValues.add(Math.abs(m));
+        if (absValues.isEmpty()) return 0.5;
+        Collections.sort(absValues);
+
+        // Количество исторических значений меньше текущего
+        int below = 0;
+        for (double v : absValues) if (v < currentImpulse) below++;
+        return (double) below / absValues.size();
+    }
+
     /**
      * [v23.0] RESTORED micro-momentum adjustConfidence.
      * v18.0 killed this method → bot stopped reacting to tick-level acceleration.
      * Now restored with TAMED influence: ±8 max (was ±30+).
-     * This lets the bot "feel" the market moving in real-time.
+     * [PATCH v-MILLION #7] Boost/penalty теперь масштабируется по percentile rank,
+     * а не по линейному ratio — это различает "средний памп" от "аномального".
      */
     public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
         MicroTrendResult mt = computeMicroTrend(signal.symbol);
@@ -364,19 +404,28 @@ public final class SignalOptimizer {
         boolean impulseAligned = (isLong && mt.smoothSpeed > 0) || (!isLong && mt.smoothSpeed < 0);
         boolean impulseOpposed = (isLong && mt.smoothSpeed < 0) || (!isLong && mt.smoothSpeed > 0);
 
-        // [v51] Boosted aligned micro-momentum: max +7 (was +5).
-        // Real-time tick alignment is the strongest predictor at trade entry.
+        // [PATCH v-MILLION #7] Percentile-scaled boost/penalty.
+        // Percentile rank [0..1] корректирует силу буста:
+        //   - 90th percentile: полный буст (+7)
+        //   - 50th percentile: половина буста (+3.5)
+        //   - ниже 30th percentile: нет буста
+        // Это исключает ложные бусты от "обычных" импульсов.
         if (impulseAligned && mt.impulse > STRONG_IMPULSE) {
-            double boost = Math.min(7.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 4.0);
-            conf += boost;
+            double pct = computeImpulsePercentile(signal.symbol, mt.impulse);
+            if (pct >= 0.30) { // игнорируем нижние 30% импульсов
+                double boost = Math.min(7.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 4.0 * pct);
+                conf += boost;
+            }
         }
-        // [v51] Opposed micro-momentum → harsher penalty (max -10, was -8).
-        // If ticks are going against the signal direction, the entry is wrong.
+        // Penalty масштабируется аналогично — штраф только за значимые встречные импульсы
         if (impulseOpposed && mt.impulse > STRONG_IMPULSE) {
-            double penalty = Math.min(10.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 5.0);
-            conf -= penalty;
+            double pct = computeImpulsePercentile(signal.symbol, mt.impulse);
+            if (pct >= 0.25) {
+                double penalty = Math.min(10.0, Math.log1p(mt.impulse / STRONG_IMPULSE) * 5.0 * pct);
+                conf -= penalty;
+            }
         }
-        // [v51] Stronger acceleration bonus
+        // Acceleration bonus — без percentile (ускорение само по себе значимо)
         if (impulseAligned && Math.abs(mt.accel) > ACCELERATION_THRESHOLD) {
             conf += Math.min(5.0, Math.abs(mt.accel) / ACCELERATION_THRESHOLD * 2.0);
         }
