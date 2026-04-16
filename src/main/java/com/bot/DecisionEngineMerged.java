@@ -4,6 +4,17 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+// ═══════════════════════════════════════════════════════════════════════
+// DecisionEngineMerged — REFACTORED v38-FINAL
+// CHANGES vs original:
+//   [FIX-allFlags]   List<String> allFlags moved BEFORE CI filter block
+//                    → fixes "Cannot resolve symbol 'allFlags'" compile error
+//   [REFACTOR]       MIN_AGREEING_CLUSTERS = 3 (was 2)
+//   [REFACTOR]       MIN_CLUSTER_SCORE = 0.25 (was none)
+//   [REFACTOR]       Choppiness Index filter (CI > 61.8/68.0 block)
+//   [REFACTOR]       Thread-safe symbolMinConf via compute()
+//   [REFACTOR]       vdHistory/cvdHistory via computeIfAbsent()
+// ═══════════════════════════════════════════════════════════════════════
 public final class DecisionEngineMerged {
 
     public static volatile java.time.ZoneId USER_ZONE = java.time.ZoneId.of("Europe/Warsaw");
@@ -1192,6 +1203,10 @@ public final class DecisionEngineMerged {
         // CI > 61.8 = классический порог choppiness (золотое сечение).
         // Исключения: aggressiveShort (BTC crash), сильный тренд (STRONG_TREND), earlyShort.
         // ════════════════════════════════════════════════════════
+        // [FIX] allFlags объявляется здесь чтобы CI-блок мог добавить флаг ДО return null.
+        List<String> allFlags = new ArrayList<>();
+        if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
+
         if (!aggressiveShort && state != MarketState.STRONG_TREND && c15.size() >= 15) {
             double ci = com.bot.TradingCore.choppinessIndex(c15, 14);
             if (ci > 61.8) {
@@ -1292,9 +1307,7 @@ public final class DecisionEngineMerged {
         ClusterScores cHTF         = new ClusterScores(); // 1H, 2H bias, VWAP
         ClusterScores cDerivatives = new ClusterScores(); // Funding, OI, Divergences
         ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
-        List<String> allFlags = new ArrayList<>();
-        if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
-        // [v50] Deferred flag additions from momentum exhaustion & velocity decay
+        // [v50] allFlags уже объявлен выше (перед CI filter). Добавляем отложенные флаги.
         if (momentumExhausted) allFlags.add("MOM_EXHAUSTED_" + (exhaustionDirection > 0 ? "UP" : "DN"));
         if (velocityDecay) allFlags.add("VEL_DECAY");
 

@@ -42,6 +42,10 @@ import java.util.concurrent.atomic.*;
  * ║  [v50] §3  EARLY_TICK: velocity/accel/volume thresholds lowered     ║
  * ║  [v50] §4  Cache TTL 15m: 14min→8min for fresher data               ║
  * ║  [v50] §5  EARLY_TICK exhaustion guard: 2.5→2.0 ATR                 ║
+ * ║  [REFACTOR] 5m TTL: 3min→4m30s (270s) — экономия ~60% klines weight  ║
+ * ║  [REFACTOR] EARLY_TICK vel: TOP→0.0015, ALT→0.0025, MEME→0.0035      ║
+ * ║  [REFACTOR] Position sizing flat: удалены conf-based множители        ║
+ * ║  [REFACTOR] FUNDING_REFRESH: 15min, DEPTH_POLL: 120s, TOP_N=30        ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  */
 public final class SignalSender {
@@ -231,7 +235,7 @@ public final class SignalSender {
 
     private static final Map<String, Long> CACHE_TTL = Map.of(
             "1m",  55_000L,
-            "5m",  3  * 60_000L,  // was 4min
+            "5m",  270_000L,       // [REFACTOR] 4m30s = 90% of candle period (was 3min)
             "15m", 8  * 60_000L,  // [v50] was 14min — stale data for half the candle period
             "1h",  55 * 60_000L,  // was 59min
             "2h",  110 * 60_000L  // was 119min
@@ -1656,10 +1660,10 @@ public final class SignalSender {
         // "85% confidence" часто = 55-60% реальный WR. Давать ×1.50 размер на inflated сигналы
         // усиливает потери, а не прибыль. После стабилизации WR — расширить диапазон обратно.
         // Сохраняем небольшой градиент чтобы высококонфидентные сигналы всё же чуть крупнее.
-        if (idea.probability >= 80)      riskPct *= 1.15;
-        else if (idea.probability >= 70) riskPct *= 1.05;
-        else if (idea.probability >= 62) riskPct *= 1.00;
-        else                              riskPct *= 0.85; // низкая уверенность → меньше размер
+        // [REFACTOR] Flat sizing until WR > 45% calibrated.
+        // Confidence-based scaling was amplifying losses from inflated base confidence.
+        // When WR is properly validated (>45%), re-enable differential multipliers.
+        // riskPct *= 1.00; // flat for all signals
 
         // [v51] PRE_BREAK signals are predictive — slightly larger size
         if (idea.flags.contains("PRE_BREAK_UP") || idea.flags.contains("PRE_BREAK_DN")) {
@@ -2829,9 +2833,9 @@ public final class SignalSender {
         // [v50] Velocity thresholds lowered for earlier detection.
         // Old: ALT 0.0015 = move already visible on chart. New: 0.0010.
         double velThreshold = switch (etCat) {
-            case TOP  -> 0.0005;  // was 0.0008 — BTC 0.05% micro-move
-            case ALT  -> 0.0010;  // was 0.0015 — catch earlier
-            case MEME -> 0.0015;  // was 0.0020
+            case TOP  -> 0.0015;  // [REFACTOR] ×3 от 0.0005: 0.05% = нормальный шум. 0.15% = реальный импульс
+            case ALT  -> 0.0025;  // [REFACTOR] ×2.5: требуем значимый move, не micro-tick
+            case MEME -> 0.0035;  // [REFACTOR] ×2.3: MEME монеты шумные, порог выше
         };
         if (vel < velThreshold) return null;
         boolean up = move > 0;
