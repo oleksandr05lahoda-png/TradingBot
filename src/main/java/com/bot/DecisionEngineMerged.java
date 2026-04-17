@@ -1299,10 +1299,45 @@ public final class DecisionEngineMerged {
         // Applied AFTER candidateSide is known (see veto below).
         LocalExhaustion localExh = detectLocalExhaustion(c15, atr14);
 
+        // ═══════════════════════════════════════════════════════════════
+        // [PATCH C v42] POST-PUMP DETECTION
+        // Кейс SOONUSDT: +105% за ночь, потом -20% от хая → бот дал LONG в
+        // свободном падении. Блокируем LONG если монета выросла >35% за 20
+        // свечей (5h на 15m) и сейчас упала >8% от хая.
+        // Применяется ПЕРЕД кластерами — экономит CPU на заведомо битом LONG.
+        // ═══════════════════════════════════════════════════════════════
+        boolean postPumpDump = false;
+        double postPumpGain = 0, postPumpDropFromHi = 0;
+        if (c15.size() >= 20) {
+            double recentHigh = 0, recentLow = Double.MAX_VALUE;
+            int fromPP = c15.size() - 20;
+            for (int i = fromPP; i < c15.size(); i++) {
+                recentHigh = Math.max(recentHigh, c15.get(i).high);
+                recentLow  = Math.min(recentLow,  c15.get(i).low);
+            }
+            if (recentLow > 0 && recentHigh > 0) {
+                postPumpGain       = (recentHigh - recentLow) / recentLow;
+                postPumpDropFromHi = (recentHigh - price)      / recentHigh;
+                if (postPumpGain >= 0.35 && postPumpDropFromHi >= 0.08) {
+                    postPumpDump = true;
+                }
+            }
+        }
+        // ═══════════════════════════════════════════════════════════════
+
         // [v23.0] ADX low in RANGE: penalty, not veto
         boolean adxRangePenalty = false;
         if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) {
             adxRangePenalty = true;
+        }
+
+        // [PATCH C v42] allFlags перенесён сюда из низа метода — PostPump блок пишет в него.
+        // Все предыдущие add() в этот список сохранены ниже в том же порядке.
+        List<String> allFlags = new ArrayList<>();
+        if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
+        if (postPumpDump) {
+            allFlags.add(String.format("POST_PUMP_DUMP_gain%.0f_drop%.0f",
+                    postPumpGain * 100, postPumpDropFromHi * 100));
         }
 
         // ════════════════════════════════════════════════════════
@@ -1335,9 +1370,8 @@ public final class DecisionEngineMerged {
         // CI > 61.8 = классический порог choppiness (золотое сечение).
         // Исключения: aggressiveShort (BTC crash), сильный тренд (STRONG_TREND), earlyShort.
         // ════════════════════════════════════════════════════════
-        // [FIX] allFlags объявляется здесь чтобы CI-блок мог добавить флаг ДО return null.
-        List<String> allFlags = new ArrayList<>();
-        if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
+        // [PATCH C v42] allFlags уже объявлен выше (после PostPump detection).
+        // Дубликат объявления удалён, чтобы не было "variable already defined".
 
         if (!aggressiveShort && state != MarketState.STRONG_TREND && c15.size() >= 15) {
             double ci = com.bot.TradingCore.choppinessIndex(c15, 14);
@@ -2402,6 +2436,20 @@ public final class DecisionEngineMerged {
             return null; // [FIX #22] ACTUAL VETO — was missing
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // [PATCH C v42] POST-PUMP LONG VETO
+        // Финальный veto после определения candidateSide/side.
+        // Если памп+дамп цикл обнаружен (gain≥35%, drop≥8%) — LONG блокируется.
+        // Это предотвращает кейс SOONUSDT: бот дал LONG на 0.2359 когда цена уже
+        // упала с 0.34 (хай памп-цикла) на -20%+. Классическая ловля ножа.
+        // ═══════════════════════════════════════════════════════════════
+        if (postPumpDump && side == com.bot.TradingCore.Side.LONG) {
+            System.out.println("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
+                    + String.format("%.0f%%", postPumpGain * 100)
+                    + " dropFromHi=" + String.format("%.0f%%", postPumpDropFromHi * 100));
+            return null;
+        }
+
         // ════════════════════════════════════════════════════════
         // [v7.0] КАЛИБРОВАННАЯ УВЕРЕННОСТЬ — на кластерах
         // ════════════════════════════════════════════════════════
@@ -2946,6 +2994,43 @@ public final class DecisionEngineMerged {
 
         // Пересчитываем rrRatio на основе выбранного tp3
         double adaptiveRR = tp3Mult;
+
+        // ═══════════════════════════════════════════════════════════════
+        // [PATCH D v42] SL WIDTH + R:R GUARD
+        // Кейс SOONUSDT: SL 1.40% для монеты с ATR 5-8% → 0.25×ATR — выбивает шумом.
+        // Минимум SL ширины = 0.8×ATR. R:R до TP1 мin 1:1.2, до TP2 мин 1:1.80.
+        //
+        // В этой архитектуре:
+        //   tp1Mult/tp2Mult/tp3Mult — МНОЖИТЕЛИ risk-дистанции (R).
+        //   TradeIdea ctor: tp1 = price ± risk × tp1Mult, где risk = |price - stop|
+        // Значит R:R(tp1) = tp1Mult, R:R(tp2) = tp2Mult. Контролируем эти числа.
+        // ═══════════════════════════════════════════════════════════════
+        double slDistanceD = Math.abs(price - stopPrice);
+        double minSlDistD  = atr14 * 0.8;
+
+        if (slDistanceD < minSlDistD) {
+            stopPrice = (side == com.bot.TradingCore.Side.LONG)
+                    ? price - minSlDistD
+                    : price + minSlDistD;
+            slDistanceD = minSlDistD;
+            allFlags.add("SL_WIDEN_ATR");
+        }
+
+        // Минимальные множители: TP1 >= 1.2R, TP2 >= 1.8R, TP3 >= 2.4R (или tp2×1.3)
+        if (tp1Mult < 1.20) tp1Mult = 1.20;
+        if (tp2Mult < 1.80) tp2Mult = 1.80;
+        if (tp3Mult < tp2Mult * 1.30) tp3Mult = tp2Mult * 1.30;
+
+        // Финальная проверка R:R к TP2 — если после расширения SL всё ещё < 1.80,
+        // сигнал не имеет edge. Это никогда не должно сработать после принудительного
+        // tp2Mult >= 1.80, но оставляем как safety net.
+        if (tp2Mult < 1.80) {
+            System.out.println("[PATCH D] " + symbol + " rejected: tp2Mult="
+                    + String.format("%.2f", tp2Mult) + " < 1.80 (R:R floor)");
+            return null;
+        }
+        adaptiveRR = tp3Mult; // пересчитываем после возможной правки tp3Mult
+        // ═══════════════════════════════════════════════════════════════
 
         return new TradeIdea(symbol, side, price, stopPrice, takePrice, adaptiveRR,
                 probability, allFlags,

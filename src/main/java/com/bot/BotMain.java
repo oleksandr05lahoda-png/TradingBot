@@ -9,32 +9,23 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v36.0 — ARCH FIX: WS CANDLES + ORDER EXEC + ALERTS RESTORED       ║
+ * ║       BotMain v42 — PATCH A (Calibrator real TP/SL) + PATCH B (Railway -50%)   ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  [v34.0] §1 AssetType auto-detection (crypto/oil/gas/metals/forex)     ║
+ * ║  [v42]   PATCH A: ForecastRecord получает реальные tp1/sl из TradeIdea ║
+ * ║          Калибратор теперь учится на тех же уровнях, что идут трейдеру ║
+ * ║  [v42]   PATCH B: Railway cost ~$25 → ~$10 через:                       ║
+ * ║            • Thread pools 2→1 main, 4→2 aux                             ║
+ * ║            • INTERVAL default 1→2 min                                   ║
+ * ║            • Watchdog 60s→120s, LogStats 15→30 min                      ║
+ * ║            • Backtest каждые 2h → раз в сутки 03:00 UTC                 ║
+ * ║            • WalkForward ежедневно → раз в 3 дня 05:00 UTC              ║
+ * ║            • CalibratorSave 10→30 min, TimeSync 30→120 min              ║
+ * ║            • ForecastChecker 15→20 min                                  ║
+ * ║  [v36.0] §1 AssetType auto-detection (crypto/oil/gas/metals/forex)     ║
  * ║  [v34.0] §2 Dynamic CoinCategory (volume-based TOP, keyword MEME)      ║
- * ║  [v34.0] §3 TOP coin EARLY_TICK fix (BTC/ETH velocity thresholds)      ║
- * ║  [v34.0] §4 PumpHunter category-aware thresholds (60% for TOP)         ║
- * ║  [v34.0] §5 Telegram format: asset type + category in first line       ║
- * ║  [v34.0] §6 Advance Forecast shows asset type                          ║
- * ║  [v34.0] §7 Extended sector detection (AI, RWA, DePin + commodities)   ║
  * ║  [v17.0] §1 Bipolar Guard: isSymbolAvailable() in runCycle dispatch     ║
- * ║  [v17.0] §1 Final thread-safe bipolar check before telegram.send()      ║
- * ║  [v17.0] §4 DrawdownManager: SL/TP explicit reason in closeTrade()      ║
- * ║  [v17.0] §4 Trail-SL maps to "SL" reason; Trail-TP maps to "TP"        ║
  * ║  [v15.0] FIX Дыра 1: ConcurrentLinkedDeque everywhere (thread safety)  ║
- * ║  [v15.0] FIX Дыра 3: LR window 30→10, acceleration detection          ║
- * ║  [v15.0] FIX Дыра 4: Asymmetric streak reset (win halves boost)        ║
- * ║  [v15.0] FIX KITEUSDT: VolatilitySqueezeGuard blocks squeeze signals   ║
- * ║  [v14.0] FIX #1: tp2Hit флаг — убрал бесконечные TP2 уведомления      ║
- * ║  [v14.0] FIX #2: Circuit breaker — убрал Thread.sleep из scheduler     ║
- * ║  [v14.0] FIX #3: Trailing stop SHORT — исправлена инверсия логики      ║
- * ║  [v14.0] FIX #4: Thread safety — volatile на errorsInWindow            ║
- * ║  [v14.0] FIX #5: Memory leak — forecastRecords с MAX_SIZE + TTL        ║
- * ║  [v14.0] FIX #6: TrackedSignal — synchronized extreme updates          ║
- * ║  [v14.0] FIX #7: ForecastEngine integration                            ║
- * ║  [v14.0] FIX #8: Тихие часы расширены до 01:00-05:00 UTC              ║
- * ║  [v14.0] FIX #9: Forecast accuracy — исправлена логика correct/wrong   ║
+ * ║  [v14.0] FIX #1-9: tp2Hit flag, CB, trail SHORT, thread safety и т.д.  ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  */
 public final class BotMain {
@@ -57,7 +48,10 @@ public final class BotMain {
     // Auto-detected at startup: env TIMEZONE → IP geolocation → Warsaw fallback.
     // Each instance (yours in Warsaw, father's in Zaporizhzhia) detects its own timezone.
     private static final ZoneId ZONE      = detectTimezone();
-    private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 1);
+    // [PATCH B v42] Default INTERVAL 1→2 min. На 15m TF обновление каждую минуту
+    // даёт 15× избыточность. 2 мин = 7.5 обновлений/бар — достаточно для EARLY_TICK.
+    // Override через ENV SIGNAL_INTERVAL_MIN=1 если нужно сохранить старое поведение.
+    private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 2);
     private static final int    KLINES    = envInt("KLINES_LIMIT", 160);
     // Hard cap to avoid Telegram queue backlog (which can make the bot
     // "silent" for hours/days under heavy signal load).
@@ -156,6 +150,14 @@ public final class BotMain {
         // Using current ATR (from 15m candle) was wrong: in consolidation ATR shrinks 40-60%
         // making the bucket lookup wrong (e.g. MEDIUM→LOW). Use 30-day percentile instead.
         final double robustAtrPctAtSignal;
+
+        // [PATCH A v42] Реальные TP1/SL уровни из TradeIdea — нужны чтобы калибратор
+        // учился на ТЕХ ЖЕ уровнях, что реально уходят трейдеру в Telegram.
+        // Без этого калибратор учился на синтетических entry±1.0×ATR, не совпадающих
+        // с фактическими сигналами → "83% уверенности" никогда не сходится с реальностью.
+        final double tp1Level;
+        final double slLevel;
+
         final long   createdAt;
         volatile boolean resolved = false;
         volatile String  actualOutcome = null;
@@ -164,18 +166,28 @@ public final class BotMain {
         // When TradeResolver is re-enabled, both paths could fire for the same record → double count.
         volatile boolean counted = false;
 
+        // [PATCH A v42] Primary constructor с реальными уровнями
         ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
-                       String bias, double score, double signalProb, double robustAtrPct) {
+                       String bias, double score, double signalProb, double robustAtrPct,
+                       double tp1, double sl) {
             this.symbol = sym; this.side = side; this.entryPrice = price;
             this.forecastBias = bias; this.forecastScore = score;
             this.signalProbability  = signalProb;
             this.robustAtrPctAtSignal = robustAtrPct;
+            this.tp1Level = tp1;
+            this.slLevel  = sl;
             this.createdAt = System.currentTimeMillis();
+        }
+
+        // Back-compat конструктор (без tp1/sl — fallback на ATR-реконструкцию в checkForecastAccuracy)
+        ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
+                       String bias, double score, double signalProb, double robustAtrPct) {
+            this(sym, side, price, bias, score, signalProb, robustAtrPct, 0.0, 0.0);
         }
         // [v43] Back-compat constructor (signalProb unknown → use forecastScore as fallback)
         ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
                        String bias, double score) {
-            this(sym, side, price, bias, score, score, 1.0);
+            this(sym, side, price, bias, score, score, 1.0, 0.0, 0.0);
         }
         long ageMs() { return System.currentTimeMillis() - createdAt; }
     }
@@ -398,7 +410,10 @@ public final class BotMain {
         });
 
         // ── Schedulers ───────────────────────────────────────────
-        ScheduledExecutorService mainSched = Executors.newScheduledThreadPool(2, r -> {
+        // [PATCH B v42] Thread pools reduced: 2→1 main, 4→2 aux.
+        // 15m TF не требует параллелизма больше этого уровня.
+        // Экономия: ~6 потоков → ~3. Stack ~1-2MB/поток = -8MB RAM.
+        ScheduledExecutorService mainSched = Executors.newScheduledThreadPool(1, r -> {
             Thread t = new Thread(r, "TradingBot-Main");
             t.setDaemon(false);
             t.setUncaughtExceptionHandler((th, ex) ->
@@ -406,7 +421,7 @@ public final class BotMain {
             return t;
         });
 
-        ScheduledExecutorService auxSched = Executors.newScheduledThreadPool(4, r -> {
+        ScheduledExecutorService auxSched = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "TradingBot-Aux");
             t.setDaemon(true);
             return t;
@@ -419,38 +434,43 @@ public final class BotMain {
         });
 
         // ── Main cycle (каждые INTERVAL минут) ───────────────────
+        // [PATCH B v42] Default INTERVAL=1→2 min рекомендуется (через ENV SIGNAL_INTERVAL_MIN=2).
+        // 15m TF обновляется 4 раза за бар при INTERVAL=2 — достаточно для EARLY_TICK детекта.
         mainSched.scheduleAtFixedRate(
                 safe("MainCycle", () -> runCycle(telegram, gic, isc, sender)),
                 0, INTERVAL, TimeUnit.MINUTES);
 
-        // ── Stats в лог каждые 15 минут ──────────────────────────
+        // ── Stats в лог каждые 30 минут (было 15) ────────────────
+        // [PATCH B v42] Stats не требуют минутной точности.
         auxSched.scheduleAtFixedRate(
                 safe("LogStats", () -> logStats(telegram, gic, isc, sender)),
-                15, 15, TimeUnit.MINUTES);
+                30, 30, TimeUnit.MINUTES);
 
         // ── Daily summary в Telegram в 09:00 UTC ─────────────────
         auxSched.scheduleAtFixedRate(
                 safe("DailySummary", () -> maybeSendDailySummary(telegram, gic, isc, sender)),
                 1, 1, TimeUnit.MINUTES);
 
-        // ── Watchdog каждые 60s ──────────────────────────────────
+        // ── Watchdog каждые 2 минуты (было 60s) ──────────────────
+        // [PATCH B v42] WS heartbeat сам ловит разрывы быстрее 60s шедулера.
         auxSched.scheduleAtFixedRate(
                 safe("Watchdog", () -> runWatchdog(telegram, gic, isc, sender)),
-                60, 60, TimeUnit.SECONDS);
+                120, 120, TimeUnit.SECONDS);
 
-        // [PATCH #6] Periodic calibrator save (every 10 min)
+        // [PATCH #6] Periodic calibrator save (every 30 min — was 10)
+        // [PATCH B v42] Запись на диск — дорогая операция, 30 мин достаточно.
         auxSched.scheduleAtFixedRate(
                 safe("CalibratorSave", () -> {
                     com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
                     int cnt = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
                     LOG.info("[Calibrator] auto-saved, total outcomes: " + cnt);
                 }),
-                10, 10, TimeUnit.MINUTES);
+                30, 30, TimeUnit.MINUTES);
 
-        // [PATCH #7] Periodic Binance server time sync (every 30 min)
+        // [PATCH #7] Periodic Binance server time sync (every 2h — was 30 min)
         auxSched.scheduleAtFixedRate(
                 safe("TimeSync", sender::syncServerTime),
-                5, 30, TimeUnit.MINUTES);
+                5, 120, TimeUnit.MINUTES);
 
         // ── [SCANNER MODE v2.0] TradeResolver DISABLED ───────────────
         // Бот работает в режиме чистого сканера сигналов.
@@ -463,56 +483,49 @@ public final class BotMain {
         //         90, 45, TimeUnit.SECONDS);
 
         // ── [SCANNER MODE v2.0] PositionStatus DISABLED ──────────────
-        // Нет виртуальных позиций → нет смысла в отчёте о позициях.
-        //
         // auxSched.scheduleAtFixedRate(
         //         safe("PositionStatus", () -> sendPositionStatus(telegram)),
         //         15, 30, TimeUnit.MINUTES);
 
-        // ── [SCANNER MODE v2.0] ForecastChecker DISABLED ─────────────
-        // Точность прогноза считалась по виртуальным TP/SL.
-        // Без TradeResolver данные некорректны. Отключено.
-        //
-        // [v42.1 FIX] RE-ENABLED. Scanner-mode compatible: checkForecastAccuracy
-        // does NOT use virtual TP/SL — it compares real market price vs entry after
-        // 2h against a dynamic ATR threshold (see BotMain.checkForecastAccuracy).
-        // This is the feedback loop that populates ProbabilityCalibrator with real
-        // win/loss outcomes. Without it the calibrator stays empty and all #1 work
-        // is dead weight. MUST stay enabled.
+        // ── ForecastChecker каждые 20 минут (было 15) ────────────
+        // [PATCH B v42] Калибратор требует 45+ мин выдержки → 15 мин шедулера избыточно.
+        // checkForecastAccuracy — feedback loop в ProbabilityCalibrator, MUST stay enabled.
         auxSched.scheduleAtFixedRate(
                 safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
-                16, 15, TimeUnit.MINUTES);
+                20, 20, TimeUnit.MINUTES);
 
-        // ── [v42.1 FIX #10] WalkForward — daily out-of-sample validation ─
-        // Runs once every 24h. For each active symbol, slides a train/test
-        // window over 30 days of history. If test win-rate drops >15% vs
-        // train, emits an overfit alert to Telegram. This is the only
-        // protection against SignalOptimizer overfitting to historical noise.
+        // ── WalkForward раз в 3 дня в 05:00 UTC (было ежедневно) ─
+        // [PATCH B v42] fetchKlines(2880) × 8 символов — самый тяжёлый REST burst в системе.
+        // Статистика 30-дневного окна практически не меняется за сутки, 3 дня = достаточно.
         auxSched.scheduleAtFixedRate(
-                safe("WalkForward", () -> runWalkForwardValidation(sender, telegram)),
-                6 * 60, 24 * 60, TimeUnit.MINUTES);
+                safe("WalkForward", () -> {
+                    int hourUtc = ZonedDateTime.now(ZoneOffset.UTC).getHour();
+                    int dayOfYear = ZonedDateTime.now(ZoneOffset.UTC).getDayOfYear();
+                    if (hourUtc == 5 && dayOfYear % 3 == 0) {
+                        runWalkForwardValidation(sender, telegram);
+                    }
+                }),
+                60, 60, TimeUnit.MINUTES);
 
-        // ── [MODULE 4 v33] ADVANCE FORECAST ALERTS — каждые 5 минут ──
-        // Анализирует рыночную структуру и отправляет заблаговременные
-        // прогнозы о готовящихся пампах/дампах/разворотах — ДО сигнала входа.
-        // Это даёт трейдеру время подготовиться: поставить лимитник, убрать стоп,
-        // уменьшить позицию — до того как движение начнётся.
-        // [PATCH-AFC-DISABLED] Advance Forecast полностью отключён.
-        // Причина: в боковом рынке генерирует шумовые пре-прогнозы с 41-61% уверенностью,
-        // которые противоречат или дублируют боевые сигналы — создаёт путаницу для трейдера.
-        // Оставлен ТОЛЬКО один формат сообщений: боевой сигнал с TP/SL.
-        // Для повторного включения — раскомментировать блок ниже.
+        // ── [MODULE 4 v33] ADVANCE FORECAST ALERTS DISABLED ──────
+        // Оставлен отключённым — создаёт путаницу с боевыми сигналами в боковом рынке.
         //
         // auxSched.scheduleAtFixedRate(
         //         safe("AdvanceForecast", () -> runAdvanceForecast(sender, gic, isc, telegram)),
         //         3, 5, TimeUnit.MINUTES);
 
-        // ── Backtest каждые 2 часа в изолированном потоке ─────────
+        // ── Backtest раз в сутки в 03:00 UTC (было каждые 2h) ────
+        // [PATCH B v42] Было 12 CPU burst/сутки на 18 пар × 4 таймфрейма = Railway CPU billing пик.
+        // Теперь проверяем каждый час, запускаем только в 03:00 UTC (тихий час).
         auxSched.scheduleAtFixedRate(
-                safe("BacktestSubmit", () ->
+                safe("BacktestSubmit", () -> {
+                    int hourUtc = ZonedDateTime.now(ZoneOffset.UTC).getHour();
+                    if (hourUtc == 3) {
                         heavySched.submit(safe("Backtest",
-                                () -> runPeriodicBacktest(sender, isc, telegram)))),
-                30, 120, TimeUnit.MINUTES);
+                                () -> runPeriodicBacktest(sender, isc, telegram)));
+                    }
+                }),
+                60, 60, TimeUnit.MINUTES);
 
         // ── Shutdown hook ────────────────────────────────────────
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -759,9 +772,12 @@ public final class BotMain {
         double robustAtrPct = idea.robustAtrPct; // now exposed directly from TradeIdea (v43)
 
         // [v36-FIX Дыра9] Используем forecastSeq вместо currentTimeMillis() — нет коллизий
+        // [PATCH A v42] Передаём РЕАЛЬНЫЕ tp1 и stop из TradeIdea. Они попадут в калибратор
+        // при разрешении записи в checkForecastAccuracy() — тот же набор уровней, что видит трейдер.
         forecastRecords.put(key + "_" + forecastSeq.incrementAndGet(),
                 new ForecastRecord(idea.symbol, idea.side, idea.price,
-                        forecastBias, forecastScore, signalProb, robustAtrPct));
+                        forecastBias, forecastScore, signalProb, robustAtrPct,
+                        idea.tp1, idea.stop));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1178,9 +1194,12 @@ public final class BotMain {
                 if (c == null || c.isEmpty()) continue;
                 double currentPrice = c.get(c.size() - 1).close;
 
-                // ── [FIX #5] Path-based TP1/SL outcome detection ────────────
-                // Reconstruct approximate TP1/SL from ATR% at signal time.
-                // Default geometry: TP1 = entry ± 1.0×ATR, SL = entry ∓ 0.8×ATR.
+                // ── [PATCH A v42] Резолв по РЕАЛЬНЫМ tp1/sl из TradeIdea ────
+                // Старое поведение: реконструировать TP1 = entry ± 1.0×ATR, SL = ±0.8×ATR.
+                // Это НЕ совпадало с тем, что реально ушло в Telegram → калибратор
+                // учился на распределении, которого в сигналах не было.
+                // Теперь используем реальные уровни. Fallback на ATR оставлен для старых
+                // записей ForecastRecord, созданных до деплоя этого патча (tp1Level == 0).
                 double atrAbs = fr.robustAtrPctAtSignal > 0
                         ? fr.robustAtrPctAtSignal * fr.entryPrice
                         : (c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0);
@@ -1191,18 +1210,29 @@ public final class BotMain {
 
                 boolean hitTP1 = false, hitSL = false;
 
-                if (hasOpinion && atrAbs > 0) {
-                    boolean longSide = bullishBias;
-                    double tp1 = longSide ? fr.entryPrice + atrAbs * 1.0
-                            : fr.entryPrice - atrAbs * 1.0;
-                    double sl  = longSide ? fr.entryPrice - atrAbs * 0.8
-                            : fr.entryPrice + atrAbs * 0.8;
+                // Приоритет: реальные уровни из TradeIdea
+                double tp1Use = fr.tp1Level;
+                double slUse  = fr.slLevel;
+                boolean haveRealLevels = tp1Use > 0 && slUse > 0;
 
+                // Fallback для back-compat записей (до деплоя патча A)
+                if (!haveRealLevels && hasOpinion && atrAbs > 0) {
+                    boolean longSide = bullishBias;
+                    tp1Use = longSide ? fr.entryPrice + atrAbs * 1.0
+                            : fr.entryPrice - atrAbs * 1.0;
+                    slUse  = longSide ? fr.entryPrice - atrAbs * 0.8
+                            : fr.entryPrice + atrAbs * 0.8;
+                    haveRealLevels = true;
+                }
+
+                if (haveRealLevels && hasOpinion) {
+                    // Используем fr.side, а не угадываем по bias — точнее для разрешения
+                    boolean longSide = fr.side == com.bot.TradingCore.Side.LONG;
                     // Walk candles in chronological order from signal creation.
                     for (com.bot.TradingCore.Candle bar : c) {
                         if (bar.openTime + 15 * 60_000L < fr.createdAt) continue;
-                        boolean tpHere = longSide ? bar.high >= tp1 : bar.low  <= tp1;
-                        boolean slHere = longSide ? bar.low  <= sl  : bar.high >= sl;
+                        boolean tpHere = longSide ? bar.high >= tp1Use : bar.low  <= tp1Use;
+                        boolean slHere = longSide ? bar.low  <= slUse  : bar.high >= slUse;
                         // Both in same bar → conservative (assume SL hit first).
                         if (tpHere && slHere) { hitSL = true; break; }
                         if (tpHere) { hitTP1 = true; break; }
@@ -1752,20 +1782,17 @@ public final class BotMain {
 
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot PRO* `v41-R1`\n"
+        return "⚡ *TradingBot PRO* `v42`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures  ·  Crypto / Commodities\n"
                 + "VSA  ·  OFV  ·  EarlyRev  ·  Forecast\n"
                 + "R:R min `1:2`  ·  Risk-first 🔒\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🔧 *REFACTOR R1 активен:*\n"
-                + "• CI фильтр боковика (Choppiness Index)\n"
-                + "• MIN_CLUSTERS=3 (было 2)\n"
-                + "• OI refresh 15m · Depth 120s\n"
-                + "• TOP_N=30 · SCAN=25\n"
-                + "• 5m WS-candles (no REST)\n"
-                + "• EARLY_TICK заблокирован ночью\n"
-                + "• Flat sizing ×0.85..×1.15\n"
+                + "🔧 *v42 PATCHES активны:*\n"
+                + "• Calibrator — реальные TP/SL (PATCH A)\n"
+                + "• Railway -50% cost (PATCH B)\n"
+                + "• PostPumpGuard — блок после пампа (PATCH C)\n"
+                + "• SL width + R:R guard (PATCH D)\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "_Система активна. Торгуй с умом._";
     }
