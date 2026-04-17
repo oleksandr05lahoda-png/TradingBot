@@ -198,46 +198,155 @@ public final class DecisionEngineMerged {
     private final java.util.concurrent.atomic.AtomicInteger bayesSampleTrades
             = new java.util.concurrent.atomic.AtomicInteger(0);
 
+    // [PATCH 4.1] Two-speed Bayesian prior — fixes regime-change lag.
+    //
+    // Old behavior: pure linear blend over 120 trades. After regime change
+    // (e.g. trend → choppy), engine kept using stale prior for 100+ trades.
+    // On 15m timeframe that is several days of degraded signals.
+    //
+    // New behavior: two exponential moving averages at different speeds.
+    //   - FAST (alpha ~0.08, half-life ~8 trades) tracks recent regime
+    //   - SLOW (alpha ~0.015, half-life ~46 trades) provides stability
+    // Prior = blend(slow, fast). When |fast-slow| exceeds REGIME_SHIFT
+    // threshold, weight shifts toward fast EWMA (adaptive to new regime).
+    // When they agree, slow dominates (noise suppression).
+    private final java.util.concurrent.atomic.AtomicReference<Double> bayesPriorFast
+            = new java.util.concurrent.atomic.AtomicReference<>(0.50);
+    private final java.util.concurrent.atomic.AtomicReference<Double> bayesPriorSlow
+            = new java.util.concurrent.atomic.AtomicReference<>(0.50);
+    private final java.util.concurrent.atomic.AtomicInteger bayesUpdateCount
+            = new java.util.concurrent.atomic.AtomicInteger(0);
 
+    // Tunable — smaller alpha = slower response.
+    private static final double BAYES_FAST_ALPHA = 0.08;   // half-life ~8 trades
+    private static final double BAYES_SLOW_ALPHA = 0.015;  // half-life ~46 trades
+    private static final double BAYES_REGIME_SHIFT = 0.08; // |fast-slow| above this = regime change
+    private static final int    BAYES_MIN_TRADES = 15;     // below this, hold neutral 0.50
+    private static final int    BAYES_FULL_TRUST = 80;     // above this, fully trust live priors
+
+    /**
+     * Update Bayesian prior with recent trade outcome.
+     *
+     * @param winRate         rolling win-rate over last N trades (0.0–1.0)
+     * @param confirmedTrades total confirmed trades count
+     */
     public void updateBayesPrior(double winRate, int confirmedTrades) {
         int trades = Math.max(0, confirmedTrades);
         bayesSampleTrades.set(trades);
-        if (trades < 20) {
+
+        if (trades < BAYES_MIN_TRADES) {
             // Too few trades to trust: use neutral prior
             bayesPrior.set(0.50);
+            bayesPriorFast.set(0.50);
+            bayesPriorSlow.set(0.50);
             return;
         }
-        double livePrior = Math.max(0.45, Math.min(0.75, winRate));
-        if (trades < 120) {
-            // Gradual linear blend: 20 trades → 5% weight on live, 120 trades → 100%
-            double mix = (trades - 20.0) / 100.0; // 0.0 at 20 trades, 1.0 at 120 trades
-            bayesPrior.set(0.50 * (1.0 - mix) + livePrior * mix);
+
+        // Clamp live prior to realistic range — protects against outlier streaks
+        double livePrior = Math.max(0.40, Math.min(0.75, winRate));
+
+        // Update both EWMAs
+        double newFast = bayesPriorFast.get() * (1.0 - BAYES_FAST_ALPHA)
+                + livePrior * BAYES_FAST_ALPHA;
+        double newSlow = bayesPriorSlow.get() * (1.0 - BAYES_SLOW_ALPHA)
+                + livePrior * BAYES_SLOW_ALPHA;
+        bayesPriorFast.set(newFast);
+        bayesPriorSlow.set(newSlow);
+        bayesUpdateCount.incrementAndGet();
+
+        // Warmup blend: 15 → 80 trades = linearly shift from neutral to EWMA blend
+        double warmupMix;
+        if (trades >= BAYES_FULL_TRUST) {
+            warmupMix = 1.0;
         } else {
-            bayesPrior.set(livePrior);
+            warmupMix = (trades - BAYES_MIN_TRADES) / (double)(BAYES_FULL_TRUST - BAYES_MIN_TRADES);
+            warmupMix = Math.max(0.0, Math.min(1.0, warmupMix));
         }
+
+        // Regime detection: when fast deviates from slow, weight fast higher.
+        // This is the core of two-speed design — adapts to regime change in ~8 trades
+        // instead of waiting 100+ trades for pure linear blend.
+        double divergence = Math.abs(newFast - newSlow);
+        double fastWeight;
+        if (divergence > BAYES_REGIME_SHIFT) {
+            // Regime change detected — bias toward fast EWMA (cap at 0.7)
+            fastWeight = Math.min(0.70, 0.40 + (divergence - BAYES_REGIME_SHIFT) * 3.0);
+        } else {
+            // Stable regime — slow dominates (fast weight 0.25)
+            fastWeight = 0.25;
+        }
+
+        double blended = newFast * fastWeight + newSlow * (1.0 - fastWeight);
+        double finalPrior = 0.50 * (1.0 - warmupMix) + blended * warmupMix;
+
+        // Clamp final output to safe range
+        bayesPrior.set(Math.max(0.42, Math.min(0.72, finalPrior)));
     }
 
     public double getBayesPrior() { return bayesPrior.get(); }
+
+    /** Diagnostic — returns current regime shift magnitude (|fast-slow|). */
+    public double getBayesRegimeShift() {
+        return Math.abs(bayesPriorFast.get() - bayesPriorSlow.get());
+    }
+
+    /** Diagnostic — true if fast and slow EWMAs diverge beyond threshold. */
+    public boolean isBayesRegimeShift() {
+        return getBayesRegimeShift() > BAYES_REGIME_SHIFT;
+    }
 
     // ── Setters ───────────────────────────────────────────────────
     public void setPumpHunter(com.bot.PumpHunter ph) { this.pumpHunter = ph; }
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
 
-    private static final double EARLY_TICK_FC_MIN_SCORE = 0.25; // was 0.12 — CRITICAL: nearly no filter
+    // [PATCH EARLY_TICK] Category-aware directional score thresholds for EARLY_TICK gate.
+    //
+    // Old: single 0.25 threshold for all categories.
+    // Problem: MEME pairs have 3–5× more random directional noise than TOP pairs.
+    // Using the same 0.25 floor meant roughly equal signal counts across categories,
+    // but MEME signals had much lower precision — the gate was letting noise through.
+    //
+    // New: stricter thresholds for higher-noise categories.
+    //   TOP  (BTC, ETH, BNB…): 0.22 — reliable forecasts, allow borderline calls
+    //   ALT  (mid-caps):       0.28 — moderate noise
+    //   MEME (PEPE, SHIB…):    0.35 — stricter, kills speculative noise
+    // Backward-compat constant kept for any external reference.
+    private static final double EARLY_TICK_FC_MIN_SCORE      = 0.25;
+    private static final double EARLY_TICK_FC_MIN_SCORE_TOP  = 0.22;
+    private static final double EARLY_TICK_FC_MIN_SCORE_ALT  = 0.28;
+    private static final double EARLY_TICK_FC_MIN_SCORE_MEME = 0.35;
+
+    private static double earlyTickMinScoreFor(CoinCategory cat) {
+        if (cat == null) return EARLY_TICK_FC_MIN_SCORE;
+        return switch (cat) {
+            case TOP  -> EARLY_TICK_FC_MIN_SCORE_TOP;
+            case ALT  -> EARLY_TICK_FC_MIN_SCORE_ALT;
+            case MEME -> EARLY_TICK_FC_MIN_SCORE_MEME;
+        };
+    }
 
 
     public static boolean forecastPassesEarlyTickGate(
             com.bot.TradingCore.ForecastEngine.ForecastResult forecast,
             boolean isLong) {
+        return forecastPassesEarlyTickGate(forecast, isLong, null);
+    }
+
+    /** [PATCH EARLY_TICK] Category-aware overload. */
+    public static boolean forecastPassesEarlyTickGate(
+            com.bot.TradingCore.ForecastEngine.ForecastResult forecast,
+            boolean isLong,
+            CoinCategory category) {
 
         // No forecast engine attached yet (cold start) → allow through
         if (forecast == null) return true;
 
         double score = forecast.directionScore;
+        double minScore = earlyTickMinScoreFor(category);
 
         // NEUTRAL: |score| too small → no confirmed direction → REJECT EARLY_TICK
-        if (Math.abs(score) < EARLY_TICK_FC_MIN_SCORE) return false;
+        if (Math.abs(score) < minScore) return false;
 
         // OPPOSITE direction → REJECT
         if (isLong  && score < 0) return false;
@@ -670,6 +779,27 @@ public final class DecisionEngineMerged {
         // BotMain.trackSignal() stores this in ForecastRecord → correct vol-bucket
         // in calibrator (avoids consolidation ATR collapse misclassifying HIGH→LOW bucket).
         public final double robustAtrPct;
+        // [PATCH 4.3] Signal age tracking — enables decay-based filtering in
+        // earlyTickBuffer and anywhere else ideas sit in a queue. Stale signals
+        // (older than ~90s on 15m tf) lose edge because the move they predicted
+        // may have already played out. Consumers use ageMs() to apply penalty.
+        public final long createdAtMs;
+
+        /** Age of the signal in milliseconds since creation. */
+        public long ageMs() { return System.currentTimeMillis() - createdAtMs; }
+
+        /**
+         * Confidence decay factor (1.0 = fresh, 0.0 = fully stale).
+         * Linear decay over staleThresholdMs; clamped to [0, 1].
+         * Typical use: adjustedProb = probability * ageDecay(90_000L).
+         */
+        public double ageDecay(long staleThresholdMs) {
+            if (staleThresholdMs <= 0) return 1.0;
+            long age = ageMs();
+            if (age <= 0) return 1.0;
+            if (age >= staleThresholdMs) return 0.0;
+            return 1.0 - ((double) age / staleThresholdMs);
+        }
 
         /** Главный конструктор — с адаптивными TP множителями */
         public TradeIdea(String symbol, com.bot.TradingCore.Side side,
@@ -690,6 +820,8 @@ public final class DecisionEngineMerged {
             this.tp1Mult = tp1Mult; this.tp2Mult = tp2Mult; this.tp3Mult = tp3Mult;
             // [v43] Compute robustAtrPct from stop distance (best available proxy without passing ATR directly)
             this.robustAtrPct = price > 0 ? Math.abs(price - stop) / price : 0.01;
+            // [PATCH 4.3] Stamp creation time — all overloads chain through this ctor.
+            this.createdAtMs = System.currentTimeMillis();
 
             double risk = Math.abs(price - stop);
             boolean long_ = side == com.bot.TradingCore.Side.LONG;

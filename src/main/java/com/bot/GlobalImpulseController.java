@@ -1343,19 +1343,44 @@ public final class GlobalImpulseController {
     //  VOLATILITY REGIME
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * [PATCH 4.4] Percentile-based volatility regime classification.
+     *
+     * Old behavior: fixed ratios against median (>3.0 EXTREME, >1.6 HIGH, <0.5 LOW).
+     * Problem: in quiet market → median collapses → any uptick reads as HIGH.
+     * In loud market → median inflated → real spikes read as NORMAL.
+     * The thresholds were calibrated for a specific regime and don't adapt.
+     *
+     * New behavior: classify by percentile position in recent ATR history.
+     *   - EXTREME: above p90 (top decile)
+     *   - HIGH:    above p75 (top quartile)
+     *   - LOW:     below p25 (bottom quartile)
+     *   - NORMAL:  p25–p75 (interquartile range)
+     * Self-calibrating: as the market regime shifts, the percentile distribution
+     * shifts with it. No manual retuning of thresholds.
+     *
+     * Requires ≥20 samples for percentiles to be meaningful; falls back to
+     * NORMAL below that.
+     */
     private VolatilityRegime calcVolatilityRegime(double currentAtrPct) {
         if (btcAtrHistory.size() < 20) return VolatilityRegime.NORMAL;
 
         List<Double> sorted = new ArrayList<>(btcAtrHistory);
         Collections.sort(sorted);
-        double median = sorted.get(sorted.size() / 2);
+        int n = sorted.size();
 
-        if (median <= 0) return VolatilityRegime.NORMAL;
-        double ratio = currentAtrPct / median;
+        // Safety: if entire history is zero/negative, treat as NORMAL.
+        double pMax = sorted.get(n - 1);
+        if (pMax <= 0) return VolatilityRegime.NORMAL;
 
-        if (ratio > 3.0) return VolatilityRegime.EXTREME;
-        if (ratio > 1.6) return VolatilityRegime.HIGH;
-        if (ratio < 0.5) return VolatilityRegime.LOW;
+        // Percentile indices (linear nearest-rank method — no interpolation needed).
+        double p25 = sorted.get(Math.max(0, (int) Math.floor(0.25 * (n - 1))));
+        double p75 = sorted.get(Math.min(n - 1, (int) Math.ceil(0.75 * (n - 1))));
+        double p90 = sorted.get(Math.min(n - 1, (int) Math.ceil(0.90 * (n - 1))));
+
+        if (currentAtrPct >= p90) return VolatilityRegime.EXTREME;
+        if (currentAtrPct >= p75) return VolatilityRegime.HIGH;
+        if (currentAtrPct <= p25) return VolatilityRegime.LOW;
         return VolatilityRegime.NORMAL;
     }
 

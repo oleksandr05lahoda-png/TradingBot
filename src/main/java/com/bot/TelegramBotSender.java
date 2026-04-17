@@ -22,7 +22,8 @@ public final class TelegramBotSender {
     private final ScheduledExecutorService sender;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    private static final DateTimeFormatter DTF = DateTimeFormatter.ofPattern("HH:mm:ss");    private static final int RATE_LIMIT_MS = 1200; // безопасно для TG
+    private static final DateTimeFormatter DTF = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final int RATE_LIMIT_MS = 1200; // безопасно для TG
     private static final int MAX_RETRY = 3;
     // Hard limit for Telegram `sendMessage` is 4096 UTF-16 code units.
     // Use a smaller value to avoid edge cases (URL encoding expansion, newlines, emojis).

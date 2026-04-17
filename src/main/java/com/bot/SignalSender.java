@@ -236,7 +236,11 @@ public final class SignalSender {
     private static final Map<String, Long> CACHE_TTL = Map.of(
             "1m",  55_000L,
             "5m",  270_000L,       // [REFACTOR] 4m30s = 90% of candle period (was 3min)
-            "15m", 8  * 60_000L,  // [v50] was 14min — stale data for half the candle period
+            // [PATCH 5.6.6] 15m TTL tightened 8min → 4min. At 8min the cache could
+            // serve data that aged 53% of the candle period — on a scalping tf where
+            // entry precision matters, that's a stale-signal factory. 4min = 27%
+            // of the candle, comparable to 1m/5m ratios.
+            "15m", 4 * 60_000L,
             "1h",  55 * 60_000L,  // was 59min
             "2h",  110 * 60_000L  // was 119min
     );
@@ -597,6 +601,10 @@ public final class SignalSender {
     private final AtomicLong gicHardHeadwind  = new AtomicLong(0);
     private final AtomicLong wsMessageCount = new AtomicLong(0);
     private final AtomicLong udsEventsCount = new AtomicLong(0);
+    // [PATCH 1.2] fetchPool DiscardOldestPolicy counter — non-zero value
+    // indicates sustained overload (queue full, old tasks being dropped).
+    // Alert if > 0 per scanCycle.
+    private final AtomicLong rejectedFetches = new AtomicLong(0);
     private final AtomicInteger cyclePairsSeen = new AtomicInteger(0);
     private final AtomicInteger cyclePairsStale = new AtomicInteger(0);
     private volatile double cycleQualityPenalty = 0.0;
@@ -712,22 +720,38 @@ public final class SignalSender {
         this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
         this.optimizer.setPumpHunter(this.pumpHunter);
 
-        // [PATCH B2 v33] OOM FIX — fetchPool.
-        // Unbounded LinkedBlockingQueue → OOM under TOP_N=100 load.
-        // CallerRunsPolicy: if queue full, submitter thread runs the task itself
-        // → natural backpressure, zero silent drops.
-        // At TOP_N=100: poolSize = min((100+2)/3, 34) = 34 threads.
-        // Queue=400 accommodates 4× burst without blocking the main scheduler.
+        // [PATCH 1.2 v51] FETCH POOL BACKPRESSURE REDESIGN.
+        //
+        // Old design (v33): CallerRunsPolicy on ArrayBlockingQueue(400).
+        //   Problem: when queue fills, the submitter thread (wsWatcher / scanCycle)
+        //   runs the REST task inline. For wsWatcher that means WS event loop
+        //   blocks on network I/O → missed ticks → stale orderbook/velocity data.
+        //
+        // New design: larger bounded queue + DiscardOldestPolicy.
+        //   - Queue 800: absorbs 8× burst at TOP_N=100 without backpressure.
+        //   - DiscardOldest: under sustained overload, drop the stalest queued
+        //     fetch (which is least valuable anyway — 15m data is time-sensitive).
+        //   - Keeps WS thread non-blocking: submitter never runs the task inline.
+        //   - rejectedFetches counter exposes overload (monitored in scanCycle).
+        //
+        // At TOP_N=30 (current prod): poolSize = max(8, 32/3) = 10 threads.
+        // At TOP_N=100: poolSize = 34 threads. Queue 800 = 8× headroom.
         int poolSize = Math.max(8, Math.min((TOP_N + 2) / 3, 34));
         this.fetchPool = new ThreadPoolExecutor(
                 poolSize, poolSize, 0L, TimeUnit.MILLISECONDS,
-                new java.util.concurrent.ArrayBlockingQueue<>(400),
+                new java.util.concurrent.ArrayBlockingQueue<>(800),
                 r -> {
                     Thread t = new Thread(r, "fetch-" + r.hashCode());
                     t.setDaemon(true);
                     return t;
                 },
-                new ThreadPoolExecutor.CallerRunsPolicy()
+                new ThreadPoolExecutor.DiscardOldestPolicy() {
+                    @Override
+                    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+                        rejectedFetches.incrementAndGet();
+                        super.rejectedExecution(r, e);
+                    }
+                }
         );
 
         // [FIX-UDS] User Data Stream
@@ -2988,6 +3012,15 @@ public final class SignalSender {
      */
     private static final int MAX_EARLY_PER_FLUSH = 3;
 
+    // [PATCH 4.3] Signal age penalty configuration.
+    // STALE_DROP_MS: any candidate older than this is discarded outright.
+    // On 15m timeframe, >90s old means price likely moved enough that
+    // the planned entry/SL are no longer valid.
+    // STALE_DECAY_MS: effective probability decays linearly toward this point,
+    // used for sorting — fresh signals win ties against older ones.
+    private static final long EARLY_STALE_DROP_MS  = 90_000L;   // 90s hard cutoff
+    private static final long EARLY_STALE_DECAY_MS = 60_000L;   // decay horizon for ranking
+
     private void flushEarlyTickBuffer() {
         if (earlyTickBuffer.isEmpty()) return;
 
@@ -3006,9 +3039,31 @@ public final class SignalSender {
         }
         if (candidates.isEmpty()) return;
 
-        // Sort by probability descending — highest conviction goes first
+        // [PATCH 4.3] Drop hard-stale candidates (>90s old). These fired on price
+        // that is no longer current; acting on them = chasing the move.
+        int droppedStale = 0;
+        Iterator<com.bot.DecisionEngineMerged.TradeIdea> it = candidates.iterator();
+        while (it.hasNext()) {
+            com.bot.DecisionEngineMerged.TradeIdea c = it.next();
+            if (c.ageMs() > EARLY_STALE_DROP_MS) {
+                it.remove();
+                droppedStale++;
+            }
+        }
+        if (droppedStale > 0) {
+            System.out.println("[EARLY_TICK] Dropped " + droppedStale + " stale candidate(s) (>"
+                    + (EARLY_STALE_DROP_MS / 1000) + "s old)");
+        }
+        if (candidates.isEmpty()) return;
+
+        // [PATCH 4.3] Sort by AGE-ADJUSTED probability — older candidates get decay penalty.
+        // Fresh signal with prob=70 beats 5s-old signal with prob=72.
+        // effectiveProb = probability * (1.0 - age/decay_horizon), clamped to [0.3, 1.0] multiplier.
         candidates.sort(Comparator.comparingDouble(
-                (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
+                (com.bot.DecisionEngineMerged.TradeIdea i) -> {
+                    double decayMul = Math.max(0.30, i.ageDecay(EARLY_STALE_DECAY_MS));
+                    return i.probability * decayMul;
+                }).reversed());
 
         // [v35.0] Cap to top-N best signals per flush
         if (candidates.size() > MAX_EARLY_PER_FLUSH) {
@@ -3461,12 +3516,21 @@ public final class SignalSender {
     private void logCycleStats() {
         long total = totalFetches.get(), hits = cacheHits.get();
         if (total > 0 && total % 500 == 0) {
-            System.out.printf("[Stats] cache=%.1f%% early=%d liq=%d corr=%d stale=%d profit=%d e=%d opt=%d vpoc=%d fin=%d isc=%d q=+%.0f ws=%.0f%% msgs=%d bal=$%.2f%n",
+            // [PATCH 1.2] Include rejectedFetches count — non-zero means fetchPool is overloaded.
+            long rejected = rejectedFetches.get();
+            System.out.printf("[Stats] cache=%.1f%% early=%d liq=%d corr=%d stale=%d profit=%d e=%d opt=%d vpoc=%d fin=%d isc=%d rej=%d q=+%.0f ws=%.0f%% msgs=%d bal=$%.2f%n",
                     100.0*hits/total, earlySignals.get(), blockedLiq.get(), blockedCorr.get(),
                     blockedStaleRt.get(), blockedProfit.get(), blockedEarlyConf.get(),
                     blockedOptConf.get(), blockedVpoc.get(), blockedFinalConf.get(),
-                    blockedIsc.get(), cycleQualityPenalty, lastCycleWsCoverage * 100.0,
+                    blockedIsc.get(), rejected, cycleQualityPenalty, lastCycleWsCoverage * 100.0,
                     wsMessageCount.get(), accountBalance);
+
+            // [PATCH 1.2] Alert loudly when tasks are being dropped — indicates
+            // TOP_N too high for current pool, or sustained network slowness.
+            if (rejected > 0) {
+                System.out.println("[WARN] fetchPool dropped " + rejected + " tasks (queue saturated). "
+                        + "Consider lowering TOP_N or increasing poolSize.");
+            }
         }
     }
 

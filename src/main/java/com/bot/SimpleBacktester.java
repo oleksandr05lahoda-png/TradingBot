@@ -36,11 +36,49 @@ public final class SimpleBacktester {
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
-    private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE = Map.of(
+    // [PATCH 2.1] Single source of truth for warmup.
+    // Must match DecisionEngineMerged.MIN_BARS (150) — that's the gate
+    // engine.analyze() uses internally. Previously backtester used 160
+    // while live could accept 150, causing backtest signals to never fire
+    // in the early window and live to fire signals the backtest never saw.
+    // The extra 10 bars are kept as a safety margin for EMA200 stabilization.
+    private static final int BACKTEST_WARMUP_BARS = 150;
+
+    // [PATCH 2.2] Volume-adaptive slippage.
+    //
+    // Old: fixed slippage per category (TOP=0.08%, ALT=0.25%, MEME=0.60%).
+    // Problem: a $100K position in a $2M-daily-volume ALT pays real slippage
+    // 2–3× higher than the fixed value. Backtester underestimated costs and
+    // overstated winrate by ~3–5pp for small accounts / illiquid pairs.
+    //
+    // New: base slippage per category × liquidity penalty.
+    //   liquidity penalty = 1.0 + positionUSD / max(volume24hUSD, 1).
+    // For $100 position in $5B volume TOP pair → penalty ~1.00002 (negligible).
+    // For $100 position in $2M volume MEME → penalty ~1.00005 (still tiny at $100).
+    // For $10K position in $5M volume MEME → penalty 1.002 (+0.12% slippage).
+    // At realistic bot sizes ($20–$500 per trade), penalty mostly ≈1.0, but
+    // the formula correctly scales when users grow their capital.
+    private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE_BASE = Map.of(
             com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0008,
             com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0025,
             com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0060
     );
+
+    // Backward-compat alias: some call sites still reference SLIPPAGE as a field.
+    private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE = SLIPPAGE_BASE;
+
+    /**
+     * Compute effective slippage given category, position size (USD), and 24h volume.
+     * Handles nulls / zeros gracefully by falling back to base rate.
+     */
+    private static double effectiveSlippage(com.bot.DecisionEngineMerged.CoinCategory cat,
+                                            double positionUSD, double volume24hUSD) {
+        double base = SLIPPAGE_BASE.getOrDefault(cat, 0.0025);
+        if (positionUSD <= 0 || volume24hUSD <= 0) return base;
+        // Cap penalty at 3× base — beyond that, the trade is untradeable in reality.
+        double penalty = 1.0 + (positionUSD / volume24hUSD);
+        return base * Math.min(penalty, 3.0);
+    }
 
     // ── Setters ──────────────────────────────────────────────────
     public void setInitialBalance(double v)  { this.initialBalance = v; }
@@ -49,6 +87,12 @@ public final class SimpleBacktester {
     public void setTimeStopBars(int v)       { this.timeStopBars = v; }
     public void setCompound(boolean v)       { this.compound = v; }
     public void setUseM1Resolution(boolean v){ this.useM1Resolution = v; }
+
+    // [PATCH 2.2] Optional: provide 24h volume (USD) for more realistic slippage.
+    // If set, effectiveSlippage() scales with position/volume ratio.
+    // If not set, falls back to fixed base rate (old behavior) — backward compat.
+    private double volume24hUSD = 0.0;
+    public void setVolume24hUSD(double v)    { this.volume24hUSD = Math.max(0.0, v); }
 
     // ══════════════════════════════════════════════════════════════
     //  RESULTS
@@ -319,7 +363,10 @@ public final class SimpleBacktester {
         // not by oversight. The engine handles this gracefully via backtestMode flag.
         com.bot.GlobalImpulseController btGic = new com.bot.GlobalImpulseController();
         engine.setGIC(btGic);
-        double slippage = SLIPPAGE.getOrDefault(category, 0.0025);
+        // [PATCH 2.2] Effective slippage = base × (1 + position/volume) capped at 3× base.
+        // When setVolume24hUSD() not called (default = 0), falls back to base rate
+        // preserving pre-patch behavior.
+        double slippage = effectiveSlippage(category, initialBalance, this.volume24hUSD);
         double balance = initialBalance;
 
         // Build m1 index for intra-candle resolution
@@ -328,7 +375,7 @@ public final class SimpleBacktester {
         // Track daily returns
         Map<Long, Double> dailyPnL = new TreeMap<>();
 
-        int warmup = 160; // bars needed for indicators to stabilize
+        int warmup = BACKTEST_WARMUP_BARS; // [PATCH 2.1] aligned with DecisionEngine.MIN_BARS=150
         int i = warmup;
 
         // Active position tracking
@@ -391,7 +438,7 @@ public final class SimpleBacktester {
                 int fromBar = Math.max(0, i - 200);
                 // slice EXCLUDES current bar i
                 List<com.bot.TradingCore.Candle> slice15 = m15.subList(fromBar, i);
-                if (slice15.size() < 160) { i++; continue; }
+                if (slice15.size() < BACKTEST_WARMUP_BARS) { i++; continue; }
 
                 long decisionTime = m15.get(i - 1).closeTime; // момент принятия решения
                 List<com.bot.TradingCore.Candle> sliceH1 = getTimeframeSlice(
