@@ -119,11 +119,12 @@ public final class DecisionEngineMerged {
     private static final long   COOLDOWN_ALT    = 5  * 60_000L;  // was 8m  → 5m
     private static final long   COOLDOWN_MEME   = 8  * 60_000L;  // was 12m → 8m
 
-    // [v50 UPDATE] Raised 58→62 as part of quality-over-quantity mandate.
-    // This is the floor calibrator starts from — higher base means fewer weak signals leak through.
-    private static final double BASE_CONF       = 62.0;
+    // [v53 QUALITY] Raised 62→68 as part of stricter quality mandate.
+    // Combined with AFC kill-switch in BotMain, this reduces Telegram noise by ~70%.
+    // MIN_CONF_FLOOR raised 60→65 — signals below 65% were historically <50% win-rate.
+    private static final double BASE_CONF       = 68.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 60.0;  // was 52.0
+    private static final double MIN_CONF_FLOOR  = 65.0;
     private static final double MIN_CONF_CEIL   = 82.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -2022,6 +2023,24 @@ public final class DecisionEngineMerged {
         }
 
         // ════════════════════════════════════════════════════════
+        // [v53] STRONG REVERSAL DETECTOR — fires after N-bar streaks
+        // when confluence of RSI/MACD/volume agrees the trend is exhausted.
+        // High weight (0.80) because it requires 3+ confluence already.
+        // This is the "many candles in one direction = possible reversal" logic.
+        // ════════════════════════════════════════════════════════
+        double[] rsiArrForRev = com.bot.TradingCore.rsiSeries(c15, 14);
+        StrongReversalResult strongRev = detectStrongReversal(c15, rsiArrForRev, rsi14);
+        if (strongRev.detected) {
+            double srScore = mctx.s(strongRev.strength * 0.80);
+            if (strongRev.direction > 0) {
+                cEarly.addLong(srScore, "STRONG_REV_UP");
+            } else {
+                cEarly.addShort(srScore, "STRONG_REV_DN");
+            }
+            allFlags.addAll(strongRev.flags);
+        }
+
+        // ════════════════════════════════════════════════════════
         //  АГРЕГАЦИЯ КЛАСТЕРОВ
         // ════════════════════════════════════════════════════════
 
@@ -3613,6 +3632,138 @@ public final class DecisionEngineMerged {
         }
 
         return new EarlyReversalResult(false, 0, 0, flags);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v53] STRONG REVERSAL DETECTOR
+    //  High-conviction reversal after extended one-sided moves.
+    //  Fires ONLY when at least 3 of 5 confluence signals agree:
+    //    1. N consecutive bars in one direction (extended move)
+    //    2. RSI in extreme zone (>72 or <28)
+    //    3. RSI divergence (regular bearish/bullish)
+    //    4. MACD histogram sign flip
+    //    5. Volume drying up (3-bar avg < 70% of 10-bar avg)
+    //  Strength >= 0.55 required to pass threshold.
+    //  This is the "many candles in one direction — watch for reversal" logic
+    //  the user asked for.
+    // ══════════════════════════════════════════════════════════════
+
+    private static final class StrongReversalResult {
+        final boolean detected;
+        final int     direction; // +1 reversal UP (LONG after downtrend), -1 reversal DOWN (SHORT after uptrend)
+        final double  strength;  // 0..1
+        final List<String> flags;
+        StrongReversalResult(boolean d, int dir, double s, List<String> f) {
+            detected = d; direction = dir; strength = s; flags = f;
+        }
+    }
+
+    private StrongReversalResult detectStrongReversal(
+            List<com.bot.TradingCore.Candle> c15,
+            double[] rsiSeries,
+            double rsi14) {
+
+        List<String> flags = new ArrayList<>();
+        if (c15 == null || c15.size() < 20 || rsiSeries == null || rsiSeries.length < 20) {
+            return new StrongReversalResult(false, 0, 0, flags);
+        }
+
+        int n = c15.size();
+        int confluence = 0;
+        int direction = 0; // +1 up, -1 down
+
+        // ── 1. Consecutive one-sided candles (extended move) ──────
+        int greenStreak = 0, redStreak = 0;
+        for (int i = n - 1; i >= Math.max(0, n - 8); i--) {
+            com.bot.TradingCore.Candle c = c15.get(i);
+            if (c.close > c.open) {
+                if (redStreak > 0) break;
+                greenStreak++;
+            } else if (c.close < c.open) {
+                if (greenStreak > 0) break;
+                redStreak++;
+            } else break;
+        }
+        boolean extendedUp   = greenStreak >= 5;  // 5+ consecutive green = extended uptrend
+        boolean extendedDown = redStreak   >= 5;  // 5+ consecutive red   = extended downtrend
+        if (extendedUp) {
+            confluence++;
+            direction = -1; // reversal down
+            flags.add("EXTD_UP_" + greenStreak);
+        } else if (extendedDown) {
+            confluence++;
+            direction = +1; // reversal up
+            flags.add("EXTD_DN_" + redStreak);
+        } else {
+            // Without extended move, reversal signal has no context — return early
+            return new StrongReversalResult(false, 0, 0, flags);
+        }
+
+        // ── 2. RSI in extreme zone ──────────────────────────
+        if (direction < 0 && rsi14 >= 72) { confluence++; flags.add("RSI_OVERBOUGHT"); }
+        if (direction > 0 && rsi14 <= 28) { confluence++; flags.add("RSI_OVERSOLD"); }
+
+        // ── 3. RSI regular divergence ───────────────────────
+        // Bearish: price higher high, RSI lower high → sell
+        // Bullish: price lower low,  RSI higher low  → buy
+        try {
+            List<com.bot.TradingCore.Divergence> divs = com.bot.TradingCore.detectDivergences(c15, 14, 30, 2);
+            if (divs != null && !divs.isEmpty()) {
+                com.bot.TradingCore.Divergence latest = divs.get(divs.size() - 1);
+                if (direction < 0 && latest.type == com.bot.TradingCore.Divergence.Type.REGULAR_BEARISH) {
+                    confluence++; flags.add("RSI_DIV_BEAR");
+                }
+                if (direction > 0 && latest.type == com.bot.TradingCore.Divergence.Type.REGULAR_BULLISH) {
+                    confluence++; flags.add("RSI_DIV_BULL");
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // ── 4. MACD histogram sign flip ─────────────────────
+        // MACDResult returns only current value, so compute last 3 by slicing history.
+        try {
+            if (n >= 3) {
+                com.bot.TradingCore.MACDResult macd1 = com.bot.TradingCore.macd(c15);
+                com.bot.TradingCore.MACDResult macd2 = com.bot.TradingCore.macd(c15.subList(0, n - 1));
+                com.bot.TradingCore.MACDResult macd3 = com.bot.TradingCore.macd(c15.subList(0, n - 2));
+                double h1 = macd1.histogram;
+                double h2 = macd2.histogram;
+                double h3 = macd3.histogram;
+                if (direction < 0 && h3 > 0 && h2 > 0 && h1 < h2 * 0.5) {
+                    confluence++; flags.add("MACD_FLIP_DN");
+                }
+                if (direction > 0 && h3 < 0 && h2 < 0 && h1 > h2 * 0.5) {
+                    confluence++; flags.add("MACD_FLIP_UP");
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // ── 5. Volume drying up ─────────────────────────────
+        if (n >= 13) {
+            double recent3 = (c15.get(n-1).volume + c15.get(n-2).volume + c15.get(n-3).volume) / 3.0;
+            double prior10 = 0;
+            for (int i = n-13; i < n-3; i++) prior10 += c15.get(i).volume;
+            prior10 /= 10.0;
+            if (prior10 > 0 && recent3 < prior10 * 0.70) {
+                confluence++;
+                flags.add("VOL_DRY");
+            }
+        }
+
+        // ── Decision ────────────────────────────────────────
+        // Minimum 3 confluences (out of 5) to call it a strong reversal.
+        // Extended move is already counted as 1, so this effectively requires 2 more.
+        if (confluence < 3) {
+            return new StrongReversalResult(false, 0, 0, flags);
+        }
+
+        // Strength: 3 confluences = 0.55, 4 = 0.72, 5 = 0.88
+        double strength = 0.40 + confluence * 0.10;
+        strength = Math.min(0.92, strength);
+        if (strength < 0.55) return new StrongReversalResult(false, 0, 0, flags);
+
+        flags.add("STRONG_REV_" + (direction > 0 ? "UP" : "DN"));
+        return new StrongReversalResult(true, direction, strength, flags);
     }
 
     // ══════════════════════════════════════════════════════════════

@@ -117,6 +117,11 @@ public final class GlobalImpulseController {
     private final AtomicBoolean panicMode = new AtomicBoolean(false);
     private volatile long panicStartMs = 0;
     private static final long PANIC_COOLDOWN_MS = 30 * 60_000L; // 30 минут до выхода из паники
+    // [v53] Prevent PANIC alert re-firing during same panic episode.
+    // Only send repeat PANIC alert if severity escalates significantly or 15+ min passed.
+    private volatile long lastPanicAlertMs = 0;
+    private volatile double lastPanicAlertScore = 0;
+    private static final long PANIC_REALERT_MS = 15 * 60_000L;
 
     // Panic callback
     private volatile java.util.function.Consumer<String> panicCallback = null;
@@ -864,8 +869,22 @@ public final class GlobalImpulseController {
     }
 
     private void enterPanicMode(double move3, double move5, double atr14, double price) {
-        panicMode.set(true);
-        panicStartMs = System.currentTimeMillis();
+        // [v53] Dedup: don't re-send PANIC alert if one already sent in the last 15 min
+        // AND crash score hasn't escalated by >0.15 (real worsening).
+        boolean alreadyInPanic = panicMode.getAndSet(true);
+        long now = System.currentTimeMillis();
+        boolean escalation = btcCrashScore > lastPanicAlertScore + 0.15;
+        boolean canRealert = now - lastPanicAlertMs > PANIC_REALERT_MS || escalation;
+
+        if (!alreadyInPanic) {
+            panicStartMs = now;
+        }
+        if (alreadyInPanic && !canRealert) {
+            return; // already alerted; suppress until 15min or score escalation
+        }
+
+        lastPanicAlertMs = now;
+        lastPanicAlertScore = btcCrashScore;
 
         String msg = String.format(
                 "🚨 *PANIC MODE ACTIVATED*\n" +
@@ -886,6 +905,9 @@ public final class GlobalImpulseController {
 
     private void exitPanicMode() {
         panicMode.set(false);
+        // [v53] Reset dedup so next panic cycle can alert immediately
+        lastPanicAlertMs = 0;
+        lastPanicAlertScore = 0;
         System.out.println("[GIC] PANIC MODE DEACTIVATED — рынок стабилизировался");
         if (panicCallback != null) {
             try { panicCallback.accept("✅ PANIC MODE OFF — торговля восстановлена"); } catch (Exception ignored) {}

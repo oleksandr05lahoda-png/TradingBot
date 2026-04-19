@@ -103,8 +103,8 @@ public final class BotMain {
     private static volatile long lastCycleSuccessMs = 0;
     private static volatile long lastStatsSuccessMs = 0;
     private static volatile long lastWatchdogAlertMs = 0;
-    private static final long SIGNAL_DROUGHT_MS     = 60 * 60_000L;  // [v38.0] 30→60min: tight filters = fewer signals, not a bug
-    private static final long WATCHDOG_COOLDOWN_MS  = 30 * 60_000L;  // [v38.0] 10→30min: reduce spam
+    private static final long SIGNAL_DROUGHT_MS     = 120 * 60_000L;  // [v53] 60→120min: signal droughts <2h are normal in tight-filter mode
+    private static final long WATCHDOG_COOLDOWN_MS   = 60 * 60_000L;  // [v53] 30→60min: reduce spam further
     private static final AtomicLong watchdogAlerts  = new AtomicLong(0);
 
     // ── Daily summary ─────────────────────────────────────────────────────
@@ -118,15 +118,25 @@ public final class BotMain {
     // Cooldown: один прогноз по одной паре не чаще раза в 20 минут
     private static final java.util.concurrent.ConcurrentHashMap<String, Long>
             forecastCooldown = new java.util.concurrent.ConcurrentHashMap<>();
-    // [PATCH-AFC] Cooldown raised 12→20 min: 12 min caused spam pairs to repeat 3x/hour.
-    // In choppy markets the forecast "changes" every 12 min due to noise → endless alerts.
-    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 10 * 60_000L; // [v52] 20→10min: catch pump/dump setups faster
-    // [PATCH-AFC] Thresholds raised: 0.20 was too permissive — fired on any micro-fluctuation.
-    // 0.35 = genuine directional momentum. 0.55 = strong conviction (was 0.42).
-    private static final double AFC_MIN_DIRECTION_SCORE = 0.22; // [v52] 0.35→0.22: catch earlier setups // was 0.20
-    private static final double AFC_STRONG_SCORE        = 0.42; // [v52] 0.55→0.42 // was 0.42
-    // Максимум прогнозов за один запуск
-    private static final int AFC_MAX_PER_RUN = 10; // [v52] 5→10: more advance alerts per run // was 4
+    // [v53 ANTI-SPAM] AFC cooldown 10→20 min. Previous 10 min caused the same pair to re-alert
+    // 3+ times per hour on noise ("Движение вверх" at 23% confidence recurring every 12 min).
+    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 20 * 60_000L;
+    // [v53 ANTI-SPAM] Thresholds raised to production-grade conviction levels.
+    //   - AFC_MIN_DIRECTION_SCORE 0.22 → 0.55: 0.22 fired on any micro-fluctuation.
+    //     At 0.55 we require genuine directional momentum (>55% score = clear trend).
+    //   - AFC_STRONG_SCORE 0.42 → 0.70: only true "ПАМП/ДАМП" events qualify.
+    //   - AFC_MIN_CONF_TO_SEND: NEW hard gate — ANY forecast below 65% confidence
+    //     is DROPPED before ever reaching Telegram, regardless of other conditions.
+    //     Fixes the "24%-38% ожидание подтверждения" spam stream.
+    private static final double AFC_MIN_DIRECTION_SCORE = 0.55;
+    private static final double AFC_STRONG_SCORE        = 0.70;
+    private static final double AFC_MIN_CONF_TO_SEND    = 0.65;
+    // [v53] Env kill-switch: set AFC_ENABLED=false to disable advance forecasts entirely.
+    //       Clean main pipeline signals (with entry/SL/TP) are always delivered regardless.
+    private static final boolean AFC_ENABLED = envBool("AFC_ENABLED", true);
+    // [v53 ANTI-SPAM] 10 → 3 per run. Even after threshold raise, 10 messages per 2min cycle
+    // is noise overload. 3 forces selection of only the highest-conviction ideas.
+    private static final int AFC_MAX_PER_RUN = 3;
 
     // ── Forecast accuracy tracker ─────────────────────────────────────────
     // [v14.0 FIX #5] MAX_FORECAST_RECORDS предотвращает утечку памяти
@@ -1006,16 +1016,19 @@ public final class BotMain {
         if (now - lastCycleSuccessMs > 3 * 60_000L)
             issues.add("💀 MainCycle silent " + (now - lastCycleSuccessMs) / 1000 + "s");
 
-        if (now - lastStatsSuccessMs > 20 * 60_000L)
+        if (now - lastStatsSuccessMs > 40 * 60_000L)  // [v53] 20→40min — stats every 30min is normal, 40 is the real anomaly
             issues.add("💀 Stats silent " + (now - lastStatsSuccessMs) / 60_000 + "min");
 
         if (now - lastSignalMs > SIGNAL_DROUGHT_MS) {
             long droughtMin = (now - lastSignalMs) / 60_000;
             double effConf  = isc.getEffectiveMinConfidence();
-            issues.add("📭 No signals " + droughtMin + " min"
-                    + (effConf > 62 ? " | ISC effConf=" + String.format("%.0f", effConf) + "%" : "")
-                    + " WS=" + sender.getActiveWsCount()
-                    + " UDS=" + (sender.isUdsConnected() ? "✅" : "❌"));
+            // [v53] Skip drought alert when effConf is high (ISC correctly raised floor due to
+            // bad market regime — having no signals IS the correct behavior).
+            if (effConf < 70) {
+                issues.add("📭 No signals " + droughtMin + " min"
+                        + " WS=" + sender.getActiveWsCount()
+                        + " UDS=" + (sender.isUdsConnected() ? "✅" : "❌"));
+            }
         }
 
         if (sender.getActiveWsCount() < 3)
@@ -1289,6 +1302,9 @@ public final class BotMain {
                                            com.bot.GlobalImpulseController gic,
                                            com.bot.InstitutionalSignalCore isc,
                                            com.bot.TelegramBotSender telegram) {
+        // [v53] Env kill-switch: if AFC_ENABLED=false, no advance forecasts ever go out.
+        // Main-pipeline signals (with entry/SL/TP) still work normally.
+        if (!AFC_ENABLED) return;
         // Не работаем в PANIC режиме — рынок непредсказуем
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         if (ctx.panicMode) {
@@ -1405,7 +1421,13 @@ public final class BotMain {
         return fc.bias.name() + "_" + fc.trendPhase.name() + "_" + scoreStep + "_" + vsaTag;
     }
 
-    /** Строит полное Telegram-сообщение advance forecast */
+    /** Строит полное Telegram-сообщение advance forecast.
+     *  [v53 ANTI-SPAM] Returns null if the forecast is below quality bar:
+     *    - confidence < AFC_MIN_CONF_TO_SEND (65%)
+     *    - event type would be "Движение вверх/вниз" (no conviction)
+     *    - VSA signal is only NO_SUPPLY/NO_DEMAND (non-actionable absence of flow)
+     *  This eliminates the "23%-50% ожидание подтверждения" spam stream entirely.
+     */
     private static String buildAdvanceForecastMessage(
             String pair,
             com.bot.TradingCore.ForecastEngine.ForecastResult fc,
@@ -1413,13 +1435,17 @@ public final class BotMain {
             double score,
             com.bot.GlobalImpulseController.GlobalContext ctx) {
 
+        double confPct = Math.abs(score);
+        // [v53] HARD GATE: anything under 65% is noise, drop it before building anything.
+        if (confPct < AFC_MIN_CONF_TO_SEND) return null;
+
         boolean bullish = score > 0;
         boolean strong  = Math.abs(score) >= AFC_STRONG_SCORE;
 
         com.bot.DecisionEngineMerged.AssetType assetType =
                 com.bot.DecisionEngineMerged.detectAssetType(pair);
 
-        // ── Event type ──
+        // ── Event type — ONLY conviction-grade labels survive v53 ──
         boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
         boolean isEarly      = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
         boolean vsaReversal  = vsa.hasSignal() && (
@@ -1429,21 +1455,25 @@ public final class BotMain {
                         vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.EFFORT_TO_RISE_FAILED);
 
         String eventType;
+        String emoji;
         if (isExhaustion && vsaReversal) {
-            eventType = bullish ? "Разворот вниз" : "Разворот вверх";
-        } else if (isExhaustion) {
-            eventType = "Истощение тренда";
+            eventType = bullish ? "РАЗВОРОТ ВНИЗ" : "РАЗВОРОТ ВВЕРХ";
+            emoji = bullish ? "🔻" : "🚀";
+            // Reversal always flips direction — invert display
+            bullish = !bullish;
         } else if (isEarly && strong) {
-            eventType = bullish ? "Памп" : "Дамп";
-        } else if (isEarly) {
-            eventType = bullish ? "Тренд вверх" : "Тренд вниз";
+            eventType = bullish ? "ПАМП" : "ДАМП";
+            emoji = bullish ? "🚀" : "🔻";
         } else if (strong) {
-            eventType = bullish ? "Импульс вверх" : "Импульс вниз";
+            eventType = bullish ? "ТРЕНД ВВЕРХ" : "ТРЕНД ВНИЗ";
+            emoji = bullish ? "📈" : "📉";
         } else {
-            eventType = bullish ? "Движение вверх" : "Движение вниз";
+            // [v53] No more "Движение вверх", "Импульс вверх", "Истощение тренда" без подтверждения.
+            // If we can't say clearly PUMP/DUMP/REVERSAL/TREND with strong=true → drop it.
+            return null;
         }
 
-        // ── VSA status line ──
+        // ── VSA status line — drop NO_SUPPLY/NO_DEMAND (non-actionable absence) ──
         String vsaStatus = "";
         if (vsa.hasSignal()) {
             vsaStatus = switch (vsa.signal) {
@@ -1451,31 +1481,31 @@ public final class BotMain {
                 case STOPPING_VOLUME_BEAR  -> "Продажи поглотили покупки";
                 case EFFORT_TO_FALL_FAILED -> "Продажи провалились";
                 case EFFORT_TO_RISE_FAILED -> "Покупки провалились";
-                case NO_SUPPLY             -> "Нет продаж";
-                case NO_DEMAND             -> "Нет покупок";
                 case DEMAND_ABSORPTION     -> "Поглощение спроса";
                 case SUPPLY_ABSORPTION     -> "Поглощение предложения";
                 case WEAK_BREAKOUT         -> "Ловушка пробоя";
+                // [v53] NO_SUPPLY / NO_DEMAND removed — "нет покупок/продаж" is absence of data, not signal.
                 default                    -> "";
             };
         }
 
-        double confPct = Math.abs(score) * 100;
+        double confPercent = confPct * 100;
         String icon = bullish ? "🟢" : "🔴";
 
         StringBuilder body = new StringBuilder();
-        body.append(icon).append(" *").append(pair).append("* · ").append(eventType).append('\n');
-        body.append("_").append(assetType.label).append(" · прогноз_\n\n");
+        body.append(icon).append(" *").append(pair).append("* · ").append(emoji).append(' ').append(eventType).append('\n');
+        body.append("_").append(assetType.label).append("_\n\n");
         if (fc.magnetLevel > 0) {
-            body.append(String.format("Магнит: %.4f%n", fc.magnetLevel));
+            body.append(String.format("Цель: %.4f%n", fc.magnetLevel));
         }
         if (fc.projectedMovePct != 0) {
-            body.append(String.format("Движение: %+.2f%%%n", fc.projectedMovePct * 100));
+            body.append(String.format("Ожидаемое движение: %+.2f%%%n", fc.projectedMovePct * 100));
         }
         if (!vsaStatus.isEmpty()) {
             body.append(String.format("VSA: %s%n", vsaStatus));
         }
-        body.append(String.format("%n*%.0f%%* уверенность · ожидание подтверждения", confPct));
+        // [v53] No more "ожидание подтверждения" — if we sent it, it means we believe it.
+        body.append(String.format("%n📊 *%.0f%%* conviction", confPercent));
 
         return body.toString();
     }
@@ -1573,6 +1603,16 @@ public final class BotMain {
         } catch (Exception e) {
             return d;
         }
+    }
+
+    /** [v53] Env boolean helper. Accepts: true/false/1/0/yes/no (case-insensitive). */
+    private static boolean envBool(String k, boolean d) {
+        String v = System.getenv(k);
+        if (v == null || v.isBlank()) return d;
+        String s = v.trim().toLowerCase();
+        if (s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("on"))  return true;
+        if (s.equals("false")|| s.equals("0") || s.equals("no")  || s.equals("off")) return false;
+        return d;
     }
 
     /**
