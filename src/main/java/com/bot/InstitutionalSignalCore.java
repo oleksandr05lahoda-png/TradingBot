@@ -102,6 +102,17 @@ public final class InstitutionalSignalCore {
     /** Post-exit cooldowns. Symbol → earliest time a new signal is allowed (epoch ms). */
     private final Map<String, Long> symbolCooldownUntil = new ConcurrentHashMap<>();
 
+    // [v50 AUDIT FIX] Global signal rate limit — defends against signal floods
+    // in volatile markets. Trader physically cannot process more than ~6 signals per 2h.
+    private final java.util.concurrent.ConcurrentLinkedDeque<Long> globalSignalTimestamps
+            = new java.util.concurrent.ConcurrentLinkedDeque<>();
+    private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 6);
+    private static final long GLOBAL_WINDOW_2H_MS   = 2L * 60 * 60_000L;
+
+    // [v50 AUDIT FIX] Daily kill-switch threshold. At -5% daily PnL, block ALL new signals
+    // until next UTC day. resetDailyIfNeeded() will clear dailyPnLPct automatically at 00:00 UTC.
+    private static final double DAILY_KILL_SWITCH_PCT = -0.05;
+
     // [v34.0] DAILY SIGNAL LIMIT PER SYMBOL — prevents "milking" one volatile coin all day.
     // Problem: BULLAUSDT fires 12 signals in 6 hours — all correlated, same pattern = one big bet.
     // Fix: max 4 signals per symbol per rolling 8h window. Forces diversification.
@@ -386,11 +397,14 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [v50] Floor lowered 62→58 to match expanded confidence range.
-        // With the new wider cluster-base scores (40-78), 62 floor was blocking
-        // valid 3-cluster signals. At 58 we let through moderate-conviction setups
-        // that can still have positive EV due to better entry timing.
-        double floor = getTotalTradeCount() >= 200 ? 50.0 : 58.0;
+        // [v50 AUDIT FIX] Inverted logic: strict on small sample, loose ONLY if WR proven.
+        // Old: 200+ trades → floor drops to 50 unconditionally. This is backwards:
+        // large sample with BAD WR should stay strict; only large sample with GOOD WR relaxes.
+        double floor = 58.0;
+        int totalTrades = getTotalTradeCount();
+        double overallWr = getOverallWinRate();
+        if (totalTrades >= 500 && overallWr >= 0.58) floor = 50.0;
+        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 54.0;
 
         double base = Math.max(baseMinConfidence, floor);
 
@@ -451,6 +465,35 @@ public final class InstitutionalSignalCore {
 
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
+
+        // [v50 AUDIT FIX] Daily kill-switch: hard stop at -5% daily drawdown.
+        // resetDailyIfNeeded() handles auto-clear at next UTC day.
+        if (dailyPnLPct <= DAILY_KILL_SWITCH_PCT) {
+            long now = System.currentTimeMillis();
+            Long lastLog = bipolarLogThrottle.get("__daily_kill__");
+            if (lastLog == null || (now - lastLog) > BIPOLAR_LOG_THROTTLE_MS) {
+                bipolarLogThrottle.put("__daily_kill__", now);
+                log(String.format("🛑 DAILY_KILL_SWITCH: DD=%.2f%% → no new signals until next UTC day",
+                        dailyPnLPct * 100));
+            }
+            return false;
+        }
+
+        // [v50 AUDIT FIX] Global rate limit: max MAX_GLOBAL_SIGNALS_2H signals in rolling 2h.
+        long nowMs = System.currentTimeMillis();
+        while (!globalSignalTimestamps.isEmpty()
+                && nowMs - globalSignalTimestamps.peekFirst() > GLOBAL_WINDOW_2H_MS) {
+            globalSignalTimestamps.pollFirst();
+        }
+        if (globalSignalTimestamps.size() >= MAX_GLOBAL_SIGNALS_2H) {
+            Long lastLog = bipolarLogThrottle.get("__global_rate__");
+            if (lastLog == null || (nowMs - lastLog) > BIPOLAR_LOG_THROTTLE_MS) {
+                bipolarLogThrottle.put("__global_rate__", nowMs);
+                log("🚫 GLOBAL_RATE_LIMIT: " + globalSignalTimestamps.size()
+                        + "/" + MAX_GLOBAL_SIGNALS_2H + " signals in last 2h");
+            }
+            return false;
+        }
 
         // ╔══════════════════════════════════════════════════════════════╗
         // ║  [SCANNER MODE v2.0] allowSignal() — упрощён до минимума   ║
@@ -537,6 +580,8 @@ public final class InstitutionalSignalCore {
         currentHeat += estRisk;
         markSymbolActive(signal.symbol);
         recordSymbolSignal(signal.symbol);
+        // [v50 AUDIT FIX] Track for global rate limit
+        globalSignalTimestamps.addLast(System.currentTimeMillis());
 
         // [v38.0] Log signal factors for post-hoc analysis
         if (!factorLog.isEmpty()) {
@@ -908,11 +953,19 @@ public final class InstitutionalSignalCore {
             shouldSoftBlock = wr < AUTO_BLACKLIST_WR_THRESHOLD;
         }
 
-        if (shouldHardBlock) {
+        // [v50 AUDIT FIX] Binomial p-value test for hard-block.
+        // Null hypothesis: true WR >= 0.40. Only hard-block if we can reject at p<0.05.
+        // Prevents false-positives on statistical noise (on 20 trades, 25% WR can occur
+        // by chance with p≈0.05 even when true WR is 50%).
+        int wins = (int) Math.round(wr * count);
+        double pValue = shouldHardBlock ? binomialCdf(wins, count, 0.40) : 1.0;
+        boolean hardBlockStatisticallyValid = shouldHardBlock && pValue < 0.05;
+
+        if (hardBlockStatisticallyValid) {
             hardBlacklist.put(symbol, System.currentTimeMillis() + HARD_BLACKLIST_DURATION_MS);
             autoBlacklist.put(symbol, true);
-            log(String.format("[AUTO_BLACKLIST_HARD] %s WR=%.0f%% after %d trades → HARD-blocked 48h",
-                    symbol, wr * 100, count));
+            log(String.format("[AUTO_BLACKLIST_HARD] %s WR=%.0f%% after %d trades (p=%.3f) → HARD-blocked 48h",
+                    symbol, wr * 100, count, pValue));
         } else if (!currentlyBlocked && shouldSoftBlock) {
             autoBlacklist.put(symbol, true);
             log(String.format("[AUTO_BLACKLIST] %s WR=%.0f%% after %d trades → soft-blocked",
@@ -922,6 +975,26 @@ public final class InstitutionalSignalCore {
             log(String.format("[AUTO_BLACKLIST] %s WR=%.0f%% recovered → unblocked",
                     symbol, wr * 100));
         }
+    }
+
+    /**
+     * [v50 AUDIT FIX] Binomial CDF P(X <= k | n, p).
+     * Used by auto-blacklist to check if observed win count is so low it rejects
+     * the null hypothesis "true WR >= threshold" at p < 0.05.
+     */
+    private static double binomialCdf(int k, int n, double p) {
+        if (k < 0 || n <= 0 || p < 0 || p > 1) return 1.0;
+        if (k >= n) return 1.0;
+        // Use recursive computation with log-space to avoid overflow.
+        double sum = 0;
+        double logP = Math.log(p), log1mP = Math.log(1 - p);
+        double logCoeff = 0;
+        for (int i = 0; i <= k; i++) {
+            if (i > 0) logCoeff += Math.log((double)(n - i + 1) / i);
+            double logTerm = logCoeff + i * logP + (n - i) * log1mP;
+            sum += Math.exp(logTerm);
+        }
+        return Math.min(1.0, sum);
     }
 
     /** [v51] Hard blacklist check — completely blocks signal generation. */

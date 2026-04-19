@@ -38,7 +38,7 @@ public final class SignalOptimizer {
     private static final double STRONG_IMPULSE = 0.0018;   // [v50] was 0.0025
     private static final double WEAK_IMPULSE   = 0.0001;  // [v50] was 0.0002
 
-    private static final double MAX_CONF = 92.0;  // [v50] expanded from 85
+    private static final double MAX_CONF = 85.0;  // [v50 AUDIT FIX] Unified cap with DecisionEngine (was 92, caused 4 inconsistent caps)
     private static final double MIN_CONF = 45.0;  // [v50] expanded from 50
 
     // [FIX-BUG-2] Убран хардкодный кап 0.010 (1%).
@@ -375,14 +375,20 @@ public final class SignalOptimizer {
     private double computeImpulsePercentile(String symbol, double currentImpulse) {
         // Используем историю моментума как прокси для импульса
         Deque<Double> momHist = momentumHistory.get(symbol);
-        if (momHist == null || momHist.size() < 10) return 0.5; // нет данных — нейтраль
+        // [v50 FIX BUG-7] Need at least 11 entries: 10 historical + 1 current (excluded).
+        // Previously min was 10 which included the current candle's own value,
+        // inflating the percentile (candle compared against itself).
+        if (momHist == null || momHist.size() < 11) return 0.5;
 
+        // Exclude the LAST entry — it is the current candle's momentum, already pushed
+        // by analyzeMicroTrend() before adjustConfidence() runs. Comparing currentImpulse
+        // against a deque that contains currentImpulse biases the percentile upward.
+        List<Double> hist = new ArrayList<>(momHist);
         List<Double> absValues = new ArrayList<>();
-        for (double m : momHist) absValues.add(Math.abs(m));
+        for (int i = 0; i < hist.size() - 1; i++) absValues.add(Math.abs(hist.get(i)));
         if (absValues.isEmpty()) return 0.5;
         Collections.sort(absValues);
 
-        // Количество исторических значений меньше текущего
         int below = 0;
         for (double v : absValues) if (v < currentImpulse) below++;
         return (double) below / absValues.size();

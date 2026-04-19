@@ -7,6 +7,13 @@
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/PumpHunter.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalOptimizer.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SimpleBacktester.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/TelegramBotSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/TelegramBotSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -703,7 +710,23 @@
       <workItem from="1776336141966" duration="2039000" />
       <workItem from="1776342123499" duration="5015000" />
       <workItem from="1776380051996" duration="3972000" />
-      <workItem from="1776414363813" duration="1840000" />
+      <workItem from="1776414363813" duration="1860000" />
+      <workItem from="1776421203968" duration="1671000" />
+      <workItem from="1776549078672" duration="1499000" />
+      <workItem from="1776552965366" duration="11000" />
+      <workItem from="1776552988191" duration="8000" />
+      <workItem from="1776553013599" duration="78000" />
+      <workItem from="1776553104293" duration="14000" />
+      <workItem from="1776553128710" duration="130000" />
+      <workItem from="1776553268735" duration="9000" />
+      <workItem from="1776553286751" duration="44000" />
+      <workItem from="1776553340651" duration="17000" />
+      <workItem from="1776553370927" duration="5000" />
+      <workItem from="1776553387541" duration="116000" />
+      <workItem from="1776553516900" duration="661000" />
+      <workItem from="1776587423718" duration="1570000" />
+      <workItem from="1776589907773" duration="214000" />
+      <workItem from="1776590583030" duration="311000" />
     </task>
     <servers />
   </component>

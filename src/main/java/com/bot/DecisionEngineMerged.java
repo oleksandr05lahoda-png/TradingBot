@@ -160,11 +160,6 @@ public final class DecisionEngineMerged {
     private static final ProbabilityCalibrator CALIBRATOR = new ProbabilityCalibrator();
     public static ProbabilityCalibrator getCalibrator() { return CALIBRATOR; }
 
-    // [v42.0 FIX #2] Backtest mode flag — disables RT-aggTrade reads, everything else identical to live.
-    private volatile boolean backtestMode = false;
-    public void setBacktestMode(boolean v) { this.backtestMode = v; }
-    public boolean isBacktestMode() { return backtestMode; }
-
     // [v42.0 FIX #12] Last GC timestamp for postExitCooldown leak fix
     private volatile long lastCooldownGcMs = 0L;
     private static final int POST_EXIT_MAX_SIZE = 5000;
@@ -778,6 +773,18 @@ public final class DecisionEngineMerged {
         // [v43 PATCH FIX #5] Expose robustAtrPct at signal time.
         // BotMain.trackSignal() stores this in ForecastRecord → correct vol-bucket
         // in calibrator (avoids consolidation ATR collapse misclassifying HIGH→LOW bucket).
+        // [v50 AUDIT FIX] Allow override of robustAtrPct by analyze() with the real value.
+        // Previously this was derived from abs(stop-price)/price, which is incorrect for
+        // structural stops (where stop distance != ATR). Corruption of vol bucket
+        // classification was silently breaking calibrator learning.
+        private volatile double robustAtrPctOverride = -1.0;
+        public double getRobustAtrPct() {
+            return robustAtrPctOverride > 0 ? robustAtrPctOverride : robustAtrPct;
+        }
+        public void setRobustAtrPct(double v) {
+            if (v > 0 && v < 1.0) this.robustAtrPctOverride = v;
+        }
+
         public final double robustAtrPct;
         // [PATCH 4.3] Signal age tracking — enables decay-based filtering in
         // earlyTickBuffer and anywhere else ideas sit in a queue. Stale signals
@@ -2471,7 +2478,7 @@ public final class DecisionEngineMerged {
         }
         if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
             double bullConfBoost = 1.5 + Math.max(0.0, gicCtx.impulseStrength - 0.70) * 6.0;
-            probability = Math.min(86, probability + Math.min(4.0, bullConfBoost));
+            probability = Math.min(85, probability + Math.min(4.0, bullConfBoost));
             allFlags.add("BULL_CONF_BOOST");
         }
 
@@ -2516,7 +2523,7 @@ public final class DecisionEngineMerged {
         // scoreDiffPenalty and dynThreshPenalty are represented
         // by their contributing factors above — no extra flat deduction.
         ensAdj = Math.max(-14.0, Math.min(+8.0, ensAdj));
-        probability = Math.max(0.0, Math.min(88.0, probability + ensAdj));
+        probability = Math.max(0.0, Math.min(85.0, probability + ensAdj));
 
         // Exhaustion score crush: score already penalized upstream via cluster multiply.
         // Apply only a capped -7 here (was -12 flat).
@@ -2804,7 +2811,7 @@ public final class DecisionEngineMerged {
                         boolean earlyAligned = (sigLong && forecastResult.directionScore > 0)
                                 || (!sigLong && forecastResult.directionScore < 0);
                         if (earlyAligned) {
-                            probability = Math.min(88, probability + 7);
+                            probability = Math.min(85, probability + 7);
                             allFlags.add("FC_EARLY_BOOST");
                         }
                     }
@@ -2924,8 +2931,9 @@ public final class DecisionEngineMerged {
         double rawProb01 = Math.max(0.0, Math.min(1.0, probability / 100.0));
         double calibrated01 = CALIBRATOR.calibrate(symbol, rawProb01);
         probability = calibrated01 * 100.0;
-        // Hard cap on extremes — calibrator can theoretically output 0 or 1 on small samples
-        probability = Math.max(0.0, Math.min(95.0, probability));
+        // Single authoritative cap: 85.0. All intermediate caps above already respect this,
+        // so this is purely a safety net for calibrator edge cases on tiny samples.
+        probability = Math.max(0.0, Math.min(85.0, probability));
         if (probability < minConf) return null;
 
         // ════════════════════════════════════════════════════════
@@ -3032,11 +3040,15 @@ public final class DecisionEngineMerged {
         adaptiveRR = tp3Mult; // пересчитываем после возможной правки tp3Mult
         // ═══════════════════════════════════════════════════════════════
 
-        return new TradeIdea(symbol, side, price, stopPrice, takePrice, adaptiveRR,
+        TradeIdea idea = new TradeIdea(symbol, side, price, stopPrice, takePrice, adaptiveRR,
                 probability, allFlags,
                 fundingRate, fundingDelta, oiChange, bias2h.name(), cat,
                 forecastResult,
                 tp1Mult, tp2Mult, tp3Mult);
+        // [v50 AUDIT FIX] Thread the real robustAtrPct through to the TradeIdea so that
+        // ProbabilityCalibrator gets the correct VolBucket instead of a stop-distance proxy.
+        idea.setRobustAtrPct(robustAtrPct);
+        return idea;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -4342,12 +4354,25 @@ public final class DecisionEngineMerged {
             double r = clamp01(rawScore);
             if (symbol == null) return r;
 
-            // Сначала пробуем точный bucket; если данных мало — добираем из соседей.
             VolBucket b = VolBucket.of(atrPct);
             java.util.List<Outcome> snap = collect(symbol, b);
+            boolean usingGlobal = false;
+
+            // [v50 AUDIT FIX] Tiered fallback — activates calibrator in 1-2 weeks of deploy
+            // instead of 2.5 months of per-symbol-per-bucket accumulation.
             if (snap.size() < MIN_SAMPLES) {
-                // Fallback: объединяем все бакеты символа
-                snap = collectAll(symbol);
+                snap = collectAll(symbol);  // per-symbol, all buckets
+            }
+            if (snap.size() < MIN_SAMPLES) {
+                // Global fallback: same vol bucket across all symbols.
+                snap = collectGlobalBucket(b);
+                usingGlobal = true;
+            }
+            if (snap.size() < MIN_SAMPLES) {
+                // Ultimate fallback: all outcomes globally.
+                snap = new java.util.ArrayList<>();
+                history.values().forEach(snap::addAll);
+                usingGlobal = true;
             }
             if (snap.size() < MIN_SAMPLES) return r;
 
@@ -4380,9 +4405,10 @@ public final class DecisionEngineMerged {
 
             pav(y, w);
 
-            // Эмпирический Bayes shrinkage [FIX #17]:
-            // ζ = n / (n + 100). При n=50 → 0.33; при n=200 → 0.67; при n=500 → 0.83.
-            double zeta = (double) n / (n + 100.0);
+            // [v50 AUDIT FIX] Shrinkage adjusted for global fallback.
+            // Per-symbol data: trust calibration. Global fallback: pull harder toward raw (×0.5).
+            double zetaBase = (double) n / (n + 100.0);
+            double zeta = usingGlobal ? zetaBase * 0.5 : zetaBase;
 
             double calibrated;
             if (r <= x[0]) {
@@ -4403,6 +4429,18 @@ public final class DecisionEngineMerged {
             }
 
             return clamp01((1.0 - zeta) * r + zeta * calibrated);
+        }
+
+        /** [v50 AUDIT FIX] Global outcomes within a vol bucket (cold-start fallback). */
+        private java.util.List<Outcome> collectGlobalBucket(VolBucket b) {
+            java.util.List<Outcome> out = new java.util.ArrayList<>();
+            String suffix = "#" + b.name();
+            for (var entry : history.entrySet()) {
+                if (entry.getKey().endsWith(suffix)) {
+                    out.addAll(entry.getValue());
+                }
+            }
+            return out;
         }
 
         private java.util.List<Outcome> collect(String symbol, VolBucket b) {

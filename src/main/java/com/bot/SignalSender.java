@@ -977,6 +977,12 @@ public final class SignalSender {
     // ══════════════════════════════════════════════════════════════
 
     private void startWebSocketsForTopPairs(Set<String> pairs) {
+        // [v50 AUDIT FIX] Pre-filter blocklist before subscribing — avoids wasted WS connections
+        // and memory on garbage coins that processPair() would reject anyway.
+        pairs = pairs.stream()
+                .filter(p -> !GARBAGE_COIN_BLOCKLIST.contains(p))
+                .filter(p -> !isc.isHardBlacklisted(p))
+                .collect(java.util.stream.Collectors.toSet());
         // [v10.0] MEMORY LEAK FIX: clean up pairs that dropped out of TOP-N
         // Without this, wsMap/tickPriceDeque/liveM1Buffer grow forever
         Set<String> zombies = new HashSet<>(wsMap.keySet());
@@ -1190,15 +1196,26 @@ public final class SignalSender {
                 return null;
             }
 
-            // [v17.0] MAX SL% GATE — block signals with unreasonably wide stop-loss.
-            // Examples from live logs: SOLVUSDT SL=-12.11%, AIOTUSDT SL=-24.97%.
-            // These are not trading signals — they're lottery tickets.
-            // For small balance (<$50): max 3% SL. For normal balance: max 5% SL.
+            // [v50 AUDIT FIX] Adaptive MAX SL% — by volatility bucket × balance scaling.
+            // Old: fixed 3%/5% by balance. Problem: a HIGH_VOL ALT with legit 6% structural stop
+            // was blocked, while a MEME with 4.9% stop (noise) passed. Now stop width is judged
+            // against the coin's natural volatility, not account size.
             double signalSlPct = Math.abs(idea.price - idea.stop) / idea.price;
-            double maxSlPct = getMaxSlPct();
+            // Derive vol bucket from the SL distance as proxy (robust: analyze() sized SL using robustAtr)
+            com.bot.DecisionEngineMerged.VolatilityBucket bucket =
+                    com.bot.DecisionEngineMerged.classifyVolatility(signalSlPct * 0.5);
+            double volMaxSlPct = switch (bucket) {
+                case LOW     -> 0.012;
+                case MEDIUM  -> 0.025;
+                case HIGH    -> 0.045;
+                case EXTREME -> 0.075;
+            };
+            double balScale = accountBalance < 50  ? 0.6
+                    : accountBalance < 150 ? 0.8 : 1.0;
+            double maxSlPct = volMaxSlPct * balScale;
             if (signalSlPct > maxSlPct) {
-                System.out.printf("[SL-GATE] %s BLOCKED: SL=%.2f%% > max=%.2f%% (balance=%.1f)%n",
-                        pair, signalSlPct * 100, maxSlPct * 100, Math.max(accountBalance, 5.0));
+                System.out.printf("[SL-GATE] %s BLOCKED: SL=%.2f%% > vol-max=%.2f%% (bucket=%s, balScale=%.2f)%n",
+                        pair, signalSlPct * 100, maxSlPct * 100, bucket, balScale);
                 return null;
             }
 
@@ -1235,7 +1252,9 @@ public final class SignalSender {
                 double boost = Math.min(5, (gicWeight - 1.0) * 8);
                 List<String> gicFlags = new ArrayList<>(idea.flags);
                 gicFlags.add("GIC_BOOST" + String.format("%.0f", gicWeight * 100));
-                idea = rebuildIdea(idea, Math.min(85, idea.probability + boost), gicFlags);
+                // [v50 FIX BUG-18] Removed duplicate Math.min(85,...) — single cap lives in
+                // SignalOptimizer.MAX_CONF=85 which is applied after all boosts are applied.
+                idea = rebuildIdea(idea, idea.probability + boost, gicFlags);
             }
 
             if (!correlationGuard.allow(pair, idea.side, cat, sector)) {
@@ -1315,7 +1334,8 @@ public final class SignalSender {
                     double boost = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 2.0 : 1.5;
                     String tag = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? "OFV_STRONG" : "OFV_ALIGN";
                     nf.add(tag + (isLong ? "↑" : "↓"));
-                    idea = rebuildIdea(idea, Math.min(85.0, idea.probability + boost), nf);
+                    // [v50 FIX BUG-18] Removed Math.min(85.0,...) — single cap in SignalOptimizer
+                    idea = rebuildIdea(idea, idea.probability + boost, nf);
                 } else if (opposed) {
                     // Active flow against the signal direction — reduce confidence
                     double penalty = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 5.0 : 2.5;
@@ -1478,8 +1498,9 @@ public final class SignalSender {
             double _tp2Dist  = Math.abs(idea.tp2 - idea.price);
             double actualRR  = _riskDist > 1e-9 ? _tp2Dist / _riskDist : 0;
             if (actualRR < 1.80) {
-                // Undo the registration — R:R is insufficient
+                // Undo ISC and correlation registrations — R:R is insufficient
                 isc.unregisterSignal(idea);
+                correlationGuard.unregister(pair);
                 System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < 1.80 (TP2=%.6f entry=%.6f SL=%.6f)%n",
                         pair, idea.side, actualRR, idea.tp2, idea.price, idea.stop);
                 return null;
@@ -2314,76 +2335,100 @@ public final class SignalSender {
     // ══════════════════════════════════════════════════════════════
 
     private static final class CorrelationGuard {
-        private int longCount = 0, shortCount = 0;
-        private int topLongCount = 0, topShortCount = 0;
-        private final Map<String, Integer> sectorDirCount = new HashMap<>();
-        private final Set<String> registered = new HashSet<>();
+        // [v50 FIX BUG-21] State is now PERSISTENT between cycles.
+        // Previously resetCycle() wiped everything each cycle — meaning 30 cycles/hour
+        // could each emit 5 LONGs with zero cross-cycle correlation protection.
+        // Now: each registered signal has a TTL. Entries expire naturally when the
+        // signal's expected hold time passes (default 4h) or on explicit unregister().
 
-        // [v38.0] TIGHTENED LIMITS — 8 ALT in one direction = suicide
-        // MAX_DIR reduced from 10→5 (normal), 6→3 (weekend)
-        // MAX_SECTOR reduced from 4→2
+        private static final long ENTRY_TTL_MS = envLong("CORR_ENTRY_TTL_MS", 4L * 3600_000L); // 4 hours
+
+        private static final class Entry {
+            final String pair;
+            final com.bot.TradingCore.Side side;
+            final com.bot.DecisionEngineMerged.CoinCategory cat;
+            final String sector;
+            final long expiresAt;
+            Entry(String pair, com.bot.TradingCore.Side side,
+                  com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
+                this.pair = pair; this.side = side; this.cat = cat; this.sector = sector;
+                this.expiresAt = System.currentTimeMillis() + ENTRY_TTL_MS;
+            }
+            boolean expired() { return System.currentTimeMillis() > expiresAt; }
+        }
+
+        private final java.util.concurrent.ConcurrentHashMap<String, Entry> activeEntries
+                = new java.util.concurrent.ConcurrentHashMap<>();
+
         private static final int MAX_DIR_NORMAL  = envInt("CORR_MAX_DIR_NORMAL", 5);
         private static final int MAX_DIR_WEEKEND = envInt("CORR_MAX_DIR_WEEKEND", 3);
         private static final int MAX_SECTOR      = envInt("CORR_MAX_SECTOR_SAME_DIR", 2);
         private static final int MAX_TOP_SAME_DIR= envInt("CORR_MAX_TOP_SAME_DIR", 2);
-        // [v38.0] MAX_TOTAL — absolute cap on simultaneous open positions
         private static final int MAX_TOTAL       = envInt("CORR_MAX_TOTAL", 6);
-        // [v38.0] MAX_SAME_SIDE_ALT — ALTs are 0.85+ correlated with BTC
         private static final int MAX_ALT_SAME_DIR = envInt("CORR_MAX_ALT_SAME_DIR", 3);
-
-        private int altLongCount = 0, altShortCount = 0;
 
         private static boolean isWeekend() {
             java.time.DayOfWeek d = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getDayOfWeek();
             return d == java.time.DayOfWeek.SATURDAY || d == java.time.DayOfWeek.SUNDAY;
         }
 
-        synchronized void resetCycle() {
-            longCount = 0;
-            shortCount = 0;
-            topLongCount = 0;
-            topShortCount = 0;
-            altLongCount = 0;
-            altShortCount = 0;
-            sectorDirCount.clear();
-            registered.clear();
+        /** Purge expired entries. Called before every allow()/register() check. */
+        private synchronized void purgeExpired() {
+            activeEntries.values().removeIf(Entry::expired);
         }
 
-        /**
-         * [v38.0] CORRELATION-AWARE POSITION SIZING
-         * Returns multiplier [0.0, 1.0] for position size reduction.
-         * If too many correlated positions are open → shrink new position.
-         */
+        /** Counts of active (non-expired) entries. Called after purgeExpired(). */
+        private synchronized Counts count() {
+            Counts c = new Counts();
+            for (Entry e : activeEntries.values()) {
+                if (e.side == com.bot.TradingCore.Side.LONG) c.longCount++;
+                else c.shortCount++;
+                if (e.cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
+                    if (e.side == com.bot.TradingCore.Side.LONG) c.topLong++; else c.topShort++;
+                }
+                if (e.cat == com.bot.DecisionEngineMerged.CoinCategory.ALT) {
+                    if (e.side == com.bot.TradingCore.Side.LONG) c.altLong++; else c.altShort++;
+                }
+                if (e.sector != null) {
+                    c.sectorDir.merge(e.sector + "_" + e.side.name(), 1, Integer::sum);
+                }
+            }
+            return c;
+        }
+
+        private static final class Counts {
+            int longCount, shortCount, topLong, topShort, altLong, altShort;
+            final Map<String, Integer> sectorDir = new HashMap<>();
+        }
+
         double getCorrelationSizeMultiplier(String pair, com.bot.TradingCore.Side side,
                                             com.bot.DecisionEngineMerged.CoinCategory cat) {
-            // ALTs are ~0.85 correlated with each other
-            int sameDir = side == com.bot.TradingCore.Side.LONG ? longCount : shortCount;
+            purgeExpired();
+            Counts c = count();
+            int sameDir = side == com.bot.TradingCore.Side.LONG ? c.longCount : c.shortCount;
             if (sameDir == 0) return 1.0;
-            // Each additional same-direction position reduces size by 15%
             double mult = Math.max(0.30, 1.0 - sameDir * 0.15);
-            // MEME gets extra reduction
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.MEME) mult *= 0.70;
             return mult;
         }
 
         synchronized boolean allow(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
-            // [v38.0] Total position cap
-            if (longCount + shortCount >= MAX_TOTAL) return false;
-
+            purgeExpired();
+            // Already registered (duplicate call within TTL)
+            if (activeEntries.containsKey(pair)) return false;
+            Counts c = count();
+            if (c.longCount + c.shortCount >= MAX_TOTAL) return false;
             int maxDir = isWeekend() ? MAX_DIR_WEEKEND : MAX_DIR_NORMAL;
-            if (side == com.bot.TradingCore.Side.LONG  && longCount  >= maxDir) return false;
-            if (side == com.bot.TradingCore.Side.SHORT && shortCount >= maxDir) return false;
-
-            // [v38.0] ALT correlation guard — max 3 ALTs in same direction
+            if (side == com.bot.TradingCore.Side.LONG  && c.longCount  >= maxDir) return false;
+            if (side == com.bot.TradingCore.Side.SHORT && c.shortCount >= maxDir) return false;
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.ALT) {
-                int altSameDir = side == com.bot.TradingCore.Side.LONG ? altLongCount : altShortCount;
+                int altSameDir = side == com.bot.TradingCore.Side.LONG ? c.altLong : c.altShort;
                 if (altSameDir >= MAX_ALT_SAME_DIR) return false;
             }
-
-            if (sector != null && sectorDirCount.getOrDefault(sector + "_" + side.name(), 0) >= MAX_SECTOR) return false;
+            if (sector != null && c.sectorDir.getOrDefault(sector + "_" + side.name(), 0) >= MAX_SECTOR) return false;
             if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
-                int topSameDir = side == com.bot.TradingCore.Side.LONG ? topLongCount : topShortCount;
+                int topSameDir = side == com.bot.TradingCore.Side.LONG ? c.topLong : c.topShort;
                 if (topSameDir >= MAX_TOP_SAME_DIR) return false;
             }
             return true;
@@ -2391,16 +2436,22 @@ public final class SignalSender {
 
         synchronized void register(String pair, com.bot.TradingCore.Side side,
                                    com.bot.DecisionEngineMerged.CoinCategory cat, String sector) {
-            if (registered.contains(pair)) return;
-            registered.add(pair);
-            if (side == com.bot.TradingCore.Side.LONG) longCount++; else shortCount++;
-            if (cat == com.bot.DecisionEngineMerged.CoinCategory.TOP) {
-                if (side == com.bot.TradingCore.Side.LONG) topLongCount++; else topShortCount++;
-            }
-            if (cat == com.bot.DecisionEngineMerged.CoinCategory.ALT) {
-                if (side == com.bot.TradingCore.Side.LONG) altLongCount++; else altShortCount++;
-            }
-            if (sector != null) sectorDirCount.merge(sector + "_" + side.name(), 1, Integer::sum);
+            purgeExpired();
+            activeEntries.put(pair, new Entry(pair, side, cat, sector));
+        }
+
+        /** Call when a signal is explicitly closed/expired so its slot frees immediately. */
+        synchronized void unregister(String pair) {
+            activeEntries.remove(pair);
+        }
+
+        /** @deprecated resetCycle() removed — CorrelationGuard is now stateful across cycles.
+         *  Entries expire via TTL (CORR_ENTRY_TTL_MS, default 4h) or explicit unregister(). */
+        @Deprecated
+        synchronized void resetCycle() {
+            // NO-OP: intentionally left empty.
+            // Removing the reset preserves cross-cycle correlation protection.
+            // Old behaviour: all counters wiped every 2min = zero protection between cycles.
         }
     }
 

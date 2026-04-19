@@ -161,10 +161,10 @@ public final class BotMain {
         final long   createdAt;
         volatile boolean resolved = false;
         volatile String  actualOutcome = null;
-        // [FIX #19] Track whether this record was already counted in forecastTotal/forecastCorrect.
-        // markForecastRecord() and checkForecastAccuracy() both increment counters.
-        // When TradeResolver is re-enabled, both paths could fire for the same record → double count.
-        volatile boolean counted = false;
+        // [v50 AUDIT FIX] AtomicBoolean: classic check-then-act race otherwise.
+        // markForecastRecord() and checkForecastAccuracy() both can increment counters concurrently.
+        final java.util.concurrent.atomic.AtomicBoolean counted =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
 
         // [PATCH A v42] Primary constructor с реальными уровнями
         ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
@@ -390,13 +390,10 @@ public final class BotMain {
             LOG.warning("[Calibrator] load failed: " + t.getMessage());
         }
 
-        // [PATCH #6] Save on shutdown
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
-                System.out.println("[Calibrator] final save on shutdown");
-            } catch (Throwable t) { /* best effort */ }
-        }, "calibrator-shutdown"));
+        // [v50 FIX #1.2] Single shutdown hook with explicit order:
+        // 1. Stop schedulers  2. Save calibrator  3. Flush Telegram
+        // Previously two hooks (calibrator-shutdown + ShutdownHook) ran in undefined order.
+        // On Railway SIGTERM grace=10s this could cause calibrator save to be skipped.
 
         // Pass auto-detected timezone to signal formatter
         com.bot.DecisionEngineMerged.USER_ZONE = ZONE;
@@ -476,11 +473,6 @@ public final class BotMain {
         // Бот работает в режиме чистого сканера сигналов.
         // TradeResolver отслеживал виртуальные позиции и слал фантомные
         // TP/SL уведомления по сделкам, которые трейдер не открывал.
-        // При ручной торговле это создаёт путаницу. Отключено до подключения автоисполнения.
-        //
-        // auxSched.scheduleAtFixedRate(
-        //         safe("TradeResolver", () -> runTradeResolver(sender, isc, telegram)),
-        //         90, 45, TimeUnit.SECONDS);
 
         // ── [SCANNER MODE v2.0] PositionStatus DISABLED ──────────────
         // auxSched.scheduleAtFixedRate(
@@ -527,20 +519,31 @@ public final class BotMain {
                 }),
                 60, 60, TimeUnit.MINUTES);
 
-        // ── Shutdown hook ────────────────────────────────────────
+        // ── Unified shutdown hook (v50 FIX: merged from two hooks, explicit order) ────
+        // Capture calibratorFile in effectively-final variable for lambda
+        final String calibratorFileFinal = calibratorFile;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            // Step 1: stop all scheduled work first so no new tasks start
             LOG.info("═══ Завершение работы. Цикл: " + totalCycles.get()
                     + " | Сигналов: " + totalSignals.get() + " ═══");
             mainSched.shutdown();
             auxSched.shutdown();
             heavySched.shutdown();
-            telegram.shutdown();
-            try { mainSched.awaitTermination(8, TimeUnit.SECONDS); }
-            catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                mainSched.shutdownNow();
+            try { mainSched.awaitTermination(4, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            mainSched.shutdownNow();
+
+            // Step 2: persist calibrator AFTER schedulers stopped (no concurrent writes)
+            try {
+                com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFileFinal);
+                System.out.println("[Calibrator] final save on shutdown OK");
+            } catch (Throwable t) {
+                System.err.println("[Calibrator] save failed on shutdown: " + t.getMessage());
             }
-        }, "ShutdownHook"));
+
+            // Step 3: drain Telegram queue last (non-critical, best effort)
+            telegram.flushAndShutdown(4000);
+        }, "UnifiedShutdownHook"));
 
         // ── Startup ping ─────────────────────────────────────────
         telegram.sendMessageAsync(buildStartMessage());
@@ -769,7 +772,7 @@ public final class BotMain {
         // in the signal so it can map "bot says 72%" → "real win-rate is X%".
         // robustAtrPct is stored for vol-bucketed calibration (consolidation trap fix).
         double signalProb  = idea.probability;  // final calibrated % from DecisionEngine
-        double robustAtrPct = idea.robustAtrPct; // now exposed directly from TradeIdea (v43)
+        double robustAtrPct = idea.getRobustAtrPct(); // [v50 AUDIT FIX] use override-aware getter
 
         // [v36-FIX Дыра9] Используем forecastSeq вместо currentTimeMillis() — нет коллизий
         // [PATCH A v42] Передаём РЕАЛЬНЫЕ tp1 и stop из TradeIdea. Они попадут в калибратор
@@ -781,344 +784,8 @@ public final class BotMain {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  TRADE RESOLVER — v14: tp2Hit + fixed trailing + safe extremes
-    // ══════════════════════════════════════════════════════════════
-
-    private static void runTradeResolver(com.bot.SignalSender sender,
-                                         com.bot.InstitutionalSignalCore isc,
-                                         com.bot.TelegramBotSender telegram) {
-        if (trackedSignals.isEmpty()) return;
-
-        for (Iterator<Map.Entry<String, TrackedSignal>> it =
-             trackedSignals.entrySet().iterator(); it.hasNext(); ) {
-
-            Map.Entry<String, TrackedSignal> entry = it.next();
-            TrackedSignal ts = entry.getValue();
-
-            // [v28.0] PATCH #15: Force-close on deeply negative symbol score.
-            // Problem: ISC blocks NEW signals for a bad symbol, but existing tracked
-            //          positions on that symbol kept running until 90min EXPIRED.
-            //          3 stops in a row → score dropped → 4th trade still lived 90min.
-            // Fix: if symbolScore < -0.40 (approx 3 consecutive losses), force exit
-            //      at current market price (neutral close, not counted as SL win).
-            double symScore = isc.getSymbolScore(ts.symbol);
-            if (symScore < -0.40 && !ts.tp1Hit) {
-                // Only force-close pre-TP1 positions (if TP1 hit, trailing handles it)
-                it.remove();
-                isc.closeTrade(ts.symbol, ts.side, 0.0, "SCORE_EXIT");
-                telegram.sendMessageAsync(String.format(
-                        "⚠ *%s* · score exit\nScore: %.2f",
-                        ts.symbol, symScore));
-                LOG.info("[TR] SCORE EXIT: " + ts.symbol + " score=" + String.format("%.2f", symScore));
-                continue;
-            }
-
-            // Expire: 90 минут
-            if (ts.ageMs() > 90 * 60_000L) {
-                it.remove();
-                LOG.info("[TR] EXPIRED (neutral): " + ts.symbol + " " + ts.side);
-                continue;
-            }
-
-            // ── Получаем свежие 1m candles ──────────────────────
-            double priceClose;
-            double atr14Trail = 0; // [v25.0] 1m ATR for Chandelier Exit
-            try {
-                // [v36-FIX Дыра7] Используем WS-буфер вместо REST fetchKlines.
-                // REST вызов здесь из auxSched-потока → rlAcquire() с Thread.sleep() → стоп мира.
-                // getM1FromWs() возвращает данные из памяти (aggTrade → MicroCandleBuilder).
-                List<com.bot.TradingCore.Candle> candles = sender.getM1FromWs(ts.symbol);
-                if (candles == null || candles.isEmpty()) continue;
-
-                double newLow = Double.MAX_VALUE, newHigh = Double.NEGATIVE_INFINITY;
-                for (com.bot.TradingCore.Candle c : candles) {
-                    // [Hole 1 FIX] Only take extremes from candles that opened AT or AFTER the trade entry time
-                    if (c.openTime >= ts.createdAt) {
-                        newLow  = Math.min(newLow,  c.low);
-                        newHigh = Math.max(newHigh, c.high);
-                    }
-                }
-                priceClose = candles.get(candles.size() - 1).close;
-
-                // [v14.0 FIX #6] Thread-safe extreme update
-                ts.updateExtremes(newLow, newHigh);
-
-                // [v25.0] Compute 1m ATR(14) for Chandelier Exit
-                int atrN = Math.min(14, candles.size() - 1);
-                if (atrN >= 3) {
-                    double trSum = 0;
-                    for (int ci = candles.size() - atrN; ci < candles.size(); ci++) {
-                        com.bot.TradingCore.Candle cc = candles.get(ci);
-                        double prevClose = candles.get(ci - 1).close;
-                        trSum += Math.max(cc.high - cc.low,
-                                Math.max(Math.abs(cc.high - prevClose),
-                                        Math.abs(cc.low  - prevClose)));
-                    }
-                    atr14Trail = trSum / atrN;
-                }
-            } catch (Exception e) {
-                LOG.fine("[TR] Fetch fail for " + ts.symbol + ": " + e.getMessage());
-                continue;
-            }
-
-            if (priceClose <= 0) continue;
-
-            boolean isLong = ts.side == com.bot.TradingCore.Side.LONG;
-            double extremeLow  = ts.getExtremeLow();
-            double extremeHigh = ts.getExtremeHigh();
-
-            // ════════════════════════════════════════════════════
-            // [v25.0] CHANDELIER EXIT — activates at +0.8% profit,
-            // BEFORE TP1. Prevents giving back open profit when the
-            // trade reverses without hitting TP1.
-            //
-            // Formula (LONG):  chandelier = extremeHigh - ATR(1m,14) * 2.2
-            // Formula (SHORT): chandelier = extremeLow  + ATR(1m,14) * 2.2
-            //
-            // Activation threshold: +0.8% favourable move from entry.
-            // Once active: trailing floor is NEVER moved against the trade.
-            // ════════════════════════════════════════════════════
-            if (!ts.tp1Hit && atr14Trail > 0) {
-                double activationPct = isLong
-                        ? (extremeHigh - ts.entry) / ts.entry
-                        : (ts.entry - extremeLow)  / ts.entry;
-
-                if (activationPct >= 0.008 && !ts.chandelierActive) {
-                    ts.chandelierActive = true;
-                    // Initialise trailing at breakeven (entry) — never below that
-                    ts.trailingStop = ts.entry;
-                    LOG.info("[TR] CHANDELIER ACTIVATED: " + ts.symbol
-                            + " " + ts.side + " move=" + String.format("%.2f%%", activationPct * 100));
-                }
-
-                if (ts.chandelierActive) {
-                    double chandelierMult = 2.2; // ATR multiplier — tighter than TP1 trail (0.50)
-                    if (isLong) {
-                        double level = extremeHigh - atr14Trail * chandelierMult;
-                        // Never trail BELOW entry (breakeven floor)
-                        level = Math.max(level, ts.entry);
-                        // Only move trailing UP (ratchet)
-                        if (ts.trailingStop == 0 || level > ts.trailingStop)
-                            ts.trailingStop = level;
-                    } else {
-                        double level = extremeLow + atr14Trail * chandelierMult;
-                        // Never trail ABOVE entry (breakeven floor for SHORT)
-                        level = Math.min(level, ts.entry);
-                        // Only move trailing DOWN (ratchet)
-                        if (ts.trailingStop == 0 || level < ts.trailingStop)
-                            ts.trailingStop = level;
-                    }
-
-                    // Check if chandelier stop was hit
-                    boolean chandelierHit = isLong
-                            ? priceClose <= ts.trailingStop
-                            : priceClose >= ts.trailingStop;
-
-                    if (chandelierHit) {
-                        double pnl = isLong
-                                ? (ts.trailingStop - ts.entry) / ts.entry * 100
-                                : (ts.entry - ts.trailingStop) / ts.entry * 100;
-                        it.remove();
-                        isc.registerConfirmedResult(pnl > 0, ts.side);
-                        isc.closeTrade(ts.symbol, ts.side, pnl);
-                        if (pnl > 0) sender.getDecisionEngine().recordWin(ts.symbol, ts.side);
-                        else         sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
-                        sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
-                        markForecastRecord(ts.symbol + "_" + ts.side,
-                                pnl > 0 ? "CHANDELIER_PROFIT" : "CHANDELIER_FLAT");
-                        // [v38.0] Suppress noise: PnL ≈ 0% exits are breakeven, not worth notifying
-                        if (Math.abs(pnl) >= 0.20) {
-                            String chE = pnl > 0 ? "✅" : "❌";
-                            telegram.sendMessageAsync(String.format(
-                                    "%s *%s* · trail *%+.2f%%*\nTrail: %.4f",
-                                    chE, ts.symbol, pnl, ts.trailingStop));
-                        }
-                        LOG.info("[TR] CHANDELIER EXIT: " + ts.symbol
-                                + " pnl=" + String.format("%.2f%%", pnl));
-                        continue;
-                    }
-                }
-            }
-
-            // ── SL hit ──────────────────────────────────────────
-            boolean slHit = isLong
-                    ? extremeLow  <= ts.sl
-                    : extremeHigh >= ts.sl;
-
-            if (slHit) {
-                // [v34.0] REALISTIC SLIPPAGE ESTIMATION
-                // Problem (Gemini critique): on low-liquidity alts, wick touch ≠ fill at ts.sl.
-                // Real slippage: TOP=0.05%, ALT=0.15%, MEME=0.40%
-                // This makes ISC stats more realistic → better risk management decisions.
-                com.bot.DecisionEngineMerged.CoinCategory slCat = sender.getCoinCategory(ts.symbol);
-                double slippagePct = switch (slCat) {
-                    case TOP  -> 0.05;
-                    case ALT  -> 0.15;
-                    case MEME -> 0.40;
-                };
-                double pnl = isLong
-                        ? (ts.sl - ts.entry) / ts.entry * 100 - slippagePct
-                        : (ts.entry - ts.sl) / ts.entry * 100 - slippagePct;
-                it.remove();
-                isc.registerConfirmedResult(false, ts.side);
-                // [v17.0 §4] Explicit "SL" reason → ISC.closeTrade triggers recordConsecutiveSL()
-                isc.closeTrade(ts.symbol, ts.side, pnl, "SL");
-                // [FIX v32+] Notify DecisionEngine for dynamic confidence penalty + post-exit cooldown
-                sender.getDecisionEngine().recordLoss(ts.symbol, ts.side);
-                sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
-                markForecastRecord(ts.symbol + "_" + ts.side, "HIT_SL");
-                // [v36-FIX Дыра6] Восстановлен SL-алерт для ручной торговли.
-                // PATCH B3 заглушил его с аргументом "wick touch ≠ fill" — корректно для автоторговли.
-                // Для ручного трейдера молчание хуже ложной точности: он не знает что позиция умерла.
-                // Дисклеймер добавлен в текст — трейдер понимает что это расчётный уровень, не факт.
-                telegram.sendMessageAsync(String.format(
-                        "❌ *%s* · SL *%+.2f%%*\nСтоп: %.4f",
-                        ts.symbol, pnl, ts.sl));
-                LOG.info("[TR] SL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
-                continue;
-            }
-
-            // ── TP1 hit ─────────────────────────────────────────
-            boolean tp1Reached = isLong
-                    ? extremeHigh >= ts.tp1
-                    : extremeLow  <= ts.tp1;
-
-            if (tp1Reached && !ts.tp1Hit) {
-                ts.tp1Hit = true;
-                // [v25.0] If Chandelier already raised the trail above entry, keep it.
-                // Otherwise set to breakeven (entry) as before.
-                if (ts.trailingStop < ts.entry || ts.trailingStop == 0) {
-                    ts.trailingStop = ts.entry;
-                }
-                // [PATCH B3 v33] TP1 SILENCED — candle extreme touch ≠ fill.
-                // Trail moved to breakeven (critical risk management — KEPT).
-                // Telegram alert removed: creates false confidence in a partial exit
-                // that may never have executed at that exact price.
-                double tp1PnlPct = isLong
-                        ? (ts.tp1 - ts.entry) / ts.entry * 100
-                        : (ts.entry - ts.tp1) / ts.entry * 100;
-                // telegram.sendMessageAsync(String.format(
-                //         "🟢 *TP1 ✓* %s %s | +%.2f%%\n"
-                //                 + "💰 50%% позиции — фиксируй прибыль\n"
-                //                 + "🛡 Стоп → безубыток `%.6f`",
-                //         ts.symbol, ts.side, tp1PnlPct, ts.entry));
-                LOG.info("[TR] TP1 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp1PnlPct));
-            }
-
-            // ── После TP1: trailing + TP2 + TP3 ────────────────
-            if (ts.tp1Hit) {
-
-                // [v28.0] PATCH #11: ATR Chandelier trailing after TP1.
-                // OLD: newTrail = entry + (extremeHigh - entry) * 0.50
-                //   → gave back 50% of open profit on any pullback (too wide in trend).
-                // NEW: chandelier = extremeHigh - ATR(1m,14) * 1.5 for LONG
-                //                   extremeLow  + ATR(1m,14) * 1.5 for SHORT
-                // Tighter than 50%-of-profit formula. Respects current 1m volatility.
-                // Never moves against the trade (ratchet only).
-                if (atr14Trail > 0) {
-                    if (isLong) {
-                        double chandelierLevel = extremeHigh - atr14Trail * 1.5;
-                        chandelierLevel = Math.max(chandelierLevel, ts.entry); // BE floor
-                        ts.trailingStop = Math.max(ts.trailingStop, chandelierLevel);
-                    } else {
-                        double chandelierLevel = extremeLow + atr14Trail * 1.5;
-                        chandelierLevel = Math.min(chandelierLevel, ts.entry); // BE floor
-                        if (ts.trailingStop == 0 || ts.trailingStop == ts.entry) {
-                            ts.trailingStop = chandelierLevel;
-                        } else {
-                            ts.trailingStop = Math.min(ts.trailingStop, chandelierLevel);
-                        }
-                    }
-                } else {
-                    // Fallback to 50% formula if ATR unavailable (cold start)
-                    if (isLong) {
-                        double newTrail = ts.entry + (extremeHigh - ts.entry) * 0.50;
-                        ts.trailingStop = Math.max(ts.trailingStop, newTrail);
-                    } else {
-                        double profit = ts.entry - extremeLow;
-                        double newTrail = ts.entry - profit * 0.50;
-                        if (ts.trailingStop == 0 || ts.trailingStop == ts.entry) {
-                            ts.trailingStop = newTrail;
-                        } else {
-                            ts.trailingStop = Math.min(ts.trailingStop, newTrail);
-                        }
-                    }
-                }
-
-                // [v14.0 FIX #1] TP2 hit — ТОЛЬКО ОДИН РАЗ
-                boolean tp2Reached = isLong
-                        ? extremeHigh >= ts.tp2
-                        : extremeLow  <= ts.tp2;
-
-                if (tp2Reached && !ts.tp2Hit) {
-                    ts.tp2Hit = true;
-                    double tp2PnlPct = isLong
-                            ? (ts.tp2 - ts.entry) / ts.entry * 100
-                            : (ts.entry - ts.tp2) / ts.entry * 100;
-                    // [v36-FIX Дыра6] TP2 алерт восстановлен — трейдер должен двигать стоп вручную.
-                    telegram.sendMessageAsync(String.format(
-                            "✅ *%s* · TP2 *+%.2f%%*\nЗакрой 30%%%% · стоп → %.4f",
-                            ts.symbol, tp2PnlPct, ts.tp1));
-                    LOG.info("[TR] TP2 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", tp2PnlPct));
-                    // Перемещаем trailing до tp1 уровня
-                    if (isLong) ts.trailingStop = Math.max(ts.trailingStop, ts.tp1);
-                    else        ts.trailingStop = Math.min(ts.trailingStop, ts.tp1);
-                }
-
-                // TP3 hit — полное закрытие
-                boolean tp3Reached = isLong
-                        ? extremeHigh >= ts.tp3
-                        : extremeLow  <= ts.tp3;
-
-                if (tp3Reached) {
-                    double pnl = isLong
-                            ? (ts.tp3 - ts.entry) / ts.entry * 100
-                            : (ts.entry - ts.tp3) / ts.entry * 100;
-                    it.remove();
-                    isc.registerConfirmedResult(true, ts.side);
-                    isc.closeTrade(ts.symbol, ts.side, pnl, "TP");
-                    sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
-                    markForecastRecord(ts.symbol + "_" + ts.side, "HIT_TP3");
-                    // [v36-FIX Дыра6] TP3 алерт восстановлен — финальный выход, важно для трейдера.
-                    telegram.sendMessageAsync(String.format(
-                            "✅ *%s* · закрыто *+%.2f%%*",
-                            ts.symbol, pnl));
-                    LOG.info("[TR] TP3 HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
-                    continue;
-                }
-
-                // Trailing stop hit
-                boolean trailHit = isLong
-                        ? priceClose <= ts.trailingStop
-                        : priceClose >= ts.trailingStop;
-
-                if (trailHit) {
-                    double pnl = isLong
-                            ? (ts.trailingStop - ts.entry) / ts.entry * 100
-                            : (ts.entry - ts.trailingStop) / ts.entry * 100;
-                    it.remove();
-                    isc.registerConfirmedResult(pnl > 0, ts.side);
-                    isc.closeTrade(ts.symbol, ts.side, pnl, pnl > 0 ? "TP" : "SL");
-                    sender.getDecisionEngine().markPostExitCooldown(ts.symbol, ts.side);
-                    markForecastRecord(ts.symbol + "_" + ts.side,
-                            pnl > 0 ? "EXPIRED_PROFIT" : "EXPIRED_FLAT");
-                    // [v38.0] Suppress breakeven noise (PnL ≈ 0)
-                    if (Math.abs(pnl) >= 0.20) {
-                        String trE = pnl > 0 ? "✅" : "❌";
-                        telegram.sendMessageAsync(String.format(
-                                "%s *%s* · trail *%+.2f%%*\nTrail: %.4f",
-                                trE, ts.symbol, pnl, ts.trailingStop));
-                    }
-                    LOG.info("[TR] TRAIL HIT: " + ts.symbol + " pnl=" + String.format("%.2f%%", pnl));
-                }
-            }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    //  [v36-FIX Дыра6] POSITION STATUS REPORTER
+    //  POSITION STATUS REPORTER
     //  Отправляет сводку открытых позиций каждые 30 минут.
-    //  Трейдер видит актуальный статус без лишнего спама.
     // ══════════════════════════════════════════════════════════════
 
     private static void sendPositionStatus(com.bot.TelegramBotSender telegram) {
@@ -1265,8 +932,7 @@ public final class BotMain {
 
                 boolean decisive = hitTP1 || hitSL || !"FLAT".equals(outcome);
                 if (hasOpinion && decisive) {
-                    if (!fr.counted) {
-                        fr.counted = true;
+                    if (fr.counted.compareAndSet(false, true)) {
                         forecastTotal.incrementAndGet();
                         if (correct) forecastCorrect.incrementAndGet();
                     }
@@ -1583,10 +1249,7 @@ public final class BotMain {
                 .ifPresent(e -> {
                     e.getValue().resolved = true;
                     e.getValue().actualOutcome = outcome;
-                    // [FIX #19] Only count if not already counted (prevents double-count when
-                    // both TradeResolver and checkForecastAccuracy are active simultaneously).
-                    if (!e.getValue().counted) {
-                        e.getValue().counted = true;
+                    if (e.getValue().counted.compareAndSet(false, true)) {
                         boolean tp = outcome.contains("TP") || outcome.equals("EXPIRED_PROFIT");
                         if (!"EXPIRED_FLAT".equals(outcome)) {
                             forecastTotal.incrementAndGet();

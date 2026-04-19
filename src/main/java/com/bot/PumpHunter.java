@@ -145,10 +145,12 @@ public final class PumpHunter {
         // MEME: was 1.10 (only 10% harder) — MEME coins have 3× more noise than ALT.
         //        10% threshold increase provides almost no protection.
         //        Fixed: 1.35 (35% harder) gives meaningful noise reduction on MEME pairs.
+        // [v50 AUDIT FIX] MEME multiplier raised further: 1.35 still allowed 0.8% moves
+        // to qualify as "pumps" on volatile memecoins. Real MEME pumps are 2%+.
         double catMult = switch (cat) {
-            case TOP  -> 0.60;  // 40% easier (BTC 0.9% → 0.54% min move)
+            case TOP  -> 0.60;
             case ALT  -> 1.00;
-            case MEME -> 1.35;  // was 1.10 — CRITICAL: MEME noise needs real filtration
+            case MEME -> 1.60;  // was 1.35 — stricter MEME filtration
         };
         return detectPumpInternal(symbol, c1m, c5m, c15m, catMult);
     }

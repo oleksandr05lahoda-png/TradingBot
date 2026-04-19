@@ -355,12 +355,6 @@ public final class SimpleBacktester {
         if (m15 == null || m15.size() < 200) return result;
 
         com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
-        // [v42.0 FIX #2] Tell the engine it is running in backtest mode.
-        // This disables RT-aggTrade reads (which would NPE in offline mode) but keeps
-        // ALL other scoring logic identical to live, so calibration is shared.
-        engine.setBacktestMode(true);
-        // [FIX #14] Backtest cannot replicate aggTrade-derived RT-CVD / VDA — by design,
-        // not by oversight. The engine handles this gracefully via backtestMode flag.
         com.bot.GlobalImpulseController btGic = new com.bot.GlobalImpulseController();
         engine.setGIC(btGic);
         // [PATCH 2.2] Effective slippage = base × (1 + position/volume) capped at 3× base.
@@ -552,13 +546,19 @@ public final class SimpleBacktester {
                                             List<com.bot.TradingCore.Candle> h1,
                                             com.bot.DecisionEngineMerged.CoinCategory category,
                                             int trainBars, int testBars) {
+        // [v50 AUDIT FIX] Purged walk-forward with embargo.
+        // Problem: 15m candle autocorrelation (~0.8 at lag=1) causes leakage when train and
+        // test windows are adjacent. Plus, a trade opened at end of train may still be open
+        // in test window → label leakage.
+        // Fix: gap = max(timeStopBars + 10, 18) bars between train end and test start.
+        // Same-size gap after test (embargo) before next train slide.
+        final int PURGE_BARS = Math.max(timeStopBars + 10, 18);
         List<BacktestResult> oosResults = new ArrayList<>();
-        if (m15 == null || m15.size() < trainBars + testBars) return oosResults;
+        if (m15 == null || m15.size() < trainBars + testBars + 2 * PURGE_BARS) return oosResults;
 
         int cursor = 0;
-        while (cursor + trainBars + testBars <= m15.size()) {
-            // Out-of-sample test on next testBars
-            int testStart = cursor + trainBars;
+        while (cursor + trainBars + PURGE_BARS + testBars <= m15.size()) {
+            int testStart = cursor + trainBars + PURGE_BARS;
             int testEnd   = Math.min(testStart + testBars, m15.size());
 
             List<com.bot.TradingCore.Candle> testM15 = m15.subList(Math.max(0, testStart - 200), testEnd);
@@ -570,7 +570,7 @@ public final class SimpleBacktester {
             oos.compute(initialBalance);
             oosResults.add(oos);
 
-            cursor += testBars; // slide forward
+            cursor += testBars + PURGE_BARS; // slide with embargo
         }
 
         return oosResults;
