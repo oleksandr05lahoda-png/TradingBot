@@ -119,7 +119,9 @@ public final class DecisionEngineMerged {
     private static final long   COOLDOWN_ALT    = 5  * 60_000L;  // was 8m  → 5m
     private static final long   COOLDOWN_MEME   = 8  * 60_000L;  // was 12m → 8m
 
-    private static final double BASE_CONF       = 58.0;
+    // [v50 UPDATE] Raised 58→62 as part of quality-over-quantity mandate.
+    // This is the floor calibrator starts from — higher base means fewer weak signals leak through.
+    private static final double BASE_CONF       = 62.0;
     private static final int    CALIBRATION_WIN = 120;
     private static final double MIN_CONF_FLOOR  = 60.0;  // was 52.0
     private static final double MIN_CONF_CEIL   = 82.0;

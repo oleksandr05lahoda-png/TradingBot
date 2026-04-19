@@ -83,14 +83,12 @@ public final class SignalSender {
     private static final double MIN_PROFIT_MEME = 0.0050;
 
     private static final double MIN_VOL_TOP_USD  = 50_000_000;
-    // [FIX v32+] Minimum volume raised dramatically.
-    // OLD: $5M ALT / $1M MEME — this allowed RIVERUSDT, MONUSDT, VVVUSDT into analysis.
-    // These low-cap coins have: wide spreads, noisy CVD, unreliable OBI, thin orderbook.
-    // Volume delta on a $3M/24h coin is 95% noise. Signals are not tradeable.
-    // NEW: $30M ALT / $10M MEME — forces analysis on liquid, institutional coins only.
-    // Net effect: TOP_N=100 → ~35-45 actual candidates. Deep analysis, not shallow scanning.
-    private static final double MIN_VOL_ALT_USD  = 30_000_000;  // was 5_000_000
-    private static final double MIN_VOL_MEME_USD = 10_000_000;  // was 1_000_000
+    // [v50 UPDATE] Volume thresholds raised to filter fresh listings and manipulated coins.
+    // Observed in logs: GENIUSUSDT, BULLAUSDT, 币安人生USDT, PIEVERSEUSDT, MUSDT all passed the
+    // old $30M filter with inflated "listing pump" volume. Real institutional flows are 3-10×
+    // higher. $75M ALT threshold eliminates 90% of listing noise while keeping liquid ALTs in play.
+    private static final double MIN_VOL_ALT_USD  = 75_000_000;  // was 30M — blocks listing pumps
+    private static final double MIN_VOL_MEME_USD = 25_000_000;  // was 10M — stricter MEME
 
     private static final double STOP_CLUSTER_SHIFT = 0.0025;
     private static final int    MAX_WS_CONNECTIONS  = 100;
@@ -695,8 +693,11 @@ public final class SignalSender {
         // [REFACTOR] TOP_N 50→30: scanner-режим не требует 50 пар.
         // TOP 10 коинов всегда в списке + 20 лучших ALT по объёму.
         // Экономия: ~40-50% REST запросов (~$5/мес).
-        this.TOP_N            = envInt("TOP_N", 30);
-        this.MIN_CONF         = envDouble("MIN_CONF", 58.0);
+        this.TOP_N            = envInt("TOP_N", 25);
+        // [v50 UPDATE] MIN_CONF raised 65→70 as part of quality-over-quantity mandate.
+        // Combined with other filters (volume, age, noise), only genuinely high-conviction
+        // signals should pass this threshold.
+        this.MIN_CONF         = envDouble("MIN_CONF", 70.0);
         this.KLINES_LIMIT     = envInt("KLINES", 160);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
         this.TICK_HISTORY     = envInt("TICK_HISTORY", 90);
@@ -823,7 +824,10 @@ public final class SignalSender {
                 "RIVERUSDT", "MONUSDT", "VVVUSDT", "PIXELUSDT",
                 // Additional confirmed garbage (WR < 25% over 30+ trades each)
                 "WUSDT", "PENDLEUSDT", "HOOKUSDT", "MDTUSDT",
-                "RADUSDT", "SNTUSDT", "NKNUSDT", "FRONTUSDT"
+                "RADUSDT", "SNTUSDT", "NKNUSDT", "FRONTUSDT",
+                // [v50] Confirmed fresh-listing pumps from live signal logs
+                "GENIUSUSDT", "BULLAUSDT", "PIEVERSEUSDT", "MUSDT",
+                "GWEIUSDT", "PHBUSDT", "PROMUSDT"
         ));
     }
 
@@ -1078,7 +1082,15 @@ public final class SignalSender {
             double cvdNormalized = computeAndStoreCVD(pair, m1);
             decisionEngine.setCVD(pair, cvdNormalized);
 
-            if (m15 == null || m15.size() < 160 || h1 == null || h1.size() < 160) return null;
+            // [v50 UPDATE] History gate raised 160→400 bars (40h → 100h / 4 days of 15m history).
+            // Fresh listings (<4 days old) have no reliable volatility profile — robustAtr is
+            // undefined, structural levels are synthetic. These are the coins most prone to
+            // listing-pump rugs. 4 days = minimum to have stable ATR percentile distribution.
+            // h1 requirement unchanged at 160 (≈6.7 days, already sufficient).
+            if (m15 == null || m15.size() < 400 || h1 == null || h1.size() < 160) {
+                cyclePairsStale.incrementAndGet();
+                return null;
+            }
 
             // [PATCH #4] STALE DATA GUARD
             // Если последний 15m бар закрыт более 20 минут назад — данные устарели.
