@@ -67,7 +67,15 @@ public final class TelegramBotSender {
         if (!running.get() || message == null || message.isEmpty()) return;
 
         long now = System.currentTimeMillis();
-        if (message.equals(lastSentText) && (now - lastSentAt) < DEDUP_WINDOW_MS) {
+        // [v51] Time-critical reversal and pre-pump signals bypass dedup.
+        // A PUMP_EXHAUSTION appearing 30 sec after a normal PUMP_CONTINUATION is NOT
+        // a duplicate — it's a different signal (reversal vs continuation) and must
+        // reach the user. Same for PRE_PUMP/PRE_DUMP anticipatory signals.
+        boolean isCritical = message.contains("EXHAUSTION")
+                || message.contains("EXHAUST")
+                || message.contains("PRE_PUMP")
+                || message.contains("PRE_DUMP");
+        if (!isCritical && message.equals(lastSentText) && (now - lastSentAt) < DEDUP_WINDOW_MS) {
             log("[DEDUP] Dropped duplicate within " + DEDUP_WINDOW_MS + "ms");
             return;
         }
@@ -157,6 +165,13 @@ public final class TelegramBotSender {
                 || message.contains("PRE_BREAK")
                 || message.contains("EARLY_TICK")
                 || message.contains("EXHAUST_REV")
+                // [v51] New reversal/anticipatory signals are high-priority — they are
+                // time-critical (top/bottom detection) and lose edge fast.
+                || message.contains("EXHAUSTION")
+                || message.contains("PUMP_EXH")
+                || message.contains("DUMP_EXH")
+                || message.contains("PRE_PUMP")
+                || message.contains("PRE_DUMP")
                 || message.contains("PANIC")
                 || message.contains("FORCE_CLOSE")
                 || message.contains("DAILY_KILL_SWITCH");

@@ -161,6 +161,35 @@ public final class SignalSender {
     private static final double VPOC_SOFT_PENALTY    = 3.5;
     private static final double MAX_QUALITY_PENALTY  = 8.0;
     private final Map<String, Deque<Double>>      tickPriceDeque  = new ConcurrentHashMap<>();
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v52] HOT PAIR MOMENTUM TRACKER
+    //  Problem: Main cycle runs every 1 min. A pump that starts
+    //  10 seconds into the cycle interval will only be caught
+    //  up to 50 seconds later. For MEME coins that pump in 3-5 min
+    //  total — that delay is catastrophic.
+    //
+    //  Solution: Every aggTrade tick, measure 30-second price delta.
+    //  If delta > threshold — immediately submit that pair for a
+    //  full processPair() run outside the normal cycle.
+    //  This reduces reaction time from up to 60s → ≤5s.
+    //
+    //  Thresholds (% move in last 30 ticks / ~30s):
+    //    TOP  (BTC/ETH): +0.25%  → hot
+    //    ALT:             +0.40%  → hot
+    //    MEME:            +0.60%  → hot
+    //
+    //  Cooldown: 90s per pair — don't spam rescan on the same move.
+    //  Max concurrent rescans: 3 — protect fetch pool from overload.
+    // ══════════════════════════════════════════════════════════════
+    private static final double HOT_PAIR_TOP_PCT   = 0.0025;  // 0.25% in 30s
+    private static final double HOT_PAIR_ALT_PCT   = 0.0040;  // 0.40% in 30s
+    private static final double HOT_PAIR_MEME_PCT  = 0.0060;  // 0.60% in 30s
+    private static final long   HOT_PAIR_COOLDOWN_MS = 90_000L;
+    private static final int    HOT_PAIR_MAX_CONCURRENT = 3;
+    private final Map<String, Long>    hotPairLastRescan   = new ConcurrentHashMap<>();
+    private final AtomicInteger        hotPairActiveCount  = new AtomicInteger(0);
+    private final java.util.concurrent.atomic.AtomicLong hotPairTotalTriggers = new AtomicLong(0);
     private final Map<String, Deque<Double>>      tickVolumeDeque = new ConcurrentHashMap<>();
     private final Map<String, Long>               lastTickTime    = new ConcurrentHashMap<>();
     private final Map<String, Double>             lastTickPrice   = new ConcurrentHashMap<>();
@@ -238,7 +267,7 @@ public final class SignalSender {
             // serve data that aged 53% of the candle period — on a scalping tf where
             // entry precision matters, that's a stale-signal factory. 4min = 27%
             // of the candle, comparable to 1m/5m ratios.
-            "15m", 4 * 60_000L,
+            "15m", 2 * 60_000L,   // [v52] 4min→2min: fresher 15m data for pump detection
             "1h",  55 * 60_000L,  // was 59min
             "2h",  110 * 60_000L  // was 119min
     );
@@ -689,15 +718,8 @@ public final class SignalSender {
 
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
-
-        // [REFACTOR] TOP_N 50→30: scanner-режим не требует 50 пар.
-        // TOP 10 коинов всегда в списке + 20 лучших ALT по объёму.
-        // Экономия: ~40-50% REST запросов (~$5/мес).
-        this.TOP_N            = envInt("TOP_N", 25);
-        // [v50 UPDATE] MIN_CONF raised 65→70 as part of quality-over-quantity mandate.
-        // Combined with other filters (volume, age, noise), only genuinely high-conviction
-        // signals should pass this threshold.
-        this.MIN_CONF         = envDouble("MIN_CONF", 70.0);
+        this.TOP_N            = envInt("TOP_N", 30);
+        this.MIN_CONF         = envDouble("MIN_CONF", 65.0); // [v52] 70→65: more signals through, quality controlled by AFC pre-filter
         this.KLINES_LIMIT     = envInt("KLINES", 160);
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
         this.TICK_HISTORY     = envInt("TICK_HISTORY", 90);
@@ -783,6 +805,14 @@ public final class SignalSender {
         // Drains earlyTickBuffer, sorts candidates by probability (highest first),
         // dispatches TOP-1 per pair. Prevents burst spam of 5+ signals on the same pair.
         wsWatcher.scheduleAtFixedRate(this::flushEarlyTickBuffer, 2, 2, TimeUnit.SECONDS);
+
+        // [v52] HotPair rescan monitor — logs hotPairTotalTriggers every 10 min
+        wsWatcher.scheduleAtFixedRate(() -> {
+            long triggers = hotPairTotalTriggers.get();
+            if (triggers > 0) {
+                System.out.printf("[HOT] Total hot-pair rescans: %d%n", triggers);
+            }
+        }, 10, 10, TimeUnit.MINUTES);
 
         System.out.printf("[SignalSender v7.0] TOP_N=%d SCAN=%d OI=%d DEPTH=%d POOL=%d LIVE_CANDLE=ON WS_AUTO=ON UDS=%s BALANCE_TRACK=%s%n",
                 TOP_N, MAX_SCAN_PAIRS_PER_CYCLE, FUNDING_OI_TOP_N, DEPTH_SNAPSHOT_TOP_N, poolSize,
@@ -1275,7 +1305,13 @@ public final class SignalSender {
 
             // [v18.0 REFACTOR] PumpHunter: flag only, no arbitrary confidence scaling
             // [v34.0] Pass category for category-aware thresholds
-            com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1, m5, m15, cat);
+            // [v51] Use liveM1Buffer directly — it contains the currently forming bar
+            // from WS aggTrade stream. This gives PumpHunter 1-minute-fresh data instead
+            // of REST-cached closed bars. Critical for new detectExhaustion / detectPrePump
+            // which need the live forming candle to catch tops/bottoms in time.
+            List<com.bot.TradingCore.Candle> m1Live = liveM1Buffer.getOrDefault(pair, m1);
+            if (m1Live == null || m1Live.size() < 20) m1Live = m1;
+            com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1Live, m5, m15, cat);
             if (pump != null && pump.strength > 0.40) {
                 boolean aligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
                         (idea.side == com.bot.TradingCore.Side.SHORT && pump.isBearish());
@@ -2856,6 +2892,12 @@ public final class SignalSender {
         vq.addLast(qty);   while (vq.size() > TICK_HISTORY) vq.pollFirst();
         lastTickPrice.put(pair, price);
         lastTickTime.put(pair, ts);
+
+        // [v52] HOT PAIR RESCAN — detect rapid price acceleration and trigger immediate analysis.
+        // Called after tick deques updated so maybeHotRescan() has fresh 30-tick window.
+        // Non-blocking: submits to fetchPool only if threshold exceeded AND cooldown clear.
+        maybeHotRescan(pair, price);
+
         // [v36-FIX Дыра1/2] Wire WS tick → liveM1Buffer (1m candle from aggTrade)
         Optional<com.bot.TradingCore.Candle> closedM1 =
                 microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(60_000))
@@ -2869,13 +2911,20 @@ public final class SignalSender {
         }));
 
         if (ENABLE_EARLY_TICK) {
-            // [REFACTOR] EARLY_TICK block при низкой ликвидности сессии.
-            // Ночные micro-move сигналы (01:00-05:00 UTC) — главный источник ложных пробоев на 15m TF.
-            // sessionWeight < 0.85 = Азия/ночь = тонкий рынок → ложные breakout вероятны.
-            // Это самый быстрый способ срезать -50% EARLY_TICK шума без потери дневных сигналов.
-            if (getSessionWeight() < 0.85) return;
+            // [v51 FIX] SOFT session gate (was hard `return` below 0.85).
+            // Asian session is exactly when meme pumps like BOME happen — hard-blocking
+            // EARLY_TICK during 01:00-05:00 UTC was systematically missing the most
+            // profitable setups. Instead: penalize probability by 12 points during thin
+            // sessions and let the MIN_CONF filter decide if it still qualifies.
+            double sessionWeight = getSessionWeight();
+            double sessionPenalty = sessionWeight < 0.85 ? 12.0 : 0.0;
 
             com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
+            if (et != null && sessionPenalty > 0) {
+                List<String> thinFlags = new ArrayList<>(et.flags);
+                thinFlags.add("THIN_SESSION_" + String.format("%.2f", sessionWeight));
+                et = rebuildIdea(et, et.probability - sessionPenalty, thinFlags);
+            }
             if (et != null && filterEarlySignal(et)) {
                 // [v17.0 §3] STRICT FORECAST GATE for EARLY_TICK signals.
                 // A mid-candle signal has no full 15m bar yet — ForecastEngine is the
@@ -3083,6 +3132,92 @@ public final class SignalSender {
     // used for sorting — fresh signals win ties against older ones.
     private static final long EARLY_STALE_DROP_MS  = 90_000L;   // 90s hard cutoff
     private static final long EARLY_STALE_DECAY_MS = 60_000L;   // decay horizon for ranking
+
+    // ══════════════════════════════════════════════════════════════
+    //  [v52] HOT PAIR RESCAN — triggered from aggTrade handler
+    //  when 30-tick price delta exceeds threshold.
+    //  Runs a full processPair() in the background fetchPool.
+    //  Result: if valid signal found → sent to Telegram immediately.
+    //  Reduces worst-case detection latency from 60s → ≤5s.
+    // ══════════════════════════════════════════════════════════════
+    private void maybeHotRescan(String pair, double price) {
+        // Cooldown: don't rescan same pair more often than every 90s
+        Long lastRescan = hotPairLastRescan.get(pair);
+        long now = System.currentTimeMillis();
+        if (lastRescan != null && now - lastRescan < HOT_PAIR_COOLDOWN_MS) return;
+
+        // Max concurrent rescans: protect fetchPool
+        if (hotPairActiveCount.get() >= HOT_PAIR_MAX_CONCURRENT) return;
+
+        // Measure 30-tick price move
+        Deque<Double> dq = tickPriceDeque.get(pair);
+        if (dq == null || dq.size() < 30) return;
+
+        List<Double> ticks = new ArrayList<>(dq);
+        int sz = ticks.size();
+        double priceBase = ticks.get(Math.max(0, sz - 31)); // 30 ticks ago
+        if (priceBase <= 0) return;
+        double movePct = (price - priceBase) / priceBase;
+
+        // Determine threshold by coin category
+        com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
+        double threshold = switch (cat) {
+            case TOP  -> HOT_PAIR_TOP_PCT;
+            case ALT  -> HOT_PAIR_ALT_PCT;
+            case MEME -> HOT_PAIR_MEME_PCT;
+        };
+
+        // Both up AND down pumps matter (dump = SHORT opportunity)
+        if (Math.abs(movePct) < threshold) return;
+
+        // Qualifiers: must have WS data & not blacklisted
+        if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return;
+        if (isc.isHardBlacklisted(pair)) return;
+
+        // Mark rescan to prevent duplicate triggers during this move
+        hotPairLastRescan.put(pair, now);
+        hotPairActiveCount.incrementAndGet();
+        hotPairTotalTriggers.incrementAndGet();
+
+        String direction = movePct > 0 ? "UP" : "DOWN";
+        System.out.printf("[HOT] %s %s %.3f%% in 30 ticks → rescan triggered%n",
+                pair, direction, movePct * 100);
+
+        // Submit to fetchPool (same pool used by normal cycle)
+        fetchPool.submit(() -> {
+            try {
+                com.bot.DecisionEngineMerged.TradeIdea idea = processPair(pair);
+                if (idea != null) {
+                    // Respect ISC availability check
+                    if (!isc.isSymbolAvailable(idea.symbol)) return;
+
+                    // R:R check (same as BotMain dispatch gate)
+                    double rrRisk = Math.abs(idea.stop  - idea.price);
+                    double rrTp2  = Math.abs(idea.tp2   - idea.price);
+                    double rr     = rrRisk > 1e-9 ? rrTp2 / rrRisk : 0;
+                    if (rr < 1.80) return;
+
+                    // Flag the signal as hot-rescan triggered
+                    List<String> hotFlags = new ArrayList<>(idea.flags);
+                    hotFlags.add("HOT_RESCAN_" + direction);
+                    idea = rebuildIdea(idea, idea.probability, hotFlags);
+
+                    bot.sendMessageAsync(idea.toTelegramString());
+                    System.out.printf("[HOT] %s signal sent: %s %.0f%%%n",
+                            pair, idea.side, idea.probability);
+
+                    // Register in ISC and BotMain tracker
+                    com.bot.DecisionEngineMerged.CoinCategory hotCat = categorizePair(pair);
+                    String hotSector = detectSector(pair);
+                    registerApprovedSignal(idea, pair, hotCat, hotSector, now, false);
+                }
+            } catch (Exception ex) {
+                System.out.println("[HOT] Error rescanning " + pair + ": " + ex.getMessage());
+            } finally {
+                hotPairActiveCount.decrementAndGet();
+            }
+        });
+    }
 
     private void flushEarlyTickBuffer() {
         if (earlyTickBuffer.isEmpty()) return;

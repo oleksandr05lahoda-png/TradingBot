@@ -1685,15 +1685,36 @@ public final class DecisionEngineMerged {
         if (pullUp)   cMomentum.addLong(mctx.s(0.55), "PULL_UP");
         if (pullDown) cMomentum.addShort(mctx.s(0.55), "PULL_DN");
 
-        // Old Pump functionality replaced by ForecastEngine/PumpHunter
-        // PumpHunter
+        // [v51] Age-aware PumpHunter integration. Key changes vs v50:
+        //   1. Use decayedStrength() instead of raw strength — events older than 3min
+        //      get progressively weaker voice, 0 at 15min. Fixes late-echo signals.
+        //   2. Handle new reversal types: PUMP_EXHAUSTION_SHORT → crosses SHORT into
+        //      cMomentum at higher weight (0.70 vs 0.55) because exhaustion is
+        //      structurally stronger evidence than generic continuation.
+        //   3. PRE_PUMP_LONG / PRE_DUMP_SHORT routed to cEarly (anticipatory) cluster.
         if (pumpHunter != null) {
             com.bot.PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(symbol);
-            if (pump != null && pump.strength > 0.45) {
-                if (pump.isBullish())
-                    cMomentum.addLong(mctx.s(pump.strength * 0.55), "PUMP_HUNT_B");
-                if (pump.isBearish())
-                    cMomentum.addShort(mctx.s(pump.strength * 0.55), "PUMP_HUNT_S");
+            if (pump != null) {
+                double effStr = pump.decayedStrength();
+                if (effStr > 0.45) {
+                    if (pump.type == com.bot.PumpHunter.PumpType.PUMP_EXHAUSTION_SHORT) {
+                        cMomentum.addShort(mctx.s(effStr * 0.70), "PUMP_EXH_S");
+                        allFlags.add("PUMP_EXH_TOP");
+                    } else if (pump.type == com.bot.PumpHunter.PumpType.DUMP_EXHAUSTION_LONG) {
+                        cMomentum.addLong(mctx.s(effStr * 0.70), "DUMP_EXH_L");
+                        allFlags.add("DUMP_EXH_BOT");
+                    } else if (pump.type == com.bot.PumpHunter.PumpType.PRE_PUMP_LONG) {
+                        cEarly.addLong(mctx.s(effStr * 0.60), "PRE_PUMP_L");
+                        allFlags.add("PRE_PUMP");
+                    } else if (pump.type == com.bot.PumpHunter.PumpType.PRE_DUMP_SHORT) {
+                        cEarly.addShort(mctx.s(effStr * 0.60), "PRE_DUMP_S");
+                        allFlags.add("PRE_DUMP");
+                    } else if (pump.isBullish()) {
+                        cMomentum.addLong(mctx.s(effStr * 0.55), "PUMP_HUNT_B");
+                    } else if (pump.isBearish()) {
+                        cMomentum.addShort(mctx.s(effStr * 0.55), "PUMP_HUNT_S");
+                    }
+                }
             }
         }
 

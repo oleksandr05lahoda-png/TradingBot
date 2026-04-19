@@ -9,7 +9,7 @@ import java.util.logging.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       BotMain v42 — PATCH A (Calibrator real TP/SL) + PATCH B (Railway -50%)   ║
+ * ║       BotMain v52 — PATCH A (Calibrator real TP/SL) + PATCH B (Railway -50%)   ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  [v42]   PATCH A: ForecastRecord получает реальные tp1/sl из TradeIdea ║
  * ║          Калибратор теперь учится на тех же уровнях, что идут трейдеру ║
@@ -48,10 +48,12 @@ public final class BotMain {
     // Auto-detected at startup: env TIMEZONE → IP geolocation → Warsaw fallback.
     // Each instance (yours in Warsaw, father's in Zaporizhzhia) detects its own timezone.
     private static final ZoneId ZONE      = detectTimezone();
-    // [PATCH B v42] Default INTERVAL 1→2 min. На 15m TF обновление каждую минуту
-    // даёт 15× избыточность. 2 мин = 7.5 обновлений/бар — достаточно для EARLY_TICK.
-    // Override через ENV SIGNAL_INTERVAL_MIN=1 если нужно сохранить старое поведение.
-    private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 2);
+    // [v51 FIX] Default INTERVAL 2→1 min. Previous v42 change to 2 min added 1 extra
+    // minute of average latency before a fresh pump/exhaustion signal could be emitted.
+    // At 15m TF that's 1/15th of a bar — noticeable on BOME/meme pumps that develop
+    // in under 10 minutes. Railway cost impact: ~+$2/mo (acceptable).
+    // Override via ENV SIGNAL_INTERVAL_MIN=2 to revert to v42 behavior.
+    private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 1);
     private static final int    KLINES    = envInt("KLINES_LIMIT", 160);
     // Hard cap to avoid Telegram queue backlog (which can make the bot
     // "silent" for hours/days under heavy signal load).
@@ -118,13 +120,13 @@ public final class BotMain {
             forecastCooldown = new java.util.concurrent.ConcurrentHashMap<>();
     // [PATCH-AFC] Cooldown raised 12→20 min: 12 min caused spam pairs to repeat 3x/hour.
     // In choppy markets the forecast "changes" every 12 min due to noise → endless alerts.
-    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 20 * 60_000L;
+    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 10 * 60_000L; // [v52] 20→10min: catch pump/dump setups faster
     // [PATCH-AFC] Thresholds raised: 0.20 was too permissive — fired on any micro-fluctuation.
     // 0.35 = genuine directional momentum. 0.55 = strong conviction (was 0.42).
-    private static final double AFC_MIN_DIRECTION_SCORE = 0.35; // was 0.20
-    private static final double AFC_STRONG_SCORE        = 0.55; // was 0.42
+    private static final double AFC_MIN_DIRECTION_SCORE = 0.22; // [v52] 0.35→0.22: catch earlier setups // was 0.20
+    private static final double AFC_STRONG_SCORE        = 0.42; // [v52] 0.55→0.42 // was 0.42
     // Максимум прогнозов за один запуск
-    private static final int AFC_MAX_PER_RUN = 5; // was 4
+    private static final int AFC_MAX_PER_RUN = 10; // [v52] 5→10: more advance alerts per run // was 4
 
     // ── Forecast accuracy tracker ─────────────────────────────────────────
     // [v14.0 FIX #5] MAX_FORECAST_RECORDS предотвращает утечку памяти
@@ -499,12 +501,15 @@ public final class BotMain {
                 }),
                 60, 60, TimeUnit.MINUTES);
 
-        // ── [MODULE 4 v33] ADVANCE FORECAST ALERTS DISABLED ──────
-        // Оставлен отключённым — создаёт путаницу с боевыми сигналами в боковом рынке.
-        //
-        // auxSched.scheduleAtFixedRate(
-        //         safe("AdvanceForecast", () -> runAdvanceForecast(sender, gic, isc, telegram)),
-        //         3, 5, TimeUnit.MINUTES);
+        // ── [v52] ADVANCE FORECAST ALERTS — RE-ENABLED ───────────
+        // Цель: предупреждать о памп/дамп ЗАРАНЕЕ — до того как сигнал сформируется.
+        // Запускается каждые 2 минуты (было 5). При SIGNAL_INTERVAL_MIN=1 это даёт
+        // advance-предупреждение за 1-4 минуты до боевого сигнала.
+        // Threshold снижен 0.35→0.22 чтобы ловить ранние сетапы при накоплении объёма.
+        // Cooldown снижен 20→10 мин: памп развивается за 5-15 мин, 20 мин было слишком долго.
+        auxSched.scheduleAtFixedRate(
+                safe("AdvanceForecast", () -> runAdvanceForecast(sender, gic, isc, telegram)),
+                2, 2, TimeUnit.MINUTES); // [v52] 3→2 start, 5→2 interval
 
         // ── Backtest раз в сутки в 03:00 UTC (было каждые 2h) ────
         // [PATCH B v42] Было 12 CPU burst/сутки на 18 пар × 4 таймфрейма = Railway CPU billing пик.
@@ -1291,37 +1296,69 @@ public final class BotMain {
             return;
         }
 
-        // Берём топ-пары по объёму из SignalSender
-        List<String> topPairs = sender.getTopPairsForForecast(20);
+        // [v52] Расширен список до 35 пар — больше шансов поймать ранний памп/дамп
+        List<String> topPairs = sender.getTopPairsForForecast(35);
         if (topPairs == null || topPairs.isEmpty()) return;
 
         int sent = 0;
         long now = System.currentTimeMillis();
 
+        // [v52] PumpHunter instance для раннего обнаружения сжатия перед пампом
+        com.bot.PumpHunter afcPumpHunter = new com.bot.PumpHunter();
+
         for (String pair : topPairs) {
             if (sent >= AFC_MAX_PER_RUN) break;
 
-            // Cooldown проверка
-            Long lastSent = forecastCooldown.get(pair);
-            if (lastSent != null && now - lastSent < ADVANCE_FORECAST_COOLDOWN_MS) continue;
+            // [v52] Топ-3 пары имеют уменьшенный cooldown — они двигают весь рынок
+            boolean isMarketLeader = pair.equals("BTCUSDT") || pair.equals("ETHUSDT") || pair.equals("SOLUSDT");
+            long effectiveCooldown = isMarketLeader
+                    ? ADVANCE_FORECAST_COOLDOWN_MS / 2   // 5 мин для лидеров рынка
+                    : ADVANCE_FORECAST_COOLDOWN_MS;       // 10 мин для остальных
 
-            // Symbol must be available (not in active trade / SL cooldown)
+            Long lastSentCooldown = forecastCooldown.get(pair);
+            if (lastSentCooldown != null && now - lastSentCooldown < effectiveCooldown) continue;
+
             if (!isc.isSymbolAvailable(pair)) continue;
 
             try {
-                // [FIX #4] Rate-limit klines calls on auxSched thread.
-                // fetchKlines → rlAcquire → Thread.sleep inside, which blocks auxSched.
-                // Adding a small inter-pair sleep avoids RL burst and keeps auxSched responsive.
-                try { Thread.sleep(300L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                try { Thread.sleep(200L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
 
-                // Получаем 15m и 1h свечи для ForecastEngine
                 List<com.bot.TradingCore.Candle> c15 = sender.fetchKlines(pair, "15m", 100);
                 List<com.bot.TradingCore.Candle> c1h  = sender.fetchKlines(pair, "1h",  48);
+                // [v52] 1m из WS-буфера для PumpHunter.detectPrePump (compression + volume buildup)
+                List<com.bot.TradingCore.Candle> c1m  = sender.getM1FromWs(pair);
                 if (c15 == null || c15.size() < 30) continue;
 
-                // Запускаем ForecastEngine
-                // [FIX #21] Pass empty list for c5 (not available in advance forecast context)
-                // instead of null — null propagation through internal helpers is fragile.
+                // ── [v52] STAGE 1: PumpHunter — раннее обнаружение до движения ────
+                // detectPrePump() срабатывает на сжатии волатильности + рост объёма
+                // РАНЬШЕ чем ForecastEngine видит направление. Это и есть advance-сигнал.
+                if (c1m != null && c1m.size() >= 22) {
+                    com.bot.PumpHunter.PumpEvent prePump = afcPumpHunter.detectPump(pair, c1m, c15, c15);
+                    if (prePump != null && prePump.isAnticipatory() && prePump.strength >= 0.50) {
+                        String prePumpKey = "PRE_" + prePump.type.name() + "_" + (int)(prePump.strength * 10);
+                        if (!prePumpKey.equals(lastForecastSent.get(pair))) {
+                            boolean isBull = prePump.isBullish();
+                            String icon  = isBull ? "🚀" : "🔻";
+                            String arrow = isBull ? "📈 ОЖИДАЕМ РОСТ" : "📉 ОЖИДАЕМ ПАДЕНИЕ";
+                            String afcMsg = icon + " *" + pair + "* — РАННЕЕ ПРЕДУПРЕЖДЕНИЕ\n"
+                                    + "_Накопление перед движением_\n\n"
+                                    + arrow + "\n"
+                                    + "Сжатие волатильности + рост объёма\n"
+                                    + String.format("Сила: *%.0f%%*", prePump.strength * 100)
+                                    + " | Жди подтверждения\n\n"
+                                    + "⏱ _Сигнал ожидается через 1–5 мин_";
+                            telegram.sendMessageAsync(afcMsg);
+                            lastForecastSent.put(pair, prePumpKey);
+                            forecastCooldown.put(pair, now);
+                            sent++;
+                            LOG.info("[AFC/PRE] " + pair + " " + prePump.type
+                                    + " str=" + String.format("%.2f", prePump.strength));
+                            continue;
+                        }
+                    }
+                }
+
+                // ── STAGE 2: ForecastEngine полный анализ ──────────────────────
                 com.bot.TradingCore.ForecastEngine fe = new com.bot.TradingCore.ForecastEngine();
                 com.bot.TradingCore.ForecastEngine.ForecastResult fc =
                         fe.forecast(List.of(), c15, c1h != null ? c1h : List.of(), 0.0);
@@ -1330,23 +1367,23 @@ public final class BotMain {
                 double score = fc.directionScore;
                 if (Math.abs(score) < AFC_MIN_DIRECTION_SCORE) continue;
 
-                // VSA дополнительное подтверждение
+                // [v52] EXHAUSTION фаза = вершина пампа — отправляем без задержки
+                boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
+                if (!isExhaustion && Math.abs(score) < AFC_MIN_DIRECTION_SCORE) continue;
+
                 com.bot.TradingCore.VsaResult vsa = com.bot.TradingCore.vsaAnalyse(c15, 3);
 
-                // Строим ключ прогноза для дедупликации
                 String forecastKey = buildForecastKey(fc, vsa, score);
-                String prevKey = lastForecastSent.get(pair);
-                if (forecastKey.equals(prevKey)) continue; // прогноз не изменился
+                if (forecastKey.equals(lastForecastSent.get(pair))) continue;
 
-                // Формируем сообщение
-                String msg = buildAdvanceForecastMessage(pair, fc, vsa, score, ctx);
-                if (msg == null) continue;
+                String afcMsg2 = buildAdvanceForecastMessage(pair, fc, vsa, score, ctx);
+                if (afcMsg2 == null) continue;
 
-                telegram.sendMessageAsync(msg);
+                telegram.sendMessageAsync(afcMsg2);
                 lastForecastSent.put(pair, forecastKey);
                 forecastCooldown.put(pair, now);
                 sent++;
-                LOG.info("[AFC] Sent advance forecast: " + pair
+                LOG.info("[AFC] " + pair
                         + " score=" + String.format("%.2f", score)
                         + " phase=" + fc.trendPhase
                         + " bias=" + fc.bias);
@@ -1445,13 +1482,13 @@ public final class BotMain {
 
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot PRO* `v42`\n"
+        return "⚡ *TradingBot PRO* `v52`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures  ·  Crypto / Commodities\n"
                 + "VSA  ·  OFV  ·  EarlyRev  ·  Forecast\n"
                 + "R:R min `1:2`  ·  Risk-first 🔒\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🔧 *v42 PATCHES активны:*\n"
+                + "🔧 *v52 PATCHES активны:*\n"
                 + "• Calibrator — реальные TP/SL (PATCH A)\n"
                 + "• Railway -50% cost (PATCH B)\n"
                 + "• PostPumpGuard — блок после пампа (PATCH C)\n"

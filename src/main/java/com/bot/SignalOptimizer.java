@@ -140,9 +140,10 @@ public final class SignalOptimizer {
 
     private double computeAdaptiveImpulseCap(String symbol) {
         // Если PumpHunter видит активный памп — расширяем кап
+        // [v51] Use decayedStrength — a 12-minute-old pump should not keep expanding the cap.
         if (pumpHunter != null) {
             com.bot.PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(symbol);
-            if (pump != null && pump.strength > 0.65) {
+            if (pump != null && pump.decayedStrength() > 0.65) {
                 return IMPULSE_CAP_PUMP;
             }
         }
