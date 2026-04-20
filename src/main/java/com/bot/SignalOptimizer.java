@@ -298,20 +298,41 @@ public final class SignalOptimizer {
         if (momHistory == null || momHistory.size() < 8) return false;
 
         List<Double> recentMom = new ArrayList<>(momHistory);
+        int sz = recentMom.size();
 
-        // Speed и accel разнонаправлены
-        boolean diverging = speed * accel < 0 && Math.abs(accel) > 0.00015;
+        // Condition 1: Speed and acceleration point in opposite directions.
+        // price is moving up but decelerating (or moving down but decelerating).
+        // Threshold lowered 0.00015 → 0.00012 to catch deceleration earlier.
+        boolean diverging = speed * accel < 0 && Math.abs(accel) > 0.00012;
 
-        // Momentum падает 2 раза подряд
+        // Condition 2: Momentum falling 2 consecutive steps (ratio-based).
+        // Each step must be at least 25% smaller than the prior.
         boolean momentumFalling = false;
-        if (recentMom.size() >= 3) {
-            double last  = Math.abs(recentMom.get(recentMom.size() - 1));
-            double prev  = Math.abs(recentMom.get(recentMom.size() - 2));
-            double prev2 = Math.abs(recentMom.get(recentMom.size() - 3));
+        if (sz >= 3) {
+            double last  = Math.abs(recentMom.get(sz - 1));
+            double prev  = Math.abs(recentMom.get(sz - 2));
+            double prev2 = Math.abs(recentMom.get(sz - 3));
             momentumFalling = (last < prev * 0.75) && (prev < prev2 * 0.75);
         }
 
-        return diverging || momentumFalling;
+        // Condition 3: Momentum peak reversal — was rising, now falling.
+        // Catches the exact bar where the impulse peaks and starts dying.
+        // Requires 5 bars of history: 3 rising, then 2 falling.
+        boolean peakReversal = false;
+        if (sz >= 5) {
+            double m0 = Math.abs(recentMom.get(sz - 1)); // current
+            double m1 = Math.abs(recentMom.get(sz - 2));
+            double m2 = Math.abs(recentMom.get(sz - 3));
+            double m3 = Math.abs(recentMom.get(sz - 4));
+            double m4 = Math.abs(recentMom.get(sz - 5));
+            // Peak pattern: was accelerating (m4→m2 rising), now decelerating (m2→m0 falling)
+            boolean wasRising  = m2 > m4 * 1.10 && m3 > m4;
+            boolean nowFalling = m0 < m2 * 0.82 && m1 < m2;
+            peakReversal = wasRising && nowFalling && Math.abs(speed) > WEAK_IMPULSE * 2;
+        }
+
+        // Any one condition = exhaustion (OR logic — we want early warning, not late confirmation)
+        return diverging || momentumFalling || peakReversal;
     }
 
     // ══════════════════════════════════════════════════════════════

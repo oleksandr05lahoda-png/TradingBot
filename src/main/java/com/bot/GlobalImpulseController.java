@@ -183,6 +183,13 @@ public final class GlobalImpulseController {
         public final boolean          panicMode;          // true = паника активна
         public final double           shortBoost;         // бустер для SHORT сигналов при краше
 
+        // Hurst exponent [0..1] estimated from BTC price log-returns.
+        // H > 0.55 = trending market → trend-following signals more reliable.
+        // H < 0.45 = mean-reverting market → fade moves, not chase them.
+        // H ≈ 0.50 = random walk → no edge from regime.
+        // Used in SignalSender to weight trend vs reversal signals appropriately.
+        public final double           hurstExponent;
+
         // [FIX #11] Explicit field — was encoded as sentinel in confidenceAdjustment < -50.
         // Sentinel encoding is fragile: any future adjustment that legitimately uses negative confAdj
         // (e.g., -20 = "reduce conf by 20") will be misinterpreted as longSuppression.
@@ -212,6 +219,21 @@ public final class GlobalImpulseController {
                              double btcMomentumAccel, double btcCrashScore,
                              CascadeLevel cascadeLevel, boolean panicMode,
                              double shortBoost, double longSuppressionMult) {
+            this(regime, impulseStrength, volatilityExpansion, strongPressure,
+                    onlyLong, onlyShort, btcTrend, volRegime, confidenceAdjustment,
+                    btcDropVelocity, btcConsecutiveBearBars, btcMomentumAccel, btcCrashScore,
+                    cascadeLevel, panicMode, shortBoost, longSuppressionMult, 0.50);
+        }
+
+        /** Full constructor with Hurst exponent */
+        public GlobalContext(GlobalRegime regime, double impulseStrength,
+                             double volatilityExpansion, boolean strongPressure,
+                             boolean onlyLong, boolean onlyShort, double btcTrend,
+                             VolatilityRegime volRegime, double confidenceAdjustment,
+                             double btcDropVelocity, int btcConsecutiveBearBars,
+                             double btcMomentumAccel, double btcCrashScore,
+                             CascadeLevel cascadeLevel, boolean panicMode,
+                             double shortBoost, double longSuppressionMult, double hurstExponent) {
             this.regime               = regime;
             this.impulseStrength      = impulseStrength;
             this.volatilityExpansion  = volatilityExpansion;
@@ -229,6 +251,7 @@ public final class GlobalImpulseController {
             this.panicMode            = panicMode;
             this.shortBoost           = shortBoost;
             this.longSuppressionMult  = Math.max(0.10, Math.min(1.0, longSuppressionMult));
+            this.hurstExponent        = Math.max(0.0, Math.min(1.0, hurstExponent));
         }
 
         /** Обратная совместимость */
@@ -625,6 +648,14 @@ public final class GlobalImpulseController {
         // [FIX #11] longSuppressionMult now passed directly as explicit field.
         // Removed sentinel encoding (confAdj < -50) which was fragile and opaque.
 
+        // ── Hurst Exponent (R/S Analysis) ─────────────────────────
+        // Measures long-range memory of BTC returns.
+        // H > 0.55 = persistent (trending) → trust trend-following signals more.
+        // H < 0.45 = anti-persistent (mean-reverting) → trust reversal signals more.
+        // H ≈ 0.50 = random walk → no regime edge.
+        // Uses 40 bars minimum. Computation cost is O(n²) on small window = acceptable.
+        double hurstExp = calcHurstExponent(btcCandles, 40);
+
         // ── Обновляем multi-window BTC return history ─────────────
         btcReturnHistory5.addLast(move1);
         btcReturnHistory10.addLast(move1);
@@ -640,7 +671,7 @@ public final class GlobalImpulseController {
                 btcDropVelocity, btcConsecutiveBearBars,
                 btcMomentumAccel, btcCrashScore,
                 cascadeLevel, panicMode.get(),
-                shortBoost, longSuppressionMult  // [FIX #11] explicit field, no more sentinel
+                shortBoost, longSuppressionMult, hurstExp
         );
     }
 
@@ -1188,6 +1219,49 @@ public final class GlobalImpulseController {
             if (isLong) weight *= 0.90; // [SCANNER MODE] was 0.80
         }
 
+        // ── Hurst Exponent regime adjustment ─────────────────────
+        // Hurst tells us whether BTC is in a trending (H > 0.55) or
+        // mean-reverting (H < 0.45) regime RIGHT NOW.
+        //
+        // Trending regime (H > 0.55):
+        //   • Trend-following signals (LONG in uptrend, SHORT in downtrend) are
+        //     statistically more likely to succeed → weight boost +10-15%.
+        //   • Counter-trend signals are more likely to fail → weight penalty.
+        //
+        // Mean-reverting regime (H < 0.45):
+        //   • Chasing moves is dangerous (market snaps back) → trend signals penalised.
+        //   • Reversal/divergence signals more reliable → weight stays (DE handles them).
+        //
+        // We only adjust in NONE cascade (no crash): during crash, Hurst is unreliable
+        // because crash moves are non-stationary regime breaks, not trend continuations.
+        double H = ctx.hurstExponent;
+        if (ctx.cascadeLevel == CascadeLevel.NONE && weight > 0) {
+            if (H > 0.57) {
+                // Trending: boost signals that go WITH the macro direction
+                boolean goingWithBtcTrend = (isLong && ctx.btcTrend > 0) || (!isLong && ctx.btcTrend < 0);
+                if (goingWithBtcTrend) {
+                    // Strong trending: full boost. Mild trending: partial boost.
+                    double hurstBoost = H > 0.65 ? 1.14 : 1.08;
+                    weight = Math.min(weight * hurstBoost, 1.90);
+                } else {
+                    // Going against BTC trend in a trending regime = higher failure rate
+                    double hurstPenalty = H > 0.65 ? 0.82 : 0.90;
+                    weight *= hurstPenalty;
+                }
+            } else if (H < 0.43) {
+                // Mean-reverting: reduce weight on pure trend-follow signals.
+                // Reversal setups (earlyRev, bullDiv, hiddenBull) are unaffected here
+                // — their advantage is already captured in the DecisionEngine cluster scores.
+                // We only apply a mild penalty on directional momentum signals.
+                boolean strongMomentumSignal = (isLong && ctx.regime == GlobalRegime.BTC_STRONG_UP)
+                        || (!isLong && ctx.regime == GlobalRegime.BTC_STRONG_DOWN);
+                if (strongMomentumSignal) {
+                    weight *= 0.88; // mild: don't over-correct, regime can persist
+                }
+            }
+            // H in [0.43..0.57] = near random walk → no adjustment (standard weights)
+        }
+
         return clamp(weight, 0.0, 1.90);
     }
 
@@ -1444,6 +1518,120 @@ public final class GlobalImpulseController {
 
     private double clamp(double v, double lo, double hi) {
         return Math.max(lo, Math.min(hi, v));
+    }
+
+    /**
+     * Hurst Exponent via Rescaled Range (R/S) Analysis on BTC log-returns.
+     *
+     * Interpretation:
+     *   H > 0.55 — persistent (trending) market: momentum strategies work.
+     *              Trend-following signals should be weighted HIGHER.
+     *   H < 0.45 — anti-persistent (mean-reverting): fading moves works.
+     *              Reversal/divergence signals should be weighted HIGHER.
+     *   H ≈ 0.50 — random walk: no regime advantage, standard weights.
+     *
+     * Algorithm (R/S method, Mandelbrot 1972):
+     *   1. Compute log-returns from close prices.
+     *   2. For each sub-window size n in {N/4, N/3, N/2, N}:
+     *      a. Demean the return series in each sub-window.
+     *      b. Compute cumulative deviation series.
+     *      c. R = max(cumdev) - min(cumdev) in each sub-window.
+     *      d. S = std-dev of raw returns in each sub-window.
+     *      e. R/S = mean(R/S) across all sub-windows of size n.
+     *   3. log(R/S) = H × log(n) + const → H via OLS regression.
+     *
+     * Uses last `period` candles (minimum 40 for meaningful estimate).
+     * Returns 0.50 (neutral) on insufficient data or numerical failure.
+     * O(n × k) where k = number of sub-window sizes (≤ 4) — fast enough.
+     */
+    private double calcHurstExponent(List<com.bot.TradingCore.Candle> candles, int period) {
+        int n = candles.size();
+        if (n < period + 2) return 0.50;
+
+        // Build log-return series from last `period` candles
+        int start = n - period;
+        double[] returns = new double[period - 1];
+        for (int i = 0; i < returns.length; i++) {
+            double prev = candles.get(start + i).close;
+            double curr = candles.get(start + i + 1).close;
+            if (prev <= 0) return 0.50;
+            returns[i] = Math.log(curr / prev);
+        }
+
+        // Sub-window sizes for multi-scale R/S regression
+        // Using 4 scales for better OLS stability
+        int[] sizes = {returns.length / 4, returns.length / 3, returns.length / 2, returns.length};
+        double[] logN = new double[sizes.length];
+        double[] logRS = new double[sizes.length];
+        int validPoints = 0;
+
+        for (int si = 0; si < sizes.length; si++) {
+            int wSize = sizes[si];
+            if (wSize < 8) continue; // too small for meaningful R/S
+
+            int numWindows = returns.length / wSize;
+            if (numWindows < 1) continue;
+
+            double rsSum = 0;
+            int rsCount = 0;
+
+            for (int w = 0; w < numWindows; w++) {
+                int wStart = w * wSize;
+                int wEnd   = wStart + wSize;
+
+                // Mean of this sub-window
+                double mean = 0;
+                for (int i = wStart; i < wEnd; i++) mean += returns[i];
+                mean /= wSize;
+
+                // Demeaned cumulative deviation series
+                double cumDev = 0;
+                double rangeMin = 0, rangeMax = 0;
+                for (int i = wStart; i < wEnd; i++) {
+                    cumDev += returns[i] - mean;
+                    if (i == wStart) { rangeMin = cumDev; rangeMax = cumDev; }
+                    else { rangeMin = Math.min(rangeMin, cumDev); rangeMax = Math.max(rangeMax, cumDev); }
+                }
+                double R = rangeMax - rangeMin;
+
+                // Standard deviation of raw returns in sub-window
+                double variance = 0;
+                for (int i = wStart; i < wEnd; i++) variance += (returns[i] - mean) * (returns[i] - mean);
+                double S = Math.sqrt(variance / wSize);
+
+                if (S < 1e-12 || R < 1e-12) continue; // degenerate window (e.g. all returns zero)
+
+                rsSum += R / S;
+                rsCount++;
+            }
+
+            if (rsCount == 0) continue;
+            double avgRS = rsSum / rsCount;
+
+            logN[validPoints]  = Math.log(wSize);
+            logRS[validPoints] = Math.log(avgRS);
+            validPoints++;
+        }
+
+        if (validPoints < 2) return 0.50; // insufficient data for regression
+
+        // OLS regression: logRS = H * logN + const → slope = H
+        // Using only the first `validPoints` entries
+        double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        for (int i = 0; i < validPoints; i++) {
+            sumX  += logN[i];
+            sumY  += logRS[i];
+            sumXY += logN[i] * logRS[i];
+            sumX2 += logN[i] * logN[i];
+        }
+        double denom = validPoints * sumX2 - sumX * sumX;
+        if (Math.abs(denom) < 1e-12) return 0.50;
+
+        double H = (validPoints * sumXY - sumX * sumY) / denom;
+
+        // Clamp to theoretically valid range [0..1].
+        // Values below 0.30 or above 0.90 typically indicate data issues.
+        return clamp(H, 0.30, 0.90);
     }
 
     @Deprecated
