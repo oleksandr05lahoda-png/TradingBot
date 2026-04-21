@@ -4,7 +4,6 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.stream.Collectors;
 
 /** InstitutionalSignalCore v17.0 — PORTFOLIO RISK CONTROLLER */
 public final class InstitutionalSignalCore {
