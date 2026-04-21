@@ -5,65 +5,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║       GlobalImpulseController — TRADINGBOT PRO EDITION v7.0                ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║                                                                          ║
- * ║  КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.0:                                           ║
- * ║                                                                          ║
- * ║  [FIX Дыра 1] ArrayDeque → ConcurrentLinkedDeque ВЕЗДЕ                  ║
- * ║    Проблема: ArrayDeque не потокобезопасна. WS поток пишет тики,         ║
- * ║    runCycle читает — внутренние указатели разрушаются → бесконечный     ║
- * ║    цикл в JVM → поток «умирает» → бот-зомби без ошибок в логах.       ║
- * ║    Теперь: ConcurrentLinkedDeque с bounded trimming.                     ║
- * ║                                                                          ║
- * ║  КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v6.0:                                           ║
- * ║                                                                          ║
- * ║  [FIX-LATE-SHORT] Ранняя детекция краша BTC до подтверждения на 15m     ║
- * ║    Проблема: сигнал SHORT давался когда монета уже упала -5%+.           ║
- * ║    Решение: BTC velocity gate + momentum acceleration = SHORT бустер    ║
- * ║    на РАННЕЙ стадии падения, ДО того как осциллятор показал истощение.  ║
- * ║                                                                          ║
- * ║  [FIX-CASCADE] Cascade Dump Protection v2.0                             ║
- * ║    Три уровня:                                                           ║
- * ║    1. WATCH (velocity > 0.003): снижаем вес LONG на 40%                 ║
- * ║    2. DANGER (velocity > 0.007 + 2+ bear bars): вес LONG = 0.15         ║
- * ║    3. CRASH (velocity > 0.012 + 3+ bear bars): ВЕТО на все LONG         ║
- * ║    SHORT при CRASH: бустер 1.5× (рынок сам ведёт цену вниз)            ║
- * ║                                                                          ║
- * ║  [FIX-PANIC] PanicManager — встроен в GIC как inner class               ║
- * ║    Триггеры паники:                                                      ║
- * ║    · BTC -3% за 3 свечи (15m) = немедленный краш-режим                  ║
- * ║    · BTC volatility expansion > 3.5× median = EXTREME режим             ║
- * ║    · 4+ consecutive bear bars + acceleration > 0.015 = PANIC            ║
- * ║    При панике: LONG вес = 0, SHORT вес = 1.6×, уведомление              ║
- * ║                                                                          ║
- * ║  [FIX-SECTOR] Sector Contagion Guard                                    ║
- * ║    Если сектор упал > 4% за последние 8 свечей — лонги                  ║
- * ║    в этом секторе блокируются (weight = 0)                               ║
- * ║                                                                          ║
- * ║  [FIX-RS] Relative Strength Trap Protection                             ║
- * ║    RS > 0.80 при CRASH = ЛОВУШКА catch-up dump                          ║
- * ║    Логика перевёрнута: высокий RS при сильном падении BTC                ║
- * ║    УВЕЛИЧИВАЕТ риск каскада (монета ещё не капитулировала)              ║
- * ║                                                                          ║
- * ║  [FIX-TREND] BTC Momentum Acceleration                                  ║
- * ║    Новое поле: btcMomentumAccel — вторая производная движения BTC.      ║
- * ║    Acceleration > 0 при падении = падение ускоряется = SHORT усилен.   ║
- * ║    Используется в DecisionEngineMerged для boost SHORT scorе.           ║
- * ║                                                                          ║
- * ║  [FIX-MULTI-TF] Мульти-таймфреймовый режим                             ║
- * ║    GIC теперь принимает 5m свечи BTC для более быстрого обнаружения     ║
- * ║    начала краша (15m запаздывает на 1-2 свечи = 15-30 минут)           ║
- * ║                                                                          ║
- * ╚══════════════════════════════════════════════════════════════════════════╝
- */
+/** GlobalImpulseController — TRADINGBOT PRO EDITION v7.0 */
 public final class GlobalImpulseController {
 
-    // ══════════════════════════════════════════════════════════════
     //  CONFIGURATION
-    // ══════════════════════════════════════════════════════════════
 
     private final int VOL_LOOKBACK;
     private final int BODY_LOOKBACK;
@@ -103,7 +48,7 @@ public final class GlobalImpulseController {
     private volatile double btcMomentumAccel     = 0.0; // [NEW] вторая производная
     private volatile double btcCrashScore        = 0.0; // [NEW] агрегированный crash score [0..1]
 
-    // [PATCH v-MILLION #5] TIME-BASED BEAR REGIME TRACKING
+    // TIME-BASED BEAR REGIME TRACKING
     // Время начала медвежьего режима BTC_IMPULSE_DOWN / BTC_STRONG_DOWN.
     // Нужно для time-decay подавления лонгов:
     //   - Первые 15 минут: полное подавление (0.55)
@@ -117,7 +62,7 @@ public final class GlobalImpulseController {
     private final AtomicBoolean panicMode = new AtomicBoolean(false);
     private volatile long panicStartMs = 0;
     private static final long PANIC_COOLDOWN_MS = 30 * 60_000L; // 30 минут до выхода из паники
-    // [v53] Prevent PANIC alert re-firing during same panic episode.
+    // Prevent PANIC alert re-firing during same panic episode.
     // Only send repeat PANIC alert if severity escalates significantly or 15+ min passed.
     private volatile long lastPanicAlertMs = 0;
     private volatile double lastPanicAlertScore = 0;
@@ -126,9 +71,7 @@ public final class GlobalImpulseController {
     // Panic callback
     private volatile java.util.function.Consumer<String> panicCallback = null;
 
-    // ══════════════════════════════════════════════════════════════
     //  ENUMS
-    // ══════════════════════════════════════════════════════════════
 
     public enum GlobalRegime {
         NEUTRAL,
@@ -157,9 +100,7 @@ public final class GlobalImpulseController {
         PANIC    // Паника — вето на всё кроме шортов
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  GlobalContext
-    // ══════════════════════════════════════════════════════════════
 
     public static final class GlobalContext {
         public final GlobalRegime     regime;
@@ -190,7 +131,7 @@ public final class GlobalImpulseController {
         // Used in SignalSender to weight trend vs reversal signals appropriately.
         public final double           hurstExponent;
 
-        // [FIX #11] Explicit field — was encoded as sentinel in confidenceAdjustment < -50.
+        // Explicit field — was encoded as sentinel in confidenceAdjustment < -50.
         // Sentinel encoding is fragile: any future adjustment that legitimately uses negative confAdj
         // (e.g., -20 = "reduce conf by 20") will be misinterpreted as longSuppression.
         // Direct field is unambiguous: 1.0 = no suppression, 0.30 = crush LONG score to 30%.
@@ -291,9 +232,7 @@ public final class GlobalImpulseController {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  SectorContext
-    // ══════════════════════════════════════════════════════════════
 
     public static final class SectorContext {
         public final String  sector;
@@ -325,9 +264,7 @@ public final class GlobalImpulseController {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  STATE
-    // ══════════════════════════════════════════════════════════════
 
     private volatile GlobalContext currentContext = new GlobalContext(
             GlobalRegime.NEUTRAL, 0.0, 1.0, false, false, false, 0.0,
@@ -348,9 +285,7 @@ public final class GlobalImpulseController {
     private final Deque<Double> crashScoreHistory = new ConcurrentLinkedDeque<>();
     private static final int CRASH_SCORE_WINDOW = 5;
 
-    // ══════════════════════════════════════════════════════════════
     //  CONSTRUCTORS
-    // ══════════════════════════════════════════════════════════════
 
     public GlobalImpulseController() {
         this.VOL_LOOKBACK  = 20;
@@ -366,9 +301,7 @@ public final class GlobalImpulseController {
         this.panicCallback = cb;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  UPDATE — основной метод, вызывается с 15m BTC свечами
-    // ══════════════════════════════════════════════════════════════
 
     public void update(List<com.bot.TradingCore.Candle> btcCandles) {
         if (btcCandles == null || btcCandles.size() < 30) return;
@@ -398,7 +331,7 @@ public final class GlobalImpulseController {
                 : move3;
 
         // ── Momentum acceleration (вторая производная) ──────────
-        // [FIX #10] Was always Math.max(0, ...) for BOTH up and down moves — lost sign.
+        // Was always Math.max(0, ...) for BOTH up and down moves — lost sign.
         // This meant a rising BTC and a crashing BTC both produced positive accel values,
         // making it impossible to distinguish bull momentum from bear momentum.
         //
@@ -424,7 +357,7 @@ public final class GlobalImpulseController {
         // ── Consecutive bear/bull bars ───────────────────────────
         if (last.close < last.open) {
             if (btcConsecutiveBearBars == 0) {
-                // [PATCH v-MILLION #5] Первая медвежья свеча — запоминаем время
+                // Первая медвежья свеча — запоминаем время
                 bearRegimeStartMs = System.currentTimeMillis();
             }
             btcConsecutiveBearBars = Math.min(btcConsecutiveBearBars + 1, 12);
@@ -451,7 +384,7 @@ public final class GlobalImpulseController {
         double crashScore = computeCrashScore(move3, move5, atr14, price);
         crashScoreHistory.addLast(crashScore);
         if (crashScoreHistory.size() > CRASH_SCORE_WINDOW) crashScoreHistory.removeFirst();
-        // [FIX #12] stickycrashScore: was MAX over CRASH_SCORE_WINDOW=5 bars.
+        // stickycrashScore: was MAX over CRASH_SCORE_WINDOW=5 bars.
         // One anomalous spike (API error, flash wick) triggered crash mode for 5×15m = 75 min.
         // NEW: exponential weighted average — recent bars have more weight, but a single spike
         // cannot dominate. Sticky effect preserved: decay is slow (0.7 per bar = ~45min half-life).
@@ -535,7 +468,7 @@ public final class GlobalImpulseController {
         } else if (move3 < -0.004) {
             regime = GlobalRegime.BTC_IMPULSE_DOWN;
         } else {
-            // [v38.0] CHOPPY DETECTION: BTC swinging both directions rapidly
+            // CHOPPY DETECTION: BTC swinging both directions rapidly
             // Check if last 6 candles alternate direction (wick-heavy, no trend)
             if (n >= 8) {
                 int dirChanges = 0;
@@ -558,7 +491,7 @@ public final class GlobalImpulseController {
 
         boolean strongPressure = rawStrength > 0.70 && volExpansion > 1.4;
 
-        // [FIX v32+] EXTENDED LONG SUPPRESSION LADDER.
+        // EXTENDED LONG SUPPRESSION LADDER.
         //
         // OLD: onlyShort only triggered at BTC_STRONG_DOWN (move3 < -1%) + rawStrength > 0.78.
         //      BTC_IMPULSE_DOWN (move3 < -0.4%) was NOT covered → alts could go LONG while
@@ -581,12 +514,12 @@ public final class GlobalImpulseController {
         boolean onlyShort = (regime == GlobalRegime.BTC_STRONG_DOWN && rawStrength > 0.78)
                 || (regime == GlobalRegime.BTC_CRASH)
                 || (regime == GlobalRegime.BTC_PANIC)
-                // [FIX v32+] NEW: IMPULSE_DOWN with velocity also blocks all LONG
+                // NEW: IMPULSE_DOWN with velocity also blocks all LONG
                 || (regime == GlobalRegime.BTC_IMPULSE_DOWN
                 && rawStrength > 0.65
                 && btcDropVelocity > VELOCITY_WATCH);
 
-        // [PATCH v-MILLION #5] TIME-DECAY LONG SUPPRESSION
+        // TIME-DECAY LONG SUPPRESSION
         // Старая логика: фиксированные коэффициенты (0.30 / 0.55 / 0.45) держались
         // БЕСКОНЕЧНО пока режим не менялся — иногда часами после первоначального импульса.
         // Это блокировало хорошие лонговые сигналы на отскоках внутри медвежьего тренда.
@@ -645,7 +578,7 @@ public final class GlobalImpulseController {
         // ── SHORT Boost — усиление шортов при краше ──────────────
         double shortBoost = computeShortBoost(cascadeLevel, btcCrashScore, btcDropVelocity, btcMomentumAccel);
 
-        // [FIX #11] longSuppressionMult now passed directly as explicit field.
+        // longSuppressionMult now passed directly as explicit field.
         // Removed sentinel encoding (confAdj < -50) which was fragile and opaque.
 
         // ── Hurst Exponent (R/S Analysis) ─────────────────────────
@@ -713,9 +646,7 @@ public final class GlobalImpulseController {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  UPDATE SECTOR
-    // ══════════════════════════════════════════════════════════════
 
     public void updateSector(String sector, List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 25) return;
@@ -759,16 +690,14 @@ public final class GlobalImpulseController {
         SectorContext sc = new SectorContext(sector, rawBias, momentum, strength, leading, drop8bars);
         sectorMap.put(sector, sc);
 
-        // [FIX-SECTOR] Если сектор заражён — логируем
+        // Если сектор заражён — логируем
         if (sc.isContaminated()) {
             System.out.printf("[GIC] SECTOR CONTAMINATED: %s drop8=%.2f%% — LONG VETO%n",
                     sector, drop8bars * 100);
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  CRASH SCORE COMPUTATION
-    // ══════════════════════════════════════════════════════════════
 
     /**
      * Агрегированный crash score [0..1].
@@ -900,7 +829,7 @@ public final class GlobalImpulseController {
     }
 
     private void enterPanicMode(double move3, double move5, double atr14, double price) {
-        // [v53] Dedup: don't re-send PANIC alert if one already sent in the last 15 min
+        // Dedup: don't re-send PANIC alert if one already sent in the last 15 min
         // AND crash score hasn't escalated by >0.15 (real worsening).
         boolean alreadyInPanic = panicMode.getAndSet(true);
         long now = System.currentTimeMillis();
@@ -936,7 +865,7 @@ public final class GlobalImpulseController {
 
     private void exitPanicMode() {
         panicMode.set(false);
-        // [v53] Reset dedup so next panic cycle can alert immediately
+        // Reset dedup so next panic cycle can alert immediately
         lastPanicAlertMs = 0;
         lastPanicAlertScore = 0;
         System.out.println("[GIC] PANIC MODE DEACTIVATED — рынок стабилизировался");
@@ -973,9 +902,7 @@ public final class GlobalImpulseController {
                 old.cascadeLevel, newLevel);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  CASCADE DUMP RISK (для внешних модулей)
-    // ══════════════════════════════════════════════════════════════
 
     /**
      * Возвращает risk score cascade dump [0..1].
@@ -995,7 +922,7 @@ public final class GlobalImpulseController {
 
         double risk = ctx.btcCrashScore * 0.70;
 
-        // [FIX-RS] RS Trap: монета держится при падении BTC = ЕЩЁ НЕ КАПИТУЛИРОВАЛА
+        // RS Trap: монета держится при падении BTC = ЕЩЁ НЕ КАПИТУЛИРОВАЛА
         // Высокий RS при краше — это ОПАСНО, не хорошо
         if (relStrength > 0.82 && (ctx.cascadeLevel == CascadeLevel.CRASH
                 || ctx.cascadeLevel == CascadeLevel.PANIC)) {
@@ -1019,9 +946,7 @@ public final class GlobalImpulseController {
         return getCascadeDumpRisk(relStrength) >= threshold;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  FILTER WEIGHT — главный метод для SignalSender
-    // ══════════════════════════════════════════════════════════════
 
     /**
      * Возвращает вес сигнала [0..1.9].
@@ -1036,7 +961,7 @@ public final class GlobalImpulseController {
      *
      * LONG при краше: полное вето + умный штраф по уровням.
      *
-     * [FIX-SECTOR] Sector Contagion: если сектор заражён → LONG вето.
+     * Sector Contagion: если сектор заражён → LONG вето.
      */
     public double getFilterWeight(String symbol, boolean isLong, double relStrength, String sectorName) {
         GlobalContext ctx = currentContext;
@@ -1061,7 +986,7 @@ public final class GlobalImpulseController {
             }
         }
 
-        // [v50] CHOPPY MARKET — penalize but don't kill.
+        // CHOPPY MARKET — penalize but don't kill.
         // Old: 0.05 = effectively blocked everything.
         // Problem: individual coins can have clean setups even when BTC chops.
         // New: 0.40 = significant penalty (-15 to -20 probability) but allows
@@ -1076,7 +1001,7 @@ public final class GlobalImpulseController {
 
             case CRASH -> {
                 if (isLong) {
-                    // [FIX-RS] RS Trap: высокий RS = ловушка catch-up dump
+                    // RS Trap: высокий RS = ловушка catch-up dump
                     if (relStrength > 0.85) {
                         // Монета выглядит "сильной" — но это обманчиво при краше
                         SectorContext sc = sectorName != null ? sectorMap.get(sectorName) : null;
@@ -1185,14 +1110,14 @@ public final class GlobalImpulseController {
                             double cr = getCascadeDumpRisk(relStrength);
                             weight = cr >= 0.45 ? 0.55 : relStrength > 0.65 ? 0.90 : 0.70;
                         } else {
-                            // [v8.0] Чуть сильнее SHORT boost при импульсном падении
+                            // Чуть сильнее SHORT boost при импульсном падении
                             weight = Math.min(1.25, ctx.shortBoost * 0.90);
                         }
                     }
 
                     case BTC_IMPULSE_UP -> {
                         if (!isLong) {
-                            // [v8.0] Мягче: было 0.70 для всех шортов
+                            // Мягче: было 0.70 для всех шортов
                             // Если монета слабеет на бычьем BTC — шорт разрешён мягче
                             weight = relStrength < 0.35 ? 0.85 : 0.78;
                         }
@@ -1265,9 +1190,7 @@ public final class GlobalImpulseController {
         return clamp(weight, 0.0, 1.90);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MULTI-WINDOW RELATIVE STRENGTH
-    // ══════════════════════════════════════════════════════════════
 
     public double calculateWeightedRS(List<Double> symbolReturns20) {
         if (symbolReturns20 == null || symbolReturns20.isEmpty()) return 0.5;
@@ -1311,9 +1234,7 @@ public final class GlobalImpulseController {
         return clamp(0.5 + (symReturn - btcReturn) / (Math.abs(btcReturn) * 2), 0.0, 1.0);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  SECTOR ANALYSIS
-    // ══════════════════════════════════════════════════════════════
 
     public double getMarketBias() {
         if (sectorMap.isEmpty()) return 0.0;
@@ -1327,7 +1248,7 @@ public final class GlobalImpulseController {
         SectorContext target = sectorMap.get(sectorName);
         if (target == null) return 0.0;
 
-        // [FIX-SECTOR] Contaminated sector = максимальная слабость
+        // Contaminated sector = максимальная слабость
         if (target.isContaminated()) return 1.0;
 
         double marketBias = getMarketBias();
@@ -1360,9 +1281,7 @@ public final class GlobalImpulseController {
         return contaminated;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  GETTERS
-    // ══════════════════════════════════════════════════════════════
 
     public GlobalContext getContext() { return currentContext; }
 
@@ -1435,12 +1354,10 @@ public final class GlobalImpulseController {
         return sb.toString();
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  VOLATILITY REGIME
-    // ══════════════════════════════════════════════════════════════
 
     /**
-     * [PATCH 4.4] Percentile-based volatility regime classification.
+     * Percentile-based volatility regime classification.
      *
      * Old behavior: fixed ratios against median (>3.0 EXTREME, >1.6 HIGH, <0.5 LOW).
      * Problem: in quiet market → median collapses → any uptick reads as HIGH.
@@ -1480,9 +1397,7 @@ public final class GlobalImpulseController {
         return VolatilityRegime.NORMAL;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  UTILITY
-    // ══════════════════════════════════════════════════════════════
 
     private boolean isFastDataStale() {
         return System.currentTimeMillis() - lastFastUpdateMs > FAST_DATA_STALE;

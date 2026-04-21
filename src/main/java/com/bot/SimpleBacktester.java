@@ -2,27 +2,7 @@ package com.bot;
 
 import java.util.*;
 
-/**
- * ╔══════════════════════════════════════════════════════════════════════════════╗
- * ║       SimpleBacktester v10.0 — INSTITUTIONAL-GRADE BACKTEST                  ║
- * ╠══════════════════════════════════════════════════════════════════════════════╣
- * ║                                                                              ║
- * ║  FIXES from audit:                                                           ║
- * ║    · Tests ALL traded symbols, not just BTC/ETH                              ║
- * ║    · Tracks simultaneous positions (portfolio-level drawdown)               ║
- * ║    · Correct EV formula: E[R] = winRate × avgWin - lossRate × avgLoss       ║
- * ║    · Correct Sharpe: annualized from DAILY returns, not per-trade           ║
- * ║    · Walk-forward validation: optimize on N months, test on next M          ║
- * ║    · Accounts for slippage, commission, funding rate per bar                 ║
- * ║    · Intra-candle SL/TP resolution using 1m data when available             ║
- * ║    · Monte Carlo simulation for drawdown estimation                          ║
- * ║    · Max concurrent positions limit (matches live trading)                   ║
- * ║    · Correlation-adjusted exposure (no 5 correlated shorts)                  ║
- * ║    · Compounding mode: reinvest profits (mirrors live behavior)             ║
- * ║    · Detailed per-symbol and per-strategy breakdown                          ║
- * ║                                                                              ║
- * ╚══════════════════════════════════════════════════════════════════════════════╝
- */
+/** SimpleBacktester v10.0 — INSTITUTIONAL-GRADE BACKTEST */
 public final class SimpleBacktester {
 
     // ── Configuration ────────────────────────────────────────────
@@ -30,13 +10,13 @@ public final class SimpleBacktester {
     private double takerFee         = 0.0004;     // 0.04% per side
     private double fundingPer15m    = 0.0001 / 32; // ~0.01%/8h → per 15m
     private int    maxConcurrent    = 6;
-    // [v50] Time stop increased 6→8 bars (2h). With earlier entries (pre-breakout),
+    // Time stop increased 6→8 bars (2h). With earlier entries (pre-breakout),
     // the move needs more time to develop. 90min was too tight.
     private int    timeStopBars     = 8;           // 120 min at 15m (was 6 = 90min)
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
-    // [PATCH 2.1] Single source of truth for warmup.
+    // Single source of truth for warmup.
     // Must match DecisionEngineMerged.MIN_BARS (150) — that's the gate
     // engine.analyze() uses internally. Previously backtester used 160
     // while live could accept 150, causing backtest signals to never fire
@@ -44,7 +24,7 @@ public final class SimpleBacktester {
     // The extra 10 bars are kept as a safety margin for EMA200 stabilization.
     private static final int BACKTEST_WARMUP_BARS = 150;
 
-    // [PATCH 2.2] Volume-adaptive slippage.
+    // Volume-adaptive slippage.
     //
     // Old: fixed slippage per category (TOP=0.08%, ALT=0.25%, MEME=0.60%).
     // Problem: a $100K position in a $2M-daily-volume ALT pays real slippage
@@ -88,15 +68,13 @@ public final class SimpleBacktester {
     public void setCompound(boolean v)       { this.compound = v; }
     public void setUseM1Resolution(boolean v){ this.useM1Resolution = v; }
 
-    // [PATCH 2.2] Optional: provide 24h volume (USD) for more realistic slippage.
+    // Optional: provide 24h volume (USD) for more realistic slippage.
     // If set, effectiveSlippage() scales with position/volume ratio.
     // If not set, falls back to fixed base rate (old behavior) — backward compat.
     private double volume24hUSD = 0.0;
     public void setVolume24hUSD(double v)    { this.volume24hUSD = Math.max(0.0, v); }
 
-    // ══════════════════════════════════════════════════════════════
     //  RESULTS
-    // ══════════════════════════════════════════════════════════════
 
     public static final class BacktestResult {
         public final String symbol;
@@ -113,9 +91,9 @@ public final class SimpleBacktester {
         public double profitFactor;
         public double expectancy;         // avg $ per trade
         public double finalBalance;
-        // [v11.0] Reliability score: how much to trust these results
+        // Reliability score: how much to trust these results
         public double reliabilityScore;  // 0..1 based on trade count + Sharpe consistency
-        // [PATCH #2] Trade quality distribution
+        // Trade quality distribution
         public int    longestLossStreak;
         public int    longestWinStreak;
         public double medianPnlPct;
@@ -163,7 +141,7 @@ public final class SimpleBacktester {
                 double stdDaily  = Math.sqrt(varDaily);
                 sharpeDaily = stdDaily > 0 ? (meanDaily / stdDaily) * Math.sqrt(365) : 0;
 
-                // [PATCH #2] Sortino: downside deviation only (штрафует только потери)
+                // Sortino: downside deviation only (штрафует только потери)
                 double downsideVar = dailyReturns.stream()
                         .filter(r -> r < 0)
                         .mapToDouble(r -> r * r)
@@ -192,7 +170,7 @@ public final class SimpleBacktester {
             maxDrawdownPct = maxDD * 100;
             maxDDDurationBars = maxDDBars;
 
-            // [PATCH #2] Trade distribution — longest streaks
+            // Trade distribution — longest streaks
             int curLossStreak = 0, curWinStreak = 0;
             for (TradeRecord t : trades) {
                 if (t.pnlPct > 0.05) {
@@ -204,7 +182,7 @@ public final class SimpleBacktester {
                 }
             }
 
-            // [PATCH #2] Median + std of single-trade pnl
+            // Median + std of single-trade pnl
             double[] pnls = trades.stream().mapToDouble(t -> t.pnlPct).sorted().toArray();
             if (pnls.length > 0) {
                 medianPnlPct = pnls.length % 2 == 0
@@ -222,7 +200,7 @@ public final class SimpleBacktester {
                     dailyReturns.stream().mapToDouble(Double::doubleValue).average().orElse(0) * 365;
             calmarRatio = maxDrawdownPct > 0 ? annualReturn / maxDrawdownPct : 0;
 
-            // [v11.0] Reliability score: penalizes small sample sizes
+            // Reliability score: penalizes small sample sizes
             // Under 30 trades, results are statistically unreliable
             double tradeCountFactor = Math.min(1.0, total / 50.0);  // peaks at 50 trades
             double consistencyFactor = profitFactor > 1.0 ? Math.min(1.0, (profitFactor - 1.0) * 2) : 0;
@@ -341,9 +319,7 @@ public final class SimpleBacktester {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  SINGLE SYMBOL BACKTEST
-    // ══════════════════════════════════════════════════════════════
 
     public BacktestResult run(String symbol,
                               List<com.bot.TradingCore.Candle> m1,
@@ -357,7 +333,7 @@ public final class SimpleBacktester {
         com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
         com.bot.GlobalImpulseController btGic = new com.bot.GlobalImpulseController();
         engine.setGIC(btGic);
-        // [PATCH 2.2] Effective slippage = base × (1 + position/volume) capped at 3× base.
+        // Effective slippage = base × (1 + position/volume) capped at 3× base.
         // When setVolume24hUSD() not called (default = 0), falls back to base rate
         // preserving pre-patch behavior.
         double slippage = effectiveSlippage(category, initialBalance, this.volume24hUSD);
@@ -420,7 +396,7 @@ public final class SimpleBacktester {
             }
 
             // Generate signal if no position
-            // [PATCH #1] LOOK-AHEAD FIX
+            // LOOK-AHEAD FIX
             // Old: slice до i+1 (включая текущий бар) + entry = idea.price (close бара i).
             // Problem: close бара i известен только в НАЧАЛЕ бара i+1. Вход по close i
             //          даёт нереалистичный winrate (+5..15%).
@@ -479,12 +455,10 @@ public final class SimpleBacktester {
         return result;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  PORTFOLIO BACKTEST (multiple symbols simultaneously)
-    // ══════════════════════════════════════════════════════════════
 
     /**
-     * [PATCH #3] Portfolio backtest — per-symbol isolated, NO cross-symbol concurrency.
+     * Portfolio backtest — per-symbol isolated, NO cross-symbol concurrency.
      *
      * WARNING: this is NOT a true portfolio simulation. Each symbol runs independently,
      * which means the total may show 50 concurrent positions even though live CorrelationGuard
@@ -523,9 +497,7 @@ public final class SimpleBacktester {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  WALK-FORWARD VALIDATION
-    // ══════════════════════════════════════════════════════════════
 
     /**
      * Walk-forward test: split data into training and test windows.
@@ -576,9 +548,7 @@ public final class SimpleBacktester {
         return oosResults;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MONTE CARLO DRAWDOWN ESTIMATION
-    // ══════════════════════════════════════════════════════════════
 
     public static double monteCarloDrawdown(List<Double> trades, int simulations, double confidence) {
         if (trades.isEmpty()) return 0;
@@ -611,9 +581,7 @@ public final class SimpleBacktester {
         return maxDrawdowns[Math.min(idx, simulations - 1)];
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  INTERNAL: POSITION RESOLUTION
-    // ══════════════════════════════════════════════════════════════
 
     private static final class ActivePosition {
         final com.bot.TradingCore.Side side;
@@ -749,7 +717,7 @@ public final class SimpleBacktester {
             slFirst = openPos > 0.65;
         }
 
-        // [FIX #16] Ambiguous case: open is mid-range (0.35–0.65) — both SL and TP plausible.
+        // Ambiguous case: open is mid-range (0.35–0.65) — both SL and TP plausible.
         // OLD: always SL_FIRST → backtest was systematically pessimistic, artificially low WR.
         // NEW: no default bias — return null (treat as "nothing resolved this bar"),
         //      let the time-stop logic handle it if the position expires.
@@ -775,9 +743,7 @@ public final class SimpleBacktester {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  UTILITY
-    // ══════════════════════════════════════════════════════════════
 
     private Map<Long, List<com.bot.TradingCore.Candle>> buildM1Index(List<com.bot.TradingCore.Candle> m1) {
         Map<Long, List<com.bot.TradingCore.Candle>> index = new HashMap<>();

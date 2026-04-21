@@ -9,34 +9,9 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 
+/** SignalSender — TRADINGBOT PRO EDITION v37.0 */
 /**
- * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║  SignalSender — TRADINGBOT PRO EDITION v37.0                                ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  [v37.0] SMALL-BALANCE FIX + SIGNAL QUALITY GATES:                     ║
- * ║    · Balance floor removed: was Math.max(balance, 100.0) → now actual   ║
- * ║      balance used. At $18, old code sized positions as if $100.         ║
- * ║    · Small-balance risk scaling: <$50 → riskPct×0.5, <$150 → ×0.75    ║
- * ║    · Min order size: was hardcoded $6.5 → now 3% of balance (adaptive) ║
- * ║    · Max position cap: <$50 balance → 15% per trade (was 20%)          ║
- * ║    · GARBAGE_COIN_BLOCKLIST: SIRENUSDT, GIGGLEUSDT, DUSDT etc. blocked ║
- * ║    · MAX SL% GATE: SL>3% blocked for <$50 balance, SL>5% for larger   ║
- * ║      Eliminated SOLVUSDT(-12% SL) and AIOTUSDT(-25% SL) signals        ║
- * ║  [v34.0] Extended detectSector: AI, RWA, DePin, Commodities, Metals    ║
- * ║  [v34.0] Category-aware EARLY_TICK velocity thresholds                  ║
- * ║  [v34.0] Category-aware event coin filter (TOP=5%, ALT=8%, MEME=12%)   ║
- * ║  [v34.0] Asset type display in Telegram signals + tradability hints     ║
- * ║  [v34.0] PumpHunter integration with category-aware thresholds          ║
- * ║  [FIX-BLIND]  14-минутная слепота устранена — LiveCandleAssembler      ║
- * ║  [FIX-WS]     WebSocket автозапускается для топ-30 пар по объёму       ║
- * ║  [FIX-UDS]    User Data Stream — реальное закрытие ордеров с биржи     ║
- * ║  [FIX-COMP]   Размер позиции масштабируется с балансом $100→$1M        ║
- * ╚══════════════════════════════════════════════════════════════════════════╝
- */
-/**
- * ╔══════════════════════════════════════════════════════════════════════╗
  * ║   SignalSender v50.0 — PREDICTIVE SIGNAL ARCHITECTURE               ║
- * ╠══════════════════════════════════════════════════════════════════════╣
  * ║  [v50] §1  15m blind spot: 120s→15s (assembleLive15mCandle)         ║
  * ║  [v50] §2  Event coin filter: directional block, not total          ║
  * ║  [v50] §3  EARLY_TICK: velocity/accel/volume thresholds lowered     ║
@@ -46,7 +21,6 @@ import java.util.concurrent.atomic.*;
  * ║  [REFACTOR] EARLY_TICK vel: TOP→0.0015, ALT→0.0025, MEME→0.0035      ║
  * ║  [REFACTOR] Position sizing flat: удалены conf-based множители        ║
  * ║  [REFACTOR] FUNDING_REFRESH: 15min, DEPTH_POLL: 120s, TOP_N=30        ║
- * ╚══════════════════════════════════════════════════════════════════════╝
  */
 public final class SignalSender {
 
@@ -73,7 +47,7 @@ public final class SignalSender {
     private final String API_KEY;
     private final String API_SECRET;
 
-    // [REFACTOR] 5min→15min: OI не меняется кардинально за 5 минут.
+    // 5min→15min: OI не меняется кардинально за 5 минут.
     // Экономия: ~66% OI weight (~$1.5/мес).
     private static final long FUNDING_REFRESH_MS  = 15 * 60_000L;
     private static final long DELTA_WINDOW_MS     = 60_000L;
@@ -100,7 +74,7 @@ public final class SignalSender {
     private final Map<String, Long>   deltaWindowStart = new ConcurrentHashMap<>();
     private final Map<String, Double> deltaHistory     = new ConcurrentHashMap<>();
 
-    // [v29] VDA — Volume Delta Acceleration (10s micro-windows)
+    // VDA — Volume Delta Acceleration (10s micro-windows)
     private static final long   VDA_WINDOW_MS  = 10_000L;
     private final Map<String, Double> vdaCurrentBuf = new ConcurrentHashMap<>();
     private final Map<String, Double> vdaPrevBuf    = new ConcurrentHashMap<>();
@@ -133,7 +107,7 @@ public final class SignalSender {
     // OFV score per pair: positive = bullish flow velocity, negative = bearish
     private final Map<String, Double> ofvScoreMap = new ConcurrentHashMap<>();
 
-    // [v29] RT-CVD — real-time CVD from aggTrade (resets each 15m candle)
+    // RT-CVD — real-time CVD from aggTrade (resets each 15m candle)
     private final Map<String, Double> rtCvdBuy   = new ConcurrentHashMap<>();
     private final Map<String, Double> rtCvdTotal = new ConcurrentHashMap<>();
     private final Map<String, Long>   rtCvdReset = new ConcurrentHashMap<>();
@@ -162,8 +136,7 @@ public final class SignalSender {
     private static final double MAX_QUALITY_PENALTY  = 8.0;
     private final Map<String, Deque<Double>>      tickPriceDeque  = new ConcurrentHashMap<>();
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v52] HOT PAIR MOMENTUM TRACKER
+    //  HOT PAIR MOMENTUM TRACKER
     //  Problem: Main cycle runs every 1 min. A pump that starts
     //  10 seconds into the cycle interval will only be caught
     //  up to 50 seconds later. For MEME coins that pump in 3-5 min
@@ -181,7 +154,6 @@ public final class SignalSender {
     //
     //  Cooldown: 90s per pair — don't spam rescan on the same move.
     //  Max concurrent rescans: 3 — protect fetch pool from overload.
-    // ══════════════════════════════════════════════════════════════
     private static final double HOT_PAIR_TOP_PCT   = 0.0025;  // 0.25% in 30s
     private static final double HOT_PAIR_ALT_PCT   = 0.0040;  // 0.40% in 30s
     private static final double HOT_PAIR_MEME_PCT  = 0.0060;  // 0.60% in 30s
@@ -197,23 +169,21 @@ public final class SignalSender {
     private final Map<String, Long>               wsReconnectDelay= new ConcurrentHashMap<>();
     private final Map<String, MicroCandleBuilder> microBuilders   = new ConcurrentHashMap<>();
 
-    // ══════════════════════════════════════════════════════════════
     //  [v17.0 §2] EARLY TICK SIGNAL BUFFER
     //  Collects EARLY_TICK candidates across 1.5s windows per pair.
     //  earlyTickFlusher drains the buffer, sorts by probability,
     //  and dispatches only the TOP-1 per pair. Prevents signal spam
     //  during volatile bursts where the same pair fires 5× in 3 seconds.
-    // ══════════════════════════════════════════════════════════════
     /** Accumulates the best (highest probability) EARLY_TICK candidate per pair per flush window. */
     private final Map<String, com.bot.DecisionEngineMerged.TradeIdea> earlyTickBuffer
             = new ConcurrentHashMap<>();
-    // [PATCH-WS-WARMUP] Tracks last time a full WS reconnect happened.
+    // Tracks last time a full WS reconnect happened.
     // After reconnect, suppress earlyTickBuffer dispatch for 30s to prevent
     // stale-data signal flood (the "5 signals in 3 minutes" problem).
     private volatile long wsLastReconnectMs = 0;
     private static final long WS_WARMUP_MS  = 30_000L; // 30 seconds
 
-    // [v34.0] EARLY_TICK hourly rate limit per pair.
+    // EARLY_TICK hourly rate limit per pair.
     // Problem: volatile ALT fires 8 EARLY_TICK signals in 30 min — all same move.
     // Manual trader can't act on more than 2-3 signals per hour on same pair.
     // Fix: max 3 EARLY_TICK per pair per rolling 60 minutes.
@@ -238,23 +208,23 @@ public final class SignalSender {
         Thread t = new Thread(r, "ws-watcher"); t.setDaemon(true); return t;
     });
 
-    // [FIX-UDS] User Data Stream
+    // User Data Stream
     private volatile String    udsListenKey   = null;
     private volatile WebSocket udsWebSocket   = null;
-    // [PATCH-UDS-HEARTBEAT] Tracks last time any UDS event arrived.
+    // Tracks last time any UDS event arrived.
     // If no event in 5 min → socket silently died → force reconnect.
     private volatile long      udsLastEventMs = System.currentTimeMillis();
     private final ScheduledExecutorService udsExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "uds-listener"); t.setDaemon(true); return t;
     });
 
-    // [FIX-BLIND] Буфер 1m свечей для LiveCandleAssembler
+    // Буфер 1m свечей для LiveCandleAssembler
     private final Map<String, List<com.bot.TradingCore.Candle>> liveM1Buffer = new ConcurrentHashMap<>();
     private static final int LIVE_M1_BUFFER_SIZE = 180; // [v36-FIX] 4h of 1m bars from WS ticks
 
     private final Map<String, Long> lastFetchTime = new ConcurrentHashMap<>();
 
-    // [v12.0] Orderbook — populated via @bookTicker WebSocket stream
+    // Orderbook — populated via @bookTicker WebSocket stream
     private final Map<String, OrderbookSnapshot> orderbookMap = new ConcurrentHashMap<>();
 
     // Candle Cache
@@ -263,7 +233,7 @@ public final class SignalSender {
     private static final Map<String, Long> CACHE_TTL = Map.of(
             "1m",  55_000L,
             "5m",  270_000L,       // [REFACTOR] 4m30s = 90% of candle period (was 3min)
-            // [PATCH 5.6.6] 15m TTL tightened 8min → 4min. At 8min the cache could
+            // 15m TTL tightened 8min → 4min. At 8min the cache could
             // serve data that aged 53% of the candle period — on a scalping tf where
             // entry precision matters, that's a stale-signal factory. 4min = 27%
             // of the candle, comparable to 1m/5m ratios.
@@ -290,18 +260,16 @@ public final class SignalSender {
     private volatile long         lastVolRefresh   = 0L;
     private static final long     VOL_REFRESH_MS   = 30 * 60_000L;
 
-    // [FIX-COMP] Баланс для компаундинга
+    // Баланс для компаундинга
     // [BUG-FIX] Убран хардкод $1000. Теперь читаем из env ACCOUNT_BALANCE (по умолчанию 100).
     // Установи в Railway: ACCOUNT_BALANCE=500 (или любая сумма которую ты реально торгуешь).
     // Если подключён API ключ — баланс подтягивается с биржи автоматически и env игнорируется.
     private volatile double accountBalance    = envDouble("ACCOUNT_BALANCE", 100.0);
     private volatile long   lastBalanceRefresh = 0;
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v9.0] RATE LIMITER — Semaphore + Token Bucket + Backoff
+    //  RATE LIMITER — Semaphore + Token Bucket + Backoff
     //  Replaces broken volatile-based rate limiter that caused
     //  silent request drops and potential IP bans.
-    // ══════════════════════════════════════════════════════════════
     private static final int    RL_MAX_WEIGHT      = 2400;
     private static final int    RL_SAFE_WEIGHT     = 1800;
     private static final int    RL_CRITICAL_WEIGHT = 2100;
@@ -394,14 +362,14 @@ public final class SignalSender {
             rlRampUntil = System.currentTimeMillis() + 5 * 60_000L;
         }
         System.out.println("[RL] 429 #" + rl429Count + " backoff=" + backoff + "ms");
-        // [v10.0] НЕ спамим в Telegram — это внутренняя механика
+        // НЕ спамим в Telegram — это внутренняя механика
     }
 
     private void rlOn418() {
         rlIpBanned = true; rlIpBanUntil = System.currentTimeMillis() + 5*60_000L;
         rlRampUntil = rlIpBanUntil + 10 * 60_000L;
         System.out.println("[RL] 418 IP BAN 5min");
-        // [v10.0] НЕ спамим в Telegram — бот просто подождёт и продолжит
+        // НЕ спамим в Telegram — бот просто подождёт и продолжит
     }
 
     private HttpResponse<String> sendBinanceRequest(HttpRequest request, int weight) throws Exception {
@@ -439,13 +407,11 @@ public final class SignalSender {
     private final CorrelationGuard correlationGuard;
     private final ExecutorService fetchPool;
 
-    // ══════════════════════════════════════════════════════════════
     //  [v36-FIX Дыра3] ORDER EXECUTOR — встроен в SignalSender
     //  Включается через env ENABLE_AUTO_TRADE=1.
     //  При 0 — работает в режиме сигналов (текущее поведение).
     //  Исполняет: MARKET entry + STOP_MARKET SL + TAKE_PROFIT TP1.
     //  API-ключи берутся из уже существующих полей API_KEY / API_SECRET.
-    // ══════════════════════════════════════════════════════════════
     private static final boolean AUTO_TRADE_ENABLED =
             "1".equals(System.getenv("ENABLE_AUTO_TRADE"));
     private static final int AUTO_TRADE_LEVERAGE =
@@ -628,7 +594,7 @@ public final class SignalSender {
     private final AtomicLong gicHardHeadwind  = new AtomicLong(0);
     private final AtomicLong wsMessageCount = new AtomicLong(0);
     private final AtomicLong udsEventsCount = new AtomicLong(0);
-    // [PATCH 1.2] fetchPool DiscardOldestPolicy counter — non-zero value
+    // fetchPool DiscardOldestPolicy counter — non-zero value
     // indicates sustained overload (queue full, old tasks being dropped).
     // Alert if > 0 per scanCycle.
     private final AtomicLong rejectedFetches = new AtomicLong(0);
@@ -640,12 +606,12 @@ public final class SignalSender {
 
     private static final Set<String> STABLE = Set.of("USDT","USDC","BUSD","TUSD","USDP","DAI");
 
-    // [v34.0] DYNAMIC SECTOR DETECTION — extended with AI, RWA, DePin sectors
+    // DYNAMIC SECTOR DETECTION — extended with AI, RWA, DePin sectors
     // and auto-detection for commodity/metal tokens
     private String detectSector(String pair) {
         String s = pair.endsWith("USDT") ? pair.substring(0, pair.length() - 4) : pair;
 
-        // [v34.0] Auto-detect non-crypto assets first
+        // Auto-detect non-crypto assets first
         com.bot.DecisionEngineMerged.AssetType assetType =
                 com.bot.DecisionEngineMerged.detectAssetType(pair);
         if (assetType != com.bot.DecisionEngineMerged.AssetType.CRYPTO
@@ -685,9 +651,7 @@ public final class SignalSender {
         };
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  CONSTRUCTOR
-    // ══════════════════════════════════════════════════════════════
 
     public SignalSender(com.bot.TelegramBotSender bot,
                         com.bot.GlobalImpulseController sharedGIC,
@@ -695,7 +659,7 @@ public final class SignalSender {
         this.bot = bot;
         this.gic = sharedGIC;
         this.isc = sharedISC;
-        // [PATCH B1 v33] OOM FIX — httpIoExecutor.
+        // OOM FIX — httpIoExecutor.
         // Executors.newFixedThreadPool() uses LinkedBlockingQueue (UNBOUNDED).
         // Under Binance API lag: tasks pile up infinitely → Railway OOM crash.
         // Fix: bounded queue(100) + DiscardPolicy → drops oldest pending HTTP task,
@@ -726,7 +690,7 @@ public final class SignalSender {
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
         this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1;
-        // [REFACTOR] MAX_SCAN_PAIRS 50→25: при TOP_N=30 сканировать 50 пар/цикл = wasteful.
+        // MAX_SCAN_PAIRS 50→25: при TOP_N=30 сканировать 50 пар/цикл = wasteful.
         this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 25);
         this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 10);
         this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 25);
@@ -743,7 +707,7 @@ public final class SignalSender {
         this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
         this.optimizer.setPumpHunter(this.pumpHunter);
 
-        // [PATCH 1.2 v51] FETCH POOL BACKPRESSURE REDESIGN.
+        // FETCH POOL BACKPRESSURE REDESIGN.
         //
         // Old design (v33): CallerRunsPolicy on ArrayBlockingQueue(400).
         //   Problem: when queue fills, the submitter thread (wsWatcher / scanCycle)
@@ -777,12 +741,12 @@ public final class SignalSender {
                 }
         );
 
-        // [FIX-UDS] User Data Stream
+        // User Data Stream
         if (!API_KEY.isBlank()) {
             udsExecutor.schedule(this::initUserDataStream, 5, TimeUnit.SECONDS);
             udsExecutor.scheduleAtFixedRate(this::renewListenKey, 28, 28, TimeUnit.MINUTES);
             wsWatcher.scheduleAtFixedRate(this::refreshAccountBalance, 10, 120, TimeUnit.SECONDS);
-            // [v28.0] PATCH #3: Set leverage + margin mode on startup.
+            // PATCH #3: Set leverage + margin mode on startup.
             // OLD: leverage defaulted to exchange setting (often 20x) — SIZE=20$ at 20x = $400 position.
             //      SL -1.36% = -$5.44 loss on $20 margin = -27% per trade. Math was completely wrong.
             // NEW: ISOLATED margin at 5x leverage. SIZE=20$ at 5x = $100 position.
@@ -797,7 +761,7 @@ public final class SignalSender {
         // WS health check
         wsWatcher.scheduleAtFixedRate(this::checkWsHealth, 30, 30, TimeUnit.SECONDS);
 
-        // [REFACTOR] Depth snapshot: 60s→120s, ограничены top-10 пары (DEPTH_SNAPSHOT_TOP_N=10).
+        // Depth snapshot: 60s→120s, ограничены top-10 пары (DEPTH_SNAPSHOT_TOP_N=10).
         // Экономия: ~90% depth REST weight (~$4/мес). bookTicker WS покрывает L1 real-time.
         wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 120, TimeUnit.SECONDS);
 
@@ -806,7 +770,7 @@ public final class SignalSender {
         // dispatches TOP-1 per pair. Prevents burst spam of 5+ signals on the same pair.
         wsWatcher.scheduleAtFixedRate(this::flushEarlyTickBuffer, 2, 2, TimeUnit.SECONDS);
 
-        // [v52] HotPair rescan monitor — logs hotPairTotalTriggers every 10 min
+        // HotPair rescan monitor — logs hotPairTotalTriggers every 10 min
         wsWatcher.scheduleAtFixedRate(() -> {
             long triggers = hotPairTotalTriggers.get();
             if (triggers > 0) {
@@ -825,8 +789,7 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v17.0] GARBAGE COIN BLOCKLIST — micro-cap / rug-risk tokens
+    //  GARBAGE COIN BLOCKLIST — micro-cap / rug-risk tokens
     //
     //  These coins have appeared in signals but are NOT tradeable:
     //  · Extreme SL% (10-25%) = high risk, unsuitable for small balance
@@ -834,7 +797,6 @@ public final class SignalSender {
     //  · High manipulation risk (GIGGLE, D, SIREN = typical pump&dump)
     //
     //  Add new coins here if they appear in signals with SL > 8%.
-    // ══════════════════════════════════════════════════════════════
     // [v43 PATCH FIX #7] GARBAGE_COIN_BLOCKLIST is now a mutable ConcurrentHashMap-backed set.
     // This allows InstitutionalSignalCore.autoBlacklist to push symbols here at runtime
     // when their win-rate drops below 25% after 5+ trades. The static seed list is unchanged.
@@ -855,7 +817,7 @@ public final class SignalSender {
                 // Additional confirmed garbage (WR < 25% over 30+ trades each)
                 "WUSDT", "PENDLEUSDT", "HOOKUSDT", "MDTUSDT",
                 "RADUSDT", "SNTUSDT", "NKNUSDT", "FRONTUSDT",
-                // [v50] Confirmed fresh-listing pumps from live signal logs
+                // Confirmed fresh-listing pumps from live signal logs
                 "GENIUSUSDT", "BULLAUSDT", "PIEVERSEUSDT", "MUSDT",
                 "GWEIUSDT", "PHBUSDT", "PROMUSDT"
         ));
@@ -872,7 +834,7 @@ public final class SignalSender {
         return java.util.Collections.unmodifiableSet(GARBAGE_COIN_BLOCKLIST);
     }
 
-    // [v17.0] Max SL% gate: signals with stop-loss > this % of entry price are blocked.
+    // Max SL% gate: signals with stop-loss > this % of entry price are blocked.
     // Reasoning: SL=12% means you need 13.7% gain to break even after 1 loss.
     // At any balance, this is casino-level risk, not trading.
     // For small accounts (<$50): max 3% SL. For normal accounts: max 5% SL.
@@ -882,10 +844,9 @@ public final class SignalSender {
     }
 
 
-
     public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
 
-        // [v10.0] If IP banned — skip entire cycle silently, wait for ban to expire
+        // If IP banned — skip entire cycle silently, wait for ban to expire
         if (rlIpBanned && System.currentTimeMillis() < rlIpBanUntil) {
             return Collections.emptyList();
         }
@@ -904,14 +865,14 @@ public final class SignalSender {
                 cachedPairs = fresh;
                 lastPairsRefresh = System.currentTimeMillis();
             }
-            // [v10.0] Пауза после тяжёлой загрузки пар (exchangeInfo+CoinGecko = ~80 weight)
+            // Пауза после тяжёлой загрузки пар (exchangeInfo+CoinGecko = ~80 weight)
             try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
         }
 
         if (System.currentTimeMillis() - lastFundingRefresh > FUNDING_REFRESH_MS) {
             refreshAllFundingRates();
             lastFundingRefresh = System.currentTimeMillis();
-            // [v10.0] Пауза после funding refresh (premiumIndex + 100× OI = ~700 weight)
+            // Пауза после funding refresh (premiumIndex + 100× OI = ~700 weight)
             try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
         }
 
@@ -991,7 +952,7 @@ public final class SignalSender {
     private List<String> selectPairsForScan(int budget) {
         if (cachedPairs.isEmpty()) return List.of();
         List<String> sorted = new ArrayList<>(cachedPairs);
-        // [v38.0] GARBAGE PAIR FILTER — remove non-ASCII symbols (Chinese chars, etc.)
+        // GARBAGE PAIR FILTER — remove non-ASCII symbols (Chinese chars, etc.)
         // These are low-liquidity micro-cap tokens with manipulated order books.
         sorted.removeIf(pair -> {
             for (int i = 0; i < pair.length(); i++) {
@@ -1006,9 +967,7 @@ public final class SignalSender {
         return new ArrayList<>(sorted.subList(0, budget));
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [FIX-WS] АВТОЗАПУСК WEBSOCKET
-    // ══════════════════════════════════════════════════════════════
+    //  АВТОЗАПУСК WEBSOCKET
 
     private void startWebSocketsForTopPairs(Set<String> pairs) {
         // [v50 AUDIT FIX] Pre-filter blocklist before subscribing — avoids wasted WS connections
@@ -1017,7 +976,7 @@ public final class SignalSender {
                 .filter(p -> !GARBAGE_COIN_BLOCKLIST.contains(p))
                 .filter(p -> !isc.isHardBlacklisted(p))
                 .collect(java.util.stream.Collectors.toSet());
-        // [v10.0] MEMORY LEAK FIX: clean up pairs that dropped out of TOP-N
+        // MEMORY LEAK FIX: clean up pairs that dropped out of TOP-N
         // Without this, wsMap/tickPriceDeque/liveM1Buffer grow forever
         Set<String> zombies = new HashSet<>(wsMap.keySet());
         zombies.removeAll(pairs);
@@ -1086,20 +1045,18 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  PROCESS PAIR
-    // ══════════════════════════════════════════════════════════════
 
     private com.bot.DecisionEngineMerged.TradeIdea processPair(String pair) {
         try {
-            // [v17.0] GARBAGE COIN BLOCKLIST — instant reject for known micro-cap / rug tokens
+            // GARBAGE COIN BLOCKLIST — instant reject for known micro-cap / rug tokens
             if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return null;
-            // [v51] Hard blacklist check — symbols with WR < 25% after 20 trades
+            // Hard blacklist check — symbols with WR < 25% after 20 trades
             if (isc.isHardBlacklisted(pair)) return null;
             // REST для 1m больше не вызывается в основном цикле — только холодный старт.
             // Экономия: ~50 REST запросов/мин × weight=5 = 250 weight/мин.
             List<com.bot.TradingCore.Candle> m1  = getM1FromWs(pair);
-            // [REFACTOR] 5m из WS-буфера (liveM1Buffer) вместо REST getCached("5m").
+            // 5m из WS-буфера (liveM1Buffer) вместо REST getCached("5m").
             // При достаточном буфере (≥5 баров) — 0 REST weight. Fallback на REST при холодном старте.
             // Экономия: ~25% klines REST weight (~$6-8/мес при TOP_N=30).
             List<com.bot.TradingCore.Candle> m5  = getM5FromWsOrRest(pair, KLINES_LIMIT);
@@ -1122,7 +1079,7 @@ public final class SignalSender {
                 return null;
             }
 
-            // [PATCH #4] STALE DATA GUARD
+            // STALE DATA GUARD
             // Если последний 15m бар закрыт более 20 минут назад — данные устарели.
             // Причины: WS разрыв + REST кеш не обновился, Binance maintenance, локальный freeze.
             // Лучше пропустить сигнал чем войти на старых данных.
@@ -1139,16 +1096,14 @@ public final class SignalSender {
                 return null;
             }
 
-            // [v34.0] Categorize early — needed for event filter and all downstream logic
+            // Categorize early — needed for event filter and all downstream logic
             com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
             String sector = detectSector(pair);
 
-            // ═══════════════════════════════════════════════════════
             // [v13.0+v34.0] EVENT COIN FILTER — category-aware
             // TOP coins: 5% daily move = massive event (BTC rarely does 8%)
             // ALT: 8% = event
             // MEME: 12% = event (they routinely move 5-8%)
-            // ═══════════════════════════════════════════════════════
             // [v50 §12] EVENT COIN FILTER — DIRECTIONAL BLOCK.
             // Old: blocked ALL signals on coins with >5-8% daily move.
             // Problem: this blocked counter-trend entries (reversals/pullbacks)
@@ -1276,7 +1231,7 @@ public final class SignalSender {
             double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
             if (gicWeight <= 0.05) gicHardHeadwind.incrementAndGet();
 
-            // [v23.0] GIC weight → probability penalty, NOT hard veto
+            // GIC weight → probability penalty, NOT hard veto
             // Old: gicWeight <= 0 → return null (killed ALL longs during BTC dip)
             // New: gicWeight → scaled penalty. Panic = -25, Danger = -15, Watch = -8
             if (gicWeight <= 0.05) {
@@ -1304,8 +1259,8 @@ public final class SignalSender {
             }
 
             // [v18.0 REFACTOR] PumpHunter: flag only, no arbitrary confidence scaling
-            // [v34.0] Pass category for category-aware thresholds
-            // [v51] Use liveM1Buffer directly — it contains the currently forming bar
+            // Pass category for category-aware thresholds
+            // Use liveM1Buffer directly — it contains the currently forming bar
             // from WS aggTrade stream. This gives PumpHunter 1-minute-fresh data instead
             // of REST-cached closed bars. Critical for new detectExhaustion / detectPrePump
             // which need the live forming candle to catch tops/bottoms in time.
@@ -1329,7 +1284,7 @@ public final class SignalSender {
             }
 
             // [v18.0 REFACTOR] OBI: flag only, no probability scaling, no blocking
-            // [FIX v32+] ANTI-SPOOFING: cross-validate OBI with realised taker flow.
+            // ANTI-SPOOFING: cross-validate OBI with realised taker flow.
             // A limit wall (OBI) WITHOUT confirmed taker activity = likely spoofing.
             // Spoofer pattern: large bid wall appears → bot flags bullish → wall yanked → dump.
             // Validation: if OBI says bullish (bid > ask) but normDelta says sell flow → SKIP OBI.
@@ -1339,7 +1294,7 @@ public final class SignalSender {
                 double obi = obs.obi();
                 boolean obiAligned = (isLong && obi > OBI_THRESHOLD) || (!isLong && obi < -OBI_THRESHOLD);
                 if (obiAligned) {
-                    // [FIX v32+] Anti-spoofing: OBI bullish but taker flow bearish = spoof suspect
+                    // Anti-spoofing: OBI bullish but taker flow bearish = spoof suspect
                     boolean obiAndFlowAgree = isLong
                             ? normDelta > -0.10   // bid wall + some sell flow OK, but not heavy sell
                             : normDelta < 0.10;   // ask wall + some buy flow OK, but not heavy buy
@@ -1375,7 +1330,7 @@ public final class SignalSender {
 
                 List<String> nf = new ArrayList<>(idea.flags);
                 if (aligned) {
-                    // [REFACTOR] OFV boost снижен 4.5→2.0 / 2.5→1.5.
+                    // OFV boost снижен 4.5→2.0 / 2.5→1.5.
                     // Старые значения вносили до +4.5 к confidence на чистом OFV — слишком много.
                     // OFV подтверждает направление, но не должен самостоятельно поднимать сигнал
                     // через финальный порог confidence. Убрана cap 85.0 — теперь общий cap в generate().
@@ -1413,10 +1368,10 @@ public final class SignalSender {
 
             if (!checkMinProfit(idea, cat)) { blockedProfit.incrementAndGet(); return null; }
 
-            // [FIX-COMP] Добавляем рекомендованный размер позиции
+            // Добавляем рекомендованный размер позиции
             double posSize = getPositionSizeUsdt(idea, cat);
-            // [v16.0] SURVIVAL MODE (day <= -6%): position size ×0.25.
-            // [v16.0] CAUTIOUS MODE (day <= -3%): position size ×0.5.
+            // SURVIVAL MODE (day <= -6%): position size ×0.25.
+            // CAUTIOUS MODE (day <= -3%): position size ×0.5.
             // This replaces the old hard signal block with meaningful size reduction.
             if (isc.isSurvivalMode()) {
                 posSize = posSize * 0.25;
@@ -1426,7 +1381,7 @@ public final class SignalSender {
             if (qualityPenalty > 0.0) {
                 posSize *= Math.max(0.55, 1.0 - qualityPenalty * 0.06);
             }
-            // [v38.0] CORRELATION SIZE REDUCTION
+            // CORRELATION SIZE REDUCTION
             // Каждая дополнительная позиция в том же направлении уменьшает размер.
             // 8 ALT LONG = фактически 1 позиция с 8× риском (corr ~0.85).
             double corrMult = correlationGuard.getCorrelationSizeMultiplier(pair, idea.side, cat);
@@ -1442,7 +1397,7 @@ public final class SignalSender {
             nf.add(String.format("SIZE=%.1f$%s", posSize, sizeMode));
             idea = rebuildIdea(idea, idea.probability, nf);
 
-            // [v25.0] SESSION WEIGHT → FLAG + SIZE REDUCTION ONLY.
+            // SESSION WEIGHT → FLAG + SIZE REDUCTION ONLY.
             // Session context predicts LIQUIDITY, not signal direction.
             // Low liquidity = smaller position. Signal validity is unchanged.
             // Probability modification removed — it was incorrectly killing valid setups at 03:00 UTC.
@@ -1464,7 +1419,7 @@ public final class SignalSender {
             if (liqScore > 0.25) {
                 List<String> lf = new ArrayList<>(idea.flags);
                 lf.add(String.format("LIQ_MAGNET+%.0f%%", liqScore * 100));
-                // [REFACTOR] Убран confidence boost от LIQ_MAGNET (liqScore * 8, max +8).
+                // Убран confidence boost от LIQ_MAGNET (liqScore * 8, max +8).
                 // Проблема: ликвидационный магнит — это дополнительный контекст (информация о ТА),
                 // а не сигнал качества входа. Накачка confidence через LIQ_MAGNET приводила
                 // к тому что слабые сигналы "проходили" финальный порог только из-за близких ликвидаций.
@@ -1483,20 +1438,20 @@ public final class SignalSender {
                 return null;
             }
 
-            // [v28.0] PATCH #12: Adaptive TP calibration based on real historical RR.
+            // PATCH #12: Adaptive TP calibration based on real historical RR.
             // Problem: TP_TREND_EARLY sets tp3Mult=4.2, but if symbol historically only
             //          reaches avgRR=1.3, those wide TPs are wishful thinking.
             //          Bot waited for TP3 that never came, missing TP1 exits.
             // Fix: if real avgRR < 70% of assumed tp3Mult → compress all TP multipliers.
 
-            // [v51] ORDERBOOK WALL TP GUARD — if a strong wall sits in TP direction,
+            // ORDERBOOK WALL TP GUARD — if a strong wall sits in TP direction,
             // the TP probably won't be reached. Detect via L1-L5 depth imbalance.
             // OrderbookSnapshot doesn't store individual price levels, so we use
             // total depth5 as a proxy: if the OPPOSING side (where TP1 sits) has
             // very heavy depth, there's a wall blocking the move.
             OrderbookSnapshot wallCheck = orderbookMap.get(pair);
             if (wallCheck != null && wallCheck.isFresh()) {
-                // [v51] Reuse outer isLong (declared at line 1175)
+                // Reuse outer isLong (declared at line 1175)
                 // For LONG: TP is above price → ask side is the obstacle
                 // For SHORT: TP is below price → bid side is the obstacle
                 double obstacleDepth = isLong ? wallCheck.askDepth5 : wallCheck.bidDepth5;
@@ -1537,23 +1492,21 @@ public final class SignalSender {
             }
 
             isc.registerSignal(idea);
-            // [PATCH B4 v33] HARD R:R GATE — enforced AFTER adaptive TP calibration.
-            // tp2Mult floor is Math.max(1.00, ...) → worst case TP2=entry±1×risk → R:R=1:1.
-            // This violates the system's minimum 1:2 requirement.
-            // Gate: actualRR measured from TP2 (realistic partial exit target), not TP3.
-            // Tolerance: 1.80 instead of 2.00 — 10% buffer for slippage on entry fill.
+            // HARD R:R GATE — raised 1.80→2.00 (user preference ≥1:2).
+            // Синхронизировано с BotMain dispatch gate и tp2Mult floor в DecisionEngineMerged.
+            // При tp2Mult всегда ≥ 2.00 этот gate — финальная страховка (должен почти не срабатывать).
             double _riskDist = Math.abs(idea.stop - idea.price);
             double _tp2Dist  = Math.abs(idea.tp2 - idea.price);
             double actualRR  = _riskDist > 1e-9 ? _tp2Dist / _riskDist : 0;
-            if (actualRR < 1.80) {
+            if (actualRR < 2.00) {
                 // Undo ISC and correlation registrations — R:R is insufficient
                 isc.unregisterSignal(idea);
                 correlationGuard.unregister(pair);
-                System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < 1.80 (TP2=%.6f entry=%.6f SL=%.6f)%n",
+                System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < 2.00 (TP2=%.6f entry=%.6f SL=%.6f)%n",
                         pair, idea.side, actualRR, idea.tp2, idea.price, idea.stop);
                 return null;
             }
-            // [v23.0] Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
+            // Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
             decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, System.currentTimeMillis());
             correlationGuard.register(pair, idea.side, cat, sector);
 
@@ -1564,9 +1517,7 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [FIX-BLIND] LIVE CANDLE ASSEMBLER
-    // ══════════════════════════════════════════════════════════════
+    //  LIVE CANDLE ASSEMBLER
 
     /**
      * Возвращает список 15m свечей, где ПОСЛЕДНЯЯ СВЕЧА — живая,
@@ -1599,7 +1550,7 @@ public final class SignalSender {
     }
 
     /**
-     * [REFACTOR] Сборка 5m свечей из liveM1Buffer вместо REST getCached(pair, "5m", ...).
+     * Сборка 5m свечей из liveM1Buffer вместо REST getCached(pair, "5m", ...).
      * Экономия: ~25% REST weight (5m klines были 3-я по весу категория запросов).
      *
      * Алгоритм: группируем 1m бары по 5-минутным эпохам (openTime / 300_000).
@@ -1663,7 +1614,7 @@ public final class SignalSender {
         long now = System.currentTimeMillis();
         long current15mStart = (now / (15 * 60_000L)) * (15 * 60_000L);
 
-        // [v50] BLIND SPOT FIX: 120s→15s.
+        // BLIND SPOT FIX: 120s→15s.
         if (now - current15mStart < 15_000L) return null;
 
         double open = Double.NaN, high = Double.NEGATIVE_INFINITY,
@@ -1713,9 +1664,7 @@ public final class SignalSender {
         // no-op: liveM1Buffer теперь заполняется исключительно из processAggTrade()
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [FIX-COMP] РАЗМЕР ПОЗИЦИИ — Kelly-inspired компаундинг
-    // ══════════════════════════════════════════════════════════════
+    //  РАЗМЕР ПОЗИЦИИ — Kelly-inspired компаундинг
 
     /**
      * Рассчитывает размер позиции в USDT на основе текущего баланса.
@@ -1739,7 +1688,7 @@ public final class SignalSender {
             case MEME -> 0.006; // 0.6% of balance per trade
         };
 
-        // [v17.0] Small-balance safety: under $50, cut risk in half.
+        // Small-balance safety: under $50, cut risk in half.
         // At $18 × 1% = $0.18 risk. With SL ~1% this gives $18 position — 100% of balance.
         // Corrected: under $50, max 0.5% risk → max 10% balance per trade.
         if (balance < 50.0) {
@@ -1748,25 +1697,25 @@ public final class SignalSender {
             riskPct *= 0.75;
         }
 
-        // [REFACTOR] Сужен диапазон confidence-based sizing: ×0.60..×1.50 → ×0.85..×1.15.
+        // Сужен диапазон confidence-based sizing: ×0.60..×1.50 → ×0.85..×1.15.
         // Причина: до калибровки сигналов (WR > 45%) уверенность бота inflated.
         // "85% confidence" часто = 55-60% реальный WR. Давать ×1.50 размер на inflated сигналы
         // усиливает потери, а не прибыль. После стабилизации WR — расширить диапазон обратно.
         // Сохраняем небольшой градиент чтобы высококонфидентные сигналы всё же чуть крупнее.
-        // [REFACTOR] Flat sizing until WR > 45% calibrated.
+        // Flat sizing until WR > 45% calibrated.
         // Confidence-based scaling was amplifying losses from inflated base confidence.
         // When WR is properly validated (>45%), re-enable differential multipliers.
         // riskPct *= 1.00; // flat for all signals
 
-        // [v51] PRE_BREAK signals are predictive — slightly larger size
+        // PRE_BREAK signals are predictive — slightly larger size
         if (idea.flags.contains("PRE_BREAK_UP") || idea.flags.contains("PRE_BREAK_DN")) {
             riskPct *= 1.15;
         }
-        // [v51] EARLY_TICK is faster but less reliable — smaller size
+        // EARLY_TICK is faster but less reliable — smaller size
         if (idea.flags.contains("EARLY_TICK")) {
             riskPct *= 0.85;
         }
-        // [v51] Exhaustion reversal entries — smaller (counter-trend, higher fail rate)
+        // Exhaustion reversal entries — smaller (counter-trend, higher fail rate)
         if (idea.flags.contains("EXHAUSTION_REVERSAL_BOOST")) {
             riskPct *= 0.80;
         }
@@ -1774,7 +1723,7 @@ public final class SignalSender {
         double riskUsdt  = balance * riskPct;
         riskUsdt *= isc.getRiskSizeMultiplier();
 
-        // [v25.0] SESSION LIQUIDITY → size multiplier
+        // SESSION LIQUIDITY → size multiplier
         double sessionW = getSessionWeight();
         if (sessionW < 0.85) {
             riskUsdt *= Math.max(0.50, sessionW);
@@ -1782,7 +1731,7 @@ public final class SignalSender {
             riskUsdt *= 1.10;
         }
 
-        // [v25.0] LATE_ENTRY flag → reduce size 20%
+        // LATE_ENTRY flag → reduce size 20%
         if (idea.flags.contains("LATE_ENTRY_SIZE_CUT")) {
             riskUsdt *= 0.80;
         }
@@ -1801,9 +1750,7 @@ public final class SignalSender {
         return Math.round(posSize * 100.0) / 100.0;
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [FIX-COMP] ОБНОВЛЕНИЕ БАЛАНСА
-    // ══════════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ БАЛАНСА
 
     private void refreshAccountBalance() {
         if (API_KEY.isBlank() || rlIpBanned) return; // [v10.0]
@@ -1852,12 +1799,10 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v28.0] PATCH #3: LEVERAGE + MARGIN MODE INITIALIZATION
+    //  PATCH #3: LEVERAGE + MARGIN MODE INITIALIZATION
     //  Sets ISOLATED margin + 5x leverage on all active trading pairs.
     //  Called once at startup after account is ready.
     //  Without this, exchange defaults apply (often 20x CROSS = account-wipe risk).
-    // ══════════════════════════════════════════════════════════════
 
     private static final int  TARGET_LEVERAGE   = 5;    // 5x — conservative, correct risk math
     private static final String TARGET_MARGIN   = "ISOLATED"; // prevents cross-account contagion
@@ -1927,9 +1872,7 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [FIX-UDS] USER DATA STREAM
-    // ══════════════════════════════════════════════════════════════
+    //  USER DATA STREAM
 
     private void initUserDataStream() {
         if (API_KEY.isBlank()) return;
@@ -1983,7 +1926,7 @@ public final class SignalSender {
     }
 
     private void processUserDataEvent(JSONObject event) {
-        // [PATCH-UDS-HEARTBEAT] Any event = socket is alive
+        // Any event = socket is alive
         udsLastEventMs = System.currentTimeMillis();
         String type = event.optString("e", "");
         switch (type) {
@@ -2008,7 +1951,7 @@ public final class SignalSender {
                             ? com.bot.TradingCore.Side.SHORT
                             : com.bot.TradingCore.Side.LONG;
                     double pnlPct = (avgPrice > 0 && qty > 0) ? realizedPnl / (avgPrice * qty) * 100 : 0;
-                    // [v9.0] UDS confirmed result → register in ISC properly
+                    // UDS confirmed result → register in ISC properly
                     if (realizedPnl > 0) {
                         isc.registerConfirmedResult(true, closedSide);
                         decisionEngine.recordWin(symbol, closedSide);
@@ -2020,7 +1963,7 @@ public final class SignalSender {
                     String closeReason = realizedPnl > 0 ? "UDS_TP"
                             : realizedPnl < 0 ? "UDS_SL" : "UDS_CLOSE";
                     isc.closeTrade(symbol, closedSide, pnlPct, closeReason);
-                    // [v9.0] Remove from BotMain TradeResolver tracking
+                    // Remove from BotMain TradeResolver tracking
                     com.bot.BotMain.trackedSignals.remove(symbol + "_" + closedSide);
                     String emoji = realizedPnl >= 0 ? "✅" : "❌";
                     bot.sendMessageAsync(String.format(
@@ -2068,7 +2011,7 @@ public final class SignalSender {
     private void renewListenKey() {
         if (API_KEY.isBlank() || udsListenKey == null) return;
 
-        // [PATCH-UDS-HEARTBEAT] If no event arrived in 5 min, socket silently died.
+        // If no event arrived in 5 min, socket silently died.
         // Renewing the key alone won't help — we need a full reconnect.
         long silentMs = System.currentTimeMillis() - udsLastEventMs;
         if (udsWebSocket != null && silentMs > 5 * 60_000L) {
@@ -2095,11 +2038,9 @@ public final class SignalSender {
         udsExecutor.schedule(this::initUserDataStream, delaySec, TimeUnit.SECONDS);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  WS HEALTH CHECK
-    // ══════════════════════════════════════════════════════════════
 
-    // [v28.0] PATCH #9: Depth5 snapshot poller — multi-level OBI.
+    // PATCH #9: Depth5 snapshot poller — multi-level OBI.
     // Fetches /fapi/v1/depth?symbol=X&limit=10 for each active WS pair.
     // Computes sum of bid volume L1-L5 and ask volume L1-L5.
     // Updates orderbookMap with full-depth OrderbookSnapshot.
@@ -2150,7 +2091,7 @@ public final class SignalSender {
         // [SCANNER MODE v1.0] Stale threshold reduced 5m→60s for faster data recovery.
         // At 5m the bot could be analysing completely stale candles for 300 seconds silently.
         long staleThreshold = 60_000L;
-        // [FIX-WS-STORM] Collect stale pairs first, THEN reconnect.
+        // Collect stale pairs first, THEN reconnect.
         List<String> stalePairs = new ArrayList<>();
         for (Map.Entry<String, WebSocket> e : wsMap.entrySet()) {
             Long last = lastTickTime.get(e.getKey());
@@ -2159,7 +2100,7 @@ public final class SignalSender {
             }
         }
         if (!stalePairs.isEmpty()) {
-            // [v28.0] PATCH #19 + [SCANNER] alert if >20% of pairs are stale (not just any pair)
+            // PATCH #19 + [SCANNER] alert if >20% of pairs are stale (not just any pair)
             if (stalePairs.size() > wsMap.size() * 0.20) {
                 bot.sendMessageAsync(String.format(
                         "⚠️ СИСТЕМА | *WS DATA LOSS*%n"
@@ -2207,9 +2148,7 @@ public final class SignalSender {
     private volatile long lastWsHealthCheckMessages = -1;
     private volatile long lastWsHealthCheckMs       = System.currentTimeMillis();
 
-    // ══════════════════════════════════════════════════════════════
     //  LIQUIDITY GUARD
-    // ══════════════════════════════════════════════════════════════
 
     private boolean checkLiquidity(String pair, com.bot.DecisionEngineMerged.CoinCategory cat) {
         Double vol = volume24hUSD.get(pair);
@@ -2228,9 +2167,7 @@ public final class SignalSender {
         return true;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  RELATIVE STRENGTH
-    // ══════════════════════════════════════════════════════════════
 
     private double computeRelativeStrength(String pair, List<com.bot.TradingCore.Candle> m15) {
         if (m15 == null || m15.size() < 5) return 0.5;
@@ -2265,9 +2202,7 @@ public final class SignalSender {
         return cachedBtcReturn;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  STOP CLUSTER AVOIDANCE
-    // ══════════════════════════════════════════════════════════════
 
     private com.bot.DecisionEngineMerged.TradeIdea adjustStopForClusters(
             com.bot.DecisionEngineMerged.TradeIdea idea,
@@ -2307,9 +2242,7 @@ public final class SignalSender {
                 idea.tp1Mult, idea.tp2Mult, idea.tp3Mult);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MINIMUM PROFIT GUARD
-    // ══════════════════════════════════════════════════════════════
 
     private boolean checkMinProfit(com.bot.DecisionEngineMerged.TradeIdea idea,
                                    com.bot.DecisionEngineMerged.CoinCategory cat) {
@@ -2378,9 +2311,7 @@ public final class SignalSender {
                 || idea.flags.stream().anyMatch(f -> f.startsWith("VDA-"));
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  CORRELATION GUARD
-    // ══════════════════════════════════════════════════════════════
 
     private static final class CorrelationGuard {
         // [v50 FIX BUG-21] State is now PERSISTENT between cycles.
@@ -2503,9 +2434,7 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  CANDLE CACHE
-    // ══════════════════════════════════════════════════════════════
 
     // [v36-FIX Дыра5] Per-key cache locks — предотвращают stampede.
     // Без этого 34 потока fetchPool одновременно вызывают fetchKlinesDirect() для одного ключа
@@ -2535,7 +2464,7 @@ public final class SignalSender {
             }
 
             List<com.bot.TradingCore.Candle> fresh = fetchKlinesDirect(symbol, interval, limit);
-            // [PATCH #5] fresh == null → HARD fetch failure; fresh.isEmpty() → валидный empty (новая пара)
+            // fresh == null → HARD fetch failure; fresh.isEmpty() → валидный empty (новая пара)
             if (fresh != null && !fresh.isEmpty()) {
                 candleCache.put(key, new CachedCandles(fresh));
                 lastFetchTime.put(key, System.currentTimeMillis());
@@ -2557,12 +2486,12 @@ public final class SignalSender {
         return getCached(symbol, interval, limit);
     }
 
-    // [PATCH #5] Fetch error counter — exposed via stats
+    // Fetch error counter — exposed via stats
     private final AtomicLong klineFetchErrors = new AtomicLong(0);
     public long getKlineFetchErrors() { return klineFetchErrors.get(); }
 
     private List<com.bot.TradingCore.Candle> fetchKlinesDirect(String symbol, String interval, int limit) {
-        // [PATCH #5] Retry with exponential backoff.
+        // Retry with exponential backoff.
         // Return null on HARD failure (so upstream can distinguish "stale" from "empty history").
         // Return empty list ONLY when Binance returned a valid empty JSON array [].
         Exception lastEx = null;
@@ -2613,7 +2542,7 @@ public final class SignalSender {
                     double qv = k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0;
                     long closeT = k.getLong(6);
 
-                    // [PATCH #5] Sanity check — skip malformed candles
+                    // Sanity check — skip malformed candles
                     if (h < l || o <= 0 || c <= 0 || Double.isNaN(o) || Double.isNaN(c)) {
                         continue;
                     }
@@ -2635,16 +2564,13 @@ public final class SignalSender {
         return null; // NULL = hard failure, distinguished from empty list
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [PATCH #7] SERVER TIME SYNC
-    // ══════════════════════════════════════════════════════════════
+    //  SERVER TIME SYNC
     // Binance требует `timestamp` в пределах `recvWindow` (5000ms по дефолту).
     // Дрейф локальных часов на 1-2 сек → массовые -1021 ошибки.
     // Offset обновляется при старте + раз в 30 минут из BotMain.
     //
     // Использование: в signed requests вместо System.currentTimeMillis() — binanceTimestamp().
     // Сейчас авто-торговля выключена, но правка превентивная на будущее.
-    // ══════════════════════════════════════════════════════════════
 
     private volatile long serverTimeOffset = 0L;
     private volatile long lastTimeSync = 0L;
@@ -2688,9 +2614,7 @@ public final class SignalSender {
         return CompletableFuture.supplyAsync(() -> fetchKlinesDirect(symbol, interval, limit), fetchPool);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  VOLUME DELTA
-    // ══════════════════════════════════════════════════════════════
 
     public double getRawDelta(String symbol) { return deltaBuffer.getOrDefault(symbol, 0.0); }
 
@@ -2701,15 +2625,13 @@ public final class SignalSender {
         return Math.max(-1.0, Math.min(1.0, d / (absMax + 1e-9)));
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  WEBSOCKET (aggTrade + bookTicker)
-    // ══════════════════════════════════════════════════════════════
 
     public void connectWs(String pair) { connectWsInternal(pair); }
 
     private void connectWsInternal(String pair) {
         try {
-            // [v12.0] Combined stream: aggTrade + bookTicker in ONE connection
+            // Combined stream: aggTrade + bookTicker in ONE connection
             // This populates orderbookMap for real OBI analysis (was dead code before!)
             String streamUrl = "wss://fstream.binance.com/stream?streams="
                     + pair.toLowerCase() + "@aggTrade/"
@@ -2759,7 +2681,7 @@ public final class SignalSender {
         } catch (Exception e) { reconnectWs(pair); }
     }
 
-    // [v30] Guard against concurrent reconnects for the same pair
+    // Guard against concurrent reconnects for the same pair
     private final Set<String> reconnectingPairs = ConcurrentHashMap.newKeySet();
 
     private void reconnectWs(String pair) {
@@ -2769,7 +2691,7 @@ public final class SignalSender {
         if (old != null) {
             try { old.sendClose(WebSocket.NORMAL_CLOSURE, "reconnecting"); } catch (Exception ignored) {}
         }
-        // [REFACTOR] Gap-fill seed при переподключении WS.
+        // Gap-fill seed при переподключении WS.
         // Проблема (из implementation_plan §4.3): при reconnect liveM1Buffer НЕ очищался,
         // но WS-stream пропустил N тиков → MicroCandleBuilder имеет gap в данных.
         // Решение: сбрасываем буфер и делаем разовый REST-посев последних 60 баров
@@ -2846,7 +2768,7 @@ public final class SignalSender {
             deltaBuffer.merge(pair, side, Double::sum);
         }
 
-        // [v29] VDA: 10s micro-window acceleration
+        // VDA: 10s micro-window acceleration
         vdaWindowStart.putIfAbsent(pair, ts);
         long vdaAge = ts - vdaWindowStart.get(pair);
         if (vdaAge > VDA_WINDOW_MS) {
@@ -2869,7 +2791,7 @@ public final class SignalSender {
             vdaCurrentBuf.merge(pair, side, Double::sum);
         }
 
-        // [v29] RT-CVD: real-time from aggTrade, resets on 15m boundary
+        // RT-CVD: real-time from aggTrade, resets on 15m boundary
         long candleBoundary = (ts / 900_000L) * 900_000L;
         if (candleBoundary > rtCvdReset.getOrDefault(pair, 0L)) {
             rtCvdBuy.put(pair, 0.0);
@@ -2893,7 +2815,7 @@ public final class SignalSender {
         lastTickPrice.put(pair, price);
         lastTickTime.put(pair, ts);
 
-        // [v52] HOT PAIR RESCAN — detect rapid price acceleration and trigger immediate analysis.
+        // HOT PAIR RESCAN — detect rapid price acceleration and trigger immediate analysis.
         // Called after tick deques updated so maybeHotRescan() has fresh 30-tick window.
         // Non-blocking: submits to fetchPool only if threshold exceeded AND cooldown clear.
         maybeHotRescan(pair, price);
@@ -2948,7 +2870,7 @@ public final class SignalSender {
     }
 
     // [v29+v30+v34] EARLY TICK — rewritten with exhaustion guard + VDA + correct conf floor
-    // [v34.0] Category-aware velocity threshold: TOP coins (BTC/ETH) move slower in %
+    // Category-aware velocity threshold: TOP coins (BTC/ETH) move slower in %
     private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(String symbol, double price, long ts) {
         Deque<Double> dq = tickPriceDeque.get(symbol);
         Deque<Double> vq = tickVolumeDeque.get(symbol);
@@ -2961,12 +2883,12 @@ public final class SignalSender {
         double avg  = buf.stream().mapToDouble(Double::doubleValue).average().orElse(price);
         double vel  = Math.abs(move) / (avg + 1e-9);
 
-        // [v34.0] Category-aware velocity threshold
+        // Category-aware velocity threshold
         // TOP coins (BTC/ETH) have ~3-5x lower % moves than ALTs
         // Old: flat 0.0018 → BTC almost never triggered
         // New: TOP=0.0008, ALT=0.0015, MEME=0.0020
         com.bot.DecisionEngineMerged.CoinCategory etCat = categorizePair(symbol);
-        // [v50] Velocity thresholds lowered for earlier detection.
+        // Velocity thresholds lowered for earlier detection.
         // Old: ALT 0.0015 = move already visible on chart. New: 0.0010.
         double velThreshold = switch (etCat) {
             case TOP  -> 0.0015;  // [REFACTOR] ×3 от 0.0005: 0.05% = нормальный шум. 0.15% = реальный импульс
@@ -2988,12 +2910,12 @@ public final class SignalSender {
         double tickRangeHigh = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).max().orElse(price);
         double tickRangeLow  = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).min().orElse(price);
         double exhaustThresh = Math.max(atrV, (tickRangeHigh - tickRangeLow) * 0.60);
-        // [v50] Exhaustion guard lowered 2.5→2.0 — was letting through late entries
+        // Exhaustion guard lowered 2.5→2.0 — was letting through late entries
         if (moveFromBase > exhaustThresh * 2.0) return null;
 
         // Acceleration check
-        // [v34.0] TOP coins have smoother moves — lower acceleration threshold
-        // [v50] Acceleration threshold lowered: 1.35→1.15 for ALT.
+        // TOP coins have smoother moves — lower acceleration threshold
+        // Acceleration threshold lowered: 1.35→1.15 for ALT.
         // At 1.35 the second half must be 35% faster = move already obvious.
         // At 1.15 we catch the acceleration 1-2 ticks earlier.
         double accelThreshold = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.08 : 1.15;
@@ -3006,8 +2928,8 @@ public final class SignalSender {
         if (Math.abs(vda) > 0.30 && ((up && vda < 0) || (!up && vda > 0))) return null;
 
         // Volume spike
-        // [v34.0] TOP coins: lower volume spike threshold (institutional flow is steadier)
-        // [v50] Volume spike threshold lowered for earlier detection.
+        // TOP coins: lower volume spike threshold (institutional flow is steadier)
+        // Volume spike threshold lowered for earlier detection.
         double volSpikeThresh = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.08 : 1.18;
         int vw = Math.min(30, volBuf.size());
         double avgVol = volBuf.subList(0, vw - 5).stream().mapToDouble(Double::doubleValue).average().orElse(0.001);
@@ -3021,8 +2943,7 @@ public final class SignalSender {
         }
         if (streak < 2) return null;
 
-        // ═══════════════════════════════════════════════════════
-        // [v37.0] VOLATILITY-AWARE EARLY_TICK CONFIDENCE GATE
+        // VOLATILITY-AWARE EARLY_TICK CONFIDENCE GATE
         //
         // ПРОБЛЕМА (RIVER): бот давал сигнал на шумной монете с conf=73%.
         // На ALT с ATR/price > 2%, 73% confidence вообще не означает "высокое".
@@ -3035,7 +2956,6 @@ public final class SignalSender {
         //   EXTREME_VOL (>3.5% ATR):  floor 82% (почти никогда не проходит — правильно)
         //   + noiseScore > 3.0:        +6% к порогу
         //   + noiseScore > 4.0:        блок полностью
-        // ═══════════════════════════════════════════════════════
         // atrV already declared above (reused from exhaustion guard)
         double atrVPct     = atrV / price;
         double noiseScoreV = getNoiseScore(symbol);
@@ -3058,7 +2978,7 @@ public final class SignalSender {
         if (noiseScoreV > 3.0) etConfFloor += 6.0;
         else if (noiseScoreV > 2.5) etConfFloor += 3.0;
 
-        // [v34.0] Velocity-based confidence (kept from before)
+        // Velocity-based confidence (kept from before)
         double velMultiplier = switch (etCat) {
             case TOP  -> 6000;
             case ALT  -> 3500;
@@ -3076,7 +2996,7 @@ public final class SignalSender {
             return null;
         }
 
-        // [v37.0] EARLY_TICK stop uses VolatilityBucket minimum ATR mult.
+        // EARLY_TICK stop uses VolatilityBucket minimum ATR mult.
         // БЫЛО: atrV * 1.4 — слишком близко для HIGH/EXTREME vol монет.
         // СТАЛО: atrV * bucket.minAtrMult — гарантирует уважение к шуму монеты.
         com.bot.DecisionEngineMerged.VolatilityBucket etVolBucket =
@@ -3118,13 +3038,13 @@ public final class SignalSender {
      * Drains earlyTickBuffer atomically. Sorts remaining candidates by probability (desc),
      * then dispatches each one: sends to Telegram, registers with ISC, tracks in BotMain.
      *
-     * [v35.0] MAX 3 signals per flush — prevents 9 signals in 2 minutes.
+     * MAX 3 signals per flush — prevents 9 signals in 2 minutes.
      * When BTC moves, all ALTs correlate → 30 pairs fire simultaneously.
      * Sending all 30 to Telegram = information overload. Top 3 is plenty.
      */
     private static final int MAX_EARLY_PER_FLUSH = 3;
 
-    // [PATCH 4.3] Signal age penalty configuration.
+    // Signal age penalty configuration.
     // STALE_DROP_MS: any candidate older than this is discarded outright.
     // On 15m timeframe, >90s old means price likely moved enough that
     // the planned entry/SL are no longer valid.
@@ -3133,13 +3053,11 @@ public final class SignalSender {
     private static final long EARLY_STALE_DROP_MS  = 90_000L;   // 90s hard cutoff
     private static final long EARLY_STALE_DECAY_MS = 60_000L;   // decay horizon for ranking
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v52] HOT PAIR RESCAN — triggered from aggTrade handler
+    //  HOT PAIR RESCAN — triggered from aggTrade handler
     //  when 30-tick price delta exceeds threshold.
     //  Runs a full processPair() in the background fetchPool.
     //  Result: if valid signal found → sent to Telegram immediately.
     //  Reduces worst-case detection latency from 60s → ≤5s.
-    // ══════════════════════════════════════════════════════════════
     private void maybeHotRescan(String pair, double price) {
         // Cooldown: don't rescan same pair more often than every 90s
         Long lastRescan = hotPairLastRescan.get(pair);
@@ -3191,11 +3109,11 @@ public final class SignalSender {
                     // Respect ISC availability check
                     if (!isc.isSymbolAvailable(idea.symbol)) return;
 
-                    // R:R check (same as BotMain dispatch gate)
+                    // R:R check — синхронизирован с BotMain/processPair gate (≥2.00)
                     double rrRisk = Math.abs(idea.stop  - idea.price);
                     double rrTp2  = Math.abs(idea.tp2   - idea.price);
                     double rr     = rrRisk > 1e-9 ? rrTp2 / rrRisk : 0;
-                    if (rr < 1.80) return;
+                    if (rr < 2.00) return;
 
                     // Flag the signal as hot-rescan triggered
                     List<String> hotFlags = new ArrayList<>(idea.flags);
@@ -3222,7 +3140,7 @@ public final class SignalSender {
     private void flushEarlyTickBuffer() {
         if (earlyTickBuffer.isEmpty()) return;
 
-        // [PATCH-WS-WARMUP] After WS reconnect, velocity data is stale — suppress dispatch.
+        // After WS reconnect, velocity data is stale — suppress dispatch.
         // Prevents "5 signals in 3 minutes" flood that happens on reconnect.
         if (System.currentTimeMillis() - wsLastReconnectMs < WS_WARMUP_MS) {
             earlyTickBuffer.clear(); // Discard stale pre-reconnect candidates
@@ -3237,7 +3155,7 @@ public final class SignalSender {
         }
         if (candidates.isEmpty()) return;
 
-        // [PATCH 4.3] Drop hard-stale candidates (>90s old). These fired on price
+        // Drop hard-stale candidates (>90s old). These fired on price
         // that is no longer current; acting on them = chasing the move.
         int droppedStale = 0;
         Iterator<com.bot.DecisionEngineMerged.TradeIdea> it = candidates.iterator();
@@ -3254,7 +3172,7 @@ public final class SignalSender {
         }
         if (candidates.isEmpty()) return;
 
-        // [PATCH 4.3] Sort by AGE-ADJUSTED probability — older candidates get decay penalty.
+        // Sort by AGE-ADJUSTED probability — older candidates get decay penalty.
         // Fresh signal with prob=70 beats 5s-old signal with prob=72.
         // effectiveProb = probability * (1.0 - age/decay_horizon), clamped to [0.3, 1.0] multiplier.
         candidates.sort(Comparator.comparingDouble(
@@ -3263,7 +3181,7 @@ public final class SignalSender {
                     return i.probability * decayMul;
                 }).reversed());
 
-        // [v35.0] Cap to top-N best signals per flush
+        // Cap to top-N best signals per flush
         if (candidates.size() > MAX_EARLY_PER_FLUSH) {
             candidates = new ArrayList<>(candidates.subList(0, MAX_EARLY_PER_FLUSH));
         }
@@ -3276,10 +3194,10 @@ public final class SignalSender {
             // Re-check ISC (state may have changed since buffering)
             if (!isc.isSymbolAvailable(et.symbol)) continue;
 
-            // [v34.0] EARLY_TICK hourly rate limit — max 3 per pair per hour
+            // EARLY_TICK hourly rate limit — max 3 per pair per hour
             if (earlyTickHourlyLimitReached(et.symbol)) continue;
 
-            // [v35.0] VOLUME FILTER for EARLY_TICK — blocks trash coins.
+            // VOLUME FILTER for EARLY_TICK — blocks trash coins.
             // Problem: RIVERUSDT, SIRENUSDT, VVVUSDT pass EARLY_TICK without
             // any liquidity check. Their $2M daily volume = untradeable.
             // Fix: same MIN_VOL check as processPair.
@@ -3315,7 +3233,7 @@ public final class SignalSender {
                 finalEt = rebuildIdea(et, et.probability, nf);
             }
 
-            // [PATCH-SL-GATE] Same MAX SL% check as processPair() — closes the EARLY_TICK backdoor.
+            // Same MAX SL% check as processPair() — closes the EARLY_TICK backdoor.
             // Without this, EARLY_TICK signals bypassed the 3-5% SL cap entirely.
             // This is why ARIAUSDT (SL=18%) and LABUSDT (SL=11%) reached Telegram.
             double etSlPct = Math.abs(et.price - et.stop) / et.price;
@@ -3326,7 +3244,7 @@ public final class SignalSender {
                 continue;
             }
 
-            // [v35.0] CLEAN DISPATCH — toTelegramString() is now self-contained.
+            // CLEAN DISPATCH — toTelegramString() is now self-contained.
             // No external header needed. Just send the signal directly.
             bot.sendMessageAsync(finalEt.toTelegramString());
             earlySignals.incrementAndGet();
@@ -3350,9 +3268,7 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  FUNDING + OI
-    // ══════════════════════════════════════════════════════════════
 
     private void refreshAllFundingRates() {
         if (rlIpBanned) return;
@@ -3367,13 +3283,13 @@ public final class SignalSender {
             Map<String, Double> rates = new HashMap<>(arr.length());
             for (int i = 0; i < arr.length(); i++) { JSONObject o = arr.getJSONObject(i); rates.put(o.getString("symbol"), o.optDouble("lastFundingRate", 0)); }
 
-            // [v10.0] Apply funding to ALL pairs from bulk response (no extra requests)
+            // Apply funding to ALL pairs from bulk response (no extra requests)
             for (String pair : cachedPairs) {
                 double fr = rates.getOrDefault(pair, 0.0);
                 decisionEngine.updateFundingOI(pair, fr, 0, 0, 0); // funding from bulk, OI below
             }
 
-            // [v10.0] FIX: OI only for top 20 by volume (was 100 = 200 requests every 5 min)
+            // FIX: OI only for top 20 by volume (was 100 = 200 requests every 5 min)
             // 20 pairs × 1 request = 20 requests (was 200). Saves 900 weight per cycle.
             List<String> oiPairs = new ArrayList<>(cachedPairs);
             oiPairs.sort((a, b) -> Double.compare(
@@ -3395,7 +3311,7 @@ public final class SignalSender {
 
     private void fetchAndUpdateOI(String symbol, double fr) {
         try {
-            // [v10.0] Only current OI, skip expensive oiHist (saves 1 request per pair)
+            // Only current OI, skip expensive oiHist (saves 1 request per pair)
             HttpResponse<String> resp = sendBinanceRequest(
                     HttpRequest.newBuilder().uri(URI.create("https://fapi.binance.com/fapi/v1/openInterest?symbol="+symbol))
                             .timeout(Duration.ofSeconds(6)).GET().build(),
@@ -3410,9 +3326,7 @@ public final class SignalSender {
         } catch (Exception e) { decisionEngine.updateFundingOI(symbol, fr, 0, 0, 0); }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  REFRESH VOLUME + PAIRS
-    // ══════════════════════════════════════════════════════════════
 
     private void refreshVolume24h() {
         if (rlIpBanned) return; // [v10.0]
@@ -3492,8 +3406,7 @@ public final class SignalSender {
         } catch (Exception e) { return new HashSet<>(Arrays.asList("BTCUSDT","ETHUSDT","BNBUSDT")); }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // [v34.0] DYNAMIC COIN CATEGORIZATION
+    // DYNAMIC COIN CATEGORIZATION
     // Old: hardcoded switch → missed new TOP coins, couldn't adapt.
     // New: volume-based dynamic classification + known-list seed.
     //
@@ -3507,9 +3420,8 @@ public final class SignalSender {
     //
     // This is a HYBRID approach: known coins use stable labels,
     // new coins get auto-classified by market behavior.
-    // ══════════════════════════════════════════════════════════════
 
-    // [v34.0] Known seeds — these NEVER change category regardless of volume
+    // Known seeds — these NEVER change category regardless of volume
     private static final java.util.Set<String> KNOWN_TOP = java.util.Set.of(
             "BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOT","LINK",
             "MATIC","LTC","ATOM","UNI","AAVE","TON","TRX","NEAR","APT",
@@ -3522,7 +3434,7 @@ public final class SignalSender {
             "ELON","SATS","ORDI","RATS","MYRO","BOME","SLERF","MEW",
             "TRUMP","WEN","DEGEN"
     );
-    // [v34.0] Meme pattern keywords — auto-detect new meme coins
+    // Meme pattern keywords — auto-detect new meme coins
     private static final java.util.Set<String> MEME_KEYWORDS = java.util.Set.of(
             "DOG","CAT","INU","MOON","PEPE","DOGE","SHIB","FROG",
             "BABY","ELON","MEME","WOJAK","CHAD","TURBO","FLOKI",
@@ -3561,12 +3473,10 @@ public final class SignalSender {
                 src.tp1Mult, src.tp2Mult, src.tp3Mult);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  [ДЫРА №1] CVD — Cumulative Volume Delta
     //  takerBuyBaseVolume приходит в каждом kline — уже в Candle.
     //  Накапливаем за CVD_LOOKBACK_1M свечей (по умолчанию 90×1m).
     //  Нормализуем: [-1..+1], где +1 = 100% объём — покупки, -1 = 100% продажи.
-    // ══════════════════════════════════════════════════════════════
 
     public double computeAndStoreCVD(String pair, List<com.bot.TradingCore.Candle> m1) {
         if (m1 == null || m1.size() < 5) return 0.0;
@@ -3589,11 +3499,9 @@ public final class SignalSender {
         return cvdMap.getOrDefault(pair, 0.0);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  [ДЫРА №4] SESSION WEIGHT — рыночные сессии по UTC
     //  Сигналы в NY/London несут в 1.5× больше веса чем сигналы
     //  в 3 ночи UTC (азиатская сессия с ложными пробоями).
-    // ══════════════════════════════════════════════════════════════
 
     private static double getSessionWeight() {
         int h = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getHour();
@@ -3606,13 +3514,11 @@ public final class SignalSender {
         return 0.70;                          // 00-07, 22-24 UTC
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  [ДЫРА №2] LIQUIDATION HEATMAP
     //  Подписка на публичный WebSocket поток Binance: !forceOrder@arr
     //  Собираем ликвидации в ценовые уровни (bucket = 0.1% от цены).
     //  getLiquidationScore() возвращает 0..1 — насколько сильный
     //  магнит ликвидаций находится вблизи текущей цены.
-    // ══════════════════════════════════════════════════════════════
 
     private void connectLiquidationStream() {
         try {
@@ -3714,7 +3620,7 @@ public final class SignalSender {
     private void logCycleStats() {
         long total = totalFetches.get(), hits = cacheHits.get();
         if (total > 0 && total % 500 == 0) {
-            // [PATCH 1.2] Include rejectedFetches count — non-zero means fetchPool is overloaded.
+            // Include rejectedFetches count — non-zero means fetchPool is overloaded.
             long rejected = rejectedFetches.get();
             System.out.printf("[Stats] cache=%.1f%% early=%d liq=%d corr=%d stale=%d profit=%d e=%d opt=%d vpoc=%d fin=%d isc=%d rej=%d q=+%.0f ws=%.0f%% msgs=%d bal=$%.2f%n",
                     100.0*hits/total, earlySignals.get(), blockedLiq.get(), blockedCorr.get(),
@@ -3723,7 +3629,7 @@ public final class SignalSender {
                     blockedIsc.get(), rejected, cycleQualityPenalty, lastCycleWsCoverage * 100.0,
                     wsMessageCount.get(), accountBalance);
 
-            // [PATCH 1.2] Alert loudly when tasks are being dropped — indicates
+            // Alert loudly when tasks are being dropped — indicates
             // TOP_N too high for current pool, or sustained network slowness.
             if (rejected > 0) {
                 System.out.println("[WARN] fetchPool dropped " + rejected + " tasks (queue saturated). "
@@ -3732,19 +3638,17 @@ public final class SignalSender {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  ACCESSORS
-    // ══════════════════════════════════════════════════════════════
 
     public double getAtr(String symbol) {
         CachedCandles cc = candleCache.get(symbol + "_15m");
         if (cc == null || cc.candles.isEmpty()) return 0;
-        // [v37.0] Use robustAtr — prevents underestimation during consolidation
+        // Use robustAtr — prevents underestimation during consolidation
         return com.bot.DecisionEngineMerged.robustAtr(cc.candles, 14);
     }
 
     /**
-     * [v37.0] Returns the noise score (wick/body ratio) for a symbol from cached 15m candles.
+     * Returns the noise score (wick/body ratio) for a symbol from cached 15m candles.
      * Used by EARLY_TICK gate to raise confidence threshold for noisy coins.
      */
     public double getNoiseScore(String symbol) {
@@ -3807,9 +3711,7 @@ public final class SignalSender {
     public com.bot.GlobalImpulseController getGIC()         { return gic; }
     public Map<String, Deque<Double>> getTickDeque()        { return tickPriceDeque; }
 
-    // ══════════════════════════════════════════════════════════════
     //  STATIC MATH UTILS
-    // ══════════════════════════════════════════════════════════════
 
     /** [v23.0] Delegates to TradingCore.atr() — Wilder's smoothed ATR everywhere */
     public static double atr(List<com.bot.TradingCore.Candle> c, int period) {
@@ -3879,11 +3781,9 @@ public final class SignalSender {
         return sb.toString();
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  INNER CLASSES
-    // ══════════════════════════════════════════════════════════════
 
-    // [v28.0] PATCH #9: Multi-level OrderbookSnapshot replacing single bid/ask.
+    // PATCH #9: Multi-level OrderbookSnapshot replacing single bid/ask.
     // OLD: orderbookMap stored ONE level (bookTicker = best bid/ask only).
     //      OBI = (bidQty - askQty) / (bidQty + askQty) — just the spread, not real depth.
     // NEW: stores up to 5 bid levels + 5 ask levels from depth REST snapshot.
@@ -3906,7 +3806,7 @@ public final class SignalSender {
             bidVolume = b; askVolume = a; bidDepth5 = bd5; askDepth5 = ad5; timestamp = t;
         }
 
-        // [v28.0] OBI uses 5-level depth when available, falls back to L1
+        // OBI uses 5-level depth when available, falls back to L1
         public double obi() {
             double bid = bidDepth5 > bidVolume ? bidDepth5 : bidVolume;
             double ask = askDepth5 > askVolume ? askDepth5 : askVolume;
@@ -3917,7 +3817,7 @@ public final class SignalSender {
     }
 
     /**
-     * [v51] Find liquidity wall direction relative to entry price.
+     * Find liquidity wall direction relative to entry price.
      * Returns price level where the wall sits, or -1 if no significant wall detected.
      *
      * Logic: with only L1/L5 aggregated depth available, we use OBI imbalance

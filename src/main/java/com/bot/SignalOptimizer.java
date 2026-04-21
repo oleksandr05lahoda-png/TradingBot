@@ -3,33 +3,11 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * ╔══════════════════════════════════════════════════════════════════════╗
- * ║        SignalOptimizer — TRADINGBOT EDITION v5.0                        ║
- * ╠══════════════════════════════════════════════════════════════════════╣
- * ║  ИСПРАВЛЕНИЯ v5.0:                                                   ║
- * ║                                                                      ║
- * ║  [FIX-BUG-2] УБРАН MAX_IMPULSE_CAP = 0.010 (BUG #2 из аудита)     ║
- * ║    Было: любое движение > 1% обрезалось капом                        ║
- * ║    Проблема: монета +4% = монета +1% для бота — одинаково           ║
- * ║    Бот не видел разницы между нормальным ростом и сильным пампом    ║
- * ║    Стало: адаптивный кап на основе реального ATR символа            ║
- * ║    - Базовый кап: 4× STRONG_IMPULSE (0.010 → 0.040)                ║
- * ║    - Если pumpHunter видит активный памп — кап 0.080                ║
- * ║    - Нормализация теперь относительная (vs исторический ATR)        ║
- * ║                                                                      ║
- * ║  [FIX-OPT] Улучшенный adjustConfidence:                             ║
- * ║    - Логарифмическая нормализация импульса (не линейная)             ║
- * ║    - Кап confidence оставлен на уровне 85.0 (ограничивает жадность) ║
- * ║    - Штрафы за исхождение сохранены, но не дублируются              ║
- * ║                                                                      ║
- * ║  СОХРАНЕНО: MicroTrendResult / MicroAnalysis / PumpHunter hookup    ║
- * ╚══════════════════════════════════════════════════════════════════════╝
- */
+/** SignalOptimizer — TRADINGBOT EDITION v5.0 */
 public final class SignalOptimizer {
 
     private static final int    MIN_TICKS  = 5;
-    // [PATCH v-MILLION #6] MAX_TICKS 200→50: 50 тиков = ~25 секунд данных @ 0.5s tick.
+    // MAX_TICKS 200→50: 50 тиков = ~25 секунд данных @ 0.5s tick.
     // 200 тиков = 100 секунд. Разница для индикатора: ≈0. Экономия RAM: 75%.
     // При 50 парах: 200×50×8 bytes = 80 KB → 50×50×8 bytes = 20 KB.
     private static final int    MAX_TICKS  = 50;
@@ -41,7 +19,7 @@ public final class SignalOptimizer {
     private static final double MAX_CONF = 85.0;  // [v50 AUDIT FIX] Unified cap with DecisionEngine (was 92, caused 4 inconsistent caps)
     private static final double MIN_CONF = 45.0;  // [v50] expanded from 50
 
-    // [FIX-BUG-2] Убран хардкодный кап 0.010 (1%).
+    // Убран хардкодный кап 0.010 (1%).
     // Теперь кап динамический — задаётся в computeAdaptiveImpulseCap()
     // Диапазон: 0.020..0.080 в зависимости от режима рынка
     private static final double IMPULSE_CAP_BASE   = 0.040;  // базовый (было 0.010 = 4× занижено)
@@ -60,9 +38,9 @@ public final class SignalOptimizer {
     private final Map<String, List<Double>> priceFallback       = new ConcurrentHashMap<>();
     private final Map<String, Deque<Double>> momentumHistory    = new ConcurrentHashMap<>();
 
-    // [FIX-BUG-2] История ATR по символам для адаптивного капа
+    // История ATR по символам для адаптивного капа
     private final Map<String, Deque<Double>> symbolAtrHistory   = new ConcurrentHashMap<>();
-    // [PATCH v-MILLION #6] ATR_HISTORY_SIZE 96→48: 48 × 15m = 12h истории ATR (было 24h).
+    // ATR_HISTORY_SIZE 96→48: 48 × 15m = 12h истории ATR (было 24h).
     // 12 часов более чем достаточно для адаптивного капа и режима волатильности.
     // Экономия: -50% записей в symbolAtrHistory.
     private static final int ATR_HISTORY_SIZE = 48;
@@ -77,9 +55,7 @@ public final class SignalOptimizer {
         this.pumpHunter = pumpHunter;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MicroTrendResult
-    // ══════════════════════════════════════════════════════════════
 
     public static final class MicroTrendResult {
 
@@ -92,7 +68,7 @@ public final class SignalOptimizer {
         public final double smoothSpeed;
         public final boolean isExhausted;
 
-        // [FIX-BUG-2] impulse теперь НЕ ограничен хардкодным 0.010
+        // impulse теперь НЕ ограничен хардкодным 0.010
         // Ограничение происходит снаружи через computeAdaptiveImpulseCap
         public MicroTrendResult(double speed, double accel, double avg,
                                 boolean fromTicks, double momentum,
@@ -133,14 +109,12 @@ public final class SignalOptimizer {
     private static final MicroTrendResult ZERO =
             new MicroTrendResult(0, 0, 0, false, 0, 0, false);
 
-    // ══════════════════════════════════════════════════════════════
-    //  [FIX-BUG-2] Адаптивный кап импульса
+    //  Адаптивный кап импульса
     //  Учитывает: активный памп / исторический ATR / базовый уровень
-    // ══════════════════════════════════════════════════════════════
 
     private double computeAdaptiveImpulseCap(String symbol) {
         // Если PumpHunter видит активный памп — расширяем кап
-        // [v51] Use decayedStrength — a 12-minute-old pump should not keep expanding the cap.
+        // Use decayedStrength — a 12-minute-old pump should not keep expanding the cap.
         if (pumpHunter != null) {
             com.bot.PumpHunter.PumpEvent pump = pumpHunter.getRecentPump(symbol);
             if (pump != null && pump.decayedStrength() > 0.65) {
@@ -158,7 +132,7 @@ public final class SignalOptimizer {
             return Math.max(IMPULSE_CAP_MIN, Math.min(IMPULSE_CAP_PUMP, medianAtr * 4.0));
         }
 
-        // [FIX #17] Cold-start: no ATR history yet for this symbol.
+        // Cold-start: no ATR history yet for this symbol.
         // IMPULSE_CAP_BASE = 0.040 (4%) which could be too large for a low-vol coin
         // or too small for a volatile one on first-ever detection.
         // Use the tick price deque range as a temporary proxy if available.
@@ -182,9 +156,7 @@ public final class SignalOptimizer {
         return IMPULSE_CAP_BASE;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  COMPUTE MICRO TREND
-    // ══════════════════════════════════════════════════════════════
 
     public MicroTrendResult computeMicroTrend(String symbol) {
         Deque<Double> dq = tickPriceDeque.get(symbol);
@@ -222,7 +194,7 @@ public final class SignalOptimizer {
             return ZERO;
         }
 
-        // [v34.0] No reverse needed — toArray() returns forward chronological order
+        // No reverse needed — toArray() returns forward chronological order
         MicroTrendResult result = computeFromPrices(symbol, buffer, true);
         microTrendCache.put(symbol, result);
         return result;
@@ -283,11 +255,11 @@ public final class SignalOptimizer {
         // Сохраняем momentum историю
         Deque<Double> momHistory = momentumHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         momHistory.addLast(momentum);
-        // [PATCH v-MILLION #6] Momentum history: 100→20 entries. Exhaustion detection
+        // Momentum history: 100→20 entries. Exhaustion detection
         // нужны только последние 3-5 записей, 20 — с запасом.
         while (momHistory.size() > 20) momHistory.removeFirst();
 
-        // [FIX-BUG-2] Используем адаптивный кап
+        // Используем адаптивный кап
         double adaptiveCap = computeAdaptiveImpulseCap(symbol);
 
         return new MicroTrendResult(speed, accel, avg, fromTicks, momentum, smoothSpeed, isExhausted, adaptiveCap);
@@ -335,9 +307,7 @@ public final class SignalOptimizer {
         return diverging || momentumFalling || peakReversal;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  UPDATE FROM CANDLES
-    // ══════════════════════════════════════════════════════════════
 
     public void updateFromCandles(String symbol, List<com.bot.TradingCore.Candle> candles) {
         if (candles == null || candles.size() < 10) return;
@@ -353,7 +323,7 @@ public final class SignalOptimizer {
 
         priceFallback.put(symbol, prices);
 
-        // [FIX-BUG-2] Обновляем историю ATR для адаптивного капа
+        // Обновляем историю ATR для адаптивного капа
         if (candles.size() >= 15) {
             double atrPct = computeAtrPct(candles);
             if (atrPct > 0) {
@@ -373,21 +343,17 @@ public final class SignalOptimizer {
         return price > 0 ? atr / price : 0;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  ADJUST CONFIDENCE
-    //  [FIX-BUG-2] Нормализация импульса теперь логарифмическая
+    //  Нормализация импульса теперь логарифмическая
     //  Это позволяет корректно различать +1% и +4% движения
-    // ══════════════════════════════════════════════════════════════
 
-    // ══════════════════════════════════════════════════════════════
-    //  [PATCH v-MILLION #7] PERCENTILE-RANK IMPULSE NORMALIZATION
+    //  PERCENTILE-RANK IMPULSE NORMALIZATION
     //  Проблема: линейная нормализация impulse/STRONG_IMPULSE не различает
     //  +1% и +4% движения после нескольких кратных STRONG_IMPULSE.
     //  Решение: percentile rank — возвращает позицию текущего impulse
     //  относительно исторических значений для данного символа [0.0..1.0].
     //  Это позволяет точно измерить "насколько сильный этот импульс
     //  ОТНОСИТЕЛЬНО нормы для данной монеты".
-    // ══════════════════════════════════════════════════════════════
 
     /**
      * Percentile rank текущего impulse в историческом окне [0..1].
@@ -417,10 +383,10 @@ public final class SignalOptimizer {
     }
 
     /**
-     * [v23.0] RESTORED micro-momentum adjustConfidence.
+     * RESTORED micro-momentum adjustConfidence.
      * v18.0 killed this method → bot stopped reacting to tick-level acceleration.
      * Now restored with TAMED influence: ±8 max (was ±30+).
-     * [PATCH v-MILLION #7] Boost/penalty теперь масштабируется по percentile rank,
+     * Boost/penalty теперь масштабируется по percentile rank,
      * а не по линейному ratio — это различает "средний памп" от "аномального".
      */
     public double adjustConfidence(com.bot.DecisionEngineMerged.TradeIdea signal) {
@@ -432,7 +398,7 @@ public final class SignalOptimizer {
         boolean impulseAligned = (isLong && mt.smoothSpeed > 0) || (!isLong && mt.smoothSpeed < 0);
         boolean impulseOpposed = (isLong && mt.smoothSpeed < 0) || (!isLong && mt.smoothSpeed > 0);
 
-        // [PATCH v-MILLION #7] Percentile-scaled boost/penalty.
+        // Percentile-scaled boost/penalty.
         // Percentile rank [0..1] корректирует силу буста:
         //   - 90th percentile: полный буст (+7)
         //   - 50th percentile: половина буста (+3.5)
@@ -465,12 +431,10 @@ public final class SignalOptimizer {
         return Math.max(MIN_CONF, Math.min(MAX_CONF, conf));
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  WITH ADJUSTED CONFIDENCE
-    // ══════════════════════════════════════════════════════════════
 
     /**
-     * [v23.0] Rebuild TradeIdea with micro-momentum adjusted confidence.
+     * Rebuild TradeIdea with micro-momentum adjusted confidence.
      */
     public com.bot.DecisionEngineMerged.TradeIdea withAdjustedConfidence(
             com.bot.DecisionEngineMerged.TradeIdea signal) {
@@ -485,9 +449,7 @@ public final class SignalOptimizer {
                 signal.forecast, signal.tp1Mult, signal.tp2Mult, signal.tp3Mult);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MICRO ANALYSIS
-    // ══════════════════════════════════════════════════════════════
 
     public MicroAnalysis analyzeMicroStructure(String symbol,
                                                List<com.bot.TradingCore.Candle> c1m,
@@ -593,7 +555,7 @@ public final class SignalOptimizer {
         }
 
         if (recent.size() < 25) return false;
-        // [v34.0] Already in forward chronological order from toArray()
+        // Already in forward chronological order from toArray()
 
         double first = recent.get(recent.size() - 20);
         double last  = recent.get(recent.size() - 1);

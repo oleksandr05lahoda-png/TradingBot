@@ -4,17 +4,15 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-// ═══════════════════════════════════════════════════════════════════════
 // DecisionEngineMerged — REFACTORED v38-FINAL
 // CHANGES vs original:
-//   [FIX-allFlags]   List<String> allFlags moved BEFORE CI filter block
+//   List<String> allFlags moved BEFORE CI filter block
 //                    → fixes "Cannot resolve symbol 'allFlags'" compile error
-//   [REFACTOR]       MIN_AGREEING_CLUSTERS = 3 (was 2)
-//   [REFACTOR]       MIN_CLUSTER_SCORE = 0.25 (was none)
-//   [REFACTOR]       Choppiness Index filter (CI > 61.8/68.0 block)
-//   [REFACTOR]       Thread-safe symbolMinConf via compute()
-//   [REFACTOR]       vdHistory/cvdHistory via computeIfAbsent()
-// ═══════════════════════════════════════════════════════════════════════
+//   MIN_AGREEING_CLUSTERS = 3 (was 2)
+//   MIN_CLUSTER_SCORE = 0.25 (was none)
+//   Choppiness Index filter (CI > 61.8/68.0 block)
+//   Thread-safe symbolMinConf via compute()
+//   vdHistory/cvdHistory via computeIfAbsent()
 public final class DecisionEngineMerged {
 
     public static volatile java.time.ZoneId USER_ZONE = java.time.ZoneId.of("Europe/Warsaw");
@@ -132,18 +130,22 @@ public final class DecisionEngineMerged {
     private static final double DIV_VOL_DELTA_GATE = 1.80;
     private static final double DIV_TREND_RSI_GATE = 72.0;
 
-    // [v7.0] Crash score порог
+    // Crash score порог
     private static final double CRASH_SCORE_BOOST_THRESHOLD = 0.35;
     private static final double CRASH_SHORT_BOOST_BASE = 0.75;
 
-    // [REFACTOR] Cluster confluence bonus
+    // Cluster confluence bonus
     private static final double CLUSTER_CONFLUENCE_BONUS = 0.15;
-    // [REFACTOR] Raised 2→3: two weak clusters (each 0.15) were enough to fire a signal.
+    // Raised 2→3: two weak clusters (each 0.15) were enough to fire a signal.
     // With three required, we eliminate "2 noise clusters = signal" false positives (~-25% false signals).
     private static final int    MIN_AGREEING_CLUSTERS    = 3;
-    // [REFACTOR] Minimum contribution per cluster to count as "agreeing".
-    // Prevents clusters with only micro-contributions (e.g. 0.10) from being counted.
-    private static final double MIN_CLUSTER_SCORE        = 0.25;
+    // Raised 0.25→0.30: кластер с weight <30% = шум, а не confluence.
+    // Эффект: -10..15% сигналов, +5..8% WR. «2 средних + 1 слабый» больше не проходят.
+    private static final double MIN_CLUSTER_SCORE        = 0.30;
+
+    // Single authoritative probability ceiling. All intermediate caps and the
+    // final calibrator clamp must reference this constant. Previously hardcoded 85 in 5+ places.
+    private static final double PROB_CEIL = 85.0;
 
     // ── State ─────────────────────────────────────────────────────
     private final Map<String, Double>           symbolMinConf    = new ConcurrentHashMap<>();
@@ -196,7 +198,7 @@ public final class DecisionEngineMerged {
     private final java.util.concurrent.atomic.AtomicInteger bayesSampleTrades
             = new java.util.concurrent.atomic.AtomicInteger(0);
 
-    // [PATCH 4.1] Two-speed Bayesian prior — fixes regime-change lag.
+    // Two-speed Bayesian prior — fixes regime-change lag.
     //
     // Old behavior: pure linear blend over 120 trades. After regime change
     // (e.g. trend → choppy), engine kept using stale prior for 100+ trades.
@@ -298,7 +300,7 @@ public final class DecisionEngineMerged {
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
 
-    // [PATCH EARLY_TICK] Category-aware directional score thresholds for EARLY_TICK gate.
+    // Category-aware directional score thresholds for EARLY_TICK gate.
     //
     // Old: single 0.25 threshold for all categories.
     // Problem: MEME pairs have 3–5× more random directional noise than TOP pairs.
@@ -370,7 +372,7 @@ public final class DecisionEngineMerged {
         if (losses >= CONF_PENALTY_THRESHOLD) {
             final double penalty = Math.min(CONF_PENALTY_MAX,
                     (losses - CONF_PENALTY_THRESHOLD + 1) * CONF_PENALTY_PER_LOSS);
-            // [REFACTOR] compute() вместо get()+put() — атомарное read-modify-write.
+            // compute() вместо get()+put() — атомарное read-modify-write.
             // Старый код: get()+put() = lost update при конкурентном доступе из fetchPool (34 потока).
             symbolMinConf.compute(symbol, (k, cur) -> {
                 double base = (cur != null ? cur : globalMinConf.get());
@@ -381,12 +383,12 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [FIX v32+] Record win — decays confidence penalty, resets consecutive losses.
+     * Record win — decays confidence penalty, resets consecutive losses.
      * Call from BotMain TradeResolver after TP hit.
      */
     public void recordWin(String symbol, com.bot.TradingCore.Side side) {
         consecutiveLossMap.put(symbol, 0);
-        // [REFACTOR] compute() — атомарный декремент штрафа confidence
+        // compute() — атомарный декремент штрафа confidence
         symbolMinConf.compute(symbol, (k, cur) -> {
             double base = (cur != null ? cur : globalMinConf.get());
             return Math.max(globalMinConf.get(), base - CONF_PENALTY_PER_LOSS);
@@ -394,7 +396,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [FIX v32+] Called from BotMain after any position close (TP/SL/Chandelier).
+     * Called from BotMain after any position close (TP/SL/Chandelier).
      * Blocks re-entry in same direction for POST_EXIT_COOLDOWN_MS to prevent spin-trading.
      */
     public void markPostExitCooldown(String symbol, com.bot.TradingCore.Side side) {
@@ -445,7 +447,7 @@ public final class DecisionEngineMerged {
     /** [ДЫРА №1] CVD — устанавливается из SignalSender после вычисления накопленной дельты */
     public void setCVD(String sym, double cvdNormalized) {
         cvdMap.put(sym, cvdNormalized);
-        // [FIX v32+] Build CVD history for persistence check (short-covering vs real demand)
+        // Build CVD history for persistence check (short-covering vs real demand)
         Deque<Double> hist = cvdHistory.computeIfAbsent(sym,
                 k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
         hist.addLast(cvdNormalized);
@@ -453,7 +455,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [FIX #7] CVD Persistence check.
+     * CVD Persistence check.
      * Returns true only if the LAST minBars readings ALL agree in direction.
      * Prevents short-covering spikes from triggering LONG signals.
      * FIXED: was counting any matching bar in the window — now requires the last N to be consecutive.
@@ -517,17 +519,15 @@ public final class DecisionEngineMerged {
         return h.stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  CLUSTER SCORE HOLDER
     //  Каждый кластер хранит свой лучший LONG и SHORT score
-    // ══════════════════════════════════════════════════════════════
 
     private static final class ClusterScores {
         double longScore  = 0;
         double shortScore = 0;
         final List<String> flags = new ArrayList<>();
 
-        // [v11.0] Per-cluster cap reduced: prevents single market event
+        // Per-cluster cap reduced: prevents single market event
         // from inflating one cluster's score via correlated sub-signals.
         // 0.75 (was 0.85) — more conservative, fewer false-strong signals
         private static final double CLUSTER_CAP = 0.75;
@@ -563,9 +563,7 @@ public final class DecisionEngineMerged {
         double netShort() { return shortScore - longScore * 0.3; }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MARKET CONTEXT
-    // ══════════════════════════════════════════════════════════════
 
     private static final class MarketContext {
         final double volMultiplier;
@@ -595,8 +593,7 @@ public final class DecisionEngineMerged {
         return new MarketContext(clamp(volMult, 0.3, 3.0), atrCurrent / (price + 1e-9));
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v37.0] VOLATILITY BUCKET — per-symbol volatility classification
+    //  VOLATILITY BUCKET — per-symbol volatility classification
     //
     //  PROBLEM (RIVER case): bот ставил стоп 0.70% на монете с ATR 2-3%.
     //  Причина: ATR во время консолидации был искусственно сжат.
@@ -605,7 +602,6 @@ public final class DecisionEngineMerged {
     //
     //  РЕШЕНИЕ: классифицировать монету по ДОЛГОСРОЧНОМУ ATR и применять
     //  соответствующие минимальные кратные для стопа и тейков.
-    // ══════════════════════════════════════════════════════════════
 
     public enum VolatilityBucket {
         LOW    ("LOW",    2.2, 0.04, 1.00),  // <0.5% ATR/price:  BTC/ETH
@@ -632,7 +628,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [v37.0] Robust ATR: max(currentATR, longTermATR × 0.80).
+     * Robust ATR: max(currentATR, longTermATR × 0.80).
      *
      * PROBLEM: during consolidation, current ATR can drop to 30-40% of normal.
      * This makes the ATR-based stop floor dangerously tight.
@@ -678,7 +674,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [v37.0] Noise Score: average wick/body ratio over last N candles.
+     * Noise Score: average wick/body ratio over last N candles.
      *
      * High score (>2.5) = long wicks relative to body = market is choppy.
      * RIVER on the screenshot = classic "noisy" coin: wicks dominate body.
@@ -754,9 +750,7 @@ public final class DecisionEngineMerged {
         CalibRecord(double p, boolean c) { predicted = p; correct = c; }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  TRADE IDEA
-    // ══════════════════════════════════════════════════════════════
 
     public static final class TradeIdea {
         public final String           symbol;
@@ -768,7 +762,7 @@ public final class DecisionEngineMerged {
         public final String           htfBias;
         public final double           rr;
         public final CoinCategory     category;
-        // [v14.0] ForecastEngine integration
+        // ForecastEngine integration
         public final com.bot.TradingCore.ForecastEngine.ForecastResult forecast;
         public final String trendPhase;
         // [ДЫРА №6] Адаптивные множители TP по режиму рынка
@@ -785,11 +779,13 @@ public final class DecisionEngineMerged {
             return robustAtrPctOverride > 0 ? robustAtrPctOverride : robustAtrPct;
         }
         public void setRobustAtrPct(double v) {
-            if (v > 0 && v < 1.0) this.robustAtrPctOverride = v;
+            // v = ATR/price ratio (NOT percent). Realistic range: (0, 0.5].
+            // 0.5 = 50% ATR/price = extreme volatility edge. Anything >0.5 is a bug source.
+            if (v > 0 && v <= 0.5) this.robustAtrPctOverride = v;
         }
 
         public final double robustAtrPct;
-        // [PATCH 4.3] Signal age tracking — enables decay-based filtering in
+        // Signal age tracking — enables decay-based filtering in
         // earlyTickBuffer and anywhere else ideas sit in a queue. Stale signals
         // (older than ~90s on 15m tf) lose edge because the move they predicted
         // may have already played out. Consumers use ageMs() to apply penalty.
@@ -828,9 +824,9 @@ public final class DecisionEngineMerged {
             this.forecast = forecast;
             this.trendPhase = forecast != null ? forecast.trendPhase.name() : "UNKNOWN";
             this.tp1Mult = tp1Mult; this.tp2Mult = tp2Mult; this.tp3Mult = tp3Mult;
-            // [v43] Compute robustAtrPct from stop distance (best available proxy without passing ATR directly)
+            // Compute robustAtrPct from stop distance (best available proxy without passing ATR directly)
             this.robustAtrPct = price > 0 ? Math.abs(price - stop) / price : 0.01;
-            // [PATCH 4.3] Stamp creation time — all overloads chain through this ctor.
+            // Stamp creation time — all overloads chain through this ctor.
             this.createdAtMs = System.currentTimeMillis();
 
             double risk = Math.abs(price - stop);
@@ -884,7 +880,7 @@ public final class DecisionEngineMerged {
                 "2H_BEAR", "1H2H_BULL", "1H2H_BEAR", "HTF_CONFLICT", "VWAP_BULL",
                 "VWAP_BEAR", "FR_NEG", "FR_POS", "FR_FALL", "FR_RISE", "OI_UP", "OI_DN",
                 "PUMP_HUNT_",
-                // [v28.0] PATCH #20: Added missing internal prefixes that could leak to Telegram
+                // PATCH #20: Added missing internal prefixes that could leak to Telegram
                 "BOS5_",      // e.g. BOS5_LVL=219.3400 — internal swing level number
                 "CHOCH_",     // internal BoS direction flags
                 "LOW_CLUSTERS_", // internal cluster count debug info
@@ -906,7 +902,7 @@ public final class DecisionEngineMerged {
 
         /** Флаги видимые трейдеру — размер, OBI, дельта, конфлюэнция, фаза */
         private List<String> traderFlags() {
-            // [v27.0] Priority-ranked flag rendering.
+            // Priority-ranked flag rendering.
             // PROBLEM: old code showed CVD_DIV⚠ + CVD_SELL + CVD_DIV_BEAR — 3 flags for 1 fact.
             // FIX: deduplicate by semantic group, cap at 5 visible flags, priority order:
             //   1. Risk warnings (VOLATILE, BTC_BLOCK, LOW_SESSION)
@@ -957,7 +953,7 @@ public final class DecisionEngineMerged {
                     volShown = true;
                     continue;
                 }
-                // [v29] VDA: VDA+0.75 → "⚡VDA↑", VDA-0.80 → "⚡VDA↓"
+                // VDA: VDA+0.75 → "⚡VDA↑", VDA-0.80 → "⚡VDA↓"
                 if (f.startsWith("VDA+") || f.startsWith("VDA-")) {
                     result.add("⚡VDA" + (f.startsWith("VDA+") ? "↑" : "↓"));
                     continue;
@@ -988,7 +984,7 @@ public final class DecisionEngineMerged {
                 if (f.equals("SL_ADJ")) { result.add("📐 SL_ADJ"); break; }
             }
 
-            // [v27.0] Cap at 6 flags max — cognitive load limit.
+            // Cap at 6 flags max — cognitive load limit.
             // A trader needs to act in <3 seconds. More than 6 flags = ignored.
             if (result.size() > 6) {
                 return result.subList(0, 6);
@@ -997,15 +993,13 @@ public final class DecisionEngineMerged {
             return result;
         }
 
-        // ═══════════════════════════════════════════════════════
-        // [v38.0] TradingView-совместимый тикер для поиска монеты
-        // ═══════════════════════════════════════════════════════
+        // TradingView-совместимый тикер для поиска монеты
         private static String toTradingViewTicker(String symbol) {
             // BTCUSDT → BINANCE:BTCUSDT.P (Perpetual Futures)
             return "BINANCE:" + symbol + ".P";
         }
 
-        // [v38.0] Аналог в традиционных активах — помогает понять масштаб монеты
+        // Аналог в традиционных активах — помогает понять масштаб монеты
         private static String getComparableAsset(String symbol, CoinCategory cat) {
             if (cat == CoinCategory.TOP) {
                 if (symbol.startsWith("BTC"))  return "🥇 ≈ Золото (XAU)";
@@ -1026,7 +1020,7 @@ public final class DecisionEngineMerged {
             return "📊 ≈ Mid-cap акция";
         }
 
-        // [v38.0] Сектор монеты для контекста
+        // Сектор монеты для контекста
         private static String detectCoinSector(String symbol) {
             String s = symbol.toUpperCase();
             if (s.contains("AI") || s.contains("FET") || s.contains("RENDER") || s.contains("RNDR")
@@ -1093,9 +1087,7 @@ public final class DecisionEngineMerged {
         @Override public String toString() { return toTelegramString(); }
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  PUBLIC API
-    // ══════════════════════════════════════════════════════════════
 
     // [MODULE 1 v33] FR MOMENTUM HISTORY — stores last N funding rate snapshots per symbol.
     // Needed to compute 2nd derivative (acceleration) of funding rate.
@@ -1148,7 +1140,7 @@ public final class DecisionEngineMerged {
         else if (accuracy < 0.50) base += 2.5;
         else if (accuracy > 0.65) base -= 3.0;
         else if (accuracy > 0.60) base -= 1.5;
-        // [REFACTOR] compute() — атомарное обновление, безопасно при конкурентном доступе
+        // compute() — атомарное обновление, безопасно при конкурентном доступе
         final double newVal = clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL);
         symbolMinConf.compute(sym, (k, cur) -> newVal);
     }
@@ -1172,12 +1164,10 @@ public final class DecisionEngineMerged {
         return generate(symbol, c1, c5, c15, c1h, null, cat, System.currentTimeMillis());
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v25.0] 5m BREAK OF STRUCTURE / CHANGE OF CHARACTER
+    //  5m BREAK OF STRUCTURE / CHANGE OF CHARACTER
     //  Primary entry trigger: fires 1-3 bars BEFORE 15m structure confirms.
     //  BoS  = breakout WITH the HTF trend  → strong signal (score 0.62)
     //  ChoCh = breakout AGAINST HTF trend  → counter-trend caution (score 0.42)
-    // ══════════════════════════════════════════════════════════════
 
     private static final class BosResult {
         final boolean detected;
@@ -1192,7 +1182,7 @@ public final class DecisionEngineMerged {
 
     /**
      * Detect a Break of Structure on 5m candles.
-     * [FIX #8] Was using global MAX pivot high / MIN pivot low over the entire window.
+     * Was using global MAX pivot high / MIN pivot low over the entire window.
      * A real BoS breaks the MOST RECENT swing, not an arbitrary historical extreme.
      * Fixed: scan from right-to-left and stop at the FIRST confirmed pivot.
      */
@@ -1204,7 +1194,7 @@ public final class DecisionEngineMerged {
         double lastSwingLow  = Double.MAX_VALUE;
         boolean foundHigh = false, foundLow = false;
 
-        // [FIX #8] Scan right-to-left: stop at FIRST confirmed pivot (most recent)
+        // Scan right-to-left: stop at FIRST confirmed pivot (most recent)
         for (int i = n - 3; i >= 2; i--) {
             double hi = c5.get(i).high;
             double lo = c5.get(i).low;
@@ -1241,9 +1231,7 @@ public final class DecisionEngineMerged {
         );
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  CORE GENERATE — v7.0 CLUSTER ARCHITECTURE
-    // ══════════════════════════════════════════════════════════════
 
     private TradeIdea generate(String symbol,
                                List<com.bot.TradingCore.Candle> c1,
@@ -1272,11 +1260,11 @@ public final class DecisionEngineMerged {
         double btcAccel         = gicCtx != null ? gicCtx.btcMomentumAccel : 0.0;
         double gicShortBoost    = gicCtx != null ? gicCtx.shortBoost : 1.0;
 
-        // [FIX #11] Read explicit longSuppressionMult field — no more sentinel decode.
+        // Read explicit longSuppressionMult field — no more sentinel decode.
         // Old code: if (confAdj < -50) longSuppression = (confAdj+150)/100 — opaque and fragile.
         double gicLongSuppression = gicCtx != null ? gicCtx.longSuppressionMult : 1.0;
 
-        // [v26.0] GIC DIRECTIONAL GATE — consume onlyLong / onlyShort that were
+        // GIC DIRECTIONAL GATE — consume onlyLong / onlyShort that were
         // previously computed in GIC but never enforced in generate().
         // onlyLong  = BTC_STRONG_UP + strength > 0.82  → veto all SHORT signals
         // onlyShort = BTC_STRONG_DOWN / CRASH / PANIC + strength > 0.78 → veto all LONG signals
@@ -1305,18 +1293,16 @@ public final class DecisionEngineMerged {
 
         adaptGlobalMinConf(state, atr14, price);
 
-        // [PATCH v1.0] LOCAL EXHAUSTION — detect per-pair dumps/pumps independent of BTC GIC.
+        // LOCAL EXHAUSTION — detect per-pair dumps/pumps independent of BTC GIC.
         // Critical for altcoins that dump alone while BTC stays flat.
         // Applied AFTER candidateSide is known (see veto below).
         LocalExhaustion localExh = detectLocalExhaustion(c15, atr14);
 
-        // ═══════════════════════════════════════════════════════════════
-        // [PATCH C v42] POST-PUMP DETECTION
+        // POST-PUMP DETECTION
         // Кейс SOONUSDT: +105% за ночь, потом -20% от хая → бот дал LONG в
         // свободном падении. Блокируем LONG если монета выросла >35% за 20
         // свечей (5h на 15m) и сейчас упала >8% от хая.
         // Применяется ПЕРЕД кластерами — экономит CPU на заведомо битом LONG.
-        // ═══════════════════════════════════════════════════════════════
         boolean postPumpDump = false;
         double postPumpGain = 0, postPumpDropFromHi = 0;
         if (c15.size() >= 20) {
@@ -1334,15 +1320,14 @@ public final class DecisionEngineMerged {
                 }
             }
         }
-        // ═══════════════════════════════════════════════════════════════
 
-        // [v23.0] ADX low in RANGE: penalty, not veto
+        // ADX low in RANGE: penalty, not veto
         boolean adxRangePenalty = false;
         if (!aggressiveShort && state == MarketState.RANGE && adx(c15, 14) < 15) {
             adxRangePenalty = true;
         }
 
-        // [PATCH C v42] allFlags перенесён сюда из низа метода — PostPump блок пишет в него.
+        // allFlags перенесён сюда из низа метода — PostPump блок пишет в него.
         // Все предыдущие add() в этот список сохранены ниже в том же порядке.
         List<String> allFlags = new ArrayList<>();
         if (adxRangePenalty) allFlags.add("ADX_LOW_RANGE");
@@ -1351,12 +1336,10 @@ public final class DecisionEngineMerged {
                     postPumpGain * 100, postPumpDropFromHi * 100));
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v38.0] REGIME FILTER — блокировка нечитаемого рынка
+        // REGIME FILTER — блокировка нечитаемого рынка
         // Если ADX < 12 И ATR в нижнем 15-м перцентиле И рынок RANGE
         // → структура отсутствует, любой сигнал = монетка.
         // Исключение: aggressiveShort (BTC crash) пробивает фильтр.
-        // ════════════════════════════════════════════════════════
         if (!aggressiveShort && state == MarketState.RANGE) {
             double adxVal = adx(c15, 14);
             double atrPct = atr14 / (price + 1e-9);
@@ -1374,14 +1357,12 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
-        // [REFACTOR] CHOPPINESS INDEX FILTER — дополнительный фильтр бокового рынка.
+        // CHOPPINESS INDEX FILTER — дополнительный фильтр бокового рынка.
         // ADX + ATR percentile не ловят все случаи choppiness (например ADX=20, atrPctile=0.30
         // формально проходит фильтр, но рынок всё ещё пилообразный).
         // CI > 61.8 = классический порог choppiness (золотое сечение).
         // Исключения: aggressiveShort (BTC crash), сильный тренд (STRONG_TREND), earlyShort.
-        // ════════════════════════════════════════════════════════
-        // [PATCH C v42] allFlags уже объявлен выше (после PostPump detection).
+        // allFlags уже объявлен выше (после PostPump detection).
         // Дубликат объявления удалён, чтобы не было "variable already defined".
 
         if (!aggressiveShort && state != MarketState.STRONG_TREND && c15.size() >= 15) {
@@ -1403,10 +1384,8 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v38.0] SYMBOL NAME FILTER — блокировка мусорных пар
+        // SYMBOL NAME FILTER — блокировка мусорных пар
         // Пары с не-ASCII символами (иероглифы, спецзнаки) = неликвид
-        // ════════════════════════════════════════════════════════
         for (int ci = 0; ci < symbol.length(); ci++) {
             char ch = symbol.charAt(ci);
             if (ch > 127) return null; // не-ASCII = мусорная пара
@@ -1425,7 +1404,7 @@ public final class DecisionEngineMerged {
             for (int i = n15 - 1; i >= Math.max(0, n15 - 6); i--) {
                 if ((c15.get(i).close > c15.get(i).open) == up) consec++; else break;
             }
-            // [v50] 2→1: single directional bar after 1.2×ATR move = already late
+            // 2→1: single directional bar after 1.2×ATR move = already late
             if (consec >= 1 && up) lateEntryLong = true;
             if (consec >= 1 && !up) lateEntryShort = true;
             lateMoveAtrMul = Math.abs(move4bars) / (atr14 + 1e-12);
@@ -1475,31 +1454,27 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
         //  ИНИЦИАЛИЗАЦИЯ 5 КЛАСТЕРОВ
-        // ════════════════════════════════════════════════════════
         ClusterScores cStructure   = new ClusterScores(); // BOS, HH/HL, FVG, OB, LiqSweep
         ClusterScores cMomentum    = new ClusterScores(); // Impulse, AntiLag, Pump, Compression
         ClusterScores cVolume      = new ClusterScores(); // VolumeDelta, VolumeSpike
         ClusterScores cHTF         = new ClusterScores(); // 1H, 2H bias, VWAP
         ClusterScores cDerivatives = new ClusterScores(); // Funding, OI, Divergences
         ClusterScores cEarly       = new ClusterScores(); // [v7.1] Early Reversal Detection
-        // [v50] allFlags уже объявлен выше (перед CI filter). Добавляем отложенные флаги.
+        // allFlags уже объявлен выше (перед CI filter). Добавляем отложенные флаги.
         if (momentumExhausted) allFlags.add("MOM_EXHAUSTED_" + (exhaustionDirection > 0 ? "UP" : "DN"));
         if (velocityDecay) allFlags.add("VEL_DECAY");
 
-        // ════════════════════════════════════════════════════════
-        // [v25.0] 5m BREAK OF STRUCTURE — PRIMARY ENTRY TRIGGER
+        // 5m BREAK OF STRUCTURE — PRIMARY ENTRY TRIGGER
         // Fires 1-3 bars before 15m structure confirms.
         // BoS aligned with HTF → high-conviction structural entry.
         // ChoCh against HTF → early reversal caution (lower score).
-        // ════════════════════════════════════════════════════════
         int htfStructure15 = marketStructure(c15); // reuse: +1 bull, -1 bear, 0 neutral
         BosResult bos5 = detectBoS(c5, htfStructure15);
         if (bos5.detected) {
             // BoS confirmed with HTF trend = strong confluence entry
             // ChoCh against HTF = possible reversal but weaker conviction
-            // [v30] BoS5m score raised: BoS 0.62→0.72, ChoCh 0.42→0.52.
+            // BoS5m score raised: BoS 0.62→0.72, ChoCh 0.42→0.52.
             // 5m BoS is the EARLIEST reliable structural signal before 15m candle closes.
             // It was underweighted vs FVG (0.50) and OB (0.52). Fixed.
             double bosBaseScore = bos5.isChoch ? 0.52 : 0.72;
@@ -1512,9 +1487,7 @@ public final class DecisionEngineMerged {
             allFlags.add(String.format("BOS5_LVL=%.4f", bos5.swingLevel));
         }
 
-        // ════════════════════════════════════════════════════════
         // [CLUSTER 0] BTC CRASH — прямой override, ДО кластеров
-        // ════════════════════════════════════════════════════════
         double crashBoost = 0;
         if (btcCrashScore >= CRASH_SCORE_BOOST_THRESHOLD) {
             crashBoost = (btcCrashScore - CRASH_SCORE_BOOST_THRESHOLD)
@@ -1531,9 +1504,7 @@ public final class DecisionEngineMerged {
             allFlags.add("BTC_ACCEL" + String.format("%.0f", btcAccel * 10000));
         }
 
-        // ════════════════════════════════════════════════════════
         // КЛАСТЕР 1: STRUCTURE
-        // ════════════════════════════════════════════════════════
 
         // Market Structure (HH/HL vs LL/LH)
         int structure = marketStructure(c15);
@@ -1638,9 +1609,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
         // КЛАСТЕР 2: MOMENTUM
-        // ════════════════════════════════════════════════════════
 
         // Anti-Lag (1m+5m+15m)
         // [v15.0 FIX KITEUSDT] Block ANTI_LAG in volatility squeeze (ATR < 60% of 50-bar avg)
@@ -1687,7 +1656,7 @@ public final class DecisionEngineMerged {
         if (pullUp)   cMomentum.addLong(mctx.s(0.55), "PULL_UP");
         if (pullDown) cMomentum.addShort(mctx.s(0.55), "PULL_DN");
 
-        // [v51] Age-aware PumpHunter integration. Key changes vs v50:
+        // Age-aware PumpHunter integration. Key changes vs v50:
         //   1. Use decayedStrength() instead of raw strength — events older than 3min
         //      get progressively weaker voice, 0 at 15min. Fixes late-echo signals.
         //   2. Handle new reversal types: PUMP_EXHAUSTION_SHORT → crosses SHORT into
@@ -1764,9 +1733,9 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // [v29] VDA — Volume Delta Acceleration. Leading indicator: fires on first ticks
+        // VDA — Volume Delta Acceleration. Leading indicator: fires on first ticks
         // of a real impulse before the candle shows it. Weight 0.60 = highest in cMomentum.
-        // [v50] VDA weight raised 0.60→0.75 — this is the most leading indicator we have.
+        // VDA weight raised 0.60→0.75 — this is the most leading indicator we have.
         if (Math.abs(vdaVal) >= 0.20) {
             double vdaScore = mctx.s(Math.min(0.75, Math.abs(vdaVal) * 0.85));
             if (vdaVal > 0) cMomentum.addLong(vdaScore,  "VDA_BUY_ACCEL");
@@ -1776,13 +1745,10 @@ public final class DecisionEngineMerged {
         if (move5 > 0.002 && vdaVal < -0.25) { cMomentum.penalizeLong(0.55);  allFlags.add("VDA_DIV_BEAR"); }
         if (move5 < -0.002 && vdaVal > 0.25) { cMomentum.penalizeShort(0.55); allFlags.add("VDA_DIV_BULL"); }
 
-        // ════════════════════════════════════════════════════════
-        // ════════════════════════════════════════════════════════
         // КЛАСТЕР 3: VOLUME
-        // ════════════════════════════════════════════════════════
 
-        // [v28.0] PATCH #4: CVD triple-count fix.
-        // [FIX v32+] SHORT-COVERING BOUNCE FIX: LONG requires CVD persistent 3+ bars.
+        // PATCH #4: CVD triple-count fix.
+        // SHORT-COVERING BOUNCE FIX: LONG requires CVD persistent 3+ bars.
         // A single CVD spike on the bottom is NOT real demand — it's shorts covering stops.
         // Only flag CVD_BUY (LONG signal) when positive CVD holds across multiple bars.
         // SHORT side has no persistence requirement: one bar of aggressive selling is enough.
@@ -1798,13 +1764,13 @@ public final class DecisionEngineMerged {
                     ? mctx.s(Math.min(0.65, Math.abs(cvdVal) * 0.70)) : 0.0;
             double bestScore = Math.max(vdScore, cvdScore);
 
-            // [v33] LONG CVD remains stricter than SHORT, but RS leaders can confirm faster.
+            // LONG CVD remains stricter than SHORT, but RS leaders can confirm faster.
             int bullPersistBars = getBullCvdPersistenceBars(symbol);
             boolean cvdBullPersistent = isCVDPersistent(symbol, true, bullPersistBars);
             boolean volBull = (vd != null && vd > 0 && vdRatio > 1.5) || (cvdVal > 0.10 && cvdBullPersistent);
             boolean volBear = (vd != null && vd < 0 && vdRatio > 1.5) || cvdVal < -0.10; // bear: instant
 
-            // [FIX #6] DISTRIBUTION DETECTOR
+            // DISTRIBUTION DETECTOR
             // Classic distribution: volume expanding on last 3 bars, but price gain
             // decelerating > 50% vs prior 3 bars. Institutions offloading to retail —
             // CVD still positive (retail hitting ask) but price can no longer advance.
@@ -1851,7 +1817,7 @@ public final class DecisionEngineMerged {
         // CVD-divergence (high-confidence threshold: price strongly disagrees with CVD)
         boolean cvdDivBear = move5 > 0.003 && cvdVal < -0.15;
         boolean cvdDivBull = move5 < -0.003 && cvdVal > 0.15;
-        // [FIX v32+] Remove duplicate penalize calls — addShort/addLong already handle it
+        // Remove duplicate penalize calls — addShort/addLong already handle it
         if (cvdDivBear) { cVolume.addShort(mctx.s(0.55), "CVD_DIV_BEAR"); allFlags.add("CVD_DIV⚠"); }
         if (cvdDivBull) { cVolume.addLong(mctx.s(0.55),  "CVD_DIV_BULL"); allFlags.add("CVD_DIV⚠"); }
 
@@ -1861,9 +1827,7 @@ public final class DecisionEngineMerged {
             else           cVolume.boostShort(mctx.s(0.22), "VOL_SPIKE");
         }
 
-        // ════════════════════════════════════════════════════════
         // КЛАСТЕР 4: HTF (Higher Timeframe)
-        // ════════════════════════════════════════════════════════
 
         // 1H Bias
         if (bias1h == HTFBias.BULL) {
@@ -1889,7 +1853,7 @@ public final class DecisionEngineMerged {
         if ((bias1h == HTFBias.BULL && bias2h == HTFBias.BEAR) ||
                 (bias1h == HTFBias.BEAR && bias2h == HTFBias.BULL)) {
             if (!aggressiveShort) {
-                // [v8.0] Аддитивный штраф вместо *= 0.50
+                // Аддитивный штраф вместо *= 0.50
                 cHTF.boostLong(-0.15, null);
                 cHTF.boostShort(-0.15, null);
             } else {
@@ -1904,7 +1868,7 @@ public final class DecisionEngineMerged {
         if (price > vwapVal * 1.0008) cHTF.boostLong(mctx.s(0.18), "VWAP_BULL");
         if (price < vwapVal * 0.9992) cHTF.boostShort(mctx.s(0.18), "VWAP_BEAR");
 
-        // [FIX v32+] VWAP counter-trend penalty.
+        // VWAP counter-trend penalty.
         // Price aggressively below VWAP + LONG candidate = trading against institutional flow.
         // Price aggressively above VWAP + SHORT candidate (not crash mode) = same issue.
         // This is the #1 killer of false LONG setups in bear markets.
@@ -1917,14 +1881,12 @@ public final class DecisionEngineMerged {
             allFlags.add("VWAP_ABOVE_PENALTY");
         }
 
-        // ════════════════════════════════════════════════════════
         // КЛАСТЕР 5: DERIVATIVES (Funding, OI, Divergences)
-        // ════════════════════════════════════════════════════════
 
         FundingOIData frData = fundingCache.get(symbol);
         boolean hasFR = false;
         double fundingRate = 0, fundingDelta = 0, oiChange = 0;
-        // [v38.0] Funding Rate Confidence Filter
+        // Funding Rate Confidence Filter
         // FR > +0.05% → ритейл переплачивает за LONG → штраф -10 для LONG, бонус +5 для SHORT
         // FR < -0.05% → ритейл переплачивает за SHORT → штраф -10 для SHORT, бонус +5 для LONG
         double frConfPenaltyLong  = 0;
@@ -1934,7 +1896,7 @@ public final class DecisionEngineMerged {
             fundingDelta = frData.fundingDelta;
             oiChange     = frData.oiChange1h;
 
-            // [v38.0] FR CONFIDENCE ADJUSTMENT — один из немногих бесплатных edge в крипте
+            // FR CONFIDENCE ADJUSTMENT — один из немногих бесплатных edge в крипте
             if (fundingRate > 0.0005) { // +0.05%: crowded long
                 frConfPenaltyLong  = -Math.min(12, fundingRate / 0.0005 * 5); // до -12 для LONG
                 frConfPenaltyShort = Math.min(8, fundingRate / 0.0005 * 3);   // до +8 для SHORT
@@ -2021,17 +1983,15 @@ public final class DecisionEngineMerged {
             allFlags.add("HIDDEN_BEAR_DIV_L_PENALTY");
         }
 
-        // ════════════════════════════════════════════════════════
         // КЛАСТЕР 6: EARLY — РАННИЙ РАЗВОРОТ
-        // [v7.1] Ловит момент когда текущий тренд ОСЛАБЕВАЕТ
+        // Ловит момент когда текущий тренд ОСЛАБЕВАЕТ
         // но ещё не сломалась структура на 15m.
         // Использует 1m/5m micro-structure + momentum deceleration
         // + volume divergence + wick rejection + RSI shift.
         // Даёт сигнал на 1-2 свечи РАНЬШЕ чем Structure/Momentum.
-        // ════════════════════════════════════════════════════════
 
         EarlyReversalResult earlyRev = detectEarlyReversal(c1, c5, c15, rsi14, rsi7, price, atr14);
-        // [v40.0] Threshold lowered 0.35→0.30: catches reversals 1 candle earlier.
+        // Threshold lowered 0.35→0.30: catches reversals 1 candle earlier.
         // Volume confirmation via HTF OVERRIDE gate compensates for lower threshold.
         if (earlyRev.detected && earlyRev.strength > 0.30) {
             double earlyScore = mctx.s(earlyRev.strength * 0.70);
@@ -2043,12 +2003,10 @@ public final class DecisionEngineMerged {
             allFlags.addAll(earlyRev.flags);
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v53] STRONG REVERSAL DETECTOR — fires after N-bar streaks
+        // STRONG REVERSAL DETECTOR — fires after N-bar streaks
         // when confluence of RSI/MACD/volume agrees the trend is exhausted.
         // High weight (0.80) because it requires 3+ confluence already.
         // This is the "many candles in one direction = possible reversal" logic.
-        // ════════════════════════════════════════════════════════
         double[] rsiArrForRev = com.bot.TradingCore.rsiSeries(c15, 14);
         StrongReversalResult strongRev = detectStrongReversal(c15, rsiArrForRev, rsi14);
         if (strongRev.detected) {
@@ -2061,9 +2019,7 @@ public final class DecisionEngineMerged {
             allFlags.addAll(strongRev.flags);
         }
 
-        // ════════════════════════════════════════════════════════
         //  АГРЕГАЦИЯ КЛАСТЕРОВ
-        // ════════════════════════════════════════════════════════
 
         ClusterScores[] clusters = { cStructure, cMomentum, cVolume, cHTF, cDerivatives, cEarly };
         String[] clusterNames = { "STR", "MOM", "VOL", "HTF", "DRV", "EARLY" };
@@ -2077,7 +2033,7 @@ public final class DecisionEngineMerged {
             ClusterScores cl = clusters[i];
             totalLong  += cl.longScore;
             totalShort += cl.shortScore;
-            // [REFACTOR] Apply MIN_CLUSTER_SCORE: a cluster counts as "agreeing" only if its
+            // Apply MIN_CLUSTER_SCORE: a cluster counts as "agreeing" only if its
             // contribution exceeds the threshold. Prevents micro-contributions (0.10-0.15)
             // from padding the cluster count and inflating false signals.
             if (cl.favorsLong()  && cl.longScore  >= MIN_CLUSTER_SCORE) longClusters++;
@@ -2100,7 +2056,7 @@ public final class DecisionEngineMerged {
             allFlags.add("GIC_BOOST" + String.format("%.0f", gicShortBoost * 100));
         }
 
-        // [FIX v32+] GIC GRADIENT LONG SUPPRESSION
+        // GIC GRADIENT LONG SUPPRESSION
         // Applies when BTC is in IMPULSE_DOWN or STRONG_DOWN without hitting hard veto threshold.
         // Proportionally crushes LONG score so signals don't pass unless they have
         // overwhelming confluence (5+ clusters vs normal 2 minimum).
@@ -2120,8 +2076,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v40.0] DUAL HTF DIRECTIONAL GATE — with EARLY REVERSAL OVERRIDE
+        // DUAL HTF DIRECTIONAL GATE — with EARLY REVERSAL OVERRIDE
         // When BOTH 1H and 2H agree on direction, the counter-direction
         // candidate needs much higher conviction to override them.
         //
@@ -2132,12 +2087,11 @@ public final class DecisionEngineMerged {
         //
         // Without override: bot waits for 1H+2H to flip → price already moved 3-5%
         // With override: bot enters on micro-structure reversal + volume intent
-        // ════════════════════════════════════════════════════════
         com.bot.TradingCore.Side prelimSide = totalLong > totalShort
                 ? com.bot.TradingCore.Side.LONG
                 : com.bot.TradingCore.Side.SHORT;
 
-        // [v40.0] Detect strong leading (volume-based) reversal signals
+        // Detect strong leading (volume-based) reversal signals
         // [v50 §6] EARLY REVERSAL STRENGTH: 0.50→0.38 for earlier trigger.
         // At 0.50 the reversal was already confirming on the chart.
         // At 0.38 we catch it 1-2 bars earlier when micro-structure just shifts.
@@ -2152,7 +2106,7 @@ public final class DecisionEngineMerged {
                 f.startsWith("VSA_STOP_VOL_BEAR") || f.startsWith("VSA_ABSORB_BEAR")
                         || f.equals("VSA_NO_DEMAND"));
 
-        // [PATCH v1.0] DUAL-HTF HARD VETO (was soft multiplier *0.35, which signals could
+        // DUAL-HTF HARD VETO (was soft multiplier *0.35, which signals could
         // still clear via cluster confluence). hasLeadingOverride removed — too many
         // dead-cat bounces were sneaking through after a long BEAR move.
         if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
@@ -2166,7 +2120,7 @@ public final class DecisionEngineMerged {
             return null;
         }
 
-        // [PATCH v1.0] SINGLE-HTF penalty (new): one HTF against direction + other not
+        // SINGLE-HTF penalty (new): one HTF against direction + other not
         // supporting → -25% score. Previously no penalty here — signals proceeded
         // even with one HTF actively against them.
         if (prelimSide == com.bot.TradingCore.Side.LONG
@@ -2182,9 +2136,7 @@ public final class DecisionEngineMerged {
             allFlags.add("SINGLE_HTF_BULL_PENALTY");
         }
 
-        // ════════════════════════════════════════════════════════
         // CONFLUENCE BONUS
-        // ════════════════════════════════════════════════════════
         double scoreLong  = totalLong;
         double scoreShort = totalShort;
 
@@ -2201,7 +2153,7 @@ public final class DecisionEngineMerged {
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
 
-        // [v29] HARD EXHAUSTION VETO — prevents ADA/ENA type lag signals.
+        // HARD EXHAUSTION VETO — prevents ADA/ENA type lag signals.
         // If price already moved > 3×ATR from recent base in signal direction → HARD VETO.
         // If moved > 2×ATR → heavy score penalty (score *= 0.20).
         {
@@ -2223,9 +2175,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
         // REVERSE EXHAUSTION CHECK
-        // ════════════════════════════════════════════════════════
         ReverseWarning rw = detectReversePattern(c15, c1h, state);
         if (rw != null && rw.confidence > 0.48) {
             allFlags.add("⚠REV_" + rw.type);
@@ -2233,7 +2183,7 @@ public final class DecisionEngineMerged {
                 boolean confirmed = confirmReversalStructure(c1, c5, com.bot.TradingCore.Side.SHORT);
                 if (!confirmed) {
                     scoreLong *= 0.35;
-                    // [v23.0] Flag for penalty, not veto
+                    // Flag for penalty, not veto
                     if (scoreLong < 0.20) allFlags.add("LEXH_SCORE_CRUSHED");
                 } else {
                     allFlags.add("LEXH_CONFIRMED_1M");
@@ -2253,24 +2203,20 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
         // EXHAUSTION FILTERS
-        // ════════════════════════════════════════════════════════
-        // [v18.0] Removed overlapping and arbitrary EXHAUSTION, OVEREXTENDED, and 2H VETO
+        // Removed overlapping and arbitrary EXHAUSTION, OVEREXTENDED, and 2H VETO
         // multipliers (e.g. scoreLong *= 0.45, etc.) that effectively forced the bot to
         // "fade" out of perfectly valid setups. ForecastEngine now governs macro directional confidence.
 
-        // ════════════════════════════════════════════════════════
-        // [v8.0] МИНИМУМ КЛАСТЕРОВ — АДАПТИВНЫЙ
+        // МИНИМУМ КЛАСТЕРОВ — АДАПТИВНЫЙ
         // Обычно: 2 кластера
         // Если EARLY сильный (> 0.65): достаточно 1 кластер
         // Это позволяет ловить развороты ДО подтверждения структуры
-        // ════════════════════════════════════════════════════════
         com.bot.TradingCore.Side candidateSide = scoreLong > scoreShort
                 ? com.bot.TradingCore.Side.LONG
                 : com.bot.TradingCore.Side.SHORT;
 
-        // [v19.0] HARD VETO: Если очень мощный разворотный сигнал идет ПРОТИВ тренда,
+        // HARD VETO: Если очень мощный разворотный сигнал идет ПРОТИВ тренда,
         // который набрал баллы на отстающих индикаторах (как 1H EMA), убиваем трендовый сигнал.
         if (earlyRev.detected && earlyRev.strength > 0.30) {
             com.bot.TradingCore.Side earlySide = earlyRev.direction > 0 ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
@@ -2313,7 +2259,7 @@ public final class DecisionEngineMerged {
         int supportingClusters = candidateSide == com.bot.TradingCore.Side.LONG
                 ? longClusters : shortClusters;
 
-        // [v8.0] EARLY-SOLO: сильный ранний сигнал может пройти с 1 кластером
+        // EARLY-SOLO: сильный ранний сигнал может пройти с 1 кластером
         boolean earlyStrong = earlyRev.detected && earlyRev.strength > 0.65;
         boolean earlyLongLead = cEarly.favorsLong() && (
                 cVolume.favorsLong()
@@ -2341,12 +2287,12 @@ public final class DecisionEngineMerged {
 
         int requiredClusters = earlySoloAllowed ? 1 : MIN_AGREEING_CLUSTERS;
 
-        // [v11.0] RANGE market is treacherous — require 3 clusters minimum
+        // RANGE market is treacherous — require 3 clusters minimum
         if (state == MarketState.RANGE && !earlySoloAllowed && !aggressiveShort) {
             requiredClusters = 3;
         }
 
-        // [v23.0] Insufficient clusters → penalty flag (was return null)
+        // Insufficient clusters → penalty flag (was return null)
         boolean clusterPenalty = false;
         if (supportingClusters < requiredClusters) {
             if (!(aggressiveShort && candidateSide == com.bot.TradingCore.Side.SHORT && crashBoost > 0.30)) {
@@ -2357,9 +2303,7 @@ public final class DecisionEngineMerged {
 
         if (earlySoloAllowed) allFlags.add("EARLY_SOLO");
 
-        // ════════════════════════════════════════════════════════
         // MINIMUM SCORE DIFFERENCE
-        // ════════════════════════════════════════════════════════
         scoreDiff = Math.abs(scoreLong - scoreShort);
         double minDiff;
         if (aggressiveShort) {
@@ -2369,7 +2313,7 @@ public final class DecisionEngineMerged {
                     : state == MarketState.RANGE ? 0.28
                       : 0.20;
         }
-        // [v23.0] scoreDiff/dynThresh → penalty flags (was return null)
+        // scoreDiff/dynThresh → penalty flags (was return null)
         boolean scoreDiffPenalty = scoreDiff < minDiff;
         boolean dynThreshPenalty = false;
         double dynThresh;
@@ -2387,7 +2331,7 @@ public final class DecisionEngineMerged {
 
         com.bot.TradingCore.Side side = candidateSide;
 
-        // [PATCH v1.0] LOCAL EXHAUSTION VETO — applied after side is finalized.
+        // LOCAL EXHAUSTION VETO — applied after side is finalized.
         // Blocks counter-trend entries against isolated pair moves where GIC didn't trigger.
         if (localExh != null && !aggressiveShort) {
             if (localExh.direction == -1 && side == com.bot.TradingCore.Side.LONG) {
@@ -2452,7 +2396,7 @@ public final class DecisionEngineMerged {
         // This was circular — those flags fire BECAUSE the move already happened.
         // Late entry penalty now stands regardless of other signals.
 
-        // [v11.0] VOLUME CONFIRMATION GATE
+        // VOLUME CONFIRMATION GATE
         boolean volumeSupports = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsLong())
                 || (side == com.bot.TradingCore.Side.SHORT && cVolume.favorsShort());
         boolean volumeOpposes = (side == com.bot.TradingCore.Side.LONG && cVolume.favorsShort())
@@ -2477,11 +2421,11 @@ public final class DecisionEngineMerged {
         if (!cooldownAllowedEx(symbol, side, cat, now, shortCooldownOverride)) return null;
         if (!flipAllowed(symbol, side)) return null;
 
-        // [FIX v32+] Post-exit directional cooldown: prevents re-entry in same direction
+        // Post-exit directional cooldown: prevents re-entry in same direction
         // for 10 minutes after any position close. Eliminates spin-trading on same pair.
         if (isPostExitBlocked(symbol, side)) return null;
 
-        // [v33] Panic remains a hard veto for LONG.
+        // Panic remains a hard veto for LONG.
         // Outside panic, SignalSender reapplies nuanced GIC weights after all downstream
         // probability adjustments. Returning null here was double-counting the same filter
         // and zeroing out counter-trend reversals before RS/sector overrides could act.
@@ -2492,7 +2436,7 @@ public final class DecisionEngineMerged {
             allFlags.add("GIC_PANIC_VETO_LONG");
             return null;
         }
-        // [FIX #22] GIC directional gate: was adding a flag but NOT blocking the signal.
+        // GIC directional gate: was adding a flag but NOT blocking the signal.
         // Comment said "actual veto happens post-candidate-selection via earlyReturn sentinel"
         // but no such sentinel existed — it was dead code. Hard veto added here.
         if (gicOnlyLong && side == com.bot.TradingCore.Side.SHORT) {
@@ -2506,13 +2450,11 @@ public final class DecisionEngineMerged {
             return null; // [FIX #22] ACTUAL VETO — was missing
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // [PATCH C v42] POST-PUMP LONG VETO
+        // POST-PUMP LONG VETO
         // Финальный veto после определения candidateSide/side.
         // Если памп+дамп цикл обнаружен (gain≥35%, drop≥8%) — LONG блокируется.
         // Это предотвращает кейс SOONUSDT: бот дал LONG на 0.2359 когда цена уже
         // упала с 0.34 (хай памп-цикла) на -20%+. Классическая ловля ножа.
-        // ═══════════════════════════════════════════════════════════════
         if (postPumpDump && side == com.bot.TradingCore.Side.LONG) {
             System.out.println("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
                     + String.format("%.0f%%", postPumpGain * 100)
@@ -2520,9 +2462,7 @@ public final class DecisionEngineMerged {
             return null;
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v7.0] КАЛИБРОВАННАЯ УВЕРЕННОСТЬ — на кластерах
-        // ════════════════════════════════════════════════════════
+        // КАЛИБРОВАННАЯ УВЕРЕННОСТЬ — на кластерах
         double probability = computeClusterConfidence(
                 symbol, scoreLong, scoreShort, scoreDiff,
                 longClusters, shortClusters,
@@ -2536,17 +2476,16 @@ public final class DecisionEngineMerged {
         // Crash mode confidence boost
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
             double crashConfBoost = btcCrashScore * 10.0;
-            probability = Math.min(85, probability + crashConfBoost);
+            probability = Math.min(PROB_CEIL, probability + crashConfBoost);
             allFlags.add("CRASH_CONF_BOOST");
         }
         if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
             double bullConfBoost = 1.5 + Math.max(0.0, gicCtx.impulseStrength - 0.70) * 6.0;
-            probability = Math.min(85, probability + Math.min(4.0, bullConfBoost));
+            probability = Math.min(PROB_CEIL, probability + Math.min(4.0, bullConfBoost));
             allFlags.add("BULL_CONF_BOOST");
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v25.0] WEIGHTED ENSEMBLE — replaces additive penalty hell.
+        // WEIGHTED ENSEMBLE — replaces additive penalty hell.
         // Each factor VOTES with a weight [-1..+1].
         // Total adjustment is capped at [-14, +8] — no single factor
         // can kill a signal with 5/6 agreeing clusters.
@@ -2554,7 +2493,6 @@ public final class DecisionEngineMerged {
         // RATIONALE: Old code applied flat -8, -10, -12, -15 subtractions
         // independently. A valid 4-cluster TREND setup with a slightly late
         // entry could lose -41 points and die at 50. That was a bug, not logic.
-        // ════════════════════════════════════════════════════════
 
         // Factor 1: Structure/cluster agreement  [weight 35%]
         double activeScore = (side == com.bot.TradingCore.Side.LONG) ? scoreLong : scoreShort;
@@ -2586,7 +2524,7 @@ public final class DecisionEngineMerged {
         // scoreDiffPenalty and dynThreshPenalty are represented
         // by their contributing factors above — no extra flat deduction.
         ensAdj = Math.max(-14.0, Math.min(+8.0, ensAdj));
-        probability = Math.max(0.0, Math.min(85.0, probability + ensAdj));
+        probability = Math.max(0.0, Math.min(PROB_CEIL, probability + ensAdj));
 
         // Exhaustion score crush: score already penalized upstream via cluster multiply.
         // Apply only a capped -7 here (was -12 flat).
@@ -2597,11 +2535,11 @@ public final class DecisionEngineMerged {
         // Probability already mildly dipped above. No further deduction needed.
         if (lateEntryPenalty) allFlags.add("LATE_ENTRY_SIZE_CUT");
 
-        // [v38.0] FUNDING RATE CONFIDENCE ADJUSTMENT — applied after all cluster logic
+        // FUNDING RATE CONFIDENCE ADJUSTMENT — applied after all cluster logic
         boolean _isLong = (side == com.bot.TradingCore.Side.LONG);
         double frAdj = _isLong ? frConfPenaltyLong : frConfPenaltyShort;
         if (Math.abs(frAdj) > 0.5) {
-            probability = Math.max(0, Math.min(85, probability + frAdj));
+            probability = Math.max(0, Math.min(PROB_CEIL, probability + frAdj));
             if (frAdj < -3) allFlags.add("FR_CROWD_PENALTY");
             if (frAdj > 3)  allFlags.add("FR_EDGE_BOOST");
         }
@@ -2615,14 +2553,12 @@ public final class DecisionEngineMerged {
         }
         if (probability < minConf) return null;
 
-        // ════════════════════════════════════════════════════════
-        // [v37.0] VOLATILITY CLASSIFICATION + NOISE GUARD
+        // VOLATILITY CLASSIFICATION + NOISE GUARD
         //
         // RIVER FIX: бот ставил стоп 0.70% на монете с ATR 2-3%.
         // Причина: ATR был сжат в консолидации → стоп = noise level.
         // Решение: robustAtr() = max(currentATR, longTermATR×0.80).
         // Noise score: монеты с большими хвостами требуют шире стоп.
-        // ════════════════════════════════════════════════════════
         double robustAtr14   = robustAtr(c15, 14);
         double robustAtrPct  = robustAtr14 / price;
         double noiseScore    = computeNoiseScore(c15, 14); // avg wick/body ratio
@@ -2630,14 +2566,14 @@ public final class DecisionEngineMerged {
         // Classify coin's volatility for this symbol
         VolatilityBucket volBucket = classifyVolatility(robustAtrPct);
 
-        // [v37.0] EXTREME VOLATILITY BLOCK: atr/price > 5% = shitcoin/micro-cap noise.
+        // EXTREME VOLATILITY BLOCK: atr/price > 5% = shitcoin/micro-cap noise.
         // No indicator works reliably at this level. Signal would be 90% false positive.
         if (robustAtrPct > 0.05) {
             allFlags.add("EXTREME_VOL_BLOCK");
             return null;
         }
 
-        // [v37.0] HIGH_ATR threshold corrected: 0.2% (was) → 1.5% (meaningful).
+        // HIGH_ATR threshold corrected: 0.2% (was) → 1.5% (meaningful).
         // At 0.2% every single ALT would trigger HIGH_ATR — meaningless label.
         if (robustAtrPct > 0.015) allFlags.add("HIGH_ATR");
 
@@ -2667,7 +2603,6 @@ public final class DecisionEngineMerged {
             return null;
         }
 
-        // ════════════════════════════════════════════════════════
         // СТОП И ТЕЙК — [v37.0] ROBUST STRUCTURAL STOP PLACEMENT
         //
         // Иерархия приоритетов:
@@ -2675,8 +2610,7 @@ public final class DecisionEngineMerged {
         // 2. ATR floor = robustAtr × minAtrMult (зависит от VolatilityBucket)
         // 3. Noise adjustment: шумные монеты получают +20-40% к стопу
         // 4. Cap: category-specific max stop % (не более maxStopPct)
-        // ════════════════════════════════════════════════════════
-        // [v51] REGIME-ADAPTIVE RISK PARAMETERS.
+        // REGIME-ADAPTIVE RISK PARAMETERS.
         // TREND: tight stop (1.2× ATR floor), wide TP (rrRatio boosted).
         //        Trend moves are directional — tight stop survives, wide TP captures the move.
         // RANGE: wide stop (1.8× ATR floor) behind channel boundary, tight TP to opposite wall.
@@ -2702,7 +2636,7 @@ public final class DecisionEngineMerged {
             stopFloorMult = 1.5; // default
         }
 
-        // [v37.0] ATR floor: uses robustAtr + VolatilityBucket multiplier.
+        // ATR floor: uses robustAtr + VolatilityBucket multiplier.
         // БЫЛО: atr14 * 1.85 * riskMult → на RIVER в консолидации = 0.70%.
         // СТАЛО: robustAtr14 * bucket.minAtrMult * riskMult → всегда учитывает долгосрочный шум.
         double atrStop = Math.max(
@@ -2740,17 +2674,17 @@ public final class DecisionEngineMerged {
             double structDist = side == com.bot.TradingCore.Side.LONG
                     ? price - structuralStop
                     : structuralStop - price;
-            // [v51] Regime-aware floor: trend needs tight (1.1×), range needs wide (1.5×)
+            // Regime-aware floor: trend needs tight (1.1×), range needs wide (1.5×)
             double atrFloor = atrStop * Math.max(1.1, stopFloorMult * 0.85);
             stopDist = Math.max(structDist, atrFloor);
             allFlags.add("STRUCT_STOP");
         }
 
-        // [v37.0] Category-specific stop cap (replaces flat 3% for all)
+        // Category-specific stop cap (replaces flat 3% for all)
         // ALT монеты могут требовать 5-8% стоп в HIGH_VOL режиме — это нормально.
         stopDist = Math.min(stopDist, price * volBucket.maxStopPct);
 
-        // [v43] Safety flag: if cap trimmed the stop below ATR floor, flag it
+        // Safety flag: if cap trimmed the stop below ATR floor, flag it
         if (stopDist < atrStop) {
             allFlags.add("STOP_CAP_TIGHT");
         }
@@ -2768,12 +2702,10 @@ public final class DecisionEngineMerged {
 
         if (!priceMovedEnough(symbol, price, robustAtrPct)) return null;
 
-        // ════════════════════════════════════════════════════════
-        // [v17.0] ForecastEngine Integration — RELAXED GATING
+        // ForecastEngine Integration — RELAXED GATING
         // Philosophy: ForecastEngine is an ADVISOR, not a DICTATOR.
         // Only block when forecast STRONGLY disagrees. Otherwise,
         // let the cluster-based signal through with a penalty.
-        // ════════════════════════════════════════════════════════
         com.bot.TradingCore.ForecastEngine.ForecastResult forecastResult = null;
         // [v24.0 FIX WEAK-3] Save probability before FC for penalty cap
         final double probBeforeFC = probability;
@@ -2790,11 +2722,9 @@ public final class DecisionEngineMerged {
                     boolean fcBull = forecastResult.directionScore > 0.2;
                     boolean fcBear = forecastResult.directionScore < -0.2;
 
-                    // ══════════════════════════════════════════════════
-                    // [v23.0] ALL VETOES → PENALTIES
+                    // ALL VETOES → PENALTIES
                     // ForecastEngine is an ADVISOR, not a DICTATOR.
                     // Squeeze = OPPORTUNITY (penalty reduced, breakout boosted).
-                    // ══════════════════════════════════════════════════
 
                     // SQUEEZE: reduced penalty, NOT veto (was return null)
                     Double squeezeFlag = forecastResult.factorScores.get("SQUEEZE");
@@ -2865,7 +2795,7 @@ public final class DecisionEngineMerged {
                         }
                     }
 
-                    // [v30] BOOST: EARLY phase aligned — raised +3→+7.
+                    // BOOST: EARLY phase aligned — raised +3→+7.
                     // EARLY_BULL/BEAR = fresh EMA cross + ATR expanding + MACD positive.
                     // This is the BEST entry phase. Under-rewarding it (only +3) caused
                     // the bot to rank exhaustion-phase signals equally with early signals.
@@ -2874,13 +2804,13 @@ public final class DecisionEngineMerged {
                         boolean earlyAligned = (sigLong && forecastResult.directionScore > 0)
                                 || (!sigLong && forecastResult.directionScore < 0);
                         if (earlyAligned) {
-                            probability = Math.min(85, probability + 7);
+                            probability = Math.min(PROB_CEIL, probability + 7);
                             allFlags.add("FC_EARLY_BOOST");
                         }
                     }
 
                     // ── RANGE quality gate — penalty, NOT veto ──
-                    // [v17.0] Was hard veto → now soft penalty (-5)
+                    // Was hard veto → now soft penalty (-5)
                     double stopRetAbs = stopDist / (price + 1e-9);
                     double fcMoveAbs = Math.abs(forecastResult.projectedMovePct);
                     double fcConf = forecastResult.confidence;
@@ -2898,7 +2828,7 @@ public final class DecisionEngineMerged {
                             allFlags.add("FC_NEUTRAL_RANGE");
                         }
                     } else {
-                        // [v28.0] PATCH #6: FC NEUTRAL in TREND was 0 penalty — fixed to -4.
+                        // PATCH #6: FC NEUTRAL in TREND was 0 penalty — fixed to -4.
                         // If ForecastEngine sees no direction in a trending market, that IS a signal:
                         // the trend may be exhausting or the data is ambiguous. Require more conviction.
                         if (forecastResult.bias == com.bot.TradingCore.ForecastEngine.ForecastBias.NEUTRAL) {
@@ -2917,7 +2847,7 @@ public final class DecisionEngineMerged {
                             allFlags.add("FC_MOVE_OK");
                         }
                     }
-                    // [v17.0] REMOVED: FC_LOWCONF_NEUTRAL veto — NEUTRAL means "I don't know",
+                    // REMOVED: FC_LOWCONF_NEUTRAL veto — NEUTRAL means "I don't know",
                     // not "block everything". Let the cluster signal decide.
 
                     // [v24.0 FIX WEAK-3] FC PENALTY CAP — max -25 total from ForecastEngine.
@@ -2932,7 +2862,7 @@ public final class DecisionEngineMerged {
             } catch (OutOfMemoryError oom) {
                 throw oom; // не глотаем
             } catch (RuntimeException e) {
-                // [PATCH #8] ForecastEngine hard-failed. Это НЕ нормально —
+                // ForecastEngine hard-failed. Это НЕ нормально —
                 // раньше мы просто игнорировали, теперь применяем conservative penalty
                 // чтобы сигнал не прошёл "втихую" без FC-проверки.
                 System.out.printf("[FC-ERROR] %s %s: %s%n",
@@ -2948,15 +2878,13 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v31] VDA VOLUME DECELERATION EXHAUSTION VETO
+        // VDA VOLUME DECELERATION EXHAUSTION VETO
         // Problem: bot shorts into the BOTTOM of a move because bearish
         // trend is confirmed, but the SPEED of selling is already dying.
         // Fix: if last 3×1m candles show BOTH price deceleration AND
         // volume shrinkage in the signal direction → soft penalty -10.
         // This is NOT a hard veto — it just pushes borderline signals
         // below the confidence floor. Strong signals survive.
-        // ════════════════════════════════════════════════════════
         if (c1 != null && c1.size() >= 5) {
             int n1v = c1.size();
             com.bot.TradingCore.Candle cv1 = c1.get(n1v - 1);
@@ -2991,15 +2919,22 @@ public final class DecisionEngineMerged {
         // NEW: clamp to [0..100] and pass through ProbabilityCalibrator (isotonic regression).
         //      If <50 historical samples → uses raw score as-is (no floor).
         //      If ≥50 samples → maps raw score to empirical win-rate via PAV.
+        // CALIBRATOR BUCKET ALIGNMENT — BUG FIX.
+        // БЫЛО: calibrate(symbol, rawProb01) → overload → calibrate(symbol, raw, 1.0) → ВСЕГДА бакет MID.
+        // Запись (recordOutcome в BotMain): atrPct = robustAtrPct * 100.0 (в процентах, напр. 2.0 для 2% ATR).
+        // Чтение раньше: всегда 1.0 → VolBucket.MID. Запись попадала в HIGH. Несовпадение = kalibrator
+        // никогда не находил свою историю → fallback shrinkage ×0.5 → 72% без реальной коррекции.
+        // СТАЛО: передаём тот же atrPct (в процентах) что используется при recordOutcome(). Теперь
+        // запись и чтение используют идентичный VolBucket → per-symbol калибровка работает.
+        double calibAtrPct  = robustAtrPct * 100.0;
         double rawProb01 = Math.max(0.0, Math.min(1.0, probability / 100.0));
-        double calibrated01 = CALIBRATOR.calibrate(symbol, rawProb01);
+        double calibrated01 = CALIBRATOR.calibrate(symbol, rawProb01, calibAtrPct);
         probability = calibrated01 * 100.0;
-        // Single authoritative cap: 85.0. All intermediate caps above already respect this,
-        // so this is purely a safety net for calibrator edge cases on tiny samples.
-        probability = Math.max(0.0, Math.min(85.0, probability));
+        // Single authoritative cap via PROB_CEIL. All intermediate caps above reference
+        // the same constant, so this is purely a safety net for calibrator edge cases.
+        probability = Math.max(0.0, Math.min(PROB_CEIL, probability));
         if (probability < minConf) return null;
 
-        // ════════════════════════════════════════════════════════
         // [ДЫРА №6] АДАПТИВНЫЕ TP ПО РЕЖИМУ РЫНКА
         // Одни и те же множители TP для всех режимов — главная причина
         // "недобора" в тренде и "перелёта" в боковике.
@@ -3007,7 +2942,6 @@ public final class DecisionEngineMerged {
         // RANGE:  цена ходит в канале → короткие TP, быстро фиксируем
         // TREND:  цена идёт далеко → длинные TP, не закрываем рано
         // EXHAUST: движение умирает → очень короткие TP, скальп
-        // ════════════════════════════════════════════════════════
         double tp1Mult, tp2Mult, tp3Mult;
         boolean isTrendState  = state == MarketState.STRONG_TREND;
         boolean isRangeState  = state == MarketState.RANGE;
@@ -3021,16 +2955,16 @@ public final class DecisionEngineMerged {
             tp1Mult = 0.60; tp2Mult = 1.00; tp3Mult = 1.50;
             allFlags.add("TP_EXHAUST");
         } else if (isRangeState) {
-            // [v51] RANGE: tight TPs — aim for opposite wall, not beyond.
+            // RANGE: tight TPs — aim for opposite wall, not beyond.
             // Range = mean-reversion. Taking 2× risk is greedy when price bounces in a box.
             tp1Mult = 0.65; tp2Mult = 1.10; tp3Mult = 1.60;
             allFlags.add("TP_RANGE");
         } else if (isTrendState && isEarlyPhase) {
-            // [v51] EARLY TREND: widest TPs — the move has just started, let it run.
+            // EARLY TREND: widest TPs — the move has just started, let it run.
             tp1Mult = 1.40; tp2Mult = 2.80; tp3Mult = 4.50;
             allFlags.add("TP_TREND_EARLY");
         } else if (isTrendState) {
-            // [v51] MID TREND: still wide, but not as aggressive as early.
+            // MID TREND: still wide, but not as aggressive as early.
             tp1Mult = 1.20; tp2Mult = 2.40; tp3Mult = 3.80;
             allFlags.add("TP_TREND");
         } else {
@@ -3038,8 +2972,7 @@ public final class DecisionEngineMerged {
             tp1Mult = 1.00; tp2Mult = 2.00; tp3Mult = 3.20;
         }
 
-        // ════════════════════════════════════════════════════════
-        // [v37.0] VOLATILITY-BUCKET TP ADJUSTMENT
+        // VOLATILITY-BUCKET TP ADJUSTMENT
         //
         // HIGH/EXTREME vol монеты разворачиваются быстрее → тейки ближе.
         // Нет смысла держать позицию на +4% если монета ходит по ±3% в день.
@@ -3051,7 +2984,6 @@ public final class DecisionEngineMerged {
         // MEDIUM  | ×1.00   | Стандарт
         // HIGH    | ×0.80   | Волатильная ALT — берём быстрее
         // EXTREME | ×0.60   | Шиткоин — только скальп, иначе уйдёт обратно
-        // ════════════════════════════════════════════════════════
         double vtpFactor = switch (volBucket) {
             case LOW     -> isTrendState ? 1.10 : 1.00;
             case MEDIUM  -> 1.00;
@@ -3066,8 +2998,7 @@ public final class DecisionEngineMerged {
         // Пересчитываем rrRatio на основе выбранного tp3
         double adaptiveRR = tp3Mult;
 
-        // ═══════════════════════════════════════════════════════════════
-        // [PATCH D v42] SL WIDTH + R:R GUARD
+        // SL WIDTH + R:R GUARD
         // Кейс SOONUSDT: SL 1.40% для монеты с ATR 5-8% → 0.25×ATR — выбивает шумом.
         // Минимум SL ширины = 0.8×ATR. R:R до TP1 мin 1:1.2, до TP2 мин 1:1.80.
         //
@@ -3075,7 +3006,6 @@ public final class DecisionEngineMerged {
         //   tp1Mult/tp2Mult/tp3Mult — МНОЖИТЕЛИ risk-дистанции (R).
         //   TradeIdea ctor: tp1 = price ± risk × tp1Mult, где risk = |price - stop|
         // Значит R:R(tp1) = tp1Mult, R:R(tp2) = tp2Mult. Контролируем эти числа.
-        // ═══════════════════════════════════════════════════════════════
         double slDistanceD = Math.abs(price - stopPrice);
         double minSlDistD  = atr14 * 0.8;
 
@@ -3088,20 +3018,19 @@ public final class DecisionEngineMerged {
         }
 
         // Минимальные множители: TP1 >= 1.2R, TP2 >= 1.8R, TP3 >= 2.4R (или tp2×1.3)
+        // R:R FLOOR: tp2Mult 1.80→2.00 (user preference ≥1:2).
+        // TP1 ≥ 1.2R, TP2 ≥ 2.0R, TP3 ≥ TP2×1.30.
         if (tp1Mult < 1.20) tp1Mult = 1.20;
-        if (tp2Mult < 1.80) tp2Mult = 1.80;
+        if (tp2Mult < 2.00) tp2Mult = 2.00;
         if (tp3Mult < tp2Mult * 1.30) tp3Mult = tp2Mult * 1.30;
 
-        // Финальная проверка R:R к TP2 — если после расширения SL всё ещё < 1.80,
-        // сигнал не имеет edge. Это никогда не должно сработать после принудительного
-        // tp2Mult >= 1.80, но оставляем как safety net.
-        if (tp2Mult < 1.80) {
-            System.out.println("[PATCH D] " + symbol + " rejected: tp2Mult="
-                    + String.format("%.2f", tp2Mult) + " < 1.80 (R:R floor)");
+        // Safety net: после всех принудительных значений tp2Mult всегда ≥ 2.00.
+        if (tp2Mult < 2.00) {
+            System.out.println("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
+                    + String.format("%.2f", tp2Mult) + " < 2.00 (user pref 1:2)");
             return null;
         }
         adaptiveRR = tp3Mult; // пересчитываем после возможной правки tp3Mult
-        // ═══════════════════════════════════════════════════════════════
 
         TradeIdea idea = new TradeIdea(symbol, side, price, stopPrice, takePrice, adaptiveRR,
                 probability, allFlags,
@@ -3114,9 +3043,7 @@ public final class DecisionEngineMerged {
         return idea;
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v7.0] CLUSTER-BASED CONFIDENCE
-    // ══════════════════════════════════════════════════════════════
+    //  CLUSTER-BASED CONFIDENCE
 
     private double computeClusterConfidence(
             String symbol,
@@ -3216,9 +3143,7 @@ public final class DecisionEngineMerged {
     // 70/30 blend in computeClusterConfidence). Calibration now lives entirely in
     // ProbabilityCalibrator (PAV isotonic regression with vol-buckets).
 
-    // ══════════════════════════════════════════════════════════════
     //  COOLDOWN
-    // ══════════════════════════════════════════════════════════════
 
     /**
      * [v24.0 FIX BUG-2] CHECK ONLY — does NOT set cooldown anymore.
@@ -3237,7 +3162,7 @@ public final class DecisionEngineMerged {
                     cat == CoinCategory.ALT  ? COOLDOWN_ALT : COOLDOWN_MEME;
         }
         Long last = cooldownMap.get(key);
-        // [v24.0] CHECK ONLY — removed: cooldownMap.put(key, now)
+        // CHECK ONLY — removed: cooldownMap.put(key, now)
         return last == null || now - last >= base;
     }
 
@@ -3268,7 +3193,7 @@ public final class DecisionEngineMerged {
      * 2 minutes later was blocked as "price not moved enough". Now lastSigPrice
      * is updated ONLY in confirmSignal() after ISC approves.
      */
-    // [v28.0] PATCH #13: Dynamic price-moved threshold.
+    // PATCH #13: Dynamic price-moved threshold.
     // OLD: static 0.35% regardless of volatility — in 2% ATR market, 0.35% is one candle's noise.
     // NEW: max(0.35%, ATR * 0.15) — scales with current volatility.
     // atr14Pct is passed in from generate() where atr14 is already computed.
@@ -3284,9 +3209,7 @@ public final class DecisionEngineMerged {
         return priceMovedEnough(sym, price, 0.0);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  REVERSAL STRUCTURE CONFIRMATION
-    // ══════════════════════════════════════════════════════════════
 
     private boolean confirmReversalStructure(List<com.bot.TradingCore.Candle> c1,
                                              List<com.bot.TradingCore.Candle> c5,
@@ -3324,9 +3247,7 @@ public final class DecisionEngineMerged {
         return false;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  ANTI-LAG DETECTION
-    // ══════════════════════════════════════════════════════════════
 
     private static class AntiLagResult {
         final int direction; final double strength;
@@ -3376,9 +3297,7 @@ public final class DecisionEngineMerged {
         return null;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  REVERSE EXHAUSTION DETECTION
-    // ══════════════════════════════════════════════════════════════
 
     private static class ReverseWarning {
         final String type; final double confidence;
@@ -3457,15 +3376,13 @@ public final class DecisionEngineMerged {
         return (c.get(n - offset - 1).close - base) / (base + 1e-9);
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v7.1] EARLY REVERSAL DETECTION
+    //  EARLY REVERSAL DETECTION
     //  5 независимых сигналов раннего разворота:
     //  1. Momentum Deceleration — свечи уменьшаются, тренд слабеет
     //  2. Volume Divergence — цена = новый экстремум, объём падает
     //  3. Wick Rejection — длинная тень на 1m/5m = отвергли уровень
     //  4. RSI Momentum Shift — RSI разворачивается раньше цены
     //  5. Micro Structure Break — на 1m сломалась структура
-    // ══════════════════════════════════════════════════════════════
 
     private static final class EarlyReversalResult {
         final boolean detected;
@@ -3500,11 +3417,9 @@ public final class DecisionEngineMerged {
         // Если нет выраженного тренда — ранний разворот не применяется
         if (!inUptrend && !inDowntrend) return new EarlyReversalResult(false, 0, 0, List.of());
 
-        // ═══════════════════════════════════════════════════════
         // 1. MOMENTUM DECELERATION
         // Тренд идёт вверх/вниз, но свечи УМЕНЬШАЮТСЯ.
         // Тело 3-й < тело 2-й < тело 1-й = тренд теряет силу.
-        // ═══════════════════════════════════════════════════════
         if (c15.size() >= 5) {
             double b1 = Math.abs(c15.get(c15.size()-1).close - c15.get(c15.size()-1).open);
             double b2 = Math.abs(c15.get(c15.size()-2).close - c15.get(c15.size()-2).open);
@@ -3534,11 +3449,9 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ═══════════════════════════════════════════════════════
         // 2. VOLUME DIVERGENCE
         // Цена делает новый хай/лой, но объём падает.
         // Smart money уже вышли — розница догоняет.
-        // ═══════════════════════════════════════════════════════
         if (c15.size() >= 6) {
             com.bot.TradingCore.Candle cur  = c15.get(c15.size() - 1);
             com.bot.TradingCore.Candle prev = c15.get(c15.size() - 2);
@@ -3557,12 +3470,10 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ═══════════════════════════════════════════════════════
         // 3. WICK REJECTION на 1m/5m
         // Длинная тень в направлении тренда = цену отвергли.
         // Если на 5m последняя свеча имеет тень > 2× тело
         // в направлении тренда — это rejection.
-        // ═══════════════════════════════════════════════════════
         if (c5 != null && c5.size() >= 3) {
             com.bot.TradingCore.Candle lc5 = c5.get(c5.size() - 1);
             double body5 = Math.abs(lc5.close - lc5.open) + 1e-10;
@@ -3602,11 +3513,9 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ═══════════════════════════════════════════════════════
         // 4. RSI MOMENTUM SHIFT
         // RSI7 начинает падать с зоны перекупленности/перепроданности
         // РАНЬШЕ чем цена развернулась.
-        // ═══════════════════════════════════════════════════════
         if (inUptrend && rsi7 < 62 && rsi14 > 65) {
             // RSI7 уже упал ниже 62, но RSI14 ещё выше 65 = дивергенция скоростей
             score += 0.25;
@@ -3620,11 +3529,9 @@ public final class DecisionEngineMerged {
             flags.add("RSI_SHIFT_UP");
         }
 
-        // ═══════════════════════════════════════════════════════
         // 5. MICRO STRUCTURE BREAK на 1m
         // На 15m ещё HH/HL (бычий), но на 1m уже появился LH
         // (Lower High) — микро-структура сломалась РАНЬШЕ.
-        // ═══════════════════════════════════════════════════════
         if (c1 != null && c1.size() >= 15) {
             int n1 = c1.size();
             // Ищем структуру на последних 12 минутных свечах
@@ -3658,10 +3565,8 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ═══════════════════════════════════════════════════════
         // АГРЕГАЦИЯ
         // Нужно минимум 2 сигнала в одном направлении
-        // ═══════════════════════════════════════════════════════
         if (bearSignals >= 2 && inUptrend && score >= 0.45) {
             // Ранний разворот вниз (SHORT): тренд был вверх, но слабеет
             return new EarlyReversalResult(true, -1, Math.min(score, 0.85), flags);
@@ -3674,8 +3579,7 @@ public final class DecisionEngineMerged {
         return new EarlyReversalResult(false, 0, 0, flags);
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v53] STRONG REVERSAL DETECTOR
+    //  STRONG REVERSAL DETECTOR
     //  High-conviction reversal after extended one-sided moves.
     //  Fires ONLY when at least 3 of 5 confluence signals agree:
     //    1. N consecutive bars in one direction (extended move)
@@ -3686,7 +3590,6 @@ public final class DecisionEngineMerged {
     //  Strength >= 0.55 required to pass threshold.
     //  This is the "many candles in one direction — watch for reversal" logic
     //  the user asked for.
-    // ══════════════════════════════════════════════════════════════
 
     private static final class StrongReversalResult {
         final boolean detected;
@@ -3806,9 +3709,7 @@ public final class DecisionEngineMerged {
         return new StrongReversalResult(true, direction, strength, flags);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MARKET STRUCTURE
-    // ══════════════════════════════════════════════════════════════
 
     public static int marketStructure(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 20) return 0;
@@ -3848,9 +3749,7 @@ public final class DecisionEngineMerged {
         return res;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  SMC: FVG + ORDER BLOCK
-    // ══════════════════════════════════════════════════════════════
 
     private static final class FVGResult {
         final boolean detected, isBullish;
@@ -3901,9 +3800,7 @@ public final class DecisionEngineMerged {
         return new OrderBlockResult(false, false, 0);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  LIQUIDITY SWEEP
-    // ══════════════════════════════════════════════════════════════
 
     public static boolean detectLiquiditySweep(List<com.bot.TradingCore.Candle> c) {
         if (c == null || c.size() < 6) return false;
@@ -3917,10 +3814,7 @@ public final class DecisionEngineMerged {
     }
 
 
-
-    // ══════════════════════════════════════════════════════════════
     //  COMPRESSION BREAKOUT
-    // ══════════════════════════════════════════════════════════════
 
     private static final class CompressionResult {
         final boolean breakout; final int direction;
@@ -3942,9 +3836,7 @@ public final class DecisionEngineMerged {
         return new CompressionResult(false, 0);
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  EXHAUSTION CHECKS
-    // ══════════════════════════════════════════════════════════════
 
     private boolean isLongExhausted(List<com.bot.TradingCore.Candle> c15,
                                     List<com.bot.TradingCore.Candle> c1h,
@@ -3994,9 +3886,7 @@ public final class DecisionEngineMerged {
         return false;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MARKET STATE + HTF BIAS
-    // ══════════════════════════════════════════════════════════════
 
     private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 55) return MarketState.WEAK_TREND;
@@ -4012,7 +3902,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [FIX v32+] detectBias1H REWRITE.
+     * detectBias1H REWRITE.
      *
      * PROBLEM: EMA50 vs EMA200 crossover on 1H takes 8-10 DAYS to flip.
      * During any altcoin correction (2-5 days), EMA50 stays below EMA200 everywhere.
@@ -4029,7 +3919,7 @@ public final class DecisionEngineMerged {
      * This prevents false BEAR lock that kills all LONG opportunities.
      */
     /**
-     * [PATCH v1.0] Weighted HTFBias instead of vote-counting.
+     * Weighted HTFBias instead of vote-counting.
      * Old version: 4 binary votes, threshold 3/4. RSI=47 → bear; RSI=48 → NONE.
      * Single noisy factor could flip the bias.
      * New version: each factor contributes proportionally; sum compared to 3.0.
@@ -4082,12 +3972,12 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [FIX v32+] detectBias2H uses EMA12/26/50 — already faster than 1H version,
+     * detectBias2H uses EMA12/26/50 — already faster than 1H version,
      * but still biased to slow cross. Add RSI and swing structure confirmation.
      * Same 3/4 factors threshold to avoid BEAR lock during corrections.
      */
     /**
-     * [PATCH v1.0] detectBias2H — same weighted approach as 1H.
+     * detectBias2H — same weighted approach as 1H.
      * Weights slightly higher since 2H is slower/more significant than 1H.
      */
     private HTFBias detectBias2H(List<com.bot.TradingCore.Candle> c) {
@@ -4164,7 +4054,7 @@ public final class DecisionEngineMerged {
         return h2 < h1 && l2 < l1;
     }
 
-    // [v28.0] PATCH #5: synchronized to fix race condition.
+    // PATCH #5: synchronized to fix race condition.
     // volatile double does NOT make read-modify-write atomic.
     // fetchPool has up to 25 threads — concurrent clamp(base,...) writes corrupt globalMinConf.
     private synchronized void adaptGlobalMinConf(MarketState state, double atr, double price) {
@@ -4181,11 +4071,9 @@ public final class DecisionEngineMerged {
         globalMinConf.set(clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL));
     }
 
-    // ══════════════════════════════════════════════════════════════
-    //  [v11.0] STRUCTURAL STOP PLACEMENT
+    //  STRUCTURAL STOP PLACEMENT
     //  Finds nearest swing low (for LONG) or swing high (for SHORT)
     //  behind current price. SL goes below/above that level + buffer.
-    // ══════════════════════════════════════════════════════════════
 
     private double findStructuralStop(List<com.bot.TradingCore.Candle> c15,
                                       com.bot.TradingCore.Side side,
@@ -4195,7 +4083,7 @@ public final class DecisionEngineMerged {
         double buffer = atr14 * 0.25;
         int n = c15.size();
 
-        // [v51] VOLUME-PROFILE STOP: find the nearest high-volume zone behind price.
+        // VOLUME-PROFILE STOP: find the nearest high-volume zone behind price.
         // Market makers defend volume nodes — placing SL behind one means
         // price must break through institutional defence to hit your stop.
         //
@@ -4257,7 +4145,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [v51] VOLUME PROFILE STOP — find nearest high-volume price zone.
+     * VOLUME PROFILE STOP — find nearest high-volume price zone.
      * Divides recent price range into 20 buckets, counts volume per bucket.
      * Returns the center of the nearest high-volume bucket behind price.
      * High-volume = top 30% by volume. "Behind" = below for LONG, above for SHORT.
@@ -4320,12 +4208,10 @@ public final class DecisionEngineMerged {
         return -1;
     }
 
-    // ══════════════════════════════════════════════════════════════
     //  MATH PRIMITIVES
-    // ══════════════════════════════════════════════════════════════
 
     /**
-     * [v12.0] Wilder's Smoothed ATR — matches TradingView/Binance exactly.
+     * Wilder's Smoothed ATR — matches TradingView/Binance exactly.
      * Old code used simple SMA of TR — gives 15-20% different values.
      * All ATR-dependent thresholds (stops, impulse, overextension) were miscalibrated.
      */
@@ -4358,7 +4244,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [v12.0] Wilder's ADX — proper smoothed calculation.
+     * Wilder's ADX — proper smoothed calculation.
      * Old code used simple sum, not Wilder's smoothing.
      * This caused ADX to read 15 where real ADX was 28 → wrong RANGE detection.
      * The bot was entering RANGE trades that were actually trending, and vice versa.
@@ -4574,7 +4460,7 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * [FIX v32+] pullback — tightened RSI ranges.
+     * pullback — tightened RSI ranges.
      * OLD LONG: RSI 30-65 — allowed entry at RSI 64 = nearly overbought = terrible timing.
      * NEW LONG: RSI 32-55 — only enter on genuine pullback, not mid-rally.
      * OLD SHORT: RSI 35-70 — allowed entry at RSI 36 = nearly oversold.
@@ -4613,7 +4499,6 @@ public final class DecisionEngineMerged {
     private boolean valid(List<?> c)  { return c != null && c.size() >= MIN_BARS; }
     private double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
 
-    // ════════════════════════════════════════════════════════════════════════
     // [v42.0 FIX #1, #3, #4, #7]  ProbabilityCalibrator — static nested class
     //
     // Replaces 24 hardcoded `Math.max(50, ...)` floors with empirical isotonic
@@ -4622,19 +4507,26 @@ public final class DecisionEngineMerged {
     // (Zadrozny-Elkan, Niculescu-Mizil 2005).
     //
     // BUCKETED BY VOLATILITY (FIX #7): one calibration per (symbol, vol-bucket).
-    // ════════════════════════════════════════════════════════════════════════
     public static final class ProbabilityCalibrator {
 
-        private static final int  MIN_SAMPLES = 50;
+        // MIN_SAMPLES: 50→30.
+        // При 5-10 сигналов/день глобальный fallback набирает 30 за ~1 неделю (было 1.5 нед).
+        // Per-symbol-per-bucket собирается за ~2-3 нед (было 2.5+ месяца при старых границах).
+        private static final int  MIN_SAMPLES = 30;
         private static final int  WINDOW      = 500;
         private static final int  BUCKETS     = 10;
         private static final long MAX_AGE_MS  = 30L * 24 * 60 * 60 * 1000L;
 
+        // UNIFIED VOL BUCKET BOUNDARIES.
+        // БЫЛО: 0.8/1.8 — не совпадало с DecisionEngineMerged.classifyVolatility() (0.5/1.5 в долях).
+        // После PATCH #2 калибратор читает правильный бакет, но разные границы искажали классификацию:
+        // монета с ATR 1.6% → HIGH в DE (>1.5%), но MID в калибраторе (<1.8%). Теперь одинаково.
+        // Бонус: 3 бакета с единой семантикой → MIN_SAMPLES 30 набирается за 1-2 недели (было 2.5 мес).
         public enum VolBucket { LOW, MID, HIGH;
             public static VolBucket of(double atrPct) {
-                if (atrPct < 0.8) return LOW;
-                if (atrPct < 1.8) return MID;
-                return HIGH;
+                if (atrPct < 0.5) return LOW;   // <0.5%  = BTC/ETH class
+                if (atrPct < 1.5) return MID;   // 0.5–1.5% = major ALT
+                return HIGH;                    // >1.5% = volatile ALT / MEME
             }
         }
 
@@ -4848,9 +4740,7 @@ public final class DecisionEngineMerged {
 
         public void resetAll() { history.clear(); }
 
-        // ════════════════════════════════════════════════════════
-        // [PATCH #6] PERSISTENT STATE — save/load to disk
-        // ════════════════════════════════════════════════════════
+        // PERSISTENT STATE — save/load to disk
 
         /**
          * Сохраняет всё состояние калибратора в текстовый файл.
@@ -4932,8 +4822,7 @@ public final class DecisionEngineMerged {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // [PATCH v1.0] LOCAL EXHAUSTION — per-pair dump/pump detection.
+    // LOCAL EXHAUSTION — per-pair dump/pump detection.
     //
     // Returns:
     //   direction = +1  →  strong UP move   (blocks SHORT entries)
@@ -4946,7 +4835,6 @@ public final class DecisionEngineMerged {
     //
     // This catches isolated alt dumps (e.g. DOT dumps, BTC flat) that GIC misses
     // because GIC only watches BTC-driven global panics.
-    // ═══════════════════════════════════════════════════════════════════════
     private static final class LocalExhaustion {
         final int direction;   // -1, 0, +1
         final double moveAtr;  // magnitude in ATR units

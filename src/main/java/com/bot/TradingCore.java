@@ -3,35 +3,7 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * ╔══════════════════════════════════════════════════════════════════════════════╗
- * ║       TradingCore v15.0 — INSTITUTIONAL QUANT + FORECASTING FOUNDATION      ║
- * ╠══════════════════════════════════════════════════════════════════════════════╣
- * ║                                                                              ║
- * ║  v15.0 CRITICAL FIXES:                                                       ║
- * ║    · [FIX Дыра 3] LR window: 30→10 bars (catches V-reversals)              ║
- * ║    · [FIX Дыра 3] LR Acceleration (2nd derivative) — detects slope change  ║
- * ║    · [FIX KITEUSDT] VolatilitySqueezeGuard — blocks signals in squeeze     ║
- * ║    · Squeeze zone: directionScore×0.25, confidence×0.5                      ║
- * ║                                                                              ║
- * ║  v13.0 NEW — FORECASTING PRIMITIVES (for 8-candle ahead prediction):        ║
- * ║    · LinearRegressionChannel — slope, std-channel, momentum projection      ║
- * ║    · VolumeProfileEngine — VPOC, VAH, VAL, key magnetic levels              ║
- * ║    · TrendPhaseAnalyzer — EARLY/MID/LATE/EXHAUSTION phase detection         ║
- * ║    · FisherTransform — better oscillator, less lag than RSI                 ║
- * ║    · ATRPercentile — current volatility vs historical regime                 ║
- * ║    · SwingStructure — HH/HL vs LH/LL market structure                       ║
- * ║    · OrderBlockDetector — institutional footprint zones                      ║
- * ║    · WyckoffPhaseDetector — accumulation/distribution detection             ║
- * ║                                                                              ║
- * ║  v10.0 PRESERVED — all original math primitives:                            ║
- * ║    · RSI (Wilder), ATR, EMA, SMA, VWAP, Bollinger, Keltner                 ║
- * ║    · MACD, StochRSI, CCI, MFI, OBV, CMF, ADX                              ║
- * ║    · Hurst Exponent, Shannon Entropy                                         ║
- * ║    · Divergence detection, Market Regime, Risk Engine, Adaptive Brain       ║
- * ║                                                                              ║
- * ╚══════════════════════════════════════════════════════════════════════════════╝
- */
+/** TradingCore v15.0 — INSTITUTIONAL QUANT + FORECASTING FOUNDATION */
 public final class TradingCore {
 
     private TradingCore() {}
@@ -433,9 +405,6 @@ public final class TradingCore {
     }
 
 
-
-
-
     public static double[] obvSeries(List<Candle> candles) {
         double[] obv = new double[candles.size()];
         obv[0] = candles.get(0).volume;
@@ -446,7 +415,6 @@ public final class TradingCore {
         }
         return obv;
     }
-
 
 
     /* ════════════════════════════════════════════════════════════════
@@ -489,11 +457,6 @@ public final class TradingCore {
         if (Math.abs(denom) < 1e-12) return 0.5;
         return clamp((pn * sumXY - sumX * sumY) / denom, 0.0, 1.0);
     }
-
-
-
-
-
 
 
     /* ════════════════════════════════════════════════════════════════
@@ -1295,7 +1258,7 @@ public final class TradingCore {
         }
 
         /**
-         * [v38.0] ATR-BASED POSITION SIZING + QUARTER-KELLY
+         * ATR-BASED POSITION SIZING + QUARTER-KELLY
          *
          * Формула: size = (balance × riskPct) / (ATR × leverage)
          * Kelly: f* = (p × b − q) / b, применяется × 0.25 (quarter Kelly)
@@ -1563,9 +1526,7 @@ public final class TradingCore {
         boolean closedHigh = closePos >= 0.65;  // closed in upper 35% of bar
         boolean closedLow  = closePos <= 0.35;  // closed in lower 35% of bar
 
-        // ════════════════════════════════════════════════════════
         // BULLISH PATTERNS (ordered by statistical reliability)
-        // ════════════════════════════════════════════════════════
 
         // STOPPING VOLUME BULL — the single most reliable bottom signal in VSA.
         // Ultra-high volume on a down-bar that closes near the HIGH of the bar.
@@ -1601,9 +1562,7 @@ public final class TradingCore {
             return new VsaResult(VsaResult.VsaSignal.DEMAND_ABSORPTION, str);
         }
 
-        // ════════════════════════════════════════════════════════
         // BEARISH PATTERNS
-        // ════════════════════════════════════════════════════════
 
         // STOPPING VOLUME BEAR — ultra-volume on an up-bar that closes near the LOW.
         // Interpretation: massive demand hit the market, sellers absorbed it all.
@@ -1742,7 +1701,20 @@ public final class TradingCore {
 
         public ForecastResult forecast(List<Candle> c5, List<Candle> c15,
                                        List<Candle> c1h, double volumeDelta) {
-            if (c15 == null || c15.size() < 100 || c1h == null || c1h.size() < 50) return null;
+            // Разделены на два return для читаемости + логирование холодного старта.
+            // Ранее: один молчаливый return null — непонятно почему AFC Stage 2 не работает.
+            // Теперь: явное сообщение когда данных недостаточно (cold start, а не ошибка).
+            if (c15 == null || c15.size() < 100) {
+                // Cold start или AFC передал < 100 свечей 15m — ждём накопления данных.
+                return null;
+            }
+            if (c1h == null || c1h.size() < 50) {
+                // Cold start 1h данных — BotMain.runAdvanceForecast должен запрашивать ≥72 баров.
+                // Если этот лог появляется → PATCH #1 не применён в BotMain.
+                System.out.printf("[ForecastEngine] cold-start 1h: size=%d < 50 required%n",
+                        c1h == null ? 0 : c1h.size());
+                return null;
+            }
             int n = c15.size();
             double price = c15.get(n - 1).close;
             double atr14 = fcAtr(c15, 14);
@@ -1750,23 +1722,19 @@ public final class TradingCore {
 
             Map<String, Double> f = new LinkedHashMap<>();
 
-            // ═══════════════════════════════════════════════════════
             // STEP 1: Identify the CURRENT MOVE (direction + age + depth)
-            // ═══════════════════════════════════════════════════════
             MoveInfo move = identifyCurrentMove(c15, atr14);
             f.put("MOVE_DIR", (double) move.direction);
             f.put("MOVE_AGE", (double) move.ageBars);
             f.put("MOVE_DEPTH", move.depthAtr);
 
-            // ═══════════════════════════════════════════════════════
             // STEP 2: EXHAUSTION BRAIN — is this move dying?
             // This is the KEY innovation. Each factor answers:
             // "Is the fuel running out?" → positive = exhausted → reversal likely
-            // ═══════════════════════════════════════════════════════
             double exhaustionScore = 0;
             int exhaustionSignals = 0;
 
-            // [v50] All exhaustion factor thresholds lowered 0.3→0.2.
+            // All exhaustion factor thresholds lowered 0.3→0.2.
             // At 0.3 exhaustion was only detected when the move was nearly done.
             // At 0.2 we catch the early signs 1-2 bars sooner.
 
@@ -1802,14 +1770,12 @@ public final class TradingCore {
             exhaustionScore = clamp(exhaustionScore, 0, 1);
             f.put("EXHAUSTION", exhaustionScore);
 
-            // ═══════════════════════════════════════════════════════
             // STEP 3: TREND BRAIN — [v38.0] SIMPLIFIED
             // Удалены мультиколлинеарные факторы:
             //   LR_8 ≈ SWING (оба = краткосрочное направление) → оставляем SWING
             //   FISHER ≈ OF (оба = осцилляторы потока) → оставляем OF
             // Оставлены 3 ключевых: SWING (структура), OF (поток), HTF (тренд)
             // + 2 опережающих: CVD_RT (реальное время), ACCEL (ускорение)
-            // ═══════════════════════════════════════════════════════
             double trendDir = 0;
 
             // Swing structure — HH/HL vs LL/LH
@@ -1827,10 +1793,8 @@ public final class TradingCore {
             f.put("HTF", htfScore);
             trendDir += htfScore * 0.15;
 
-            // ═══════════════════════════════════════════════════════
-            // [v38.0] LEADING FACTORS — опережающие индикаторы
+            // LEADING FACTORS — опережающие индикаторы
             // CVD_RT + ACCEL дают 3-5 свечей форы
-            // ═══════════════════════════════════════════════════════
 
             // RT-CVD — реальное соотношение покупок/продаж
             double cvdRt = clamp(volumeDelta * 1.8, -0.85, 0.85);
@@ -1855,35 +1819,27 @@ public final class TradingCore {
             }
             // [BUG B] Sum of weights: 0.22 + 0.18 + 0.15 + 0.25 + 0.20 = 1.00 (normalized)
 
-            // ═══════════════════════════════════════════════════════
             // LEADING FACTOR: Chaikin Money Flow — institutional intent.
             // CMF > 0 = close near top of range × volume = institutional buying.
             // Used in confidence only (trendDir weights already sum to 1.0).
             // NOT added to trendDir to preserve weight normalization.
-            // ═══════════════════════════════════════════════════════
             double cmfScore = calcCMF(c15, 20);
             f.put("CMF", cmfScore);
 
-            // ═══════════════════════════════════════════════════════
             // LEADING FACTOR: OBV slope — structural accumulation/distribution.
             // Positive slope = net buying across last 20 bars (OBV trending up).
             // OBV diverging from price is one of the best reversal predictors.
             // Used in confidence only (same reason as CMF).
-            // ═══════════════════════════════════════════════════════
             double obvSlopeScore = calcOBVSlope(c15, 20);
             f.put("OBV_SLOPE", obvSlopeScore);
 
             trendDir = clamp(trendDir, -1.0, 1.0);
 
-            // ═══════════════════════════════════════════════════════
             // STEP 4: SQUEEZE detection — block all direction in compression
-            // ═══════════════════════════════════════════════════════
             boolean squeezed = isVolatilitySqueeze(c15, atr14);
             f.put("SQUEEZE", squeezed ? 1.0 : 0.0);
 
-            // ═══════════════════════════════════════════════════════
             // STEP 5: COMBINE — Exhaustion OVERRIDES Trend
-            // ═══════════════════════════════════════════════════════
             TrendPhase phase = detectPhase(c15, c1h, move, exhaustionScore);
 
             double dir;
@@ -1903,13 +1859,13 @@ public final class TradingCore {
                 }
                 dir = squeezeBias;
             } else if (exhaustionScore > 0.38 && exhaustionSignals >= 2) {
-                // [v50] STRONG exhaustion lowered 0.50→0.38, signals 2 (kept).
+                // STRONG exhaustion lowered 0.50→0.38, signals 2 (kept).
                 // At 0.50 the reversal was already confirmed on chart.
                 // At 0.38 we forecast it 1-2 bars earlier.
                 dir = -move.direction * exhaustionScore * 0.90;
                 dir += trendDir * 0.03;
             } else if (exhaustionScore > 0.22 && exhaustionSignals >= 1) {
-                // [v50] Moderate exhaustion lowered 0.30→0.22.
+                // Moderate exhaustion lowered 0.30→0.22.
                 // Single exhaustion signal = early warning, not full reversal.
                 dir = trendDir * 0.20 + vpocPull * 0.30;
                 dir -= move.direction * exhaustionScore * 0.45;
@@ -1925,7 +1881,6 @@ public final class TradingCore {
 
             dir = clamp(dir, -1.0, 1.0);
 
-            // ═══════════════════════════════════════════════════════
             // STEP 6: Confidence = взвешенное согласие факторов
             // [ДЫРА №3] Раньше все факторы имели одинаковый вес.
             // HTF (часовой тренд) и OF (orderflow/CVD) = фундаментальные.
@@ -1934,12 +1889,10 @@ public final class TradingCore {
             // [v36-FIX Дыра4] FACTOR_WEIGHTS вынесены в static final (нет аллокаций на каждый вызов).
             // Удалены мультиколлинеарные факторы: LR_8 (≈SWING), Fisher (≈OF/dir), SQUEEZE (шум вес=0.5).
             // Оставлены 5 ключевых факторов с наибольшей предиктивной силой.
-            // ═══════════════════════════════════════════════════════
             double conf;
             if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
                 conf = clamp(0.50 + exhaustionScore * 0.30, 0.50, 0.85);
             } else {
-                // ─────────────────────────────────────────────────────────────
                 // MAGNITUDE-WEIGHTED CONFIDENCE
                 //
                 // OLD (binary): factor > 0.10 AND direction matches → add weight.
@@ -1957,7 +1910,6 @@ public final class TradingCore {
                 // Bonus: if 3+ leading indicators all agree (CMF, CVD_RT, ACCEL,
                 //   OBV_SLOPE) → strong +8% confidence boost. These four together
                 //   represent the best real-time institutional flow signal we have.
-                // ─────────────────────────────────────────────────────────────
                 Map<String, Double> FACTOR_WEIGHTS = squeezed ? FW_SQUEEZE : FW_BASE;
                 double dirSign       = Math.signum(dir);
                 double weightedAgree = 0, weightedDisagree = 0, totalWeight = 0;
@@ -2017,9 +1969,7 @@ public final class TradingCore {
                 }
             }
 
-            // ═══════════════════════════════════════════════════════
             // STEP 7: Bias classification
-            // ═══════════════════════════════════════════════════════
             ForecastBias bias;
             if (dir > 0.40) bias = ForecastBias.STRONG_BULL;
             else if (dir > 0.12) bias = ForecastBias.BULL;
@@ -2027,16 +1977,14 @@ public final class TradingCore {
             else if (dir < -0.12) bias = ForecastBias.BEAR;
             else bias = ForecastBias.NEUTRAL;
 
-            // [v38.0] projMove: estimated next-bar move based on direction strength and ATR
+            // projMove: estimated next-bar move based on direction strength and ATR
             double projMove = dir * atr14 * 2.0 / price;
             double vpoc = calcVPOC(c15, 50);
 
             return new ForecastResult(bias, dir, conf, phase, projMove, vpoc, f);
         }
 
-        // ═══════════════════════════════════════════════════════
         //  MOVE IDENTIFICATION — find origin, direction, age, depth
-        // ═══════════════════════════════════════════════════════
 
         private static final class MoveInfo {
             final int direction;     // +1 = bullish move, -1 = bearish, 0 = flat
@@ -2051,7 +1999,7 @@ public final class TradingCore {
         }
 
         /**
-         * [FIX #1 + BUG D] Swing-pivot approach — O(n), no EMA5 lag.
+         * Swing-pivot approach — O(n), no EMA5 lag.
          *
          * Problem with old version:
          *   1) EMA5 lags 2-3 bars → after pump peak, method still reports dir=+1
@@ -2127,14 +2075,12 @@ public final class TradingCore {
             return new MoveInfo(dir, age, depth, origin, originPrice);
         }
 
-        // ═══════════════════════════════════════════════════════
         //  EXHAUSTION FACTORS
-        // ═══════════════════════════════════════════════════════
 
         /** Volume Fade: average volume of last 3 bars vs first 3 bars of move.
          *  If later bars have less volume → move losing fuel. Returns [0..1]. */
         private double calcVolumeFade(List<Candle> c, MoveInfo move) {
-            // [FIX #2] Old: ageBars<4 → 60min lag. New: adaptive window, works from 2 bars.
+            // Old: ageBars<4 → 60min lag. New: adaptive window, works from 2 bars.
             if (move.ageBars < 2) return 0;
             int n = c.size();
             int start = move.originIdx;
@@ -2164,7 +2110,7 @@ public final class TradingCore {
         /** Momentum Decay: body size of last window vs first window.
          *  If each bar is smaller → momentum dying. Returns [0..1]. */
         private double calcMomentumDecay(List<Candle> c, MoveInfo move, double atr) {
-            // [FIX #2] Old: ageBars<4. New: adaptive window from 2 bars.
+            // Old: ageBars<4. New: adaptive window from 2 bars.
             if (move.ageBars < 2) return 0;
             int n = c.size();
             int start = move.originIdx;
@@ -2200,7 +2146,7 @@ public final class TradingCore {
         }
 
         /** Wick Rejection: wicks against the move growing = opposition forming.
-         *  [FIX #2] Added early (1-2 bar) wick detection for fast reversals. */
+         *  Added early (1-2 bar) wick detection for fast reversals. */
         private double calcWickRejection(List<Candle> c, MoveInfo move) {
             int n = c.size();
             if (move.ageBars < 1 || n < 3 || move.direction == 0) return 0;
@@ -2400,9 +2346,7 @@ public final class TradingCore {
             return clamp(dist * 0.20, -0.5, 0.5);
         }
 
-        // ═══════════════════════════════════════════════════════
         //  TREND PHASE — now uses exhaustion brain
-        // ═══════════════════════════════════════════════════════
 
         public TrendPhase detectPhase(List<Candle> c15, List<Candle> c1h) {
             return detectPhase(c15, c1h,
@@ -2419,9 +2363,7 @@ public final class TradingCore {
             return TrendPhase.MID;
         }
 
-        // ═══════════════════════════════════════════════════════
         //  SQUEEZE detection
-        // ═══════════════════════════════════════════════════════
 
         /**
          * Volatility Squeeze v2 — Bollinger Bands inside Keltner Channels (John Carter).
@@ -2490,9 +2432,7 @@ public final class TradingCore {
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════
         //  TREND BRAIN helpers (kept but secondary)
-        // ═══════════════════════════════════════════════════════
 
         /**
          * Order Flow v2 — taker ratio + CMF + volumeDelta combined.
@@ -2552,7 +2492,7 @@ public final class TradingCore {
         }
 
         /**
-         * [FIX #3 + BUG A] Slope-based HTF — no EMA lag.
+         * Slope-based HTF — no EMA lag.
          *
          * Problem with old version: EMA9>EMA21 on 1h persists 5-9 hours after a pump.
          * Document's fix (EMA delta over 1 hourly bar) is still EMA-based and lagged.
@@ -2736,9 +2676,7 @@ public final class TradingCore {
             return clamp(s, -0.8, 0.8);
         }
 
-        // ═══════════════════════════════════════════════════════
         //  MATH primitives
-        // ═══════════════════════════════════════════════════════
 
         private double linRegSlope(List<Candle> c, int p) {
             int n = c.size();
@@ -2796,9 +2734,6 @@ public final class TradingCore {
             for (int i = 1; i < bins; i++) if (vb[i] > vb[mx]) mx = i;
             return lo + (mx + 0.5) * bs;
         }
-
-        /** [v23.0 FIX] Delegates to TradingCore.atr() — Wilder's smoothed ATR.
-         *  Old SMA diverges 15-20% from Wilder's → miscalculated exhaustion thresholds. */
         private double fcAtr(List<Candle> c, int n) {
             return TradingCore.atr(c, n);
         }
@@ -2810,5 +2745,5 @@ public final class TradingCore {
                 e = c.get(i).close * k + e * (1 - k);
             return e;
         }
-    } // end ForecastEngine
+    }
 }

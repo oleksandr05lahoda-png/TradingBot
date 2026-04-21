@@ -93,7 +93,7 @@ public final class PumpHunter {
         MEGA_PUMP_UP, MEGA_PUMP_DOWN,
         SQUEEZE_UP, SQUEEZE_DOWN,
         BREAKOUT_UP, BREAKOUT_DOWN,
-        // [v51] Reversal / anticipatory
+        // Reversal / anticipatory
         PUMP_EXHAUSTION_SHORT, DUMP_EXHAUSTION_LONG,
         PRE_PUMP_LONG, PRE_DUMP_SHORT
     }
