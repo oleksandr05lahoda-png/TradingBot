@@ -77,6 +77,16 @@ public final class PumpHunter {
 
     // ==================== STATE ====================
 
+    // [FIX] Symbols to skip entirely — garbage coins that produce noise events.
+    // Populated by SignalSender via addGarbageSymbol() or constructor.
+    // Keeps PumpHunter logs clean and prevents memory growth on meme pumps.
+    private final java.util.Set<String> garbageSymbols =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    public void addGarbageSymbol(String symbol) {
+        if (symbol != null) garbageSymbols.add(symbol);
+    }
+
     private final Map<String, Long> lastPumpTime       = new ConcurrentHashMap<>();
     private final Map<String, Long> lastExhaustionTime = new ConcurrentHashMap<>();
     private final Map<String, Long> lastPrePumpTime    = new ConcurrentHashMap<>();
@@ -236,6 +246,9 @@ public final class PumpHunter {
                                          List<com.bot.TradingCore.Candle> c5m,
                                          List<com.bot.TradingCore.Candle> c15m,
                                          double catMult) {
+
+        // [FIX] Skip known garbage coins — prevent log spam and memory waste
+        if (garbageSymbols.contains(symbol)) return null;
 
         if (c1m == null || c1m.size() < 20
                 || c5m == null || c5m.size() < 15

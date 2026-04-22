@@ -417,7 +417,17 @@ public final class BotMain {
 
         // [BUG-FIX v33.1] panicCallback was routed to LOG only — trader never saw BTC CRASH alerts.
         // Now: GIC CRASH/PANIC events go to Telegram immediately (bypass normal queue, use offerFirst).
-        isc.setTimeStopCallback((sym, msg) -> LOG.info("[ISC time-stop] " + sym + ": " + msg));
+        isc.setTimeStopCallback((sym, msg) -> {
+            LOG.info("[ISC time-stop] " + sym + ": " + msg);
+            // [FIX SCANNER MODE] Notify trader to check/close position manually.
+            // Without TradeResolver, trader had no idea when 90-min time limit fired.
+            telegram.sendMessageAsync(
+                    "⏱ *TIME STOP* — #" + sym + "\n"
+                            + "━━━━━━━━━━━━━━━━━━\n"
+                            + "90 мин истекло · проверь позицию\n"
+                            + "Закрой вручную если открыта\n"
+                            + "━━━━━━━━━━━━━━━━━━");
+        });
         gic.setPanicCallback(msg -> {
             LOG.warning("[GIC panic] " + msg);
             telegram.sendMessageAsync("⚠ *Market Alert*\n\n" + msg);
@@ -945,6 +955,30 @@ public final class BotMain {
                 fr.resolved = true;
                 fr.actualOutcome = outcome;
 
+                // [FIX SCANNER MODE] Send TP1/SL hit notification to trader.
+                // In scanner mode there's no TradeResolver watching positions —
+                // trader opened based on our signal but had zero exit notification.
+                // This fixes the #1 complaint: "I had no idea it hit SL"
+                if ((hitTP1 || hitSL) && hasOpinion) {
+                    String _emoji  = hitTP1 ? "✅" : "❌";
+                    String _action = hitTP1 ? "TP1 HIT" : "SL HIT";
+                    String _side   = fr.side == com.bot.TradingCore.Side.LONG ? "LONG" : "SHORT";
+                    double _level  = hitTP1 ? fr.tp1Level : fr.slLevel;
+                    double _pnlPct = fr.side == com.bot.TradingCore.Side.LONG
+                            ? (_level - fr.entryPrice) / fr.entryPrice * 100
+                            : (fr.entryPrice - _level) / fr.entryPrice * 100;
+                    String _fmt = fr.entryPrice < 0.001 ? "%.6f" : fr.entryPrice < 1 ? "%.4f" : "%.2f";
+                    telegram.sendMessageAsync(String.format(
+                            _emoji + " *" + _action + "* — #" + fr.symbol + " " + _side + "%n"
+                                    + "━━━━━━━━━━━━━━━━━━%n"
+                                    + "Вход:  `" + _fmt + "`%n"
+                                    + (hitTP1 ? "TP1:   `" : "SL:    `") + _fmt + "` (%+.2f%%)%n"
+                                    + "━━━━━━━━━━━━━━━━━━",
+                            fr.entryPrice, _level, _pnlPct));
+                    LOG.info(String.format("[NOTIFY] %s %s %s level=%.6f pnl=%+.2f%%",
+                            _action, fr.symbol, _side, _level, _pnlPct));
+                }
+
                 boolean decisive = hitTP1 || hitSL || !"FLAT".equals(outcome);
                 if (hasOpinion && decisive) {
                     if (fr.counted.compareAndSet(false, true)) {
@@ -1067,6 +1101,8 @@ public final class BotMain {
         int fcCorrect  = forecastCorrect.get();
         double fcAcc   = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
 
+        int calSamples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+        String calNote = calSamples < 50 ? String.format("\n⚠️ Калибровка сырая (%d/50 исходов) — скоры ≠ winrate", calSamples) : "";
         String msg = String.format(
                 "*Daily Report*\n\n"
                         + "Up %dm · Cycles %d · Signals %d\n"
@@ -1074,7 +1110,7 @@ public final class BotMain {
                         + "BTC %s · Vol %s\n"
                         + "WS %d · Bal $%.2f\n\n"
                         + "Forecast *%.0f%%* (%d/%d)\n"
-                        + "Open %d",
+                        + "Open %d" + calNote,
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 isc.getDailyPnL(), isc.getDrawdownFromPeak(),
                 ctx.regime, ctx.volRegime,
@@ -1322,6 +1358,11 @@ public final class BotMain {
         for (String pair : topPairs) {
             if (sent >= AFC_MAX_PER_RUN) break;
 
+            // [FIX] Block garbage coins and non-ASCII symbols from AFC.
+            // Previously UAIUSDT (in GARBAGE_COIN_BLOCKLIST) was fetching
+            // 150+72 klines every 2 minutes because AFC had no garbage filter.
+            if (com.bot.SignalSender.isBlocklisted(pair)) continue;
+
             boolean isMarketLeader = pair.equals("BTCUSDT") || pair.equals("ETHUSDT") || pair.equals("SOLUSDT");
             long effectiveCooldown = isMarketLeader
                     ? ADVANCE_FORECAST_COOLDOWN_MS / 2
@@ -1507,6 +1548,14 @@ public final class BotMain {
     }
 
 
+    /** Returns honest calibration status for startup message */
+    private static String calibrationStatus() {
+        int samples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+        if (samples < 30)  return "⚠️ Калибровка: " + samples + "/30 — скоры сырые";
+        if (samples < 100) return "🔸 Калибровка: " + samples + "/100 — частичная";
+        return "✅ Калибровка: " + samples + " исходов";
+    }
+
     private static String buildStartMessage() {
         return "⚡ *TradingBot PRO* `v52`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1520,6 +1569,7 @@ public final class BotMain {
                 + "• PostPumpGuard — блок после пампа (PATCH C)\n"
                 + "• SL width + R:R guard (PATCH D)\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
+                + calibrationStatus() + "\n"
                 + "_Система активна. Торгуй с умом._";
     }
     private static String nowWarsawStr() {

@@ -703,6 +703,12 @@ public final class SignalSender {
 
         this.decisionEngine.setPumpHunter(this.pumpHunter);
         this.decisionEngine.setGIC(this.gic);
+
+        // [FIX] Pre-load garbage coins into PumpHunter so it skips them entirely.
+        // Prevents UAIUSDT/BASUSDT noise events from spamming logs every 90s.
+        for (String garbageSym : GARBAGE_COIN_BLOCKLIST) {
+            this.pumpHunter.addGarbageSymbol(garbageSym);
+        }
         // [v14.0 FIX #Forecast] Wire ForecastEngine so TradeIdea.forecast is not always null.
         this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
         this.optimizer.setPumpHunter(this.pumpHunter);
@@ -826,14 +832,30 @@ public final class SignalSender {
                 // Pre-blocking them here saves ~50+ REST/WS calls per hour and
                 // eliminates EARLY-SL-GATE log spam that masks real issues.
                 "RAVEUSDT", "GUNUSDT", "UAIUSDT", "BASEDUSDT",
-                "EDUUSDT", "CHIPUSDT"
+                "EDUUSDT", "CHIPUSDT",
+                // [FIX] Confirmed ultra-wide-SL coins (SL 10-29%) from live logs.
+                // 50+ EARLY-SL-GATE blocks per hour, burn API weight, could liquidate at 5x.
+                "BASUSDT", "METUSDT"
         ));
+    }
+
+    // [FIX] Public gate for BotMain.runAdvanceForecast() and other callers
+    public static boolean isBlocklisted(String symbol) {
+        if (symbol == null) return false;
+        if (GARBAGE_COIN_BLOCKLIST.contains(symbol)) return true;
+        // Block non-ASCII symbols (Chinese chars, special chars = listing pumps)
+        for (int k = 0; k < symbol.length(); k++) {
+            if (symbol.charAt(k) > 127) return true;
+        }
+        return false;
     }
 
     /** [v43] Called by BotMain after ISC auto-blacklist fires — syncs to processPair filter */
     public void addToGarbageBlocklist(String symbol) {
         if (symbol != null && !symbol.isBlank()) {
             GARBAGE_COIN_BLOCKLIST.add(symbol);
+            // [FIX] Also tell PumpHunter to skip this coin
+            this.pumpHunter.addGarbageSymbol(symbol);
         }
     }
 
@@ -2240,7 +2262,7 @@ public final class SignalSender {
 
         if (newStop == oldStop) return idea;
         List<String> nf = new ArrayList<>(idea.flags);
-        nf.add("SL_ADJ");
+        nf.add(String.format("SL_ADJ→%.2f%%", Math.abs(newStop - idea.price) / idea.price * 100));
         return new com.bot.DecisionEngineMerged.TradeIdea(
                 idea.symbol, idea.side, idea.price, newStop, idea.take, idea.rr,
                 idea.probability, nf, idea.fundingRate, idea.fundingDelta,
@@ -3247,6 +3269,14 @@ public final class SignalSender {
                 finalEt = rebuildIdea(et, et.probability, nf);
             }
 
+            // [FIX] Block non-ASCII symbols — listing pumps with Chinese/special names.
+            // These bypass selectPairsForScan() when they spike into top-N by volume.
+            // The same check exists in generate() but EARLY_TICK path skips generate().
+            if (isBlocklisted(et.symbol)) {
+                System.out.printf("[EARLY_TICK-BLOCK] %s: garbage/non-ASCII symbol%n", et.symbol);
+                continue;
+            }
+
             // Same MAX SL% check as processPair() — closes the EARLY_TICK backdoor.
             // Without this, EARLY_TICK signals bypassed the 3-5% SL cap entirely.
             // This is why ARIAUSDT (SL=18%) and LABUSDT (SL=11%) reached Telegram.
@@ -3683,8 +3713,12 @@ public final class SignalSender {
      */
     public List<String> getTopPairsForForecast(int n) {
         if (volume24hUSD.isEmpty()) return List.of();
+        // [FIX] Filter garbage coins and non-ASCII symbols from AFC scan universe.
+        // Previously UAIUSDT, METUSDT etc. caused REST fetches every 2 minutes.
         return volume24hUSD.entrySet().stream()
                 .filter(e -> e.getValue() >= MIN_VOL_ALT_USD)
+                .filter(e -> !isBlocklisted(e.getKey()))
+                .filter(e -> !isc.isHardBlacklisted(e.getKey()))
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .limit(n)
                 .map(Map.Entry::getKey)

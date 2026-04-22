@@ -981,7 +981,7 @@ public final class DecisionEngineMerged {
 
             // ── PASS 6: SL adjustment flag (important for trader) ─────────────
             for (String f : flags) {
-                if (f.equals("SL_ADJ")) { result.add("📐 SL_ADJ"); break; }
+                if (f.startsWith("SL_ADJ")) { result.add("📐 " + f); break; }
             }
 
             // Cap at 6 flags max — cognitive load limit.
@@ -1078,9 +1078,37 @@ public final class DecisionEngineMerged {
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.2f%%)%n", stop, slPct));
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("📊 Уверенность: *%.0f%%*  _%s_%n",
-                    probability, signalQualityLabel(probability)));
-            sb.append("⏱ ").append(timeStr).append(" · ").append(city);
+            // [FIX] Show calibration status AND apply shrinkage when data is scarce.
+            // Raw model score 87% with 0 calibration data is actively misleading.
+            // With < 30 samples: shrink toward 68% (middle of our min-conf range).
+            // With 30-99 samples: partial shrinkage.
+            // With 100+ samples: trust the calibrated score.
+            int _calSamples = DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+            double _displayedProb = probability;
+            if (_calSamples < 30) {
+                // Heavy shrinkage toward neutral — we literally don't know
+                _displayedProb = probability * 0.60 + 68.0 * 0.40;
+                _displayedProb = Math.min(78.0, _displayedProb); // cap at 78% when blind
+            } else if (_calSamples < 100) {
+                // Partial shrinkage — we have some data but not enough
+                double weight = (double)(_calSamples - 30) / 70.0; // 0→1 over 30..100 samples
+                _displayedProb = probability * (0.60 + weight * 0.40) + 68.0 * (0.40 - weight * 0.40);
+            }
+            _displayedProb = Math.max(0, Math.min(85, _displayedProb));
+            if (_calSamples < 100) {
+                sb.append(String.format("📊 Скор: *%.0f%%*  _%s_  ⚠️_(%d/100)_%n",
+                        _displayedProb, signalQualityLabel(_displayedProb), _calSamples));
+            } else {
+                sb.append(String.format("📊 Уверенность: *%.0f%%*  _%s_%n",
+                        _displayedProb, signalQualityLabel(_displayedProb)));
+            }
+            // [FIX] Warn trader when SL is very tight relative to ATR.
+            // SL < 0.8% on liquid ALTs (ATR ~1%) = noise-stop risk even with correct direction.
+            double _slPctAbs = Math.abs(slPct);
+            if (_slPctAbs > 0 && _slPctAbs < 0.60) {
+                sb.append("\n⚠️ _Стоп очень тесный — риск выноса шумом_");
+            }
+            sb.append("\n⏱ ").append(timeStr).append(" · ").append(city);
 
             return sb.toString();
         }
@@ -1101,11 +1129,13 @@ public final class DecisionEngineMerged {
          * "probability" or "win rate" until the calibrator has sufficient data.
          */
         private static String signalQualityLabel(double prob) {
-            if (prob >= 83) return "высокая сила · все кластеры сходятся";
-            if (prob >= 77) return "хорошая сила · большинство кластеров";
-            if (prob >= 70) return "умеренная сила · несколько кластеров";
-            if (prob >= 65) return "базовая сила · минимальный порог";
-            return "слабая сила";
+            // [FIX] Labels reflect cluster/model score only — NOT calibrated win-rate.
+            // Calibration activates after 50+ resolved trades.
+            if (prob >= 83) return "сильный кластер";
+            if (prob >= 77) return "хороший кластер";
+            if (prob >= 70) return "умеренный кластер";
+            if (prob >= 65) return "базовый кластер";
+            return "слабый кластер";
         }
     }
 
@@ -3029,7 +3059,12 @@ public final class DecisionEngineMerged {
         //   TradeIdea ctor: tp1 = price ± risk × tp1Mult, где risk = |price - stop|
         // Значит R:R(tp1) = tp1Mult, R:R(tp2) = tp2Mult. Контролируем эти числа.
         double slDistanceD = Math.abs(price - stopPrice);
-        double minSlDistD  = atr14 * 0.8;
+        // [FIX] SL width guard must use robustAtr14, not fast atr14.
+        // Fast atr14 collapses 40-60% during consolidation → guard threshold drops to ~0.4%
+        // → structural stop 0.82% passes the guard → noise stop guaranteed.
+        // robustAtr14 = max(longTermATR × 0.80, 70%×longTerm + 30%×current) — always respects
+        // the coin's real trading noise even during quiet periods.
+        double minSlDistD  = robustAtr14 * 0.8;
 
         if (slDistanceD < minSlDistD) {
             stopPrice = (side == com.bot.TradingCore.Side.LONG)
