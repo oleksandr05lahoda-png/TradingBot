@@ -1704,17 +1704,8 @@ public final class TradingCore {
             // Разделены на два return для читаемости + логирование холодного старта.
             // Ранее: один молчаливый return null — непонятно почему AFC Stage 2 не работает.
             // Теперь: явное сообщение когда данных недостаточно (cold start, а не ошибка).
-            if (c15 == null || c15.size() < 100) {
-                // Cold start или AFC передал < 100 свечей 15m — ждём накопления данных.
-                return null;
-            }
-            if (c1h == null || c1h.size() < 50) {
-                // Cold start 1h данных — BotMain.runAdvanceForecast должен запрашивать ≥72 баров.
-                // Если этот лог появляется → PATCH #1 не применён в BotMain.
-                System.out.printf("[ForecastEngine] cold-start 1h: size=%d < 50 required%n",
-                        c1h == null ? 0 : c1h.size());
-                return null;
-            }
+            if (c15 == null || c15.size() < 100) return null;
+            if (c1h == null || c1h.size() < 50)  return null;
             int n = c15.size();
             double price = c15.get(n - 1).close;
             double atr14 = fcAtr(c15, 14);

@@ -57,11 +57,11 @@ public final class PumpHunter {
     // [A2] Confirmation: 1 bar (was 3). Squeeze/breakout conflict guards still filter dead-cat.
     private static final int PUMP_CONFIRM_BARS = 1;
 
-    // [A3] Separate cooldowns. PUMP_COOLDOWN gates ONLY continuation-type re-emission;
-    //      exhaustion & pre-pump have their own fast cooldowns.
-    private static final long PUMP_COOLDOWN_MS       = 3 * 60_000L;
-    private static final long EXHAUSTION_COOLDOWN_MS = 90_000L;
-    private static final long PREPUMP_COOLDOWN_MS    = 2 * 60_000L;
+    // [v61] Cooldowns increased. Was 3min/90s/2min — too short, produced
+    // 2-3 duplicate signals per real event. New values: 12/4/6 min.
+    private static final long PUMP_COOLDOWN_MS       = 12 * 60_000L;
+    private static final long EXHAUSTION_COOLDOWN_MS = 4 * 60_000L;
+    private static final long PREPUMP_COOLDOWN_MS    = 6 * 60_000L;
 
     // [B] Exhaustion thresholds
     private static final long   EXH_PUMP_AGE_MS = 10 * 60_000L; // exhaustion only valid within 10min after pump
@@ -85,6 +85,29 @@ public final class PumpHunter {
 
     public void addGarbageSymbol(String symbol) {
         if (symbol != null) garbageSymbols.add(symbol);
+    }
+
+    // ── [v61] TTL cleanup — prevents unbounded state growth on Railway ────
+    private volatile long lastCleanupMs = 0L;
+    private static final long CLEANUP_INTERVAL_MS = 10 * 60_000L;
+    private static final long STATE_TTL_MS        = 2 * 60 * 60_000L;
+
+    /** Drop stale entries from all internal maps. Call periodically from BotMain. */
+    public void periodicCleanup() {
+        long now = System.currentTimeMillis();
+        if (now - lastCleanupMs < CLEANUP_INTERVAL_MS) return;
+        lastCleanupMs = now;
+        long cutoff = now - STATE_TTL_MS;
+        lastPumpTime.entrySet().removeIf(e -> e.getValue() < cutoff);
+        lastExhaustionTime.entrySet().removeIf(e -> e.getValue() < cutoff);
+        lastPrePumpTime.entrySet().removeIf(e -> e.getValue() < cutoff);
+        recentPumps.entrySet().removeIf(e -> e.getValue().timestamp < cutoff);
+        pumpHistory.entrySet().removeIf(e -> {
+            Deque<PumpEvent> q = e.getValue();
+            if (q == null) return true;
+            q.removeIf(pe -> pe.timestamp < cutoff);
+            return q.isEmpty();
+        });
     }
 
     private final Map<String, Long> lastPumpTime       = new ConcurrentHashMap<>();

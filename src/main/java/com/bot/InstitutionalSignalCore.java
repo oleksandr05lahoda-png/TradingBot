@@ -79,11 +79,9 @@ public final class InstitutionalSignalCore {
     // in volatile markets. Trader physically cannot process more than ~6 signals per 2h.
     private final java.util.concurrent.ConcurrentLinkedDeque<Long> globalSignalTimestamps
             = new java.util.concurrent.ConcurrentLinkedDeque<>();
-    // [v50 UPDATE] Rate limit raised from 6→20 per 2h. User wants professional-grade signals
-    // without artificial caps. Quality is now enforced by strict gates in SignalSender.processPair(),
-    // not by counting sent signals. If quality is truly high, 20 sigs/2h = 1 sig/6min is achievable
-    // on busy trending days without being spammy. In quiet markets the real output will be much lower.
-    private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 20);
+    // [v61] 20 → 12 per 2h. Dispatcher now enforces a tighter 4/hour cap upstream,
+    // so this ISC limit is a safety net for the rare case Dispatcher is bypassed.
+    private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 12);
     private static final long GLOBAL_WINDOW_2H_MS   = 2L * 60 * 60_000L;
 
     // [v50 AUDIT FIX] Daily kill-switch threshold. At -5% daily PnL, block ALL new signals

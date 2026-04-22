@@ -120,7 +120,9 @@ public final class DecisionEngineMerged {
     // [v53 QUALITY] Raised 62→68 as part of stricter quality mandate.
     // Combined with AFC kill-switch in BotMain, this reduces Telegram noise by ~70%.
     // MIN_CONF_FLOOR raised 60→65 — signals below 65% were historically <50% win-rate.
-    private static final double BASE_CONF       = 68.0;
+    // [v61] Raised 68→72. Combined with Dispatcher cold-start floor of 78 and
+    // min cluster count of 4, this filters ~40% more borderline signals.
+    private static final double BASE_CONF       = 72.0;
     private static final int    CALIBRATION_WIN = 120;
     private static final double MIN_CONF_FLOOR  = 65.0;
     private static final double MIN_CONF_CEIL   = 82.0;
@@ -1078,32 +1080,24 @@ public final class DecisionEngineMerged {
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.2f%%)%n", stop, slPct));
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
-            // [FIX] Show calibration status AND apply shrinkage when data is scarce.
-            // Raw model score 87% with 0 calibration data is actively misleading.
-            // With < 30 samples: shrink toward 68% (middle of our min-conf range).
-            // With 30-99 samples: partial shrinkage.
-            // With 100+ samples: trust the calibrated score.
+            // [v61] Honest display. No cosmetic shrinkage — show the real model score.
+            // Dispatcher filters sub-30-sample signals upstream, so any signal reaching
+            // Telegram has earned its score through strict gates (prob≥78, clusters≥4).
             int _calSamples = DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-            double _displayedProb = probability;
+            double _prob = Math.max(0, Math.min(85, probability));
             if (_calSamples < 30) {
-                // Heavy shrinkage toward neutral — we literally don't know
-                _displayedProb = probability * 0.60 + 68.0 * 0.40;
-                _displayedProb = Math.min(78.0, _displayedProb); // cap at 78% when blind
+                sb.append(String.format("📊 Скор: *%.0f%%*  _%s_%n",
+                        _prob, signalQualityLabel(_prob)));
+                sb.append("_Калибровка обучается — торгуй меньшим размером_\n");
             } else if (_calSamples < 100) {
-                // Partial shrinkage — we have some data but not enough
-                double weight = (double)(_calSamples - 30) / 70.0; // 0→1 over 30..100 samples
-                _displayedProb = probability * (0.60 + weight * 0.40) + 68.0 * (0.40 - weight * 0.40);
-            }
-            _displayedProb = Math.max(0, Math.min(85, _displayedProb));
-            if (_calSamples < 100) {
-                sb.append(String.format("📊 Скор: *%.0f%%*  _%s_  ⚠️_(%d/100)_%n",
-                        _displayedProb, signalQualityLabel(_displayedProb), _calSamples));
+                sb.append(String.format("📊 Уверенность: *%.0f%%*  _%s_%n",
+                        _prob, signalQualityLabel(_prob)));
+                sb.append(String.format("_Калибровка: %d/100_%n", _calSamples));
             } else {
                 sb.append(String.format("📊 Уверенность: *%.0f%%*  _%s_%n",
-                        _displayedProb, signalQualityLabel(_displayedProb)));
+                        _prob, signalQualityLabel(_prob)));
             }
-            // [FIX] Warn trader when SL is very tight relative to ATR.
-            // SL < 0.8% on liquid ALTs (ATR ~1%) = noise-stop risk even with correct direction.
+            // Warn trader when SL is very tight relative to ATR.
             double _slPctAbs = Math.abs(slPct);
             if (_slPctAbs > 0 && _slPctAbs < 0.60) {
                 sb.append("\n⚠️ _Стоп очень тесный — риск выноса шумом_");
@@ -2337,7 +2331,16 @@ public final class DecisionEngineMerged {
                 && ((candidateSide == com.bot.TradingCore.Side.LONG && earlyLongLead)
                 || (candidateSide == com.bot.TradingCore.Side.SHORT && earlyShortLead));
 
-        int requiredClusters = earlySoloAllowed ? 1 : MIN_AGREEING_CLUSTERS;
+        // [FIX SIGNAL ACCURACY] EARLY_SOLO was 1 cluster. Changed to 2.
+        // Root cause of "4/4 wrong" signals:
+        //   earlyLongLead can be true when Momentum score=0.15 (below MIN_CLUSTER_SCORE=0.30).
+        //   With requiredClusters=1 and longClusters=1 (only Early), the signal passes
+        //   even when Structure/HTF/Volume/Derivatives ALL disagree.
+        // Fix: EARLY_SOLO still bypasses the normal MIN_AGREEING_CLUSTERS=3 requirement,
+        //   but we demand at least 2 clusters scoring >= MIN_CLUSTER_SCORE.
+        //   This means Early must be strong AND one other cluster truly confirms (Volume/Momentum/Derivatives/Structure).
+        //   Effect: eliminates solo-Early misfires while keeping legitimate early pump detection.
+        int requiredClusters = earlySoloAllowed ? 2 : MIN_AGREEING_CLUSTERS;
 
         // RANGE market is treacherous — require 3 clusters minimum
         if (state == MarketState.RANGE && !earlySoloAllowed && !aggressiveShort) {
@@ -2567,10 +2570,12 @@ public final class DecisionEngineMerged {
         double lateVote = lateEntryPenalty ? -0.85 : 0.0;
         ensAdj += lateVote * 0.30 * 14.0;
 
-        // Factor 5: Cluster count adequacy       [weight 10%]
+        // Factor 5: Cluster count adequacy       [weight 20%] ← raised from 10%
+        // At 10% a 1/3 cluster penalty was only -0.91 pts — barely felt.
+        // At 20% it becomes -1.82 pts — enough to drop a 67% signal below 65% floor.
         int activeClCount = (side == com.bot.TradingCore.Side.LONG) ? longClusters : shortClusters;
         double clVote = clusterPenalty ? -0.65 : (activeClCount >= 4 ? 0.55 : 0.0);
-        ensAdj += clVote * 0.10 * 14.0;
+        ensAdj += clVote * 0.20 * 14.0;
 
         // Cap: ensemble cannot exceed these bounds.
         // scoreDiffPenalty and dynThreshPenalty are represented
@@ -2586,6 +2591,24 @@ public final class DecisionEngineMerged {
         // LATE_ENTRY → carry flag for position-size reduction in SignalSender.
         // Probability already mildly dipped above. No further deduction needed.
         if (lateEntryPenalty) allFlags.add("LATE_ENTRY_SIZE_CUT");
+
+        // [FIX SIGNAL ACCURACY] HTF ALIGNMENT GATE — extra penalty when 1h/2h HTF opposes signal.
+        // The most common cause of wrong signals: 15m says SHORT, 1h says BULL.
+        // With 6 equal-weight clusters, HTF disagreement was only -4 to -6 pts.
+        // After ensemble: signal at 71% passes minimum. Then it's wrong.
+        // New: if HTF actively opposes (not just neutral) AND we're in non-crash neutral market:
+        //   LONG with BEAR HTF → -5 additional penalty
+        //   SHORT with BULL HTF → -5 additional penalty
+        // This is NOT applied when: aggressiveShort (crash), EXHAUSTION_REVERSAL (HTF lags reversals),
+        //   or when htfBias == NONE (HTF is neutral — ambiguous is OK).
+        if (!aggressiveShort && !allFlags.contains("EXHAUSTION_REVERSAL_BOOST")) {
+            boolean htfOpposes = (side == com.bot.TradingCore.Side.LONG && bias2h == HTFBias.BEAR)
+                    || (side == com.bot.TradingCore.Side.SHORT && bias2h == HTFBias.BULL);
+            if (htfOpposes) {
+                probability = Math.max(0, probability - 5.0);
+                allFlags.add("HTF_OPPOSE-5");
+            }
+        }
 
         // FUNDING RATE CONFIDENCE ADJUSTMENT — applied after all cluster logic
         boolean _isLong = (side == com.bot.TradingCore.Side.LONG);

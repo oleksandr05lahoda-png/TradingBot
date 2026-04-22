@@ -154,9 +154,14 @@ public final class SignalSender {
     //
     //  Cooldown: 90s per pair — don't spam rescan on the same move.
     //  Max concurrent rescans: 3 — protect fetch pool from overload.
-    private static final double HOT_PAIR_TOP_PCT   = 0.0025;  // 0.25% in 30s
-    private static final double HOT_PAIR_ALT_PCT   = 0.0040;  // 0.40% in 30s
-    private static final double HOT_PAIR_MEME_PCT  = 0.0060;  // 0.60% in 30s
+    // [FIX] HOT_PAIR thresholds raised: reduce false hot-pair rescans.
+    // Old ALT=0.40%: fired on normal micro-volatility (ALT's typical 15m ATR ~1%).
+    // New ALT=0.55%: requires genuine momentum surge (55% of normal 15m ATR in 30s).
+    // TOP unchanged — BTC/ETH 0.25% in 30s IS a real event.
+    // MEME raised 0.60→0.80%: MEMEs routinely spike 0.5-0.6% on noise; 0.80% = real.
+    private static final double HOT_PAIR_TOP_PCT   = 0.0025;  // 0.25% in 30s (unchanged)
+    private static final double HOT_PAIR_ALT_PCT   = 0.0055;  // 0.55% in 30s (was 0.40%)
+    private static final double HOT_PAIR_MEME_PCT  = 0.0080;  // 0.80% in 30s (was 0.60%)
     private static final long   HOT_PAIR_COOLDOWN_MS = 90_000L;
     private static final int    HOT_PAIR_MAX_CONCURRENT = 3;
     private final Map<String, Long>    hotPairLastRescan   = new ConcurrentHashMap<>();
@@ -187,7 +192,10 @@ public final class SignalSender {
     // Problem: volatile ALT fires 8 EARLY_TICK signals in 30 min — all same move.
     // Manual trader can't act on more than 2-3 signals per hour on same pair.
     // Fix: max 3 EARLY_TICK per pair per rolling 60 minutes.
-    private static final int    MAX_EARLY_TICK_PER_HOUR = 3;
+    // [FIX] MAX_EARLY_TICK_PER_HOUR 3→2. Manual trader cannot act on 3/hour same pair.
+    // Real pumps fire Early cluster once, maybe twice (entry + re-entry after pullback).
+    // A third EARLY_TICK on same pair in 60 min = same move repeating = noise spam.
+    private static final int    MAX_EARLY_TICK_PER_HOUR = 2;
     private static final long   EARLY_TICK_WINDOW_MS    = 60 * 60_000L;
     private final Map<String, Deque<Long>> earlyTickTimestamps = new ConcurrentHashMap<>();
 
@@ -981,9 +989,14 @@ public final class SignalSender {
     private List<String> selectPairsForScan(int budget) {
         if (cachedPairs.isEmpty()) return List.of();
         List<String> sorted = new ArrayList<>(cachedPairs);
-        // GARBAGE PAIR FILTER — remove non-ASCII symbols (Chinese chars, etc.)
-        // These are low-liquidity micro-cap tokens with manipulated order books.
+        // [FIX] GARBAGE PAIR FILTER — remove non-ASCII AND known garbage coins.
+        // Previously only non-ASCII was filtered here. GARBAGE_COIN_BLOCKLIST coins
+        // (BASUSDT, UAIUSDT, METUSDT...) still got submitted to fetchPool → REST fetch
+        // → processPair() rejection. Each wasted fetch = 5 Binance weight = ~50 wasted/hour.
+        // Now filtered upfront: 0 REST calls, 0 fetchPool slots, 0 processPair() overhead.
         sorted.removeIf(pair -> {
+            if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return true;
+            if (isc.isHardBlacklisted(pair)) return true;
             for (int i = 0; i < pair.length(); i++) {
                 if (pair.charAt(i) > 127) return true;
             }
@@ -3156,14 +3169,19 @@ public final class SignalSender {
                     hotFlags.add("HOT_RESCAN_" + direction);
                     idea = rebuildIdea(idea, idea.probability, hotFlags);
 
-                    bot.sendMessageAsync(idea.toTelegramString());
-                    System.out.printf("[HOT] %s signal sent: %s %.0f%%%n",
-                            pair, idea.side, idea.probability);
-
-                    // Register in ISC and BotMain tracker
-                    com.bot.DecisionEngineMerged.CoinCategory hotCat = categorizePair(pair);
-                    String hotSector = detectSector(pair);
-                    registerApprovedSignal(idea, pair, hotCat, hotSector, now, false);
+                    // v61: route through central Dispatcher (cold-start gate, dedup, hourly cap)
+                    com.bot.BotMain.Dispatcher disp = com.bot.BotMain.Dispatcher.getInstance();
+                    if (disp == null) return;
+                    com.bot.BotMain.Dispatcher.Result res = disp.dispatch(idea, "HOT_RESCAN");
+                    if (res.dispatched) {
+                        com.bot.DecisionEngineMerged.CoinCategory hotCat = categorizePair(pair);
+                        String hotSector = detectSector(pair);
+                        registerApprovedSignalNoTrack(idea, pair, hotCat, hotSector, now);
+                        System.out.printf("[HOT] %s signal sent: %s %.0f%%%n",
+                                pair, idea.side, idea.probability);
+                    } else {
+                        System.out.printf("[HOT-BLOCK] %s: %s%n", pair, res.reason);
+                    }
                 }
             } catch (Exception ex) {
                 System.out.println("[HOT] Error rescanning " + pair + ": " + ex.getMessage());
@@ -3288,14 +3306,34 @@ public final class SignalSender {
                 continue;
             }
 
-            // CLEAN DISPATCH — toTelegramString() is now self-contained.
-            // No external header needed. Just send the signal directly.
-            bot.sendMessageAsync(finalEt.toTelegramString());
-            earlySignals.incrementAndGet();
-            recordEarlyTickSent(finalEt.symbol);
-            registerApprovedSignal(finalEt, finalEt.symbol, cat, sector,
-                    System.currentTimeMillis(), true);
+            // v61: route through central Dispatcher (cold-start gate, dedup, hourly cap)
+            com.bot.BotMain.Dispatcher disp = com.bot.BotMain.Dispatcher.getInstance();
+            if (disp == null) {
+                // Safety: dispatcher not initialized (should never happen after main()).
+                continue;
+            }
+            com.bot.BotMain.Dispatcher.Result res = disp.dispatch(finalEt, "EARLY_TICK");
+            if (res.dispatched) {
+                earlySignals.incrementAndGet();
+                recordEarlyTickSent(finalEt.symbol);
+                registerApprovedSignalNoTrack(finalEt, finalEt.symbol, cat, sector,
+                        System.currentTimeMillis());
+            } else {
+                System.out.printf("[EARLY_TICK-BLOCK] %s %s: %s%n",
+                        finalEt.symbol, finalEt.side, res.reason);
+            }
         }
+    }
+
+    /** v61: register w/o tracking (tracking happens inside Dispatcher.dispatch). */
+    private void registerApprovedSignalNoTrack(com.bot.DecisionEngineMerged.TradeIdea idea,
+                                               String pair,
+                                               com.bot.DecisionEngineMerged.CoinCategory cat,
+                                               String sector,
+                                               long approvedAtMs) {
+        isc.registerSignal(idea);
+        decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, approvedAtMs);
+        correlationGuard.register(pair, idea.side, cat, sector);
     }
 
     private void registerApprovedSignal(com.bot.DecisionEngineMerged.TradeIdea idea,

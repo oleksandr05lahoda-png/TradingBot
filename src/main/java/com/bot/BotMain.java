@@ -7,141 +7,81 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.logging.*;
 
-/** BotMain v52 — PATCH A (Calibrator real TP/SL) + PATCH B (Railway -50%) */
+/**
+ * BotMain v61 — SCANNER-MASTERPIECE
+ *
+ *  Mode: PURE SIGNAL SCANNER. No auto-trade, no order execution.
+ *        Bot watches top-30 coins by volume and emits manual-trade signals
+ *        with Entry / TP1 / TP2 / TP3 / SL.
+ *
+ *  CORE DESIGN: Every signal → Telegram path goes through Dispatcher.dispatch().
+ *               No direct telegram.sendMessageAsync(idea.toTelegramString())
+ *               anywhere. Enforced in SignalSender.flushEarlyTickBuffer and
+ *               SignalSender hot-pair rescan too.
+ *
+ *  WHAT'S GONE vs v60:
+ *   - AFC advance forecast (the 📡 ПРОГНОЗ spam)
+ *   - Watchdog re-alerting same drought every 60 min
+ *   - TIME_STOP for signals the user never saw
+ *   - Cosmetic probability-shrinkage shown to user
+ *   - Auto-trade leverage/margin/order/margin-call notifications
+ *
+ *  WHAT'S NEW vs v60:
+ *   - Dispatcher: single gate for ALL signal dispatches
+ *   - Hard cold-start gate applied uniformly: prob>=78, clusters>=4,
+ *     forecast conf>=0.55, R:R>=2.0, SL distance>=0.35%
+ *   - Per-symbol dispatch dedup: same sym+side within 15min = drop
+ *   - Hourly soft cap: max 4 signals/hour prevents "flood day" spam
+ */
 public final class BotMain {
 
     private static final Logger LOG = Logger.getLogger(BotMain.class.getName());
 
-    // ── Конфигурация из env ───────────────────────────────────────────────
-    private static final String TG_TOKEN  = requireEnv("TELEGRAM_TOKEN");
-    private static final String CHAT_ID   = requireEnv("TELEGRAM_CHAT_ID");
+    private static final String TG_TOKEN = requireEnv("TELEGRAM_TOKEN");
+    private static final String CHAT_ID  = requireEnv("TELEGRAM_CHAT_ID");
 
     private static String requireEnv(String name) {
         String v = System.getenv(name);
-        if (v == null || v.isBlank()) {
-            throw new IllegalStateException(
-                    "Required env var missing: " + name
-                            + ". Set it in your environment, do NOT hardcode in source.");
-        }
+        if (v == null || v.isBlank())
+            throw new IllegalStateException("Required env var missing: " + name);
         return v;
     }
-    // Auto-detected at startup: env TIMEZONE → IP geolocation → Warsaw fallback.
-    // Each instance (yours in Warsaw, father's in Zaporizhzhia) detects its own timezone.
-    private static final ZoneId ZONE      = detectTimezone();
-    // [v51 FIX] Default INTERVAL 2→1 min. Previous v42 change to 2 min added 1 extra
-    // minute of average latency before a fresh pump/exhaustion signal could be emitted.
-    // At 15m TF that's 1/15th of a bar — noticeable on BOME/meme pumps that develop
-    // in under 10 minutes. Railway cost impact: ~+$2/mo (acceptable).
-    // Override via ENV SIGNAL_INTERVAL_MIN=2 to revert to v42 behavior.
-    private static final int    INTERVAL  = envInt("SIGNAL_INTERVAL_MIN", 1);
-    private static final int    KLINES    = envInt("KLINES_LIMIT", 160);
-    // Hard cap to avoid Telegram queue backlog (which can make the bot
-    // "silent" for hours/days under heavy signal load).
-    // MAX_SIGNALS_PER_CYCLE was 50 — comment said "10→5" but value was never changed.
-    // 50 signals/cycle floods the Telegram queue, causes the bot to appear "silent" for hours
-    // while the queue drains. 5 forces only the highest-confidence ideas to be sent.
-    private static final int    MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 5); // was 50 — CRITICAL BUG
 
-    // ── Секторальные лидеры для GIC ───────────────────────────────────────
+    private static volatile ZoneId ZONE = ZoneId.of("Europe/Warsaw");
+    private static final int INTERVAL = envInt("SIGNAL_INTERVAL_MIN", 1);
+    private static final int KLINES   = envInt("KLINES_LIMIT", 160);
+    private static final int MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 3);
+
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
-        put("DOGEUSDT", "MEME");
-        put("SOLUSDT",  "L1");
-        put("UNIUSDT",  "DEFI");
-        put("LINKUSDT", "INFRA");
-        put("ETHUSDT",  "TOP");
-        put("XRPUSDT",  "PAYMENT");
-        put("AVAXUSDT", "L1");
-        put("BNBUSDT",  "CEX");
+        put("DOGEUSDT", "MEME"); put("SOLUSDT", "L1"); put("UNIUSDT", "DEFI");
+        put("LINKUSDT", "INFRA"); put("ETHUSDT", "TOP"); put("XRPUSDT", "PAYMENT");
+        put("AVAXUSDT", "L1"); put("BNBUSDT", "CEX");
     }};
 
-    // ── Счётчики ──────────────────────────────────────────────────────────
-    private static final AtomicLong totalCycles   = new AtomicLong(0);
-    private static final AtomicLong totalSignals  = new AtomicLong(0);
-    private static final AtomicLong errorCount    = new AtomicLong(0);
-    // [v36-FIX Дыра9] Монотонный счётчик для ключей forecastRecords.
-    // System.currentTimeMillis() вызывает коллизию если два сигнала приходят за 1ms.
-    private static final AtomicLong forecastSeq   = new AtomicLong(0);
+    private static final AtomicLong totalCycles  = new AtomicLong(0);
+    private static final AtomicLong totalSignals = new AtomicLong(0);
+    private static final AtomicLong errorCount   = new AtomicLong(0);
+    private static final AtomicLong forecastSeq  = new AtomicLong(0);
     private static long startTimeMs = 0;
 
-    // ── Circuit breaker ─────────────────────────────────────────────────
-    // [v14.0 FIX #2] Убран Thread.sleep. Вместо паузы — пропускаем циклы.
-    // [v14.0 FIX #4] volatile на errorsInWindow
-    // CB_THRESHOLD raised 5→10, window raised 5→10m, pause reduced 2→1m.
-    // Old thresholds: 5 errors in 5 minutes → 2 min pause. Too aggressive.
-    // A brief Binance API slowdown (common) would trigger 5 errors and pause the bot,
-    // causing it to miss entire signal cycles. Now requires 10 errors in 10 min.
     private static final int  CB_THRESHOLD = 10;
     private static final long CB_WINDOW_MS = 10 * 60_000L;
-    private static final long CB_PAUSE_MS  = 60_000L; // 1 min (was 2)
+    private static final long CB_PAUSE_MS  = 60_000L;
     private static volatile long lastErrorWindowStart = 0;
-    // [v24.0 FIX BUG-4] AtomicInteger (was volatile int — race on ++ and >= check)
     private static final AtomicInteger errorsInWindow = new AtomicInteger(0);
-    private static volatile long cbPauseUntil         = 0; // [FIX #2] время окончания паузы
+    private static volatile long cbPauseUntil = 0;
 
-    // ── Watchdog ──────────────────────────────────────────────────────────
     private static volatile long lastSignalMs       = 0;
     private static volatile long lastCycleSuccessMs = 0;
     private static volatile long lastStatsSuccessMs = 0;
-    private static volatile long lastWatchdogAlertMs = 0;
-    private static final long SIGNAL_DROUGHT_MS     = 120 * 60_000L;  // [v53] 60→120min: signal droughts <2h are normal in tight-filter mode
-    private static final long WATCHDOG_COOLDOWN_MS   = 60 * 60_000L;  // [v53] 30→60min: reduce spam further
-    private static final AtomicLong watchdogAlerts  = new AtomicLong(0);
+    private static final long SIGNAL_DROUGHT_MS = 3 * 60 * 60_000L;
+    private static final AtomicBoolean droughtAnnounced = new AtomicBoolean(false);
+    private static volatile long lastInfraAlertMs = 0;
+    private static final long INFRA_ALERT_COOLDOWN_MS = 60 * 60_000L;
+    private static final AtomicLong watchdogAlerts = new AtomicLong(0);
 
-    // ── Daily summary ─────────────────────────────────────────────────────
     private static volatile int lastSummaryDay = -1;
 
-    // ── [MODULE 4 v33] ADVANCE FORECAST STATE ────────────────────────────
-    // Дедупликация: отправляем прогноз только если он ИЗМЕНИЛСЯ с прошлого цикла.
-    // Без этого каждые 5 минут одинаковый "РОСТ БИТКОИНА" будет спамить чат.
-    private static final java.util.concurrent.ConcurrentHashMap<String, String>
-            lastForecastSent = new java.util.concurrent.ConcurrentHashMap<>();
-    // Cooldown: один прогноз по одной паре не чаще раза в 20 минут
-    private static final java.util.concurrent.ConcurrentHashMap<String, Long>
-            forecastCooldown = new java.util.concurrent.ConcurrentHashMap<>();
-    // [v53 ANTI-SPAM] AFC cooldown 10→20 min. Previous 10 min caused the same pair to re-alert
-    // 3+ times per hour on noise ("Движение вверх" at 23% confidence recurring every 12 min).
-    private static final long ADVANCE_FORECAST_COOLDOWN_MS = 20 * 60_000L;
-    // [v53 ANTI-SPAM] Thresholds raised to production-grade conviction levels.
-    //   - AFC_MIN_DIRECTION_SCORE 0.22 → 0.55: 0.22 fired on any micro-fluctuation.
-    //     At 0.55 we require genuine directional momentum (>55% score = clear trend).
-    //   - AFC_STRONG_SCORE 0.42 → 0.70: only true "ПАМП/ДАМП" events qualify.
-    //   - AFC_MIN_CONF_TO_SEND: NEW hard gate — ANY forecast below 65% confidence
-    //     is DROPPED before ever reaching Telegram, regardless of other conditions.
-    //     Fixes the "24%-38% ожидание подтверждения" spam stream.
-    private static final double AFC_MIN_DIRECTION_SCORE = 0.55;
-    private static final double AFC_STRONG_SCORE        = 0.70;
-    private static final double AFC_MIN_CONF_TO_SEND    = 0.65;
-    // Env kill-switch: set AFC_ENABLED=false to disable advance forecasts entirely.
-    //       Clean main pipeline signals (with entry/SL/TP) are always delivered regardless.
-    private static final boolean AFC_ENABLED = envBool("AFC_ENABLED", true);
-    // [v53 ANTI-SPAM] 10 → 3 per run. Even after threshold raise, 10 messages per 2min cycle
-    // is noise overload. 3 forces selection of only the highest-conviction ideas.
-    private static final int AFC_MAX_PER_RUN = 3;
-
-    // ── AFC Telegram sender (optional separate chat) ──────────────────────
-    // Set env AFC_CHAT_ID to route forecast/analysis messages to a dedicated
-    // channel. If not set, AFC messages go to the same chat as trade signals
-    // but with a clear [📡 ПРОГНОЗ] prefix so they are never confused with
-    // real entry signals (which always contain TP1/TP2/TP3/SL tables).
-    private static volatile com.bot.TelegramBotSender afcSender = null;
-
-    // ── Shared PumpHunter instance for AFC (not per-call) ────────────────
-    // Previously: new PumpHunter() created inside runAdvanceForecast() on
-    // every 2-minute tick. Each construction allocates fresh ConcurrentHashMap
-    // instances (recentPumps, pumpHistory) and discards the state from the
-    // previous call, meaning pump history is always empty → PRE_PUMP detection
-    // never fires. A shared instance preserves the detection state across calls.
-    private static final com.bot.PumpHunter AFC_PUMP_HUNTER = new com.bot.PumpHunter();
-
-    // ── AFC map cleanup ───────────────────────────────────────────────────
-    // lastForecastSent and forecastCooldown had no eviction: they grew
-    // indefinitely during long uptime (Railway deployments can run weeks).
-    // Cleanup runs inside runAdvanceForecast every ~100 calls (~200 min).
-    private static final java.util.concurrent.atomic.AtomicLong afcCleanupCounter
-            = new java.util.concurrent.atomic.AtomicLong(0);
-
-    // ── Forecast accuracy tracker ─────────────────────────────────────────
-    // [v14.0 FIX #5] MAX_FORECAST_RECORDS предотвращает утечку памяти
     private static final int MAX_FORECAST_RECORDS = 500;
     static final ConcurrentHashMap<String, ForecastRecord> forecastRecords = new ConcurrentHashMap<>();
 
@@ -151,254 +91,316 @@ public final class BotMain {
         final double entryPrice;
         final String forecastBias;
         final double forecastScore;
-        // signalProbability = the FINAL calibrated probability shown in the
-        // Telegram signal (e.g. "72%"). Previously we were feeding forecastScore (a raw
-        // directional score from ForecastEngine) into the calibrator — which is WRONG because:
-        //   a) forecastScore ∈ [-1..+1], not [0..1]
-        //   b) it measures forecast direction confidence, NOT signal entry quality
-        // The calibrator needs the same number the user sees — the signal probability.
-        // This closes the feedback loop: signal said 72% → trade resolved WIN/LOSS →
-        // calibrator learns "72% raw maps to X% real win-rate" → future signals corrected.
         final double signalProbability;
-        // Long-term robust ATR% at signal time — needed for vol-bucketed calibration.
-        // Using current ATR (from 15m candle) was wrong: in consolidation ATR shrinks 40-60%
-        // making the bucket lookup wrong (e.g. MEDIUM→LOW). Use 30-day percentile instead.
         final double robustAtrPctAtSignal;
-
-        // Реальные TP1/SL уровни из TradeIdea — нужны чтобы калибратор
-        // учился на ТЕХ ЖЕ уровнях, что реально уходят трейдеру в Telegram.
-        // Без этого калибратор учился на синтетических entry±1.0×ATR, не совпадающих
-        // с фактическими сигналами → "83% уверенности" никогда не сходится с реальностью.
         final double tp1Level;
         final double slLevel;
-
         final long   createdAt;
         volatile boolean resolved = false;
         volatile String  actualOutcome = null;
-        // [v50 AUDIT FIX] AtomicBoolean: classic check-then-act race otherwise.
-        // markForecastRecord() and checkForecastAccuracy() both can increment counters concurrently.
-        final java.util.concurrent.atomic.AtomicBoolean counted =
-                new java.util.concurrent.atomic.AtomicBoolean(false);
+        final AtomicBoolean counted = new AtomicBoolean(false);
 
-        // Primary constructor с реальными уровнями
         ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
                        String bias, double score, double signalProb, double robustAtrPct,
                        double tp1, double sl) {
             this.symbol = sym; this.side = side; this.entryPrice = price;
             this.forecastBias = bias; this.forecastScore = score;
-            this.signalProbability  = signalProb;
+            this.signalProbability = signalProb;
             this.robustAtrPctAtSignal = robustAtrPct;
-            this.tp1Level = tp1;
-            this.slLevel  = sl;
+            this.tp1Level = tp1; this.slLevel = sl;
             this.createdAt = System.currentTimeMillis();
-        }
-
-        // Back-compat конструктор (без tp1/sl — fallback на ATR-реконструкцию в checkForecastAccuracy)
-        ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
-                       String bias, double score, double signalProb, double robustAtrPct) {
-            this(sym, side, price, bias, score, signalProb, robustAtrPct, 0.0, 0.0);
-        }
-        // Back-compat constructor (signalProb unknown → use forecastScore as fallback)
-        ForecastRecord(String sym, com.bot.TradingCore.Side side, double price,
-                       String bias, double score) {
-            this(sym, side, price, bias, score, score, 1.0, 0.0, 0.0);
         }
         long ageMs() { return System.currentTimeMillis() - createdAt; }
     }
 
-    // ── Forecast accuracy stats ───────────────────────────────────────────
     private static final AtomicInteger forecastTotal   = new AtomicInteger(0);
     private static final AtomicInteger forecastCorrect = new AtomicInteger(0);
 
-    //  SIGNAL QUALITY TRACKING
-    // Rolling window of recent signal outcomes, split by confidence bucket.
-    // Gives visibility into "does the bot's 80% really mean 80%?" — the
-    // key question for signal-only (manual trading) mode.
-    //
-    // Reports every 60 min via logStats / buildSignalQualityReport.
-
     private static final class SignalOutcome {
-        final String symbol;
-        final double confidence;   // 0..100
-        final String category;     // TOP/ALT/MEME
-        final boolean hit;
-        final long ts;
-        SignalOutcome(String sym, double conf, String cat, boolean hit) {
-            this.symbol = sym; this.confidence = conf;
-            this.category = cat; this.hit = hit;
-            this.ts = System.currentTimeMillis();
+        final String symbol; final double confidence; final String category;
+        final boolean hit; final long ts;
+        SignalOutcome(String s, double c, String cat, boolean h) {
+            symbol = s; confidence = c; category = cat; hit = h;
+            ts = System.currentTimeMillis();
         }
     }
 
-    private static final java.util.concurrent.ConcurrentLinkedDeque<SignalOutcome> signalOutcomes
-            = new java.util.concurrent.ConcurrentLinkedDeque<>();
+    private static final ConcurrentLinkedDeque<SignalOutcome> signalOutcomes = new ConcurrentLinkedDeque<>();
     private static final int SIGNAL_OUTCOME_WINDOW = 200;
     private static final AtomicLong lastSignalQualityReport = new AtomicLong(0);
     private static final long SIGNAL_QUALITY_REPORT_MS = 60 * 60_000L;
 
-    /** Вызывается из checkForecastAccuracy когда известен исход прогноза */
     public static void recordSignalOutcome(String sym, double conf, String cat, boolean hit) {
         signalOutcomes.addLast(new SignalOutcome(sym, conf, cat, hit));
         while (signalOutcomes.size() > SIGNAL_OUTCOME_WINDOW) signalOutcomes.pollFirst();
     }
 
-    /** Формирует текст отчёта по качеству сигналов */
     private static String buildSignalQualityReport() {
         if (signalOutcomes.isEmpty()) return "📊 *SIGNAL QUALITY*\nNo signals tracked yet";
-
-        java.util.List<SignalOutcome> snap = new java.util.ArrayList<>(signalOutcomes);
+        List<SignalOutcome> snap = new ArrayList<>(signalOutcomes);
         int total = snap.size();
         long hits = snap.stream().filter(o -> o.hit).count();
-        double overallAcc = (double) hits / total;
-
-        // По уверенности
         int[] b60 = new int[2], b70 = new int[2], b80 = new int[2];
         for (SignalOutcome o : snap) {
             int[] bucket = o.confidence < 70 ? b60 : o.confidence < 80 ? b70 : b80;
-            bucket[0]++;
-            if (o.hit) bucket[1]++;
+            bucket[0]++; if (o.hit) bucket[1]++;
         }
-
-        // По категории
-        java.util.Map<String, int[]> byCat = new java.util.LinkedHashMap<>();
+        Map<String, int[]> byCat = new LinkedHashMap<>();
         for (SignalOutcome o : snap) {
             int[] pair = byCat.computeIfAbsent(o.category == null ? "?" : o.category, k -> new int[2]);
-            pair[0]++;
-            if (o.hit) pair[1]++;
+            pair[0]++; if (o.hit) pair[1]++;
         }
-
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("📊 *SIGNAL QUALITY* (last %d)%n", total));
-        sb.append(String.format("Overall: %.1f%% (%d/%d)%n", overallAcc * 100, hits, total));
+        sb.append(String.format("Overall: %.1f%% (%d/%d)%n", 100.0*hits/total, hits, total));
         sb.append("━━━ by Confidence ━━━\n");
-        if (b60[0] > 0) sb.append(String.format("60-70%%: %.0f%% (%d/%d)%n", 100.0 * b60[1] / b60[0], b60[1], b60[0]));
-        if (b70[0] > 0) sb.append(String.format("70-80%%: %.0f%% (%d/%d)%n", 100.0 * b70[1] / b70[0], b70[1], b70[0]));
-        if (b80[0] > 0) sb.append(String.format("80%%+:   %.0f%% (%d/%d)%n", 100.0 * b80[1] / b80[0], b80[1], b80[0]));
+        if (b60[0] > 0) sb.append(String.format("60-70%%: %.0f%% (%d/%d)%n", 100.0*b60[1]/b60[0], b60[1], b60[0]));
+        if (b70[0] > 0) sb.append(String.format("70-80%%: %.0f%% (%d/%d)%n", 100.0*b70[1]/b70[0], b70[1], b70[0]));
+        if (b80[0] > 0) sb.append(String.format("80%%+:   %.0f%% (%d/%d)%n", 100.0*b80[1]/b80[0], b80[1], b80[0]));
         sb.append("━━━ by Category ━━━\n");
         for (var e : byCat.entrySet()) {
-            int[] p = e.getValue();
-            if (p[0] == 0) continue;
-            sb.append(String.format("%s: %.0f%% (%d/%d)%n",
-                    e.getKey(), 100.0 * p[1] / p[0], p[1], p[0]));
+            int[] p = e.getValue(); if (p[0] == 0) continue;
+            sb.append(String.format("%s: %.0f%% (%d/%d)%n", e.getKey(), 100.0*p[1]/p[0], p[1], p[0]));
         }
         return sb.toString();
     }
 
-    //  TrackedSignal — v14: tp2Hit + synchronized extremes
-
     static final ConcurrentHashMap<String, TrackedSignal> trackedSignals = new ConcurrentHashMap<>();
 
     static final class TrackedSignal {
-        final String          symbol;
+        final String symbol;
         final com.bot.TradingCore.Side side;
-        final double          entry, sl, tp1, tp2, tp3;
-        final long            createdAt;
-        final String          forecastBias;
-        final double          forecastScore;
+        final double entry, sl, tp1, tp2, tp3;
+        final long createdAt;
+        final String forecastBias;
+        final double forecastScore;
+        final boolean sentToUser;
 
-        // [v14.0 FIX #1] Добавлен tp2Hit флаг
-        volatile boolean tp1Hit          = false;
-        volatile boolean tp2Hit          = false; // ← NEW: предотвращает дубли TP2 сообщений
-        volatile double  trailingStop    = 0;
-
-        // Chandelier Exit — активируется при +0.8% от entry, до TP1.
-        // Позволяет закрыть позицию с прибылью если цена разворачивается
-        // не дойдя до TP1. ATR-based trailing на 1m свечах.
+        volatile boolean tp1Hit = false;
+        volatile boolean tp2Hit = false;
+        volatile boolean timeStopNotified = false;
+        volatile double  trailingStop = 0;
         volatile boolean chandelierActive = false;
 
-        // [v24.0 FIX] NEGATIVE_INFINITY for max search (Double.MIN_VALUE = tiny positive number)
-        private double  extremeLow    = Double.MAX_VALUE;
-        private double  extremeHigh   = Double.NEGATIVE_INFINITY;
+        private double extremeLow  = Double.MAX_VALUE;
+        private double extremeHigh = Double.NEGATIVE_INFINITY;
         private final Object extremeLock = new Object();
 
         TrackedSignal(String sym, com.bot.TradingCore.Side side,
                       double entry, double sl, double tp1, double tp2, double tp3,
-                      String forecastBias, double forecastScore) {
+                      String forecastBias, double forecastScore, boolean sentToUser) {
             this.symbol = sym; this.side = side; this.entry = entry;
             this.sl = sl; this.tp1 = tp1; this.tp2 = tp2; this.tp3 = tp3;
             this.forecastBias = forecastBias; this.forecastScore = forecastScore;
+            this.sentToUser = sentToUser;
             this.createdAt = System.currentTimeMillis();
         }
         long ageMs() { return System.currentTimeMillis() - createdAt; }
-
-        // [v14.0 FIX #6] Thread-safe extreme updates
-        void updateExtremes(double newLow, double newHigh) {
+        void updateExtremes(double low, double high) {
             synchronized (extremeLock) {
-                extremeLow  = Math.min(extremeLow, newLow);
-                extremeHigh = Math.max(extremeHigh, newHigh);
+                extremeLow  = Math.min(extremeLow,  low);
+                extremeHigh = Math.max(extremeHigh, high);
             }
         }
         double getExtremeLow()  { synchronized (extremeLock) { return extremeLow; } }
         double getExtremeHigh() { synchronized (extremeLock) { return extremeHigh; } }
     }
 
-    //  SafeRunnable
+    // ═══════════════════════════════════════════════════════════════════
+    //  DISPATCHER — the only gateway for trade-signal → Telegram.
+    //  Every call to telegram.sendMessageAsync(idea.toTelegramString())
+    //  has been replaced by Dispatcher.getInstance().dispatch(idea, src).
+    //  If compile fails in SignalSender, it's because someone added a new
+    //  direct dispatch path — route it through here instead.
+    // ═══════════════════════════════════════════════════════════════════
+    public static final class Dispatcher {
+
+        private static final int    COLD_START_MIN_OUTCOMES = 30;
+        private static final double COLD_START_PROB_FLOOR   = 78.0;
+        private static final int    COLD_START_MIN_CLUSTERS = 4;
+        private static final double COLD_START_MIN_FC_CONF  = 0.55;
+
+        private static final double MIN_RR         = 2.00;
+        private static final double MIN_SL_PCT     = 0.0035;
+        private static final long   SYMBOL_DEDUP_MS = 15 * 60_000L;
+        private static final int    MAX_PER_HOUR   = 4;
+        private static final long   HOUR_MS        = 60 * 60_000L;
+
+        private final com.bot.TelegramBotSender tg;
+        private final com.bot.InstitutionalSignalCore isc;
+
+        private final ConcurrentHashMap<String, Long> lastDispatchMs = new ConcurrentHashMap<>();
+        private final ConcurrentLinkedDeque<Long> dispatchTimestamps = new ConcurrentLinkedDeque<>();
+        private final AtomicLong totalDispatched = new AtomicLong(0);
+        private final AtomicLong blockedByGate   = new AtomicLong(0);
+
+        private static volatile Dispatcher INSTANCE;
+
+        private Dispatcher(com.bot.TelegramBotSender tg, com.bot.InstitutionalSignalCore isc) {
+            this.tg = tg; this.isc = isc;
+        }
+
+        public static Dispatcher init(com.bot.TelegramBotSender tg, com.bot.InstitutionalSignalCore isc) {
+            if (INSTANCE == null) INSTANCE = new Dispatcher(tg, isc);
+            return INSTANCE;
+        }
+
+        public static Dispatcher getInstance() { return INSTANCE; }
+
+        public static final class Result {
+            public final boolean dispatched;
+            public final String  reason;
+            Result(boolean d, String r) { dispatched = d; reason = r; }
+            static Result ok() { return new Result(true, "OK"); }
+            static Result blocked(String why) { return new Result(false, why); }
+        }
+
+        /**
+         * The single source of truth for "should this signal reach the user?"
+         * Returns dispatched=true iff a Telegram message was queued.
+         */
+        public Result dispatch(com.bot.DecisionEngineMerged.TradeIdea idea, String source) {
+            if (idea == null) return Result.blocked("null idea");
+
+            if (!isc.isSymbolAvailable(idea.symbol)) {
+                blockedByGate.incrementAndGet();
+                return Result.blocked("bipolar/cooldown");
+            }
+
+            double riskDist = Math.abs(idea.stop - idea.price);
+            double tp2Dist  = Math.abs(idea.tp2 - idea.price);
+            double actualRR = riskDist > 1e-9 ? tp2Dist / riskDist : 0;
+            if (actualRR < MIN_RR) {
+                blockedByGate.incrementAndGet();
+                return Result.blocked(String.format("R:R=%.2f<%.1f", actualRR, MIN_RR));
+            }
+
+            double slPct = riskDist / idea.price;
+            if (slPct < MIN_SL_PCT) {
+                blockedByGate.incrementAndGet();
+                return Result.blocked(String.format("SL=%.3f%%<%.2f%%", slPct * 100, MIN_SL_PCT * 100));
+            }
+
+            int calSamples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+            boolean coldStart = calSamples < COLD_START_MIN_OUTCOMES;
+            if (coldStart) {
+                int clusters = countClusterFlags(idea.flags);
+                double fcConf = idea.forecast != null ? idea.forecast.confidence : 0.0;
+                if (idea.probability < COLD_START_PROB_FLOOR
+                        || clusters < COLD_START_MIN_CLUSTERS
+                        || fcConf < COLD_START_MIN_FC_CONF) {
+                    blockedByGate.incrementAndGet();
+                    return Result.blocked(String.format(
+                            "cold-start: prob=%.0f clusters=%d fcConf=%.2f",
+                            idea.probability, clusters, fcConf));
+                }
+            }
+
+            String dedupKey = idea.symbol + "_" + idea.side.name();
+            Long lastMs = lastDispatchMs.get(dedupKey);
+            long now = System.currentTimeMillis();
+            if (lastMs != null && now - lastMs < SYMBOL_DEDUP_MS) {
+                blockedByGate.incrementAndGet();
+                return Result.blocked(String.format("dedup %ds", (now - lastMs) / 1000));
+            }
+
+            pruneDispatchTimestamps(now);
+            if (dispatchTimestamps.size() >= MAX_PER_HOUR) {
+                blockedByGate.incrementAndGet();
+                return Result.blocked("hourly cap " + MAX_PER_HOUR);
+            }
+
+            try {
+                tg.sendMessageAsync(idea.toTelegramString());
+                totalDispatched.incrementAndGet();
+                lastDispatchMs.put(dedupKey, now);
+                dispatchTimestamps.addLast(now);
+                totalSignals.incrementAndGet();
+                lastSignalMs = now;
+                droughtAnnounced.set(false);
+                trackSignal(idea, true);
+                isc.setSignalCooldown(idea.symbol, 30 * 60_000L);
+                LOG.info(String.format("[DISPATCH/%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% cold=%s",
+                        source, idea.symbol, idea.side, idea.probability,
+                        idea.forecast != null ? idea.forecast.confidence : 0.0,
+                        actualRR, slPct * 100, coldStart));
+                return Result.ok();
+            } catch (Throwable t) {
+                LOG.warning("[DISPATCH/" + source + "] " + idea.symbol + " failed: " + t.getMessage());
+                return Result.blocked("exception");
+            }
+        }
+
+        private void pruneDispatchTimestamps(long now) {
+            while (!dispatchTimestamps.isEmpty()
+                    && now - dispatchTimestamps.peekFirst() > HOUR_MS) {
+                dispatchTimestamps.pollFirst();
+            }
+        }
+
+        public long getTotalDispatched() { return totalDispatched.get(); }
+        public long getBlockedByGate()   { return blockedByGate.get(); }
+        public int  getHourlyCount() {
+            pruneDispatchTimestamps(System.currentTimeMillis());
+            return dispatchTimestamps.size();
+        }
+    }
+
+    private static int countClusterFlags(List<String> flags) {
+        if (flags == null) return 0;
+        int c = 0;
+        for (String f : flags) {
+            if (f == null) continue;
+            String u = f.toUpperCase();
+            if (u.startsWith("CLUSTER") || u.contains("EARLY") || u.contains("TREND")
+                    || u.contains("BREAKOUT") || u.contains("VSA") || u.contains("PUMP")
+                    || u.contains("EXH") || u.contains("OFV_STRONG") || u.contains("OBI")
+                    || u.contains("HTF_") || u.contains("BOS") || u.contains("FVG")
+                    || u.contains("LIQ_MAGNET") || u.contains("DIV")) c++;
+        }
+        return c;
+    }
 
     private static Runnable safe(String name, Runnable task) {
         return () -> {
-            try {
-                task.run();
-            } catch (Throwable t) {
+            try { task.run(); }
+            catch (Throwable t) {
                 errorCount.incrementAndGet();
-
-                // Fix Circuit Breaker Over-sensitivity:
-                // Only trigger CB for internal logic crashes or critical order errors.
-                // Ignore transient API/network/JSON parsing glitches.
                 boolean isTransient = t instanceof java.io.IOException ||
                         t instanceof java.net.http.HttpTimeoutException ||
                         t.getClass().getSimpleName().toLowerCase().contains("json") ||
                         (t.getMessage() != null && (t.getMessage().contains("502") || t.getMessage().contains("timeout")));
-
-                if (!isTransient) {
-                    errorsInWindow.incrementAndGet();
-                }
-
+                if (!isTransient) errorsInWindow.incrementAndGet();
                 LOG.log(Level.SEVERE, "[SAFE] Task '" + name + "' FAILED: " + t.getMessage(), t);
             }
         };
     }
 
+    // ═══════════════════════════════════════════════════════════════════
     //  MAIN
-
+    // ═══════════════════════════════════════════════════════════════════
     public static void main(String[] args) {
-        // [SCANNER MODE v1.0] Force UTF-8 on stdout/stderr so Cyrillic log lines are readable on Railway.
-        // Without this, JVM uses the container's default charset (often ASCII/Latin-1) → ??? ????????
         try {
             System.setOut(new java.io.PrintStream(System.out, true, "UTF-8"));
             System.setErr(new java.io.PrintStream(System.err, true, "UTF-8"));
         } catch (java.io.UnsupportedEncodingException ignored) {}
 
         configureLogger();
+        resolveTimezoneAsync();
 
-        if (TG_TOKEN == null || TG_TOKEN.isBlank()) {
-            LOG.severe("TELEGRAM_TOKEN не задан — выход.");
-            System.exit(1);
-        }
-
-        startTimeMs              = System.currentTimeMillis();
-        lastErrorWindowStart     = startTimeMs;
-        lastSignalMs             = startTimeMs;
-        lastCycleSuccessMs       = startTimeMs;
-        lastStatsSuccessMs       = startTimeMs;
+        startTimeMs          = System.currentTimeMillis();
+        lastErrorWindowStart = startTimeMs;
+        lastSignalMs         = startTimeMs;
+        lastCycleSuccessMs   = startTimeMs;
+        lastStatsSuccessMs   = startTimeMs;
 
         final com.bot.TelegramBotSender telegram = new com.bot.TelegramBotSender(TG_TOKEN, CHAT_ID);
-
-        // Optional separate AFC channel. If AFC_CHAT_ID not set → reuse main sender.
-        // This lets you route "forecast/analysis" to a secondary channel while keeping
-        // the main channel clean with only real entry signals (Entry+TP+SL).
-        String afcChatId = System.getenv("AFC_CHAT_ID");
-        if (afcChatId != null && !afcChatId.isBlank() && !afcChatId.equals(CHAT_ID)) {
-            afcSender = new com.bot.TelegramBotSender(TG_TOKEN, afcChatId.trim());
-            LOG.info("[AFC] Separate AFC channel configured: " + afcChatId.trim());
-        } else {
-            afcSender = telegram; // same channel — AFC messages carry [📡 ПРОГНОЗ] prefix
-        }
-
         final com.bot.GlobalImpulseController gic = new com.bot.GlobalImpulseController();
         final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
         final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram, gic, isc);
 
-        // Load persisted calibrator state
+        Dispatcher.init(telegram, isc);
+
         final String calibratorFile = System.getenv()
                 .getOrDefault("CALIBRATOR_FILE", "./data/calibrator.csv");
         try {
@@ -407,36 +409,33 @@ public final class BotMain {
             LOG.warning("[Calibrator] load failed: " + t.getMessage());
         }
 
-        // [v50 FIX #1.2] Single shutdown hook with explicit order:
-        // 1. Stop schedulers  2. Save calibrator  3. Flush Telegram
-        // Previously two hooks (calibrator-shutdown + ShutdownHook) ran in undefined order.
-        // On Railway SIGTERM grace=10s this could cause calibrator save to be skipped.
-
-        // Pass auto-detected timezone to signal formatter
         com.bot.DecisionEngineMerged.USER_ZONE = ZONE;
 
-        // [BUG-FIX v33.1] panicCallback was routed to LOG only — trader never saw BTC CRASH alerts.
-        // Now: GIC CRASH/PANIC events go to Telegram immediately (bypass normal queue, use offerFirst).
         isc.setTimeStopCallback((sym, msg) -> {
-            LOG.info("[ISC time-stop] " + sym + ": " + msg);
-            // [FIX SCANNER MODE] Notify trader to check/close position manually.
-            // Without TradeResolver, trader had no idea when 90-min time limit fired.
-            telegram.sendMessageAsync(
-                    "⏱ *TIME STOP* — #" + sym + "\n"
-                            + "━━━━━━━━━━━━━━━━━━\n"
-                            + "90 мин истекло · проверь позицию\n"
-                            + "Закрой вручную если открыта\n"
-                            + "━━━━━━━━━━━━━━━━━━");
+            boolean notify = false;
+            for (TrackedSignal ts : trackedSignals.values()) {
+                if (!ts.symbol.equals(sym)) continue;
+                if (!ts.sentToUser) continue;
+                if (ts.timeStopNotified) continue;
+                ts.timeStopNotified = true;
+                notify = true;
+                break;
+            }
+            if (notify) {
+                telegram.sendMessageAsync(
+                        "⏱ *TIME STOP* — #" + sym + "\n"
+                                + "━━━━━━━━━━━━━━━━━━\n"
+                                + "90 мин истекло · проверь позицию\n"
+                                + "Закрой вручную если открыта\n"
+                                + "━━━━━━━━━━━━━━━━━━");
+            }
         });
+
         gic.setPanicCallback(msg -> {
             LOG.warning("[GIC panic] " + msg);
             telegram.sendMessageAsync("⚠ *Market Alert*\n\n" + msg);
         });
 
-        // ── Schedulers ───────────────────────────────────────────
-        // Thread pools reduced: 2→1 main, 4→2 aux.
-        // 15m TF не требует параллелизма больше этого уровня.
-        // Экономия: ~6 потоков → ~3. Stack ~1-2MB/поток = -8MB RAM.
         ScheduledExecutorService mainSched = Executors.newScheduledThreadPool(1, r -> {
             Thread t = new Thread(r, "TradingBot-Main");
             t.setDaemon(false);
@@ -444,45 +443,29 @@ public final class BotMain {
                     LOG.log(Level.SEVERE, "UNCAUGHT in " + th.getName(), ex));
             return t;
         });
-
         ScheduledExecutorService auxSched = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "TradingBot-Aux");
             t.setDaemon(true);
             return t;
         });
-
         ExecutorService heavySched = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "TradingBot-Heavy");
             t.setDaemon(true);
             return t;
         });
 
-        // ── Main cycle (каждые INTERVAL минут) ───────────────────
-        // Default INTERVAL=1→2 min рекомендуется (через ENV SIGNAL_INTERVAL_MIN=2).
-        // 15m TF обновляется 4 раза за бар при INTERVAL=2 — достаточно для EARLY_TICK детекта.
         mainSched.scheduleAtFixedRate(
                 safe("MainCycle", () -> runCycle(telegram, gic, isc, sender)),
                 0, INTERVAL, TimeUnit.MINUTES);
-
-        // ── Stats в лог каждые 30 минут (было 15) ────────────────
-        // Stats не требуют минутной точности.
         auxSched.scheduleAtFixedRate(
-                safe("LogStats", () -> logStats(telegram, gic, isc, sender)),
+                safe("LogStats", () -> logStats(gic, isc, sender)),
                 30, 30, TimeUnit.MINUTES);
-
-        // ── Daily summary в Telegram в 09:00 UTC ─────────────────
         auxSched.scheduleAtFixedRate(
                 safe("DailySummary", () -> maybeSendDailySummary(telegram, gic, isc, sender)),
                 1, 1, TimeUnit.MINUTES);
-
-        // ── Watchdog каждые 2 минуты (было 60s) ──────────────────
-        // WS heartbeat сам ловит разрывы быстрее 60s шедулера.
         auxSched.scheduleAtFixedRate(
-                safe("Watchdog", () -> runWatchdog(telegram, gic, isc, sender)),
+                safe("Watchdog", () -> runWatchdog(telegram, sender)),
                 120, 120, TimeUnit.SECONDS);
-
-        // Periodic calibrator save (every 30 min — was 10)
-        // Запись на диск — дорогая операция, 30 мин достаточно.
         auxSched.scheduleAtFixedRate(
                 safe("CalibratorSave", () -> {
                     com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
@@ -490,32 +473,12 @@ public final class BotMain {
                     LOG.info("[Calibrator] auto-saved, total outcomes: " + cnt);
                 }),
                 30, 30, TimeUnit.MINUTES);
-
-        // Periodic Binance server time sync (every 2h — was 30 min)
         auxSched.scheduleAtFixedRate(
                 safe("TimeSync", sender::syncServerTime),
                 5, 120, TimeUnit.MINUTES);
-
-        // ── [SCANNER MODE v2.0] TradeResolver DISABLED ───────────────
-        // Бот работает в режиме чистого сканера сигналов.
-        // TradeResolver отслеживал виртуальные позиции и слал фантомные
-        // TP/SL уведомления по сделкам, которые трейдер не открывал.
-
-        // ── [SCANNER MODE v2.0] PositionStatus DISABLED ──────────────
-        // auxSched.scheduleAtFixedRate(
-        //         safe("PositionStatus", () -> sendPositionStatus(telegram)),
-        //         15, 30, TimeUnit.MINUTES);
-
-        // ── ForecastChecker каждые 20 минут (было 15) ────────────
-        // Калибратор требует 45+ мин выдержки → 15 мин шедулера избыточно.
-        // checkForecastAccuracy — feedback loop в ProbabilityCalibrator, MUST stay enabled.
         auxSched.scheduleAtFixedRate(
                 safe("ForecastChecker", () -> checkForecastAccuracy(sender, telegram)),
                 20, 20, TimeUnit.MINUTES);
-
-        // ── WalkForward раз в 3 дня в 05:00 UTC (было ежедневно) ─
-        // fetchKlines(2880) × 8 символов — самый тяжёлый REST burst в системе.
-        // Статистика 30-дневного окна практически не меняется за сутки, 3 дня = достаточно.
         auxSched.scheduleAtFixedRate(
                 safe("WalkForward", () -> {
                     int hourUtc = ZonedDateTime.now(ZoneOffset.UTC).getHour();
@@ -525,84 +488,41 @@ public final class BotMain {
                     }
                 }),
                 60, 60, TimeUnit.MINUTES);
-
-        // ── [v52] ADVANCE FORECAST ALERTS — RE-ENABLED ───────────
-        // Цель: предупреждать о памп/дамп ЗАРАНЕЕ — до того как сигнал сформируется.
-        // Запускается каждые 2 минуты (было 5). При SIGNAL_INTERVAL_MIN=1 это даёт
-        // advance-предупреждение за 1-4 минуты до боевого сигнала.
-        // Threshold снижен 0.35→0.22 чтобы ловить ранние сетапы при накоплении объёма.
-        // Cooldown снижен 20→10 мин: памп развивается за 5-15 мин, 20 мин было слишком долго.
-        auxSched.scheduleAtFixedRate(
-                safe("AdvanceForecast", () -> runAdvanceForecast(sender, gic, isc, telegram)),
-                2, 2, TimeUnit.MINUTES); // [v52] 3→2 start, 5→2 interval
-
-        // ── Backtest раз в сутки в 03:00 UTC (было каждые 2h) ────
-        // Было 12 CPU burst/сутки на 18 пар × 4 таймфрейма = Railway CPU billing пик.
-        // Теперь проверяем каждый час, запускаем только в 03:00 UTC (тихий час).
         auxSched.scheduleAtFixedRate(
                 safe("BacktestSubmit", () -> {
                     int hourUtc = ZonedDateTime.now(ZoneOffset.UTC).getHour();
                     if (hourUtc == 3) {
                         heavySched.submit(safe("Backtest",
-                                () -> runPeriodicBacktest(sender, isc, telegram)));
+                                () -> runPeriodicBacktest(sender, isc)));
                     }
                 }),
                 60, 60, TimeUnit.MINUTES);
 
-        // ── Unified shutdown hook (v50 FIX: merged from two hooks, explicit order) ────
-        // Capture calibratorFile in effectively-final variable for lambda
         final String calibratorFileFinal = calibratorFile;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            // Step 1: stop all scheduled work first so no new tasks start
-            LOG.info("═══ Завершение работы. Цикл: " + totalCycles.get()
-                    + " | Сигналов: " + totalSignals.get() + " ═══");
-            mainSched.shutdown();
-            auxSched.shutdown();
-            heavySched.shutdown();
+            LOG.info("═══ Shutdown. Cycles: " + totalCycles.get()
+                    + " | Signals: " + totalSignals.get() + " ═══");
+            mainSched.shutdown(); auxSched.shutdown(); heavySched.shutdown();
             try { mainSched.awaitTermination(4, TimeUnit.SECONDS); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             mainSched.shutdownNow();
-
-            // Step 2: persist calibrator AFTER schedulers stopped (no concurrent writes)
             try {
                 com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFileFinal);
-                System.out.println("[Calibrator] final save on shutdown OK");
-            } catch (Throwable t) {
-                System.err.println("[Calibrator] save failed on shutdown: " + t.getMessage());
-            }
+            } catch (Throwable ignored) {}
+            telegram.flushAndShutdown(8000);
+        }, "ShutdownHook"));
 
-            // Step 3: drain Telegram queue last (non-critical, best effort)
-            telegram.flushAndShutdown(4000);
-            if (afcSender != null && afcSender != telegram) {
-                afcSender.flushAndShutdown(2000);
-            }
-        }, "UnifiedShutdownHook"));
-
-        // ── Startup ping ─────────────────────────────────────────
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v15.0 ARCHITECTURE FIX стартовал " + nowWarsawStr() + " ═══");
+        LOG.info("═══ TradingBot v61 SCANNER started " + nowLocalStr() + " ═══");
     }
-
-    //  MAIN CYCLE
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
                                  com.bot.GlobalImpulseController gic,
                                  com.bot.InstitutionalSignalCore isc,
                                  com.bot.SignalSender sender) {
         long cycleStart = System.currentTimeMillis();
-
-        // QUIET HOURS REMOVED — 24/7 operation.
-        // Crypto markets do not close. Removing the Asia-session blackout that was
-        // causing the bot to "sleep" between 01:00-05:00 UTC.
-        // Session weight still reduces POSITION SIZE during low-liquidity hours
-        // via getPositionSizeUsdt() — this is the correct approach.
-
-        // [v14.0 FIX #2] Circuit breaker — skip cycle instead of sleeping
         long now = System.currentTimeMillis();
-        if (now < cbPauseUntil) {
-            LOG.fine("[CB] Пауза активна, осталось " + (cbPauseUntil - now) / 1000 + "s");
-            return;
-        }
+        if (now < cbPauseUntil) return;
         if (now - lastErrorWindowStart > CB_WINDOW_MS) {
             lastErrorWindowStart = now;
             errorsInWindow.set(0);
@@ -610,23 +530,19 @@ public final class BotMain {
         if (errorsInWindow.get() >= CB_THRESHOLD) {
             cbPauseUntil = now + CB_PAUSE_MS;
             errorsInWindow.set(0);
-            LOG.warning("[CB] Слишком много ошибок, пауза до " + formatLocalTime(cbPauseUntil));
+            LOG.warning("[CB] Too many errors, pause till " + formatLocalTime(cbPauseUntil));
             return;
         }
 
         long cycle = totalCycles.incrementAndGet();
-        LOG.info("══ ЦИКЛ #" + cycle + " ══ " + nowWarsawStr());
+        LOG.info("══ CYCLE #" + cycle + " ══ " + nowLocalStr());
 
-        // BTC контекст + секторальные лидеры
         updateBtcContext(sender, gic);
         updateSectors(sender, gic);
+        try { sender.getPumpHunter().periodicCleanup(); } catch (Throwable ignored) {}
 
         double bal = sender.getAccountBalance();
         if (bal > 0) isc.updateBalance(bal);
-
-        // updateBayesPrior threshold aligned: was 20, function requires 50 to blend.
-        // Calling with 20–49 confirmed trades just sets 0.55 hardcoded prior — wasted call.
-        // Now we call only when the function can actually use the data (>= 50 trades).
         int totalTrades = isc.getTotalTradeCount();
         if (totalTrades >= 50) {
             sender.getDecisionEngine().updateBayesPrior(isc.getOverallWinRate(), totalTrades);
@@ -640,14 +556,11 @@ public final class BotMain {
 
         List<com.bot.DecisionEngineMerged.TradeIdea> signals = sender.generateSignals();
         lastCycleSuccessMs = System.currentTimeMillis();
-
         if (signals == null || signals.isEmpty()) {
-            LOG.info("Нет сигналов. " + isc.getStats());
+            LOG.info("No signals. " + isc.getStats());
             return;
         }
 
-        // Keep only top signals per cycle to prevent Telegram queue backlog.
-        // Priority: probability desc, then forecast confidence, then abs(directionScore).
         signals.sort(Comparator
                 .comparingDouble((com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed()
                 .thenComparingDouble(i -> i.forecast != null ? i.forecast.confidence : 0.0).reversed()
@@ -656,86 +569,23 @@ public final class BotMain {
         List<com.bot.DecisionEngineMerged.TradeIdea> dispatchSignals =
                 reorderSignalsForDispatch(new ArrayList<>(signals.subList(0, limit)));
 
-        int sent = 0;
+        int sent = 0, blocked = 0;
         for (com.bot.DecisionEngineMerged.TradeIdea s : dispatchSignals) {
-
-            // [v42.0 FIX] SLOT LEAK GUARD — every signal that reaches this loop
-            // was already registered via isc.registerSignal() inside processPair().
-            // If it gets rejected here (bipolar, R:R, exception), the slot MUST be freed.
-            // Without this, rejected signals permanently occupy ISC slots → "Max global signals".
-            boolean dispatched = false;
-            try {
-                // [v17.0 §1] BIPOLAR GUARD — final single-threaded check.
-                if (!isc.isSymbolAvailable(s.symbol)) {
-                    LOG.info("[BIPOLAR SKIP] " + s.symbol + " already active or in cooldown — dropped");
-                    continue; // finally → unregister
-                }
-
-                // DISPATCH R:R GATE — raised 1.80→2.00 (user preference ≥1:2).
-                // Было два дублирующихся gate: здесь и в processPair/SignalSender. Теперь оба=2.00.
-                double _rrRiskDist = Math.abs(s.stop  - s.price);
-                double _rrTp2Dist  = Math.abs(s.tp2   - s.price);
-                double _rrActual   = _rrRiskDist > 1e-9 ? _rrTp2Dist / _rrRiskDist : 0;
-                if (_rrActual < 2.00) {
-                    LOG.info("[RR-DISPATCH-BLOCK] " + s.symbol + " " + s.side
-                            + " rr=" + String.format("%.2f", _rrActual)
-                            + " entry=" + s.price + " sl=" + s.stop + " tp2=" + s.tp2);
-                    continue; // finally → unregister
-                }
-
-                // CLEAN DISPATCH — toTelegramString() is self-contained now.
-                telegram.sendMessageAsync(s.toTelegramString());
-
-                // [SCANNER MODE v2.0] AUTO EXECUTION DISABLED — ручная торговля.
-                // executeOrderAsync() отключён до подключения биржевого API.
-                // double autoSizeUsdt = sender.getPositionSizeUsdt(s, sender.getCoinCategory(s.symbol));
-                // sender.executeOrderAsync(s, autoSizeUsdt);
-
-                LOG.info("► " + s.symbol + " " + s.side
-                        + " conf=" + String.format("%.0f%%", s.probability)
-                        + (s.forecast != null ? " fc=" + s.forecast.bias.name() : ""));
-                totalSignals.incrementAndGet();
-                sent++;
-
-                // [v42.1 FIX] Track signal for ProbabilityCalibrator feedback loop.
-                // SCANNER MODE COMPATIBLE: trackSignal() only writes to forecastRecords
-                // (no virtual position tracking, no fake TP/SL events). The ForecastChecker
-                // resolves these by comparing real market price after 2h vs entry — this
-                // is WHAT FEEDS THE ISOTONIC CALIBRATOR. Without this call the entire
-                // ProbabilityCalibrator path stays empty forever and #1 fix is dead.
-                trackSignal(s);
-
-                // [SCANNER MODE] Без TradeResolver бот не знает, выиграл сигнал или проиграл.
-                // Поэтому применяем worst-case cooldown = SL_COOLDOWN_MS (30 мин).
-                // Если был SL — 30 мин даёт "falling knife" остыть; если TP — просто подождём чуть дольше.
-                // Синхронизация с ISC.SL_COOLDOWN_MS — единый источник истины.
-                isc.setSignalCooldown(s.symbol, 30 * 60_000L);
-
-                lastSignalMs = System.currentTimeMillis();
-                dispatched = true;
-            } catch (Exception ex) {
-                LOG.warning("[DISPATCH] " + s.symbol + " failed: " + ex.getMessage());
-            } finally {
-                // If signal was NOT dispatched → free the ISC slot that
-                // processPair().registerSignal() occupied. This is the critical fix
-                // for the "coins blocked forever" bug.
-                if (!dispatched) {
-                    isc.unregisterSignal(s);
-                    LOG.info("[SLOT-FREE] " + s.symbol + " " + s.side + " — ISC slot released");
-                }
+            Dispatcher.Result res = Dispatcher.getInstance().dispatch(s, "CYCLE");
+            if (res.dispatched) sent++;
+            else {
+                blocked++;
+                isc.unregisterSignal(s);
+                LOG.info("[CYCLE-BLOCK] " + s.symbol + " " + s.side + ": " + res.reason);
             }
         }
-
-        LOG.info("══ ЦИКЛ #" + cycle + " END ══ sent=" + sent
+        LOG.info("══ CYCLE #" + cycle + " END ══ sent=" + sent + " blocked=" + blocked
                 + " time=" + (System.currentTimeMillis() - cycleStart) + "ms");
     }
-
-    //  TRACK SIGNAL
 
     private static List<com.bot.DecisionEngineMerged.TradeIdea> reorderSignalsForDispatch(
             List<com.bot.DecisionEngineMerged.TradeIdea> selected) {
         if (selected == null || selected.size() < 3) return selected;
-
         List<com.bot.DecisionEngineMerged.TradeIdea> longs = new ArrayList<>();
         List<com.bot.DecisionEngineMerged.TradeIdea> shorts = new ArrayList<>();
         for (com.bot.DecisionEngineMerged.TradeIdea idea : selected) {
@@ -743,155 +593,77 @@ public final class BotMain {
             else shorts.add(idea);
         }
         if (longs.isEmpty() || shorts.isEmpty()) return selected;
-
         List<com.bot.DecisionEngineMerged.TradeIdea> ordered = new ArrayList<>(selected.size());
         int li = 0, si = 0;
         boolean takeLong = selected.get(0).side == com.bot.TradingCore.Side.LONG;
         while (li < longs.size() || si < shorts.size()) {
-            if (takeLong && li < longs.size()) {
-                ordered.add(longs.get(li++));
-            } else if (!takeLong && si < shorts.size()) {
-                ordered.add(shorts.get(si++));
-            } else if (li < longs.size()) {
-                ordered.add(longs.get(li++));
-            } else if (si < shorts.size()) {
-                ordered.add(shorts.get(si++));
-            }
+            if (takeLong && li < longs.size()) ordered.add(longs.get(li++));
+            else if (!takeLong && si < shorts.size()) ordered.add(shorts.get(si++));
+            else if (li < longs.size()) ordered.add(longs.get(li++));
+            else if (si < shorts.size()) ordered.add(shorts.get(si++));
             takeLong = !takeLong;
         }
         return ordered;
     }
 
-    static void trackSignal(com.bot.DecisionEngineMerged.TradeIdea idea) {
+    public static void trackSignal(com.bot.DecisionEngineMerged.TradeIdea idea) {
+        trackSignal(idea, true);
+    }
+
+    static void trackSignal(com.bot.DecisionEngineMerged.TradeIdea idea, boolean sentToUser) {
         if (idea == null) return;
         String key = idea.symbol + "_" + idea.side;
-
         trackedSignals.remove(key);
-
-        String  forecastBias  = "NEUTRAL";
-        double  forecastScore = 0.0;
+        String forecastBias = "NEUTRAL";
+        double forecastScore = 0.0;
         if (idea.forecast != null) {
-            forecastBias  = idea.forecast.bias.name();
+            forecastBias = idea.forecast.bias.name();
             forecastScore = idea.forecast.directionScore;
         }
-
-        double tp3 = idea.tp3 > 0 ? idea.tp3
-                : idea.price + (idea.tp2 - idea.price) * 1.5;
-
+        double tp3 = idea.tp3 > 0 ? idea.tp3 : idea.price + (idea.tp2 - idea.price) * 1.5;
         trackedSignals.put(key, new TrackedSignal(
                 idea.symbol, idea.side, idea.price, idea.stop,
                 idea.tp1, idea.tp2, tp3,
-                forecastBias, forecastScore));
-
-        // [v14.0 FIX #5] Ограничиваем размер forecastRecords
+                forecastBias, forecastScore, sentToUser));
         if (forecastRecords.size() >= MAX_FORECAST_RECORDS) {
-            // Удаляем самые старые resolved записи
             forecastRecords.entrySet().removeIf(e ->
                     e.getValue().resolved && e.getValue().ageMs() > 60 * 60_000L);
-            // Если всё ещё переполнено — удаляем самые старые любые
             if (forecastRecords.size() >= MAX_FORECAST_RECORDS) {
                 forecastRecords.entrySet().stream()
                         .min(Comparator.comparingLong(e -> e.getValue().createdAt))
                         .ifPresent(e -> forecastRecords.remove(e.getKey()));
             }
         }
-
-        // [v43 PATCH FIX #1] Store SIGNAL probability (what user sees in Telegram),
-        // NOT forecastScore. The calibrator must learn from the exact number shown
-        // in the signal so it can map "bot says 72%" → "real win-rate is X%".
-        // robustAtrPct is stored for vol-bucketed calibration (consolidation trap fix).
-        double signalProb  = idea.probability;  // final calibrated % from DecisionEngine
-        double robustAtrPct = idea.getRobustAtrPct(); // [v50 AUDIT FIX] use override-aware getter
-
-        // [v36-FIX Дыра9] Используем forecastSeq вместо currentTimeMillis() — нет коллизий
-        // Передаём РЕАЛЬНЫЕ tp1 и stop из TradeIdea. Они попадут в калибратор
-        // при разрешении записи в checkForecastAccuracy() — тот же набор уровней, что видит трейдер.
         forecastRecords.put(key + "_" + forecastSeq.incrementAndGet(),
                 new ForecastRecord(idea.symbol, idea.side, idea.price,
-                        forecastBias, forecastScore, signalProb, robustAtrPct,
+                        forecastBias, forecastScore, idea.probability, idea.getRobustAtrPct(),
                         idea.tp1, idea.stop));
     }
 
-    //  POSITION STATUS REPORTER
-    //  Отправляет сводку открытых позиций каждые 30 минут.
-
-    private static void sendPositionStatus(com.bot.TelegramBotSender telegram) {
-        if (trackedSignals.isEmpty()) return;
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("*Открытые позиции*\n\n");
-
-        int longCount = 0, shortCount = 0;
-        for (TrackedSignal ts : trackedSignals.values()) {
-            long ageMin = ts.ageMs() / 60_000;
-            String dir = ts.side == com.bot.TradingCore.Side.LONG ? "L" : "S";
-            String status = ts.tp2Hit ? " TP2" : ts.tp1Hit ? " TP1" : "";
-            if (ts.side == com.bot.TradingCore.Side.LONG) longCount++; else shortCount++;
-
-            String sl;
-            if (ts.trailingStop > 0 && ts.tp1Hit) {
-                sl = String.format("trail %.4f", ts.trailingStop);
-            } else {
-                sl = String.format("sl %.4f", ts.sl);
-            }
-            sb.append(String.format("%s · %s%s · %dm · %s\n",
-                    ts.symbol, dir, status, ageMin, sl));
-        }
-        sb.append(String.format("\nL %d · S %d · Total %d",
-                longCount, shortCount, trackedSignals.size()));
-        telegram.sendMessageAsync(sb.toString());
-    }
-
-    //  FORECAST ACCURACY CHECKER
-
-    // Deduplication: Forecast Accuracy Report was firing 3x per minute.
-    // Root cause: checkForecastAccuracy() ran every 15m and called sendMessageAsync
-    // for EVERY resolved record when total % 20 == 0, which could match multiple
-    // records in the same run. Added lastForecastReportMs gate: max 1 report/hour.
     private static volatile long lastForecastReportMs = 0;
-    private static final long FORECAST_REPORT_INTERVAL_MS = 60 * 60_000L; // once per hour max
+    private static final long FORECAST_REPORT_INTERVAL_MS = 60 * 60_000L;
 
     private static void checkForecastAccuracy(com.bot.SignalSender sender,
                                               com.bot.TelegramBotSender telegram) {
-        long now = System.currentTimeMillis();
-        // 120→45 min. On 15m TF, 3 bars (45m) is enough to resolve
-        // TP1 (1.0×ATR) or SL (0.8×ATR) in the vast majority of cases.
-        // Waiting 2 hours meant calibrator was learning from stale market regimes.
         long minAgeMs = 45 * 60_000L;
-
         for (Iterator<Map.Entry<String, ForecastRecord>> it =
              forecastRecords.entrySet().iterator(); it.hasNext(); ) {
-
             Map.Entry<String, ForecastRecord> e = it.next();
             ForecastRecord fr = e.getValue();
-
             if (fr.ageMs() < minAgeMs) continue;
-
             if (fr.resolved) {
                 if (fr.ageMs() > minAgeMs + 30 * 60_000L) it.remove();
                 continue;
             }
-
-            // Remove unresolved records older than 4h
-            if (fr.ageMs() > 4 * 60 * 60_000L) {
-                it.remove();
-                continue;
-            }
+            if (fr.ageMs() > 4 * 60 * 60_000L) { it.remove(); continue; }
 
             try {
-                // Fetch enough candles to cover the full signal lifetime.
                 int barsNeeded = (int) Math.ceil(fr.ageMs() / (15.0 * 60_000L)) + 2;
                 barsNeeded = Math.max(5, Math.min(30, barsNeeded));
                 List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", barsNeeded);
                 if (c == null || c.isEmpty()) continue;
                 double currentPrice = c.get(c.size() - 1).close;
 
-                // ── [PATCH A v42] Резолв по РЕАЛЬНЫМ tp1/sl из TradeIdea ────
-                // Старое поведение: реконструировать TP1 = entry ± 1.0×ATR, SL = ±0.8×ATR.
-                // Это НЕ совпадало с тем, что реально ушло в Telegram → калибратор
-                // учился на распределении, которого в сигналах не было.
-                // Теперь используем реальные уровни. Fallback на ATR оставлен для старых
-                // записей ForecastRecord, созданных до деплоя этого патча (tp1Level == 0).
                 double atrAbs = fr.robustAtrPctAtSignal > 0
                         ? fr.robustAtrPctAtSignal * fr.entryPrice
                         : (c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0);
@@ -900,51 +672,57 @@ public final class BotMain {
                 boolean bearishBias = fr.forecastBias.contains("BEAR");
                 boolean hasOpinion = bullishBias || bearishBias;
 
-                boolean hitTP1 = false, hitSL = false;
-
-                // Приоритет: реальные уровни из TradeIdea
+                boolean hitTP1 = false, hitSL = false, ambiguous = false;
                 double tp1Use = fr.tp1Level;
                 double slUse  = fr.slLevel;
                 boolean haveRealLevels = tp1Use > 0 && slUse > 0;
-
-                // Fallback для back-compat записей (до деплоя патча A)
                 if (!haveRealLevels && hasOpinion && atrAbs > 0) {
                     boolean longSide = bullishBias;
-                    tp1Use = longSide ? fr.entryPrice + atrAbs * 1.0
-                            : fr.entryPrice - atrAbs * 1.0;
-                    slUse  = longSide ? fr.entryPrice - atrAbs * 0.8
-                            : fr.entryPrice + atrAbs * 0.8;
+                    tp1Use = longSide ? fr.entryPrice + atrAbs * 1.0 : fr.entryPrice - atrAbs * 1.0;
+                    slUse  = longSide ? fr.entryPrice - atrAbs * 0.8 : fr.entryPrice + atrAbs * 0.8;
                     haveRealLevels = true;
                 }
 
                 if (haveRealLevels && hasOpinion) {
-                    // Используем fr.side, а не угадываем по bias — точнее для разрешения
                     boolean longSide = fr.side == com.bot.TradingCore.Side.LONG;
-                    // Walk candles in chronological order from signal creation.
                     for (com.bot.TradingCore.Candle bar : c) {
                         if (bar.openTime + 15 * 60_000L < fr.createdAt) continue;
                         boolean tpHere = longSide ? bar.high >= tp1Use : bar.low  <= tp1Use;
                         boolean slHere = longSide ? bar.low  <= slUse  : bar.high >= slUse;
-                        // Both in same bar → conservative (assume SL hit first).
-                        if (tpHere && slHere) { hitSL = true; break; }
+                        if (tpHere && slHere) {
+                            double openPx = bar.open;
+                            double tpDist = Math.abs(tp1Use - openPx);
+                            double slDist = Math.abs(slUse  - openPx);
+                            if (longSide) {
+                                boolean openInFavor = openPx > fr.entryPrice && tpDist < slDist;
+                                boolean openAgainst = openPx < fr.entryPrice && slDist < tpDist;
+                                if (openInFavor) { hitTP1 = true; break; }
+                                if (openAgainst) { hitSL  = true; break; }
+                                ambiguous = true; break;
+                            } else {
+                                boolean openInFavor = openPx < fr.entryPrice && tpDist < slDist;
+                                boolean openAgainst = openPx > fr.entryPrice && slDist < tpDist;
+                                if (openInFavor) { hitTP1 = true; break; }
+                                if (openAgainst) { hitSL  = true; break; }
+                                ambiguous = true; break;
+                            }
+                        }
                         if (tpHere) { hitTP1 = true; break; }
                         if (slHere) { hitSL  = true; break; }
                     }
                 }
 
-                // ── Outcome classification ─────────────────────────────────
-                boolean correct;
-                String outcome;
-                if (hitTP1) {
-                    correct = true; outcome = "TP1";
-                } else if (hitSL) {
-                    correct = false; outcome = "SL";
-                } else {
-                    // Neither hit — fall back to direction at check time.
+                boolean correct; String outcome;
+                if (ambiguous) {
+                    fr.resolved = true; fr.actualOutcome = "AMBIGUOUS";
+                    continue;
+                }
+                if (hitTP1) { correct = true;  outcome = "TP1"; }
+                else if (hitSL) { correct = false; outcome = "SL"; }
+                else {
                     double atrForFc = c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0;
                     double fcThreshold = atrForFc > 0
-                            ? Math.max(0.3, (atrForFc / currentPrice) * 100.0 * 0.25)
-                            : 0.3;
+                            ? Math.max(0.3, (atrForFc / currentPrice) * 100.0 * 0.25) : 0.3;
                     double changePct = (currentPrice - fr.entryPrice) / fr.entryPrice * 100.0;
                     boolean bullishMove = changePct > fcThreshold;
                     boolean bearishMove = changePct < -fcThreshold;
@@ -955,28 +733,23 @@ public final class BotMain {
                 fr.resolved = true;
                 fr.actualOutcome = outcome;
 
-                // [FIX SCANNER MODE] Send TP1/SL hit notification to trader.
-                // In scanner mode there's no TradeResolver watching positions —
-                // trader opened based on our signal but had zero exit notification.
-                // This fixes the #1 complaint: "I had no idea it hit SL"
-                if ((hitTP1 || hitSL) && hasOpinion) {
-                    String _emoji  = hitTP1 ? "✅" : "❌";
-                    String _action = hitTP1 ? "TP1 HIT" : "SL HIT";
-                    String _side   = fr.side == com.bot.TradingCore.Side.LONG ? "LONG" : "SHORT";
-                    double _level  = hitTP1 ? fr.tp1Level : fr.slLevel;
-                    double _pnlPct = fr.side == com.bot.TradingCore.Side.LONG
-                            ? (_level - fr.entryPrice) / fr.entryPrice * 100
-                            : (fr.entryPrice - _level) / fr.entryPrice * 100;
-                    String _fmt = fr.entryPrice < 0.001 ? "%.6f" : fr.entryPrice < 1 ? "%.4f" : "%.2f";
+                if ((hitTP1 || hitSL) && hasOpinion
+                        && wasDispatchedToUser(fr.symbol, fr.side, fr.entryPrice)) {
+                    String emoji  = hitTP1 ? "✅" : "❌";
+                    String action = hitTP1 ? "TP1 HIT" : "SL HIT";
+                    String side   = fr.side == com.bot.TradingCore.Side.LONG ? "LONG" : "SHORT";
+                    double level  = hitTP1 ? fr.tp1Level : fr.slLevel;
+                    double pnlPct = fr.side == com.bot.TradingCore.Side.LONG
+                            ? (level - fr.entryPrice) / fr.entryPrice * 100
+                            : (fr.entryPrice - level) / fr.entryPrice * 100;
+                    String fmt = fr.entryPrice < 0.001 ? "%.6f" : fr.entryPrice < 1 ? "%.4f" : "%.2f";
                     telegram.sendMessageAsync(String.format(
-                            _emoji + " *" + _action + "* — #" + fr.symbol + " " + _side + "%n"
+                            emoji + " *" + action + "* — #" + fr.symbol + " " + side + "%n"
                                     + "━━━━━━━━━━━━━━━━━━%n"
-                                    + "Вход:  `" + _fmt + "`%n"
-                                    + (hitTP1 ? "TP1:   `" : "SL:    `") + _fmt + "` (%+.2f%%)%n"
+                                    + "Вход:  `" + fmt + "`%n"
+                                    + (hitTP1 ? "TP1:   `" : "SL:    `") + fmt + "` (%+.2f%%)%n"
                                     + "━━━━━━━━━━━━━━━━━━",
-                            fr.entryPrice, _level, _pnlPct));
-                    LOG.info(String.format("[NOTIFY] %s %s %s level=%.6f pnl=%+.2f%%",
-                            _action, fr.symbol, _side, _level, _pnlPct));
+                            fr.entryPrice, level, pnlPct));
                 }
 
                 boolean decisive = hitTP1 || hitSL || !"FLAT".equals(outcome);
@@ -985,7 +758,6 @@ public final class BotMain {
                         forecastTotal.incrementAndGet();
                         if (correct) forecastCorrect.incrementAndGet();
                     }
-
                     try {
                         double sigProb01 = Math.max(0.01, Math.min(0.99, fr.signalProbability / 100.0));
                         double atrForFc = c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0;
@@ -994,22 +766,16 @@ public final class BotMain {
                                 : (atrForFc > 0 ? (atrForFc / currentPrice) * 100.0 : 1.0);
                         com.bot.DecisionEngineMerged.getCalibrator()
                                 .recordOutcome(fr.symbol, sigProb01, correct, atrPctForBucket);
-
-                        // Also track for the signal quality report
                         String cat = com.bot.DecisionEngineMerged.detectAssetType(fr.symbol).label;
                         recordSignalOutcome(fr.symbol, fr.signalProbability, cat, correct);
-                    } catch (Throwable cbe) {
-                        LOG.fine("[CAL] feed failed: " + cbe.getMessage());
-                    }
+                    } catch (Throwable ignored) {}
                 }
 
-                int total   = forecastTotal.get();
+                int total = forecastTotal.get();
                 int correct2 = forecastCorrect.get();
-                double acc  = total > 0 ? (double) correct2 / total * 100 : 0;
-
-                LOG.info(String.format("[FC] %s bias=%s outcome=%s %s | Accuracy: %.0f%% (%d/%d)",
-                        fr.symbol, fr.forecastBias, outcome,
-                        correct ? "✅" : "❌",
+                double acc = total > 0 ? (double) correct2 / total * 100 : 0;
+                LOG.info(String.format("[FC] %s bias=%s outcome=%s %s | Acc: %.0f%% (%d/%d)",
+                        fr.symbol, fr.forecastBias, outcome, correct ? "✅" : "❌",
                         acc, correct2, total));
 
                 if (total > 0 && total % 20 == 0) {
@@ -1017,9 +783,8 @@ public final class BotMain {
                     if (nowMs - lastForecastReportMs >= FORECAST_REPORT_INTERVAL_MS) {
                         lastForecastReportMs = nowMs;
                         telegram.sendMessageAsync(String.format(
-                                "*Forecast*\n\nTotal %d · Hit %d · *%.1f%%*",
+                                "*Forecast Accuracy*\n\nTotal %d · Hit %d · *%.1f%%*",
                                 total, correct2, acc));
-                        // Also send the detailed signal quality breakdown
                         if (nowMs - lastSignalQualityReport.get() >= SIGNAL_QUALITY_REPORT_MS) {
                             lastSignalQualityReport.set(nowMs);
                             telegram.sendMessageAsync(buildSignalQualityReport());
@@ -1032,58 +797,53 @@ public final class BotMain {
         }
     }
 
-    //  WATCHDOG
+    private static boolean wasDispatchedToUser(String sym, com.bot.TradingCore.Side side, double entryPrice) {
+        for (TrackedSignal ts : trackedSignals.values()) {
+            if (!ts.symbol.equals(sym)) continue;
+            if (ts.side != side) continue;
+            if (Math.abs(ts.entry - entryPrice) > entryPrice * 0.005) continue;
+            return ts.sentToUser;
+        }
+        return false;
+    }
 
     private static void runWatchdog(com.bot.TelegramBotSender telegram,
-                                    com.bot.GlobalImpulseController gic,
-                                    com.bot.InstitutionalSignalCore isc,
                                     com.bot.SignalSender sender) {
-        // Periodic cleanup — releases stale activeSymbols entries even during droughts.
-        isc.periodicCleanup();
         long now = System.currentTimeMillis();
-        List<String> issues = new ArrayList<>();
-
+        List<String> infraIssues = new ArrayList<>();
         if (now - lastCycleSuccessMs > 3 * 60_000L)
-            issues.add("💀 MainCycle silent " + (now - lastCycleSuccessMs) / 1000 + "s");
-
+            infraIssues.add("💀 MainCycle silent " + (now - lastCycleSuccessMs) / 1000 + "s");
         if (now - lastStatsSuccessMs > 40 * 60_000L)
-            issues.add("💀 Stats silent " + (now - lastStatsSuccessMs) / 60_000 + "min");
-
-        if (now - lastSignalMs > SIGNAL_DROUGHT_MS) {
-            long droughtMin = (now - lastSignalMs) / 60_000;
-            double effConf  = isc.getEffectiveMinConfidence();
-            if (effConf < 70) {
-                // Also show how many symbols are in cooldown — helps diagnose why no signals
-                int activeCooldownCount = sender.getCooldownedSymbolCount();
-                String cooldownInfo = activeCooldownCount > 0
-                        ? " (CD=" + activeCooldownCount + " pairs locked)"
-                        : "";
-                issues.add("📭 No signals " + droughtMin + " min"
-                        + " WS=" + sender.getActiveWsCount()
-                        + " UDS=" + (sender.isUdsConnected() ? "✅" : "❌")
-                        + cooldownInfo);
-            }
-        }
-
+            infraIssues.add("💀 Stats silent " + (now - lastStatsSuccessMs) / 60_000 + "min");
         if (sender.getActiveWsCount() < 3)
-            issues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
+            infraIssues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
+
+        boolean signalDrought = now - lastSignalMs > SIGNAL_DROUGHT_MS;
 
         if (sender.getActiveWsCount() < 3 || now - lastCycleSuccessMs > 3 * 60_000L) {
-            System.out.println("[WD] Triggering force-reconnect: WS=" + sender.getActiveWsCount()
-                    + " cycleAge=" + (now - lastCycleSuccessMs) / 1000 + "s");
             sender.forceResubscribeTopPairs();
         }
 
-        if (!issues.isEmpty() && now - lastWatchdogAlertMs > WATCHDOG_COOLDOWN_MS) {
-            lastWatchdogAlertMs = now;
+        if (!infraIssues.isEmpty() && now - lastInfraAlertMs > INFRA_ALERT_COOLDOWN_MS) {
+            lastInfraAlertMs = now;
             watchdogAlerts.incrementAndGet();
-            LOG.warning("[WD #" + watchdogAlerts.get() + "] " + String.join(" | ", issues));
             telegram.sendMessageAsync("*Watchdog* #" + watchdogAlerts.get() + "\n\n"
-                    + String.join("\n", issues));
+                    + String.join("\n", infraIssues));
+        }
+
+        if (signalDrought && droughtAnnounced.compareAndSet(false, true)) {
+            long droughtMin = (now - lastSignalMs) / 60_000;
+            int cooldowned = sender.getCooldownedSymbolCount();
+            String cooldownInfo = cooldowned > 0 ? " (" + cooldowned + " в кулдауне)" : "";
+            watchdogAlerts.incrementAndGet();
+            telegram.sendMessageAsync(String.format(
+                    "📭 *Тихо на рынке*%n%n"
+                            + "%d мин без сигналов%s%n"
+                            + "Нет качественных кластеров.%n"
+                            + "_Следующий алерт когда сигнал появится._",
+                    droughtMin, cooldownInfo));
         }
     }
-
-    //  DAILY SUMMARY
 
     private static void maybeSendDailySummary(com.bot.TelegramBotSender telegram,
                                               com.bot.GlobalImpulseController gic,
@@ -1091,188 +851,97 @@ public final class BotMain {
                                               com.bot.SignalSender sender) {
         ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
         int h = utc.getHour(), m = utc.getMinute(), day = utc.getDayOfYear();
-
         if (h != 9 || m > 2 || day == lastSummaryDay) return;
         lastSummaryDay = day;
 
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
-        int fcTotal    = forecastTotal.get();
-        int fcCorrect  = forecastCorrect.get();
-        double fcAcc   = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
-
+        int fcTotal   = forecastTotal.get();
+        int fcCorrect = forecastCorrect.get();
+        double fcAcc  = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
         int calSamples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-        String calNote = calSamples < 50 ? String.format("\n⚠️ Калибровка сырая (%d/50 исходов) — скоры ≠ winrate", calSamples) : "";
+        String calNote = calSamples < 30
+                ? String.format("\n⚠️ Cold-start (%d/30)", calSamples)
+                : calSamples < 100
+                  ? String.format("\n🔸 Калибровка (%d/100)", calSamples)
+                  : "";
         String msg = String.format(
                 "*Daily Report*\n\n"
                         + "Up %dm · Cycles %d · Signals %d\n"
-                        + "PnL *%+.2f%%* · DD %.1f%%\n"
-                        + "BTC %s · Vol %s\n"
-                        + "WS %d · Bal $%.2f\n\n"
+                        + "BTC %s · Vol %s · WS %d\n\n"
                         + "Forecast *%.0f%%* (%d/%d)\n"
-                        + "Open %d" + calNote,
+                        + "Tracked %d" + calNote,
                 uptimeMin, totalCycles.get(), totalSignals.get(),
-                isc.getDailyPnL(), isc.getDrawdownFromPeak(),
                 ctx.regime, ctx.volRegime,
                 sender.getActiveWsCount(),
-                sender.getAccountBalance(),
                 fcAcc, fcCorrect, fcTotal,
                 trackedSignals.size());
-
         telegram.sendMessageAsync(msg);
-        LOG.info("[DAILY] Sent summary");
     }
 
-    //  BACKTEST
-
     private static void runPeriodicBacktest(com.bot.SignalSender sender,
-                                            com.bot.InstitutionalSignalCore isc,
-                                            com.bot.TelegramBotSender telegram) {
-        // [v36-FIX Дыра8] Backtest REST Burst:
-        // БЫЛО: 12 пар × (500+200+500+300) bars = ~9000 weight/burst — одновременно с live-торговлей.
-        // СТАЛО:
-        //   • Universe сокращён до 6 seed + 6 dynamic = 12 max (было 6+12=18)
-        //   • Лимиты свечей снижены: m15=300, h1=100, m5=200 (было 500/200/300)
-        //   • m1 берётся из WS-буфера (0 REST weight), не из fetchKlines
-        //   • Задержка 3s между символами = нагрузка растянута на 36s вместо burst
-        // Итог: ~3600 weight за 36s = 100 weight/s vs старые 9000 weight/s.
-        LOG.info("[BT] Начало периодического бэктеста...");
+                                            com.bot.InstitutionalSignalCore isc) {
         com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
-        java.util.LinkedHashSet<String> universe = new java.util.LinkedHashSet<>(java.util.List.of(
+        LinkedHashSet<String> universe = new LinkedHashSet<>(List.of(
                 "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "LINKUSDT", "XRPUSDT"));
-        universe.addAll(sender.getScanUniverseSnapshot(6)); // было 12 → 6 dynamic
-        double totalEV = 0;
-        int    count   = 0;
-        StringBuilder btLog = new StringBuilder("[BT] Results: ");
-
+        universe.addAll(sender.getScanUniverseSnapshot(6));
+        double totalEV = 0; int count = 0;
         for (String sym : universe) {
             try {
-                // [v36-FIX] 3s throttle между символами — не даём RL burst во время торговли
                 Thread.sleep(3_000L);
-
-                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 300); // было 500
-                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  100); // было 200
-                // [v36-FIX] m1 из WS-буфера — 0 REST weight
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 300);
+                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  100);
                 List<com.bot.TradingCore.Candle> m1  = sender.getM1FromWs(sym);
-                List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m",  200); // было 300
-
+                List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m",  200);
                 if (m15 == null || m15.size() < 200) continue;
-
                 com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
-                com.bot.SimpleBacktester.BacktestResult r = bt.run(
-                        sym, m1, m5, m15, h1, cat);
-
+                com.bot.SimpleBacktester.BacktestResult r = bt.run(sym, m1, m5, m15, h1, cat);
                 if (r.total >= 5) {
-                    totalEV += r.ev;
-                    count++;
-                    btLog.append(sym).append("=").append(String.format("%.3f", r.ev)).append(" ");
+                    totalEV += r.ev; count++;
                     isc.setSymbolBacktestResult(sym, r.ev);
                 }
             } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                LOG.info("[BT] Прерван");
-                return;
-            } catch (Exception e) {
-                LOG.warning("[BT] " + sym + ": " + e.getMessage());
-            }
+                Thread.currentThread().interrupt(); return;
+            } catch (Exception ignored) {}
         }
-
         if (count > 0) {
             double avgEV = totalEV / count;
             isc.setBacktestResult(avgEV, System.currentTimeMillis());
-            LOG.info(btLog + "| avgEV=" + String.format("%.4f", avgEV)
-                    + " effConf=" + String.format("%.0f%%", isc.getEffectiveMinConfidence()));
-        } else {
-            LOG.warning("[BT] Нет достаточных данных для бэктеста");
         }
     }
 
-    //  STATS
-
-    private static void logStats(com.bot.TelegramBotSender telegram,
-                                 com.bot.GlobalImpulseController gic,
+    private static void logStats(com.bot.GlobalImpulseController gic,
                                  com.bot.InstitutionalSignalCore isc,
                                  com.bot.SignalSender sender) {
         lastStatsSuccessMs = System.currentTimeMillis();
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
-
+        Dispatcher d = Dispatcher.getInstance();
         String msg = String.format(
-                "[STATS] Up:%dm Cyc:%d Sig:%d Trk:%d FR:%d | "
-                        + "BTC:%s str=%.2f | "
-                        + "WS:%d UDS:%s Bal:$%.2f | "
-                        + "Day:%+.2f%% DD:%.1f%% | "
-                        + "FC:%.0f%%(%d/%d) Err:%d WD:%d | "
-                        + "DQ:+%.0f st=%.0f%% ws=%.0f%% | %s | %s",
+                "[STATS] Up:%dm Cyc:%d Sig:%d Trk:%d FR:%d | BTC:%s str=%.2f | "
+                        + "WS:%d Disp:%d/%d | FC:%.0f%%(%d/%d) Err:%d WD:%d | %s",
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 trackedSignals.size(), forecastRecords.size(),
                 ctx.regime, ctx.impulseStrength,
-                sender.getActiveWsCount(), sender.isUdsConnected() ? "OK" : "DOWN",
-                sender.getAccountBalance(),
-                isc.getDailyPnL(), isc.getDrawdownFromPeak(),
+                sender.getActiveWsCount(),
+                d != null ? d.getTotalDispatched() : 0,
+                d != null ? d.getBlockedByGate() : 0,
                 forecastTotal.get() > 0 ? (double) forecastCorrect.get() / forecastTotal.get() * 100 : 0.0,
                 forecastCorrect.get(), forecastTotal.get(),
                 errorCount.get(), watchdogAlerts.get(),
-                sender.getCycleQualityPenalty(), sender.getLastCycleStaleRatio() * 100.0,
-                sender.getLastCycleWsCoverage() * 100.0,
-                isc.getStats(), sender.getRejectionStats());
-
+                isc.getStats());
         LOG.info(msg);
-
-        // [v43 PATCH FIX #8] Sync ISC auto-blacklist → SignalSender.GARBAGE_COIN_BLOCKLIST.
-        // When ISC detects WR < 25% for a symbol, it soft-blocks it via +20 minConf boost.
-        // We also push the symbol to SignalSender's garbage list so processPair() skips it
-        // entirely — avoiding wasted REST/WS fetch overhead on known-bad coins.
         try {
-            java.util.Set<String> autoBlocked = isc.getAutoBlacklist();
-            for (String sym : autoBlocked) {
-                sender.addToGarbageBlocklist(sym);
-            }
+            Set<String> autoBlocked = isc.getAutoBlacklist();
+            for (String sym : autoBlocked) sender.addToGarbageBlocklist(sym);
         } catch (Exception ignored) {}
-
-        // [v43 PATCH FIX #8b] Per-symbol win-rate metrics log (every 30 min = every 6 stat cycles at 5m).
-        // Logs symbols with WR < 40% so operator can review and manually add to blocklist.
-        // Also logs calibrator sample count to track when calibration becomes meaningful (≥50 samples).
-        long nowMs = System.currentTimeMillis();
-        if (uptimeMin % 30 < 5) {   // fire in the first 5min of each 30min window
-            try {
-                StringBuilder wr = new StringBuilder("[WR_METRICS]\n");
-                int total = isc.getTotalTradeCount();
-                double overall = isc.getOverallWinRate();
-                wr.append(String.format("  Overall: %.0f%% (%d trades)\n", overall * 100, total));
-
-                // Log auto-blacklisted symbols
-                java.util.Set<String> bl = isc.getAutoBlacklist();
-                if (!bl.isEmpty()) {
-                    wr.append("  AUTO_BLOCKED: ").append(bl).append("\n");
-                }
-
-                // Log symbols with WR data and flag poor performers
-                isc.getTradeHistorySymbols().stream()
-                        .filter(s -> isc.getTradeCount(s) >= 3)
-                        .sorted(java.util.Comparator.comparingDouble(isc::getWinRate))
-                        .limit(10)
-                        .forEach(s -> {
-                            double sWr = isc.getWinRate(s);
-                            int cnt = isc.getTradeCount(s);
-                            String flag = sWr < 0.30 ? " ❌POOR" : sWr < 0.45 ? " ⚠️WEAK" : "";
-                            wr.append(String.format("  %s: %.0f%% (%d)%s\n", s, sWr * 100, cnt, flag));
-                        });
-
-                LOG.info(wr.toString());
-            } catch (Exception ignored) {}
-        }
     }
-
-    //  HELPERS
 
     private static void updateBtcContext(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         try {
             List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", "15m", KLINES);
             if (btc != null && btc.size() > 30) gic.update(btc);
-        } catch (Exception e) {
-            LOG.warning("[BTC ctx] " + e.getMessage());
-        }
+        } catch (Exception e) { LOG.warning("[BTC ctx] " + e.getMessage()); }
     }
 
     private static void updateSectors(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
@@ -1284,295 +953,31 @@ public final class BotMain {
         }
     }
 
-    private static void markForecastRecord(String key, String outcome) {
-        forecastRecords.entrySet().stream()
-                .filter(e -> e.getKey().startsWith(key) && !e.getValue().resolved)
-                .max(Comparator.comparingLong(e -> e.getValue().createdAt))
-                .ifPresent(e -> {
-                    e.getValue().resolved = true;
-                    e.getValue().actualOutcome = outcome;
-                    if (e.getValue().counted.compareAndSet(false, true)) {
-                        boolean tp = outcome.contains("TP") || outcome.equals("EXPIRED_PROFIT");
-                        if (!"EXPIRED_FLAT".equals(outcome)) {
-                            forecastTotal.incrementAndGet();
-                            if (tp) forecastCorrect.incrementAndGet();
-                        }
-                    }
-                });
-    }
-
-    //  [MODULE 4 v33] ADVANCE FORECAST ALERTS
-    //  Запускается каждые 5 минут. Сканирует топ-пары через ForecastEngine
-    //  и отправляет заблаговременные прогнозы в Telegram ДО формирования сигнала.
-    //
-    //  Логика отправки прогноза:
-    //  1. |directionScore| >= AFC_MIN_DIRECTION_SCORE (умеренный сигнал)
-    //  2. Прогноз изменился с предыдущего цикла (дедупликация по ключу)
-    //  3. Cooldown 20 минут на пару (не спамим)
-    //  4. GIC не в PANIC режиме (в панике прогнозы неактуальны)
-    //  5. Не более AFC_MAX_PER_RUN прогнозов за один запуск
-    //
-    //  Типы прогнозов:
-    //    🚀 ПАМП — сильный бычий импульс ожидается (score > AFC_STRONG_SCORE)
-    //    📉 ДАМП — сильный медвежий импульс ожидается
-    //    🔄 РАЗВОРОТ ВВЕРХ — смена тренда с нисходящего на восходящий
-    //    🔄 РАЗВОРОТ ВНИЗ — смена тренда с восходящего на нисходящий
-    //    📈 ТРЕНД ФОРМИРУЕТСЯ — ранняя фаза (EARLY) направленного движения
-    //    ⛽ ИСТОЩЕНИЕ — тренд заканчивается, ожидать разворота или консолидации
-
-    private static void runAdvanceForecast(com.bot.SignalSender sender,
-                                           com.bot.GlobalImpulseController gic,
-                                           com.bot.InstitutionalSignalCore isc,
-                                           com.bot.TelegramBotSender telegram) {
-        if (!AFC_ENABLED) return;
-        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
-        if (ctx.panicMode) {
-            LOG.fine("[AFC] SKIP — GIC in PANIC mode");
-            return;
-        }
-
-        // ── Periodic map cleanup (every ~100 runs = ~200 min) ────────────
-        // lastForecastSent and forecastCooldown were never evicted, growing
-        // indefinitely during long Railway deployments. Purge entries for pairs
-        // that haven't been in the scan universe for over 6 hours.
-        if (afcCleanupCounter.incrementAndGet() % 100 == 0) {
-            long cutoff = System.currentTimeMillis() - 6 * 60 * 60_000L;
-            forecastCooldown.entrySet().removeIf(e -> e.getValue() < cutoff);
-            // lastForecastSent has no timestamp — purge entries not in top scan universe
-            java.util.Set<String> currentUniverse =
-                    new java.util.HashSet<>(sender.getTopPairsForForecast(50));
-            lastForecastSent.entrySet().removeIf(e -> !currentUniverse.contains(e.getKey()));
-            LOG.fine("[AFC] Map cleanup: cooldown=" + forecastCooldown.size()
-                    + " lastSent=" + lastForecastSent.size());
-        }
-
-        List<String> topPairs = sender.getTopPairsForForecast(35);
-        if (topPairs == null || topPairs.isEmpty()) return;
-
-        int sent = 0;
-        long now = System.currentTimeMillis();
-
-        // Use the shared AFC_PUMP_HUNTER instance — preserves pump history across calls.
-        // Previously: new PumpHunter() per call = history always empty = PRE_PUMP never fires.
-
-        for (String pair : topPairs) {
-            if (sent >= AFC_MAX_PER_RUN) break;
-
-            // [FIX] Block garbage coins and non-ASCII symbols from AFC.
-            // Previously UAIUSDT (in GARBAGE_COIN_BLOCKLIST) was fetching
-            // 150+72 klines every 2 minutes because AFC had no garbage filter.
-            if (com.bot.SignalSender.isBlocklisted(pair)) continue;
-
-            boolean isMarketLeader = pair.equals("BTCUSDT") || pair.equals("ETHUSDT") || pair.equals("SOLUSDT");
-            long effectiveCooldown = isMarketLeader
-                    ? ADVANCE_FORECAST_COOLDOWN_MS / 2
-                    : ADVANCE_FORECAST_COOLDOWN_MS;
-
-            Long lastSentCooldown = forecastCooldown.get(pair);
-            if (lastSentCooldown != null && now - lastSentCooldown < effectiveCooldown) continue;
-
-            if (!isc.isSymbolAvailable(pair)) continue;
-
-            try {
-                try { Thread.sleep(200L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
-
-                List<com.bot.TradingCore.Candle> c15 = sender.fetchKlines(pair, "15m", 150);
-                List<com.bot.TradingCore.Candle> c1h  = sender.fetchKlines(pair, "1h",  72);
-                List<com.bot.TradingCore.Candle> c1m  = sender.getM1FromWs(pair);
-                if (c15 == null || c15.size() < 30) continue;
-
-                // ── STAGE 1: PumpHunter — early detection ──────────────────
-                if (c1m != null && c1m.size() >= 22) {
-                    com.bot.PumpHunter.PumpEvent prePump =
-                            AFC_PUMP_HUNTER.detectPump(pair, c1m, c15, c15);
-                    if (prePump != null && prePump.isAnticipatory() && prePump.strength >= 0.50) {
-                        String prePumpKey = "PRE_" + prePump.type.name() + "_" + (int)(prePump.strength * 10);
-                        if (!prePumpKey.equals(lastForecastSent.get(pair))) {
-                            boolean isBull = prePump.isBullish();
-                            String icon  = isBull ? "🚀" : "🔻";
-                            String arrow = isBull ? "📈 ОЖИДАЕМ РОСТ" : "📉 ОЖИДАЕМ ПАДЕНИЕ";
-                            // ── [FIX] Clear [📡 ПРОГНОЗ] prefix ────────────────────────────
-                            // Previously looked identical to a real entry signal in Telegram.
-                            // Now begins with a clearly distinct header.
-                            String afcMsg = "📡 *[ПРОГНОЗ — не сигнал входа]*\n"
-                                    + icon + " *" + pair + "* — Накопление перед движением\n"
-                                    + "━━━━━━━━━━━━━━━━━━━━━\n"
-                                    + arrow + "\n"
-                                    + "Сжатие волатильности + рост объёма\n"
-                                    + String.format("Сила: *%.0f%%*", prePump.strength * 100)
-                                    + " | Жди подтверждения\n\n"
-                                    + "⏱ _Сигнал с TP/SL ожидается через 1–5 мин_";
-                            afcSender.sendMessageAsync(afcMsg);
-                            lastForecastSent.put(pair, prePumpKey);
-                            forecastCooldown.put(pair, now);
-                            sent++;
-                            LOG.info("[AFC/PRE] " + pair + " " + prePump.type
-                                    + " str=" + String.format("%.2f", prePump.strength));
-                            continue;
-                        }
-                    }
-                }
-
-                // ── STAGE 2: ForecastEngine ─────────────────────────────────
-                com.bot.TradingCore.ForecastEngine fe = new com.bot.TradingCore.ForecastEngine();
-                com.bot.TradingCore.ForecastEngine.ForecastResult fc =
-                        fe.forecast(List.of(), c15, c1h != null ? c1h : List.of(), 0.0);
-                if (fc == null) continue;
-
-                double score = fc.directionScore;
-                if (Math.abs(score) < AFC_MIN_DIRECTION_SCORE) continue;
-
-                boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
-                if (!isExhaustion && Math.abs(score) < AFC_MIN_DIRECTION_SCORE) continue;
-
-                com.bot.TradingCore.VsaResult vsa = com.bot.TradingCore.vsaAnalyse(c15, 3);
-
-                String forecastKey = buildForecastKey(fc, vsa, score);
-                if (forecastKey.equals(lastForecastSent.get(pair))) continue;
-
-                String afcMsg2 = buildAdvanceForecastMessage(pair, fc, vsa, score, ctx);
-                if (afcMsg2 == null) continue;
-
-                afcSender.sendMessageAsync(afcMsg2);
-                lastForecastSent.put(pair, forecastKey);
-                forecastCooldown.put(pair, now);
-                sent++;
-                LOG.info("[AFC] " + pair
-                        + " score=" + String.format("%.2f", score)
-                        + " phase=" + fc.trendPhase
-                        + " bias=" + fc.bias);
-
-            } catch (Exception e) {
-                LOG.fine("[AFC] Error for " + pair + ": " + e.getMessage());
-            }
-        }
-    }
-
-    /** Строит дедупликационный ключ из ключевых параметров прогноза */
-    private static String buildForecastKey(
-            com.bot.TradingCore.ForecastEngine.ForecastResult fc,
-            com.bot.TradingCore.VsaResult vsa,
-            double score) {
-        // Округляем score до шага 0.10 — небольшие флуктуации не меняют суть прогноза
-        int scoreStep = (int)(score * 10);
-        String vsaTag  = vsa.hasSignal() ? vsa.signal.name() : "NONE";
-        return fc.bias.name() + "_" + fc.trendPhase.name() + "_" + scoreStep + "_" + vsaTag;
-    }
-
-    /**
-     * Строит Telegram-сообщение advance forecast.
-     * ВАЖНО: сообщение ВСЕГДА начинается с "📡 [ПРОГНОЗ]" — визуально отличается
-     * от торговых сигналов (которые начинаются с "₿ SYMBOL SHORT/LONG" + таблица TP/SL).
-     * Это гарантирует, что трейдер никогда не спутает прогноз с реальным входом.
-     *
-     * Returns null if below quality threshold (see AFC_MIN_CONF_TO_SEND).
-     */
-    private static String buildAdvanceForecastMessage(
-            String pair,
-            com.bot.TradingCore.ForecastEngine.ForecastResult fc,
-            com.bot.TradingCore.VsaResult vsa,
-            double score,
-            com.bot.GlobalImpulseController.GlobalContext ctx) {
-
-        double confPct = Math.abs(score);
-        if (confPct < AFC_MIN_CONF_TO_SEND) return null;
-
-        boolean bullish = score > 0;
-        boolean strong  = Math.abs(score) >= AFC_STRONG_SCORE;
-
-        com.bot.DecisionEngineMerged.AssetType assetType =
-                com.bot.DecisionEngineMerged.detectAssetType(pair);
-
-        boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
-        boolean isEarly      = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
-        boolean vsaReversal  = vsa.hasSignal() && (
-                vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.STOPPING_VOLUME_BULL ||
-                        vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.STOPPING_VOLUME_BEAR ||
-                        vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.EFFORT_TO_FALL_FAILED ||
-                        vsa.signal == com.bot.TradingCore.VsaResult.VsaSignal.EFFORT_TO_RISE_FAILED);
-
-        String eventType;
-        String emoji;
-        if (isExhaustion && vsaReversal) {
-            eventType = bullish ? "РАЗВОРОТ ВНИЗ" : "РАЗВОРОТ ВВЕРХ";
-            emoji = bullish ? "🔻" : "🚀";
-            bullish = !bullish;
-        } else if (isEarly && strong) {
-            eventType = bullish ? "ПАМП" : "ДАМП";
-            emoji = bullish ? "🚀" : "🔻";
-        } else if (strong) {
-            eventType = bullish ? "ТРЕНД ВВЕРХ" : "ТРЕНД ВНИЗ";
-            emoji = bullish ? "📈" : "📉";
-        } else {
-            return null; // ниже порога — не отправляем
-        }
-
-        String vsaStatus = "";
-        if (vsa.hasSignal()) {
-            vsaStatus = switch (vsa.signal) {
-                case STOPPING_VOLUME_BULL  -> "Покупки поглотили продажи";
-                case STOPPING_VOLUME_BEAR  -> "Продажи поглотили покупки";
-                case EFFORT_TO_FALL_FAILED -> "Продажи провалились";
-                case EFFORT_TO_RISE_FAILED -> "Покупки провалились";
-                case DEMAND_ABSORPTION     -> "Поглощение спроса";
-                case SUPPLY_ABSORPTION     -> "Поглощение предложения";
-                case WEAK_BREAKOUT         -> "Ловушка пробоя";
-                default                    -> "";
-            };
-        }
-
-        double confPercent = confPct * 100;
-
-        // ── [KEY FIX] Clear ПРОГНОЗ header — impossible to confuse with entry signal ──
-        // Real entry signals format:  "₿ SOLUSDT · 🔴 SHORT ━━━━ ▫️ Вход: 86.0000 ..."
-        // Forecast format starts with "📡 [ПРОГНОЗ]" — no Entry/TP/SL numbers follow.
-        StringBuilder body = new StringBuilder();
-        body.append("📡 *[ПРОГНОЗ — не сигнал входа]*\n");
-        body.append("━━━━━━━━━━━━━━━━━━━━━\n");
-        body.append(emoji).append(" *").append(pair).append("* · ").append(eventType).append('\n');
-        body.append("_").append(assetType.label).append("_\n\n");
-
-        if (fc.magnetLevel > 0) {
-            body.append(String.format("Цель (магнит): %.4f%n", fc.magnetLevel));
-        }
-        if (fc.projectedMovePct != 0) {
-            body.append(String.format("Ожидаемое движение: %+.2f%%%n", fc.projectedMovePct * 100));
-        }
-        if (!vsaStatus.isEmpty()) {
-            body.append(String.format("VSA: %s%n", vsaStatus));
-        }
-        body.append(String.format("%n📊 *%.0f%%* сила прогноза", confPercent));
-        body.append("\n_Дождись сигнала с TP/SL для входа_");
-
-        return body.toString();
-    }
-
-
-    /** Returns honest calibration status for startup message */
     private static String calibrationStatus() {
-        int samples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-        if (samples < 30)  return "⚠️ Калибровка: " + samples + "/30 — скоры сырые";
-        if (samples < 100) return "🔸 Калибровка: " + samples + "/100 — частичная";
-        return "✅ Калибровка: " + samples + " исходов";
+        int s = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+        if (s < 30)  return String.format("⚠️ Cold-start: %d/30 исходов", s);
+        if (s < 100) return "🔸 Калибровка: " + s + "/100";
+        return "✅ Калибровка: " + s + " исходов";
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot PRO* `v52`\n"
+        return "⚡ *TradingBot SCANNER* `v61`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "`15M` Futures  ·  Crypto / Commodities\n"
-                + "VSA  ·  OFV  ·  EarlyRev  ·  Forecast\n"
-                + "R:R min `1:2`  ·  Risk-first 🔒\n"
+                + "`15M` Futures · TOP-30 · Scanner-only\n"
+                + "R:R min `1:2` · SL min `0.35%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🔧 *v52 PATCHES активны:*\n"
-                + "• Calibrator — реальные TP/SL (PATCH A)\n"
-                + "• Railway -50% cost (PATCH B)\n"
-                + "• PostPumpGuard — блок после пампа (PATCH C)\n"
-                + "• SL width + R:R guard (PATCH D)\n"
+                + "🔧 *v61 масштерпис:*\n"
+                + "• Единый Dispatcher — все сигналы через него\n"
+                + "• Cold-start: prob≥78, clusters≥4, fcConf≥0.55\n"
+                + "• Дедуп 15 мин · макс 4/час\n"
+                + "• Честный скор (без косметики)\n"
+                + "• TIME_STOP только для показанных сигналов\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
-                + "_Система активна. Торгуй с умом._";
+                + "_Только реальные сигналы с TP/SL._";
     }
-    private static String nowWarsawStr() {
+
+    private static String nowLocalStr() {
         return ZonedDateTime.now(ZONE)
                 .format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"));
     }
@@ -1582,156 +987,87 @@ public final class BotMain {
                 .format(DateTimeFormatter.ofPattern("HH:mm"));
     }
 
-    /**
-     * Auto-detects timezone for Telegram signal timestamps.
-     * Priority: 1) env TIMEZONE  2) IP geolocation (ip-api.com)  3) Europe/Warsaw
-     * Each bot instance detects the timezone of the machine it runs on automatically.
-     * To force a specific zone, set env variable: TIMEZONE=Europe/Zaporozhye
-     */
-    private static ZoneId detectTimezone() {
-        // 1. Manual override via environment variable
+    private static void resolveTimezoneAsync() {
         String envTz = System.getenv("TIMEZONE");
         if (envTz != null && !envTz.isBlank()) {
             try {
-                ZoneId z = ZoneId.of(envTz.trim());
-                System.out.println("[TIMEZONE] Using env override: " + z.getId());
-                return z;
-            } catch (Exception ignored) {
-                System.out.println("[TIMEZONE] Invalid env TIMEZONE value: " + envTz);
-            }
+                ZONE = ZoneId.of(envTz.trim());
+                com.bot.DecisionEngineMerged.USER_ZONE = ZONE;
+                return;
+            } catch (Exception ignored) {}
         }
-        // 2. Auto-detect via IP geolocation (no API key required)
-        try {
-            java.net.URL url = new java.net.URL("http://ip-api.com/json?fields=timezone,city");
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(4000);
-            conn.setReadTimeout(4000);
-            conn.setRequestMethod("GET");
-            if (conn.getResponseCode() == 200) {
-                try (java.io.InputStream is = conn.getInputStream();
-                     java.util.Scanner sc = new java.util.Scanner(is, "UTF-8")) {
-                    String body = sc.useDelimiter("\\A").hasNext() ? sc.next() : "";
-                    // Parse "timezone":"Europe/Warsaw"
-                    int idx = body.indexOf("\"timezone\"");
-                    if (idx >= 0) {
-                        int q1 = body.indexOf('"', idx + 10) + 1;
-                        int q2 = body.indexOf('"', q1);
-                        if (q1 > 0 && q2 > q1) {
-                            String tz = body.substring(q1, q2);
-                            // Parse "city":"Warsaw"
-                            String city = "";
-                            int ci = body.indexOf("\"city\"");
-                            if (ci >= 0) {
-                                int c1 = body.indexOf('"', ci + 6) + 1;
-                                int c2 = body.indexOf('"', c1);
-                                if (c1 > 0 && c2 > c1) city = body.substring(c1, c2);
+        Thread tzThread = new Thread(() -> {
+            try {
+                java.net.URI uri = java.net.URI.create("http://ip-api.com/json?fields=timezone,city");
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) uri.toURL().openConnection();
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(3000);
+                conn.setRequestMethod("GET");
+                if (conn.getResponseCode() == 200) {
+                    try (java.io.InputStream is = conn.getInputStream();
+                         java.util.Scanner sc = new java.util.Scanner(is, "UTF-8")) {
+                        String body = sc.useDelimiter("\\A").hasNext() ? sc.next() : "";
+                        int idx = body.indexOf("\"timezone\"");
+                        if (idx >= 0) {
+                            int q1 = body.indexOf('"', idx + 10) + 1;
+                            int q2 = body.indexOf('"', q1);
+                            if (q1 > 0 && q2 > q1) {
+                                ZoneId z = ZoneId.of(body.substring(q1, q2));
+                                ZONE = z;
+                                com.bot.DecisionEngineMerged.USER_ZONE = z;
                             }
-                            ZoneId z = ZoneId.of(tz);
-                            System.out.println("[TIMEZONE] Auto-detected: " + tz
-                                    + (city.isEmpty() ? "" : " (" + city + ")"));
-                            return z;
                         }
                     }
                 }
-            }
-            conn.disconnect();
-        } catch (Exception e) {
-            System.out.println("[TIMEZONE] IP geolocation failed: " + e.getMessage());
-        }
-        // 3. Default fallback
-        System.out.println("[TIMEZONE] Using default: Europe/Warsaw");
-        return ZoneId.of("Europe/Warsaw");
+                conn.disconnect();
+            } catch (Exception ignored) {}
+        }, "tz-resolver");
+        tzThread.setDaemon(true);
+        tzThread.start();
     }
 
     private static int envInt(String k, int d) {
-        try {
-            return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d)));
-        } catch (Exception e) {
-            return d;
-        }
+        try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); }
+        catch (Exception e) { return d; }
     }
 
-    /** [v53] Env boolean helper. Accepts: true/false/1/0/yes/no (case-insensitive). */
-    private static boolean envBool(String k, boolean d) {
-        String v = System.getenv(k);
-        if (v == null || v.isBlank()) return d;
-        String s = v.trim().toLowerCase();
-        if (s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("on"))  return true;
-        if (s.equals("false")|| s.equals("0") || s.equals("no")  || s.equals("off")) return false;
-        return d;
-    }
-
-    /**
-     * [v42.1 FIX #10] Walk-forward out-of-sample validation.
-     * Runs daily. For each active symbol, slides a 14-day train / 3-day test
-     * window over the last 30 days of history. If test win-rate diverges
-     * significantly from train win-rate, emits an overfit alert — the only
-     * protection against SignalOptimizer tuning to historical noise.
-     */
     private static void runWalkForwardValidation(com.bot.SignalSender sender,
                                                  com.bot.TelegramBotSender telegram) {
         try {
             com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
             List<String> symbols = new ArrayList<>(SECTOR_LEADERS.keySet());
-            int alerts = 0;
-            int totalWindows = 0;
+            int alerts = 0, totalWindows = 0;
             double totalDelta = 0;
-
             for (String sym : symbols) {
                 try {
-                    // Fetch 30 days of 15m candles (2880 bars) and 1h (720 bars)
                     List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 2880);
                     List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  720);
                     if (m15 == null || m15.size() < 1500) continue;
-
                     com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
                     if (cat == null) cat = com.bot.DecisionEngineMerged.CoinCategory.ALT;
-
-                    // 14d train = 1344 bars @15m, 3d test = 288 bars @15m
                     List<com.bot.SimpleBacktester.BacktestResult> oos =
                             bt.walkForward(sym, m15, h1, cat, 1344, 288);
-
-                    for (com.bot.SimpleBacktester.BacktestResult r : oos) {
-                        totalWindows++;
-                        double wr = r.winRate * 100.0;   // winRate is [0..1], display as %
-                        LOG.info(String.format("[WF] %s window winRate=%.1f%% trades=%d",
-                                sym, wr, r.total));
-                    }
+                    for (com.bot.SimpleBacktester.BacktestResult r : oos) totalWindows++;
                     if (oos.size() >= 2) {
-                        // Compare first half vs second half as a stability proxy
                         double firstHalf = 0, secondHalf = 0;
                         int half = oos.size() / 2;
-                        for (int i = 0; i < half; i++)              firstHalf  += oos.get(i).winRate * 100.0;
-                        for (int i = half; i < oos.size(); i++)     secondHalf += oos.get(i).winRate * 100.0;
+                        for (int i = 0; i < half; i++) firstHalf += oos.get(i).winRate * 100.0;
+                        for (int i = half; i < oos.size(); i++) secondHalf += oos.get(i).winRate * 100.0;
                         firstHalf  /= Math.max(1, half);
                         secondHalf /= Math.max(1, oos.size() - half);
                         double delta = firstHalf - secondHalf;
                         totalDelta += Math.abs(delta);
-
-                        if (Math.abs(delta) > 15.0) {
-                            alerts++;
-                            LOG.warning(String.format(
-                                    "[WF-ALERT] %s unstable: early=%.1f%% late=%.1f%% Δ=%.1f%%",
-                                    sym, firstHalf, secondHalf, delta));
-                        }
+                        if (Math.abs(delta) > 15.0) alerts++;
                     }
-                } catch (Throwable perSym) {
-                    LOG.warning("[WF] " + sym + " failed: " + perSym.getMessage());
-                }
+                } catch (Throwable ignored) {}
             }
-
             if (alerts > 0 && telegram != null) {
                 telegram.sendMessageAsync(String.format(
-                        "⚠️ *Walk-Forward Alert*\n%d/%d symbols unstable\nAvg Δ win-rate: %.1f%%\n" +
-                                "Model may be overfit — consider re-tuning.",
+                        "⚠️ *Walk-Forward Alert*\n%d/%d symbols unstable\nAvg Δ: %.1f%%",
                         alerts, symbols.size(),
                         totalWindows > 0 ? totalDelta / Math.max(1, totalWindows) : 0));
             }
-            LOG.info(String.format("[WF] done: %d windows across %d symbols, %d alerts",
-                    totalWindows, symbols.size(), alerts));
-        } catch (Throwable t) {
-            LOG.warning("[WF] validation failed: " + t.getMessage());
-        }
+        } catch (Throwable ignored) {}
     }
 
     private static void configureLogger() {
@@ -1739,12 +1075,11 @@ public final class BotMain {
         root.setLevel(Level.INFO);
         for (Handler h : root.getHandlers()) {
             h.setFormatter(new SimpleFormatter() {
-                private final DateTimeFormatter fmt =
-                        DateTimeFormatter.ofPattern("HH:mm:ss");
+                private final DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss");
                 @Override
                 public String format(LogRecord r) {
                     return String.format("[%s][%-7s] %s%n",
-                            ZonedDateTime.now(ZONE).format(fmt), // Используем динамическую ZONE
+                            ZonedDateTime.now(ZONE).format(fmt),
                             r.getLevel(), r.getMessage());
                 }
             });
