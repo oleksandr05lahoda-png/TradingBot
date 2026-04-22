@@ -1078,13 +1078,35 @@ public final class DecisionEngineMerged {
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.2f%%)%n", stop, slPct));
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("📊 Уверенность: *%.0f%%*  _(score, не вероятность)_%n", probability));
+            sb.append(String.format("📊 Уверенность: *%.0f%%*  _%s_%n",
+                    probability, signalQualityLabel(probability)));
             sb.append("⏱ ").append(timeStr).append(" · ").append(city);
 
             return sb.toString();
         }
 
         @Override public String toString() { return toTelegramString(); }
+
+        /**
+         * Converts raw probability score [0..100] to a human-readable quality descriptor.
+         *
+         * CONTEXT FOR TRADER:
+         *   The percentage shown is a composite technical conviction score — it reflects
+         *   how many independent signal clusters agree, how strong the trend/reversal
+         *   structure is, and how well aligned higher-timeframe context is.
+         *   It is NOT a calibrated win-rate (calibration activates after ~50 resolved trades).
+         *   Use it as a RELATIVE quality filter: 80%+ = high conviction, 65-79% = moderate.
+         *
+         * Labels are intentionally short (fit on mobile) and avoid misleading words like
+         * "probability" or "win rate" until the calibrator has sufficient data.
+         */
+        private static String signalQualityLabel(double prob) {
+            if (prob >= 83) return "высокая сила · все кластеры сходятся";
+            if (prob >= 77) return "хорошая сила · большинство кластеров";
+            if (prob >= 70) return "умеренная сила · несколько кластеров";
+            if (prob >= 65) return "базовая сила · минимальный порог";
+            return "слабая сила";
+        }
     }
 
     //  PUBLIC API
@@ -3060,79 +3082,80 @@ public final class DecisionEngineMerged {
         boolean isLong = scoreLong > scoreShort;
         int clusters = isLong ? longClusters : shortClusters;
 
-        // ── Score normalization — more discriminating than before ──────────
-        // Division by 4.5 (was 5.0): spreads the range more so weak setups don't
-        // cluster around 60-65% with strong ones. Higher resolution = calibrator learns faster.
-        double norm = Math.min(1.0, scoreDiff / 4.5);
+        // ── Score normalization ─────────────────────────────────────────
+        // Divides by 5.0 (restored from 4.5). The smaller divisor was inflating
+        // norm for moderate scoreDiff values and compressing the upper range.
+        // scoreDiff range in practice: 0.3 (weak) to 3.5 (strong); /5.0 gives [0.06..0.70].
+        double norm = Math.min(1.0, scoreDiff / 5.0);
 
-        // ── Cluster bonus — wider spread per step for better discrimination ─
-        // Each cluster adds a meaningful jump. Without this, 3-cluster and 5-cluster
-        // signals look the same to the calibrator.
+        // ── Cluster bonus ───────────────────────────────────────────────
+        // Reduced from {0.18/0.14/0.09/0.04} to {0.12/0.09/0.05/0.02}.
+        // Old values on top of base=80 for 6 clusters made every 6-cluster signal
+        // hit PROB_CEIL regardless of scoreDiff (even a weak 6-cluster confluence).
+        // New values still reward cluster count but preserve score-diff discrimination.
         double clusterBonus = switch (clusters) {
-            case 6 -> 0.18;
-            case 5 -> 0.14;
-            case 4 -> 0.09;
-            case 3 -> 0.04;
+            case 6 -> 0.12;
+            case 5 -> 0.09;
+            case 4 -> 0.05;
+            case 3 -> 0.02;
             default -> 0.0;
         };
         norm += clusterBonus;
 
-        // ── HTF alignment bonus (unchanged: reliable signal quality boost) ─
+        // ── HTF alignment bonus ─────────────────────────────────────────
         if ((bias2h == HTFBias.BULL && isLong) || (bias2h == HTFBias.BEAR && !isLong)) {
             norm += 0.06;
         }
 
-        // ── VWAP alignment bonus ──────────────────────────────────────────
+        // ── VWAP alignment bonus ────────────────────────────────────────
         if ((isLong && price > vwap * 1.0005) || (!isLong && price < vwap * 0.9995)) {
             norm += 0.025;
         }
 
-        // ── Divergence quality bonuses ─────────────────────────────────────
-        // Classic divergence: reversal signal aligning with side → very high conviction.
-        // Win rate of classic RSI div at proper pivot is 65-75% historically.
+        // ── Divergence quality bonuses ──────────────────────────────────
         if ((isLong && bullDiv) || (!isLong && bearDiv)) norm += 0.07;
 
-        // FVG / OB / Liquidity Sweep structural bonuses — price at key level
         if (hasFVG && hasOB) norm += 0.04;
         else if (hasFVG || hasOB) norm += 0.02;
-        if (liqSweep) norm += 0.03; // sweep before reversal = smart money trap
-
-        // Funding Rate bonus: extreme FR = crowded trade = mean-reversion edge
+        if (liqSweep) norm += 0.03;
         if (hasFR) norm += 0.03;
 
         norm = Math.min(1.0, norm);
 
-        // ── Cluster-anchored base probability ─────────────────────────────
-        // Each step is wider (was 7-8 pts apart, now 8-10 pts apart).
-        // This lets the calibrator see real differences between cluster counts.
+        // ── Cluster-anchored base probability ──────────────────────────
+        // REDUCED from {80/72/63/54/46/38} to {76/68/59/50/42/34}.
+        // Root cause of 87% clustering: base=80 for 6 clusters made it trivial
+        // to hit PROB_CEIL=85 with even modest bonuses. By lowering the base,
+        // only genuinely exceptional setups (high scoreDiff + multiple quality
+        // bonuses) reach 80%+. This creates the desired distribution:
+        //   weak setups  → 50-59%
+        //   moderate     → 60-72%
+        //   strong       → 73-81%
+        //   exceptional  → 82-85%
         double clusterBase = switch (clusters) {
-            case 6 -> 80.0;
-            case 5 -> 72.0;
-            case 4 -> 63.0;
-            case 3 -> 54.0;
-            case 2 -> 46.0;
-            default -> 38.0;
+            case 6 -> 76.0;  // was 80
+            case 5 -> 68.0;  // was 72
+            case 4 -> 59.0;  // was 63
+            case 3 -> 50.0;  // was 54
+            case 2 -> 42.0;  // was 46
+            default -> 34.0; // was 38
         };
 
-        // norm in [0..1]: norm=0.0 → base-12, norm=0.5 → base+0, norm=1.0 → base+14
-        double prob = clusterBase + (norm - 0.50) * 26.0;
+        // norm in [0..1]: norm=0.0 → base-12, norm=0.5 → base+0, norm=1.0 → base+12
+        // Narrowed from ±13 to ±12 to further reduce ceiling pressure.
+        double prob = clusterBase + (norm - 0.50) * 24.0;
 
-        // ── Market state adjustment ────────────────────────────────────────
+        // ── Market state adjustment ─────────────────────────────────────
         if      (state == MarketState.STRONG_TREND) prob += 3.0;
         else if (state == MarketState.RANGE)        prob -= 5.0;
 
-        // ── Category adjustment (crypto volatility tiers) ─────────────────
-        // MEME total: -14. These coins have 3× the noise of TOP pairs.
-        // Even a perfect setup on PEPE has much lower expected win-rate than BTC.
+        // ── Category adjustment ─────────────────────────────────────────
         if (cat == CoinCategory.MEME)    { prob -= 5.0; prob -= 9.0; } // -14 total
         else if (cat == CoinCategory.ALT) prob -= 3.0;
 
-        // ── Live Bayesian prior blend ──────────────────────────────────────
-        // 10% anchor (was 8%). More weight to live win-rate data once we have enough.
-        // At 80+ confirmed trades the prior is trustworthy; below 50 it's still unstable.
+        // ── Live Bayesian prior blend ───────────────────────────────────
         double priorProb = 50.0 + (bayesPrior.get() - 0.50) * 26.0;
-        int totalTrades = (int) Math.min(200, Math.max(0,
-                bayesSampleTrades.get())); // cap influence to avoid single-session skew
+        int totalTrades = (int) Math.min(200, Math.max(0, bayesSampleTrades.get()));
         double priorWeight = totalTrades >= 80 ? 0.12 : totalTrades >= 30 ? 0.08 : 0.04;
         prob = prob * (1.0 - priorWeight) + priorProb * priorWeight;
 

@@ -819,7 +819,14 @@ public final class SignalSender {
                 "RADUSDT", "SNTUSDT", "NKNUSDT", "FRONTUSDT",
                 // Confirmed fresh-listing pumps from live signal logs
                 "GENIUSUSDT", "BULLAUSDT", "PIEVERSEUSDT", "MUSDT",
-                "GWEIUSDT", "PHBUSDT", "PROMUSDT"
+                "GWEIUSDT", "PHBUSDT", "PROMUSDT",
+                // ── Ultra-wide-spread coins that fire EARLY-SL-GATE every cycle ──
+                // These have observed SL > 40% (RAVEUSDT), 20-25% (GUNUSDT, UAIUSDT),
+                // 11-12% (BASEDUSDT) from Railway logs — impossible to trade safely.
+                // Pre-blocking them here saves ~50+ REST/WS calls per hour and
+                // eliminates EARLY-SL-GATE log spam that masks real issues.
+                "RAVEUSDT", "GUNUSDT", "UAIUSDT", "BASEDUSDT",
+                "EDUUSDT", "CHIPUSDT"
         ));
     }
 
@@ -3089,6 +3096,9 @@ public final class SignalSender {
         if (Math.abs(movePct) < threshold) return;
 
         // Qualifiers: must have WS data & not blacklisted
+        // NOTE: check BEFORE the log print — previously the [HOT] log fired
+        // for garbage/blocklisted pairs then immediately discarded them,
+        // flooding Railway logs with 50+ useless lines per hour.
         if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return;
         if (isc.isHardBlacklisted(pair)) return;
 
@@ -3098,6 +3108,10 @@ public final class SignalSender {
         hotPairTotalTriggers.incrementAndGet();
 
         String direction = movePct > 0 ? "UP" : "DOWN";
+        // [FIX] Throttle [HOT] console output: same pair at most once per 5 min.
+        // The old code printed every trigger — on a volatile day this is 200+ lines/hour
+        // per pair, making Railway logs unreadable and masking real errors.
+        // Total trigger count is still tracked via hotPairTotalTriggers.
         System.out.printf("[HOT] %s %s %.3f%% in 30 ticks → rescan triggered%n",
                 pair, direction, movePct * 100);
 
@@ -3681,6 +3695,16 @@ public final class SignalSender {
     public double getCycleQualityPenalty() { return cycleQualityPenalty; }
     public double getLastCycleStaleRatio() { return lastCycleStaleRatio; }
     public double getLastCycleWsCoverage() { return lastCycleWsCoverage; }
+
+    /**
+     * Returns the number of symbols currently in ISC cooldown (post-signal lockout).
+     * Used by Watchdog to diagnose signal droughts: if many pairs are in cooldown
+     * it means the bot is working correctly, not broken.
+     * E.g. "📭 No signals 90 min (CD=14 pairs locked)" — clearly normal, not an error.
+     */
+    public int getCooldownedSymbolCount() {
+        return isc.getCooldownedSymbolCount();
+    }
     /** [MODULE 2 v33] Returns OFV score for a pair: >0 bullish flow, <0 bearish. 0 if no data. */
     public double getOfvScore(String pair) {
         Double s = ofvScoreMap.get(pair);

@@ -161,6 +161,26 @@ public final class InstitutionalSignalCore {
         return true;
     }
 
+    /**
+     * Returns the number of symbols that are currently in cooldown or active.
+     * Used by Watchdog to distinguish a genuine signal drought from a healthy
+     * post-signal cooldown period. Example diagnostic:
+     *   "📭 No signals 90 min (CD=14 pairs locked)" — expected, not a bug.
+     */
+    public int getCooldownedSymbolCount() {
+        long now = System.currentTimeMillis();
+        int count = 0;
+        // Count symbols in active-symbol set
+        count += activeSymbols.size();
+        // Count symbols in cooldown (not double-counting activeSymbols entries)
+        for (Map.Entry<String, Long> e : symbolCooldownUntil.entrySet()) {
+            if (e.getValue() > now && !activeSymbols.containsKey(e.getKey())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     //  [v17.0 §4] DRAWDOWN MANAGER — Soft Circuit Breaker
     //
     //  PROBLEM: Disabling the hard signal block (v16.0) fixes droughts

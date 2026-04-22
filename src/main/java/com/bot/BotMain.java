@@ -118,6 +118,28 @@ public final class BotMain {
     // is noise overload. 3 forces selection of only the highest-conviction ideas.
     private static final int AFC_MAX_PER_RUN = 3;
 
+    // ── AFC Telegram sender (optional separate chat) ──────────────────────
+    // Set env AFC_CHAT_ID to route forecast/analysis messages to a dedicated
+    // channel. If not set, AFC messages go to the same chat as trade signals
+    // but with a clear [📡 ПРОГНОЗ] prefix so they are never confused with
+    // real entry signals (which always contain TP1/TP2/TP3/SL tables).
+    private static volatile com.bot.TelegramBotSender afcSender = null;
+
+    // ── Shared PumpHunter instance for AFC (not per-call) ────────────────
+    // Previously: new PumpHunter() created inside runAdvanceForecast() on
+    // every 2-minute tick. Each construction allocates fresh ConcurrentHashMap
+    // instances (recentPumps, pumpHistory) and discards the state from the
+    // previous call, meaning pump history is always empty → PRE_PUMP detection
+    // never fires. A shared instance preserves the detection state across calls.
+    private static final com.bot.PumpHunter AFC_PUMP_HUNTER = new com.bot.PumpHunter();
+
+    // ── AFC map cleanup ───────────────────────────────────────────────────
+    // lastForecastSent and forecastCooldown had no eviction: they grew
+    // indefinitely during long uptime (Railway deployments can run weeks).
+    // Cleanup runs inside runAdvanceForecast every ~100 calls (~200 min).
+    private static final java.util.concurrent.atomic.AtomicLong afcCleanupCounter
+            = new java.util.concurrent.atomic.AtomicLong(0);
+
     // ── Forecast accuracy tracker ─────────────────────────────────────────
     // [v14.0 FIX #5] MAX_FORECAST_RECORDS предотвращает утечку памяти
     private static final int MAX_FORECAST_RECORDS = 500;
@@ -360,6 +382,18 @@ public final class BotMain {
         lastStatsSuccessMs       = startTimeMs;
 
         final com.bot.TelegramBotSender telegram = new com.bot.TelegramBotSender(TG_TOKEN, CHAT_ID);
+
+        // Optional separate AFC channel. If AFC_CHAT_ID not set → reuse main sender.
+        // This lets you route "forecast/analysis" to a secondary channel while keeping
+        // the main channel clean with only real entry signals (Entry+TP+SL).
+        String afcChatId = System.getenv("AFC_CHAT_ID");
+        if (afcChatId != null && !afcChatId.isBlank() && !afcChatId.equals(CHAT_ID)) {
+            afcSender = new com.bot.TelegramBotSender(TG_TOKEN, afcChatId.trim());
+            LOG.info("[AFC] Separate AFC channel configured: " + afcChatId.trim());
+        } else {
+            afcSender = telegram; // same channel — AFC messages carry [📡 ПРОГНОЗ] prefix
+        }
+
         final com.bot.GlobalImpulseController gic = new com.bot.GlobalImpulseController();
         final com.bot.InstitutionalSignalCore isc = new com.bot.InstitutionalSignalCore();
         final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram, gic, isc);
@@ -529,6 +563,9 @@ public final class BotMain {
 
             // Step 3: drain Telegram queue last (non-critical, best effort)
             telegram.flushAndShutdown(4000);
+            if (afcSender != null && afcSender != telegram) {
+                afcSender.flushAndShutdown(2000);
+            }
         }, "UnifiedShutdownHook"));
 
         // ── Startup ping ─────────────────────────────────────────
@@ -968,8 +1005,6 @@ public final class BotMain {
                                     com.bot.InstitutionalSignalCore isc,
                                     com.bot.SignalSender sender) {
         // Periodic cleanup — releases stale activeSymbols entries even during droughts.
-        // Without this, if no signals fire for 20+ minutes, ISC slots stay locked forever
-        // because cleanupExpired() only runs inside allowSignal().
         isc.periodicCleanup();
         long now = System.currentTimeMillis();
         List<String> issues = new ArrayList<>();
@@ -977,27 +1012,28 @@ public final class BotMain {
         if (now - lastCycleSuccessMs > 3 * 60_000L)
             issues.add("💀 MainCycle silent " + (now - lastCycleSuccessMs) / 1000 + "s");
 
-        if (now - lastStatsSuccessMs > 40 * 60_000L)  // [v53] 20→40min — stats every 30min is normal, 40 is the real anomaly
+        if (now - lastStatsSuccessMs > 40 * 60_000L)
             issues.add("💀 Stats silent " + (now - lastStatsSuccessMs) / 60_000 + "min");
 
         if (now - lastSignalMs > SIGNAL_DROUGHT_MS) {
             long droughtMin = (now - lastSignalMs) / 60_000;
             double effConf  = isc.getEffectiveMinConfidence();
-            // Skip drought alert when effConf is high (ISC correctly raised floor due to
-            // bad market regime — having no signals IS the correct behavior).
             if (effConf < 70) {
+                // Also show how many symbols are in cooldown — helps diagnose why no signals
+                int activeCooldownCount = sender.getCooldownedSymbolCount();
+                String cooldownInfo = activeCooldownCount > 0
+                        ? " (CD=" + activeCooldownCount + " pairs locked)"
+                        : "";
                 issues.add("📭 No signals " + droughtMin + " min"
                         + " WS=" + sender.getActiveWsCount()
-                        + " UDS=" + (sender.isUdsConnected() ? "✅" : "❌"));
+                        + " UDS=" + (sender.isUdsConnected() ? "✅" : "❌")
+                        + cooldownInfo);
             }
         }
 
         if (sender.getActiveWsCount() < 3)
             issues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
 
-        // [SCANNER MODE v1.0] Aggressive WS recovery:
-        // forceResubscribeTopPairs only refreshes the subscription list.
-        // If main cycle is silent >3min or WS count is critically low, do a full force-reconnect.
         if (sender.getActiveWsCount() < 3 || now - lastCycleSuccessMs > 3 * 60_000L) {
             System.out.println("[WD] Triggering force-reconnect: WS=" + sender.getActiveWsCount()
                     + " cycleAge=" + (now - lastCycleSuccessMs) / 1000 + "s");
@@ -1008,7 +1044,6 @@ public final class BotMain {
             lastWatchdogAlertMs = now;
             watchdogAlerts.incrementAndGet();
             LOG.warning("[WD #" + watchdogAlerts.get() + "] " + String.join(" | ", issues));
-            // [SCANNER MODE] Also send watchdog alerts to Telegram so issues are visible.
             telegram.sendMessageAsync("*Watchdog* #" + watchdogAlerts.get() + "\n\n"
                     + String.join("\n", issues));
         }
@@ -1253,34 +1288,44 @@ public final class BotMain {
                                            com.bot.GlobalImpulseController gic,
                                            com.bot.InstitutionalSignalCore isc,
                                            com.bot.TelegramBotSender telegram) {
-        // Env kill-switch: if AFC_ENABLED=false, no advance forecasts ever go out.
-        // Main-pipeline signals (with entry/SL/TP) still work normally.
         if (!AFC_ENABLED) return;
-        // Не работаем в PANIC режиме — рынок непредсказуем
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         if (ctx.panicMode) {
             LOG.fine("[AFC] SKIP — GIC in PANIC mode");
             return;
         }
 
-        // Расширен список до 35 пар — больше шансов поймать ранний памп/дамп
+        // ── Periodic map cleanup (every ~100 runs = ~200 min) ────────────
+        // lastForecastSent and forecastCooldown were never evicted, growing
+        // indefinitely during long Railway deployments. Purge entries for pairs
+        // that haven't been in the scan universe for over 6 hours.
+        if (afcCleanupCounter.incrementAndGet() % 100 == 0) {
+            long cutoff = System.currentTimeMillis() - 6 * 60 * 60_000L;
+            forecastCooldown.entrySet().removeIf(e -> e.getValue() < cutoff);
+            // lastForecastSent has no timestamp — purge entries not in top scan universe
+            java.util.Set<String> currentUniverse =
+                    new java.util.HashSet<>(sender.getTopPairsForForecast(50));
+            lastForecastSent.entrySet().removeIf(e -> !currentUniverse.contains(e.getKey()));
+            LOG.fine("[AFC] Map cleanup: cooldown=" + forecastCooldown.size()
+                    + " lastSent=" + lastForecastSent.size());
+        }
+
         List<String> topPairs = sender.getTopPairsForForecast(35);
         if (topPairs == null || topPairs.isEmpty()) return;
 
         int sent = 0;
         long now = System.currentTimeMillis();
 
-        // PumpHunter instance для раннего обнаружения сжатия перед пампом
-        com.bot.PumpHunter afcPumpHunter = new com.bot.PumpHunter();
+        // Use the shared AFC_PUMP_HUNTER instance — preserves pump history across calls.
+        // Previously: new PumpHunter() per call = history always empty = PRE_PUMP never fires.
 
         for (String pair : topPairs) {
             if (sent >= AFC_MAX_PER_RUN) break;
 
-            // Топ-3 пары имеют уменьшенный cooldown — они двигают весь рынок
             boolean isMarketLeader = pair.equals("BTCUSDT") || pair.equals("ETHUSDT") || pair.equals("SOLUSDT");
             long effectiveCooldown = isMarketLeader
-                    ? ADVANCE_FORECAST_COOLDOWN_MS / 2   // 5 мин для лидеров рынка
-                    : ADVANCE_FORECAST_COOLDOWN_MS;       // 10 мин для остальных
+                    ? ADVANCE_FORECAST_COOLDOWN_MS / 2
+                    : ADVANCE_FORECAST_COOLDOWN_MS;
 
             Long lastSentCooldown = forecastCooldown.get(pair);
             if (lastSentCooldown != null && now - lastSentCooldown < effectiveCooldown) continue;
@@ -1290,33 +1335,33 @@ public final class BotMain {
             try {
                 try { Thread.sleep(200L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
 
-                // c15: 100→150 (проходит ForecastEngine gate ≥100, дает запас для VolBucket/noiseScore)
-                // c1h: 48→72 (ForecastEngine hard gate ≥50 убивал Stage 2 всегда; 72=3 суток контекста)
                 List<com.bot.TradingCore.Candle> c15 = sender.fetchKlines(pair, "15m", 150);
                 List<com.bot.TradingCore.Candle> c1h  = sender.fetchKlines(pair, "1h",  72);
-                // 1m из WS-буфера для PumpHunter.detectPrePump (compression + volume buildup)
                 List<com.bot.TradingCore.Candle> c1m  = sender.getM1FromWs(pair);
                 if (c15 == null || c15.size() < 30) continue;
 
-                // ── [v52] STAGE 1: PumpHunter — раннее обнаружение до движения ────
-                // detectPrePump() срабатывает на сжатии волатильности + рост объёма
-                // РАНЬШЕ чем ForecastEngine видит направление. Это и есть advance-сигнал.
+                // ── STAGE 1: PumpHunter — early detection ──────────────────
                 if (c1m != null && c1m.size() >= 22) {
-                    com.bot.PumpHunter.PumpEvent prePump = afcPumpHunter.detectPump(pair, c1m, c15, c15);
+                    com.bot.PumpHunter.PumpEvent prePump =
+                            AFC_PUMP_HUNTER.detectPump(pair, c1m, c15, c15);
                     if (prePump != null && prePump.isAnticipatory() && prePump.strength >= 0.50) {
                         String prePumpKey = "PRE_" + prePump.type.name() + "_" + (int)(prePump.strength * 10);
                         if (!prePumpKey.equals(lastForecastSent.get(pair))) {
                             boolean isBull = prePump.isBullish();
                             String icon  = isBull ? "🚀" : "🔻";
                             String arrow = isBull ? "📈 ОЖИДАЕМ РОСТ" : "📉 ОЖИДАЕМ ПАДЕНИЕ";
-                            String afcMsg = icon + " *" + pair + "* — РАННЕЕ ПРЕДУПРЕЖДЕНИЕ\n"
-                                    + "_Накопление перед движением_\n\n"
+                            // ── [FIX] Clear [📡 ПРОГНОЗ] prefix ────────────────────────────
+                            // Previously looked identical to a real entry signal in Telegram.
+                            // Now begins with a clearly distinct header.
+                            String afcMsg = "📡 *[ПРОГНОЗ — не сигнал входа]*\n"
+                                    + icon + " *" + pair + "* — Накопление перед движением\n"
+                                    + "━━━━━━━━━━━━━━━━━━━━━\n"
                                     + arrow + "\n"
                                     + "Сжатие волатильности + рост объёма\n"
                                     + String.format("Сила: *%.0f%%*", prePump.strength * 100)
                                     + " | Жди подтверждения\n\n"
-                                    + "⏱ _Сигнал ожидается через 1–5 мин_";
-                            telegram.sendMessageAsync(afcMsg);
+                                    + "⏱ _Сигнал с TP/SL ожидается через 1–5 мин_";
+                            afcSender.sendMessageAsync(afcMsg);
                             lastForecastSent.put(pair, prePumpKey);
                             forecastCooldown.put(pair, now);
                             sent++;
@@ -1327,7 +1372,7 @@ public final class BotMain {
                     }
                 }
 
-                // ── STAGE 2: ForecastEngine полный анализ ──────────────────────
+                // ── STAGE 2: ForecastEngine ─────────────────────────────────
                 com.bot.TradingCore.ForecastEngine fe = new com.bot.TradingCore.ForecastEngine();
                 com.bot.TradingCore.ForecastEngine.ForecastResult fc =
                         fe.forecast(List.of(), c15, c1h != null ? c1h : List.of(), 0.0);
@@ -1336,7 +1381,6 @@ public final class BotMain {
                 double score = fc.directionScore;
                 if (Math.abs(score) < AFC_MIN_DIRECTION_SCORE) continue;
 
-                // EXHAUSTION фаза = вершина пампа — отправляем без задержки
                 boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
                 if (!isExhaustion && Math.abs(score) < AFC_MIN_DIRECTION_SCORE) continue;
 
@@ -1348,7 +1392,7 @@ public final class BotMain {
                 String afcMsg2 = buildAdvanceForecastMessage(pair, fc, vsa, score, ctx);
                 if (afcMsg2 == null) continue;
 
-                telegram.sendMessageAsync(afcMsg2);
+                afcSender.sendMessageAsync(afcMsg2);
                 lastForecastSent.put(pair, forecastKey);
                 forecastCooldown.put(pair, now);
                 sent++;
@@ -1374,12 +1418,13 @@ public final class BotMain {
         return fc.bias.name() + "_" + fc.trendPhase.name() + "_" + scoreStep + "_" + vsaTag;
     }
 
-    /** Строит полное Telegram-сообщение advance forecast.
-     *  [v53 ANTI-SPAM] Returns null if the forecast is below quality bar:
-     *    - confidence < AFC_MIN_CONF_TO_SEND (65%)
-     *    - event type would be "Движение вверх/вниз" (no conviction)
-     *    - VSA signal is only NO_SUPPLY/NO_DEMAND (non-actionable absence of flow)
-     *  This eliminates the "23%-50% ожидание подтверждения" spam stream entirely.
+    /**
+     * Строит Telegram-сообщение advance forecast.
+     * ВАЖНО: сообщение ВСЕГДА начинается с "📡 [ПРОГНОЗ]" — визуально отличается
+     * от торговых сигналов (которые начинаются с "₿ SYMBOL SHORT/LONG" + таблица TP/SL).
+     * Это гарантирует, что трейдер никогда не спутает прогноз с реальным входом.
+     *
+     * Returns null if below quality threshold (see AFC_MIN_CONF_TO_SEND).
      */
     private static String buildAdvanceForecastMessage(
             String pair,
@@ -1389,7 +1434,6 @@ public final class BotMain {
             com.bot.GlobalImpulseController.GlobalContext ctx) {
 
         double confPct = Math.abs(score);
-        // HARD GATE: anything under 65% is noise, drop it before building anything.
         if (confPct < AFC_MIN_CONF_TO_SEND) return null;
 
         boolean bullish = score > 0;
@@ -1398,7 +1442,6 @@ public final class BotMain {
         com.bot.DecisionEngineMerged.AssetType assetType =
                 com.bot.DecisionEngineMerged.detectAssetType(pair);
 
-        // ── Event type — ONLY conviction-grade labels survive v53 ──
         boolean isExhaustion = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EXHAUSTION;
         boolean isEarly      = fc.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
         boolean vsaReversal  = vsa.hasSignal() && (
@@ -1412,7 +1455,6 @@ public final class BotMain {
         if (isExhaustion && vsaReversal) {
             eventType = bullish ? "РАЗВОРОТ ВНИЗ" : "РАЗВОРОТ ВВЕРХ";
             emoji = bullish ? "🔻" : "🚀";
-            // Reversal always flips direction — invert display
             bullish = !bullish;
         } else if (isEarly && strong) {
             eventType = bullish ? "ПАМП" : "ДАМП";
@@ -1421,12 +1463,9 @@ public final class BotMain {
             eventType = bullish ? "ТРЕНД ВВЕРХ" : "ТРЕНД ВНИЗ";
             emoji = bullish ? "📈" : "📉";
         } else {
-            // No more "Движение вверх", "Импульс вверх", "Истощение тренда" без подтверждения.
-            // If we can't say clearly PUMP/DUMP/REVERSAL/TREND with strong=true → drop it.
-            return null;
+            return null; // ниже порога — не отправляем
         }
 
-        // ── VSA status line — drop NO_SUPPLY/NO_DEMAND (non-actionable absence) ──
         String vsaStatus = "";
         if (vsa.hasSignal()) {
             vsaStatus = switch (vsa.signal) {
@@ -1437,19 +1476,23 @@ public final class BotMain {
                 case DEMAND_ABSORPTION     -> "Поглощение спроса";
                 case SUPPLY_ABSORPTION     -> "Поглощение предложения";
                 case WEAK_BREAKOUT         -> "Ловушка пробоя";
-                // NO_SUPPLY / NO_DEMAND removed — "нет покупок/продаж" is absence of data, not signal.
                 default                    -> "";
             };
         }
 
         double confPercent = confPct * 100;
-        String icon = bullish ? "🟢" : "🔴";
 
+        // ── [KEY FIX] Clear ПРОГНОЗ header — impossible to confuse with entry signal ──
+        // Real entry signals format:  "₿ SOLUSDT · 🔴 SHORT ━━━━ ▫️ Вход: 86.0000 ..."
+        // Forecast format starts with "📡 [ПРОГНОЗ]" — no Entry/TP/SL numbers follow.
         StringBuilder body = new StringBuilder();
-        body.append(icon).append(" *").append(pair).append("* · ").append(emoji).append(' ').append(eventType).append('\n');
+        body.append("📡 *[ПРОГНОЗ — не сигнал входа]*\n");
+        body.append("━━━━━━━━━━━━━━━━━━━━━\n");
+        body.append(emoji).append(" *").append(pair).append("* · ").append(eventType).append('\n');
         body.append("_").append(assetType.label).append("_\n\n");
+
         if (fc.magnetLevel > 0) {
-            body.append(String.format("Цель: %.4f%n", fc.magnetLevel));
+            body.append(String.format("Цель (магнит): %.4f%n", fc.magnetLevel));
         }
         if (fc.projectedMovePct != 0) {
             body.append(String.format("Ожидаемое движение: %+.2f%%%n", fc.projectedMovePct * 100));
@@ -1457,8 +1500,8 @@ public final class BotMain {
         if (!vsaStatus.isEmpty()) {
             body.append(String.format("VSA: %s%n", vsaStatus));
         }
-        // No more "ожидание подтверждения" — if we sent it, it means we believe it.
-        body.append(String.format("%n📊 *%.0f%%* conviction", confPercent));
+        body.append(String.format("%n📊 *%.0f%%* сила прогноза", confPercent));
+        body.append("\n_Дождись сигнала с TP/SL для входа_");
 
         return body.toString();
     }
