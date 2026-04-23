@@ -215,16 +215,24 @@ public final class BotMain {
     // ═══════════════════════════════════════════════════════════════════
     public static final class Dispatcher {
 
+        // [v62] Progressive cold-start. Old v61 gate required all three at once
+        // (prob>=78 AND clusters>=4 AND fcConf>=0.55) which, on a neutral market,
+        // produced 0 signals / 8 hours. We now relax gradually as we collect data.
+        //
+        // Phase 1 (0-9 outcomes):   prob>=75 AND (clusters>=4 OR fcConf>=0.55)
+        // Phase 2 (10-19 outcomes): prob>=72 AND (clusters>=3 OR fcConf>=0.50)
+        // Phase 3 (20-29 outcomes): prob>=70 (either clusters or fc is fine, single)
+        // Phase 4 (30+):            no extra gate (Dispatcher just applies rr/sl/dedup)
+        //
+        // The underlying cluster-confidence engine already filters weak signals
+        // upstream. This gate is a quality floor, not a primary filter.
         private static final int    COLD_START_MIN_OUTCOMES = 30;
-        private static final double COLD_START_PROB_FLOOR   = 78.0;
-        private static final int    COLD_START_MIN_CLUSTERS = 4;
-        private static final double COLD_START_MIN_FC_CONF  = 0.55;
 
-        private static final double MIN_RR         = 2.00;
-        private static final double MIN_SL_PCT     = 0.0035;
+        private static final double MIN_RR          = 2.00;
+        private static final double MIN_SL_PCT      = 0.0035;
         private static final long   SYMBOL_DEDUP_MS = 15 * 60_000L;
-        private static final int    MAX_PER_HOUR   = 4;
-        private static final long   HOUR_MS        = 60 * 60_000L;
+        private static final int    MAX_PER_HOUR    = 4;
+        private static final long   HOUR_MS         = 60 * 60_000L;
 
         private final com.bot.TelegramBotSender tg;
         private final com.bot.InstitutionalSignalCore isc;
@@ -233,6 +241,14 @@ public final class BotMain {
         private final ConcurrentLinkedDeque<Long> dispatchTimestamps = new ConcurrentLinkedDeque<>();
         private final AtomicLong totalDispatched = new AtomicLong(0);
         private final AtomicLong blockedByGate   = new AtomicLong(0);
+
+        // [v62] Breakdown counters — visible in stats so we can tune gates from data.
+        private final AtomicLong blockedBipolar   = new AtomicLong(0);
+        private final AtomicLong blockedRR        = new AtomicLong(0);
+        private final AtomicLong blockedSL        = new AtomicLong(0);
+        private final AtomicLong blockedColdStart = new AtomicLong(0);
+        private final AtomicLong blockedDedup     = new AtomicLong(0);
+        private final AtomicLong blockedHourly    = new AtomicLong(0);
 
         private static volatile Dispatcher INSTANCE;
 
@@ -264,6 +280,7 @@ public final class BotMain {
 
             if (!isc.isSymbolAvailable(idea.symbol)) {
                 blockedByGate.incrementAndGet();
+                blockedBipolar.incrementAndGet();
                 return Result.blocked("bipolar/cooldown");
             }
 
@@ -272,27 +289,65 @@ public final class BotMain {
             double actualRR = riskDist > 1e-9 ? tp2Dist / riskDist : 0;
             if (actualRR < MIN_RR) {
                 blockedByGate.incrementAndGet();
+                blockedRR.incrementAndGet();
                 return Result.blocked(String.format("R:R=%.2f<%.1f", actualRR, MIN_RR));
             }
 
             double slPct = riskDist / idea.price;
             if (slPct < MIN_SL_PCT) {
                 blockedByGate.incrementAndGet();
+                blockedSL.incrementAndGet();
                 return Result.blocked(String.format("SL=%.3f%%<%.2f%%", slPct * 100, MIN_SL_PCT * 100));
             }
 
+            // [v62] Progressive cold-start gate. Blocks borderline signals early,
+            // relaxes as we collect outcomes.
             int calSamples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-            boolean coldStart = calSamples < COLD_START_MIN_OUTCOMES;
-            if (coldStart) {
-                int clusters = countClusterFlags(idea.flags);
-                double fcConf = idea.forecast != null ? idea.forecast.confidence : 0.0;
-                if (idea.probability < COLD_START_PROB_FLOOR
-                        || clusters < COLD_START_MIN_CLUSTERS
-                        || fcConf < COLD_START_MIN_FC_CONF) {
+            int clusters   = countClusterFlags(idea.flags);
+            double fcConf  = idea.forecast != null ? idea.forecast.confidence : 0.0;
+
+            double probFloor;
+            boolean needExtra;
+            int extraClusters;
+            double extraFcConf;
+
+            if (calSamples >= COLD_START_MIN_OUTCOMES) {
+                probFloor = 0;       // gate off — rr/sl/dedup are enough
+                needExtra = false;
+                extraClusters = 0;
+                extraFcConf = 0;
+            } else if (calSamples >= 20) {
+                probFloor = 70.0;
+                needExtra = false;   // just the prob floor
+                extraClusters = 0;
+                extraFcConf = 0;
+            } else if (calSamples >= 10) {
+                probFloor = 72.0;
+                needExtra = true;    // OR between clusters and fcConf
+                extraClusters = 3;
+                extraFcConf = 0.50;
+            } else {
+                probFloor = 75.0;
+                needExtra = true;
+                extraClusters = 4;
+                extraFcConf = 0.55;
+            }
+
+            if (idea.probability < probFloor) {
+                blockedByGate.incrementAndGet();
+                blockedColdStart.incrementAndGet();
+                return Result.blocked(String.format(
+                        "cold-start: prob=%.0f<%.0f (n=%d)", idea.probability, probFloor, calSamples));
+            }
+            if (needExtra) {
+                boolean clustersOk = clusters >= extraClusters;
+                boolean fcOk = fcConf >= extraFcConf;
+                if (!clustersOk && !fcOk) {
                     blockedByGate.incrementAndGet();
+                    blockedColdStart.incrementAndGet();
                     return Result.blocked(String.format(
-                            "cold-start: prob=%.0f clusters=%d fcConf=%.2f",
-                            idea.probability, clusters, fcConf));
+                            "cold-start: clusters=%d<%d AND fcConf=%.2f<%.2f (n=%d)",
+                            clusters, extraClusters, fcConf, extraFcConf, calSamples));
                 }
             }
 
@@ -301,12 +356,14 @@ public final class BotMain {
             long now = System.currentTimeMillis();
             if (lastMs != null && now - lastMs < SYMBOL_DEDUP_MS) {
                 blockedByGate.incrementAndGet();
+                blockedDedup.incrementAndGet();
                 return Result.blocked(String.format("dedup %ds", (now - lastMs) / 1000));
             }
 
             pruneDispatchTimestamps(now);
             if (dispatchTimestamps.size() >= MAX_PER_HOUR) {
                 blockedByGate.incrementAndGet();
+                blockedHourly.incrementAndGet();
                 return Result.blocked("hourly cap " + MAX_PER_HOUR);
             }
 
@@ -320,10 +377,9 @@ public final class BotMain {
                 droughtAnnounced.set(false);
                 trackSignal(idea, true);
                 isc.setSignalCooldown(idea.symbol, 30 * 60_000L);
-                LOG.info(String.format("[DISPATCH/%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% cold=%s",
+                LOG.info(String.format("[DISPATCH/%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% n=%d",
                         source, idea.symbol, idea.side, idea.probability,
-                        idea.forecast != null ? idea.forecast.confidence : 0.0,
-                        actualRR, slPct * 100, coldStart));
+                        fcConf, actualRR, slPct * 100, calSamples));
                 return Result.ok();
             } catch (Throwable t) {
                 LOG.warning("[DISPATCH/" + source + "] " + idea.symbol + " failed: " + t.getMessage());
@@ -343,6 +399,13 @@ public final class BotMain {
         public int  getHourlyCount() {
             pruneDispatchTimestamps(System.currentTimeMillis());
             return dispatchTimestamps.size();
+        }
+
+        /** [v62] Block-reason breakdown for stats logging. */
+        public String getBlockBreakdown() {
+            return String.format("bi:%d rr:%d sl:%d cold:%d dd:%d hr:%d",
+                    blockedBipolar.get(), blockedRR.get(), blockedSL.get(),
+                    blockedColdStart.get(), blockedDedup.get(), blockedHourly.get());
         }
     }
 
@@ -919,13 +982,14 @@ public final class BotMain {
         Dispatcher d = Dispatcher.getInstance();
         String msg = String.format(
                 "[STATS] Up:%dm Cyc:%d Sig:%d Trk:%d FR:%d | BTC:%s str=%.2f | "
-                        + "WS:%d Disp:%d/%d | FC:%.0f%%(%d/%d) Err:%d WD:%d | %s",
+                        + "WS:%d Disp:%d/%d [%s] | FC:%.0f%%(%d/%d) Err:%d WD:%d | %s",
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 trackedSignals.size(), forecastRecords.size(),
                 ctx.regime, ctx.impulseStrength,
                 sender.getActiveWsCount(),
                 d != null ? d.getTotalDispatched() : 0,
                 d != null ? d.getBlockedByGate() : 0,
+                d != null ? d.getBlockBreakdown() : "?",
                 forecastTotal.get() > 0 ? (double) forecastCorrect.get() / forecastTotal.get() * 100 : 0.0,
                 forecastCorrect.get(), forecastTotal.get(),
                 errorCount.get(), watchdogAlerts.get(),

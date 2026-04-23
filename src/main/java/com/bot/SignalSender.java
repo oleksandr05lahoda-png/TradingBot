@@ -159,10 +159,20 @@ public final class SignalSender {
     // New ALT=0.55%: requires genuine momentum surge (55% of normal 15m ATR in 30s).
     // TOP unchanged — BTC/ETH 0.25% in 30s IS a real event.
     // MEME raised 0.60→0.80%: MEMEs routinely spike 0.5-0.6% on noise; 0.80% = real.
-    private static final double HOT_PAIR_TOP_PCT   = 0.0025;  // 0.25% in 30s (unchanged)
-    private static final double HOT_PAIR_ALT_PCT   = 0.0055;  // 0.55% in 30s (was 0.40%)
-    private static final double HOT_PAIR_MEME_PCT  = 0.0080;  // 0.80% in 30s (was 0.60%)
-    private static final long   HOT_PAIR_COOLDOWN_MS = 90_000L;
+    private static final double HOT_PAIR_TOP_PCT   = 0.0025;  // 0.25% in 30s
+    private static final double HOT_PAIR_ALT_PCT   = 0.0055;  // 0.55% in 30s
+    private static final double HOT_PAIR_MEME_PCT  = 0.0080;  // 0.80% in 30s
+    // [v62] Cooldown 90s → 10 min. SPKUSDT/UBUSDT-type illiquid pairs were
+    // triggering HOT_RESCAN every 60s, burning fetchPool CPU and producing
+    // SL=24% signals that then got blocked downstream. 10 min kills the spam.
+    private static final long   HOT_PAIR_COOLDOWN_MS = 10 * 60_000L;
+    // [v62] Soft blocklist: pair that produces SL > 5% three times in a row
+    // is added here for 2 hours. Prevents re-scanning ultra-volatile garbage.
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> hotSoftBlocklist =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, Integer> hotSlFailures =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long   HOT_SOFT_BLOCK_MS = 2 * 60 * 60_000L;
     private static final int    HOT_PAIR_MAX_CONCURRENT = 3;
     private final Map<String, Long>    hotPairLastRescan   = new ConcurrentHashMap<>();
     private final AtomicInteger        hotPairActiveCount  = new AtomicInteger(0);
@@ -3101,7 +3111,19 @@ public final class SignalSender {
     //  Result: if valid signal found → sent to Telegram immediately.
     //  Reduces worst-case detection latency from 60s → ≤5s.
     private void maybeHotRescan(String pair, double price) {
-        // Cooldown: don't rescan same pair more often than every 90s
+        // [v62] FIRST: cheap string-level filter. Non-ASCII symbols (币安人生USDT),
+        // known garbage, and soft-blocked ultra-volatile pairs are rejected BEFORE
+        // any compute. Previously these triggered [HOT] logs and processPair
+        // compute only to be discarded downstream.
+        if (isBlocklisted(pair)) return;
+        Long softUntil = hotSoftBlocklist.get(pair);
+        if (softUntil != null) {
+            if (System.currentTimeMillis() < softUntil) return;
+            hotSoftBlocklist.remove(pair);
+            hotSlFailures.remove(pair);
+        }
+
+        // Cooldown: don't rescan same pair more often than HOT_PAIR_COOLDOWN_MS
         Long lastRescan = hotPairLastRescan.get(pair);
         long now = System.currentTimeMillis();
         if (lastRescan != null && now - lastRescan < HOT_PAIR_COOLDOWN_MS) return;
@@ -3115,11 +3137,10 @@ public final class SignalSender {
 
         List<Double> ticks = new ArrayList<>(dq);
         int sz = ticks.size();
-        double priceBase = ticks.get(Math.max(0, sz - 31)); // 30 ticks ago
+        double priceBase = ticks.get(Math.max(0, sz - 31));
         if (priceBase <= 0) return;
         double movePct = (price - priceBase) / priceBase;
 
-        // Determine threshold by coin category
         com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
         double threshold = switch (cat) {
             case TOP  -> HOT_PAIR_TOP_PCT;
@@ -3127,13 +3148,21 @@ public final class SignalSender {
             case MEME -> HOT_PAIR_MEME_PCT;
         };
 
-        // Both up AND down pumps matter (dump = SHORT opportunity)
         if (Math.abs(movePct) < threshold) return;
 
-        // Qualifiers: must have WS data & not blacklisted
-        // NOTE: check BEFORE the log print — previously the [HOT] log fired
-        // for garbage/blocklisted pairs then immediately discarded them,
-        // flooding Railway logs with 50+ useless lines per hour.
+        // [v62] Volume gate at HOT level too (was only in EARLY_TICK path).
+        // SPKUSDT/UBUSDT type listings trigger HOT but have ~$2M daily volume —
+        // untradeable even if a signal would form.
+        Double vol24h = volume24hUSD.get(pair);
+        if (vol24h != null) {
+            double minVol = switch (cat) {
+                case TOP  -> MIN_VOL_TOP_USD;
+                case ALT  -> MIN_VOL_ALT_USD;
+                case MEME -> MIN_VOL_MEME_USD;
+            };
+            if (vol24h < minVol) return;
+        }
+
         if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return;
         if (isc.isHardBlacklisted(pair)) return;
 
@@ -3301,6 +3330,17 @@ public final class SignalSender {
             double etSlPct = Math.abs(et.price - et.stop) / et.price;
             double etMaxSlPct = getMaxSlPct();
             if (etSlPct > etMaxSlPct) {
+                // [v62] Track repeat failures. After 3 SL>max events in a single
+                // flush-cycle window for this pair, add to soft-blocklist for 2h
+                // so it stops being re-scanned. SPKUSDT-type noise is silenced.
+                int failures = hotSlFailures.merge(et.symbol, 1, Integer::sum);
+                if (failures >= 3) {
+                    hotSoftBlocklist.put(et.symbol,
+                            System.currentTimeMillis() + HOT_SOFT_BLOCK_MS);
+                    hotSlFailures.remove(et.symbol);
+                    System.out.printf("[SOFT-BLOCK] %s: 3× SL>max in a row, suspended 2h%n",
+                            et.symbol);
+                }
                 System.out.printf("[EARLY-SL-GATE] %s BLOCKED: SL=%.2f%% > max=%.2f%%%n",
                         et.symbol, etSlPct * 100, etMaxSlPct * 100);
                 continue;
