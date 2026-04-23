@@ -2894,6 +2894,18 @@ public final class SignalSender {
         }));
 
         if (ENABLE_EARLY_TICK) {
+            // [v62 FIX] Cheapest filter first: refuse to even compute EARLY_TICK
+            // for blocklisted (non-ASCII / garbage) or soft-blocklisted (3× SL>max)
+            // pairs. Previously these passed through here, got rejected at SL-gate
+            // one second later, and spam-logged. Stop at the source.
+            if (isBlocklisted(pair)) return;
+            Long earlySoftUntil = hotSoftBlocklist.get(pair);
+            if (earlySoftUntil != null) {
+                if (System.currentTimeMillis() < earlySoftUntil) return;
+                hotSoftBlocklist.remove(pair);
+                hotSlFailures.remove(pair);
+            }
+
             // [v51 FIX] SOFT session gate (was hard `return` below 0.85).
             // Asian session is exactly when meme pumps like BOME happen — hard-blocking
             // EARLY_TICK during 01:00-05:00 UTC was systematically missing the most
@@ -3339,19 +3351,26 @@ public final class SignalSender {
             double etSlPct = Math.abs(et.price - et.stop) / et.price;
             double etMaxSlPct = getMaxSlPct();
             if (etSlPct > etMaxSlPct) {
-                // [v62] Track repeat failures. After 3 SL>max events in a single
-                // flush-cycle window for this pair, add to soft-blocklist for 2h
-                // so it stops being re-scanned. SPKUSDT-type noise is silenced.
-                int failures = hotSlFailures.merge(et.symbol, 1, Integer::sum);
-                if (failures >= 3) {
-                    hotSoftBlocklist.put(et.symbol,
-                            System.currentTimeMillis() + HOT_SOFT_BLOCK_MS);
-                    hotSlFailures.remove(et.symbol);
-                    System.out.printf("[SOFT-BLOCK] %s: 3× SL>max in a row, suspended 2h%n",
-                            et.symbol);
+                // [v62 FIX] Only trigger soft-block ONCE per pair. Previously each
+                // flush-cycle re-ran the counter and spam-logged "[SOFT-BLOCK] ..."
+                // repeatedly for the same pair. Now we check if it's already banned.
+                boolean alreadySoftBlocked =
+                        hotSoftBlocklist.containsKey(et.symbol)
+                                && System.currentTimeMillis() < hotSoftBlocklist.get(et.symbol);
+                if (!alreadySoftBlocked) {
+                    int failures = hotSlFailures.merge(et.symbol, 1, Integer::sum);
+                    if (failures >= 3) {
+                        hotSoftBlocklist.put(et.symbol,
+                                System.currentTimeMillis() + HOT_SOFT_BLOCK_MS);
+                        hotSlFailures.remove(et.symbol);
+                        // Purge remaining buffered candidates for this pair
+                        earlyTickBuffer.remove(et.symbol);
+                        System.out.printf("[SOFT-BLOCK] %s: 3× SL>max in a row, suspended 2h%n",
+                                et.symbol);
+                    }
+                    System.out.printf("[EARLY-SL-GATE] %s BLOCKED: SL=%.2f%% > max=%.2f%%%n",
+                            et.symbol, etSlPct * 100, etMaxSlPct * 100);
                 }
-                System.out.printf("[EARLY-SL-GATE] %s BLOCKED: SL=%.2f%% > max=%.2f%%%n",
-                        et.symbol, etSlPct * 100, etMaxSlPct * 100);
                 continue;
             }
 
