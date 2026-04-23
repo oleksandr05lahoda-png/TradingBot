@@ -120,9 +120,10 @@ public final class DecisionEngineMerged {
     // [v53 QUALITY] Raised 62→68 as part of stricter quality mandate.
     // Combined with AFC kill-switch in BotMain, this reduces Telegram noise by ~70%.
     // MIN_CONF_FLOOR raised 60→65 — signals below 65% were historically <50% win-rate.
-    // [v62] 72→70. Dispatcher now has progressive cold-start gate (75→72→70→off)
-    // that enforces per-sample-count quality. BASE_CONF 72 was double-gating.
-    private static final double BASE_CONF       = 70.0;
+    // [v63] Back to 65 — Dispatcher cold-start now handles quality floor per phase.
+    // Previous 72/70 was double-gating and killing signal flow. The progressive
+    // gate in BotMain.Dispatcher gives us per-phase control; this can stay low.
+    private static final double BASE_CONF       = 65.0;
     private static final int    CALIBRATION_WIN = 120;
     private static final double MIN_CONF_FLOOR  = 65.0;
     private static final double MIN_CONF_CEIL   = 82.0;

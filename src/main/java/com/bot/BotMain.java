@@ -231,7 +231,7 @@ public final class BotMain {
         private static final double MIN_RR          = 2.00;
         private static final double MIN_SL_PCT      = 0.0035;
         private static final long   SYMBOL_DEDUP_MS = 15 * 60_000L;
-        private static final int    MAX_PER_HOUR    = 4;
+        private static final int    MAX_PER_HOUR    = 6;    // [v63] was 4 — too restrictive
         private static final long   HOUR_MS         = 60 * 60_000L;
 
         private final com.bot.TelegramBotSender tg;
@@ -312,25 +312,28 @@ public final class BotMain {
             double extraFcConf;
 
             if (calSamples >= COLD_START_MIN_OUTCOMES) {
-                probFloor = 0;       // gate off — rr/sl/dedup are enough
+                probFloor = 0;
                 needExtra = false;
                 extraClusters = 0;
                 extraFcConf = 0;
             } else if (calSamples >= 20) {
-                probFloor = 70.0;
-                needExtra = false;   // just the prob floor
+                // [v63] Was 70.0 — lowered to 65.0. Pairs with prob 65-70 that
+                // also have clusters/fc are typically good scalp setups that we
+                // were missing. Real winrate tracking will auto-correct.
+                probFloor = 65.0;
+                needExtra = false;
                 extraClusters = 0;
                 extraFcConf = 0;
             } else if (calSamples >= 10) {
-                probFloor = 72.0;
-                needExtra = true;    // OR between clusters and fcConf
-                extraClusters = 3;
-                extraFcConf = 0.50;
-            } else {
-                probFloor = 75.0;
+                probFloor = 68.0;         // was 72.0
                 needExtra = true;
-                extraClusters = 4;
-                extraFcConf = 0.55;
+                extraClusters = 2;        // was 3
+                extraFcConf = 0.45;       // was 0.50
+            } else {
+                probFloor = 70.0;         // was 75.0
+                needExtra = true;
+                extraClusters = 3;        // was 4
+                extraFcConf = 0.50;       // was 0.55
             }
 
             if (idea.probability < probFloor) {
@@ -582,7 +585,7 @@ public final class BotMain {
         }, "ShutdownHook"));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v62 SCANNER started " + nowLocalStr()
+        LOG.info("═══ TradingBot v63 SCANNER started " + nowLocalStr()
                 + " (first cycle in 90s) ═══");
     }
 
@@ -1049,21 +1052,19 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v62`\n"
+        return "⚡ *TradingBot SCANNER* `v63`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures · TOP-30 · Scanner-only\n"
                 + "R:R min `1:2` · SL min `0.35%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🎯 *Фильтры качества:*\n"
-                + "• Прогрессивная калибровка (75→72→70)\n"
-                + "• Дедуп по символу 15 мин\n"
-                + "• Макс 4 сигнала/час\n"
-                + "• HOT-rescan с авто-soft-blocklist\n"
-                + "• Staggered startup (без IP-банов)\n"
+                + "🎯 *Оптимизация v63 (balanced):*\n"
+                + "• Cold-start: 70→68→65 (прогрессивно)\n"
+                + "• До 6 сигналов/час\n"
+                + "• Volume-gate расслаблен (40M/15M)\n"
+                + "• Цель: 1-3 качественных сигнала в день\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
-                + "_Реальные сигналы с Entry/TP1-3/SL._\n"
-                + "_Первый цикл через ~90 сек._";
+                + "_Реальные сигналы с Entry/TP1-3/SL._";
     }
 
     private static String nowLocalStr() {

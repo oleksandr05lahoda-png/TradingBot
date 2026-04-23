@@ -57,12 +57,12 @@ public final class SignalSender {
     private static final double MIN_PROFIT_MEME = 0.0050;
 
     private static final double MIN_VOL_TOP_USD  = 50_000_000;
-    // [v50 UPDATE] Volume thresholds raised to filter fresh listings and manipulated coins.
-    // Observed in logs: GENIUSUSDT, BULLAUSDT, 币安人生USDT, PIEVERSEUSDT, MUSDT all passed the
-    // old $30M filter with inflated "listing pump" volume. Real institutional flows are 3-10×
-    // higher. $75M ALT threshold eliminates 90% of listing noise while keeping liquid ALTs in play.
-    private static final double MIN_VOL_ALT_USD  = 75_000_000;  // was 30M — blocks listing pumps
-    private static final double MIN_VOL_MEME_USD = 25_000_000;  // was 10M — stricter MEME
+    // [v63] Relaxed. Previous 75M/25M cut off too many valid pairs (APT, ARB, OP,
+    // RUNE, INJ etc can trade at 30-60M on quiet days yet still be liquid enough).
+    // Real institutional-listing noise is still blocked by isBlocklisted + soft-block
+    // + SL-gate + ATR-gate chain. Keeping vol thresholds high was double-filtering.
+    private static final double MIN_VOL_ALT_USD  = 40_000_000;  // was 75M
+    private static final double MIN_VOL_MEME_USD = 15_000_000;  // was 25M
 
     private static final double STOP_CLUSTER_SHIFT = 0.0025;
     private static final int    MAX_WS_CONNECTIONS  = 100;
