@@ -517,18 +517,24 @@ public final class BotMain {
             return t;
         });
 
+        // [v62] Staggered startup. Previous v61 schedule (0s delay) caused bursts
+        // of BTC + 8 sectors + 30-pair scan within 2s of boot → Binance 418 IP ban.
+        // New schedule lets WS subscribe, cache warm up, then start cycles.
+        //   - main cycle: first run at +90s (was 0s)
+        //   - stats: first at +15min (was +30min, now slightly earlier for observability)
+        //   - watchdog grace: first check at +5min to avoid alerts during warmup
         mainSched.scheduleAtFixedRate(
                 safe("MainCycle", () -> runCycle(telegram, gic, isc, sender)),
-                0, INTERVAL, TimeUnit.MINUTES);
+                90, INTERVAL * 60L, TimeUnit.SECONDS);
         auxSched.scheduleAtFixedRate(
                 safe("LogStats", () -> logStats(gic, isc, sender)),
-                30, 30, TimeUnit.MINUTES);
+                15, 30, TimeUnit.MINUTES);
         auxSched.scheduleAtFixedRate(
                 safe("DailySummary", () -> maybeSendDailySummary(telegram, gic, isc, sender)),
                 1, 1, TimeUnit.MINUTES);
         auxSched.scheduleAtFixedRate(
                 safe("Watchdog", () -> runWatchdog(telegram, sender)),
-                120, 120, TimeUnit.SECONDS);
+                5 * 60, 120, TimeUnit.SECONDS);
         auxSched.scheduleAtFixedRate(
                 safe("CalibratorSave", () -> {
                     com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
@@ -576,7 +582,8 @@ public final class BotMain {
         }, "ShutdownHook"));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v61 SCANNER started " + nowLocalStr() + " ═══");
+        LOG.info("═══ TradingBot v62 SCANNER started " + nowLocalStr()
+                + " (first cycle in 90s) ═══");
     }
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
@@ -585,6 +592,15 @@ public final class BotMain {
                                  com.bot.SignalSender sender) {
         long cycleStart = System.currentTimeMillis();
         long now = System.currentTimeMillis();
+
+        // [v62] Skip entire cycle if Binance has us under IP ban.
+        // Previously v61 attempted fetchKlines 30+ times per cycle which produced
+        // [HARD FAIL] spam AND kept the rate-limit window hot, extending the ban.
+        if (sender.isRlBanned()) {
+            LOG.info("[CYCLE] Skipped — Binance IP ban for " + sender.rlBanSecondsLeft() + "s");
+            return;
+        }
+
         if (now < cbPauseUntil) return;
         if (now - lastErrorWindowStart > CB_WINDOW_MS) {
             lastErrorWindowStart = now;
@@ -873,17 +889,25 @@ public final class BotMain {
     private static void runWatchdog(com.bot.TelegramBotSender telegram,
                                     com.bot.SignalSender sender) {
         long now = System.currentTimeMillis();
+
+        // [v62] Don't alert during Binance IP ban — it's expected & self-healing.
+        // Don't alert during first 10 min of uptime — WS might still be connecting.
+        if (sender.isRlBanned()) return;
+        if (now - startTimeMs < 10 * 60_000L) return;
+
         List<String> infraIssues = new ArrayList<>();
         if (now - lastCycleSuccessMs > 3 * 60_000L)
             infraIssues.add("💀 MainCycle silent " + (now - lastCycleSuccessMs) / 1000 + "s");
         if (now - lastStatsSuccessMs > 40 * 60_000L)
             infraIssues.add("💀 Stats silent " + (now - lastStatsSuccessMs) / 60_000 + "min");
-        if (sender.getActiveWsCount() < 3)
+        // [v62] Raised threshold 3 → 10. WebSocket count < 10 means degraded,
+        // but 2-3 is expected during the first minute or after a pair reshuffle.
+        if (sender.getActiveWsCount() < 10)
             infraIssues.add("⚠️ WebSockets low: " + sender.getActiveWsCount());
 
         boolean signalDrought = now - lastSignalMs > SIGNAL_DROUGHT_MS;
 
-        if (sender.getActiveWsCount() < 3 || now - lastCycleSuccessMs > 3 * 60_000L) {
+        if (sender.getActiveWsCount() < 10 || now - lastCycleSuccessMs > 3 * 60_000L) {
             sender.forceResubscribeTopPairs();
         }
 
@@ -1025,20 +1049,21 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v61`\n"
+        return "⚡ *TradingBot SCANNER* `v62`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures · TOP-30 · Scanner-only\n"
                 + "R:R min `1:2` · SL min `0.35%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🔧 *v61 масштерпис:*\n"
-                + "• Единый Dispatcher — все сигналы через него\n"
-                + "• Cold-start: prob≥78, clusters≥4, fcConf≥0.55\n"
-                + "• Дедуп 15 мин · макс 4/час\n"
-                + "• Честный скор (без косметики)\n"
-                + "• TIME_STOP только для показанных сигналов\n"
+                + "🎯 *Фильтры качества:*\n"
+                + "• Прогрессивная калибровка (75→72→70)\n"
+                + "• Дедуп по символу 15 мин\n"
+                + "• Макс 4 сигнала/час\n"
+                + "• HOT-rescan с авто-soft-blocklist\n"
+                + "• Staggered startup (без IP-банов)\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
-                + "_Только реальные сигналы с TP/SL._";
+                + "_Реальные сигналы с Entry/TP1-3/SL._\n"
+                + "_Первый цикл через ~90 сек._";
     }
 
     private static String nowLocalStr() {

@@ -390,6 +390,15 @@ public final class SignalSender {
         // НЕ спамим в Telegram — бот просто подождёт и продолжит
     }
 
+    /** [v62] Public RL status for BotMain cycle-skip logic. */
+    public boolean isRlBanned() {
+        return rlIpBanned && System.currentTimeMillis() < rlIpBanUntil;
+    }
+    public long rlBanSecondsLeft() {
+        if (!isRlBanned()) return 0;
+        return Math.max(0, (rlIpBanUntil - System.currentTimeMillis()) / 1000);
+    }
+
     private HttpResponse<String> sendBinanceRequest(HttpRequest request, int weight) throws Exception {
         if (!rlAcquire(weight)) return null;
         try {
