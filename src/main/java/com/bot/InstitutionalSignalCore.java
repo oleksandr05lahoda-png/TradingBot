@@ -7,11 +7,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /** InstitutionalSignalCore v17.0 — PORTFOLIO RISK CONTROLLER */
 public final class InstitutionalSignalCore {
-    // [v16.0 FIX] Reduced from 75→68. At 75% the bot requires near-perfect confluence
-    // which almost never happens → 20+ hour droughts. 68% is high-conviction but achievable.
-    // [v64] 68 → 70. Gives headroom when daily-loss penalty (+3) stacks on floor=58,
-    // so we can reach 61 without clamping. Still well below typical Dispatcher floor (73).
-    private static final double MAX_EFFECTIVE_MIN_CONF = 70.0;
+    // [v70] 70 → 62 synced с DE MIN_CONF_FLOOR=55 + Dispatcher Phase 1 floor=58.
+    // При floor=58 and daily penalty +2 потолок 62 оставляет валидный диапазон.
+    private static final double MAX_EFFECTIVE_MIN_CONF = 62.0;
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
@@ -27,17 +25,13 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;   // per symbol, bounded
 
     public InstitutionalSignalCore() {
-        // [v64] ISC is now a risk governor, not a quality filter.
-        // Quality is enforced upstream (DecisionEngine + Optimizer: floor 65, ceil 85)
-        // and downstream (Dispatcher cold-start gate: prob>=73 in Phase 1).
-        // ISC base conf dropped 65→63 so borderline 64-68% candidates reach Dispatcher
-        // where the OR-based gate can assess them properly. Without this, ISC silently
-        // killed signals before Dispatcher ever saw them.
+        // [v70] baseMinConfidence 63 → 56 synced с DE=55.
+        // ISC остаётся risk-governor не quality-filter; quality gate живёт в DE+Dispatcher.
         this(
                 envInt("ISC_MAX_GLOBAL_SIGNALS", 6),
                 envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
                 envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
-                envDouble("ISC_BASE_MIN_CONF", 63.0),       // was 65.0
+                envDouble("ISC_BASE_MIN_CONF", 56.0),
                 envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003),
                 envInt("ISC_MAX_SAME_SECTOR_DIR", 2)
         );
@@ -394,31 +388,25 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [v50 AUDIT FIX] Inverted logic: strict on small sample, loose ONLY if WR proven.
-        // Old: 200+ trades → floor drops to 50 unconditionally. This is backwards:
-        // large sample with BAD WR should stay strict; only large sample with GOOD WR relaxes.
-        double floor = 58.0;
+        // [v70] floor 58 → 52 synced с DE MIN_CONF_FLOOR=55 - margin.
+        // Logic сохранена: strict по умолчанию, loosens только при proven WR.
+        double floor = 52.0;
         int totalTrades = getTotalTradeCount();
         double overallWr = getOverallWinRate();
-        if (totalTrades >= 500 && overallWr >= 0.58) floor = 50.0;
-        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 54.0;
+        if (totalTrades >= 500 && overallWr >= 0.58) floor = 48.0;
+        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 50.0;
 
         double base = Math.max(baseMinConfidence, floor);
 
-        // [v16.0 FIX] Daily loss penalties DRASTICALLY reduced.
-        // OLD: -6% → +12pts (62+12=74%), -3% → +6pts (62+6=68%) → both exceed MAX_EFFECTIVE_MIN_CONF
-        // and combine with qualityPenalty/symbolBoost to reach 80%+ → physically impossible to pass.
-        // NEW: -6% → +3pts (62+3=65%), -3% → +1.5pts (62+1.5=63.5%).
-        // Risk is managed by getRiskSizeMultiplier() reducing position size, NOT by silencing signals.
+        // [v70] Daily loss penalties смягчены: +3.0→+2.0, +1.5→+1.0
         if (dailyPnLPct <= DAILY_LOSS_SURVIVAL_PCT) {
-            base += 3.0;   // was +12.0 — caused 20h droughts
+            base += 2.0;
         } else if (dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT) {
-            base += 1.5;   // was +6.0
+            base += 1.0;
         }
 
-        // Backtest EV adjustment
         if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L)
-            base += 3.0;
+            base += 2.0;
 
         return Math.max(floor, Math.min(base, MAX_EFFECTIVE_MIN_CONF));
     }

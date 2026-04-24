@@ -720,7 +720,7 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
         this.TOP_N            = envInt("TOP_N", 30);
-        this.MIN_CONF         = envDouble("MIN_CONF", 65.0); // [v52] 70→65: more signals through, quality controlled by AFC pre-filter
+        this.MIN_CONF         = envDouble("MIN_CONF", 58.0); // [v70] 65→58, synced с DE MIN_CONF_FLOOR=55
         this.KLINES_LIMIT     = envInt("KLINES", 420);
         // [v66] 160 → 420. CRITICAL BUG FIX: processPair gate at line 1149 requires
         // m15.size() >= 400, but KLINES_LIMIT=160 meant fetchKlines returned only 160

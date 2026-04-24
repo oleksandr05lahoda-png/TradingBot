@@ -117,22 +117,15 @@ public final class DecisionEngineMerged {
     private static final long   COOLDOWN_ALT    = 5  * 60_000L;  // was 8m  → 5m
     private static final long   COOLDOWN_MEME   = 8  * 60_000L;  // was 12m → 8m
 
-    // [v53 QUALITY] Raised 62→68 as part of stricter quality mandate.
-    // Combined with AFC kill-switch in BotMain, this reduces Telegram noise by ~70%.
-    // MIN_CONF_FLOOR raised 60→65 — signals below 65% were historically <50% win-rate.
-    // [v63] Back to 65 — Dispatcher cold-start now handles quality floor per phase.
-    // Previous 72/70 was double-gating and killing signal flow. The progressive
-    // gate in BotMain.Dispatcher gives us per-phase control; this can stay low.
-    // [v69 FIX] 65→60. Комментарий v63 заявляет что Dispatcher обрабатывает quality
-    // floor per-phase, но при floor=65 создаётся double-gating:
-    //   stage 1: probability < 65 → reject в analyze() (prob_lt_minConf_early)
-    //   stage 2: Dispatcher phase gate поверх этого
-    // В логах prob_lt_minConf_early=8-12/цикл = главный душитель сигналов.
-    // При floor=60 Dispatcher остаётся authoritative источником quality control.
-    private static final double BASE_CONF       = 60.0;
+    // [v70] Floor 60→55 / ceil 82→76. При neutral BTC + плоских альтах probability
+    // физически не дотягивает до 60 (3 кластера clusterBase=50, -5 RANGE, -3 ALT
+    // уже даёт ~42). Новые значения позволяют пропустить ранние тренды / развороты /
+    // pump/dump setups в диапазоне 55–75, при этом downstream Dispatcher + ISC
+    // остаются authoritative quality-gate (их пороги тоже понижены).
+    private static final double BASE_CONF       = 55.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 60.0;
-    private static final double MIN_CONF_CEIL   = 82.0;
+    private static final double MIN_CONF_FLOOR  = 55.0;
+    private static final double MIN_CONF_CEIL   = 76.0;
 
     // Дивергенции — штраф вместо хард-лока
     private static final double DIV_PENALTY_SCORE  = 0.55;
@@ -145,12 +138,13 @@ public final class DecisionEngineMerged {
 
     // Cluster confluence bonus
     private static final double CLUSTER_CONFLUENCE_BONUS = 0.15;
-    // Raised 2→3: two weak clusters (each 0.15) were enough to fire a signal.
-    // With three required, we eliminate "2 noise clusters = signal" false positives (~-25% false signals).
-    private static final int    MIN_AGREEING_CLUSTERS    = 3;
-    // Raised 0.25→0.30: кластер с weight <30% = шум, а не confluence.
-    // Эффект: -10..15% сигналов, +5..8% WR. «2 средних + 1 слабый» больше не проходят.
-    private static final double MIN_CLUSTER_SCORE        = 0.30;
+    // [v70] 3→2: 2-cluster setups разрешены при strong structure.
+    // Конкретно для pump/dump/reversal detection где обычно есть сильный 1-2
+    // кластер (Volume + Momentum) без полного 3-cluster confluence. clusterBase=48
+    // для 2 кластеров всё ещё ниже minConf=55, так что просто 2 слабых кластера
+    // не пройдут — нужен сильный scoreDiff.
+    private static final int    MIN_AGREEING_CLUSTERS    = 2;
+    private static final double MIN_CLUSTER_SCORE        = 0.28;
 
     // Single authoritative probability ceiling. All intermediate caps and the
     // final calibrator clamp must reference this constant. Previously hardcoded 85 in 5+ places.
@@ -1427,48 +1421,34 @@ public final class DecisionEngineMerged {
                     postPumpGain * 100, postPumpDropFromHi * 100));
         }
 
-        // REGIME FILTER — блокировка нечитаемого рынка
-        // Если ADX < 12 И ATR в нижнем 15-м перцентиле И рынок RANGE
-        // → структура отсутствует, любой сигнал = монетка.
-        // Исключение: aggressiveShort (BTC crash) пробивает фильтр.
+        // [v70] REGIME FILTER смягчён. Прежде ADX<12 + atrPctile<0.15 = reject.
+        // Это типичный "затишье перед бурей" паттерн — лучший вход для pre-pump.
+        // Новое: reject только при совсем мёртвой структуре (ADX<9, pctile<0.08).
         if (!aggressiveShort && state == MarketState.RANGE) {
             double adxVal = adx(c15, 14);
-            double atrPct = atr14 / (price + 1e-9);
-            // ATR percentile: сравниваем текущий ATR с историческим
             double atrPctile = com.bot.TradingCore.atrPercentile(c15, 14, 96);
-            if (adxVal < 12 && atrPctile < 0.15) {
-                // Рынок абсолютно плоский — нет edge ни для тренда, ни для mean reversion
+            if (adxVal < 9 && atrPctile < 0.08) {
                 return reject("flat_market");
             }
-            // В RANGE с низким ADX — только mean-reversion (RSI extreme), NO trend-following
-            if (adxVal < 18 && atrPctile < 0.25) {
+            // В RANGE с низким ADX — только extreme RSI пропускаем (mean-reversion)
+            if (adxVal < 15 && atrPctile < 0.20) {
                 double rsi14 = rsi(c15, 14);
-                // Допускаем только extreme RSI в RANGE (mean-reversion)
-                if (rsi14 > 25 && rsi14 < 75) return reject("range_rsi_mid"); // ни перекуплено, ни перепродано
+                if (rsi14 > 22 && rsi14 < 78) return reject("range_rsi_mid");
             }
         }
 
-        // CHOPPINESS INDEX FILTER — дополнительный фильтр бокового рынка.
-        // ADX + ATR percentile не ловят все случаи choppiness (например ADX=20, atrPctile=0.30
-        // формально проходит фильтр, но рынок всё ещё пилообразный).
-        // CI > 61.8 = классический порог choppiness (золотое сечение).
-        // Исключения: aggressiveShort (BTC crash), сильный тренд (STRONG_TREND), earlyShort.
-        // allFlags уже объявлен выше (после PostPump detection).
-        // Дубликат объявления удалён, чтобы не было "variable already defined".
-
+        // [v70] Choppiness смягчён: CI threshold 61.8 → 68 для RANGE,
+        // 68 → 72 для WEAK_TREND. RSI window 28..72 → 24..76.
         if (!aggressiveShort && state != MarketState.STRONG_TREND && c15.size() >= 15) {
             double ci = com.bot.TradingCore.choppinessIndex(c15, 14);
-            if (ci > 61.8) {
-                // В глубоком боковике — требуем более жёсткого confluence
+            if (ci > 68.0) {
                 if (state == MarketState.RANGE) {
-                    // RANGE + CI > 61.8 = очень высокий шум → только extreme RSI пропускаем
                     double rsiVal = rsi(c15, 14);
-                    if (rsiVal > 28 && rsiVal < 72) {
+                    if (rsiVal > 24 && rsiVal < 76) {
                         allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
                         return reject("choppy_range");
                     }
-                } else if (ci > 68.0) {
-                    // WEAK_TREND + CI > 68 = явный пилообразный рынок → блок
+                } else if (ci > 72.0) {
                     allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
                     return reject("choppy_weak");
                 }
@@ -2197,48 +2177,33 @@ public final class DecisionEngineMerged {
                 f.startsWith("VSA_STOP_VOL_BEAR") || f.startsWith("VSA_ABSORB_BEAR")
                         || f.equals("VSA_NO_DEMAND"));
 
-        // [v69 FIX] DUAL-HTF — СОФТ-ШТРАФ вместо HARD VETO.
-        //
-        // Причина правки: HTF EMA на 1H/2H лагает на 2-4 часа. При разворотах
-        // тренда (особенно на альтах, следующих за BTC) bias1h/bias2h остаются
-        // в старом направлении ещё часами после того, как 15m уже развернулся
-        // и микро-структура подтвердила разворот объёмами + liquidity grab.
-        //
-        // Старая логика: жёстко блокировала ВСЕ reversal-сигналы в направлении,
-        // противоположном HTF. В нейтральном/переходном режиме BTC это убивало
-        // до 9 сигналов за цикл (см. DIAG-ANALYZE logs).
-        //
-        // Новая логика: score *= 0.45 (−55%). Signal всё ещё должен иметь
-        // сильную структуру чтобы пройти minConf=60. Confluence ≥4 кластеров
-        // + объёмное подтверждение пробьёт penalty; слабые setup-ы не пройдут.
-        //
-        // Исключения: aggressiveShort/aggressiveLongHtf (сильный BTC impulse даёт
-        // фундаментальный повод игнорить HTF альта).
+        // [v70] DUAL-HTF — штраф смягчён 0.45 → 0.65.
+        // HTF EMA на 1H/2H лагает 2-4 часа на разворотах. При нейтральном BTC
+        // альты часто разворачиваются первыми, HTF остаётся в прежнем направлении.
+        // Старый 0.45 убивал эти ранние reversal signals.
         boolean aggressiveLongHtf = gicRef != null && gicRef.isAggressiveLongMode();
         if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
                 && !aggressiveLongHtf && prelimSide == com.bot.TradingCore.Side.LONG) {
-            totalLong *= 0.45;
+            totalLong *= 0.65;
             allFlags.add("DUAL_HTF_BEAR_PENALTY");
         }
         if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
-            totalShort *= 0.45;
+            totalShort *= 0.65;
             allFlags.add("DUAL_HTF_BULL_PENALTY");
         }
 
-        // SINGLE-HTF penalty (new): one HTF against direction + other not
-        // supporting → -25% score. Previously no penalty here — signals proceeded
-        // even with one HTF actively against them.
+        // [v70] SINGLE-HTF смягчён 0.75 → 0.85
         if (prelimSide == com.bot.TradingCore.Side.LONG
                 && (bias1h == HTFBias.BEAR || bias2h == HTFBias.BEAR)
                 && bias1h != HTFBias.BULL && bias2h != HTFBias.BULL) {
-            totalLong *= 0.75;
+            totalLong *= 0.85;
             allFlags.add("SINGLE_HTF_BEAR_PENALTY");
         }
         if (prelimSide == com.bot.TradingCore.Side.SHORT
                 && (bias1h == HTFBias.BULL || bias2h == HTFBias.BULL)
                 && bias1h != HTFBias.BEAR && bias2h != HTFBias.BEAR) {
-            totalShort *= 0.75;
+            totalShort *= 0.85;
             allFlags.add("SINGLE_HTF_BULL_PENALTY");
         }
 
@@ -2259,15 +2224,19 @@ public final class DecisionEngineMerged {
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
 
-        // [v69 FIX] HARD EXHAUSTION VETO — пороги ослаблены.
+        // [v70] EXHAUSTION → REVERSAL (not hard veto)
         //
-        // Старое: threshold 3×ATR, lookback 10 баров. Срабатывал на любом
-        // trend-continuation impulse (2-3/цикл в DIAG-ANALYZE).
-        //   Проблема: 10 баров × 3×ATR = любой нормальный импульс, не перегрев.
+        // Старое: при движении >4.5×ATR за 15 баров hard reject обеих сторон.
+        // Проблема: это КЛАССИЧЕСКИЙ разворотный setup. Мы блокировали именно
+        // те сигналы которые трейдеры называют "overextended reversal".
+        //
         // Новое:
-        //   lookback 10 → 15 баров (больше контекста, меньше false positives)
-        //   HARD veto threshold 3×ATR → 4.5×ATR (только реальное истощение)
-        //   penalty threshold 2×ATR → 2.8×ATR, penalty 0.20 → 0.40 (мягче)
+        //   • Если candidate = сторона движения (trend continuation): hard reject
+        //     (экстремум истощён, вход против последующего разворота)
+        //   • Если candidate = противоположная сторона: это РАЗВОРОТ, boost score
+        //     и добавляем reversal-кластер. Signal passes если confluence есть.
+        //   • Нет candidate из клатеров, но extension огромный → фрорсим reversal
+        //     сторону как кандидат (чистый разворот от истощения).
         {
             int lb = Math.min(15, c15.size() - 1);
             double rHigh = Double.NEGATIVE_INFINITY, rLow = Double.MAX_VALUE;
@@ -2275,15 +2244,43 @@ public final class DecisionEngineMerged {
                 rHigh = Math.max(rHigh, c15.get(i).high);
                 rLow  = Math.min(rLow,  c15.get(i).low);
             }
-            boolean candLong = scoreLong > scoreShort;
-            double extDir = candLong ? (price - rLow) : (rHigh - price);
-            if (extDir > atr14 * 4.5) {
-                allFlags.add("EXHAUST_VETO_" + String.format("%.1fx", extDir / atr14));
-                return reject("exhaust_hard_veto");
-            } else if (extDir > atr14 * 2.8) {
-                if (candLong) scoreLong *= 0.40; else scoreShort *= 0.40;
-                allFlags.add("EXHAUST_PENALTY_" + String.format("%.1fx", extDir / atr14));
+            double extUp   = price - rLow;
+            double extDown = rHigh - price;
+            double extDir  = Math.max(extUp, extDown);
+            int extSign    = extUp > extDown ? +1 : -1; // +1 = price moved up, -1 = moved down
+
+            if (extDir > atr14 * 5.5) {
+                // Very overextended — reversal setup. Boost opposite side.
+                boolean candLong = scoreLong > scoreShort;
+                if (extSign > 0) {
+                    // Price pumped → reversal = SHORT
+                    if (candLong) {
+                        // Long candidate on pump extension = chase, veto
+                        allFlags.add("EXHAUST_LONG_VETO_" + String.format("%.1fx", extDir / atr14));
+                        return reject("exhaust_hard_veto");
+                    } else {
+                        scoreShort += 0.55;
+                        allFlags.add("EXHAUST_REV_SHORT_" + String.format("%.1fx", extDir / atr14));
+                    }
+                } else {
+                    // Price dumped → reversal = LONG
+                    if (!candLong && scoreShort > 0) {
+                        allFlags.add("EXHAUST_SHORT_VETO_" + String.format("%.1fx", extDir / atr14));
+                        return reject("exhaust_hard_veto");
+                    } else {
+                        scoreLong += 0.55;
+                        allFlags.add("EXHAUST_REV_LONG_" + String.format("%.1fx", extDir / atr14));
+                    }
+                }
                 scoreDiff = Math.abs(scoreLong - scoreShort);
+            } else if (extDir > atr14 * 3.0) {
+                // Moderate extension: penalty for trend-continuation side only
+                boolean candLong = scoreLong > scoreShort;
+                if ((extSign > 0 && candLong) || (extSign < 0 && !candLong)) {
+                    if (candLong) scoreLong *= 0.55; else scoreShort *= 0.55;
+                    allFlags.add("EXHAUST_PENALTY_" + String.format("%.1fx", extDir / atr14));
+                    scoreDiff = Math.abs(scoreLong - scoreShort);
+                }
             }
         }
 
@@ -2452,18 +2449,31 @@ public final class DecisionEngineMerged {
 
         com.bot.TradingCore.Side side = candidateSide;
 
-        // LOCAL EXHAUSTION VETO — applied after side is finalized.
-        // Blocks counter-trend entries against isolated pair moves where GIC didn't trigger.
+        // [v70] LOCAL EXHAUSTION — разрешаем reversal-сторону при strong confluence.
+        //
+        // Прежде: hard reject counter-trend entries после локального pump/dump.
+        // Проблема: мы блокировали именно те сигналы которые хотим — развороты после
+        // локального истощения. Clusters уже проголосовали за reversal сторону,
+        // значит confirmation уже есть (volume/structure/momentum).
+        //
+        // Новое: блокируем только если clusters слабы (scoreDiff < 0.35) — это
+        // настоящий chase без подтверждения. Сильный confluence → проходим с флагом.
         if (localExh != null && !aggressiveShort) {
-            if (localExh.direction == -1 && side == com.bot.TradingCore.Side.LONG) {
-                allFlags.add("LOCAL_EXHAUST_DOWN_VETO_"
+            boolean reversalSide = (localExh.direction == -1 && side == com.bot.TradingCore.Side.LONG)
+                    || (localExh.direction == +1 && side == com.bot.TradingCore.Side.SHORT);
+            if (reversalSide) {
+                double reversalScoreDiff = Math.abs(scoreLong - scoreShort);
+                if (reversalScoreDiff < 0.35) {
+                    // Weak confluence — reversal call без подтверждения = нож в падение
+                    allFlags.add("LOCAL_EXHAUST_UNCONFIRMED_"
+                            + String.format("%.1fATR", localExh.moveAtr));
+                    return reject("local_exhaust_unconfirmed");
+                }
+                // Strong confluence — reversal trade разрешён с bonus
+                allFlags.add("LOCAL_REVERSAL_" + (localExh.direction > 0 ? "TOP_" : "BOT_")
                         + String.format("%.1fATR", localExh.moveAtr));
-                return reject("local_exhaust_down_long");
-            }
-            if (localExh.direction == +1 && side == com.bot.TradingCore.Side.SHORT) {
-                allFlags.add("LOCAL_EXHAUST_UP_VETO_"
-                        + String.format("%.1fATR", localExh.moveAtr));
-                return reject("local_exhaust_up_short");
+                if (side == com.bot.TradingCore.Side.LONG) scoreLong += 0.30;
+                else scoreShort += 0.30;
             }
         }
 
@@ -2486,22 +2496,24 @@ public final class DecisionEngineMerged {
             return reject("late_hard_block");
         }
 
-        // [v50 §7] MOMENTUM EXHAUSTION BLOCK — if impulse is spent, block same-direction entry.
-        // Even with 4 clusters agreeing, entering a dying impulse = SL hit.
+        // [v70 §7] MOMENTUM EXHAUSTION — usage изменено под reversal trading.
+        // Прежде: блокировка same-direction, мягкий +0.55 на opposite-side.
+        // Теперь: блокировка same-direction И заметный +1.0 boost opposite-side
+        // + флаг REVERSAL_SETUP чтобы cluster counting его заметил.
         if (momentumExhausted) {
             if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.LONG)
                     || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.SHORT)) {
                 allFlags.add("EXHAUSTION_BLOCK");
                 return reject("momentum_exhausted");
             }
-            // Opposite direction = potential reversal entry — BOOST instead
             if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.SHORT)
                     || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.LONG)) {
                 if (side == com.bot.TradingCore.Side.LONG) {
-                    cEarly.addLong(mctx.s(0.55), "EXHAUST_REV_L");
+                    cEarly.addLong(mctx.s(1.0), "EXHAUST_REV_L");
                 } else {
-                    cEarly.addShort(mctx.s(0.55), "EXHAUST_REV_S");
+                    cEarly.addShort(mctx.s(1.0), "EXHAUST_REV_S");
                 }
+                allFlags.add("REVERSAL_SETUP");
                 allFlags.add("EXHAUSTION_REVERSAL_BOOST");
             }
         }
@@ -2723,28 +2735,19 @@ public final class DecisionEngineMerged {
         // At 0.2% every single ALT would trigger HIGH_ATR — meaningless label.
         if (robustAtrPct > 0.015) allFlags.add("HIGH_ATR");
 
-        // [v43 PATCH FIX #3] Noise filter tightened — previous thresholds were too soft.
-        //
-        // ROOT CAUSE: noiseScore > 3.5 was almost never triggered on live coins.
-        // Typical "bad" coins like RIVERUSDT have noiseScore ≈ 2.6-2.9 = sailed through.
-        // At noiseScore 2.6 they received only -4 penalty → still above minConf → traded.
-        // Win-rate on these coins: 18-22%.
-        //
-        // FIX #3a: Extreme noise gate: 3.5→2.8, penalty: 10→20, hard block if below minConf
+        // [v70] Noise gates: convert hard blocks to soft penalties.
+        // Прежде: noiseScore > 2.8 = hard reject ниже minConf. Эффект — шумные
+        // монеты (все altcoin-ы с хвостами) не могли генерировать сигналы вообще.
+        // Теперь: penalty применяется, но без hard-reject — probability decides.
         if (noiseScore > 2.8) {
-            probability = Math.max(0, probability - 20);
+            probability = Math.max(0, probability - 15);
             allFlags.add("HIGH_NOISE");
-            if (probability < minConf) return reject("high_noise_lt_minConf");  // hard block — noisy coin, low signal
-        }
-        // FIX #3b: Moderate noise gate: 2.5→2.2, penalty: 4→12
-        if (noiseScore > 2.2) {
-            probability = Math.max(0, probability - 12);
+        } else if (noiseScore > 2.2) {
+            probability = Math.max(0, probability - 8);
             allFlags.add("MOD_NOISE");
-            if (probability < minConf) return reject("mod_noise_lt_minConf");
         }
-        // FIX #3c: Combo guard — noisy coin + borderline probability = guaranteed loss
-        // noiseScore > 2.0 means wicks are 2× the body — wide TP/SL needed, but signal is weak
-        if (noiseScore > 2.0 && probability < 70.0) {
+        // Combo guard stays, but tightened — only block truly broken setups
+        if (noiseScore > 2.4 && probability < 58.0) {
             allFlags.add("NOISE_PROB_COMBO_BLOCK");
             return reject("noise_prob_combo");
         }
@@ -3249,36 +3252,28 @@ public final class DecisionEngineMerged {
 
         norm = Math.min(1.0, norm);
 
-        // ── Cluster-anchored base probability ──────────────────────────
-        // REDUCED from {80/72/63/54/46/38} to {76/68/59/50/42/34}.
-        // Root cause of 87% clustering: base=80 for 6 clusters made it trivial
-        // to hit PROB_CEIL=85 with even modest bonuses. By lowering the base,
-        // only genuinely exceptional setups (high scoreDiff + multiple quality
-        // bonuses) reach 80%+. This creates the desired distribution:
-        //   weak setups  → 50-59%
-        //   moderate     → 60-72%
-        //   strong       → 73-81%
-        //   exceptional  → 82-85%
+        // [v70] Cluster base raised так чтобы 3-cluster setup с decent norm мог
+        // достичь minConf=55. Прежде 3 кластера давали base=50 → при RANGE(-5) +
+        // ALT(-3) даже с norm=0.8 prob=55 не набирался. Теперь 3 кластера = 56.
         double clusterBase = switch (clusters) {
-            case 6 -> 76.0;  // was 80
-            case 5 -> 68.0;  // was 72
-            case 4 -> 59.0;  // was 63
-            case 3 -> 50.0;  // was 54
-            case 2 -> 42.0;  // was 46
-            default -> 34.0; // was 38
+            case 6 -> 78.0;
+            case 5 -> 70.0;
+            case 4 -> 63.0;
+            case 3 -> 56.0;
+            case 2 -> 48.0;
+            default -> 38.0;
         };
 
-        // norm in [0..1]: norm=0.0 → base-12, norm=0.5 → base+0, norm=1.0 → base+12
-        // Narrowed from ±13 to ±12 to further reduce ceiling pressure.
         double prob = clusterBase + (norm - 0.50) * 24.0;
 
-        // ── Market state adjustment ─────────────────────────────────────
+        // [v70] State penalty смягчён: RANGE -5 → -2.
+        // RANGE — это именно где pump/dump/reversal setups формируются.
         if      (state == MarketState.STRONG_TREND) prob += 3.0;
-        else if (state == MarketState.RANGE)        prob -= 5.0;
+        else if (state == MarketState.RANGE)        prob -= 2.0;
 
-        // ── Category adjustment ─────────────────────────────────────────
-        if (cat == CoinCategory.MEME)    { prob -= 5.0; prob -= 9.0; } // -14 total
-        else if (cat == CoinCategory.ALT) prob -= 3.0;
+        // [v70] Category penalties смягчены. Остаются но не убивают сигнал.
+        if (cat == CoinCategory.MEME)     prob -= 8.0;   // was -14
+        else if (cat == CoinCategory.ALT) prob -= 1.0;   // was -3
 
         // ── Live Bayesian prior blend ───────────────────────────────────
         double priorProb = 50.0 + (bayesPrior.get() - 0.50) * 26.0;
@@ -4204,17 +4199,13 @@ public final class DecisionEngineMerged {
         return h2 < h1 && l2 < l1;
     }
 
-    // PATCH #5: synchronized to fix race condition.
-    // volatile double does NOT make read-modify-write atomic.
-    // fetchPool has up to 25 threads — concurrent clamp(base,...) writes corrupt globalMinConf.
     private synchronized void adaptGlobalMinConf(MarketState state, double atr, double price) {
         double vol  = atr / (price + 1e-9);
         double base = BASE_CONF;
-        if (state == MarketState.STRONG_TREND) base -= 2.0;
-        else if (state == MarketState.RANGE)   base += 2.5;
-        if (vol > 0.025)      base += 3.5;
-        else if (vol > 0.018) base += 2.0;
-        else if (vol < 0.005) base -= 1.0;
+        if (state == MarketState.STRONG_TREND) base -= 3.0;
+        else if (state == MarketState.RANGE)   base += 1.0;
+        if (vol > 0.025)      base += 2.0;
+        else if (vol > 0.018) base += 1.0;
         int utcHour = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getHour();
         if (utcHour >= 8 && utcHour <= 12)       base -= 1.0;
         else if (utcHour >= 13 && utcHour <= 21)  base -= 1.5;

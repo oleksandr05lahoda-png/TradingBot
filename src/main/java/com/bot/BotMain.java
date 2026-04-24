@@ -329,33 +329,20 @@ public final class BotMain {
             double minFcConf;
 
             if (calSamples >= COLD_START_MIN_OUTCOMES) {
-                // Phase 4 — calibrator is trusted, Dispatcher only enforces RR/SL/dedup.
+                // Phase 4 — calibrator trusted, only RR/SL/dedup enforced.
                 probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 20) {
-                // Phase 3 — near-graduation. [v68] Was 68 floor; relaxed to 0 so MIN_CONF=65
-                // upstream gate becomes the sole filter at this stage. Maintains monotonic
-                // relaxation with softened Phase 1/2 below.
+                // Phase 3 — near-graduation. MIN_CONF upstream is sole filter.
                 probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 10) {
-                // Phase 2 — warming up. [v68] Softened 70→66 / 74→70 to match relaxed
-                // Phase 1 below. Monotonic: Phase 1 (68/72) > Phase 2 (66/70) > Phase 3 (0).
-                // [v69 FIX] Synced with MIN_CONF_FLOOR=60 in DecisionEngineMerged.
-                // Было 66/70 — создавало gap 6-10 pt между analyze() и Dispatcher.
-                // Стало 62/66 — 2-6 pt margin поверх DecisionEngine minConf=60.
-                probFloor = 62.0; probShortcut = 66.0; minClusters = 2; minFcConf = 0.40;
+                // [v70] Phase 2 synced with DE MIN_CONF_FLOOR=55.
+                // Было 62/66 при DE=60 (margin 2/6). При DE=55 — 57/61 (margin 2/6).
+                probFloor = 57.0; probShortcut = 61.0; minClusters = 2; minFcConf = 0.35;
             } else {
-                // Phase 1 — hard cold start. prob>=73 baseline; prob>=76 solo-pass,
-                // otherwise need either 2+ cluster flags or forecast conf >= 0.45.
-                // [v68] Softened 73→68 and 76→72 to solve the bootstrap deadlock:
-                //   original Phase 1 was so strict that the bot couldn't dispatch ANY
-                //   signal → calibrator stayed at n=0 → Phase 1 never ended. With env
-                //   MIN_CONF=65, floor=68 keeps only 3-pt cold-start margin (safe) and
-                //   solo-pass at 72 is realistically achievable on strong setups.
-                // [v69 FIX] Synced with MIN_CONF_FLOOR=60. Было 68/72 при MIN_CONF=65
-                // (gap 3 pt). При MIN_CONF=60 прежние 68/72 создавали gap 8/12 pt —
-                // analyze() пропускал 60-67, Dispatcher всё убивал. Новое: 64/68
-                // сохраняет 4 pt cold-start margin над analyze floor.
-                probFloor = 64.0; probShortcut = 68.0; minClusters = 2; minFcConf = 0.40;
+                // [v70] Phase 1 — hard cold start synced с DE=55.
+                // Было 64/68 при DE=60. Сейчас 58/62 сохраняет тот же margin 3/7.
+                // solo-pass на 62 достижим для strong reversal/pump setups.
+                probFloor = 58.0; probShortcut = 62.0; minClusters = 2; minFcConf = 0.35;
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {
@@ -442,15 +429,15 @@ public final class BotMain {
         for (String f : flags) {
             if (f == null) continue;
             String u = f.toUpperCase();
-            // [v64] Honest counting. EARLY_TICK removed — it's a trigger type, NOT a cluster.
-            // Counting it inflated clusters=1 for every EARLY_TICK signal and fooled the
-            // old secondary gate. Real confluence means: structural (BOS/FVG/OB),
-            // volume (VSA/OFV/OBI/DIV), momentum (BREAKOUT/EXHAUST/PUMP), context (HTF/TREND).
+            // [v70] Added REVERSAL/EXHAUST_REV/LOCAL_REVERSAL — эти флаги теперь
+            // считаются кластерами чтобы reversal setups проходили cold-start gate.
             if (u.startsWith("CLUSTER") || u.contains("TREND")
                     || u.contains("BREAKOUT") || u.contains("VSA") || u.contains("PUMP")
                     || u.contains("EXH") || u.contains("OFV_STRONG") || u.contains("OBI")
                     || u.contains("HTF_") || u.contains("BOS") || u.contains("FVG")
-                    || u.contains("LIQ_MAGNET") || u.contains("DIV")) c++;
+                    || u.contains("LIQ_MAGNET") || u.contains("DIV")
+                    || u.contains("REVERSAL") || u.contains("EXHAUST_REV")
+                    || u.contains("LOCAL_REVERSAL")) c++;
         }
         return c;
     }
