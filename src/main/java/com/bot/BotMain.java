@@ -49,7 +49,12 @@ public final class BotMain {
 
     private static volatile ZoneId ZONE = ZoneId.of("Europe/Warsaw");
     private static final int INTERVAL = envInt("SIGNAL_INTERVAL_MIN", 1);
-    private static final int KLINES   = envInt("KLINES_LIMIT", 160);
+    // [v66] Read BOTH env names so one Railway variable can configure the whole bot.
+    // Previously BotMain read KLINES_LIMIT (default 160) while SignalSender read KLINES
+    // (default 160, now 420). Setting only one name left the other at 160 → BTC context
+    // fetch could lag. Now: KLINES wins if set, else KLINES_LIMIT, else default 420.
+    // 420 > 400 gate in processPair; BTC GIC needs >30 bars — both covered.
+    private static final int KLINES = envIntAny(420, "KLINES", "KLINES_LIMIT");
     private static final int MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 3);
 
     private static final Map<String, String> SECTOR_LEADERS = new LinkedHashMap<>() {{
@@ -1127,6 +1132,19 @@ public final class BotMain {
     private static int envInt(String k, int d) {
         try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); }
         catch (Exception e) { return d; }
+    }
+
+    /** [v66] Read first non-empty env var from a list, fall back to default.
+     *  Used to unify KLINES and KLINES_LIMIT naming across BotMain and SignalSender. */
+    private static int envIntAny(int defaultValue, String... keys) {
+        for (String k : keys) {
+            String v = System.getenv(k);
+            if (v != null && !v.isBlank()) {
+                try { return Integer.parseInt(v.trim()); }
+                catch (NumberFormatException ignored) {}
+            }
+        }
+        return defaultValue;
     }
 
     private static void runWalkForwardValidation(com.bot.SignalSender sender,

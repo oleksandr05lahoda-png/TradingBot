@@ -625,6 +625,10 @@ public final class SignalSender {
     private final AtomicLong blockedFinalConf = new AtomicLong(0);
     private final AtomicLong blockedIsc       = new AtomicLong(0);
     private final AtomicLong gicHardHeadwind  = new AtomicLong(0);
+    // [v66] Per-cycle diagnostic snapshots — deltas, not cumulative. Lets [DIAG] log
+    // show what blocked DURING this cycle instead of totals since startup.
+    private long prevLiq = 0, prevCorr = 0, prevStale = 0, prevProfit = 0;
+    private long prevEarlyConf = 0, prevOptConf = 0, prevVpoc = 0, prevFinalConf = 0, prevIsc = 0;
     private final AtomicLong wsMessageCount = new AtomicLong(0);
     private final AtomicLong udsEventsCount = new AtomicLong(0);
     // fetchPool DiscardOldestPolicy counter — non-zero value
@@ -717,7 +721,15 @@ public final class SignalSender {
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
         this.TOP_N            = envInt("TOP_N", 30);
         this.MIN_CONF         = envDouble("MIN_CONF", 65.0); // [v52] 70→65: more signals through, quality controlled by AFC pre-filter
-        this.KLINES_LIMIT     = envInt("KLINES", 160);
+        this.KLINES_LIMIT     = envInt("KLINES", 420);
+        // [v66] 160 → 420. CRITICAL BUG FIX: processPair gate at line 1149 requires
+        // m15.size() >= 400, but KLINES_LIMIT=160 meant fetchKlines returned only 160
+        // bars. Every pair died silently at the gate (cyclePairsStale++). Since
+        // cyclePairsSeen was only incremented AFTER the gate, `seen=0` suppressed
+        // even the [DATA] diagnostic log. The main cycle path has been dead since v50
+        // when the gate was raised 160→400 without bumping this constant. 420 gives
+        // buffer over the 400-bar gate; also aligns with EMA200 + 14-ATR + 96-day-open
+        // lookback requirements downstream. Env var KLINES still overrides at runtime.
         this.BINANCE_REFRESH_MS = envLong("BINANCE_REFRESH_MINUTES", 60) * 60_000L;
         this.TICK_HISTORY     = envInt("TICK_HISTORY", 90);
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
@@ -972,6 +984,29 @@ public final class SignalSender {
 
         refreshCycleQuality(scanPairs.size());
         logCycleStats();
+
+        // [v66] Per-cycle diagnostic — prints WHY candidates die. Without this, "No signals"
+        // is a black hole: you can't tell if 0/27 reached analyze, or 27/27 were rejected
+        // silently in upstream gates. Produces one-line summary per cycle with block deltas.
+        long dLiq = blockedLiq.get()       - prevLiq;
+        long dCorr = blockedCorr.get()     - prevCorr;
+        long dStale = cyclePairsStale.get() - prevStale;
+        long dProfit = blockedProfit.get() - prevProfit;
+        long dEarly = blockedEarlyConf.get() - prevEarlyConf;
+        long dOpt = blockedOptConf.get()   - prevOptConf;
+        long dVpoc = blockedVpoc.get()     - prevVpoc;
+        long dFinal = blockedFinalConf.get() - prevFinalConf;
+        long dIsc = blockedIsc.get()       - prevIsc;
+        long droppedInAnalyze = scanPairs.size() - result.size()
+                - dLiq - dCorr - dStale - dProfit - dEarly - dOpt - dVpoc - dFinal - dIsc;
+        System.out.printf("[DIAG] scan=%d kept=%d | analyze_null=%d stale=%d liq=%d corr=%d prof=%d early=%d opt=%d vpoc=%d finConf=%d isc=%d%n",
+                scanPairs.size(), result.size(), Math.max(0, droppedInAnalyze),
+                dStale, dLiq, dCorr, dProfit, dEarly, dOpt, dVpoc, dFinal, dIsc);
+        prevLiq = blockedLiq.get(); prevCorr = blockedCorr.get(); prevStale = cyclePairsStale.get();
+        prevProfit = blockedProfit.get(); prevEarlyConf = blockedEarlyConf.get();
+        prevOptConf = blockedOptConf.get(); prevVpoc = blockedVpoc.get();
+        prevFinalConf = blockedFinalConf.get(); prevIsc = blockedIsc.get();
+
         return result;
     }
 
@@ -1146,7 +1181,15 @@ public final class SignalSender {
             // undefined, structural levels are synthetic. These are the coins most prone to
             // listing-pump rugs. 4 days = minimum to have stable ATR percentile distribution.
             // h1 requirement unchanged at 160 (≈6.7 days, already sufficient).
-            if (m15 == null || m15.size() < 400 || h1 == null || h1.size() < 160) {
+            // [v66] History gate 400 → 200. The original 400-bar requirement (100h / 4 days
+            // of 15m history) was overly conservative. 200 bars = 50h ≈ 2 days — sufficient
+            // for EMA200 stabilization (requires ≥200 bars exactly), ATR percentile over
+            // 96-bar window, and 96-bar "day open" computation in the event-coin filter.
+            // Paired with KLINES_LIMIT=420 default above, pairs consistently have ≥420
+            // bars available. 200 is a safety floor for freshly listed pairs that just
+            // crossed the 2-day history mark, which is the earliest point where robust
+            // ATR distribution exists. h1 gate stays at 160 (≈6.7 days) — unchanged.
+            if (m15 == null || m15.size() < 200 || h1 == null || h1.size() < 160) {
                 cyclePairsStale.incrementAndGet();
                 return null;
             }
