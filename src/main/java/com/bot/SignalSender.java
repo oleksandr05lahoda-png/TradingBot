@@ -1002,6 +1002,11 @@ public final class SignalSender {
         System.out.printf("[DIAG] scan=%d kept=%d | analyze_null=%d stale=%d liq=%d corr=%d prof=%d early=%d opt=%d vpoc=%d finConf=%d isc=%d%n",
                 scanPairs.size(), result.size(), Math.max(0, droppedInAnalyze),
                 dStale, dLiq, dCorr, dProfit, dEarly, dOpt, dVpoc, dFinal, dIsc);
+        // [v67] Show WHY analyze() returned null — top reject reasons from DecisionEngineMerged.
+        String rejectTrace = com.bot.DecisionEngineMerged.getAndResetRejectTrace();
+        if (!rejectTrace.isEmpty()) {
+            System.out.println("[DIAG-ANALYZE] " + rejectTrace);
+        }
         prevLiq = blockedLiq.get(); prevCorr = blockedCorr.get(); prevStale = cyclePairsStale.get();
         prevProfit = blockedProfit.get(); prevEarlyConf = blockedEarlyConf.get();
         prevOptConf = blockedOptConf.get(); prevVpoc = blockedVpoc.get();

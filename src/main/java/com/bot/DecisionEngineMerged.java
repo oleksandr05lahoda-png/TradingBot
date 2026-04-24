@@ -168,6 +168,33 @@ public final class DecisionEngineMerged {
     private static final ProbabilityCalibrator CALIBRATOR = new ProbabilityCalibrator();
     public static ProbabilityCalibrator getCalibrator() { return CALIBRATOR; }
 
+    // [v67] Reject trace — per-reason counter, deltas printed each cycle via getAndResetRejectTrace().
+    // Lets SignalSender's [DIAG] line show WHICH internal gate is killing 24 of 25 pairs.
+    // Zero cost when not logging — single AtomicLong increment per reject.
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>
+            REJECT_TRACE = new java.util.concurrent.ConcurrentHashMap<>();
+    static TradeIdea reject(String reason) {
+        REJECT_TRACE.computeIfAbsent(reason, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
+        return null;
+    }
+    /** Returns "k1=v1 k2=v2 ..." of deltas since last call, resets the map. */
+    public static String getAndResetRejectTrace() {
+        if (REJECT_TRACE.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        java.util.List<java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLong>> entries =
+                new java.util.ArrayList<>(REJECT_TRACE.entrySet());
+        entries.sort((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()));
+        int count = 0;
+        for (var e : entries) {
+            long v = e.getValue().getAndSet(0);
+            if (v == 0) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(e.getKey()).append('=').append(v);
+            if (++count >= 6) break;
+        }
+        return sb.toString();
+    }
+
     // [v42.0 FIX #12] Last GC timestamp for postExitCooldown leak fix
     private volatile long lastCooldownGcMs = 0L;
     private static final int POST_EXIT_MAX_SIZE = 5000;
@@ -1289,14 +1316,14 @@ public final class DecisionEngineMerged {
                                CoinCategory cat,
                                long now) {
 
-        if (!valid(c15) || !valid(c1h)) return null;
+        if (!valid(c15) || !valid(c1h)) return reject("invalid_candles");
 
         double price     = last(c15).close;
         double atr14     = atr(c15, 14);
         double move5     = c15.size() >= 5 ? (last(c15).close - c15.get(c15.size() - 5).close) / price : 0.0;
         double lastRange = last(c15).high - last(c15).low;
 
-        if (lastRange > atr14 * 4.5 || atr14 <= 0) return null;
+        if (lastRange > atr14 * 4.5 || atr14 <= 0) return reject("range_or_atr");
         atr14 = Math.max(atr14, price * 0.0012);
 
         // ── GIC crash state ──────────────────────────────────────
@@ -1394,13 +1421,13 @@ public final class DecisionEngineMerged {
             double atrPctile = com.bot.TradingCore.atrPercentile(c15, 14, 96);
             if (adxVal < 12 && atrPctile < 0.15) {
                 // Рынок абсолютно плоский — нет edge ни для тренда, ни для mean reversion
-                return null;
+                return reject("flat_market");
             }
             // В RANGE с низким ADX — только mean-reversion (RSI extreme), NO trend-following
             if (adxVal < 18 && atrPctile < 0.25) {
                 double rsi14 = rsi(c15, 14);
                 // Допускаем только extreme RSI в RANGE (mean-reversion)
-                if (rsi14 > 25 && rsi14 < 75) return null; // ни перекуплено, ни перепродано
+                if (rsi14 > 25 && rsi14 < 75) return reject("range_rsi_mid"); // ни перекуплено, ни перепродано
             }
         }
 
@@ -1421,12 +1448,12 @@ public final class DecisionEngineMerged {
                     double rsiVal = rsi(c15, 14);
                     if (rsiVal > 28 && rsiVal < 72) {
                         allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
-                        return null;
+                        return reject("choppy_range");
                     }
                 } else if (ci > 68.0) {
                     // WEAK_TREND + CI > 68 = явный пилообразный рынок → блок
                     allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
-                    return null;
+                    return reject("choppy_weak");
                 }
             }
         }
@@ -2627,9 +2654,7 @@ public final class DecisionEngineMerged {
         if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
             minConf = Math.max(0.0, minConf - 4.0);
         }
-        if (probability < minConf) return null;
-
-        // VOLATILITY CLASSIFICATION + NOISE GUARD
+        if (probability < minConf) return reject("prob_lt_minConf_early");
         //
         // RIVER FIX: бот ставил стоп 0.70% на монете с ATR 2-3%.
         // Причина: ATR был сжат в консолидации → стоп = noise level.
@@ -2646,7 +2671,7 @@ public final class DecisionEngineMerged {
         // No indicator works reliably at this level. Signal would be 90% false positive.
         if (robustAtrPct > 0.05) {
             allFlags.add("EXTREME_VOL_BLOCK");
-            return null;
+            return reject("extreme_vol");
         }
 
         // HIGH_ATR threshold corrected: 0.2% (was) → 1.5% (meaningful).
@@ -2664,13 +2689,13 @@ public final class DecisionEngineMerged {
         if (noiseScore > 2.8) {
             probability = Math.max(0, probability - 20);
             allFlags.add("HIGH_NOISE");
-            if (probability < minConf) return null;  // hard block — noisy coin, low signal
+            if (probability < minConf) return reject("high_noise_lt_minConf");  // hard block — noisy coin, low signal
         }
         // FIX #3b: Moderate noise gate: 2.5→2.2, penalty: 4→12
         if (noiseScore > 2.2) {
             probability = Math.max(0, probability - 12);
             allFlags.add("MOD_NOISE");
-            if (probability < minConf) return null;
+            if (probability < minConf) return reject("mod_noise_lt_minConf");
         }
         // FIX #3c: Combo guard — noisy coin + borderline probability = guaranteed loss
         // noiseScore > 2.0 means wicks are 2× the body — wide TP/SL needed, but signal is weak
@@ -2769,14 +2794,14 @@ public final class DecisionEngineMerged {
         if (stopDist > atrStop * 2.5) {
             allFlags.add("STRUCT_WIDE");
             probability = Math.max(0, probability - 7);
-            if (probability < minConf) return null;
+            if (probability < minConf) return reject("struct_wide_lt_minConf");
         }
 
         double stopPrice = side == com.bot.TradingCore.Side.LONG  ? price - stopDist : price + stopDist;
         double takePrice = side == com.bot.TradingCore.Side.LONG  ? price + stopDist * rrRatio
                 : price - stopDist * rrRatio;
 
-        if (!priceMovedEnough(symbol, price, robustAtrPct)) return null;
+        if (!priceMovedEnough(symbol, price, robustAtrPct)) return reject("price_not_moved");
 
         // ForecastEngine Integration — RELAXED GATING
         // Philosophy: ForecastEngine is an ADVISOR, not a DICTATOR.
@@ -3009,9 +3034,7 @@ public final class DecisionEngineMerged {
         // Single authoritative cap via PROB_CEIL. All intermediate caps above reference
         // the same constant, so this is purely a safety net for calibrator edge cases.
         probability = Math.max(0.0, Math.min(PROB_CEIL, probability));
-        if (probability < minConf) return null;
-
-        // [ДЫРА №6] АДАПТИВНЫЕ TP ПО РЕЖИМУ РЫНКА
+        if (probability < minConf) return reject("calibrated_lt_minConf");
         // Одни и те же множители TP для всех режимов — главная причина
         // "недобора" в тренде и "перелёта" в боковике.
         //
