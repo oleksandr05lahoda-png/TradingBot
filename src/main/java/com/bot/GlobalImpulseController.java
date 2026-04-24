@@ -1318,6 +1318,14 @@ public final class GlobalImpulseController {
     /**
      * [NEW] Возвращает true если SHORT следует давать агрессивно (без ожидания подтверждений).
      * При CRASH/PANIC: даём SHORT РАНЬШЕ, не ждём RSI/дивергенций.
+     *
+     * [FIX v69] Расширено на BTC_STRONG_DOWN и BTC_IMPULSE_DOWN.
+     * Прежняя версия срабатывала только на CRASH/PANIC — что редкость.
+     * При обычном BTC_STRONG_DOWN (BTC сыпется -1.5% за 45m) dual_htf_bull_veto
+     * блокировал ВСЕ шорты альтов, т.к. их 1H/2H EMA лагали на часы.
+     * Результат: zero signals exactly when market needs shorts most.
+     * Теперь aggressiveShort=true когда BTC объективно в нисходящем импульсе
+     * достаточной силы, что позволяет shorts пробиваться сквозь HTF veto.
      */
     public boolean isAggressiveShortMode() {
         GlobalContext ctx = currentContext;
@@ -1326,7 +1334,23 @@ public final class GlobalImpulseController {
                 || ctx.panicMode
                 || ctx.regime == GlobalRegime.BTC_CRASH
                 || ctx.regime == GlobalRegime.BTC_PANIC
+                || ctx.regime == GlobalRegime.BTC_STRONG_DOWN
+                || (ctx.regime == GlobalRegime.BTC_IMPULSE_DOWN
+                && ctx.impulseStrength > 0.55)
                 || (ctx.cascadeLevel == CascadeLevel.DANGER && ctx.btcDropVelocity > VELOCITY_DANGER);
+    }
+
+    /**
+     * [NEW v69] Симметричный aggressiveLong mode — зеркало aggressiveShort.
+     * При BTC_STRONG_UP и достаточно сильном BTC_IMPULSE_UP shorts на altах
+     * должны пробиваться сквозь dual_htf_bear_veto (т.к. EMA на 1H/2H лагают
+     * при восстановлении после даунтренда и продолжают показывать BEAR).
+     */
+    public boolean isAggressiveLongMode() {
+        GlobalContext ctx = currentContext;
+        return ctx.regime == GlobalRegime.BTC_STRONG_UP
+                || (ctx.regime == GlobalRegime.BTC_IMPULSE_UP
+                && ctx.impulseStrength > 0.55);
     }
 
     /**

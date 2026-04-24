@@ -123,9 +123,15 @@ public final class DecisionEngineMerged {
     // [v63] Back to 65 — Dispatcher cold-start now handles quality floor per phase.
     // Previous 72/70 was double-gating and killing signal flow. The progressive
     // gate in BotMain.Dispatcher gives us per-phase control; this can stay low.
-    private static final double BASE_CONF       = 65.0;
+    // [v69 FIX] 65→60. Комментарий v63 заявляет что Dispatcher обрабатывает quality
+    // floor per-phase, но при floor=65 создаётся double-gating:
+    //   stage 1: probability < 65 → reject в analyze() (prob_lt_minConf_early)
+    //   stage 2: Dispatcher phase gate поверх этого
+    // В логах prob_lt_minConf_early=8-12/цикл = главный душитель сигналов.
+    // При floor=60 Dispatcher остаётся authoritative источником quality control.
+    private static final double BASE_CONF       = 60.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 65.0;
+    private static final double MIN_CONF_FLOOR  = 60.0;
     private static final double MIN_CONF_CEIL   = 82.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -2180,18 +2186,33 @@ public final class DecisionEngineMerged {
                 f.startsWith("VSA_STOP_VOL_BEAR") || f.startsWith("VSA_ABSORB_BEAR")
                         || f.equals("VSA_NO_DEMAND"));
 
-        // DUAL-HTF HARD VETO (was soft multiplier *0.35, which signals could
-        // still clear via cluster confluence). hasLeadingOverride removed — too many
-        // dead-cat bounces were sneaking through after a long BEAR move.
+        // [v69 FIX] DUAL-HTF — СОФТ-ШТРАФ вместо HARD VETO.
+        //
+        // Причина правки: HTF EMA на 1H/2H лагает на 2-4 часа. При разворотах
+        // тренда (особенно на альтах, следующих за BTC) bias1h/bias2h остаются
+        // в старом направлении ещё часами после того, как 15m уже развернулся
+        // и микро-структура подтвердила разворот объёмами + liquidity grab.
+        //
+        // Старая логика: жёстко блокировала ВСЕ reversal-сигналы в направлении,
+        // противоположном HTF. В нейтральном/переходном режиме BTC это убивало
+        // до 9 сигналов за цикл (см. DIAG-ANALYZE logs).
+        //
+        // Новая логика: score *= 0.45 (−55%). Signal всё ещё должен иметь
+        // сильную структуру чтобы пройти minConf=60. Confluence ≥4 кластеров
+        // + объёмное подтверждение пробьёт penalty; слабые setup-ы не пройдут.
+        //
+        // Исключения: aggressiveShort/aggressiveLongHtf (сильный BTC impulse даёт
+        // фундаментальный повод игнорить HTF альта).
+        boolean aggressiveLongHtf = gicRef != null && gicRef.isAggressiveLongMode();
         if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
-                && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.LONG) {
-            allFlags.add("DUAL_HTF_BEAR_VETO");
-            return reject("dual_htf_bear_veto");
+                && !aggressiveLongHtf && prelimSide == com.bot.TradingCore.Side.LONG) {
+            totalLong *= 0.45;
+            allFlags.add("DUAL_HTF_BEAR_PENALTY");
         }
         if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
-            allFlags.add("DUAL_HTF_BULL_VETO");
-            return reject("dual_htf_bull_veto");
+            totalShort *= 0.45;
+            allFlags.add("DUAL_HTF_BULL_PENALTY");
         }
 
         // SINGLE-HTF penalty (new): one HTF against direction + other not
@@ -2227,11 +2248,17 @@ public final class DecisionEngineMerged {
 
         double scoreDiff = Math.abs(scoreLong - scoreShort);
 
-        // HARD EXHAUSTION VETO — prevents ADA/ENA type lag signals.
-        // If price already moved > 3×ATR from recent base in signal direction → HARD VETO.
-        // If moved > 2×ATR → heavy score penalty (score *= 0.20).
+        // [v69 FIX] HARD EXHAUSTION VETO — пороги ослаблены.
+        //
+        // Старое: threshold 3×ATR, lookback 10 баров. Срабатывал на любом
+        // trend-continuation impulse (2-3/цикл в DIAG-ANALYZE).
+        //   Проблема: 10 баров × 3×ATR = любой нормальный импульс, не перегрев.
+        // Новое:
+        //   lookback 10 → 15 баров (больше контекста, меньше false positives)
+        //   HARD veto threshold 3×ATR → 4.5×ATR (только реальное истощение)
+        //   penalty threshold 2×ATR → 2.8×ATR, penalty 0.20 → 0.40 (мягче)
         {
-            int lb = Math.min(10, c15.size() - 1);
+            int lb = Math.min(15, c15.size() - 1);
             double rHigh = Double.NEGATIVE_INFINITY, rLow = Double.MAX_VALUE;
             for (int i = c15.size() - 1 - lb; i < c15.size() - 1; i++) {
                 rHigh = Math.max(rHigh, c15.get(i).high);
@@ -2239,11 +2266,11 @@ public final class DecisionEngineMerged {
             }
             boolean candLong = scoreLong > scoreShort;
             double extDir = candLong ? (price - rLow) : (rHigh - price);
-            if (extDir > atr14 * 3.0) {
+            if (extDir > atr14 * 4.5) {
                 allFlags.add("EXHAUST_VETO_" + String.format("%.1fx", extDir / atr14));
                 return reject("exhaust_hard_veto");
-            } else if (extDir > atr14 * 2.0) {
-                if (candLong) scoreLong *= 0.20; else scoreShort *= 0.20;
+            } else if (extDir > atr14 * 2.8) {
+                if (candLong) scoreLong *= 0.40; else scoreShort *= 0.40;
                 allFlags.add("EXHAUST_PENALTY_" + String.format("%.1fx", extDir / atr14));
                 scoreDiff = Math.abs(scoreLong - scoreShort);
             }
@@ -2538,10 +2565,15 @@ public final class DecisionEngineMerged {
         // Если памп+дамп цикл обнаружен (gain≥35%, drop≥8%) — LONG блокируется.
         // Это предотвращает кейс SOONUSDT: бот дал LONG на 0.2359 когда цена уже
         // упала с 0.34 (хай памп-цикла) на -20%+. Классическая ловля ножа.
+        //
+        // [v69 FIX] Добавлен cooldown 30 минут. В логах BSBUSDT мелькал в
+        // [POST-PUMP VETO] каждый цикл минуту за минутой — зря тратил CPU
+        // на полный анализ пары, которая гарантированно будет отклонена.
         if (postPumpDump && side == com.bot.TradingCore.Side.LONG) {
             System.out.println("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
                     + String.format("%.0f%%", postPumpGain * 100)
                     + " dropFromHi=" + String.format("%.0f%%", postPumpDropFromHi * 100));
+            cooldownMap.put(symbol, System.currentTimeMillis() + 30 * 60_000L);
             return reject("post_pump_long");
         }
 
