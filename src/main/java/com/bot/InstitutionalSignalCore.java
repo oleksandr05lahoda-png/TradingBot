@@ -9,7 +9,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class InstitutionalSignalCore {
     // [v16.0 FIX] Reduced from 75→68. At 75% the bot requires near-perfect confluence
     // which almost never happens → 20+ hour droughts. 68% is high-conviction but achievable.
-    private static final double MAX_EFFECTIVE_MIN_CONF = 68.0;
+    // [v64] 68 → 70. Gives headroom when daily-loss penalty (+3) stacks on floor=58,
+    // so we can reach 61 without clamping. Still well below typical Dispatcher floor (73).
+    private static final double MAX_EFFECTIVE_MIN_CONF = 70.0;
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
@@ -25,15 +27,19 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;   // per symbol, bounded
 
     public InstitutionalSignalCore() {
-        // Tightened defaults: MAX_GLOBAL 12→6, MAX_SECTOR 3→2
-        // Aligned with CorrelationGuard MAX_TOTAL=6
+        // [v64] ISC is now a risk governor, not a quality filter.
+        // Quality is enforced upstream (DecisionEngine + Optimizer: floor 65, ceil 85)
+        // and downstream (Dispatcher cold-start gate: prob>=73 in Phase 1).
+        // ISC base conf dropped 65→63 so borderline 64-68% candidates reach Dispatcher
+        // where the OR-based gate can assess them properly. Without this, ISC silently
+        // killed signals before Dispatcher ever saw them.
         this(
                 envInt("ISC_MAX_GLOBAL_SIGNALS", 6),
-                envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),  // [v38.0] 2→1: no stacking
-                envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06), // [v38.0] 8%→6%
-                envDouble("ISC_BASE_MIN_CONF", 65.0),      // [v38.0] 62→65: higher bar
-                envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003), // [v38.0] 0.25%→0.3%
-                envInt("ISC_MAX_SAME_SECTOR_DIR", 2)       // [v38.0] 3→2
+                envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
+                envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
+                envDouble("ISC_BASE_MIN_CONF", 63.0),       // was 65.0
+                envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003),
+                envInt("ISC_MAX_SAME_SECTOR_DIR", 2)
         );
     }
 

@@ -753,23 +753,29 @@ public final class GlobalImpulseController {
     private CascadeLevel determineCascadeLevel(double crashScore, double move3, double move5) {
         if (panicMode.get()) return CascadeLevel.PANIC;
 
-        // PANIC: сверхбыстрое падение
+        // [v64 FIX] All levels now require minimum real price drop as a gate.
+        // Previously CRASH could fire on score>=0.70 alone (purely velocity-based),
+        // which caused the production bug: move3=-0.91% CrashScore=0.77 → CRASH → panic.
+
+        // PANIC: сверхбыстрое падение — unchanged, already requires drop
         if (move3 < -PANIC_DROP_3BAR || (move5 < -0.040 && btcConsecutiveBearBars >= 4)) {
             return CascadeLevel.PANIC;
         }
 
-        // CRASH: высокий crash score + несколько подтверждений
-        if (crashScore >= 0.70 || (crashScore >= 0.55 && btcConsecutiveBearBars >= 3)) {
+        // CRASH: high score AND real drop (at least -1.2% in 3 bars)
+        if ((crashScore >= 0.70 && move3 < -0.012)
+                || (crashScore >= 0.55 && btcConsecutiveBearBars >= 4 && move3 < -0.015)) {
             return CascadeLevel.CRASH;
         }
 
-        // DANGER: умеренный crash score
-        if (crashScore >= 0.40 || btcDropVelocity > VELOCITY_DANGER) {
+        // DANGER: moderate score + some drop
+        if ((crashScore >= 0.45 && move3 < -0.008)
+                || (btcDropVelocity > VELOCITY_DANGER && move3 < -0.005)) {
             return CascadeLevel.DANGER;
         }
 
-        // WATCH: первые признаки
-        if (crashScore >= 0.20 || btcDropVelocity > VELOCITY_WATCH) {
+        // WATCH: early signs — velocity-only OK here, it's just a soft flag
+        if (crashScore >= 0.25 || btcDropVelocity > VELOCITY_WATCH) {
             return CascadeLevel.WATCH;
         }
 
@@ -811,19 +817,29 @@ public final class GlobalImpulseController {
         // Уже в панике
         if (panicMode.get()) return false;
 
-        // BTC упал > 3% за 3 свечи (45 минут)
+        // [v64 FIX] Panic triggered at move3=-0.91% in production log.
+        // Root cause: velocity+score combo fired without real price drop guard.
+        // All panic branches NOW require a minimum REAL price drop. Velocity
+        // alone is NOT sufficient — otherwise normal volatility becomes "panic".
+
+        // (1) Hard trigger: BTC упал > 3% за 3 свечи (45 минут)
         if (move3 < -PANIC_DROP_3BAR) return true;
 
-        // BTC упал > 4% за 5 свечей
+        // (2) Hard trigger: BTC упал > 4% за 5 свечей
         if (move5 < -0.040) return true;
 
-        // Краш-уровень + 4+ red bars + высокий score
-        if (level == CascadeLevel.CRASH && btcConsecutiveBearBars >= 4
-                && crashScore >= 0.75) return true;
+        // (3) CRASH level cascade — now requires move3 < -1.5% AND 5+ bears AND score>=0.80.
+        // Old rule let crashScore=0.77 + 4 bars trigger panic at move3=-0.9%.
+        // Tightened to prevent false alarms on normal corrections.
+        if (level == CascadeLevel.CRASH
+                && btcConsecutiveBearBars >= 5
+                && crashScore >= 0.80
+                && move3 < -0.015) return true;
 
-        // Extreme волатильность + сильное падение
+        // (4) Extreme vol + real drop. Both guards required.
         if (currentContext.volRegime == VolatilityRegime.EXTREME
-                && move3 < -0.020 && btcDropVelocity > VELOCITY_CRASH) return true;
+                && move3 < -0.020
+                && btcDropVelocity > VELOCITY_CRASH) return true;
 
         return false;
     }

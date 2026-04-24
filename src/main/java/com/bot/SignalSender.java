@@ -434,6 +434,12 @@ public final class SignalSender {
     private final CorrelationGuard correlationGuard;
     private final ExecutorService fetchPool;
 
+    // [v64] Direct forecast access for EARLY_TICK path (bypasses DecisionEngine.analyze).
+    // Without this, every EARLY_TICK TradeIdea has forecast=null and Dispatcher reads
+    // fcConf=0.00, blocking 100% of signals during cold-start. Fix: call forecast() on
+    // fresh 5m/15m/1h candles when building EARLY_TICK idea so fcConf is a real number.
+    private final com.bot.TradingCore.ForecastEngine forecastEngineDirect;
+
     //  [v36-FIX Дыра3] ORDER EXECUTOR — встроен в SignalSender
     //  Включается через env ENABLE_AUTO_TRADE=1.
     //  При 0 — работает в режиме сигналов (текущее поведение).
@@ -737,7 +743,12 @@ public final class SignalSender {
             this.pumpHunter.addGarbageSymbol(garbageSym);
         }
         // [v14.0 FIX #Forecast] Wire ForecastEngine so TradeIdea.forecast is not always null.
-        this.decisionEngine.setForecastEngine(new com.bot.TradingCore.ForecastEngine());
+        // [v64] Also keep a direct reference — EARLY_TICK needs to call forecast() itself
+        // because it builds TradeIdea outside DecisionEngine.analyze() flow. Without this,
+        // every EARLY_TICK signal had forecast=null → fcConf=0.00 → Dispatcher gate blocked 100%.
+        com.bot.TradingCore.ForecastEngine fe = new com.bot.TradingCore.ForecastEngine();
+        this.decisionEngine.setForecastEngine(fe);
+        this.forecastEngineDirect = fe;
         this.optimizer.setPumpHunter(this.pumpHunter);
 
         // FETCH POOL BACKPRESSURE REDESIGN.
@@ -3078,19 +3089,50 @@ public final class SignalSender {
         double etTpMult   = etStopMult * (etVolBucket == com.bot.DecisionEngineMerged.VolatilityBucket.EXTREME ? 1.8
                 : etVolBucket == com.bot.DecisionEngineMerged.VolatilityBucket.HIGH   ? 2.2 : 2.8);
 
+        // [v64] Build a REAL forecast for this EARLY_TICK so Dispatcher can read fcConf > 0.
+        // The 7-arg TradeIdea ctor silently set forecast=null. This was invisible but lethal:
+        // 100% of EARLY_TICK signals were blocked because Dispatcher required either
+        // clusters>=3 (impossible for EARLY_TICK flags) OR fcConf>=0.50 (null → 0.00).
+        // Now we call ForecastEngine directly on cached candles. If anything fails
+        // (insufficient data, races), we fall back to the original null-forecast ctor,
+        // and Dispatcher's probability-solo-pass path will still let strong signals through.
+        com.bot.TradingCore.ForecastEngine.ForecastResult etForecast = null;
+        try {
+            List<com.bot.TradingCore.Candle> etC15 = getCached15mWithLive(symbol);
+            List<com.bot.TradingCore.Candle> etC5  = getM5FromWsOrRest(symbol, 100);
+            List<com.bot.TradingCore.Candle> etC1h = getCached(symbol, "1h", 100);
+            if (etC15 != null && etC15.size() >= 100 && etC1h != null && etC1h.size() >= 50) {
+                double etDelta = getNormalizedDelta(symbol);
+                etForecast = forecastEngineDirect.forecast(etC5, etC15, etC1h, etDelta);
+            }
+        } catch (Throwable ignored) { /* fall through — null forecast is acceptable */ }
+
+        boolean isLong = up;
+        double riskDist = atrV * etStopMult;
+        double entry = price;
+        double stop  = isLong ? price - riskDist : price + riskDist;
+        double take  = isLong ? price + atrV * etTpMult : price - atrV * etTpMult;
+        List<String> flags = new java.util.ArrayList<>(java.util.List.of(
+                "EARLY_TICK", up ? "UP" : "DN",
+                String.format("vel=%.2e", vel),
+                String.format("vda=%+.2f", vda),
+                "stk=" + streak,
+                "vBkt=" + etVolBucket.label));
+
+        // Use 14-arg TradeIdea ctor to attach forecast + category + htfBias.
         return new com.bot.DecisionEngineMerged.TradeIdea(
                 symbol,
-                up ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
-                price,
-                up ? price - atrV * etStopMult : price + atrV * etStopMult,
-                up ? price + atrV * etTpMult   : price - atrV * etTpMult,
-                conf,
-                new java.util.ArrayList<>(java.util.List.of(
-                        "EARLY_TICK", up ? "UP" : "DN",
-                        String.format("vel=%.2e", vel),
-                        String.format("vda=%+.2f", vda),
-                        "stk=" + streak,
-                        "vBkt=" + etVolBucket.label)));
+                isLong ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
+                entry, stop, take,
+                /* rr          */ 2.0,
+                /* probability */ conf,
+                flags,
+                /* fundingRate  */ 0.0,
+                /* fundingDelta */ 0.0,
+                /* oiChange     */ 0.0,
+                /* htfBias      */ "NONE",
+                etCat,
+                etForecast);
     }
 
     private boolean filterEarlySignal(com.bot.DecisionEngineMerged.TradeIdea sig) {

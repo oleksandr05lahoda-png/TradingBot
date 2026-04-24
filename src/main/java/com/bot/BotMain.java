@@ -215,17 +215,25 @@ public final class BotMain {
     // ═══════════════════════════════════════════════════════════════════
     public static final class Dispatcher {
 
-        // [v62] Progressive cold-start. Old v61 gate required all three at once
-        // (prob>=78 AND clusters>=4 AND fcConf>=0.55) which, on a neutral market,
-        // produced 0 signals / 8 hours. We now relax gradually as we collect data.
+        // [v64 CRITICAL FIX] Cold-start gate redesign.
         //
-        // Phase 1 (0-9 outcomes):   prob>=75 AND (clusters>=4 OR fcConf>=0.55)
-        // Phase 2 (10-19 outcomes): prob>=72 AND (clusters>=3 OR fcConf>=0.50)
-        // Phase 3 (20-29 outcomes): prob>=70 (either clusters or fc is fine, single)
-        // Phase 4 (30+):            no extra gate (Dispatcher just applies rr/sl/dedup)
+        // ROOT CAUSE of 12h+ silence: EARLY_TICK TradeIdea is built via the 7-arg
+        // constructor which sets forecast=null. Dispatcher read fcConf=0.00 always.
+        // Flags = [EARLY_TICK, UP, vel=..., vda=...] → countClusterFlags=1 (only
+        // "EARLY_TICK" matches). Phase 1 required clusters>=3 OR fcConf>=0.50 —
+        // both physically impossible for EARLY_TICK → 100% block → calibrator
+        // never received a single outcome → bot stuck in Phase 1 forever.
         //
-        // The underlying cluster-confidence engine already filters weak signals
-        // upstream. This gate is a quality floor, not a primary filter.
+        // New gate: OR-based, probability-first.
+        //   Phase 1 (n<10):  prob>=73 AND (prob>=76 OR clusters>=2 OR fcConf>=0.45)
+        //   Phase 2 (10-19): prob>=70 AND (prob>=74 OR clusters>=2 OR fcConf>=0.40)
+        //   Phase 3 (20-29): prob>=68
+        //   Phase 4 (30+):   no extra gate — calibrator is the authority
+        //
+        // Rationale: a standalone signal with probability>=76 (MAX_CONF=85 ceiling)
+        // represents a very high-conviction setup and is allowed through even
+        // without cluster confluence. This lets EARLY_TICK breathe while still
+        // rejecting the 60-72% mediocre noise.
         private static final int    COLD_START_MIN_OUTCOMES = 30;
 
         private static final double MIN_RR          = 2.00;
@@ -306,51 +314,47 @@ public final class BotMain {
             int clusters   = countClusterFlags(idea.flags);
             double fcConf  = idea.forecast != null ? idea.forecast.confidence : 0.0;
 
+            // [v64] OR-based gate. probShortcut is the "high conviction solo pass":
+            // a signal with prob >= probShortcut passes regardless of clusters/fc.
+            // This lets EARLY_TICK (which has null forecast by design) through when
+            // its standalone probability is strong enough.
             double probFloor;
-            boolean needExtra;
-            int extraClusters;
-            double extraFcConf;
+            double probShortcut;
+            int    minClusters;
+            double minFcConf;
 
             if (calSamples >= COLD_START_MIN_OUTCOMES) {
-                probFloor = 0;
-                needExtra = false;
-                extraClusters = 0;
-                extraFcConf = 0;
+                // Phase 4 — calibrator is trusted, Dispatcher only enforces RR/SL/dedup.
+                probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 20) {
-                // [v63] Was 70.0 — lowered to 65.0. Pairs with prob 65-70 that
-                // also have clusters/fc are typically good scalp setups that we
-                // were missing. Real winrate tracking will auto-correct.
-                probFloor = 65.0;
-                needExtra = false;
-                extraClusters = 0;
-                extraFcConf = 0;
+                // Phase 3 — near-graduation. Single prob floor, no confluence required.
+                probFloor = 68.0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 10) {
-                probFloor = 68.0;         // was 72.0
-                needExtra = true;
-                extraClusters = 2;        // was 3
-                extraFcConf = 0.45;       // was 0.50
+                // Phase 2 — warming up. prob>=70 baseline; prob>=74 solo-pass.
+                probFloor = 70.0; probShortcut = 74.0; minClusters = 2; minFcConf = 0.40;
             } else {
-                probFloor = 70.0;         // was 75.0
-                needExtra = true;
-                extraClusters = 3;        // was 4
-                extraFcConf = 0.50;       // was 0.55
+                // Phase 1 — hard cold start. prob>=73 baseline; prob>=76 solo-pass,
+                // otherwise need either 2+ cluster flags or forecast conf >= 0.45.
+                probFloor = 73.0; probShortcut = 76.0; minClusters = 2; minFcConf = 0.45;
             }
 
-            if (idea.probability < probFloor) {
+            if (probFloor > 0 && idea.probability < probFloor) {
                 blockedByGate.incrementAndGet();
                 blockedColdStart.incrementAndGet();
                 return Result.blocked(String.format(
                         "cold-start: prob=%.0f<%.0f (n=%d)", idea.probability, probFloor, calSamples));
             }
-            if (needExtra) {
-                boolean clustersOk = clusters >= extraClusters;
-                boolean fcOk = fcConf >= extraFcConf;
+            if (probShortcut > 0 && idea.probability < probShortcut) {
+                // Didn't clear the solo-pass — require secondary confluence.
+                boolean clustersOk = clusters >= minClusters;
+                boolean fcOk       = fcConf   >= minFcConf;
                 if (!clustersOk && !fcOk) {
                     blockedByGate.incrementAndGet();
                     blockedColdStart.incrementAndGet();
                     return Result.blocked(String.format(
-                            "cold-start: clusters=%d<%d AND fcConf=%.2f<%.2f (n=%d)",
-                            clusters, extraClusters, fcConf, extraFcConf, calSamples));
+                            "cold-start: prob=%.0f<shortcut=%.0f AND clusters=%d<%d AND fcConf=%.2f<%.2f (n=%d)",
+                            idea.probability, probShortcut,
+                            clusters, minClusters, fcConf, minFcConf, calSamples));
                 }
             }
 
@@ -418,7 +422,11 @@ public final class BotMain {
         for (String f : flags) {
             if (f == null) continue;
             String u = f.toUpperCase();
-            if (u.startsWith("CLUSTER") || u.contains("EARLY") || u.contains("TREND")
+            // [v64] Honest counting. EARLY_TICK removed — it's a trigger type, NOT a cluster.
+            // Counting it inflated clusters=1 for every EARLY_TICK signal and fooled the
+            // old secondary gate. Real confluence means: structural (BOS/FVG/OB),
+            // volume (VSA/OFV/OBI/DIV), momentum (BREAKOUT/EXHAUST/PUMP), context (HTF/TREND).
+            if (u.startsWith("CLUSTER") || u.contains("TREND")
                     || u.contains("BREAKOUT") || u.contains("VSA") || u.contains("PUMP")
                     || u.contains("EXH") || u.contains("OFV_STRONG") || u.contains("OBI")
                     || u.contains("HTF_") || u.contains("BOS") || u.contains("FVG")
@@ -585,7 +593,7 @@ public final class BotMain {
         }, "ShutdownHook"));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v63 SCANNER started " + nowLocalStr()
+        LOG.info("═══ TradingBot v64 SCANNER started " + nowLocalStr()
                 + " (first cycle in 90s) ═══");
     }
 
@@ -1052,16 +1060,16 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v63`\n"
+        return "⚡ *TradingBot SCANNER* `v64`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures · TOP-30 · Scanner-only\n"
                 + "R:R min `1:2` · SL min `0.35%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🎯 *Оптимизация v63 (balanced):*\n"
-                + "• Cold-start: 70→68→65 (прогрессивно)\n"
-                + "• До 6 сигналов/час\n"
-                + "• Volume-gate расслаблен (40M/15M)\n"
-                + "• Цель: 1-3 качественных сигнала в день\n"
+                + "🎯 *v64 Critical fixes:*\n"
+                + "• Cold-start gate → OR-logic\n"
+                + "• EARLY_TICK unblocked (fcConf=0 bug)\n"
+                + "• Panic thresholds raised\n"
+                + "• Target: 3-8 signals/day\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
                 + "_Реальные сигналы с Entry/TP1-3/SL._";
