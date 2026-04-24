@@ -1462,7 +1462,7 @@ public final class DecisionEngineMerged {
         // Пары с не-ASCII символами (иероглифы, спецзнаки) = неликвид
         for (int ci = 0; ci < symbol.length(); ci++) {
             char ch = symbol.charAt(ci);
-            if (ch > 127) return null; // не-ASCII = мусорная пара
+            if (ch > 127) return reject("symbol_non_ascii"); // не-ASCII = мусорная пара
         }
 
         int n15 = c15.size();
@@ -2186,12 +2186,12 @@ public final class DecisionEngineMerged {
         if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.LONG) {
             allFlags.add("DUAL_HTF_BEAR_VETO");
-            return null;
+            return reject("dual_htf_bear_veto");
         }
         if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
             allFlags.add("DUAL_HTF_BULL_VETO");
-            return null;
+            return reject("dual_htf_bull_veto");
         }
 
         // SINGLE-HTF penalty (new): one HTF against direction + other not
@@ -2241,7 +2241,7 @@ public final class DecisionEngineMerged {
             double extDir = candLong ? (price - rLow) : (rHigh - price);
             if (extDir > atr14 * 3.0) {
                 allFlags.add("EXHAUST_VETO_" + String.format("%.1fx", extDir / atr14));
-                return null;
+                return reject("exhaust_hard_veto");
             } else if (extDir > atr14 * 2.0) {
                 if (candLong) scoreLong *= 0.20; else scoreShort *= 0.20;
                 allFlags.add("EXHAUST_PENALTY_" + String.format("%.1fx", extDir / atr14));
@@ -2420,12 +2420,12 @@ public final class DecisionEngineMerged {
             if (localExh.direction == -1 && side == com.bot.TradingCore.Side.LONG) {
                 allFlags.add("LOCAL_EXHAUST_DOWN_VETO_"
                         + String.format("%.1fATR", localExh.moveAtr));
-                return null;
+                return reject("local_exhaust_down_long");
             }
             if (localExh.direction == +1 && side == com.bot.TradingCore.Side.SHORT) {
                 allFlags.add("LOCAL_EXHAUST_UP_VETO_"
                         + String.format("%.1fATR", localExh.moveAtr));
-                return null;
+                return reject("local_exhaust_up_short");
             }
         }
 
@@ -2445,7 +2445,7 @@ public final class DecisionEngineMerged {
         // Removed EARLY_SOLO exemption — it was allowing chasing on exhausted moves.
         if (lateEntryPenalty && lateMoveAtrMul > 1.8) {
             allFlags.add(String.format("LATE_HARD_BLOCK_%.1fx", lateMoveAtrMul));
-            return null;
+            return reject("late_hard_block");
         }
 
         // [v50 §7] MOMENTUM EXHAUSTION BLOCK — if impulse is spent, block same-direction entry.
@@ -2454,7 +2454,7 @@ public final class DecisionEngineMerged {
             if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.LONG)
                     || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.SHORT)) {
                 allFlags.add("EXHAUSTION_BLOCK");
-                return null;
+                return reject("momentum_exhausted");
             }
             // Opposite direction = potential reversal entry — BOOST instead
             if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.SHORT)
@@ -2471,7 +2471,7 @@ public final class DecisionEngineMerged {
         // [v50 §11] VELOCITY DECAY PENALTY — dying momentum even without full exhaustion
         if (velocityDecay && lateEntryPenalty) {
             allFlags.add("VEL_DECAY_LATE_BLOCK");
-            return null; // velocity decay + late = guaranteed loss
+            return reject("vel_decay_late"); // velocity decay + late = guaranteed loss
         }
 
         // [v50 §1] leadBreakoutOverride REMOVED.
@@ -2501,12 +2501,12 @@ public final class DecisionEngineMerged {
 
         // Cooldown
         long shortCooldownOverride = aggressiveShort ? 60_000L : -1;
-        if (!cooldownAllowedEx(symbol, side, cat, now, shortCooldownOverride)) return null;
-        if (!flipAllowed(symbol, side)) return null;
+        if (!cooldownAllowedEx(symbol, side, cat, now, shortCooldownOverride)) return reject("cooldown_block");
+        if (!flipAllowed(symbol, side)) return reject("flip_block");
 
         // Post-exit directional cooldown: prevents re-entry in same direction
         // for 10 minutes after any position close. Eliminates spin-trading on same pair.
-        if (isPostExitBlocked(symbol, side)) return null;
+        if (isPostExitBlocked(symbol, side)) return reject("post_exit_block");
 
         // Panic remains a hard veto for LONG.
         // Outside panic, SignalSender reapplies nuanced GIC weights after all downstream
@@ -2517,7 +2517,7 @@ public final class DecisionEngineMerged {
                 || gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
                 && side == com.bot.TradingCore.Side.LONG) {
             allFlags.add("GIC_PANIC_VETO_LONG");
-            return null;
+            return reject("gic_panic_long");
         }
         // GIC directional gate: was adding a flag but NOT blocking the signal.
         // Comment said "actual veto happens post-candidate-selection via earlyReturn sentinel"
@@ -2525,12 +2525,12 @@ public final class DecisionEngineMerged {
         if (gicOnlyLong && side == com.bot.TradingCore.Side.SHORT) {
             // BTC in extreme up-impulse: short on an alt = very high failure rate
             allFlags.add("GIC_STRONG_BTCUP");
-            return null; // [FIX #22] ACTUAL VETO — was missing
+            return reject("gic_btcup_short_veto"); // [FIX #22] ACTUAL VETO — was missing
         }
         if (gicOnlyShort && side == com.bot.TradingCore.Side.LONG) {
             // BTC crashing: long on an alt = catching a falling knife
             allFlags.add("GIC_STRONG_BTCDOWN");
-            return null; // [FIX #22] ACTUAL VETO — was missing
+            return reject("gic_btcdown_long_veto"); // [FIX #22] ACTUAL VETO — was missing
         }
 
         // POST-PUMP LONG VETO
@@ -2542,7 +2542,7 @@ public final class DecisionEngineMerged {
             System.out.println("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
                     + String.format("%.0f%%", postPumpGain * 100)
                     + " dropFromHi=" + String.format("%.0f%%", postPumpDropFromHi * 100));
-            return null;
+            return reject("post_pump_long");
         }
 
         // КАЛИБРОВАННАЯ УВЕРЕННОСТЬ — на кластерах
@@ -2701,7 +2701,7 @@ public final class DecisionEngineMerged {
         // noiseScore > 2.0 means wicks are 2× the body — wide TP/SL needed, but signal is weak
         if (noiseScore > 2.0 && probability < 70.0) {
             allFlags.add("NOISE_PROB_COMBO_BLOCK");
-            return null;
+            return reject("noise_prob_combo");
         }
 
         // СТОП И ТЕЙК — [v37.0] ROBUST STRUCTURAL STOP PLACEMENT
@@ -3132,7 +3132,7 @@ public final class DecisionEngineMerged {
         if (tp2Mult < 2.00) {
             System.out.println("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
                     + String.format("%.2f", tp2Mult) + " < 2.00 (user pref 1:2)");
-            return null;
+            return reject("rr_tp2_lt_2");
         }
         adaptiveRR = tp3Mult; // пересчитываем после возможной правки tp3Mult
 
