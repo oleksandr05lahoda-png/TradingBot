@@ -190,7 +190,7 @@ public final class DecisionEngineMerged {
             if (v == 0) continue;
             if (sb.length() > 0) sb.append(' ');
             sb.append(e.getKey()).append('=').append(v);
-            if (++count >= 6) break;
+            if (++count >= 12) break;
         }
         return sb.toString();
     }

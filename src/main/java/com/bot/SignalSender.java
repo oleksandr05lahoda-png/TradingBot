@@ -990,7 +990,10 @@ public final class SignalSender {
         // silently in upstream gates. Produces one-line summary per cycle with block deltas.
         long dLiq = blockedLiq.get()       - prevLiq;
         long dCorr = blockedCorr.get()     - prevCorr;
-        long dStale = cyclePairsStale.get() - prevStale;
+        // [v67 FIX] cyclePairsStale is per-cycle (reset at line 960), not cumulative like
+        // blockedLiq/blockedCorr. Using delta arithmetic with prevStale produced negative values.
+        // Read raw cycle value; don't update prevStale below.
+        long dStale = cyclePairsStale.get();
         long dProfit = blockedProfit.get() - prevProfit;
         long dEarly = blockedEarlyConf.get() - prevEarlyConf;
         long dOpt = blockedOptConf.get()   - prevOptConf;
@@ -1007,7 +1010,7 @@ public final class SignalSender {
         if (!rejectTrace.isEmpty()) {
             System.out.println("[DIAG-ANALYZE] " + rejectTrace);
         }
-        prevLiq = blockedLiq.get(); prevCorr = blockedCorr.get(); prevStale = cyclePairsStale.get();
+        prevLiq = blockedLiq.get(); prevCorr = blockedCorr.get(); // prevStale: no-op — per-cycle
         prevProfit = blockedProfit.get(); prevEarlyConf = blockedEarlyConf.get();
         prevOptConf = blockedOptConf.get(); prevVpoc = blockedVpoc.get();
         prevFinalConf = blockedFinalConf.get(); prevIsc = blockedIsc.get();

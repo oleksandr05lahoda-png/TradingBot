@@ -332,15 +332,23 @@ public final class BotMain {
                 // Phase 4 — calibrator is trusted, Dispatcher only enforces RR/SL/dedup.
                 probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 20) {
-                // Phase 3 — near-graduation. Single prob floor, no confluence required.
-                probFloor = 68.0; probShortcut = 0; minClusters = 0; minFcConf = 0;
+                // Phase 3 — near-graduation. [v68] Was 68 floor; relaxed to 0 so MIN_CONF=65
+                // upstream gate becomes the sole filter at this stage. Maintains monotonic
+                // relaxation with softened Phase 1/2 below.
+                probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 10) {
-                // Phase 2 — warming up. prob>=70 baseline; prob>=74 solo-pass.
-                probFloor = 70.0; probShortcut = 74.0; minClusters = 2; minFcConf = 0.40;
+                // Phase 2 — warming up. [v68] Softened 70→66 / 74→70 to match relaxed
+                // Phase 1 below. Monotonic: Phase 1 (68/72) > Phase 2 (66/70) > Phase 3 (0).
+                probFloor = 66.0; probShortcut = 70.0; minClusters = 2; minFcConf = 0.40;
             } else {
                 // Phase 1 — hard cold start. prob>=73 baseline; prob>=76 solo-pass,
                 // otherwise need either 2+ cluster flags or forecast conf >= 0.45.
-                probFloor = 73.0; probShortcut = 76.0; minClusters = 2; minFcConf = 0.45;
+                // [v68] Softened 73→68 and 76→72 to solve the bootstrap deadlock:
+                //   original Phase 1 was so strict that the bot couldn't dispatch ANY
+                //   signal → calibrator stayed at n=0 → Phase 1 never ended. With env
+                //   MIN_CONF=65, floor=68 keeps only 3-pt cold-start margin (safe) and
+                //   solo-pass at 72 is realistically achievable on strong setups.
+                probFloor = 68.0; probShortcut = 72.0; minClusters = 2; minFcConf = 0.45;
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {
