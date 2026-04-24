@@ -1284,10 +1284,13 @@ public final class SignalSender {
             //      the bot to discard most pairs when WebSocket connectivity was degraded).
             // NEW: stale → zero out delta/VDA (conservative assumption: no momentum) and CONTINUE.
             // The historical candle data (15m/1h/2h) is still valid and sufficient for analysis.
+            // [v68 FIX] Removed cyclePairsStale.incrementAndGet() here — this path does NOT
+            // return null, so the pair still reaches analyze(). Incrementing cyclePairsStale
+            // here double-counted into [DIAG] droppedInAnalyze math: stale=24/seen=18 (>100%)
+            // made analyze_null compute as 0, masking the real reject reasons in [DIAG-ANALYZE].
             if (lastRealtimeTick == null || System.currentTimeMillis() - lastRealtimeTick > REALTIME_STALE_SKIP_MS) {
                 decisionEngine.setVolumeDelta(pair, 0.0);
                 decisionEngine.setVDA(pair, 0.0);
-                cyclePairsStale.incrementAndGet();
                 // Note: NOT returning null here anymore — analysis continues with zeroed delta
             }
 
