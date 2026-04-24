@@ -339,7 +339,10 @@ public final class BotMain {
             } else if (calSamples >= 10) {
                 // Phase 2 — warming up. [v68] Softened 70→66 / 74→70 to match relaxed
                 // Phase 1 below. Monotonic: Phase 1 (68/72) > Phase 2 (66/70) > Phase 3 (0).
-                probFloor = 66.0; probShortcut = 70.0; minClusters = 2; minFcConf = 0.40;
+                // [v69 FIX] Synced with MIN_CONF_FLOOR=60 in DecisionEngineMerged.
+                // Было 66/70 — создавало gap 6-10 pt между analyze() и Dispatcher.
+                // Стало 62/66 — 2-6 pt margin поверх DecisionEngine minConf=60.
+                probFloor = 62.0; probShortcut = 66.0; minClusters = 2; minFcConf = 0.40;
             } else {
                 // Phase 1 — hard cold start. prob>=73 baseline; prob>=76 solo-pass,
                 // otherwise need either 2+ cluster flags or forecast conf >= 0.45.
@@ -348,7 +351,11 @@ public final class BotMain {
                 //   signal → calibrator stayed at n=0 → Phase 1 never ended. With env
                 //   MIN_CONF=65, floor=68 keeps only 3-pt cold-start margin (safe) and
                 //   solo-pass at 72 is realistically achievable on strong setups.
-                probFloor = 68.0; probShortcut = 72.0; minClusters = 2; minFcConf = 0.45;
+                // [v69 FIX] Synced with MIN_CONF_FLOOR=60. Было 68/72 при MIN_CONF=65
+                // (gap 3 pt). При MIN_CONF=60 прежние 68/72 создавали gap 8/12 pt —
+                // analyze() пропускал 60-67, Dispatcher всё убивал. Новое: 64/68
+                // сохраняет 4 pt cold-start margin над analyze floor.
+                probFloor = 64.0; probShortcut = 68.0; minClusters = 2; minFcConf = 0.40;
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {

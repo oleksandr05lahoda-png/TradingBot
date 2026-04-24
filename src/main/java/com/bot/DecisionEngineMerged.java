@@ -162,6 +162,9 @@ public final class DecisionEngineMerged {
     private final java.util.concurrent.atomic.AtomicReference<Double> globalMinConf
             = new java.util.concurrent.atomic.AtomicReference<>(BASE_CONF);
     private final Map<String, Long>             cooldownMap      = new ConcurrentHashMap<>();
+    // [v69] Отдельный per-symbol skip для post-pump пар. Key = symbol, value = until-timestamp.
+    // Не переиспользуем cooldownMap (у того другая semantics: time-of-last-signal, key=sym_side).
+    private final Map<String, Long>             postPumpSkipUntil = new ConcurrentHashMap<>();
     private final Map<String, Deque<String>>    recentDirs       = new ConcurrentHashMap<>();
     private final Map<String, Double>           lastSigPrice     = new ConcurrentHashMap<>();
     private final Map<String, FundingOIData>    fundingCache     = new ConcurrentHashMap<>();
@@ -1323,6 +1326,14 @@ public final class DecisionEngineMerged {
                                long now) {
 
         if (!valid(c15) || !valid(c1h)) return reject("invalid_candles");
+
+        // [v69] Post-pump skip — ранний выход без анализа для пар, недавно заблокированных
+        // post-pump вето. Экономит CPU и чистит логи от повторяющегося [POST-PUMP VETO].
+        Long ppUntil = postPumpSkipUntil.get(symbol);
+        if (ppUntil != null) {
+            if (now < ppUntil) return reject("post_pump_cooldown");
+            postPumpSkipUntil.remove(symbol); // expired
+        }
 
         double price     = last(c15).close;
         double atr14     = atr(c15, 14);
@@ -2566,14 +2577,16 @@ public final class DecisionEngineMerged {
         // Это предотвращает кейс SOONUSDT: бот дал LONG на 0.2359 когда цена уже
         // упала с 0.34 (хай памп-цикла) на -20%+. Классическая ловля ножа.
         //
-        // [v69 FIX] Добавлен cooldown 30 минут. В логах BSBUSDT мелькал в
-        // [POST-PUMP VETO] каждый цикл минуту за минутой — зря тратил CPU
-        // на полный анализ пары, которая гарантированно будет отклонена.
+        // [v69 FIX] post-pump skip в отдельном map'е (cooldownMap использует
+        // key = sym+"_"+side и другую semantics — нельзя переиспользовать).
+        // Проверка postPumpSkipUntil вынесена в начало analyze() для раннего
+        // выхода без полного анализа. 30 минут вполне достаточно чтобы 20-барное
+        // окно сдвинулось и условие postPumpDump перестало срабатывать естественно.
         if (postPumpDump && side == com.bot.TradingCore.Side.LONG) {
             System.out.println("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
                     + String.format("%.0f%%", postPumpGain * 100)
                     + " dropFromHi=" + String.format("%.0f%%", postPumpDropFromHi * 100));
-            cooldownMap.put(symbol, System.currentTimeMillis() + 30 * 60_000L);
+            postPumpSkipUntil.put(symbol, System.currentTimeMillis() + 30 * 60_000L);
             return reject("post_pump_long");
         }
 
