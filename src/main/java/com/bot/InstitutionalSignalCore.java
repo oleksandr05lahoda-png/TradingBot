@@ -5,16 +5,28 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/** InstitutionalSignalCore v17.0 — PORTFOLIO RISK CONTROLLER */
+/**
+ * InstitutionalSignalCore v18.0 — PORTFOLIO RISK CONTROLLER
+ *
+ * Назначение: risk-governor + cooldown manager.
+ * НЕ quality-filter (это делает DecisionEngine + Dispatcher).
+ *
+ * v18.0 changes:
+ *  - Smoothed thresholds for flat-market signal generation
+ *  - Removed dead version-history comments (kept WHY-rationale)
+ *  - Tightened daily-loss → size-only penalty (no signal blocks)
+ *  - Synced with DE MIN_CONF_FLOOR=50, Dispatcher floor=53
+ */
 public final class InstitutionalSignalCore {
-    // [v70] 70 → 62 synced с DE MIN_CONF_FLOOR=55 + Dispatcher Phase 1 floor=58.
-    // При floor=58 and daily penalty +2 потолок 62 оставляет валидный диапазон.
-    private static final double MAX_EFFECTIVE_MIN_CONF = 62.0;
+
+    // [v18] Synced with DE MIN_CONF_FLOOR=50 + Dispatcher floor=53.
+    // Ceiling 60: при daily penalty +2 валидный диапазон floor..60 не ужимается до нуля.
+    private static final double MAX_EFFECTIVE_MIN_CONF = 60.0;
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
     private final int    maxSignalsPerSymbol;
-    private final double maxPortfolioHeat;   // max total risk as fraction of balance
+    private final double maxPortfolioHeat;
     private final double baseMinConfidence;
     private final double minSignalPriceDiff;
     private final int    maxSameSectorSameDir;
@@ -22,16 +34,15 @@ public final class InstitutionalSignalCore {
     // Time stop
     private static final int  TIME_STOP_BARS  = 6;    // 6 × 15m = 90 min
     private static final long TIME_STOP_MS    = TIME_STOP_BARS * 15 * 60_000L;
-    private static final int  MAX_HISTORY     = 100;   // per symbol, bounded
+    private static final int  MAX_HISTORY     = 100;
 
     public InstitutionalSignalCore() {
-        // [v70] baseMinConfidence 63 → 56 synced с DE=55.
-        // ISC остаётся risk-governor не quality-filter; quality gate живёт в DE+Dispatcher.
+        // [v18] baseMinConfidence 56 → 53 (synced с DE=50 + 3pt margin).
         this(
                 envInt("ISC_MAX_GLOBAL_SIGNALS", 6),
                 envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
                 envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
-                envDouble("ISC_BASE_MIN_CONF", 56.0),
+                envDouble("ISC_BASE_MIN_CONF", 53.0),
                 envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003),
                 envInt("ISC_MAX_SAME_SECTOR_DIR", 2)
         );
@@ -53,11 +64,11 @@ public final class InstitutionalSignalCore {
     private final Map<String, Double>              symbolScore    = new ConcurrentHashMap<>();
     private volatile double                        currentHeat    = 0.0;
 
-    //  [v17.0 §1] SIGNAL STATE MANAGER — Anti-bipolar + SL Cooldown
+    //  SIGNAL STATE MANAGER — Anti-bipolar + SL Cooldown
     //
     //  PROBLEM A — Bipolar trades: bot was sending LONG and then SHORT
-    //  (or vice versa) on the same symbol while the first trade was still
-    //  open. Result: hedged position = pure fee loss, no directional edge.
+    //  on the same symbol while the first trade was still open.
+    //  Result: hedged position = pure fee loss, no directional edge.
     //
     //  PROBLEM B — Falling knife re-entries: after SL hit, next signal
     //  on the same symbol could fire within the next 1-minute cycle,
@@ -65,9 +76,8 @@ public final class InstitutionalSignalCore {
     //
     //  SOLUTION:
     //    · activeSymbols tracks which symbols currently have ANY open trade.
-    //    · Any new signal on an active symbol → HARD DROP (no matter direction).
-    //    · After SL exit: 30-min cooldown before symbol can fire again.
-    //    · After TP exit: 5-min cooldown (short pause, not a full lockout).
+    //    · Any new signal on an active symbol → HARD DROP.
+    //    · After SL exit: 30-min cooldown. After TP exit: 5-min cooldown.
 
     /** Symbols with an open tracked trade (any direction). Symbol → entry timestamp. */
     private final Map<String, Long> activeSymbols = new ConcurrentHashMap<>();
@@ -75,27 +85,22 @@ public final class InstitutionalSignalCore {
     /** Post-exit cooldowns. Symbol → earliest time a new signal is allowed (epoch ms). */
     private final Map<String, Long> symbolCooldownUntil = new ConcurrentHashMap<>();
 
-    // [v50 AUDIT FIX] Global signal rate limit — defends against signal floods
-    // in volatile markets. Trader physically cannot process more than ~6 signals per 2h.
-    private final java.util.concurrent.ConcurrentLinkedDeque<Long> globalSignalTimestamps
-            = new java.util.concurrent.ConcurrentLinkedDeque<>();
-    // [v61] 20 → 12 per 2h. Dispatcher now enforces a tighter 4/hour cap upstream,
-    // so this ISC limit is a safety net for the rare case Dispatcher is bypassed.
-    private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 12);
+    // Global signal rate limit — defends against signal floods.
+    // [v18] 12 → 16 per 2h. Allows more signals when market is active.
+    private final ConcurrentLinkedDeque<Long> globalSignalTimestamps = new ConcurrentLinkedDeque<>();
+    private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 16);
     private static final long GLOBAL_WINDOW_2H_MS   = 2L * 60 * 60_000L;
 
-    // [v50 AUDIT FIX] Daily kill-switch threshold. At -5% daily PnL, block ALL new signals
-    // until next UTC day. resetDailyIfNeeded() will clear dailyPnLPct automatically at 00:00 UTC.
+    // Daily kill-switch threshold. At -5% daily PnL, block ALL new signals
+    // until next UTC day. resetDailyIfNeeded() will clear dailyPnLPct automatically.
     private static final double DAILY_KILL_SWITCH_PCT = -0.05;
 
     // DAILY SIGNAL LIMIT PER SYMBOL — prevents "milking" one volatile coin all day.
-    // Problem: BULLAUSDT fires 12 signals in 6 hours — all correlated, same pattern = one big bet.
-    // Fix: max 4 signals per symbol per rolling 8h window. Forces diversification.
-    private static final int    MAX_SIGNALS_PER_SYMBOL_8H = 4;
+    // [v18] 4 → 5 per 8h (slightly more headroom in trending day).
+    private static final int    MAX_SIGNALS_PER_SYMBOL_8H = 5;
     private static final long   SIGNAL_WINDOW_8H_MS       = 8 * 60 * 60_000L;
     private final Map<String, Deque<Long>> symbolSignalTimestamps = new ConcurrentHashMap<>();
 
-    /** Prune timestamps older than the 8h window from the deque. */
     private void pruneOldSignalTimestamps(Deque<Long> timestamps) {
         long cutoff = System.currentTimeMillis() - SIGNAL_WINDOW_8H_MS;
         while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
@@ -103,52 +108,44 @@ public final class InstitutionalSignalCore {
         }
     }
 
-    /** Check if symbol has exceeded its daily signal quota */
     private boolean symbolDailyLimitReached(String symbol) {
         Deque<Long> timestamps = symbolSignalTimestamps.get(symbol);
         if (timestamps == null) return false;
-        pruneOldSignalTimestamps(timestamps); // [FIX #18] single prune location
+        pruneOldSignalTimestamps(timestamps);
         return timestamps.size() >= MAX_SIGNALS_PER_SYMBOL_8H;
     }
 
-    /** Record a signal timestamp for daily quota tracking */
     private void recordSymbolSignal(String symbol) {
         Deque<Long> timestamps = symbolSignalTimestamps.computeIfAbsent(symbol,
-                k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+                k -> new ConcurrentLinkedDeque<>());
         timestamps.addLast(System.currentTimeMillis());
-        pruneOldSignalTimestamps(timestamps); // [FIX #18] reuse same prune helper
+        pruneOldSignalTimestamps(timestamps);
     }
 
     /** SL cooldown — 30 min, blocks falling-knife re-entry. */
     private static final long SL_COOLDOWN_MS  = 30 * 60_000L;
     /** TP cooldown — 20 min, synced with BotMain.setSignalCooldown(20min). */
     private static final long TP_COOLDOWN_MS  = 20 * 60_000L;
-    /** TIME_STOP cooldown — 45 min. A pair that didn't move in 90 min needs
-     *  more time off the active list than a clean TP exit. Pair with
-     *  chain-pause (2+ TS in a row → 4h side pause) below. */
+    /** TIME_STOP cooldown — 45 min. Pair that didn't move in 90 min needs more time off. */
     private static final long TIME_STOP_COOLDOWN_MS = 45 * 60_000L;
 
     //  TIME-STOP CHAIN GUARD
-    //  Tracks consecutive TIME_STOP exits per (symbol, side). After 2 TS in
-    //  a row the engine pauses that side for 4h; after 3 the entire symbol
-    //  is paused for 8h (treated as dead until regime change). Any decisive
-    //  close (TP / SL) resets the chain. Wired from cleanupExpired() and
-    //  closeTrade(). DecisionEngineMerged queries isPausedByChain() early.
+    //  After 2 TS in a row pauses (symbol, side) for 4h.
+    //  After 3 TS pauses entire symbol for 8h.
+    //  Any decisive close (TP / SL) resets the chain.
     private static final int  TS_CHAIN_TIER1_THRESHOLD = 2;
     private static final int  TS_CHAIN_TIER2_THRESHOLD = 3;
     private static final long TS_CHAIN_TIER1_PAUSE_MS  = 4L * 60 * 60_000L;
     private static final long TS_CHAIN_TIER2_PAUSE_MS  = 8L * 60 * 60_000L;
     private final Map<String, java.util.concurrent.atomic.AtomicInteger> tsChainCounters
             = new ConcurrentHashMap<>();
-    private final Map<String, Long> tsChainSidePause   = new ConcurrentHashMap<>(); // key = sym|SIDE
-    private final Map<String, Long> tsChainSymbolPause = new ConcurrentHashMap<>(); // key = sym
+    private final Map<String, Long> tsChainSidePause   = new ConcurrentHashMap<>();
+    private final Map<String, Long> tsChainSymbolPause = new ConcurrentHashMap<>();
 
-    /** Register symbol as having an open trade. Called from registerSignal(). */
     public void markSymbolActive(String symbol) {
         activeSymbols.put(symbol, System.currentTimeMillis());
     }
 
-    /** Release symbol after trade close. Applies SL or TP cooldown. */
     public void markSymbolClosed(String symbol, boolean wasSL) {
         activeSymbols.remove(symbol);
         long cooldown = wasSL ? SL_COOLDOWN_MS : TP_COOLDOWN_MS;
@@ -158,30 +155,22 @@ public final class InstitutionalSignalCore {
     }
 
     /**
-     * §1 — Central gate: is a new signal for this symbol allowed RIGHT NOW?
-     *
-     * Returns false (BLOCK) if:
-     *   a) Symbol has any currently active trade (bipolar prevention)
-     *   b) Symbol is within its post-SL cooldown window
+     * Central gate: is a new signal for this symbol allowed RIGHT NOW?
+     * Returns false if symbol has any active trade OR is within post-SL cooldown.
      */
     public boolean isSymbolAvailable(String symbol) {
-        // (a) Bipolar guard
         if (activeSymbols.containsKey(symbol)) return false;
-        // (b) Cooldown guard
         Long until = symbolCooldownUntil.get(symbol);
         if (until != null && System.currentTimeMillis() < until) return false;
         return true;
     }
 
-    //  CHAIN-GUARD API — used by DecisionEngineMerged + cleanupExpired
+    //  CHAIN-GUARD API
 
     private static String chainKey(String symbol, com.bot.TradingCore.Side side) {
         return symbol + "|" + side.name();
     }
 
-    /** Increments the chain counter for (symbol, side) and installs the
-     *  appropriate pause if a tier threshold is crossed. Called from
-     *  cleanupExpired() on every TIME_STOP. Returns the new chain length. */
     public int recordTimeStopChain(String symbol, com.bot.TradingCore.Side side) {
         if (symbol == null || side == null) return 0;
         String k = chainKey(symbol, side);
@@ -190,22 +179,19 @@ public final class InstitutionalSignalCore {
         long now = System.currentTimeMillis();
         if (n >= TS_CHAIN_TIER2_THRESHOLD) {
             tsChainSymbolPause.put(symbol, now + TS_CHAIN_TIER2_PAUSE_MS);
-            tsChainCounters.get(k).set(0); // reset — pause IS the consequence
+            tsChainCounters.get(k).set(0);
         } else if (n >= TS_CHAIN_TIER1_THRESHOLD) {
             tsChainSidePause.put(k, now + TS_CHAIN_TIER1_PAUSE_MS);
         }
         return n;
     }
 
-    /** Called on TP / SL / chandelier-exit. Resets chain for (symbol, side). */
     public void resetTimeStopChain(String symbol, com.bot.TradingCore.Side side) {
         if (symbol == null || side == null) return;
         var c = tsChainCounters.get(chainKey(symbol, side));
         if (c != null) c.set(0);
     }
 
-    /** True when (symbol, side) is in a chain-pause window. DecisionEngine
-     *  should reject signal generation up-front when this returns true. */
     public boolean isPausedByChain(String symbol, com.bot.TradingCore.Side side) {
         if (symbol == null || side == null) return false;
         long now = System.currentTimeMillis();
@@ -222,7 +208,6 @@ public final class InstitutionalSignalCore {
         return false;
     }
 
-    /** Diagnostic: minutes left on the active chain pause, 0 if none. */
     public long chainPauseMinutesLeft(String symbol, com.bot.TradingCore.Side side) {
         if (!isPausedByChain(symbol, side)) return 0;
         long now = System.currentTimeMillis();
@@ -232,17 +217,13 @@ public final class InstitutionalSignalCore {
     }
 
     /**
-     * Returns the number of symbols that are currently in cooldown or active.
-     * Used by Watchdog to distinguish a genuine signal drought from a healthy
-     * post-signal cooldown period. Example diagnostic:
-     *   "📭 No signals 90 min (CD=14 pairs locked)" — expected, not a bug.
+     * Returns the number of symbols currently in cooldown or active.
+     * Used by Watchdog to distinguish a genuine signal drought from healthy
+     * post-signal cooldown.
      */
     public int getCooldownedSymbolCount() {
         long now = System.currentTimeMillis();
-        int count = 0;
-        // Count symbols in active-symbol set
-        count += activeSymbols.size();
-        // Count symbols in cooldown (not double-counting activeSymbols entries)
+        int count = activeSymbols.size();
         for (Map.Entry<String, Long> e : symbolCooldownUntil.entrySet()) {
             if (e.getValue() > now && !activeSymbols.containsKey(e.getKey())) {
                 count++;
@@ -251,33 +232,18 @@ public final class InstitutionalSignalCore {
         return count;
     }
 
-    //  [v17.0 §4] DRAWDOWN MANAGER — Soft Circuit Breaker
+    //  DRAWDOWN MANAGER — Soft Circuit Breaker
     //
-    //  PROBLEM: Disabling the hard signal block (v16.0) fixes droughts
-    //  but leaves the bot fully exposed during prolonged loss streaks.
-    //  We need a middle ground: signals keep flowing, but with REDUCED_RISK
-    //  flag so position sizing drops automatically.
-    //
-    //  LOGIC:
-    //    · Track consecutive confirmed SL exits (not chandelier/trail).
-    //    · 3+ consecutive SLs → REDUCED_RISK mode (size ×0.5 additional).
-    //    · 5+ consecutive SLs → DEEP_REDUCED_RISK mode (size ×0.25 additional).
-    //    · Any TP or Chandelier profit → reset counter, exit REDUCED_RISK.
-    //    · Mode surfaced via getReducedRiskMultiplier() to SignalSender.
+    //  Track consecutive confirmed SL exits (not chandelier/trail).
+    //  3+ consecutive SLs → REDUCED_RISK mode (size ×0.5).
+    //  5+ consecutive SLs → DEEP_REDUCED_RISK mode (size ×0.25).
+    //  Any TP or Chandelier profit → reset counter, exit REDUCED_RISK.
 
-    // RACE CONDITION FIX — consecutiveSlCount.
-    // volatile int + ++ operator is NOT atomic: read-increment-write = 3 ops.
-    // Two parallel SL closures (different symbols closing simultaneously in TradeResolver)
-    // can both read the same value, both increment, and write the same +1 result.
-    // Net effect: one SL is silently lost from the counter → DrawdownManager under-counts.
-    // At REDUCED_RISK_THRESHOLD=3: missing 1 count means bot stays at full risk 1 SL too long.
-    // Fix: AtomicInteger.incrementAndGet() is a single CAS operation — always correct.
     private final java.util.concurrent.atomic.AtomicInteger consecutiveSlCount
             = new java.util.concurrent.atomic.AtomicInteger(0);
     private static final int REDUCED_RISK_THRESHOLD      = 3;
     private static final int DEEP_REDUCED_RISK_THRESHOLD = 5;
 
-    /** Called by BotMain.runTradeResolver() on every SL hit. */
     public void recordConsecutiveSL() {
         int c = consecutiveSlCount.incrementAndGet();
         if (c >= DEEP_REDUCED_RISK_THRESHOLD) {
@@ -287,7 +253,6 @@ public final class InstitutionalSignalCore {
         }
     }
 
-    /** Called by BotMain.runTradeResolver() on any profitable exit (TP / Chandelier / Trail+). */
     public void resetConsecutiveSL() {
         int prev = consecutiveSlCount.getAndSet(0);
         if (prev >= REDUCED_RISK_THRESHOLD) {
@@ -295,11 +260,6 @@ public final class InstitutionalSignalCore {
         }
     }
 
-    /**
-     * §4 — Size multiplier from DrawdownManager.
-     * Applied ADDITIONALLY on top of daily-loss multiplier.
-     * Returns: 1.0 normal | 0.5 reduced | 0.25 deep_reduced.
-     */
     public double getReducedRiskMultiplier() {
         int c = consecutiveSlCount.get();
         if (c >= DEEP_REDUCED_RISK_THRESHOLD) return 0.25;
@@ -307,7 +267,6 @@ public final class InstitutionalSignalCore {
         return 1.0;
     }
 
-    /** Returns the REDUCED_RISK flag string to embed in signal flags. Empty if normal. */
     public String getReducedRiskFlag() {
         int c = consecutiveSlCount.get();
         if (c >= DEEP_REDUCED_RISK_THRESHOLD) return "🔴DEEP_REDUCED_RISK";
@@ -322,44 +281,37 @@ public final class InstitutionalSignalCore {
     private volatile double streakConfidenceBoost = 0.0;
     private volatile long   lastStreakUpdateMs    = System.currentTimeMillis();
 
-    // [v16.0 FIX ROOT CAUSE] Daily loss now affects ONLY position size — NEVER blocks signals.
-    // OLD behaviour (v15): -6% daily → allowSignal() hard return false → 20h signal drought.
-    // NEW behaviour (v16): -6% daily → position size ×0.25 via getRiskSizeMultiplier().
-    // The bot keeps sending signals with tiny size instead of going completely silent.
-    // Confidence threshold penalty softened: +12→+3, +6→+1.5 (see getEffectiveMinConfidence).
-    private static final double DAILY_LOSS_CAUTIOUS_PCT  = -3.0; // -3% → cautious: size ×0.5
-    private static final double DAILY_LOSS_SURVIVAL_PCT  = -6.0; // -6% → survival: size ×0.25 (NO BLOCK)
-    private volatile boolean    cautiousMode          = false; // position size only — never blocks signals
+    // Daily loss → POSITION SIZE ONLY, never blocks signals (prevents 20h droughts).
+    private static final double DAILY_LOSS_CAUTIOUS_PCT  = -3.0; // size ×0.5
+    private static final double DAILY_LOSS_SURVIVAL_PCT  = -6.0; // size ×0.25 (NO BLOCK)
+    private volatile boolean    cautiousMode          = false;
 
     private volatile double dailyPnLPct        = 0.0;
     private volatile long   dailyPnLResetDay   = currentDay();
 
-    // Drawdown tracking (stats only, no pause)
+    // Drawdown tracking (stats only)
     private volatile double peakBalance          = 0.0;
     private volatile double drawdownFromPeak     = 0.0;
 
-    // Consecutive wins tracking for adaptive risk
     private volatile int currentWinStreak = 0;
 
     // Direction-specific loss tracking
-    // If we keep losing LONGs, penalize LONGs more. Same for SHORTs.
     private volatile int consecutiveLongLosses = 0;
     private volatile int consecutiveShortLosses = 0;
-    private static final int DIR_LOSS_PENALTY_THRESHOLD = 3; // 3 same-direction losses → extra penalty
+    private static final int DIR_LOSS_PENALTY_THRESHOLD = 3;
 
     // Backtest integration
     private volatile double lastBacktestEV   = 0.0;
     private volatile long   lastBacktestTime = 0;
 
-    // PATCH #7: Per-symbol OOS EV tracking.
-    // OLD: single avgEV for all 100 pairs — BTCUSDT EV +0.04 masked DOGEUSDT EV -0.08.
-    // NEW: each symbol gets its own EV; symbolMinConf raised +5 if OOS EV < 0.
-    private final java.util.concurrent.ConcurrentHashMap<String, Double> symbolOosEV
-            = new java.util.concurrent.ConcurrentHashMap<>();
+    // Per-symbol OOS EV tracking (separates BTC EV from DOGE EV).
+    private final ConcurrentHashMap<String, Double> symbolOosEV = new ConcurrentHashMap<>();
 
     // Callbacks
     private volatile java.util.function.BiConsumer<String, String> timeStopCallback = null;
-    public void setTimeStopCallback(java.util.function.BiConsumer<String, String> cb) { this.timeStopCallback = cb; }
+    public void setTimeStopCallback(java.util.function.BiConsumer<String, String> cb) {
+        this.timeStopCallback = cb;
+    }
 
     //  MODELS
 
@@ -367,7 +319,7 @@ public final class InstitutionalSignalCore {
         public final String symbol;
         public final com.bot.TradingCore.Side side;
         public final double entry, sl, tp1, probability;
-        public final double riskPct; // % of balance at risk
+        public final double riskPct;
         public final long   timestamp;
         public final String category;
         public final String sector;
@@ -407,9 +359,6 @@ public final class InstitutionalSignalCore {
         registerConfirmedResult(win, null);
     }
 
-    /** [v15.0] Direction-aware result tracking
-     *  FIX Дыра 4: First win after loss streak HALVES the boost (was only -1.5).
-     *  This prevents the bot from self-silencing after 3 normal stop-losses. */
     public void registerConfirmedResult(boolean win, com.bot.TradingCore.Side side) {
         synchronized (globalResultStreak) {
             globalResultStreak.addLast(win);
@@ -421,7 +370,7 @@ public final class InstitutionalSignalCore {
             streakConfidenceBoost = 0;
             currentLossStreak = 0;
             currentWinStreak++;
-            if (side == com.bot.TradingCore.Side.LONG) consecutiveLongLosses = 0;
+            if (side == com.bot.TradingCore.Side.LONG)  consecutiveLongLosses  = 0;
             if (side == com.bot.TradingCore.Side.SHORT) consecutiveShortLosses = 0;
         } else {
             currentLossStreak++;
@@ -437,7 +386,8 @@ public final class InstitutionalSignalCore {
     }
 
     public void resetStreakGuard() {
-        log("STREAK RESET (was " + currentLossStreak + " L:" + consecutiveLongLosses + " S:" + consecutiveShortLosses + ")");
+        log("STREAK RESET (was " + currentLossStreak
+                + " L:" + consecutiveLongLosses + " S:" + consecutiveShortLosses + ")");
         currentLossStreak = 0;
         streakConfidenceBoost = 0.0;
         consecutiveLongLosses = 0;
@@ -448,29 +398,30 @@ public final class InstitutionalSignalCore {
     private void decayStreakBoost() {
         if (streakConfidenceBoost <= 0) return;
         long elapsed = System.currentTimeMillis() - lastStreakUpdateMs;
-        // [v15.0 FIX Дыра 4] Faster decay: 30% every 8min (was 20%/10min — too slow)
-        // After 3 losses (boost=4.5), decay to zero in ~24min instead of ~60min
+        // Decay 30% every 8min — after 3 losses (boost=4.5) decays to zero in ~24min
         if (elapsed > 8 * 60_000L) {
             streakConfidenceBoost *= 0.70;
             lastStreakUpdateMs = System.currentTimeMillis();
-            if (streakConfidenceBoost < 0.3) { streakConfidenceBoost = 0; currentLossStreak = 0; }
+            if (streakConfidenceBoost < 0.3) {
+                streakConfidenceBoost = 0;
+                currentLossStreak = 0;
+            }
         }
     }
 
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [v70] floor 58 → 52 synced с DE MIN_CONF_FLOOR=55 - margin.
-        // Logic сохранена: strict по умолчанию, loosens только при proven WR.
-        double floor = 52.0;
+        // [v18] floor 52 → 50 synced с DE MIN_CONF_FLOOR=50.
+        double floor = 50.0;
         int totalTrades = getTotalTradeCount();
         double overallWr = getOverallWinRate();
-        if (totalTrades >= 500 && overallWr >= 0.58) floor = 48.0;
-        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 50.0;
+        if (totalTrades >= 500 && overallWr >= 0.58) floor = 46.0;
+        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 48.0;
 
         double base = Math.max(baseMinConfidence, floor);
 
-        // [v70] Daily loss penalties смягчены: +3.0→+2.0, +1.5→+1.0
+        // Daily loss penalties — soft (size already cut elsewhere)
         if (dailyPnLPct <= DAILY_LOSS_SURVIVAL_PCT) {
             base += 2.0;
         } else if (dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT) {
@@ -484,36 +435,24 @@ public final class InstitutionalSignalCore {
     }
 
     public void setBacktestResult(double ev, long ts) {
-        this.lastBacktestEV = ev; this.lastBacktestTime = ts;
+        this.lastBacktestEV = ev;
+        this.lastBacktestTime = ts;
     }
 
-    // PATCH #7: Per-symbol backtest result.
-    // Called from BotMain.runPeriodicBacktest() for each backtested symbol.
     public void setSymbolBacktestResult(String symbol, double ev) {
         symbolOosEV.put(symbol, ev);
     }
 
-    // [v16.0 FIX] Penalties halved: +8/+5 → +4/+3. Old values on top of raised daily-loss
-    // thresholds pushed total required confidence to 80%+, making some symbols untradeable.
-    // Still penalises bad symbols — just doesn't completely quarantine them.
-    // getSymbolMinConfBoost() moved to auto-blacklist section below (includes WR-based blocking)
-
     //  SIGNAL FILTERING
 
-    // Max positions per direction — prevents one-sided portfolio blow-up
-    // MAX_SAME_DIRECTION raised 4→6.
-    // Was: max 4 concurrent LONGs or 4 SHORTs. On trending days this blocked
-    // the 5th valid signal completely. With 25 pairs and TOP_N filtering,
-    // 6 concurrent same-direction positions is still well within risk limits.
+    // Max positions per direction (signal-mode only — we don't auto-trade).
     private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 10);
 
     // Rate-limit BIPOLAR BLOCK logs: one log per symbol per 60s to avoid Railway log flood.
     private final Map<String, Long> bipolarLogThrottle = new ConcurrentHashMap<>();
     private static final long BIPOLAR_LOG_THROTTLE_MS = 60_000L;
 
-    /** [FIX #15] Periodic cleanup — call this from BotMain every cycle or every few minutes.
-     *  cleanupExpired() was previously only reachable inside allowSignal() (synchronized).
-     *  If no new signals arrive (signal drought), activeSymbols never gets cleaned → stuck symbols. */
+    /** Periodic cleanup — call from BotMain every cycle. */
     public synchronized void periodicCleanup() {
         cleanupExpired();
     }
@@ -521,8 +460,7 @@ public final class InstitutionalSignalCore {
     public synchronized boolean allowSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         cleanupExpired();
 
-        // [v50 AUDIT FIX] Daily kill-switch: hard stop at -5% daily drawdown.
-        // resetDailyIfNeeded() handles auto-clear at next UTC day.
+        // Daily kill-switch: hard stop at -5% daily DD until next UTC day.
         if (dailyPnLPct <= DAILY_KILL_SWITCH_PCT) {
             long now = System.currentTimeMillis();
             Long lastLog = bipolarLogThrottle.get("__daily_kill__");
@@ -534,7 +472,7 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        // [v50 AUDIT FIX] Global rate limit: max MAX_GLOBAL_SIGNALS_2H signals in rolling 2h.
+        // Global rate limit: max MAX_GLOBAL_SIGNALS_2H signals in rolling 2h.
         long nowMs = System.currentTimeMillis();
         while (!globalSignalTimestamps.isEmpty()
                 && nowMs - globalSignalTimestamps.peekFirst() > GLOBAL_WINDOW_2H_MS) {
@@ -550,31 +488,18 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        // ╔══════════════════════════════════════════════════════════════╗
-        // ║  [SCANNER MODE v2.0] allowSignal() — упрощён до минимума   ║
-        // ║                                                              ║
-        // ║  УДАЛЕНО (блокировало сигналы при ручной торговле):         ║
-        // ║  · Portfolio heat cap (currentHeat > maxPortfolioHeat)      ║
-        // ║  · Global signal limit (maxGlobalSignals)                   ║
-        // ║  · Same direction limit (MAX_SAME_DIRECTION)                ║
-        // ║  · Directional loss guard (consecutiveLongLosses)           ║
-        // ║  · Daily signal limit per symbol (symbolDailyLimitReached)  ║
-        // ║                                                              ║
-        // ║  ВСЕ ЭТИ ПРОВЕРКИ были для ВИРТУАЛЬНОГО ПОРТФЕЛЯ.          ║
-        // ║  При ручной торговле без автоисполнения — они блокировали   ║
-        // ║  сигналы основываясь на позициях, которых нет в реальности. ║
-        // ║                                                              ║
-        // ║  ОСТАВЛЕНО (защита качества сигналов):                      ║
-        // ║  · Bipolar guard — нет LONG→SHORT на одной монете           ║
-        // ║  · Cooldown guard — кулдаун 20 мин после сигнала            ║
-        // ║  Эти проверки работают от реального состояния (setSignalCooldown),
-        // ║  не от виртуального портфеля.                               ║
-        // ╚══════════════════════════════════════════════════════════════╝
+        //  [SCANNER MODE] allowSignal() — minimal gate for manual-trading mode.
+        //  REMOVED (was blocking real signals when bot is signal-only):
+        //    · Portfolio heat cap, Global signal limit, Same-direction limit,
+        //    · Directional loss guard, Daily signal limit per symbol.
+        //  These were checking VIRTUAL portfolio state — meaningless without auto-execution.
+        //
+        //  KEPT (signal quality protection):
+        //    · Bipolar guard — no LONG→SHORT on same symbol while open
+        //    · Cooldown guard — 20-min cooldown after each signal
 
-        // Единственная проверка: кулдаун / биполярная защита
         if (!isSymbolAvailable(signal.symbol)) {
             Long until = symbolCooldownUntil.get(signal.symbol);
-            // Rate-limit log: max once per 60s per symbol (was every call = Railway spam)
             long now2 = System.currentTimeMillis();
             Long lastLog = bipolarLogThrottle.get(signal.symbol);
             if (lastLog == null || (now2 - lastLog) > BIPOLAR_LOG_THROTTLE_MS) {
@@ -589,26 +514,17 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        // Daily loss mode — обновляем флаг (влияет только на размер позиции в будущей автоторговле)
         cautiousMode = dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT;
 
         return true;
     }
 
     /**
-     * [SCANNER MODE v2.0] Устанавливает кулдаун на монету после отправки сигнала.
-     * Заменяет пару markSymbolActive() + (ждём TradeResolver) → markSymbolClosed().
-     *
-     * Механика:
-     *   1. Убираем символ из activeSymbols (больше не "в сделке")
-     *   2. Ставим кулдаун symbolCooldownUntil на durationMs вперёд
-     *   3. isSymbolAvailable() вернёт false пока кулдаун не истечёт
-     *
-     * @param symbol    Монета (напр. "BTCUSDT")
-     * @param durationMs Длительность кулдауна в мс (20 * 60_000L = 20 мин)
+     * Sets cooldown on a symbol after a signal is sent.
+     * Replaces markSymbolActive() + (wait for TradeResolver) → markSymbolClosed() chain.
      */
     public synchronized void setSignalCooldown(String symbol, long durationMs) {
-        activeSymbols.remove(symbol); // снимаем "в активной сделке"
+        activeSymbols.remove(symbol);
         long until = System.currentTimeMillis() + durationMs;
         symbolCooldownUntil.put(symbol, until);
         log("⏱ SIGNAL_COOLDOWN: " + symbol + " → " + (durationMs / 60_000) + " мин");
@@ -621,7 +537,7 @@ public final class InstitutionalSignalCore {
         if (signal.forecast != null && signal.forecast.factorScores != null) {
             StringBuilder fl = new StringBuilder();
             for (var e : signal.forecast.factorScores.entrySet()) {
-                if (Math.abs(e.getValue()) > 0.08) { // only log significant factors
+                if (Math.abs(e.getValue()) > 0.08) {
                     if (fl.length() > 0) fl.append(",");
                     fl.append(e.getKey()).append("=").append(String.format("%.2f", e.getValue()));
                 }
@@ -635,10 +551,8 @@ public final class InstitutionalSignalCore {
         currentHeat += estRisk;
         markSymbolActive(signal.symbol);
         recordSymbolSignal(signal.symbol);
-        // [v50 AUDIT FIX] Track for global rate limit
         globalSignalTimestamps.addLast(System.currentTimeMillis());
 
-        // Log signal factors for post-hoc analysis
         if (!factorLog.isEmpty()) {
             log(String.format("[SIGNAL] %s %s prob=%.0f%% factors=[%s]",
                     signal.symbol, signal.side, signal.probability, factorLog));
@@ -646,10 +560,8 @@ public final class InstitutionalSignalCore {
     }
 
     /**
-     * UNREGISTER SIGNAL — undo a registerSignal() call.
-     * Used by the R:R gate in SignalSender when a trade passes allowSignal()
-     * but then fails the hard R:R >= 1.80 check (after adaptive TP calibration).
-     * Without this, the symbol stays "active" and heat is inflated permanently.
+     * Undo a registerSignal() call — used by R:R gate in SignalSender when a trade
+     * passes allowSignal() but fails the hard R:R check after adaptive TP calibration.
      */
     public synchronized void unregisterSignal(com.bot.DecisionEngineMerged.TradeIdea signal) {
         List<ActiveSignal> list = activeSignals.get(signal.symbol);
@@ -657,7 +569,6 @@ public final class InstitutionalSignalCore {
         list.removeIf(s -> s.side == signal.side &&
                 Math.abs(s.entry - signal.price) < signal.price * 0.001);
         if (list.isEmpty()) activeSignals.remove(signal.symbol);
-        // Release heat and bipolar lock so the symbol is immediately available again
         double estRisk = estimateRisk(signal.probability, signal.category);
         currentHeat = Math.max(0, currentHeat - estRisk);
         activeSymbols.remove(signal.symbol);
@@ -666,12 +577,12 @@ public final class InstitutionalSignalCore {
 
     //  TRADE CLOSE
 
-    /** [v11.0 FIX-COMPILE] 3-arg overload for BotMain/TradeResolver compatibility */
     public synchronized void closeTrade(String symbol, com.bot.TradingCore.Side side, double pnlPct) {
         closeTrade(symbol, side, pnlPct, pnlPct > 0 ? "TP" : "SL");
     }
 
-    public synchronized void closeTrade(String symbol, com.bot.TradingCore.Side side, double pnlPct, String reason) {
+    public synchronized void closeTrade(String symbol, com.bot.TradingCore.Side side,
+                                        double pnlPct, String reason) {
         List<ActiveSignal> list = activeSignals.get(symbol);
         if (list == null) return;
 
@@ -685,16 +596,14 @@ public final class InstitutionalSignalCore {
         if (matched != null) {
             currentHeat = Math.max(0, currentHeat - matched.riskPct);
 
-            // P&L ATTRIBUTION — log which factors led to this outcome
-            // After 500+ trades, analyze: which factors correlate with wins vs losses
             String outcome = pnlPct > 0.05 ? "WIN" : pnlPct < -0.05 ? "LOSS" : "FLAT";
-            if (!matched.sector.isEmpty()) { // sector field stores factor log in v38
+            if (!matched.sector.isEmpty()) {
                 log(String.format("[P&L_ATTR] %s %s %s pnl=%+.2f%% dur=%dm factors=[%s]",
                         symbol, side, outcome, pnlPct, matched.ageMs() / 60_000, matched.sector));
             }
 
-            // Add to bounded history
-            Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(symbol, k -> new ConcurrentLinkedDeque<>());
+            Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(symbol,
+                    k -> new ConcurrentLinkedDeque<>());
             hist.addLast(new ClosedTrade(symbol, side, pnlPct, matched.ageMs(), reason));
             while (hist.size() > MAX_HISTORY) hist.removeFirst();
 
@@ -705,13 +614,11 @@ public final class InstitutionalSignalCore {
         }
         if (list.isEmpty()) activeSignals.remove(symbol);
 
-        // Release symbol with appropriate cooldown + reset chain counter:
-        // any decisive close (TP or SL) clears the TS chain.
         boolean wasSL = "SL".equals(reason) || "HIT_SL".equals(reason) || "SCORE_EXIT".equals(reason);
         boolean wasProfit = pnlPct > 0.05;
         markSymbolClosed(symbol, wasSL);
         resetTimeStopChain(symbol, side);
-        if (wasSL)      recordConsecutiveSL();
+        if (wasSL)          recordConsecutiveSL();
         else if (wasProfit) resetConsecutiveSL();
     }
 
@@ -726,18 +633,15 @@ public final class InstitutionalSignalCore {
                 if (s.ageMs() > TIME_STOP_MS) {
                     currentHeat = Math.max(0, currentHeat - s.riskPct);
 
-                    // Release symbol from active set; apply 45-min TIME_STOP cooldown.
                     activeSymbols.remove(s.symbol);
                     symbolCooldownUntil.put(s.symbol,
                             System.currentTimeMillis() + TIME_STOP_COOLDOWN_MS);
 
-                    // NEUTRAL trade — not loss, not win. Streak NOT affected.
-                    Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(s.symbol, k -> new ConcurrentLinkedDeque<>());
+                    Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(s.symbol,
+                            k -> new ConcurrentLinkedDeque<>());
                     hist.addLast(new ClosedTrade(s.symbol, s.side, 0.0, s.ageMs(), "TIME_STOP"));
                     while (hist.size() > MAX_HISTORY) hist.removeFirst();
 
-                    // Chain-guard: if this is the 2nd / 3rd TS in a row for
-                    // (symbol, side) it installs a 4h / 8h pause.
                     int chainLen = recordTimeStopChain(s.symbol, s.side);
                     long pauseMin = chainPauseMinutesLeft(s.symbol, s.side);
                     log("⏱ TIME_STOP: " + s.symbol + " " + s.side
@@ -757,8 +661,7 @@ public final class InstitutionalSignalCore {
         }
         activeSignals.entrySet().removeIf(e -> e.getValue().isEmpty());
 
-        // Safety net: purge any activeSymbols entry without a matching
-        // activeSignal that is older than TIME_STOP_MS + 5min buffer.
+        // Safety net: purge stale activeSymbols entries
         long staleThreshold = TIME_STOP_MS + 5 * 60_000L;
         activeSymbols.entrySet().removeIf(e ->
                 (now - e.getValue()) > staleThreshold &&
@@ -797,14 +700,15 @@ public final class InstitutionalSignalCore {
         return tradeHistory.values().stream().mapToInt(Deque::size).sum();
     }
 
-    /** [v43] Returns all symbols that have trade history — used for WR metrics logging in BotMain. */
     public java.util.Set<String> getTradeHistorySymbols() {
         return java.util.Collections.unmodifiableSet(tradeHistory.keySet());
     }
 
-    // PATCH #12: Expose per-symbol average realized R:R for TP calibration.
-    // Returns average PnL of winning trades / average PnL magnitude of losing trades.
-    // If symbol has insufficient data, returns 0 (= use market-state defaults).
+    /**
+     * Per-symbol average realized R:R for TP calibration.
+     * Returns avg PnL of wins / avg PnL magnitude of losses.
+     * If symbol has insufficient data, returns 0 (= use market-state defaults).
+     */
     public double getAvgRealizedRR(String symbol) {
         Deque<ClosedTrade> hist = tradeHistory.get(symbol);
         if (hist == null || hist.size() < 5) return 0.0;
@@ -815,19 +719,17 @@ public final class InstitutionalSignalCore {
         return avgLoss > 0 ? avgWin / avgLoss : 0.0;
     }
 
-    // PATCH #15: Expose symbol score for BotMain TradeResolver force-exit.
     public double getSymbolScore(String symbol) {
         return symbolScore.getOrDefault(symbol, 0.0);
     }
 
-    /** [v16.0] True when daily loss exceeds -3% (cautious) OR -6% (survival).
-     *  Both modes reduce position size. Survival additionally uses getRiskSizeMultiplier() → 0.25. */
+    /** True when daily loss exceeds -3% (cautious) OR -6% (survival). Both modes reduce size. */
     public boolean isCautiousMode() {
         resetDailyIfNeeded();
         return dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT;
     }
 
-    /** [v16.0] True only in deep survival mode (day <= -6%). Position size ×0.25. */
+    /** True only in deep survival mode (day <= -6%). Position size ×0.25. */
     public boolean isSurvivalMode() {
         resetDailyIfNeeded();
         return dailyPnLPct <= DAILY_LOSS_SURVIVAL_PCT;
@@ -835,39 +737,25 @@ public final class InstitutionalSignalCore {
 
     public int getCurrentLossStreak() { return currentLossStreak; }
     public double getStreakBoost()    { return streakConfidenceBoost; }
-    public double getCurrentHeat()   { return currentHeat; }
+    public double getCurrentHeat()    { return currentHeat; }
 
     /**
-     * [ДЫРА №5] Адаптивный размер позиции на основе реальных последних 10 сделок.
-     *
-     * Было: бэктест влиял на 3% порога → практически бесполезно.
-     * Стало: смотрим на РЕАЛЬНЫЕ последние 10 сделок.
-     *   • 8-10 из 10 прибыльных → рынок на нашей стороне → ×1.20 (чуть агрессивнее)
-     *   • 5-7 из 10 прибыльных → норма → ×1.00
-     *   • 3-4 из 10 прибыльных → плохо → ×0.60 (сокращаем вдвое)
-     *   • 0-2 из 10 прибыльных → стоп → ×0.30 (минимальный риск, ждём восстановления)
-     *
-     * Это и есть то что делают профессиональные трейдеры: когда система
-     * не работает — уменьшай размер, не жди пока всё не сольёшь.
+     * Adaptive position size based on REAL last 10 closed trades.
+     *   • 8-10 of 10 wins → ×1.20
+     *   • 5-7  of 10 wins → ×1.00 (norm)
+     *   • 3-4  of 10 wins → ×0.60 (cut)
+     *   • 0-2  of 10 wins → ×0.30 (survival, never zero — keep edge tested)
      */
     public double getRiskSizeMultiplier() {
-        // Survival mode (day <= -6%) → position size ×0.25 regardless of streak.
-        // This replaces the old hard signal block with a meaningful risk reduction.
         resetDailyIfNeeded();
         if (dailyPnLPct <= DAILY_LOSS_SURVIVAL_PCT) {
-            return 0.25; // lost ≥6% today — trade with minimum size, but keep trading
-        }
-        if (dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT) {
-            // Further constrained by trade history below, but floor at 0.40
-            // (was 0.50 — extra caution when we've already lost 3%+)
+            return 0.25; // -6% day → minimum size, but keep trading
         }
 
-        // Собираем последние 10 РЕАЛЬНЫХ закрытых сделок (не ISC internal, а трейд-история)
         List<ClosedTrade> recent = new ArrayList<>();
         for (Deque<ClosedTrade> hist : tradeHistory.values()) {
             recent.addAll(hist);
         }
-        // Сортируем по времени закрытия, берём последние 10
         recent.sort(Comparator.comparingLong(t -> t.closedAt));
         int n = recent.size();
         if (n < 3) {
@@ -889,13 +777,14 @@ public final class InstitutionalSignalCore {
             mult = dailyPnLPct <= DAILY_LOSS_CAUTIOUS_PCT ? 0.25 : 0.30;
         }
 
-        if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L) {
+        if (lastBacktestEV < -0.02
+                && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L) {
             mult *= 0.80;
         }
 
         if (mult <= 0.30) {
             log("⚠️ СТОП-РЕЖИМ: последние " + window + " сделок: " + wins + " побед/"
-                    + losses + " потерь. Позиции сокращены до " + (int)(mult*100) + "%.");
+                    + losses + " потерь. Позиции: " + (int)(mult*100) + "%.");
         } else if (mult <= 0.60) {
             log("⚠️ ОСТОРОЖНЫЙ РЕЖИМ: " + wins + "/" + window + " побед. Позиции: "
                     + (int)(mult*100) + "%.");
@@ -906,7 +795,8 @@ public final class InstitutionalSignalCore {
 
     public String getStats() {
         String rrFlag = getReducedRiskFlag();
-        return String.format("ISC[act=%d/%d heat=%.1f%% cl=%d wr=%.0f%% str=%d+%.0f L%d/S%d eff=%.0f%% day=%.2f%% SL_streak=%d%s]",
+        return String.format(
+                "ISC[act=%d/%d heat=%.1f%% cl=%d wr=%.0f%% str=%d+%.0f L%d/S%d eff=%.0f%% day=%.2f%% SL_streak=%d%s]",
                 getActiveCount(), maxGlobalSignals, currentHeat * 100,
                 getTotalTradeCount(), getOverallWinRate() * 100,
                 currentLossStreak, streakConfidenceBoost,
@@ -920,56 +810,43 @@ public final class InstitutionalSignalCore {
     //  INTERNAL
 
     private double estimateRisk(double confidence, com.bot.DecisionEngineMerged.CoinCategory cat) {
-        // Flat risk until we have 50+ trades proving the edge
-        // Old code gave 2× position to 80%+ signals — but those 80% were self-assessed,
-        // not validated. This caused outsized losses on overconfident signals.
+        // Flat conservative risk until we have 50+ trades proving the edge.
         int totalTrades = getTotalTradeCount();
         double overallWR = getOverallWinRate();
 
         double base;
         if (totalTrades < 50 || overallWR < 0.52) {
-            // Unproven system — flat conservative risk
             base = 0.008; // 0.8% regardless of confidence
         } else {
-            // Proven edge — modest scaling
-            base = confidence >= 78 ? 0.015 : confidence >= 68 ? 0.012 : confidence >= 58 ? 0.010 : 0.008;
+            base = confidence >= 78 ? 0.015
+                    : confidence >= 68 ? 0.012
+                      : confidence >= 58 ? 0.010
+                        : 0.008;
         }
 
         double mult = cat == com.bot.DecisionEngineMerged.CoinCategory.MEME ? 0.5 :
-                cat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.0 : 0.75;
+                cat == com.bot.DecisionEngineMerged.CoinCategory.TOP  ? 1.0 : 0.75;
         return base * mult;
     }
 
     private void updateSymbolScore(String symbol, double pnl) {
         double delta = pnl > 0.5 ? 0.015 : pnl < -0.5 ? -0.018 : -0.003;
         symbolScore.merge(symbol, delta, Double::sum);
-        symbolScore.compute(symbol, (k, v) -> com.bot.TradingCore.clamp(v == null ? 0 : v, -0.40, 0.40));
+        symbolScore.compute(symbol, (k, v) ->
+                com.bot.TradingCore.clamp(v == null ? 0 : v, -0.40, 0.40));
 
-        // [v43 PATCH FIX #6] Auto-soft-blacklist: symbols with persistent low win-rate
-        // get a hard confidence boost, making them functionally un-tradeable.
-        //
-        // Why soft-blacklist instead of hard block?
-        //   Hard block in ISC = no override possible. Soft block via minConf boost means:
-        //   - if the symbol genuinely recovers WR (regime change), it can re-qualify
-        //   - the boost applies per-symbol, not globally
-        //   - getSymbolMinConfBoost() already exists and is checked in allowSignal()
-        //
-        // Trigger: win-rate < 25% AND at least 5 trades (statistically meaningful).
-        // Effect: +20 minConf boost → effectively requires 80%+ signal confidence → untradeable.
-        // Recovery: boost removed when WR recovers above 40%.
+        // Auto-soft-blacklist: symbols with persistent low WR get a hard conf boost,
+        // making them functionally untradeable until WR recovers.
         checkAutoBlacklist(symbol);
     }
 
     // Thread-safe auto-blacklist registry (symbol → soft-blocked)
-    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> autoBlacklist
-            = new java.util.concurrent.ConcurrentHashMap<>();
-    // TIGHTER DYNAMIC BLACKLIST — multi-tier WR enforcement.
-    // Old: single 25% threshold after 5 trades = too lenient (lost capital before block).
-    // New: 3 tiers based on trade count for early intervention.
+    private final ConcurrentHashMap<String, Boolean> autoBlacklist = new ConcurrentHashMap<>();
+
     // Three-tier auto-blacklist for early intervention.
     // Tier 1: 5+ trades, WR < 30% → soft block (confidence boost)
     // Tier 2: 15+ trades, WR < 35% → soft block continues
-    // Tier 3: 20+ trades, WR < 25% → HARD block (no signals at all)
+    // Tier 3: 20+ trades, WR < 25% → HARD block (no signals at all, requires p<0.05 binomial test)
     private static final double AUTO_BLACKLIST_WR_THRESHOLD  = 0.30;
     private static final double AUTO_BLACKLIST_WR_RECOVERY   = 0.45;
     private static final int    AUTO_BLACKLIST_MIN_TRADES    = 5;
@@ -980,8 +857,7 @@ public final class InstitutionalSignalCore {
     private static final double AUTO_BLACKLIST_CONF_BOOST    = 20.0;
 
     // Hard blacklist — completely blocks signal generation for the symbol.
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> hardBlacklist
-            = new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> hardBlacklist = new ConcurrentHashMap<>();
     private static final long HARD_BLACKLIST_DURATION_MS = 48L * 60 * 60 * 1000L;
 
     private void checkAutoBlacklist(String symbol) {
@@ -991,7 +867,6 @@ public final class InstitutionalSignalCore {
         double wr = getWinRate(symbol);
         boolean currentlyBlocked = autoBlacklist.getOrDefault(symbol, false);
 
-        // Three-tier blocking
         boolean shouldHardBlock = count >= AUTO_BLACKLIST_HARD_TRADES && wr < AUTO_BLACKLIST_HARD_WR;
         boolean shouldSoftBlock;
         if (count >= AUTO_BLACKLIST_TIGHT_TRADES) {
@@ -1000,10 +875,9 @@ public final class InstitutionalSignalCore {
             shouldSoftBlock = wr < AUTO_BLACKLIST_WR_THRESHOLD;
         }
 
-        // [v50 AUDIT FIX] Binomial p-value test for hard-block.
+        // Binomial p-value test for hard-block.
         // Null hypothesis: true WR >= 0.40. Only hard-block if we can reject at p<0.05.
-        // Prevents false-positives on statistical noise (on 20 trades, 25% WR can occur
-        // by chance with p≈0.05 even when true WR is 50%).
+        // Prevents false-positives on noise (on 20 trades, 25% WR can occur by chance even if true WR = 50%).
         int wins = (int) Math.round(wr * count);
         double pValue = shouldHardBlock ? binomialCdf(wins, count, 0.40) : 1.0;
         boolean hardBlockStatisticallyValid = shouldHardBlock && pValue < 0.05;
@@ -1025,14 +899,11 @@ public final class InstitutionalSignalCore {
     }
 
     /**
-     * [v50 AUDIT FIX] Binomial CDF P(X <= k | n, p).
-     * Used by auto-blacklist to check if observed win count is so low it rejects
-     * the null hypothesis "true WR >= threshold" at p < 0.05.
+     * Binomial CDF P(X <= k | n, p) — log-space computation to avoid overflow.
      */
     private static double binomialCdf(int k, int n, double p) {
         if (k < 0 || n <= 0 || p < 0 || p > 1) return 1.0;
         if (k >= n) return 1.0;
-        // Use recursive computation with log-space to avoid overflow.
         double sum = 0;
         double logP = Math.log(p), log1mP = Math.log(1 - p);
         double logCoeff = 0;
@@ -1044,7 +915,7 @@ public final class InstitutionalSignalCore {
         return Math.min(1.0, sum);
     }
 
-    /** [v51] Hard blacklist check — completely blocks signal generation. */
+    /** Hard blacklist check — completely blocks signal generation. */
     public boolean isHardBlacklisted(String symbol) {
         Long until = hardBlacklist.get(symbol);
         if (until == null) return false;
@@ -1056,40 +927,34 @@ public final class InstitutionalSignalCore {
         return true;
     }
 
-    /** [v51] Stricter OOS EV-based confidence boost. */
+    /** OOS EV-based confidence boost. */
     public double getSymbolMinConfBoost(String symbol) {
         if (autoBlacklist.getOrDefault(symbol, false)) {
             return AUTO_BLACKLIST_CONF_BOOST;
         }
         Double ev = symbolOosEV.get(symbol);
         if (ev == null) return 0.0;
-        if (ev < -0.05) return +8.0;  // strong negative EV → strong penalty
-        if (ev < -0.02) return +5.0;  // was +4
+        if (ev < -0.05) return +8.0;
+        if (ev < -0.02) return +5.0;
         if (ev < 0.00)  return +3.0;
-        if (ev > 0.04)  return -3.0;  // strong positive → small bonus
+        if (ev > 0.04)  return -3.0;
         if (ev > 0.02)  return -2.0;
         return 0.0;
     }
 
-    /** [v43] Expose auto-blacklist status for logging/metrics */
     public boolean isAutoBlacklisted(String symbol) {
         return autoBlacklist.getOrDefault(symbol, false);
     }
 
-    /** [v43] Get full auto-blacklist for reporting */
     public java.util.Set<String> getAutoBlacklist() {
         return java.util.Collections.unmodifiableSet(autoBlacklist.keySet());
     }
 
     //  DAILY LOSS LIMIT + DRAWDOWN PROTECTION
 
-    // PATCH #16: synchronized prevents concurrent write on volatile compound op.
-    // PATCH #1: triggers drawdown pause when -8% from peak threshold breached.
     private synchronized void trackDailyPnL(double pnlPct) {
         resetDailyIfNeeded();
         dailyPnLPct += pnlPct;
-
-        // Time-based pauses removed entirely. Track stats only.
     }
 
     private void resetDailyIfNeeded() {
@@ -1120,7 +985,7 @@ public final class InstitutionalSignalCore {
         }
     }
 
-    /** Called by BotMain when balance is refreshed — tracks drawdown (stats only) */
+    /** Called by BotMain when balance is refreshed — tracks drawdown (stats only). */
     public void updateBalance(double currentBalance) {
         if (currentBalance > peakBalance) {
             peakBalance = currentBalance;
@@ -1135,6 +1000,7 @@ public final class InstitutionalSignalCore {
 
     private static void log(String msg) {
         System.out.printf("[ISC %s] %s%n",
-                java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")), msg);
+                java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")),
+                msg);
     }
 }
