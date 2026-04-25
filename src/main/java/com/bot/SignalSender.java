@@ -748,6 +748,7 @@ public final class SignalSender {
 
         this.decisionEngine.setPumpHunter(this.pumpHunter);
         this.decisionEngine.setGIC(this.gic);
+        this.decisionEngine.setIsc(this.isc); // chain-pause gate uses ISC's chain state
 
         // [FIX] Pre-load garbage coins into PumpHunter so it skips them entirely.
         // Prevents UAIUSDT/BASUSDT noise events from spamming logs every 90s.
@@ -1646,11 +1647,14 @@ public final class SignalSender {
     //  LIVE CANDLE ASSEMBLER
 
     /**
-     * Возвращает список 15m свечей, где ПОСЛЕДНЯЯ СВЕЧА — живая,
-     * собранная из 1m данных прямо сейчас.
-     *
-     * Это устраняет 14-минутную слепоту: RSI, EMA, ATR пересчитываются
-     * каждую минуту вместо раза в 14 минут.
+     * Returns the 15m series with the live (in-flight) candle spliced as the
+     * last bar — eliminates the 14-minute analysis blind spot.
+     * <p>
+     * Splice is gated: the live bar is included only when it is in a neutral
+     * observation window. If the live bar is already mid-impulse (body &gt;
+     * 0.60×ATR), at an RSI extreme (outside 28..72), or showing wick rejection
+     * (max wick &gt; 1.5× body), the historical (closed) series is returned
+     * unmodified — analyzing such a live bar pins entries at local tops.
      */
     private List<com.bot.TradingCore.Candle> getCached15mWithLive(String pair) {
         List<com.bot.TradingCore.Candle> historical = getCached(pair, "15m", KLINES_LIMIT);
@@ -1662,17 +1666,65 @@ public final class SignalSender {
         com.bot.TradingCore.Candle liveCurrent = assembleLive15mCandle(m1buf);
         if (liveCurrent == null) return historical;
 
+        // GATE — refuse the splice if the live bar is unsafe to analyze.
+        if (!isLiveCandleSafeToSplice(historical, liveCurrent)) return historical;
+
         com.bot.TradingCore.Candle lastHistorical = historical.get(historical.size() - 1);
         long livePeriod = liveCurrent.openTime / (15 * 60_000L);
         long lastPeriod = lastHistorical.openTime / (15 * 60_000L);
 
         List<com.bot.TradingCore.Candle> result = new ArrayList<>(historical);
         if (livePeriod == lastPeriod) {
-            result.set(result.size() - 1, liveCurrent); // заменяем текущую
+            result.set(result.size() - 1, liveCurrent);
         } else if (livePeriod > lastPeriod) {
-            result.add(liveCurrent); // новая свеча началась
+            result.add(liveCurrent);
         }
         return Collections.unmodifiableList(result);
+    }
+
+    /**
+     * Returns false if splicing the live candle into the analysis series
+     * would bias the decision engine toward the local top/bottom of the
+     * in-flight bar.
+     */
+    private static boolean isLiveCandleSafeToSplice(
+            List<com.bot.TradingCore.Candle> closedHistory,
+            com.bot.TradingCore.Candle live) {
+        if (closedHistory == null || closedHistory.size() < 15) return true;
+
+        double atr14 = com.bot.TradingCore.atr(closedHistory, 14);
+        if (atr14 <= 0) return true;
+
+        // (1) Body magnitude vs ATR
+        double body = Math.abs(live.close - live.open);
+        if (body / atr14 > 0.60) return false;
+
+        // (2) Wick rejection (only when body is non-trivial — dojis carry their
+        //     own information and are caught by the body check above)
+        if (body > atr14 * 0.10) {
+            double upperWick = live.high - Math.max(live.open, live.close);
+            double lowerWick = Math.min(live.open, live.close) - live.low;
+            double maxWick = Math.max(upperWick, lowerWick);
+            if (maxWick > body * 1.5) return false;
+        }
+
+        // (3) RSI extreme — compute Wilder RSI(14) on the spliced series
+        int n = closedHistory.size();
+        double[] closes = new double[15];
+        for (int i = 0; i < 14; i++) closes[i] = closedHistory.get(n - 14 + i).close;
+        closes[14] = live.close;
+        double gain = 0, loss = 0;
+        for (int i = 1; i <= 14; i++) {
+            double d = closes[i] - closes[i - 1];
+            if (d > 0) gain += d; else loss -= d;
+        }
+        double avgGain = gain / 14.0;
+        double avgLoss = loss / 14.0;
+        double rsi = (avgLoss < 1e-12) ? 100.0
+                : 100.0 - (100.0 / (1.0 + avgGain / avgLoss));
+        if (rsi < 28.0 || rsi > 72.0) return false;
+
+        return true;
     }
 
     /**

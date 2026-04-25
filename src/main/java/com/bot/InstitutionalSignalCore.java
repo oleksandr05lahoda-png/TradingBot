@@ -119,15 +119,29 @@ public final class InstitutionalSignalCore {
         pruneOldSignalTimestamps(timestamps); // [FIX #18] reuse same prune helper
     }
 
-    /** SL cooldown: 2 × 15m candles = 30 minutes (prevents "falling knife" re-entry). */
+    /** SL cooldown — 30 min, blocks falling-knife re-entry. */
     private static final long SL_COOLDOWN_MS  = 30 * 60_000L;
-
-    /** [PATCH #7] TP cooldown: 15→20min. Синхронизирован с BotMain.isc.setSignalCooldown(20min).
-     *  Было: TP_COOLDOWN_MS=15min vs BotMain setSignalCooldown=20min → рассинхронизация.
-     *  ISC разблокировал монету через 15 мин, но BotMain cooldown ещё держал 20 мин.
-     *  При setSignalCooldown(20min) монета всё равно была заблокирована DecisionEngine cooldown.
-     *  Теперь: оба кулдауна = 20 мин = единый источник истины. */
+    /** TP cooldown — 20 min, synced with BotMain.setSignalCooldown(20min). */
     private static final long TP_COOLDOWN_MS  = 20 * 60_000L;
+    /** TIME_STOP cooldown — 45 min. A pair that didn't move in 90 min needs
+     *  more time off the active list than a clean TP exit. Pair with
+     *  chain-pause (2+ TS in a row → 4h side pause) below. */
+    private static final long TIME_STOP_COOLDOWN_MS = 45 * 60_000L;
+
+    //  TIME-STOP CHAIN GUARD
+    //  Tracks consecutive TIME_STOP exits per (symbol, side). After 2 TS in
+    //  a row the engine pauses that side for 4h; after 3 the entire symbol
+    //  is paused for 8h (treated as dead until regime change). Any decisive
+    //  close (TP / SL) resets the chain. Wired from cleanupExpired() and
+    //  closeTrade(). DecisionEngineMerged queries isPausedByChain() early.
+    private static final int  TS_CHAIN_TIER1_THRESHOLD = 2;
+    private static final int  TS_CHAIN_TIER2_THRESHOLD = 3;
+    private static final long TS_CHAIN_TIER1_PAUSE_MS  = 4L * 60 * 60_000L;
+    private static final long TS_CHAIN_TIER2_PAUSE_MS  = 8L * 60 * 60_000L;
+    private final Map<String, java.util.concurrent.atomic.AtomicInteger> tsChainCounters
+            = new ConcurrentHashMap<>();
+    private final Map<String, Long> tsChainSidePause   = new ConcurrentHashMap<>(); // key = sym|SIDE
+    private final Map<String, Long> tsChainSymbolPause = new ConcurrentHashMap<>(); // key = sym
 
     /** Register symbol as having an open trade. Called from registerSignal(). */
     public void markSymbolActive(String symbol) {
@@ -157,6 +171,64 @@ public final class InstitutionalSignalCore {
         Long until = symbolCooldownUntil.get(symbol);
         if (until != null && System.currentTimeMillis() < until) return false;
         return true;
+    }
+
+    //  CHAIN-GUARD API — used by DecisionEngineMerged + cleanupExpired
+
+    private static String chainKey(String symbol, com.bot.TradingCore.Side side) {
+        return symbol + "|" + side.name();
+    }
+
+    /** Increments the chain counter for (symbol, side) and installs the
+     *  appropriate pause if a tier threshold is crossed. Called from
+     *  cleanupExpired() on every TIME_STOP. Returns the new chain length. */
+    public int recordTimeStopChain(String symbol, com.bot.TradingCore.Side side) {
+        if (symbol == null || side == null) return 0;
+        String k = chainKey(symbol, side);
+        int n = tsChainCounters.computeIfAbsent(k,
+                x -> new java.util.concurrent.atomic.AtomicInteger(0)).incrementAndGet();
+        long now = System.currentTimeMillis();
+        if (n >= TS_CHAIN_TIER2_THRESHOLD) {
+            tsChainSymbolPause.put(symbol, now + TS_CHAIN_TIER2_PAUSE_MS);
+            tsChainCounters.get(k).set(0); // reset — pause IS the consequence
+        } else if (n >= TS_CHAIN_TIER1_THRESHOLD) {
+            tsChainSidePause.put(k, now + TS_CHAIN_TIER1_PAUSE_MS);
+        }
+        return n;
+    }
+
+    /** Called on TP / SL / chandelier-exit. Resets chain for (symbol, side). */
+    public void resetTimeStopChain(String symbol, com.bot.TradingCore.Side side) {
+        if (symbol == null || side == null) return;
+        var c = tsChainCounters.get(chainKey(symbol, side));
+        if (c != null) c.set(0);
+    }
+
+    /** True when (symbol, side) is in a chain-pause window. DecisionEngine
+     *  should reject signal generation up-front when this returns true. */
+    public boolean isPausedByChain(String symbol, com.bot.TradingCore.Side side) {
+        if (symbol == null || side == null) return false;
+        long now = System.currentTimeMillis();
+        Long sym = tsChainSymbolPause.get(symbol);
+        if (sym != null) {
+            if (now < sym) return true;
+            tsChainSymbolPause.remove(symbol);
+        }
+        Long sd = tsChainSidePause.get(chainKey(symbol, side));
+        if (sd != null) {
+            if (now < sd) return true;
+            tsChainSidePause.remove(chainKey(symbol, side));
+        }
+        return false;
+    }
+
+    /** Diagnostic: minutes left on the active chain pause, 0 if none. */
+    public long chainPauseMinutesLeft(String symbol, com.bot.TradingCore.Side side) {
+        if (!isPausedByChain(symbol, side)) return 0;
+        long now = System.currentTimeMillis();
+        long sym = tsChainSymbolPause.getOrDefault(symbol, 0L);
+        long sd  = tsChainSidePause.getOrDefault(chainKey(symbol, side), 0L);
+        return Math.max(0, (Math.max(sym, sd) - now) / 60_000L);
     }
 
     /**
@@ -633,16 +705,17 @@ public final class InstitutionalSignalCore {
         }
         if (list.isEmpty()) activeSignals.remove(symbol);
 
-        // [v17.0 §1] Release symbol with appropriate cooldown
-        // [v17.0 §4] Update consecutive SL counter for DrawdownManager
+        // Release symbol with appropriate cooldown + reset chain counter:
+        // any decisive close (TP or SL) clears the TS chain.
         boolean wasSL = "SL".equals(reason) || "HIT_SL".equals(reason) || "SCORE_EXIT".equals(reason);
         boolean wasProfit = pnlPct > 0.05;
         markSymbolClosed(symbol, wasSL);
+        resetTimeStopChain(symbol, side);
         if (wasSL)      recordConsecutiveSL();
         else if (wasProfit) resetConsecutiveSL();
     }
 
-    //  CLEANUP — Time Stop = NEUTRAL
+    //  CLEANUP — Time Stop = NEUTRAL (chain-counted)
 
     private void cleanupExpired() {
         decayStreakBoost();
@@ -653,25 +726,25 @@ public final class InstitutionalSignalCore {
                 if (s.ageMs() > TIME_STOP_MS) {
                     currentHeat = Math.max(0, currentHeat - s.riskPct);
 
-                    // [v17.0 CRITICAL FIX] Release from activeSymbols on expiry.
-                    // BUG: activeSymbols was NEVER cleaned on TIME_STOP — only activeSignals was.
-                    // Result: every symbol that ever got a signal stayed in activeSymbols forever.
-                    // isSymbolAvailable() checks activeSymbols first → permanent BIPOLAR BLOCK.
-                    // This was the ROOT CAUSE of:
-                    //   1. Endless "BIPOLAR BLOCK: X already active" log spam
-                    //   2. Signal drought growing worse the longer the bot ran
-                    //   3. wr=0% cl=46 — all "closes" were TIME_STOP because signals never unlocked
-                    // Fix: apply TP_COOLDOWN after TIME_STOP (not SL_COOLDOWN — it wasn't a loss).
+                    // Release symbol from active set; apply 45-min TIME_STOP cooldown.
                     activeSymbols.remove(s.symbol);
                     symbolCooldownUntil.put(s.symbol,
-                            System.currentTimeMillis() + TP_COOLDOWN_MS); // 15min cooldown after expiry
+                            System.currentTimeMillis() + TIME_STOP_COOLDOWN_MS);
 
-                    // NEUTRAL — not loss, not win. Streak NOT affected.
+                    // NEUTRAL trade — not loss, not win. Streak NOT affected.
                     Deque<ClosedTrade> hist = tradeHistory.computeIfAbsent(s.symbol, k -> new ConcurrentLinkedDeque<>());
                     hist.addLast(new ClosedTrade(s.symbol, s.side, 0.0, s.ageMs(), "TIME_STOP"));
                     while (hist.size() > MAX_HISTORY) hist.removeFirst();
 
-                    log("⏱ TIME_STOP: " + s.symbol + " " + s.side + " — unlocked, 15min cooldown");
+                    // Chain-guard: if this is the 2nd / 3rd TS in a row for
+                    // (symbol, side) it installs a 4h / 8h pause.
+                    int chainLen = recordTimeStopChain(s.symbol, s.side);
+                    long pauseMin = chainPauseMinutesLeft(s.symbol, s.side);
+                    log("⏱ TIME_STOP: " + s.symbol + " " + s.side
+                            + " — unlocked, 45min cooldown"
+                            + (chainLen >= TS_CHAIN_TIER1_THRESHOLD
+                            ? " · TS-CHAIN=" + chainLen + " pause=" + pauseMin + "min"
+                            : ""));
 
                     if (timeStopCallback != null) {
                         try { timeStopCallback.accept(s.symbol, "TIME_STOP " + s.symbol + " " + s.side); }
@@ -684,9 +757,8 @@ public final class InstitutionalSignalCore {
         }
         activeSignals.entrySet().removeIf(e -> e.getValue().isEmpty());
 
-        // [v17.0 FIX] Purge stale activeSymbols entries that have no matching activeSignal.
-        // Safety net: if a symbol ended up in activeSymbols without a signal (e.g. race condition),
-        // it stays locked forever. Remove any entry older than TIME_STOP_MS + 5min buffer.
+        // Safety net: purge any activeSymbols entry without a matching
+        // activeSignal that is older than TIME_STOP_MS + 5min buffer.
         long staleThreshold = TIME_STOP_MS + 5 * 60_000L;
         activeSymbols.entrySet().removeIf(e ->
                 (now - e.getValue()) > staleThreshold &&

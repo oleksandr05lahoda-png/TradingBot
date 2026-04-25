@@ -2337,7 +2337,11 @@ public final class TradingCore {
             return clamp(dist * 0.20, -0.5, 0.5);
         }
 
-        //  TREND PHASE — now uses exhaustion brain
+        //  TREND PHASE — tighter classification
+        //
+        // Old thresholds let 5–8 bar moves through as MID, blocking late-entry
+        // penalties on already-mature trends. Tightened: LATE now triggers at
+        // age > 5 OR depth > 2.5 ATR OR speed > 0.65 ATR/bar (parabolic catch).
 
         public TrendPhase detectPhase(List<Candle> c15, List<Candle> c1h) {
             return detectPhase(c15, c1h,
@@ -2348,10 +2352,18 @@ public final class TradingCore {
                                        MoveInfo move, double exhaustion) {
             if (exhaustion > 0.55) return TrendPhase.EXHAUSTION;
             if (exhaustion > 0.35) return TrendPhase.LATE;
-            if (move.ageBars <= 3 && move.depthAtr < 1.5) return TrendPhase.EARLY;
-            if (move.ageBars <= 8 && move.depthAtr < 3.0) return TrendPhase.MID;
-            if (move.ageBars > 12 || move.depthAtr > 3.5) return TrendPhase.LATE;
-            return TrendPhase.MID;
+
+            // Speed-based late catch: parabolic moves age fast in ATR space.
+            // 3-bar pump that traveled 2.5 ATR is LATE, not MID.
+            if (move.ageBars >= 3) {
+                double speed = move.depthAtr / Math.max(1, move.ageBars);
+                if (speed > 0.65) return TrendPhase.LATE;
+            }
+
+            if (move.ageBars <= 3 && move.depthAtr < 1.2) return TrendPhase.EARLY;
+            if (move.ageBars <= 5 && move.depthAtr < 2.0) return TrendPhase.MID;
+            if (move.ageBars >  5 || move.depthAtr > 2.5) return TrendPhase.LATE;
+            return TrendPhase.LATE; // boundary catch — classify conservatively
         }
 
         //  SQUEEZE detection

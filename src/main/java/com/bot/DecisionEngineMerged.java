@@ -138,12 +138,11 @@ public final class DecisionEngineMerged {
 
     // Cluster confluence bonus
     private static final double CLUSTER_CONFLUENCE_BONUS = 0.15;
-    // [v70] 3→2: 2-cluster setups разрешены при strong structure.
-    // Конкретно для pump/dump/reversal detection где обычно есть сильный 1-2
-    // кластер (Volume + Momentum) без полного 3-cluster confluence. clusterBase=48
-    // для 2 кластеров всё ещё ниже minConf=55, так что просто 2 слабых кластера
-    // не пройдут — нужен сильный scoreDiff.
-    private static final int    MIN_AGREEING_CLUSTERS    = 2;
+    // Minimum independent cluster agreement. 3 clusters required so that
+    // 2-cluster setups (which have base prob ≈ 48 < min 55) cannot pass on
+    // score-boost alone. Pump/dump patterns reliably trigger Volume +
+    // Momentum + Structure, so 3 is not a barrier in practice.
+    private static final int    MIN_AGREEING_CLUSTERS    = 3;
     private static final double MIN_CLUSTER_SCORE        = 0.28;
 
     // Single authoritative probability ceiling. All intermediate caps and the
@@ -207,7 +206,11 @@ public final class DecisionEngineMerged {
 
     private final Map<String, Deque<Double>>    cvdHistory       = new ConcurrentHashMap<>();
 
-    private static final int CVD_PERSIST_BARS = 1; // was 3 — major latency source
+    // CVD must persist for 2 bars before it counts as confirmation. At 1 bar
+    // the filter accepted spikes from short-covering or single large market
+    // orders that had no follow-through. Latency is fixed via EARLY_TICK,
+    // CVD must remain a real confirmation filter.
+    private static final int CVD_PERSIST_BARS = 2;
 
     private final Map<String, Integer> consecutiveLossMap = new ConcurrentHashMap<>();
     private static final double CONF_PENALTY_PER_LOSS = 3.0;
@@ -216,11 +219,16 @@ public final class DecisionEngineMerged {
 
     private final Map<String, Long> postExitCooldown = new ConcurrentHashMap<>();
 
-    private static final long POST_EXIT_COOLDOWN_MS = 10 * 60_000L; // was 30
+    private static final long POST_EXIT_COOLDOWN_MS = 20 * 60_000L;
 
     private volatile com.bot.GlobalImpulseController gicRef = null;
     private com.bot.PumpHunter pumpHunter;
     private volatile com.bot.TradingCore.ForecastEngine forecastEngine = null;
+
+    /** Optional ISC reference — used only for chain-pause check at the top of
+     *  generate(). Null until BotMain wires it; null-safe at every call site. */
+    private volatile com.bot.InstitutionalSignalCore iscRef = null;
+    public void setIsc(com.bot.InstitutionalSignalCore isc) { this.iscRef = isc; }
 
     public DecisionEngineMerged() {}
 
@@ -1463,22 +1471,25 @@ public final class DecisionEngineMerged {
         }
 
         int n15 = c15.size();
-        double move4bars = last(c15).close - c15.get(n15 - 5).close;
-        boolean lateEntryLong = false, lateEntryShort = false;
-        double lateMoveAtrMul = 0;
-        // [v50 §2] AGGRESSIVE LATE DETECTION: 2.0→1.2 ATR, 1 bar streak (was 2).
-        // At 2.0×ATR the move is already 60-80% done — too late for any entry.
-        // At 1.2×ATR we catch entries before they become unprofitable.
-        if (Math.abs(move4bars) > atr14 * 1.2) {
-            int consec = 0;
-            boolean up = move4bars > 0;
-            for (int i = n15 - 1; i >= Math.max(0, n15 - 6); i--) {
-                if ((c15.get(i).close > c15.get(i).open) == up) consec++; else break;
-            }
-            // 2→1: single directional bar after 1.2×ATR move = already late
-            if (consec >= 1 && up) lateEntryLong = true;
-            if (consec >= 1 && !up) lateEntryShort = true;
-            lateMoveAtrMul = Math.abs(move4bars) / (atr14 + 1e-12);
+
+        // ── LATE-MOVE DETECTION (multi-window) ───────────────────────
+        // Old single-window move4bars caught only ~1h displacement and
+        // missed slow grinds (5-8 small candles in one direction).
+        // New scheme runs three orthogonal checks:
+        //   1) ATR depth across 4 / 8 / 12-bar windows
+        //   2) Consecutive same-direction bar streak
+        //   3) Velocity blow-up (3-bar avg vs 20-bar median)
+        // Severity tiers: NONE / SOFT (penalty) / HARD (reject).
+        LateMoveSignal lateMove = detectLateMove(c15, atr14);
+        boolean lateEntryLong  = lateMove.severity != 0 &&  lateMove.dirUp;
+        boolean lateEntryShort = lateMove.severity != 0 && !lateMove.dirUp;
+        double lateMoveAtrMul  = lateMove.maxAtrMul;
+        double move4bars = (n15 >= 5)
+                ? last(c15).close - c15.get(n15 - 5).close
+                : 0.0;
+        if (lateMove.severity != 0) {
+            allFlags.add("LM_" + (lateMove.severity == 2 ? "HARD" : "SOFT")
+                    + "_" + (lateMove.dirUp ? "UP" : "DN"));
         }
 
         // [v50 §7] MOMENTUM EXHAUSTION GATE — detect spent impulses BEFORE cluster scoring.
@@ -2449,6 +2460,13 @@ public final class DecisionEngineMerged {
 
         com.bot.TradingCore.Side side = candidateSide;
 
+        // CHAIN-PAUSE GATE — block re-entry if pair has 2+ consecutive
+        // TIME_STOPs (4h side pause) or 3+ on either side (8h symbol pause).
+        // Catches the ENJUSDT-style chain on dead structure.
+        if (iscRef != null && iscRef.isPausedByChain(symbol, side)) {
+            return reject("ts_chain_pause");
+        }
+
         // [v70] LOCAL EXHAUSTION — разрешаем reversal-сторону при strong confluence.
         //
         // Прежде: hard reject counter-trend entries после локального pump/dump.
@@ -2488,12 +2506,16 @@ public final class DecisionEngineMerged {
             allFlags.add("LATE_ENTRY_S");
         }
 
-        // [v50 §3] HARD ATR VETO: 2.8→1.8. No EARLY_SOLO exemption.
-        // At 1.8×ATR the move is already significant. No indicator can save a late entry.
-        // Removed EARLY_SOLO exemption — it was allowing chasing on exhausted moves.
-        if (lateEntryPenalty && lateMoveAtrMul > 1.8) {
-            allFlags.add(String.format("LATE_HARD_BLOCK_%.1fx", lateMoveAtrMul));
-            return reject("late_hard_block");
+        // HARD veto from late-move detector — already includes ATR depth,
+        // streak count, and velocity. Replaces the old single-axis
+        // 1.8×ATR check which missed slow-grind setups entirely.
+        if (lateMove.severity == 2) {
+            if ((lateMove.dirUp && side == com.bot.TradingCore.Side.LONG)
+                    || (!lateMove.dirUp && side == com.bot.TradingCore.Side.SHORT)) {
+                allFlags.add(String.format("LATE_HARD_BLOCK_atr=%.2f_streak=%d",
+                        lateMove.maxAtrMul, lateMove.streakBars));
+                return reject("late_hard_block");
+            }
         }
 
         // [v70 §7] MOMENTUM EXHAUSTION — usage изменено под reversal trading.
@@ -5015,5 +5037,114 @@ public final class DecisionEngineMerged {
 
         int direction = move > 0 ? +1 : -1;
         return new LocalExhaustion(direction, moveAtr);
+    }
+
+    //  LATE-MOVE DETECTION (multi-window)
+
+    /** Result of {@link #detectLateMove}. severity: 0=NONE, 1=SOFT, 2=HARD. */
+    private static final class LateMoveSignal {
+        final int severity;
+        final boolean dirUp;
+        final double maxAtrMul;
+        final int streakBars;
+        final double velocityRatio;
+        LateMoveSignal(int severity, boolean dirUp, double maxAtrMul,
+                       int streakBars, double velocityRatio) {
+            this.severity = severity;
+            this.dirUp = dirUp;
+            this.maxAtrMul = maxAtrMul;
+            this.streakBars = streakBars;
+            this.velocityRatio = velocityRatio;
+        }
+    }
+
+    private static final LateMoveSignal LATE_NONE = new LateMoveSignal(0, false, 0, 0, 1.0);
+
+    private static final double LM_SOFT_ATR  = 1.2;
+    private static final double LM_HARD_ATR  = 1.8;
+    private static final int    LM_STREAK_S  = 4;
+    private static final int    LM_STREAK_H  = 6;
+    private static final double LM_VEL_BLOWUP = 2.5;
+    private static final int    LM_W_FAST = 4;
+    private static final int    LM_W_MID  = 8;
+    private static final int    LM_W_SLOW = 12;
+
+    /**
+     * Multi-window late-entry risk classifier. Returns NONE / SOFT / HARD.
+     * <p>OR-combined factors:
+     * <ul>
+     *   <li>ATR depth on max(4,8,12)-bar window</li>
+     *   <li>Consecutive same-direction bar streak</li>
+     *   <li>3-bar velocity vs 20-bar median velocity</li>
+     * </ul>
+     * HARD when ANY of: atr ≥ 1.8, streak ≥ 6, atr ≥ 1.2 + streak ≥ 4,
+     * atr ≥ 1.2 + velocity ≥ 2.5×.
+     */
+    private static LateMoveSignal detectLateMove(java.util.List<com.bot.TradingCore.Candle> c, double atr14) {
+        if (c == null || c.size() < LM_W_SLOW + 2) return LATE_NONE;
+        final int n = c.size();
+
+        // (1) Multi-window ATR displacement
+        double maxAtrMul = 0;
+        Boolean atrDirUp = null;
+        if (atr14 > 0) {
+            double last = c.get(n - 1).close;
+            int[] windows = { LM_W_FAST, LM_W_MID, LM_W_SLOW };
+            for (int w : windows) {
+                int idx = n - 1 - w;
+                if (idx < 0) continue;
+                double from = c.get(idx).close;
+                double mul = Math.abs(last - from) / atr14;
+                if (mul > maxAtrMul) {
+                    maxAtrMul = mul;
+                    atrDirUp = last > from;
+                }
+            }
+        }
+
+        // (2) Consecutive same-color streak
+        boolean firstBull = c.get(n - 1).close > c.get(n - 1).open;
+        int streak = 0;
+        for (int i = n - 1; i >= Math.max(0, n - LM_STREAK_H - 2); i--) {
+            boolean bull = c.get(i).close > c.get(i).open;
+            if (bull == firstBull) streak++;
+            else break;
+        }
+        Boolean streakDirUp = streak >= 2 ? firstBull : null;
+
+        // (3) Velocity blow-up
+        double velocityRatio = 1.0;
+        if (n >= 22) {
+            double recent = 0;
+            for (int i = n - 3; i < n; i++) {
+                recent += Math.abs(c.get(i).close - c.get(i - 1).close);
+            }
+            recent /= 3.0;
+            double[] hist = new double[20];
+            for (int i = 0; i < 20; i++) {
+                int idx = n - 23 + i;
+                hist[i] = Math.abs(c.get(idx).close - c.get(idx - 1).close);
+            }
+            java.util.Arrays.sort(hist);
+            double median = (hist[9] + hist[10]) / 2.0;
+            if (median > 1e-12) velocityRatio = recent / median;
+        }
+
+        Boolean primaryDirUp = atrDirUp != null ? atrDirUp : streakDirUp;
+        if (primaryDirUp == null) return LATE_NONE;
+
+        boolean atrSoft = maxAtrMul >= LM_SOFT_ATR;
+        boolean atrHard = maxAtrMul >= LM_HARD_ATR;
+        boolean strkS   = streak    >= LM_STREAK_S;
+        boolean strkH   = streak    >= LM_STREAK_H;
+        boolean velBlow = velocityRatio >= LM_VEL_BLOWUP;
+
+        if (atrHard || strkH || (atrSoft && velBlow) || (atrSoft && strkS)) {
+            return new LateMoveSignal(2, primaryDirUp, maxAtrMul, streak, velocityRatio);
+        }
+        if (atrSoft || strkS || velBlow) {
+            return new LateMoveSignal(1, primaryDirUp, maxAtrMul, streak, velocityRatio);
+        }
+        return LATE_NONE;
     }
 }
