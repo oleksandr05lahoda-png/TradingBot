@@ -19,9 +19,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public final class InstitutionalSignalCore {
 
-    // [v18] Synced with DE MIN_CONF_FLOOR=50 + Dispatcher floor=53.
-    // Ceiling 60: при daily penalty +2 валидный диапазон floor..60 не ужимается до нуля.
-    private static final double MAX_EFFECTIVE_MIN_CONF = 60.0;
+    // [v71] MAX_EFFECTIVE_MIN_CONF 60→56. Синхронизация с DE.MIN_CONF_FLOOR=52
+    // и SignalSender.MIN_CONF=53. Старый потолок 60 не давал ISC снизить порог
+    // достаточно даже при отличном track record — daily penalty +2 двигал base
+    // выше потолка и порог застревал на 60 (выше чем фильтр в SignalSender).
+    private static final double MAX_EFFECTIVE_MIN_CONF = 56.0;
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
@@ -37,12 +39,14 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;
 
     public InstitutionalSignalCore() {
-        // [v18] baseMinConfidence 56 → 53 (synced с DE=50 + 3pt margin).
+        // [v71] baseMinConfidence 53→50. Синхронизация с DE.MIN_CONF_FLOOR=52
+        // (margin -2: ISC умышленно слегка ниже DE чтобы не дублировать фильтр).
+        // Реальный quality control делается в Dispatcher cold-start gate (53/57).
         this(
                 envInt("ISC_MAX_GLOBAL_SIGNALS", 6),
                 envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
                 envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
-                envDouble("ISC_BASE_MIN_CONF", 53.0),
+                envDouble("ISC_BASE_MIN_CONF", 50.0),
                 envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003),
                 envInt("ISC_MAX_SAME_SECTOR_DIR", 2)
         );
@@ -412,12 +416,15 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [v18] floor 52 → 50 synced с DE MIN_CONF_FLOOR=50.
-        double floor = 50.0;
+        // [v71] floor 50→47, milestones 46→44 / 48→45.
+        // Синхронизация с DE.MIN_CONF_FLOOR=52: ISC должен ВСЕГДА быть ниже DE
+        // на 3-5pt margin, иначе становится дублирующим фильтром. Реальная
+        // защита качества — Dispatcher cold-start gate (53/57) и калибратор.
+        double floor = 47.0;
         int totalTrades = getTotalTradeCount();
         double overallWr = getOverallWinRate();
-        if (totalTrades >= 500 && overallWr >= 0.58) floor = 46.0;
-        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 48.0;
+        if (totalTrades >= 500 && overallWr >= 0.58) floor = 44.0;
+        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 45.0;
 
         double base = Math.max(baseMinConfidence, floor);
 

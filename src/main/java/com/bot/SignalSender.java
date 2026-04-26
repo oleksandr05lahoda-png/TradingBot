@@ -720,7 +720,7 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
         this.TOP_N            = envInt("TOP_N", 30);
-        this.MIN_CONF         = envDouble("MIN_CONF", 58.0); // [v70] 65→58, synced с DE MIN_CONF_FLOOR=55
+        this.MIN_CONF         = envDouble("MIN_CONF", 53.0); // [v71] 58→53, синхронизация с DE.MIN_CONF_FLOOR=52 + 1pt margin
         this.KLINES_LIMIT     = envInt("KLINES", 420);
         // [v66] 160 → 420. CRITICAL BUG FIX: processPair gate at line 1149 requires
         // m15.size() >= 400, but KLINES_LIMIT=160 meant fetchKlines returned only 160
@@ -1348,7 +1348,11 @@ public final class SignalSender {
             // qualityPenalty still reduces position size in getPositionSizeUsdt() below.
             double symbolConfBoost = isc.getSymbolMinConfBoost(pair);
             double qualityPenalty = cycleQualityPenalty;
-            double earlyMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost);
+            // [v71] Раньше: max(MIN_CONF, isc...). При хорошем track record ISC мог
+            // выдавать floor=44, но MIN_CONF=53 всё равно блокировал. Теперь ISC может
+            // опускать порог ниже MIN_CONF на 3pt (max benefit) — но не ниже MIN_CONF-3.
+            double iscFloor = isc.getEffectiveMinConfidence() + symbolConfBoost;
+            double earlyMinConf = (iscFloor >= MIN_CONF) ? iscFloor : Math.max(MIN_CONF - 3.0, iscFloor);
             if (idea.probability < earlyMinConf) {
                 blockedEarlyConf.incrementAndGet();
                 return null;

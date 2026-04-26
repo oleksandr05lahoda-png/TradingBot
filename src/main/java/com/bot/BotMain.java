@@ -335,14 +335,16 @@ public final class BotMain {
                 // Phase 3 — near-graduation. MIN_CONF upstream is sole filter.
                 probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 10) {
-                // [v70] Phase 2 synced with DE MIN_CONF_FLOOR=55.
-                // Было 62/66 при DE=60 (margin 2/6). При DE=55 — 57/61 (margin 2/6).
-                probFloor = 57.0; probShortcut = 61.0; minClusters = 2; minFcConf = 0.35;
+                // [v71] Phase 2 синхронизирована с DE.MIN_CONF_FLOOR=52.
+                // Было 57/61 при DE=55 (margin 2/6). При DE=52 — 52/56 (margin 0/4).
+                // probShortcut=56 значит что 3-cluster setup с прочной математикой проходит solo.
+                probFloor = 52.0; probShortcut = 56.0; minClusters = 2; minFcConf = 0.32;
             } else {
-                // [v70] Phase 1 — hard cold start synced с DE=55.
-                // Было 64/68 при DE=60. Сейчас 58/62 сохраняет тот же margin 3/7.
-                // solo-pass на 62 достижим для strong reversal/pump setups.
-                probFloor = 58.0; probShortcut = 62.0; minClusters = 2; minFcConf = 0.35;
+                // [v71] Phase 1 — hard cold start синхронизирован с DE=52.
+                // Было 58/62 при DE=55. Сейчас 53/57 — solo-pass на 57 достижим для
+                // строгого 3-4 cluster setup. minFcConf 0.35→0.32: ForecastEngine
+                // редко выдаёт confidence>=0.35 на cold-start без истории.
+                probFloor = 53.0; probShortcut = 57.0; minClusters = 2; minFcConf = 0.32;
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {
@@ -600,7 +602,7 @@ public final class BotMain {
         }, "ShutdownHook"));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v64 SCANNER started " + nowLocalStr()
+        LOG.info("═══ TradingBot v71 SCANNER started " + nowLocalStr()
                 + " (first cycle in 90s) ═══");
     }
 
@@ -1067,16 +1069,18 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v64`\n"
+        return "⚡ *TradingBot SCANNER* `v71`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures · TOP-30 · Scanner-only\n"
                 + "R:R min `1:2` · SL min `0.35%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🎯 *v64 Critical fixes:*\n"
-                + "• Cold-start gate → OR-logic\n"
-                + "• EARLY_TICK unblocked (fcConf=0 bug)\n"
-                + "• Panic thresholds raised\n"
-                + "• Target: 3-8 signals/day\n"
+                + "🎯 *v71 Critical math fixes:*\n"
+                + "• Probability formula rebalanced\n"
+                + "• 3-cluster setups теперь проходят\n"
+                + "• late_hard_block смягчён 1.8→2.5 ATR\n"
+                + "• RANGE reversal (2-cluster) разрешён\n"
+                + "• Cold-start gate: 53/57 (было 58/62)\n"
+                + "• Target: 5-10 signals/day\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
                 + "_Реальные сигналы с Entry/TP1-3/SL._";

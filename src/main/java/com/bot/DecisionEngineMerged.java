@@ -122,9 +122,13 @@ public final class DecisionEngineMerged {
     // уже даёт ~42). Новые значения позволяют пропустить ранние тренды / развороты /
     // pump/dump setups в диапазоне 55–75, при этом downstream Dispatcher + ISC
     // остаются authoritative quality-gate (их пороги тоже понижены).
-    private static final double BASE_CONF       = 55.0;
+    // [v71] MIN_CONF_FLOOR 55→52: после rebalance формулы (cluster bases 56→60,
+    // RANGE penalty -2→-0.5, ALT -1→0) валидный 3-cluster setup в плоском рынке
+    // выдаёт 53-58. С floor=55 он валился. С floor=52 — проходит, но Dispatcher
+    // cold-start gate (53/57) и калибратор остаются authoritative quality control.
+    private static final double BASE_CONF       = 52.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 55.0;
+    private static final double MIN_CONF_FLOOR  = 52.0;
     private static final double MIN_CONF_CEIL   = 76.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -1342,7 +1346,10 @@ public final class DecisionEngineMerged {
         double move5     = c15.size() >= 5 ? (last(c15).close - c15.get(c15.size() - 5).close) / price : 0.0;
         double lastRange = last(c15).high - last(c15).low;
 
-        if (lastRange > atr14 * 4.5 || atr14 <= 0) return reject("range_or_atr");
+        // [v71] Threshold 4.5→6.5. Широкая impulse-свеча 4.5×ATR это и есть
+        // начало тренда — ровно то что мы хотим поймать. Блокировали именно
+        // breakout-сетапы. 6.5×ATR оставляет защиту от истинных flash spikes.
+        if (lastRange > atr14 * 6.5 || atr14 <= 0) return reject("range_or_atr");
         atr14 = Math.max(atr14, price * 0.0012);
 
         // ── GIC crash state ──────────────────────────────────────
@@ -1456,7 +1463,9 @@ public final class DecisionEngineMerged {
                         allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
                         return reject("choppy_range");
                     }
-                } else if (ci > 72.0) {
+                } else if (ci > 76.0) {
+                    // [v71] CI threshold 72→76. В WEAK_TREND CI>72 случается на каждой
+                    // второй паре — слишком агрессивный фильтр. 76 ловит реальный chop.
                     allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
                     return reject("choppy_weak");
                 }
@@ -2417,8 +2426,15 @@ public final class DecisionEngineMerged {
         int requiredClusters = earlySoloAllowed ? 2 : MIN_AGREEING_CLUSTERS;
 
         // RANGE market is treacherous — require 3 clusters minimum
+        // [v71] Exception: reversal context (LOCAL_REVERSAL/EXHAUSTION_REVERSAL_BOOST/
+        // REVERSAL_SETUP) — это легитимный mean-reversion сетап и 2 кластера достаточно.
+        // Это разблокирует именно ту категорию которая работает в RANGE: pump exhaust
+        // → SHORT, dump exhaust → LONG (как MOVRUSDT TP1 показал).
         if (state == MarketState.RANGE && !earlySoloAllowed && !aggressiveShort) {
-            requiredClusters = 3;
+            boolean reversalContext = allFlags.contains("REVERSAL_SETUP")
+                    || allFlags.contains("EXHAUSTION_REVERSAL_BOOST")
+                    || allFlags.stream().anyMatch(f -> f != null && f.startsWith("LOCAL_REVERSAL"));
+            requiredClusters = reversalContext ? 2 : 3;
         }
 
         // Insufficient clusters → penalty flag (was return null)
@@ -2769,7 +2785,10 @@ public final class DecisionEngineMerged {
             allFlags.add("MOD_NOISE");
         }
         // Combo guard stays, but tightened — only block truly broken setups
-        if (noiseScore > 2.4 && probability < 58.0) {
+        // [v71] Threshold 2.4→2.7, prob 58→50. До этой строки УЖЕ снято -8 за noise>2.2
+        // (line above) — повторная hard-блокировка была double-penalty. Теперь срабатывает
+        // только для реально сломанных сетапов (high noise + очень низкая probability).
+        if (noiseScore > 2.7 && probability < 50.0) {
             allFlags.add("NOISE_PROB_COMBO_BLOCK");
             return reject("noise_prob_combo");
         }
@@ -3274,28 +3293,41 @@ public final class DecisionEngineMerged {
 
         norm = Math.min(1.0, norm);
 
-        // [v70] Cluster base raised так чтобы 3-cluster setup с decent norm мог
-        // достичь minConf=55. Прежде 3 кластера давали base=50 → при RANGE(-5) +
-        // ALT(-3) даже с norm=0.8 prob=55 не набирался. Теперь 3 кластера = 56.
+        // [v71] CRITICAL REBALANCE — главная причина silence бота.
+        //
+        // Анализ старой математики: для типичной альты в NEUTRAL рынке (3 кластера,
+        // scoreDiff=0.30) norm = 0.30/5.0 + 0.02 + 0.06(HTF) + 0.025(VWAP) ≈ 0.165.
+        //   prob = 56 + (0.165 - 0.50) × 24 = 56 - 8.04 = 48
+        //   - RANGE -2 - ALT -1 = 45 < MIN_CONF_FLOOR=55 → REJECT.
+        // 3-cluster setup был МАТЕМАТИЧЕСКИ невозможен в RANGE/NEUTRAL.
+        //
+        // Фикс: (1) поднять clusterBase для 2-3 кластеров, (2) сместить center
+        // формулы с 0.50 на 0.30 (реалистичный median norm в плоском рынке),
+        // (3) уменьшить gain 24→22 чтобы не раздувать 4-6 cluster setups.
+        //
+        // Новая математика для тех же условий: 60 + (0.165 - 0.30) × 22 = 60 - 2.97 = 57.
+        // - RANGE -0.5 (A2) - ALT 0 (A3) = 56.5 → проходит floor=52, даёт калибратору шанс.
         double clusterBase = switch (clusters) {
             case 6 -> 78.0;
             case 5 -> 70.0;
             case 4 -> 63.0;
-            case 3 -> 56.0;
-            case 2 -> 48.0;
-            default -> 38.0;
+            case 3 -> 60.0;   // 56→60: 3-cluster setup в RANGE+ALT теперь дотягивает
+            case 2 -> 53.0;   // 48→53: 2-cluster + сильный score теперь имеет шанс
+            default -> 40.0;  // 38→40
         };
 
-        double prob = clusterBase + (norm - 0.50) * 24.0;
+        double prob = clusterBase + (norm - 0.30) * 22.0;
 
-        // [v70] State penalty смягчён: RANGE -5 → -2.
-        // RANGE — это именно где pump/dump/reversal setups формируются.
+        // [v71] State penalty: RANGE -2→-0.5. RANGE = normal, не должен жёстко
+        // штрафоваться. MOVRUSDT (единственный сигнал за 8 часов) был в RANGE
+        // и взял TP1 — доказательство что RANGE сетапы валидны.
         if      (state == MarketState.STRONG_TREND) prob += 3.0;
-        else if (state == MarketState.RANGE)        prob -= 2.0;
+        else if (state == MarketState.RANGE)        prob -= 0.5;
 
-        // [v70] Category penalties смягчены. Остаются но не убивают сигнал.
-        if (cat == CoinCategory.MEME)     prob -= 8.0;   // was -14
-        else if (cat == CoinCategory.ALT) prob -= 1.0;   // was -3
+        // [v71] Category penalties: ALT -1→0. 80% монет это ALT — постоянный
+        // штраф был arbitrary tax. MEME оставлен -8 (реальная noise penalty).
+        if (cat == CoinCategory.MEME)     prob -= 8.0;
+        else if (cat == CoinCategory.ALT) prob -= 0.0;
 
         // ── Live Bayesian prior blend ───────────────────────────────────
         double priorProb = 50.0 + (bayesPrior.get() - 0.50) * 26.0;
@@ -5060,11 +5092,20 @@ public final class DecisionEngineMerged {
 
     private static final LateMoveSignal LATE_NONE = new LateMoveSignal(0, false, 0, 0, 1.0);
 
-    private static final double LM_SOFT_ATR  = 1.2;
-    private static final double LM_HARD_ATR  = 1.8;
-    private static final int    LM_STREAK_S  = 4;
-    private static final int    LM_STREAK_H  = 6;
-    private static final double LM_VEL_BLOWUP = 2.5;
+    // [v71] Late-move thresholds raised — главная причина late_hard_block=2-7/cycle.
+    //
+    // Анализ: на 15m таймфрейме streak 6 баров одного цвета = 1.5 часа one-color =
+    // НОРМАЛЬНЫЙ начинающийся тренд, а не "late entry". Старые границы блокировали
+    // именно те сетапы которые мы хотим — продолжение свежего тренда.
+    //
+    //   atr 1.8→2.5  : 2.5×ATR за 4-12 баров = реальный extension, а не setup
+    //   streak 6→8   : 8 баров = 2 часа one-color, реально поздно
+    //   vel 2.5→3.0  : умеренное ускорение это часть тренда, не late entry
+    private static final double LM_SOFT_ATR  = 1.5;   // 1.2→1.5
+    private static final double LM_HARD_ATR  = 2.5;   // 1.8→2.5
+    private static final int    LM_STREAK_S  = 5;     // 4→5
+    private static final int    LM_STREAK_H  = 8;     // 6→8
+    private static final double LM_VEL_BLOWUP = 3.0;  // 2.5→3.0
     private static final int    LM_W_FAST = 4;
     private static final int    LM_W_MID  = 8;
     private static final int    LM_W_SLOW = 12;
