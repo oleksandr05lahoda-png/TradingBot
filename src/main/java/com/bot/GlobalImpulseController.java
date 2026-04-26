@@ -4,9 +4,14 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
+
 
 /** GlobalImpulseController — TRADINGBOT PRO EDITION v7.0 */
 public final class GlobalImpulseController {
+    // [v72] Unified logger
+    private static final Logger LOG = Logger.getLogger(GlobalImpulseController.class.getName());
+
 
     //  CONFIGURATION
 
@@ -873,7 +878,7 @@ public final class GlobalImpulseController {
                 computeShortBoost(CascadeLevel.PANIC, btcCrashScore, btcDropVelocity, btcMomentumAccel) * 100
         );
 
-        System.out.println("[GIC] " + msg.replace("*", ""));
+        LOG.info("[GIC] " + msg.replace("*", ""));
         if (panicCallback != null) {
             try { panicCallback.accept(msg); } catch (Exception ignored) {}
         }
@@ -884,7 +889,7 @@ public final class GlobalImpulseController {
         // Reset dedup so next panic cycle can alert immediately
         lastPanicAlertMs = 0;
         lastPanicAlertScore = 0;
-        System.out.println("[GIC] PANIC MODE DEACTIVATED — рынок стабилизировался");
+        LOG.info("[GIC] PANIC MODE DEACTIVATED — рынок стабилизировался");
         if (panicCallback != null) {
             try { panicCallback.accept("✅ PANIC MODE OFF — торговля восстановлена"); } catch (Exception ignored) {}
         }

@@ -244,7 +244,11 @@ public final class BotMain {
         private static final double MIN_RR          = 2.00;
         private static final double MIN_SL_PCT      = 0.0035;
         private static final long   SYMBOL_DEDUP_MS = 15 * 60_000L;
-        private static final int    MAX_PER_HOUR    = 6;    // [v63] was 4 — too restrictive
+        // [v74] 6 → 12. On 30 active pairs during a sector wave (BTC moves, ALTs follow),
+        // 6/h means the bot fires its quota in 10 minutes and silently drops everything
+        // for the rest of the hour. 12/h = 1 signal every 5 min averaged, still readable
+        // in Telegram, but doesn't choke during volatility clusters.
+        private static final int    MAX_PER_HOUR    = 12;
         private static final long   HOUR_MS         = 60 * 60_000L;
 
         private final com.bot.TelegramBotSender tg;
@@ -602,8 +606,20 @@ public final class BotMain {
         }, "ShutdownHook"));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v71 SCANNER started " + nowLocalStr()
+        LOG.info("═══ TradingBot v74 SCANNER started " + nowLocalStr()
                 + " (first cycle in 90s) ═══");
+
+        // [v74] STARTUP SELF-VALIDATION — answers "does this strategy actually
+        // have edge?" without waiting weeks. 5min after start (volume24hUSD is
+        // populated by then) and every 6h after, walks 4 days of 15m history
+        // through the live engine, simulates outcomes, sends a Telegram verdict.
+        // Lives inside SimpleBacktester (no new top-level class). Toggle via
+        // VALIDATOR_ENABLED env var.
+        try {
+            com.bot.SimpleBacktester.SelfValidator.start(sender, telegram, 5 * 60_000L);
+        } catch (Throwable t) {
+            LOG.warning("[SELF-VALIDATOR] init failed: " + t.getMessage());
+        }
     }
 
     private static void runCycle(com.bot.TelegramBotSender telegram,

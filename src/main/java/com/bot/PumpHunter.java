@@ -3,6 +3,8 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.logging.Logger;
+
 
 /**
  * PumpHunter v51 — latency-optimized pump / dump / exhaustion / pre-pump detector.
@@ -37,6 +39,9 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  *   8. Volume climax / confirmation (kept)
  */
 public final class PumpHunter {
+    // [v72] Unified logger
+    private static final Logger LOG = Logger.getLogger(PumpHunter.class.getName());
+
 
     // ==================== CONFIG ====================
 
@@ -289,7 +294,7 @@ public final class PumpHunter {
             if (exh != null) {
                 lastExhaustionTime.put(symbol, now);
                 recordEvent(symbol, exh);
-                System.out.println("[PumpHunter/EXH] " + exh);
+                LOG.info("[PumpHunter/EXH] " + exh);
                 return exh;
             }
         }
@@ -305,7 +310,7 @@ public final class PumpHunter {
             if (pre != null) {
                 lastPrePumpTime.put(symbol, now);
                 recordEvent(symbol, pre);
-                System.out.println("[PumpHunter/PRE] " + pre);
+                LOG.info("[PumpHunter/PRE] " + pre);
                 return pre;
             }
         }
@@ -420,7 +425,7 @@ public final class PumpHunter {
 
         lastPumpTime.put(symbol, now);
         recordEvent(symbol, event);
-        System.out.println("[PumpHunter] " + event);
+        LOG.info("[PumpHunter] " + event);
         return event;
     }
 

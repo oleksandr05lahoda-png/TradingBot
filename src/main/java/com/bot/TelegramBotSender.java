@@ -17,6 +17,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Logger;
+
 
 /**
  * TelegramBotSender v60 — production-hardened Telegram delivery.
@@ -41,6 +43,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *  [F7] isHealthy() returns false if worker stuck >30s or 10+ consecutive send failures.
  */
 public final class TelegramBotSender {
+    // [v72] Unified logger
+    private static final Logger LOG = Logger.getLogger(TelegramBotSender.class.getName());
+
 
     private final String token;
     private final String chatId;
@@ -298,7 +303,7 @@ public final class TelegramBotSender {
     }
 
     private void log(String msg) {
-        System.out.println("[TG " + LocalDateTime.now().format(DTF) + "] " + msg);
+        LOG.info("[TG " + LocalDateTime.now().format(DTF) + "] " + msg);
     }
 
     private static String shortBody(String body, int max) {

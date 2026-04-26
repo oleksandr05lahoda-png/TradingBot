@@ -3,6 +3,7 @@ package com.bot;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Logger;
 
 // DecisionEngineMerged — REFACTORED v38-FINAL
 // CHANGES vs original:
@@ -14,6 +15,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 //   Thread-safe symbolMinConf via compute()
 //   vdHistory/cvdHistory via computeIfAbsent()
 public final class DecisionEngineMerged {
+    // [v72] Unified logger
+    private static final Logger LOG = Logger.getLogger(DecisionEngineMerged.class.getName());
+
 
     public static volatile java.time.ZoneId USER_ZONE = java.time.ZoneId.of("Europe/Warsaw");
 
@@ -348,29 +352,25 @@ public final class DecisionEngineMerged {
     // Category-aware directional score thresholds for EARLY_TICK gate.
     //
     // Old: single 0.25 threshold for all categories.
-    // Problem: MEME pairs have 3–5× more random directional noise than TOP pairs.
-    // Using the same 0.25 floor meant roughly equal signal counts across categories,
-    // but MEME signals had much lower precision — the gate was letting noise through.
-    //
-    // New: stricter thresholds for higher-noise categories.
-    //   TOP  (BTC, ETH, BNB…): 0.22 — reliable forecasts, allow borderline calls
-    //   ALT  (mid-caps):       0.28 — moderate noise
-    //   MEME (PEPE, SHIB…):    0.35 — stricter, kills speculative noise
-    // Backward-compat constant kept for any external reference.
-    private static final double EARLY_TICK_FC_MIN_SCORE      = 0.25;
-    private static final double EARLY_TICK_FC_MIN_SCORE_TOP  = 0.22;
-    private static final double EARLY_TICK_FC_MIN_SCORE_ALT  = 0.28;
-    private static final double EARLY_TICK_FC_MIN_SCORE_MEME = 0.35;
+    // EARLY_TICK forecast gate — asymmetric thresholds.
+    // EARLY_TICK fires on tick velocity (leading); ForecastEngine works on closed
+    // 15m bars (lagging). Demanding strong same-direction confirmation defeats the
+    // purpose: by the time the closed bar agrees, the move has already happened.
+    // Solution: only block when forecast is *meaningfully* against the trade.
+    // Neutral or weakly-aligned forecast = allow (this is the pre-move regime).
+    private static final double EARLY_TICK_FC_OPPOSE_TOP  = 0.18;
+    private static final double EARLY_TICK_FC_OPPOSE_ALT  = 0.22;
+    private static final double EARLY_TICK_FC_OPPOSE_MEME = 0.28;
+    private static final double EARLY_TICK_FC_OPPOSE_DEF  = 0.22;
 
-    private static double earlyTickMinScoreFor(CoinCategory cat) {
-        if (cat == null) return EARLY_TICK_FC_MIN_SCORE;
+    private static double earlyTickOpposeThresholdFor(CoinCategory cat) {
+        if (cat == null) return EARLY_TICK_FC_OPPOSE_DEF;
         return switch (cat) {
-            case TOP  -> EARLY_TICK_FC_MIN_SCORE_TOP;
-            case ALT  -> EARLY_TICK_FC_MIN_SCORE_ALT;
-            case MEME -> EARLY_TICK_FC_MIN_SCORE_MEME;
+            case TOP  -> EARLY_TICK_FC_OPPOSE_TOP;
+            case ALT  -> EARLY_TICK_FC_OPPOSE_ALT;
+            case MEME -> EARLY_TICK_FC_OPPOSE_MEME;
         };
     }
-
 
     public static boolean forecastPassesEarlyTickGate(
             com.bot.TradingCore.ForecastEngine.ForecastResult forecast,
@@ -378,26 +378,24 @@ public final class DecisionEngineMerged {
         return forecastPassesEarlyTickGate(forecast, isLong, null);
     }
 
-    /** [PATCH EARLY_TICK] Category-aware overload. */
+    /**
+     * Category-aware EARLY_TICK forecast gate.
+     * Pass-through unless ForecastEngine is *actively* against the trade direction
+     * by more than the category-specific opposing threshold.
+     */
     public static boolean forecastPassesEarlyTickGate(
             com.bot.TradingCore.ForecastEngine.ForecastResult forecast,
             boolean isLong,
             CoinCategory category) {
 
-        // No forecast engine attached yet (cold start) → allow through
         if (forecast == null) return true;
 
         double score = forecast.directionScore;
-        double minScore = earlyTickMinScoreFor(category);
+        double opposeThr = earlyTickOpposeThresholdFor(category);
 
-        // NEUTRAL: |score| too small → no confirmed direction → REJECT EARLY_TICK
-        if (Math.abs(score) < minScore) return false;
+        if ( isLong && score < -opposeThr) return false;
+        if (!isLong && score >  opposeThr) return false;
 
-        // OPPOSITE direction → REJECT
-        if (isLong  && score < 0) return false;
-        if (!isLong && score > 0) return false;
-
-        // Confirmed direction → ALLOW
         return true;
     }
     // Now accepts price to properly track lastSigPrice.
@@ -2633,7 +2631,7 @@ public final class DecisionEngineMerged {
         // выхода без полного анализа. 30 минут вполне достаточно чтобы 20-барное
         // окно сдвинулось и условие postPumpDump перестало срабатывать естественно.
         if (postPumpDump && side == com.bot.TradingCore.Side.LONG) {
-            System.out.println("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
+            LOG.info("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
                     + String.format("%.0f%%", postPumpGain * 100)
                     + " dropFromHi=" + String.format("%.0f%%", postPumpDropFromHi * 100));
             postPumpSkipUntil.put(symbol, System.currentTimeMillis() + 30 * 60_000L);
@@ -3219,7 +3217,7 @@ public final class DecisionEngineMerged {
 
         // Safety net: после всех принудительных значений tp2Mult всегда ≥ 2.00.
         if (tp2Mult < 2.00) {
-            System.out.println("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
+            LOG.info("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
                     + String.format("%.2f", tp2Mult) + " < 2.00 (user pref 1:2)");
             return reject("rr_tp2_lt_2");
         }
@@ -4965,7 +4963,7 @@ public final class DecisionEngineMerged {
                     }
                 }
             } catch (Exception ex) {
-                System.out.println("[Calibrator] save failed: " + ex.getMessage());
+                LOG.warning("[Calibrator] save failed: " + ex.getMessage());
             }
         }
 
@@ -5000,10 +4998,10 @@ public final class DecisionEngineMerged {
                         } catch (Exception parseEx) { skipped++; }
                     }
                 }
-                System.out.println("[Calibrator] loaded " + loaded + " outcomes from " + path
+                LOG.info("[Calibrator] loaded " + loaded + " outcomes from " + path
                         + " (skipped " + skipped + ")");
             } catch (Exception ex) {
-                System.out.println("[Calibrator] load failed: " + ex.getMessage());
+                LOG.warning("[Calibrator] load failed: " + ex.getMessage());
             }
         }
 

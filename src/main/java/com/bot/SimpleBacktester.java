@@ -1,6 +1,9 @@
 package com.bot;
 
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.logging.Logger;
 
 /** SimpleBacktester v10.0 — INSTITUTIONAL-GRADE BACKTEST */
 public final class SimpleBacktester {
@@ -763,5 +766,196 @@ public final class SimpleBacktester {
             if (c.openTime >= fromMs && c.openTime <= toMs) result.add(c);
         }
         return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // [v74] STARTUP SELF-VALIDATION HARNESS
+    //
+    // Replays the last N days of 15m history through the live engine on
+    // bot startup (and every 6h thereafter). Aggregates win-rate, profit
+    // factor, expectancy across the top-K pairs by 24h volume, and posts
+    // a GO / MARGINAL / NO-GO verdict to Telegram.
+    //
+    // Goal: give the operator a concrete edge measurement BEFORE risking
+    // real money — without requiring them to download CSVs or run separate
+    // scripts. Pulls candles via SignalSender.fetchKlines (REST through
+    // the existing rate-limited cache).
+    //
+    // Disable with VALIDATOR_ENABLED=0.
+    // ═══════════════════════════════════════════════════════════════════════
+    public static final class SelfValidator {
+
+        private static final Logger LOG = Logger.getLogger(SelfValidator.class.getName());
+
+        private final int    daysOfHistory;
+        private final int    topNPairs;
+        private final long   reportEveryMs;
+        private final boolean enabled;
+
+        private final SignalSender              sender;
+        private final TelegramBotSender         tg;
+        private final ScheduledExecutorService  sched;
+        private final AtomicBoolean             running = new AtomicBoolean(false);
+
+        public SelfValidator(SignalSender sender, TelegramBotSender tg) {
+            this.sender         = sender;
+            this.tg             = tg;
+            this.daysOfHistory  = envInt("VALIDATOR_DAYS",         4);
+            this.topNPairs      = envInt("VALIDATOR_TOP_N",        12);
+            this.reportEveryMs  = envLong("VALIDATOR_REPORT_EVERY_MS", 6 * 60 * 60_000L);
+            this.enabled        = envInt("VALIDATOR_ENABLED", 1) == 1;
+            this.sched = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "self-validator");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+
+        /** Convenience static entry point used from BotMain. */
+        public static SelfValidator start(SignalSender sender,
+                                          TelegramBotSender tg,
+                                          long initialDelayMs) {
+            SelfValidator v = new SelfValidator(sender, tg);
+            v.schedule(initialDelayMs);
+            return v;
+        }
+
+        public void schedule(long initialDelayMs) {
+            if (!enabled) {
+                LOG.info("[SELF-VALIDATOR] disabled via VALIDATOR_ENABLED=0");
+                return;
+            }
+            sched.schedule(this::runSafe, initialDelayMs, TimeUnit.MILLISECONDS);
+            sched.scheduleAtFixedRate(this::runSafe,
+                    reportEveryMs + initialDelayMs, reportEveryMs, TimeUnit.MILLISECONDS);
+        }
+
+        public void stop() { sched.shutdownNow(); }
+
+        private void runSafe() {
+            if (!running.compareAndSet(false, true)) return;
+            try { run(); }
+            catch (Throwable t) { LOG.warning("[SELF-VALIDATOR] " + t.getMessage()); }
+            finally { running.set(false); }
+        }
+
+        private void run() {
+            long t0 = System.currentTimeMillis();
+            List<String> pairs = sender.getTopPairsForForecast(topNPairs);
+            if (pairs == null || pairs.isEmpty()) {
+                LOG.info("[SELF-VALIDATOR] no pairs available");
+                return;
+            }
+
+            int barsNeeded = daysOfHistory * 96 + 250; // warmup + window
+            int h1Limit    = Math.max(200, barsNeeded / 4 + 50);
+
+            // Aggregate across all pairs
+            int totalSignals = 0, totalWins = 0, totalLosses = 0, totalTimeStops = 0;
+            double totalGrossPnL = 0, totalNetPnL = 0;
+            double sumProfitFactor = 0, sumExpectancy = 0;
+            int pairsWithSignals = 0;
+
+            SimpleBacktester bt = new SimpleBacktester();
+            bt.setInitialBalance(100.0);
+            bt.setCompound(false);
+            bt.setUseM1Resolution(false);
+
+            for (String pair : pairs) {
+                List<com.bot.TradingCore.Candle> m15;
+                List<com.bot.TradingCore.Candle> h1;
+                try {
+                    m15 = sender.fetchKlines(pair, "15m", barsNeeded);
+                    h1  = sender.fetchKlines(pair, "1h",  h1Limit);
+                } catch (Throwable e) {
+                    continue;
+                }
+                if (m15 == null || m15.size() < 250) continue;
+                if (h1  == null || h1.size()  < 80)  continue;
+
+                DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(pair);
+
+                // run() expects (m1, m5, m15, h1, category). m1/m5 = null is fine —
+                // the backtest engine handles it; this is the conservative path
+                // (less context than live), so any edge measured here is a lower
+                // bound on real-bot edge.
+                BacktestResult r;
+                try {
+                    r = bt.run(pair, null, null, m15, h1, cat);
+                } catch (Throwable e) {
+                    continue;
+                }
+                if (r == null || r.total == 0) continue;
+
+                pairsWithSignals++;
+                totalSignals    += r.total;
+                totalWins       += r.wins;
+                totalLosses     += r.losses;
+                totalTimeStops  += r.timeStops;
+                totalGrossPnL   += r.grossPnL;
+                totalNetPnL     += r.netPnL;
+                if (r.profitFactor > 0 && !Double.isInfinite(r.profitFactor))
+                    sumProfitFactor += r.profitFactor;
+                sumExpectancy += r.expectancy;
+            }
+
+            long elapsed = System.currentTimeMillis() - t0;
+            String report = formatReport(daysOfHistory, pairs.size(), pairsWithSignals,
+                    elapsed, totalSignals, totalWins, totalLosses, totalTimeStops,
+                    totalGrossPnL, totalNetPnL, sumProfitFactor, sumExpectancy);
+
+            LOG.info(report);
+            if (tg != null) {
+                try { tg.sendMessageAsync(report); }
+                catch (Throwable ignore) { }
+            }
+        }
+
+        private static String formatReport(int days, int pairsScanned, int pairsWithSignals,
+                                           long elapsedMs, int signals, int wins, int losses,
+                                           int timeStops, double grossPnL, double netPnL,
+                                           double sumPF, double sumExpectancy) {
+            if (signals == 0) {
+                return String.format(
+                        "🧪 SELF-VALIDATOR (%dd × %d pairs, %.1fs)\n" +
+                                "❌ NO SIGNALS GENERATED on history.\n" +
+                                "Engine produced 0 ideas across %d pairs walked.\n" +
+                                "→ Filters too strict OR market regime mismatch.",
+                        days, pairsScanned, elapsedMs / 1000.0, pairsScanned);
+            }
+            double winRate = 100.0 * wins / signals;
+            double avgPF   = pairsWithSignals > 0 ? sumPF / pairsWithSignals : 0.0;
+            double avgExp  = pairsWithSignals > 0 ? sumExpectancy / pairsWithSignals : 0.0;
+            double sigPerDayPerPair = signals / (double) Math.max(1, days * pairsWithSignals);
+
+            String verdict =
+                    (winRate >= 55 && avgPF > 1.50 && netPnL > 0) ? "✅ GO — viable edge"
+                            : (winRate >= 48 && avgPF > 1.10 && netPnL > 0) ? "⚠️ MARGINAL — edge thin"
+                              : "❌ NO-GO — no edge / negative expectancy";
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format("🧪 SELF-VALIDATOR  %dd × %d pairs  (%.1fs)\n",
+                    days, pairsScanned, elapsedMs / 1000.0));
+            sb.append(String.format("Signals: %d   ~%.2f / day / pair (active: %d)\n",
+                    signals, sigPerDayPerPair, pairsWithSignals));
+            sb.append(String.format("Win-rate: %.1f%%  (W=%d, L=%d, T-stop=%d)\n",
+                    winRate, wins, losses, timeStops));
+            sb.append(String.format("Gross PnL: %+.2f%%   Net PnL: %+.2f%%\n",
+                    grossPnL, netPnL));
+            sb.append(String.format("Avg profit-factor: %.2f   Avg expectancy: $%+.2f / trade\n",
+                    avgPF, avgExp));
+            sb.append("\n").append(verdict).append("\n");
+            return sb.toString();
+        }
+
+        // ── helpers ──
+        private static int envInt(String key, int def) {
+            try { return Integer.parseInt(System.getenv().getOrDefault(key, String.valueOf(def))); }
+            catch (Exception e) { return def; }
+        }
+        private static long envLong(String key, long def) {
+            try { return Long.parseLong(System.getenv().getOrDefault(key, String.valueOf(def))); }
+            catch (Exception e) { return def; }
+        }
     }
 }

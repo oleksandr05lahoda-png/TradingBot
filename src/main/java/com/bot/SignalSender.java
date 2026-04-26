@@ -8,6 +8,8 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /** SignalSender — TRADINGBOT PRO EDITION v37.0 */
 /**
@@ -23,6 +25,12 @@ import java.util.concurrent.atomic.*;
  * ║  [REFACTOR] FUNDING_REFRESH: 15min, DEPTH_POLL: 120s, TOP_N=30        ║
  */
 public final class SignalSender {
+
+    // [v72] Унифицированное логирование. Раньше использовали System.out.println
+    // (27 мест) — это идёт в stdout который Railway/cloud platforms могут
+    // буферизовать или терять. Logger пишет через JUL handler с правильным
+    // форматом и severity, плюс уже есть подавление таймстампов в BotMain.
+    private static final Logger LOG = Logger.getLogger(SignalSender.class.getName());
 
     private final com.bot.TelegramBotSender bot;
     private final HttpClient              http;
@@ -379,14 +387,14 @@ public final class SignalSender {
         if (rl429Count >= 3) {
             rlRampUntil = System.currentTimeMillis() + 5 * 60_000L;
         }
-        System.out.println("[RL] 429 #" + rl429Count + " backoff=" + backoff + "ms");
+        LOG.info("[RL] 429 #" + rl429Count + " backoff=" + backoff + "ms");
         // НЕ спамим в Telegram — это внутренняя механика
     }
 
     private void rlOn418() {
         rlIpBanned = true; rlIpBanUntil = System.currentTimeMillis() + 5*60_000L;
         rlRampUntil = rlIpBanUntil + 10 * 60_000L;
-        System.out.println("[RL] 418 IP BAN 5min");
+        LOG.warning("[RL] 418 IP BAN 5min");
         // НЕ спамим в Telegram — бот просто подождёт и продолжит
     }
 
@@ -458,7 +466,7 @@ public final class SignalSender {
     public void executeOrderAsync(com.bot.DecisionEngineMerged.TradeIdea idea, double sizeUsdt) {
         if (!AUTO_TRADE_ENABLED) return;
         if (API_KEY.isBlank() || API_SECRET.isBlank()) {
-            System.out.println("[OE] ENABLE_AUTO_TRADE=1 но API ключи не заданы — пропуск");
+            LOG.info("[OE] ENABLE_AUTO_TRADE=1 но API ключи не заданы — пропуск");
             return;
         }
 
@@ -513,7 +521,7 @@ public final class SignalSender {
                         sizeUsdt, AUTO_TRADE_LEVERAGE));
 
             } catch (Exception e) {
-                System.out.println("[OE] Error " + idea.symbol + ": " + e.getMessage());
+                LOG.warning("[OE] Error " + idea.symbol + ": " + e.getMessage());
                 bot.sendMessageAsync(String.format(
                         "%s %s | #%s%n"
                                 + "⚠️ СТАТУС: *AUTO ERROR*%n"
@@ -555,7 +563,7 @@ public final class SignalSender {
 
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() != 200) {
-                System.out.println("[OE] Order error " + resp.statusCode() + ": " + resp.body());
+                LOG.warning("[OE] Order error " + resp.statusCode() + ": " + resp.body());
                 return -1;
             }
             String r = resp.body();
@@ -565,7 +573,7 @@ public final class SignalSender {
             if (end < 0) end = r.indexOf('}', start);
             return Long.parseLong(r.substring(start, end).trim());
         } catch (Exception e) {
-            System.out.println("[OE] placeOrder exception: " + e.getMessage());
+            LOG.warning("[OE] placeOrder exception: " + e.getMessage());
             return -1;
         }
     }
@@ -842,7 +850,7 @@ public final class SignalSender {
 
         // [Hole 13 FIX] Make default $1000 balance loudly transparent
         if (API_KEY.isBlank()) {
-            System.out.println("⚠️ Внимание: API не подключен, использую виртуальный фикс. баланс $1000");
+            LOG.info("⚠️ Внимание: API не подключен, использую виртуальный фикс. баланс $1000");
         }
     }
 
@@ -1009,7 +1017,7 @@ public final class SignalSender {
         // [v67] Show WHY analyze() returned null — top reject reasons from DecisionEngineMerged.
         String rejectTrace = com.bot.DecisionEngineMerged.getAndResetRejectTrace();
         if (!rejectTrace.isEmpty()) {
-            System.out.println("[DIAG-ANALYZE] " + rejectTrace);
+            LOG.info("[DIAG-ANALYZE] " + rejectTrace);
         }
         prevLiq = blockedLiq.get(); prevCorr = blockedCorr.get(); // prevStale: no-op — per-cycle
         prevProfit = blockedProfit.get(); prevEarlyConf = blockedEarlyConf.get();
@@ -1157,7 +1165,7 @@ public final class SignalSender {
             cachedPairs = fresh;
             lastPairsRefresh = System.currentTimeMillis();
         } catch (Exception e) {
-            System.out.println("[WS-RECOVER] " + e.getMessage());
+            LOG.info("[WS-RECOVER] " + e.getMessage());
         }
     }
 
@@ -1643,7 +1651,7 @@ public final class SignalSender {
 
             return idea;
         } catch (Exception e) {
-            System.out.println("[processPair] " + pair + ": " + e.getMessage());
+            LOG.info("[processPair] " + pair + ": " + e.getMessage());
             return null;
         }
     }
@@ -1691,6 +1699,28 @@ public final class SignalSender {
      * would bias the decision engine toward the local top/bottom of the
      * in-flight bar.
      */
+    /**
+     * [v74 FIX — MAIN LATENCY SOURCE]
+     *
+     * Old behaviour: returned false when the live bar was mid-impulse (body > 0.60×ATR),
+     * showing wick rejection, or RSI extreme — and the caller fell back to closed bars
+     * only. Result: at the exact moment a move started developing, the engine went BLIND
+     * and analysed only stale closed history. By the time the closed bar agreed, the
+     * move had already played out (= "SOON" / GALA-style late signals).
+     *
+     * New behaviour: live bar is ALWAYS spliced — analyse() needs to see the move.
+     * The two real risks the old code worried about (entering at the local top of an
+     * impulse, or chasing a wick rejection) are now handled correctly downstream:
+     *  - DecisionEngineMerged has lateMove / momentumExhausted / velocityDecay logic
+     *    that penalises chasing on its own merits, using the spliced data.
+     *  - SL placement and TP scaling already account for impulse magnitude via
+     *    robustATR. They don't need a splice-level veto on top of that.
+     *
+     * The remaining check (RSI 14 extreme on the spliced series) is kept only as a
+     * very narrow safety net for true climaxes (RSI < 18 or > 82) — both extremes
+     * indicate exhausted momentum where adding the live bar genuinely distorts
+     * percentile-based features. Anything inside 18..82 = analyse with the live bar.
+     */
     private static boolean isLiveCandleSafeToSplice(
             List<com.bot.TradingCore.Candle> closedHistory,
             com.bot.TradingCore.Candle live) {
@@ -1699,20 +1729,8 @@ public final class SignalSender {
         double atr14 = com.bot.TradingCore.atr(closedHistory, 14);
         if (atr14 <= 0) return true;
 
-        // (1) Body magnitude vs ATR
-        double body = Math.abs(live.close - live.open);
-        if (body / atr14 > 0.60) return false;
-
-        // (2) Wick rejection (only when body is non-trivial — dojis carry their
-        //     own information and are caught by the body check above)
-        if (body > atr14 * 0.10) {
-            double upperWick = live.high - Math.max(live.open, live.close);
-            double lowerWick = Math.min(live.open, live.close) - live.low;
-            double maxWick = Math.max(upperWick, lowerWick);
-            if (maxWick > body * 1.5) return false;
-        }
-
-        // (3) RSI extreme — compute Wilder RSI(14) on the spliced series
+        // Only veto on TRUE climax: RSI(14) < 18 or > 82 on the spliced series.
+        // 28..72 was way too tight — most healthy moves register 65-78 RSI mid-leg.
         int n = closedHistory.size();
         double[] closes = new double[15];
         for (int i = 0; i < 14; i++) closes[i] = closedHistory.get(n - 14 + i).close;
@@ -1726,7 +1744,7 @@ public final class SignalSender {
         double avgLoss = loss / 14.0;
         double rsi = (avgLoss < 1e-12) ? 100.0
                 : 100.0 - (100.0 / (1.0 + avgGain / avgLoss));
-        if (rsi < 28.0 || rsi > 72.0) return false;
+        if (rsi < 18.0 || rsi > 82.0) return false;
 
         return true;
     }
@@ -2071,7 +2089,7 @@ public final class SignalSender {
             udsListenKey = new JSONObject(resp.body()).getString("listenKey");
             connectUserDataStream(udsListenKey);
         } catch (Exception e) {
-            System.out.println("[UDS] Init error: " + e.getMessage());
+            LOG.warning("[UDS] Init error: " + e.getMessage());
             scheduleUdsRetry(30);
         }
     }
@@ -2103,7 +2121,7 @@ public final class SignalSender {
                         return CompletableFuture.completedFuture(null);
                     }
                 })
-                .thenAccept(ws -> { udsWebSocket = ws; System.out.println("[UDS] ✅ Connected"); })
+                .thenAccept(ws -> { udsWebSocket = ws; LOG.info("[UDS] ✅ Connected"); })
                 .exceptionally(ex -> { scheduleUdsRetry(15); return null; });
     }
 
@@ -2181,7 +2199,7 @@ public final class SignalSender {
                         + "━━━━━━━━━━━━━━━━━━\n"
                         + "⚠️ Немедленно проверьте аккаунт\n"
                         + "━━━━━━━━━━━━━━━━━━");
-                System.out.println("[UDS] ⚠️ MARGIN CALL!");
+                LOG.severe("[UDS] ⚠️ MARGIN CALL!");
             }
 
             case "listenKeyExpired" -> {
@@ -2211,7 +2229,7 @@ public final class SignalSender {
                             .header("X-MBX-APIKEY", API_KEY)
                             .PUT(HttpRequest.BodyPublishers.noBody()).build(),
                     BINANCE_WEIGHT_SIGNED_LIGHT);
-            if (resp != null && resp.statusCode() == 200) { System.out.println("[UDS] Key renewed"); }
+            if (resp != null && resp.statusCode() == 200) { LOG.info("[UDS] Key renewed"); }
             else { initUserDataStream(); }
         } catch (Exception e) { initUserDataStream(); }
     }
@@ -2302,7 +2320,7 @@ public final class SignalSender {
         if (lastWsHealthCheckMessages == totalMessages && !wsMap.isEmpty()) {
             // Messages stopped — check if frozen for > 60s
             if (now - lastWsHealthCheckMs > 60_000L) {
-                System.out.println("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
+                LOG.info("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
                 bot.sendMessageAsync("⚠️ СИСТЕМА | *WS SILENT 60s*\n"
                         + "━━━━━━━━━━━━━━━━━━\n"
                         + "Форс-переподключение всех каналов\n"
@@ -2741,7 +2759,7 @@ public final class SignalSender {
         }
         // All retries failed
         klineFetchErrors.incrementAndGet();
-        System.out.println("[fetchKlines] HARD FAIL " + symbol + " " + interval
+        LOG.severe("[fetchKlines] HARD FAIL " + symbol + " " + interval
                 + " after 3 attempts: " + (lastEx != null ? lastEx.getMessage() : "unknown"));
         return null; // NULL = hard failure, distinguished from empty list
     }
@@ -2780,10 +2798,10 @@ public final class SignalSender {
             if (Math.abs(newOffset) < 10_000L) {
                 serverTimeOffset = newOffset;
                 lastTimeSync = t1;
-                System.out.println("[TimeSync] offset=" + newOffset + "ms rtt=" + roundTrip + "ms");
+                LOG.info("[TimeSync] offset=" + newOffset + "ms rtt=" + roundTrip + "ms");
             }
         } catch (Exception e) {
-            System.out.println("[TimeSync] failed: " + e.getMessage());
+            LOG.warning("[TimeSync] failed: " + e.getMessage());
         }
     }
 
@@ -3027,13 +3045,13 @@ public final class SignalSender {
                 hotSlFailures.remove(pair);
             }
 
-            // [v51 FIX] SOFT session gate (was hard `return` below 0.85).
-            // Asian session is exactly when meme pumps like BOME happen — hard-blocking
-            // EARLY_TICK during 01:00-05:00 UTC was systematically missing the most
-            // profitable setups. Instead: penalize probability by 12 points during thin
-            // sessions and let the MIN_CONF filter decide if it still qualifies.
+            // Soft session gate. Asian session is exactly when meme pumps happen —
+            // hard-blocking would systematically miss the most profitable setups.
+            // Penalty was 12pt — too aggressive, killed valid pre-pump signals
+            // in the only window where they fire on small-cap coins. 6pt is enough
+            // to suppress noise but lets real velocity events through.
             double sessionWeight = getSessionWeight();
-            double sessionPenalty = sessionWeight < 0.85 ? 12.0 : 0.0;
+            double sessionPenalty = sessionWeight < 0.85 ? 6.0 : 0.0;
 
             com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
             if (et != null && sessionPenalty > 0) {
@@ -3042,23 +3060,19 @@ public final class SignalSender {
                 et = rebuildIdea(et, et.probability - sessionPenalty, thinFlags);
             }
             if (et != null && filterEarlySignal(et)) {
-                // [v17.0 §3] STRICT FORECAST GATE for EARLY_TICK signals.
-                // A mid-candle signal has no full 15m bar yet — ForecastEngine is the
-                // primary macro context. If it disagrees or is neutral → DROP.
+                // EARLY_TICK forecast gate — category-aware, asymmetric.
+                // Blocks only when ForecastEngine is *actively* against the trade
+                // by more than the category-specific opposing threshold.
                 boolean fcPasses = com.bot.DecisionEngineMerged.forecastPassesEarlyTickGate(
-                        et.forecast, et.side == com.bot.TradingCore.Side.LONG);
+                        et.forecast,
+                        et.side == com.bot.TradingCore.Side.LONG,
+                        et.category != null ? et.category : categorizePair(et.symbol));
                 if (!fcPasses) {
-                    // Forecast neutral/opposite — do not send this EARLY_TICK
                     return;
                 }
 
-                // [v17.0 §2] SIGNAL BUFFER — collect into per-pair buffer, flush best on timer.
-                // Instead of sending immediately (which caused signal spam during vol spikes),
-                // we store the candidate and let earlyTickFlush() pick the top signal per pair
-                // within a 1.5s collection window.
                 earlyTickBuffer.merge(pair, et, (existing, candidate) ->
                         candidate.probability > existing.probability ? candidate : existing);
-                // Flush is handled by the earlyTickFlusher scheduled task (see constructor).
             }
         }
     }
@@ -3250,24 +3264,26 @@ public final class SignalSender {
         double rs = relStrengthHistory.getOrDefault(sig.symbol, new java.util.concurrent.ConcurrentLinkedDeque<>())
                 .stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
         double gicWeight = gic.getFilterWeight(sig.symbol, isLong, rs, detectSector(sig.symbol));
-        double minEarlyGicWeight = sig.probability >= 76.0 ? 0.45 : 0.55;
+        // Tiered GIC threshold — high-confidence ideas only need weak macro alignment,
+        // marginal ideas need stronger macro tailwind.
+        double minEarlyGicWeight =
+                sig.probability >= 78.0 ? 0.40 :
+                        sig.probability >= 70.0 ? 0.48 : 0.55;
         if (gicWeight < minEarlyGicWeight) return false;
         if (!isc.allowSignal(sig)) return false;
-        // [v16.0 FIX] Use plain effectiveMinConfidence (no symbolBoost stacking in early path)
-        return sig.probability >= isc.getEffectiveMinConfidence();
+        // Probability gating is owned by the dispatcher (effectiveMinConfidence is
+        // applied uniformly there). No duplicate check here.
+        return true;
     }
 
     /**
-     * [v17.0 §2] EARLY TICK BUFFER FLUSH — called every 2 seconds by wsWatcher.
-     *
-     * Drains earlyTickBuffer atomically. Sorts remaining candidates by probability (desc),
-     * then dispatches each one: sends to Telegram, registers with ISC, tracks in BotMain.
-     *
-     * MAX 3 signals per flush — prevents 9 signals in 2 minutes.
-     * When BTC moves, all ALTs correlate → 30 pairs fire simultaneously.
-     * Sending all 30 to Telegram = information overload. Top 3 is plenty.
+     * EARLY_TICK buffer flush — drains earlyTickBuffer atomically, sorts by
+     * age-decayed probability, dispatches up to MAX_EARLY_PER_FLUSH per cycle.
+     * Was 3 — too restrictive when 4-5 correlated pairs fire pre-pump together
+     * (sector waves: L1, AI, meme). 5 keeps Telegram readable while not
+     * silently dropping #4 and #5 of a synchronised move.
      */
-    private static final int MAX_EARLY_PER_FLUSH = 3;
+    private static final int MAX_EARLY_PER_FLUSH = 5;
 
     // Signal age penalty configuration.
     // STALE_DROP_MS: any candidate older than this is discarded outright.
@@ -3386,7 +3402,7 @@ public final class SignalSender {
                     }
                 }
             } catch (Exception ex) {
-                System.out.println("[HOT] Error rescanning " + pair + ": " + ex.getMessage());
+                LOG.warning("[HOT] Error rescanning " + pair + ": " + ex.getMessage());
             } finally {
                 hotPairActiveCount.decrementAndGet();
             }
@@ -3423,7 +3439,7 @@ public final class SignalSender {
             }
         }
         if (droppedStale > 0) {
-            System.out.println("[EARLY_TICK] Dropped " + droppedStale + " stale candidate(s) (>"
+            LOG.info("[EARLY_TICK] Dropped " + droppedStale + " stale candidate(s) (>"
                     + (EARLY_STALE_DROP_MS / 1000) + "s old)");
         }
         if (candidates.isEmpty()) return;
@@ -3608,7 +3624,7 @@ public final class SignalSender {
                 catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                 catch (Exception ignored) {}
             }
-        } catch (Exception e) { System.out.println("[FR] Error: " + e.getMessage()); }
+        } catch (Exception e) { LOG.warning("[FR] Error: " + e.getMessage()); }
     }
 
     private void fetchAndUpdateOI(String symbol, double fr) {
@@ -3640,7 +3656,7 @@ public final class SignalSender {
             if (resp == null) return;
             JSONArray arr = new JSONArray(resp.body());
             for (int i = 0; i < arr.length(); i++) { JSONObject o = arr.getJSONObject(i); double v = o.optDouble("quoteVolume", 0); if (v > 0) volume24hUSD.put(o.getString("symbol"), v); }
-        } catch (Exception e) { System.out.println("[VOL24H] Error: " + e.getMessage()); }
+        } catch (Exception e) { LOG.warning("[VOL24H] Error: " + e.getMessage()); }
     }
 
     public Set<String> getTopSymbolsSet(int limit) {
@@ -3687,7 +3703,7 @@ public final class SignalSender {
                     top.add(p);
                 }
             }
-            System.out.println("[PAIRS] Loaded " + top.size());
+            LOG.info("[PAIRS] Loaded " + top.size());
             return top;
         } catch (Exception e) {
             return new LinkedHashSet<>(Arrays.asList("BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT"));
@@ -3856,15 +3872,15 @@ public final class SignalSender {
                             })
                     .thenAccept(ws -> {
                         liqWebSocket = ws;
-                        System.out.println("[LIQ] ✅ Liquidation stream connected");
+                        LOG.info("[LIQ] ✅ Liquidation stream connected");
                     })
                     .exceptionally(ex -> {
-                        System.out.println("[LIQ] Connect failed: " + ex.getMessage());
+                        LOG.warning("[LIQ] Connect failed: " + ex.getMessage());
                         udsExecutor.schedule(this::connectLiquidationStream, 30, TimeUnit.SECONDS);
                         return null;
                     });
         } catch (Exception e) {
-            System.out.println("[LIQ] Error: " + e.getMessage());
+            LOG.warning("[LIQ] Error: " + e.getMessage());
         }
     }
 
@@ -3934,7 +3950,7 @@ public final class SignalSender {
             // Alert loudly when tasks are being dropped — indicates
             // TOP_N too high for current pool, or sustained network slowness.
             if (rejected > 0) {
-                System.out.println("[WARN] fetchPool dropped " + rejected + " tasks (queue saturated). "
+                LOG.warning("[WARN] fetchPool dropped " + rejected + " tasks (queue saturated). "
                         + "Consider lowering TOP_N or increasing poolSize.");
             }
         }
