@@ -244,12 +244,16 @@ public final class BotMain {
         private static final double MIN_RR          = 2.00;
         private static final double MIN_SL_PCT      = 0.0035;
         private static final long   SYMBOL_DEDUP_MS = 15 * 60_000L;
-        // [v74] 6 → 12. On 30 active pairs during a sector wave (BTC moves, ALTs follow),
-        // 6/h means the bot fires its quota in 10 minutes and silently drops everything
-        // for the rest of the hour. 12/h = 1 signal every 5 min averaged, still readable
-        // in Telegram, but doesn't choke during volatility clusters.
-        private static final int    MAX_PER_HOUR    = 12;
-        private static final long   HOUR_MS         = 60 * 60_000L;
+        // [v75] 12 → 20 + rolling burst protection. The hard 12/h cap caused the
+        // "2 signals in 8 hours" symptom: when BTC moves and a sector wave triggers,
+        // the bot would fire 12 signals in 15 minutes and stay silent for the rest
+        // of the hour — exactly when the user needed updates most. Now 20/h overall,
+        // but with a 5-in-5-minute burst limit that lets sector waves through while
+        // still protecting against runaway loops.
+        private static final int    MAX_PER_HOUR     = 20;
+        private static final int    MAX_PER_5MIN     = 5;   // burst protection
+        private static final long   HOUR_MS          = 60 * 60_000L;
+        private static final long   FIVE_MIN_MS      = 5 * 60_000L;
 
         private final com.bot.TelegramBotSender tg;
         private final com.bot.InstitutionalSignalCore isc;
@@ -339,16 +343,16 @@ public final class BotMain {
                 // Phase 3 — near-graduation. MIN_CONF upstream is sole filter.
                 probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 10) {
-                // [v71] Phase 2 синхронизирована с DE.MIN_CONF_FLOOR=52.
-                // Было 57/61 при DE=55 (margin 2/6). При DE=52 — 52/56 (margin 0/4).
-                // probShortcut=56 значит что 3-cluster setup с прочной математикой проходит solo.
-                probFloor = 52.0; probShortcut = 56.0; minClusters = 2; minFcConf = 0.32;
+                // [v75] Phase 2 — calibrator warming up. MIN_CONF upstream + soft secondary.
+                // Floor stays at 52, but shortcut lowered 56→54 so 2-cluster setups don't
+                // get sandbagged just because we haven't collected 20 outcomes yet.
+                probFloor = 52.0; probShortcut = 54.0; minClusters = 2; minFcConf = 0.30;
             } else {
-                // [v71] Phase 1 — hard cold start синхронизирован с DE=52.
-                // Было 58/62 при DE=55. Сейчас 53/57 — solo-pass на 57 достижим для
-                // строгого 3-4 cluster setup. minFcConf 0.35→0.32: ForecastEngine
-                // редко выдаёт confidence>=0.35 на cold-start без истории.
-                probFloor = 53.0; probShortcut = 57.0; minClusters = 2; minFcConf = 0.32;
+                // [v75] Phase 1 — hard cold start. Was 53/57 — too aggressive: a fresh
+                // install with empty calibrator was rejecting ~40% of valid signals,
+                // which then never became outcomes, which kept us in Phase 1 forever.
+                // Now 52/55 with 2-cluster OR fcConf=0.30 OR — clear path to Phase 2.
+                probFloor = 52.0; probShortcut = 55.0; minClusters = 2; minFcConf = 0.30;
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {
@@ -381,10 +385,24 @@ public final class BotMain {
             }
 
             pruneDispatchTimestamps(now);
+            // [v75] Two-tier rate limit:
+            //   1) Hourly cap (20/h) — protects against runaway loops
+            //   2) Burst cap   (5/5min) — protects Telegram from spam during sector waves
+            //                              while still allowing 5 high-conviction signals
+            //                              in 5 minutes when a real opportunity hits.
             if (dispatchTimestamps.size() >= MAX_PER_HOUR) {
                 blockedByGate.incrementAndGet();
                 blockedHourly.incrementAndGet();
                 return Result.blocked("hourly cap " + MAX_PER_HOUR);
+            }
+            int recentBurst = 0;
+            for (Long t : dispatchTimestamps) {
+                if (t != null && now - t <= FIVE_MIN_MS) recentBurst++;
+            }
+            if (recentBurst >= MAX_PER_5MIN) {
+                blockedByGate.incrementAndGet();
+                blockedHourly.incrementAndGet();
+                return Result.blocked("burst cap " + MAX_PER_5MIN + "/5min");
             }
 
             try {
@@ -396,7 +414,16 @@ public final class BotMain {
                 lastSignalMs = now;
                 droughtAnnounced.set(false);
                 trackSignal(idea, true);
-                isc.setSignalCooldown(idea.symbol, 30 * 60_000L);
+                // [v75] Directional cooldown. Was: blanket 30 min lock on every dispatch
+                // — meant after a BTC LONG, BTC was muted for 30 min even if it broke
+                // structure 5 minutes later. Now:
+                //   - same-side dedup is handled by SYMBOL_DEDUP_MS=15 min above
+                //   - this cooldown blocks the pair entirely (incl. opposite side)
+                //     for 8 min — enough to let the move develop without instant flip,
+                //     short enough to catch real reversals.
+                // Direction flip protection (no instant LONG→SHORT on noise) is handled
+                // by ISC.bipolar guard which separately tracks last-side timestamps.
+                isc.setSignalCooldown(idea.symbol, 8 * 60_000L);
                 LOG.info(String.format("[DISPATCH/%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% n=%d",
                         source, idea.symbol, idea.side, idea.probability,
                         fcConf, actualRR, slPct * 100, calSamples));

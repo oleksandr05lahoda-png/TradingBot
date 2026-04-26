@@ -2749,4 +2749,707 @@ public final class TradingCore {
             return e;
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  ADVANCED INDICATORS BLOCK [v75]
+    //  ───────────────────────────
+    //  All institutional-grade indicators added in-place to avoid new files.
+    //  Methods are static and pure — they read List<Candle> and return primitives
+    //  or small DTOs declared inside this block.
+    //
+    //  Contents:
+    //    1. SMC: Order Blocks, Fair Value Gaps, Liquidity Sweeps, BoS/ChoCh helpers
+    //    2. Anchored VWAP (from arbitrary anchor: daily open / HoD / LoD / event)
+    //    3. SuperTrend (non-lagging trend regime)
+    //    4. KAMA (Kaufman Adaptive Moving Average) — adapts to chop vs trend
+    //    5. CVD Footprint per candle (estimated buy/sell delta from OHLC+volume)
+    //    6. Volume-Weighted Bollinger + Squeeze detector
+    //    7. Premium/Discount zones (institutional range model)
+    //    8. Funding Rate impulse (rate-of-change detector for funding)
+    //    9. PreMove pattern detector (compression / absorption / spring / delta-div)
+    //   10. Confluence aggregator
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── 1. SMART MONEY CONCEPTS ────────────────────────────────────────────────
+    //
+    //  Note: OrderBlock class and detectOrderBlocks(List<Candle>, int lookback)
+    //  already exist earlier in this file (line ~943). The advanced confluence
+    //  aggregator below uses that existing implementation (top/bottom/isBullish/
+    //  strength/formationBar). FVG and LiquiditySweep are new in v75.
+
+    /** Fair Value Gap: a 3-bar imbalance where bar[i-1].high < bar[i+1].low (bullish FVG)
+     *  or bar[i-1].low > bar[i+1].high (bearish FVG). */
+    public static final class FairValueGap {
+        public final double  upperBound;
+        public final double  lowerBound;
+        public final boolean bullish;
+        public final long    timestamp;
+        public final int     barIndex;
+        public final boolean filled;       // price has since traded into the gap
+        public FairValueGap(double up, double lo, boolean bull, long ts, int idx, boolean fill) {
+            this.upperBound = up; this.lowerBound = lo; this.bullish = bull;
+            this.timestamp = ts; this.barIndex = idx; this.filled = fill;
+        }
+        public double mid() { return (upperBound + lowerBound) / 2.0; }
+        public double size() { return upperBound - lowerBound; }
+    }
+
+    public static List<FairValueGap> detectFVGs(List<Candle> c, int lookback, int maxGaps) {
+        List<FairValueGap> result = new ArrayList<>();
+        if (c == null || c.size() < 4) return result;
+        int n = c.size();
+        double atrV = atr(c, 14);
+        if (atrV <= 0) return result;
+        double minGap = atrV * 0.20; // ignore micro-gaps that are just spread noise
+
+        int start = Math.max(1, n - lookback);
+        for (int i = n - 2; i >= start; i--) {
+            Candle prev = c.get(i - 1);
+            Candle next = c.get(i + 1);
+            // Bullish FVG: prev.high < next.low → gap above prev
+            if (prev.high < next.low && (next.low - prev.high) >= minGap) {
+                boolean filled = false;
+                for (int j = i + 2; j < n; j++) {
+                    if (c.get(j).low <= prev.high) { filled = true; break; }
+                }
+                result.add(new FairValueGap(next.low, prev.high, true,
+                        c.get(i).openTime, i, filled));
+            }
+            // Bearish FVG: prev.low > next.high → gap below prev
+            else if (prev.low > next.high && (prev.low - next.high) >= minGap) {
+                boolean filled = false;
+                for (int j = i + 2; j < n; j++) {
+                    if (c.get(j).high >= prev.low) { filled = true; break; }
+                }
+                result.add(new FairValueGap(prev.low, next.high, false,
+                        c.get(i).openTime, i, filled));
+            }
+            if (result.size() >= maxGaps) break;
+        }
+        return result;
+    }
+
+    /** Liquidity sweep detection: price wicks beyond a recent high/low and reverses.
+     *  Returns {sweptHigh: bool, sweptLow: bool, reverseStrength: 0..1}. */
+    public static final class LiquiditySweep {
+        public final boolean sweptHigh;
+        public final boolean sweptLow;
+        public final double  reverseStrength;   // how decisively price reversed (0..1)
+        public final double  sweepLevel;        // the level that was swept
+        public LiquiditySweep(boolean h, boolean l, double rs, double lvl) {
+            this.sweptHigh = h; this.sweptLow = l;
+            this.reverseStrength = rs; this.sweepLevel = lvl;
+        }
+        public boolean any() { return sweptHigh || sweptLow; }
+    }
+
+    public static LiquiditySweep detectLiquiditySweep(List<Candle> c, int lookback) {
+        if (c == null || c.size() < lookback + 3) {
+            return new LiquiditySweep(false, false, 0.0, 0.0);
+        }
+        int n = c.size();
+        Candle last = c.get(n - 1);
+        // Find prior swing high/low excluding the last 2 bars
+        double swingHi = Double.NEGATIVE_INFINITY, swingLo = Double.POSITIVE_INFINITY;
+        for (int i = n - lookback - 2; i < n - 2; i++) {
+            if (i < 0) continue;
+            swingHi = Math.max(swingHi, c.get(i).high);
+            swingLo = Math.min(swingLo, c.get(i).low);
+        }
+        double atrV = atr(c, 14);
+        if (atrV <= 0) return new LiquiditySweep(false, false, 0.0, 0.0);
+
+        // Sweep high: last bar wicked above swingHi but closed back below
+        boolean sweptHigh = last.high > swingHi && last.close < swingHi;
+        boolean sweptLow  = last.low  < swingLo && last.close > swingLo;
+        double reverse = 0.0;
+        double level = 0.0;
+        if (sweptHigh) {
+            level = swingHi;
+            reverse = Math.min(1.0, (swingHi - last.close) / atrV);
+        } else if (sweptLow) {
+            level = swingLo;
+            reverse = Math.min(1.0, (last.close - swingLo) / atrV);
+        }
+        return new LiquiditySweep(sweptHigh, sweptLow, reverse, level);
+    }
+
+    // ── 2. ANCHORED VWAP ───────────────────────────────────────────────────────
+
+    /** VWAP anchored to a specific bar index (e.g. session open, HoD, LoD).
+     *  Returns Double.NaN if anchor invalid. */
+    public static double anchoredVWAP(List<Candle> c, int anchorIdx) {
+        if (c == null || c.isEmpty() || anchorIdx < 0 || anchorIdx >= c.size()) {
+            return Double.NaN;
+        }
+        double sumPV = 0, sumV = 0;
+        for (int i = anchorIdx; i < c.size(); i++) {
+            Candle b = c.get(i);
+            double tp = (b.high + b.low + b.close) / 3.0;
+            sumPV += tp * b.volume;
+            sumV  += b.volume;
+        }
+        return sumV > 1e-9 ? sumPV / sumV : c.get(c.size() - 1).close;
+    }
+
+    /** Anchored VWAP from the most recent daily session open (UTC midnight bar). */
+    public static double anchoredVWAPFromDailyOpen(List<Candle> c) {
+        if (c == null || c.size() < 5) return Double.NaN;
+        int anchor = c.size() - 1;
+        // 15m bars: 96 bars per day. Find the bar closest to 00:00 UTC for the active day.
+        long lastTs = c.get(c.size() - 1).openTime;
+        long dayMs  = 24L * 60 * 60 * 1000;
+        long dayStart = (lastTs / dayMs) * dayMs;
+        for (int i = c.size() - 1; i >= 0; i--) {
+            if (c.get(i).openTime <= dayStart) { anchor = i; break; }
+        }
+        return anchoredVWAP(c, anchor);
+    }
+
+    /** Anchored VWAP from the bar where the high-of-day was made. */
+    public static double anchoredVWAPFromHoD(List<Candle> c, int sessionLookback) {
+        if (c == null || c.size() < 5) return Double.NaN;
+        int n = c.size();
+        int start = Math.max(0, n - sessionLookback);
+        int hodIdx = start;
+        double hi = c.get(start).high;
+        for (int i = start + 1; i < n; i++) {
+            if (c.get(i).high > hi) { hi = c.get(i).high; hodIdx = i; }
+        }
+        return anchoredVWAP(c, hodIdx);
+    }
+
+    /** Anchored VWAP from the bar where the low-of-day was made. */
+    public static double anchoredVWAPFromLoD(List<Candle> c, int sessionLookback) {
+        if (c == null || c.size() < 5) return Double.NaN;
+        int n = c.size();
+        int start = Math.max(0, n - sessionLookback);
+        int lodIdx = start;
+        double lo = c.get(start).low;
+        for (int i = start + 1; i < n; i++) {
+            if (c.get(i).low < lo) { lo = c.get(i).low; lodIdx = i; }
+        }
+        return anchoredVWAP(c, lodIdx);
+    }
+
+    // ── 3. SUPERTREND ──────────────────────────────────────────────────────────
+
+    public static final class SuperTrendResult {
+        public final double  value;       // current SuperTrend line
+        public final boolean uptrend;
+        public final int     barsInTrend;
+        public SuperTrendResult(double v, boolean up, int bars) {
+            this.value = v; this.uptrend = up; this.barsInTrend = bars;
+        }
+    }
+
+    /** SuperTrend (period=10, multiplier=3.0 — institutional defaults). Non-lagging
+     *  trend regime indicator. Above value = bull, below = bear. */
+    public static SuperTrendResult superTrend(List<Candle> c, int period, double mult) {
+        if (c == null || c.size() < period + 2) return new SuperTrendResult(0, true, 0);
+        int n = c.size();
+        double[] atrArr = new double[n];
+        // Wilder's ATR
+        double tr0 = c.get(0).high - c.get(0).low;
+        atrArr[0] = tr0;
+        for (int i = 1; i < n; i++) {
+            Candle b = c.get(i);
+            double prevClose = c.get(i - 1).close;
+            double tr = Math.max(b.high - b.low,
+                    Math.max(Math.abs(b.high - prevClose),
+                            Math.abs(b.low - prevClose)));
+            if (i < period) {
+                atrArr[i] = ((atrArr[i - 1] * i) + tr) / (i + 1);
+            } else {
+                atrArr[i] = (atrArr[i - 1] * (period - 1) + tr) / period;
+            }
+        }
+
+        double[] upperBand = new double[n];
+        double[] lowerBand = new double[n];
+        double[] superT = new double[n];
+        boolean[] uptrendArr = new boolean[n];
+
+        for (int i = 0; i < n; i++) {
+            Candle b = c.get(i);
+            double mid = (b.high + b.low) / 2.0;
+            double atrV = atrArr[i];
+            double basicUpper = mid + mult * atrV;
+            double basicLower = mid - mult * atrV;
+            if (i == 0) {
+                upperBand[i] = basicUpper;
+                lowerBand[i] = basicLower;
+                superT[i] = basicUpper;
+                uptrendArr[i] = true;
+            } else {
+                upperBand[i] = (basicUpper < upperBand[i - 1] || c.get(i - 1).close > upperBand[i - 1])
+                        ? basicUpper : upperBand[i - 1];
+                lowerBand[i] = (basicLower > lowerBand[i - 1] || c.get(i - 1).close < lowerBand[i - 1])
+                        ? basicLower : lowerBand[i - 1];
+                if (superT[i - 1] == upperBand[i - 1]) {
+                    superT[i] = b.close > upperBand[i] ? lowerBand[i] : upperBand[i];
+                } else {
+                    superT[i] = b.close < lowerBand[i] ? upperBand[i] : lowerBand[i];
+                }
+                uptrendArr[i] = b.close > superT[i];
+            }
+        }
+        int barsIn = 1;
+        for (int i = n - 2; i >= 0; i--) {
+            if (uptrendArr[i] == uptrendArr[n - 1]) barsIn++;
+            else break;
+        }
+        return new SuperTrendResult(superT[n - 1], uptrendArr[n - 1], barsIn);
+    }
+
+    // ── 4. KAMA (Kaufman Adaptive Moving Average) ──────────────────────────────
+
+    /** KAMA — trends fast in trending markets, slows in chop. Period=10, fast=2, slow=30. */
+    public static double kama(List<Candle> c, int period) {
+        if (c == null || c.size() < period + 1) {
+            return c == null || c.isEmpty() ? 0 : c.get(c.size() - 1).close;
+        }
+        int n = c.size();
+        double fastSC = 2.0 / (2 + 1);
+        double slowSC = 2.0 / (30 + 1);
+        double kamaVal = c.get(n - period - 1).close;
+        for (int i = n - period; i < n; i++) {
+            double change = Math.abs(c.get(i).close - c.get(Math.max(0, i - period)).close);
+            double volatility = 0;
+            for (int j = Math.max(1, i - period + 1); j <= i; j++) {
+                volatility += Math.abs(c.get(j).close - c.get(j - 1).close);
+            }
+            double er = volatility > 1e-12 ? change / volatility : 0; // efficiency ratio 0..1
+            double sc = Math.pow(er * (fastSC - slowSC) + slowSC, 2);
+            kamaVal = kamaVal + sc * (c.get(i).close - kamaVal);
+        }
+        return kamaVal;
+    }
+
+    // ── 5. CVD FOOTPRINT PER CANDLE ────────────────────────────────────────────
+
+    /** Per-candle estimated buy/sell delta. Based on close position within the bar:
+     *  if close near high → most volume was buying, near low → selling. */
+    public static final class CandleFootprint {
+        public final double buyVolume;
+        public final double sellVolume;
+        public final double delta;          // buy - sell
+        public final double deltaPct;       // delta / total
+        public final double cumDelta;       // running CVD up to this bar
+        public CandleFootprint(double b, double s, double d, double dp, double cd) {
+            buyVolume = b; sellVolume = s; delta = d; deltaPct = dp; cumDelta = cd;
+        }
+    }
+
+    public static List<CandleFootprint> footprintSeries(List<Candle> c) {
+        List<CandleFootprint> out = new ArrayList<>();
+        if (c == null || c.isEmpty()) return out;
+        double cum = 0;
+        for (Candle b : c) {
+            double range = Math.max(1e-12, b.high - b.low);
+            // Buy proportion: where did the close land? 0=low, 1=high.
+            double buyProp = (b.close - b.low) / range;
+            buyProp = Math.max(0.0, Math.min(1.0, buyProp));
+            // Smooth bias: extreme close (top/bottom 5%) = 80/20 split, midrange = 50/50.
+            // This avoids over-counting on doji bars where close==low randomly.
+            double weighted = 0.5 + (buyProp - 0.5) * 0.7;
+            double buy  = b.volume * weighted;
+            double sell = b.volume * (1.0 - weighted);
+            double delta = buy - sell;
+            cum += delta;
+            double dPct = b.volume > 1e-9 ? delta / b.volume : 0;
+            out.add(new CandleFootprint(buy, sell, delta, dPct, cum));
+        }
+        return out;
+    }
+
+    /** CVD divergence detection: price makes new high but cumDelta does not (bear div),
+     *  or new low but cumDelta higher (bull div). Returns {bull, bear, strength}. */
+    public static final class CVDDivergence {
+        public final boolean bullish;
+        public final boolean bearish;
+        public final double  strength;     // 0..1
+        public CVDDivergence(boolean bl, boolean br, double s) {
+            bullish = bl; bearish = br; strength = s;
+        }
+    }
+
+    public static CVDDivergence cvdDivergence(List<Candle> c, int lookback) {
+        if (c == null || c.size() < lookback + 2) return new CVDDivergence(false, false, 0);
+        List<CandleFootprint> fp = footprintSeries(c);
+        int n = c.size();
+        int start = Math.max(0, n - lookback);
+        // Find price hi/lo and corresponding CVD values
+        int priceHiIdx = start, priceLoIdx = start;
+        for (int i = start + 1; i < n; i++) {
+            if (c.get(i).high > c.get(priceHiIdx).high) priceHiIdx = i;
+            if (c.get(i).low  < c.get(priceLoIdx).low)  priceLoIdx = i;
+        }
+        // Recent half of the window — compare its cvd peak/trough to historical
+        int mid = (start + n) / 2;
+        double recentMaxCvd = Double.NEGATIVE_INFINITY, recentMinCvd = Double.POSITIVE_INFINITY;
+        double earlyMaxCvd  = Double.NEGATIVE_INFINITY, earlyMinCvd  = Double.POSITIVE_INFINITY;
+        for (int i = start; i < n; i++) {
+            double cv = fp.get(i).cumDelta;
+            if (i >= mid) {
+                recentMaxCvd = Math.max(recentMaxCvd, cv);
+                recentMinCvd = Math.min(recentMinCvd, cv);
+            } else {
+                earlyMaxCvd = Math.max(earlyMaxCvd, cv);
+                earlyMinCvd = Math.min(earlyMinCvd, cv);
+            }
+        }
+        boolean bear = priceHiIdx >= mid && recentMaxCvd < earlyMaxCvd;
+        boolean bull = priceLoIdx >= mid && recentMinCvd > earlyMinCvd;
+        double strength = 0;
+        if (bear) {
+            double range = Math.abs(earlyMaxCvd) + 1e-9;
+            strength = Math.min(1.0, (earlyMaxCvd - recentMaxCvd) / range);
+        } else if (bull) {
+            double range = Math.abs(earlyMinCvd) + 1e-9;
+            strength = Math.min(1.0, (recentMinCvd - earlyMinCvd) / range);
+        }
+        return new CVDDivergence(bull, bear, strength);
+    }
+
+    // ── 6. VOLUME-WEIGHTED BOLLINGER + SQUEEZE ────────────────────────────────
+
+    public static final class BollingerSqueeze {
+        public final double upper;
+        public final double lower;
+        public final double mid;
+        public final double bandwidthPctile;  // 0..1 — percentile of current BW vs lookback
+        public final boolean squeeze;          // BW in bottom 10% of last 96 bars
+        public BollingerSqueeze(double u, double l, double m, double bp, boolean sq) {
+            upper = u; lower = l; mid = m; bandwidthPctile = bp; squeeze = sq;
+        }
+    }
+
+    public static BollingerSqueeze bollingerSqueeze(List<Candle> c, int period, double stdMult, int pctileLookback) {
+        if (c == null || c.size() < Math.max(period, pctileLookback) + 2) {
+            return new BollingerSqueeze(0, 0, 0, 0.5, false);
+        }
+        int n = c.size();
+        double[] bw = new double[n];
+        for (int i = period - 1; i < n; i++) {
+            double sum = 0;
+            for (int j = i - period + 1; j <= i; j++) sum += c.get(j).close;
+            double mean = sum / period;
+            double sq = 0;
+            for (int j = i - period + 1; j <= i; j++) {
+                double d = c.get(j).close - mean;
+                sq += d * d;
+            }
+            double sd = Math.sqrt(sq / period);
+            bw[i] = (2 * stdMult * sd) / Math.max(1e-9, mean);
+        }
+        // Compute percentile rank of current BW
+        double currentBw = bw[n - 1];
+        int start = Math.max(period, n - pctileLookback);
+        int below = 0, total = 0;
+        for (int i = start; i < n; i++) {
+            if (bw[i] < currentBw) below++;
+            total++;
+        }
+        double pct = total > 0 ? (double) below / total : 0.5;
+        boolean squeeze = pct <= 0.10;
+        // Recompute current bands
+        double sum = 0;
+        for (int j = n - period; j < n; j++) sum += c.get(j).close;
+        double mean = sum / period;
+        double sq = 0;
+        for (int j = n - period; j < n; j++) {
+            double d = c.get(j).close - mean;
+            sq += d * d;
+        }
+        double sd = Math.sqrt(sq / period);
+        return new BollingerSqueeze(mean + stdMult * sd, mean - stdMult * sd, mean, pct, squeeze);
+    }
+
+    // ── 7. PREMIUM/DISCOUNT ZONES ──────────────────────────────────────────────
+
+    public static final class PremiumDiscount {
+        public final double rangeHigh;
+        public final double rangeLow;
+        public final double equilibrium;       // 50% level
+        public final double currentPrice;
+        public final double zonePosition;      // 0=low, 0.5=mid, 1=high
+        public final boolean inPremium;        // > 70%
+        public final boolean inDiscount;       // < 30%
+        public PremiumDiscount(double h, double l, double eq, double cur, double pos, boolean pr, boolean ds) {
+            rangeHigh = h; rangeLow = l; equilibrium = eq; currentPrice = cur;
+            zonePosition = pos; inPremium = pr; inDiscount = ds;
+        }
+    }
+
+    public static PremiumDiscount premiumDiscount(List<Candle> c, int lookback) {
+        if (c == null || c.size() < 3) {
+            double p = c == null || c.isEmpty() ? 0 : c.get(c.size() - 1).close;
+            return new PremiumDiscount(p, p, p, p, 0.5, false, false);
+        }
+        int n = c.size();
+        int start = Math.max(0, n - lookback);
+        double hi = c.get(start).high, lo = c.get(start).low;
+        for (int i = start; i < n; i++) {
+            hi = Math.max(hi, c.get(i).high);
+            lo = Math.min(lo, c.get(i).low);
+        }
+        double cur = c.get(n - 1).close;
+        double range = Math.max(1e-12, hi - lo);
+        double pos = (cur - lo) / range;
+        return new PremiumDiscount(hi, lo, (hi + lo) / 2.0, cur, pos,
+                pos > 0.70, pos < 0.30);
+    }
+
+    // ── 8. FUNDING RATE IMPULSE ────────────────────────────────────────────────
+
+    /** Detects rapid changes in funding rate that signal squeeze setups.
+     *  fundingHistory: list of recent funding values (oldest first), spaced by 8h ideally. */
+    public static final class FundingImpulse {
+        public final double currentRate;
+        public final double rateOfChange;     // delta from previous to current
+        public final boolean longSqueezeRisk;  // funding spiking positive → longs over-leveraged
+        public final boolean shortSqueezeRisk; // funding spiking negative → shorts over-leveraged
+        public final double impulseStrength;   // 0..1
+        public FundingImpulse(double cr, double roc, boolean ls, boolean ss, double str) {
+            currentRate = cr; rateOfChange = roc;
+            longSqueezeRisk = ls; shortSqueezeRisk = ss; impulseStrength = str;
+        }
+    }
+
+    public static FundingImpulse fundingImpulse(List<Double> fundingHistory) {
+        if (fundingHistory == null || fundingHistory.size() < 2) {
+            return new FundingImpulse(0, 0, false, false, 0);
+        }
+        int n = fundingHistory.size();
+        double cur = fundingHistory.get(n - 1);
+        double prev = fundingHistory.get(n - 2);
+        double roc = cur - prev;
+        // Threshold: 0.05% per 8h cycle = aggressive crowd positioning
+        boolean longSqz  = cur > 0.0005 && roc > 0.0002;
+        boolean shortSqz = cur < -0.0005 && roc < -0.0002;
+        double strength = Math.min(1.0, Math.abs(roc) / 0.001);
+        return new FundingImpulse(cur, roc, longSqz, shortSqz, strength);
+    }
+
+    // ── 9. PRE-MOVE PATTERN DETECTOR ───────────────────────────────────────────
+
+    public enum PreMoveType { COMPRESSION_BREAKOUT, ABSORPTION, SPRING, UPTHRUST, DELTA_DIVERGENCE, NONE }
+
+    public static final class PreMoveSignal {
+        public final PreMoveType type;
+        public final boolean bullish;
+        public final double confidence;        // 0..1
+        public final String description;
+        public PreMoveSignal(PreMoveType t, boolean bull, double conf, String desc) {
+            type = t; bullish = bull; confidence = conf; description = desc;
+        }
+        public boolean detected() { return type != PreMoveType.NONE; }
+    }
+
+    /**
+     * Detect predictive pre-move patterns: compressions about to break, accumulation/distribution,
+     * Wyckoff springs/upthrusts, and CVD divergences.
+     *
+     * Returns the strongest detected pattern, or NONE if none qualify.
+     */
+    public static PreMoveSignal detectPreMove(List<Candle> c) {
+        if (c == null || c.size() < 30) {
+            return new PreMoveSignal(PreMoveType.NONE, false, 0, "insufficient data");
+        }
+        int n = c.size();
+        double atrV = atr(c, 14);
+        if (atrV <= 0) return new PreMoveSignal(PreMoveType.NONE, false, 0, "zero ATR");
+        Candle last = c.get(n - 1);
+
+        // --- Pattern 1: COMPRESSION BREAKOUT ---
+        // BB squeeze + last bar breaking out with above-average volume
+        BollingerSqueeze bb = bollingerSqueeze(c, 20, 2.0, 96);
+        double avgVol = 0;
+        for (int i = n - 20; i < n - 1; i++) avgVol += c.get(i).volume;
+        avgVol /= 19;
+        boolean volSurge = last.volume > avgVol * 1.5;
+        if (bb.squeeze && volSurge) {
+            boolean bullBreak = last.close > bb.upper;
+            boolean bearBreak = last.close < bb.lower;
+            if (bullBreak || bearBreak) {
+                double conf = Math.min(1.0, (1.0 - bb.bandwidthPctile) * 0.7
+                        + (last.volume / avgVol - 1.0) * 0.15);
+                return new PreMoveSignal(PreMoveType.COMPRESSION_BREAKOUT, bullBreak, conf,
+                        String.format("BB squeeze pctile=%.2f, vol=%.1fx", bb.bandwidthPctile, last.volume / avgVol));
+            }
+        }
+
+        // --- Pattern 2: ABSORPTION ---
+        // Sustained volume on small-range bars in tight area = institutional accumulation/distribution
+        double sumRange = 0, sumVol = 0;
+        for (int i = n - 5; i < n; i++) {
+            sumRange += (c.get(i).high - c.get(i).low);
+            sumVol += c.get(i).volume;
+        }
+        double avgRange5 = sumRange / 5;
+        double avgVol5   = sumVol / 5;
+        if (avgRange5 < atrV * 0.6 && avgVol5 > avgVol * 1.3) {
+            // Determine direction: which side of CVD has been growing?
+            List<CandleFootprint> fp = footprintSeries(c);
+            double cvdSlope = fp.get(n - 1).cumDelta - fp.get(n - 6).cumDelta;
+            boolean bull = cvdSlope > 0;
+            double conf = Math.min(1.0, (avgVol5 / avgVol - 1.0) * 0.5 + 0.3);
+            return new PreMoveSignal(PreMoveType.ABSORPTION, bull, conf,
+                    String.format("range=%.2fATR, vol=%.1fx, cvdSlope=%.2f", avgRange5/atrV, avgVol5/avgVol, cvdSlope));
+        }
+
+        // --- Pattern 3: SPRING / UPTHRUST (Wyckoff) ---
+        // Recent low broken by wick then reclaimed = Spring (bull)
+        // Recent high broken by wick then rejected = Upthrust (bear)
+        LiquiditySweep sweep = detectLiquiditySweep(c, 20);
+        if (sweep.sweptLow && sweep.reverseStrength > 0.4) {
+            return new PreMoveSignal(PreMoveType.SPRING, true, Math.min(1.0, sweep.reverseStrength),
+                    String.format("low swept @%.4f, reverseStr=%.2f", sweep.sweepLevel, sweep.reverseStrength));
+        }
+        if (sweep.sweptHigh && sweep.reverseStrength > 0.4) {
+            return new PreMoveSignal(PreMoveType.UPTHRUST, false, Math.min(1.0, sweep.reverseStrength),
+                    String.format("high swept @%.4f, reverseStr=%.2f", sweep.sweepLevel, sweep.reverseStrength));
+        }
+
+        // --- Pattern 4: CVD DIVERGENCE ---
+        CVDDivergence div = cvdDivergence(c, 20);
+        if ((div.bullish || div.bearish) && div.strength > 0.35) {
+            return new PreMoveSignal(PreMoveType.DELTA_DIVERGENCE, div.bullish, div.strength,
+                    String.format("%s div, str=%.2f", div.bullish ? "bull" : "bear", div.strength));
+        }
+
+        return new PreMoveSignal(PreMoveType.NONE, false, 0, "no pattern");
+    }
+
+    // ── 10. CONFLUENCE AGGREGATOR ─────────────────────────────────────────────
+
+    public static final class ConfluenceReport {
+        public final double bullScore;        // 0..1
+        public final double bearScore;        // 0..1
+        public final List<String> bullFactors = new ArrayList<>();
+        public final List<String> bearFactors = new ArrayList<>();
+        public ConfluenceReport(double b, double s) { bullScore = b; bearScore = s; }
+        public boolean bullishBias() { return bullScore > bearScore + 0.15; }
+        public boolean bearishBias() { return bearScore > bullScore + 0.15; }
+        public double diff() { return bullScore - bearScore; }
+    }
+
+    /**
+     * Aggregate all advanced indicators into a single bull/bear confluence score.
+     * Use this in DecisionEngine to add a "v75 advanced cluster" alongside existing 6 clusters.
+     */
+    public static ConfluenceReport advancedConfluence(List<Candle> c, double currentPrice) {
+        ConfluenceReport r = new ConfluenceReport(0, 0);
+        if (c == null || c.size() < 30) return r;
+        double atrV = atr(c, 14);
+        if (atrV <= 0) return r;
+
+        double bull = 0, bear = 0;
+
+        // Order Blocks: price tagging unmitigated bullish OB → bull, bearish OB → bear
+        // Uses existing detectOrderBlocks(candles, lookback) defined earlier in this class.
+        List<OrderBlock> obs = detectOrderBlocks(c, 50);
+        for (OrderBlock ob : obs) {
+            if (ob.isNearby(currentPrice, atrV)) {
+                if (ob.isBullish) {
+                    bull += 0.20 * ob.strength;
+                    r.bullFactors.add("OB_DEMAND_TAP");
+                } else {
+                    bear += 0.20 * ob.strength;
+                    r.bearFactors.add("OB_SUPPLY_TAP");
+                }
+                break;  // only score the most recent tagged zone
+            }
+        }
+
+        // FVGs unfilled in direction of trade
+        List<FairValueGap> fvgs = detectFVGs(c, 30, 5);
+        for (FairValueGap fvg : fvgs) {
+            if (!fvg.filled && Math.abs(currentPrice - fvg.mid()) < atrV * 1.0) {
+                if (fvg.bullish) {
+                    bull += 0.10;
+                    r.bullFactors.add("BULL_FVG_NEAR");
+                } else {
+                    bear += 0.10;
+                    r.bearFactors.add("BEAR_FVG_NEAR");
+                }
+                break;
+            }
+        }
+
+        // SuperTrend regime
+        SuperTrendResult st = superTrend(c, 10, 3.0);
+        if (st.uptrend) {
+            bull += 0.15 + Math.min(0.10, st.barsInTrend * 0.005);
+            r.bullFactors.add("ST_UP_" + st.barsInTrend);
+        } else {
+            bear += 0.15 + Math.min(0.10, st.barsInTrend * 0.005);
+            r.bearFactors.add("ST_DOWN_" + st.barsInTrend);
+        }
+
+        // KAMA slope
+        if (c.size() >= 25) {
+            double kamaNow = kama(c, 10);
+            // crude slope: kama(now) vs kama(5 bars ago)
+            double kamaPrev = kama(c.subList(0, c.size() - 5), 10);
+            if (kamaNow > kamaPrev * 1.001) { bull += 0.08; r.bullFactors.add("KAMA_UP"); }
+            else if (kamaNow < kamaPrev * 0.999) { bear += 0.08; r.bearFactors.add("KAMA_DOWN"); }
+        }
+
+        // Anchored VWAP from daily open
+        double avwap = anchoredVWAPFromDailyOpen(c);
+        if (!Double.isNaN(avwap)) {
+            if (currentPrice > avwap) { bull += 0.10; r.bullFactors.add("ABOVE_DAY_AVWAP"); }
+            else { bear += 0.10; r.bearFactors.add("BELOW_DAY_AVWAP"); }
+        }
+
+        // CVD divergence
+        CVDDivergence div = cvdDivergence(c, 20);
+        if (div.bullish && div.strength > 0.30) {
+            bull += 0.15 * div.strength;
+            r.bullFactors.add(String.format("CVD_BULL_DIV_%.2f", div.strength));
+        }
+        if (div.bearish && div.strength > 0.30) {
+            bear += 0.15 * div.strength;
+            r.bearFactors.add(String.format("CVD_BEAR_DIV_%.2f", div.strength));
+        }
+
+        // Premium / Discount
+        PremiumDiscount pd = premiumDiscount(c, 50);
+        if (pd.inDiscount) { bull += 0.08; r.bullFactors.add("DISCOUNT_ZONE"); }
+        if (pd.inPremium)  { bear += 0.08; r.bearFactors.add("PREMIUM_ZONE"); }
+
+        // Liquidity sweep recent
+        LiquiditySweep sweep = detectLiquiditySweep(c, 20);
+        if (sweep.sweptLow && sweep.reverseStrength > 0.40) {
+            bull += 0.12 * sweep.reverseStrength;
+            r.bullFactors.add(String.format("SWEPT_LOW_%.2f", sweep.reverseStrength));
+        }
+        if (sweep.sweptHigh && sweep.reverseStrength > 0.40) {
+            bear += 0.12 * sweep.reverseStrength;
+            r.bearFactors.add(String.format("SWEPT_HIGH_%.2f", sweep.reverseStrength));
+        }
+
+        // Pre-move patterns
+        PreMoveSignal pm = detectPreMove(c);
+        if (pm.detected()) {
+            double mag = pm.confidence * 0.18;
+            if (pm.bullish) {
+                bull += mag;
+                r.bullFactors.add("PREMOVE_" + pm.type.name() + "_" + String.format("%.2f", pm.confidence));
+            } else {
+                bear += mag;
+                r.bearFactors.add("PREMOVE_" + pm.type.name() + "_" + String.format("%.2f", pm.confidence));
+            }
+        }
+
+        // Normalize to 0..1
+        bull = Math.min(1.0, bull);
+        bear = Math.min(1.0, bear);
+        ConfluenceReport out = new ConfluenceReport(bull, bear);
+        out.bullFactors.addAll(r.bullFactors);
+        out.bearFactors.addAll(r.bearFactors);
+        return out;
+    }
 }

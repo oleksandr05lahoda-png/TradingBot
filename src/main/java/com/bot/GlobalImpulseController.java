@@ -1009,12 +1009,13 @@ public final class GlobalImpulseController {
 
         // CHOPPY MARKET — penalize but don't kill.
         // Old: 0.05 = effectively blocked everything.
-        // Problem: individual coins can have clean setups even when BTC chops.
-        // New: 0.40 = significant penalty (-15 to -20 probability) but allows
-        // high-conviction signals through. Pre-breakout and reversal setups
-        // on strong RS coins still deserve evaluation.
+        // [v74] 0.40 — still aggressive in practice (-15..-20 prob).
+        // [v75] 0.55 — penalty becomes -8..-12 prob. Lets high-RS coins on clean
+        // technical setups through during BTC chop. The whole point of relStrength
+        // is to find coins that DON'T behave like the index — penalizing them
+        // 60% when BTC chops defeats that signal. PANIC keeps full 0.0 veto.
         if (ctx.regime == GlobalRegime.BTC_CHOPPY) {
-            return 0.40;
+            return isLong && relStrength > 0.85 ? 0.65 : 0.55;
         }
 
         // ── Уровень каскада определяет вес ──────────────────────

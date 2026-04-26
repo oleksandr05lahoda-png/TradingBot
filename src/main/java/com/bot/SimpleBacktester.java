@@ -13,9 +13,11 @@ public final class SimpleBacktester {
     private double takerFee         = 0.0004;     // 0.04% per side
     private double fundingPer15m    = 0.0001 / 32; // ~0.01%/8h → per 15m
     private int    maxConcurrent    = 6;
-    // Time stop increased 6→8 bars (2h). With earlier entries (pre-breakout),
-    // the move needs more time to develop. 90min was too tight.
-    private int    timeStopBars     = 8;           // 120 min at 15m (was 6 = 90min)
+    // [v75] 8 → 6 bars. SYNC FIX: ISC.TIME_STOP_BARS=6 (90 min) is the live rule.
+    // Backtester at 8 (120 min) was inflating PnL by giving setups 33% more time
+    // to come back — totally invalidating walk-forward results. Now both are 90min.
+    // toTelegramString also displays "Time-stop: 90 мин" — single source of truth.
+    private int    timeStopBars     = 6;           // 90 min at 15m, matches ISC.TIME_STOP_BARS
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 

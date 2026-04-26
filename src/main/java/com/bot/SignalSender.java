@@ -1316,16 +1316,21 @@ public final class SignalSender {
 
             if (idea == null) return null;
 
-            // [v50 §12] EVENT COIN DIRECTIONAL GATE — block same-direction entry on event coins.
-            // If coin moved +7% today, block LONG but allow SHORT (reversal/pullback).
-            // If coin moved -7% today, block SHORT but allow LONG (bounce/reversal).
+            // [v75] EVENT COIN DIRECTIONAL — был hard block, теперь soft penalty.
+            // Старая логика отрезала ровно те моменты когда тренд продолжается:
+            // монета +7% за день и идёт ещё +5% → бот молчит. Теперь:
+            //   - LONG на already-up coin → -6 probability (требуем больше confluence)
+            //   - SHORT на already-down coin → -6 probability
+            // Reversal (LONG на already-down, SHORT на already-up) проходит без штрафа.
             if (eventCoinUp && idea.side == com.bot.TradingCore.Side.LONG) {
-                System.out.printf("[EVENT-DIR] %s LONG blocked: coin already up significantly today%n", pair);
-                return null;
+                List<String> evFlags = new ArrayList<>(idea.flags);
+                evFlags.add("EVENT_COIN_UP_LONG_PENALTY");
+                idea = rebuildIdea(idea, Math.max(0, idea.probability - 6), evFlags);
             }
             if (eventCoinDown && idea.side == com.bot.TradingCore.Side.SHORT) {
-                System.out.printf("[EVENT-DIR] %s SHORT blocked: coin already down significantly today%n", pair);
-                return null;
+                List<String> evFlags = new ArrayList<>(idea.flags);
+                evFlags.add("EVENT_COIN_DOWN_SHORT_PENALTY");
+                idea = rebuildIdea(idea, Math.max(0, idea.probability - 6), evFlags);
             }
 
             // [v50 AUDIT FIX] Adaptive MAX SL% — by volatility bucket × balance scaling.
@@ -1417,10 +1422,10 @@ public final class SignalSender {
             }
 
             idea = optimizer.withAdjustedConfidence(idea);
-            if (idea.probability < MIN_CONF) {
-                blockedOptConf.incrementAndGet();
-                return null;
-            }
+            // [v75] Removed duplicate MIN_CONF check here. Was: probability < MIN_CONF → reject.
+            // The same check happens at line ~1570 (finalMinConf) which is the authoritative
+            // gate. Two consecutive checks of the same threshold = no extra protection,
+            // just confusing logs and an extra rejection counter that double-counted.
 
             // [v18.0 REFACTOR] OBI: flag only, no probability scaling, no blocking
             // ANTI-SPOOFING: cross-validate OBI with realised taker flow.

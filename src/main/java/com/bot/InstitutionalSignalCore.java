@@ -39,11 +39,12 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;
 
     public InstitutionalSignalCore() {
-        // [v71] baseMinConfidence 53→50. Синхронизация с DE.MIN_CONF_FLOOR=52
-        // (margin -2: ISC умышленно слегка ниже DE чтобы не дублировать фильтр).
-        // Реальный quality control делается в Dispatcher cold-start gate (53/57).
+        // [v75] ISC_MAX_GLOBAL_SIGNALS 6→10. With 30 active pairs and a sector wave,
+        // 6 simultaneous open positions was too tight — fresh signals were dropped
+        // because the slot was occupied by an already-tracked position that hadn't
+        // hit TP/SL yet. 10 leaves headroom without diluting the portfolio.
         this(
-                envInt("ISC_MAX_GLOBAL_SIGNALS", 6),
+                envInt("ISC_MAX_GLOBAL_SIGNALS", 10),
                 envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
                 envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
                 envDouble("ISC_BASE_MIN_CONF", 50.0),
@@ -90,9 +91,12 @@ public final class InstitutionalSignalCore {
     private final Map<String, Long> symbolCooldownUntil = new ConcurrentHashMap<>();
 
     // Global signal rate limit — defends against signal floods.
-    // [v18] 12 → 16 per 2h. Allows more signals when market is active.
+    // [v75] 16 → 30 per 2h. The previous cap was the binding constraint:
+    // BotMain.MAX_PER_HOUR=20 means 40 in 2h is theoretically possible, but
+    // ISC capped at 16/2h, making the effective limit ~8/h. 30/2h = 15/h average,
+    // matching BotMain's burst-protection model. Override via ISC_MAX_GLOBAL_2H env.
     private final ConcurrentLinkedDeque<Long> globalSignalTimestamps = new ConcurrentLinkedDeque<>();
-    private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 16);
+    private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 30);
     private static final long GLOBAL_WINDOW_2H_MS   = 2L * 60 * 60_000L;
 
     // Daily kill-switch threshold. At -5% daily PnL, block ALL new signals

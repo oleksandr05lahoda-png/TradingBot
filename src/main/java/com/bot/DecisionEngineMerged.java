@@ -1095,7 +1095,9 @@ public final class DecisionEngineMerged {
                             : price < 10000  ? "%.2f"
                               : "%.2f";
 
-            // Честный расчет дистанций в процентах
+            // [v75] Честный расчет дистанций в процентах. Точность снижена 2 → 1
+            // знак после запятой: трейдер быстрее читает "+2.5%" чем "+2.53%",
+            // и десятые в SL/TP визуальный шум, не информация.
             double slPct  = (stop - price) / price * 100;
             double tp1Pct = tp1 > 0 ? (tp1 - price) / price * 100 : 0;
             double tp2Pct = tp2 > 0 ? (tp2 - price) / price * 100 : 0;
@@ -1108,19 +1110,34 @@ public final class DecisionEngineMerged {
             String city = zoneId.contains("/") ? zoneId.substring(zoneId.lastIndexOf('/') + 1).replace('_', ' ') : zoneId;
 
             // Сборка строгого вертикального сообщения
+            // [v75.1] Symbol name через mdEscape — некоторые контракты Binance
+            // (особенно кросс-фьючерсы) могут содержать `_` в тикере, например
+            // 1000PEPE_USDT в early-listing. Без escape это ломает Markdown.
             StringBuilder sb = new StringBuilder();
-            sb.append(assetType.emoji).append(" *").append(symbol).append("*")
+            sb.append(assetType.emoji).append(" *").append(_mdEscape(symbol)).append("*")
                     .append(" · ").append(assetType.label).append("\n");
             sb.append(isLong ? "🟢 *LONG*\n" : "🔴 *SHORT*\n");
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append("▫️ Вход:    `").append(String.format(fmt, price)).append("`\n");
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
-            if (tp1 > 0) sb.append(String.format("🎯 TP1:    `" + fmt + "`  (%+.2f%%)%n", tp1, tp1Pct));
-            if (tp2 > 0) sb.append(String.format("🎯 TP2:    `" + fmt + "`  (%+.2f%%)%n", tp2, tp2Pct));
-            if (tp3 > 0) sb.append(String.format("🎯 TP3:    `" + fmt + "`  (%+.2f%%)%n", tp3, tp3Pct));
+            // [v75] TP precision 2 → 1: читается быстрее, десятые роли не играют
+            if (tp1 > 0) sb.append(String.format("🎯 TP1:    `" + fmt + "`  (%+.1f%%)%n", tp1, tp1Pct));
+            if (tp2 > 0) sb.append(String.format("🎯 TP2:    `" + fmt + "`  (%+.1f%%)%n", tp2, tp2Pct));
+            if (tp3 > 0) sb.append(String.format("🎯 TP3:    `" + fmt + "`  (%+.1f%%)%n", tp3, tp3Pct));
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
-            sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.2f%%)%n", stop, slPct));
+            sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.1f%%)%n", stop, slPct));
+
+            // [v75 FIX] Explicit Risk:Reward display.
+            // Раньше трейдер должен был в уме делить tp%/|sl%|. Теперь видит сразу.
+            // Используем R:R до TP2 как наиболее представительный (TP1 — частичный
+            // выход, TP3 — exit-runner). Защищаемся от деления на 0 и аномалий.
+            double rrToTp2 = (Math.abs(slPct) > 1e-9 && tp2Pct != 0)
+                    ? Math.abs(tp2Pct) / Math.abs(slPct) : 0;
+            if (rrToTp2 > 0.1) {
+                sb.append(String.format("⚖️ R:R (TP2): *1:%.1f*%n", rrToTp2));
+            }
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
+
             // [v61] Honest display. No cosmetic shrinkage — show the real model score.
             // Dispatcher filters sub-30-sample signals upstream, so any signal reaching
             // Telegram has earned its score through strict gates (prob≥78, clusters≥4).
@@ -1138,17 +1155,79 @@ public final class DecisionEngineMerged {
                 sb.append(String.format("📊 Уверенность: *%.0f%%*  _%s_%n",
                         _prob, signalQualityLabel(_prob)));
             }
+
+            // [v75 FIX] CRITICAL BUG: traderFlags() never displayed.
+            // Was computed (deduplicates CVD_DIV, prioritises by importance, caps at 6),
+            // then dropped on the floor. As a result trader saw price/SL/TP but had
+            // NO information on WHY: position size (SIZE=N$), confluence level
+            // (CONFL_L4), CVD divergence, BTC sync, liquidity magnet, etc.
+            // Now: render the prioritized list as a 📋 Контекст section.
+            // Empty list → skip section entirely (don't show empty header).
+            //
+            // [v75.1] Markdown safety: flag names contain underscores (LIQ_MAGNET,
+            // CONFL_L4, CVD_DIV, etc.). In Telegram parse_mode=Markdown an odd
+            // count of unescaped underscores → HTTP 400 → fallback to plain text
+            // (with visible asterisks/underscores). Pre-escape `_` and `*` in
+            // each rendered flag so the string is always parser-safe.
+            List<String> _tFlags = traderFlags();
+            if (_tFlags != null && !_tFlags.isEmpty()) {
+                sb.append("📋 ");
+                for (int i = 0; i < _tFlags.size(); i++) {
+                    if (i > 0) sb.append("  ");
+                    sb.append(_mdEscape(_tFlags.get(i)));
+                }
+                sb.append("\n");
+            }
+
             // Warn trader when SL is very tight relative to ATR.
             double _slPctAbs = Math.abs(slPct);
             if (_slPctAbs > 0 && _slPctAbs < 0.60) {
                 sb.append("\n⚠️ _Стоп очень тесный — риск выноса шумом_");
             }
+
+            // [v75 FIX] Time-stop expectation. ISC auto-closes positions after
+            // TIME_STOP_BARS=6 bars (90 min @ 15m). Without this line trader
+            // can sit in a setup for hours wondering why the bot is silent —
+            // not knowing the bot has internally given up on the idea.
+            sb.append(String.format("%n⏳ Time-stop: 90 мин"));
+
             sb.append("\n⏱ ").append(timeStr).append(" · ").append(city);
 
             return sb.toString();
         }
 
         @Override public String toString() { return toTelegramString(); }
+
+        /**
+         * [v75.1] Escape Telegram Markdown v1 special chars in dynamic content.
+         *
+         * Telegram parse_mode=Markdown treats *, _, ` as formatting markers.
+         * If our content contains an odd number of these (e.g. "LIQ_MAGNET=66200"
+         * has one `_`), the parser thinks formatting is unclosed → HTTP 400 →
+         * the whole alert falls back to ugly plain text with visible *_`.
+         *
+         * This method preserves the structure of intentional formatting (added
+         * by toTelegramString) by only being applied to dynamic strings — flag
+         * names, symbol names — never to the static template.
+         *
+         * NOTE: We do NOT escape `*` here because trader flags may legitimately
+         * contain emoji-prefixed structure that doesn't include `*`. If a flag
+         * ever does (none currently), add it here.
+         */
+        private static String _mdEscape(String s) {
+            if (s == null || s.isEmpty()) return s;
+            // Escape only the characters that actually appear in dynamic content
+            // and that Markdown v1 treats as pair-markers.
+            StringBuilder sb = new StringBuilder(s.length() + 4);
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (c == '_' || c == '*' || c == '`' || c == '[' || c == ']') {
+                    sb.append('\\');
+                }
+                sb.append(c);
+            }
+            return sb.toString();
+        }
 
         /**
          * Converts raw probability score [0..100] to a human-readable quality descriptor.
@@ -1434,14 +1513,21 @@ public final class DecisionEngineMerged {
                     postPumpGain * 100, postPumpDropFromHi * 100));
         }
 
-        // [v70] REGIME FILTER смягчён. Прежде ADX<12 + atrPctile<0.15 = reject.
-        // Это типичный "затишье перед бурей" паттерн — лучший вход для pre-pump.
-        // Новое: reject только при совсем мёртвой структуре (ADX<9, pctile<0.08).
+        // [v75] REGIME FILTER переделан с hard-reject на soft-penalty.
+        // Старая логика: ADX<9 + atrPctile<0.08 = reject — но именно ТАК выглядит
+        // pre-pump компрессия, лучший момент для входа. Теперь просто штраф,
+        // а CVD/PreMove детекторы могут пробить его если есть accumulation.
+        // [v75] choppy_range: вместо reject — штраф, и пропускаем если есть
+        // confirming flag (REVERSAL_SETUP, FVG_FILL, OB_TAP, COMPRESSION_BREAKOUT).
+        boolean flatMarketPenalty = false;
+        boolean choppyRangePenalty = false;
         if (!aggressiveShort && state == MarketState.RANGE) {
             double adxVal = adx(c15, 14);
             double atrPctile = com.bot.TradingCore.atrPercentile(c15, 14, 96);
             if (adxVal < 9 && atrPctile < 0.08) {
-                return reject("flat_market");
+                // Compression detected — soft penalty, let PreMove/CVD pull through.
+                flatMarketPenalty = true;
+                allFlags.add("FLAT_MARKET_COMPRESSION");
             }
             // В RANGE с низким ADX — только extreme RSI пропускаем (mean-reversion)
             if (adxVal < 15 && atrPctile < 0.20) {
@@ -1450,16 +1536,18 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // [v70] Choppiness смягчён: CI threshold 61.8 → 68 для RANGE,
+        // [v70/v75] Choppiness смягчён: CI threshold 61.8 → 68 для RANGE,
         // 68 → 72 для WEAK_TREND. RSI window 28..72 → 24..76.
+        // [v75] choppy_range теперь не возвращает reject — это soft penalty.
+        // Реальные reversal сетапы в чопе бывают (sweep + reclaim) — пусть проходят.
         if (!aggressiveShort && state != MarketState.STRONG_TREND && c15.size() >= 15) {
             double ci = com.bot.TradingCore.choppinessIndex(c15, 14);
             if (ci > 68.0) {
                 if (state == MarketState.RANGE) {
                     double rsiVal = rsi(c15, 14);
                     if (rsiVal > 24 && rsiVal < 76) {
-                        allFlags.add("CI_BLOCK_" + String.format("%.0f", ci));
-                        return reject("choppy_range");
+                        allFlags.add("CI_HIGH_" + String.format("%.0f", ci));
+                        choppyRangePenalty = true;
                     }
                 } else if (ci > 76.0) {
                     // [v71] CI threshold 72→76. В WEAK_TREND CI>72 случается на каждой
@@ -2426,13 +2514,20 @@ public final class DecisionEngineMerged {
         // RANGE market is treacherous — require 3 clusters minimum
         // [v71] Exception: reversal context (LOCAL_REVERSAL/EXHAUSTION_REVERSAL_BOOST/
         // REVERSAL_SETUP) — это легитимный mean-reversion сетап и 2 кластера достаточно.
-        // Это разблокирует именно ту категорию которая работает в RANGE: pump exhaust
-        // → SHORT, dump exhaust → LONG (как MOVRUSDT TP1 показал).
+        // [v75] Дополнительное исключение: чистая directional conviction. Если
+        // scoreDiff >= 0.40 (то есть один из двух сторон лидирует с большим отрывом)
+        // — это сильный сетап даже на 2 кластерах. RANGE с 6 кластерами требует 3
+        // согласных, но Derivatives/HTF на сжатой бочаге часто NEUTRAL — поэтому
+        // 2 strong clusters + decisive score split = legitimate setup that DEserves
+        // to pass. Без этого исключения бот молчит весь pre-breakout период.
         if (state == MarketState.RANGE && !earlySoloAllowed && !aggressiveShort) {
             boolean reversalContext = allFlags.contains("REVERSAL_SETUP")
                     || allFlags.contains("EXHAUSTION_REVERSAL_BOOST")
                     || allFlags.stream().anyMatch(f -> f != null && f.startsWith("LOCAL_REVERSAL"));
-            requiredClusters = reversalContext ? 2 : 3;
+            double scoreDiffNow = Math.abs(scoreLong - scoreShort);
+            boolean decisiveSplit = scoreDiffNow >= 0.40;
+            requiredClusters = (reversalContext || decisiveSplit) ? 2 : 3;
+            if (decisiveSplit && !reversalContext) allFlags.add("RANGE_DECISIVE_SPLIT");
         }
 
         // Insufficient clusters → penalty flag (was return null)
@@ -2704,6 +2799,17 @@ public final class DecisionEngineMerged {
         ensAdj = Math.max(-14.0, Math.min(+8.0, ensAdj));
         probability = Math.max(0.0, Math.min(PROB_CEIL, probability + ensAdj));
 
+        // [v75] FLAT_MARKET / CHOPPY_RANGE soft penalties (replaced hard rejects upstream).
+        // Эти штрафы НЕ кумулятивные с ensAdj — они отдельный штраф за regime quality.
+        // FLAT_MARKET_COMPRESSION:  -4 (мягко — может быть pre-pump, не убиваем)
+        // CI_HIGH (chop без extreme RSI): -6 (выше чем flat, но всё ещё не reject)
+        if (flatMarketPenalty) {
+            probability = Math.max(0, probability - 4);
+        }
+        if (choppyRangePenalty) {
+            probability = Math.max(0, probability - 6);
+        }
+
         // Exhaustion score crush: score already penalized upstream via cluster multiply.
         // Apply only a capped -7 here (was -12 flat).
         if (allFlags.contains("LEXH_SCORE_CRUSHED") || allFlags.contains("SEXH_SCORE_CRUSHED"))
@@ -2738,6 +2844,66 @@ public final class DecisionEngineMerged {
             probability = Math.max(0, Math.min(PROB_CEIL, probability + frAdj));
             if (frAdj < -3) allFlags.add("FR_CROWD_PENALTY");
             if (frAdj > 3)  allFlags.add("FR_EDGE_BOOST");
+        }
+
+        // [v75] ADVANCED CONFLUENCE (SMC + AVWAP + SuperTrend + CVD + PreMove)
+        // ─────────────────────────────────────────────────────────────────────
+        // Bolts on as a 7th cluster equivalent. Reads everything in TradingCore's
+        // new advanced-indicators block and produces a single bull/bear score.
+        // Mapping to probability:
+        //   - aligned with our side AND diff>=0.20  → +6 (strong agreement)
+        //   - aligned with our side AND diff>=0.10  → +3 (mild agreement)
+        //   - opposed to our side AND diff>=0.20    → -6 (strong opposition)
+        //   - opposed to our side AND diff>=0.10    → -3 (mild opposition)
+        // Capped contribution: ±6 — cannot single-handedly flip a signal.
+        try {
+            com.bot.TradingCore.ConfluenceReport adv = com.bot.TradingCore.advancedConfluence(c15, price);
+            double advAdj = 0;
+            double diff = adv.diff();   // bull - bear
+            if (_isLong) {
+                if (diff >= 0.20)       advAdj = +6;
+                else if (diff >= 0.10)  advAdj = +3;
+                else if (diff <= -0.20) advAdj = -6;
+                else if (diff <= -0.10) advAdj = -3;
+            } else {
+                if (diff <= -0.20)      advAdj = +6;
+                else if (diff <= -0.10) advAdj = +3;
+                else if (diff >= 0.20)  advAdj = -6;
+                else if (diff >= 0.10)  advAdj = -3;
+            }
+            if (advAdj != 0) {
+                probability = Math.max(0, Math.min(PROB_CEIL, probability + advAdj));
+                allFlags.add(String.format("ADV_CONFL_%s%.0f",
+                        advAdj > 0 ? "+" : "", advAdj));
+                // Tag the strongest factor in flags for downstream visibility
+                List<String> winningSide = (_isLong && diff > 0) || (!_isLong && diff < 0)
+                        ? (_isLong ? adv.bullFactors : adv.bearFactors)
+                        : (_isLong ? adv.bearFactors : adv.bullFactors);
+                if (winningSide != null && !winningSide.isEmpty()) {
+                    // Add up to 3 factors to flags (small footprint in logs)
+                    for (int k = 0; k < Math.min(3, winningSide.size()); k++) {
+                        allFlags.add(winningSide.get(k));
+                    }
+                }
+            }
+
+            // [v75] PRE-MOVE PATTERN — separate predictive boost.
+            // If detectPreMove finds a high-confidence pattern aligned with our side,
+            // add up to +5. If aligned against our side with high confidence, -4.
+            com.bot.TradingCore.PreMoveSignal pm = com.bot.TradingCore.detectPreMove(c15);
+            if (pm.detected() && pm.confidence > 0.40) {
+                double pmAdj = 0;
+                if ((pm.bullish && _isLong) || (!pm.bullish && !_isLong)) {
+                    pmAdj = +pm.confidence * 5.0;
+                } else {
+                    pmAdj = -pm.confidence * 4.0;
+                }
+                probability = Math.max(0, Math.min(PROB_CEIL, probability + pmAdj));
+                allFlags.add(String.format("PREMOVE_%s_%.2f", pm.type.name(), pm.confidence));
+            }
+        } catch (Throwable t) {
+            // never let advanced confluence block the pipeline — log & continue
+            allFlags.add("ADV_CONFL_ERR");
         }
 
         double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
