@@ -448,176 +448,16 @@ public final class SignalSender {
     // fresh 5m/15m/1h candles when building EARLY_TICK idea so fcConf is a real number.
     private final com.bot.TradingCore.ForecastEngine forecastEngineDirect;
 
-    //  [v36-FIX Дыра3] ORDER EXECUTOR — встроен в SignalSender
-    //  Включается через env ENABLE_AUTO_TRADE=1.
-    //  При 0 — работает в режиме сигналов (текущее поведение).
-    //  Исполняет: MARKET entry + STOP_MARKET SL + TAKE_PROFIT TP1.
-    //  API-ключи берутся из уже существующих полей API_KEY / API_SECRET.
-    private static final boolean AUTO_TRADE_ENABLED =
-            "1".equals(System.getenv("ENABLE_AUTO_TRADE"));
-    private static final int AUTO_TRADE_LEVERAGE =
-            Integer.parseInt(System.getenv().getOrDefault("AUTO_TRADE_LEVERAGE", "5"));
-
-    /**
-     * Выставляет MARKET ордер + STOP_MARKET SL + TAKE_PROFIT_MARKET TP1.
-     * Вызывается после dispatch сигнала если ENABLE_AUTO_TRADE=1.
-     * Полностью асинхронный — не блокирует цикл.
-     */
-    public void executeOrderAsync(com.bot.DecisionEngineMerged.TradeIdea idea, double sizeUsdt) {
-        if (!AUTO_TRADE_ENABLED) return;
-        if (API_KEY.isBlank() || API_SECRET.isBlank()) {
-            LOG.info("[OE] ENABLE_AUTO_TRADE=1 но API ключи не заданы — пропуск");
-            return;
-        }
-
-        CompletableFuture.runAsync(() -> {
-            try {
-                String side      = idea.side == com.bot.TradingCore.Side.LONG ? "BUY"  : "SELL";
-                String closeSide = idea.side == com.bot.TradingCore.Side.LONG ? "SELL" : "BUY";
-
-                // 1. Установить плечо
-                oeSetLeverage(idea.symbol, AUTO_TRADE_LEVERAGE);
-                Thread.sleep(200);
-
-                // 2. Рассчитать quantity
-                double qty = (sizeUsdt * AUTO_TRADE_LEVERAGE) / idea.price;
-                String qtyStr = oeFormatQty(idea.symbol, qty);
-
-                // 3. MARKET entry
-                long orderId = oePlaceOrder(idea.symbol, side, "MARKET", qtyStr, 0, false);
-                if (orderId < 0) {
-                    bot.sendMessageAsync(String.format(
-                            "%s %s | #%s%n"
-                                    + "❌ СТАТУС: *AUTO FAILED*%n"
-                                    + "━━━━━━━━━━━━━━━━━━%n"
-                                    + "MARKET order failed%n"
-                                    + "━━━━━━━━━━━━━━━━━━",
-                            com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).emoji,
-                            com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).label,
-                            idea.symbol));
-                    return;
-                }
-                Thread.sleep(300);
-
-                // 4. STOP_MARKET SL — reduceOnly=true
-                oePlaceOrder(idea.symbol, closeSide, "STOP_MARKET", qtyStr, idea.stop, true);
-                Thread.sleep(200);
-
-                // 5. TAKE_PROFIT_MARKET TP1 — reduceOnly=true
-                oePlaceOrder(idea.symbol, closeSide, "TAKE_PROFIT_MARKET", qtyStr, idea.tp1, true);
-
-                bot.sendMessageAsync(String.format(
-                        "%s %s | #%s%n"
-                                + "✅ СТАТУС: *AUTO EXEC*%n"
-                                + "━━━━━━━━━━━━━━━━━━%n"
-                                + "📌 Entry: MARKET%n"
-                                + "🛑 Стоп: `%.4f`%n"
-                                + "🎯 TP1: `%.4f`%n"
-                                + "💰 Размер: $%.1f × %dx%n"
-                                + "━━━━━━━━━━━━━━━━━━",
-                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).emoji,
-                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).label,
-                        idea.symbol, idea.stop, idea.tp1,
-                        sizeUsdt, AUTO_TRADE_LEVERAGE));
-
-            } catch (Exception e) {
-                LOG.warning("[OE] Error " + idea.symbol + ": " + e.getMessage());
-                bot.sendMessageAsync(String.format(
-                        "%s %s | #%s%n"
-                                + "⚠️ СТАТУС: *AUTO ERROR*%n"
-                                + "━━━━━━━━━━━━━━━━━━%n"
-                                + "%s%n"
-                                + "━━━━━━━━━━━━━━━━━━",
-                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).emoji,
-                        com.bot.DecisionEngineMerged.detectAssetType(idea.symbol).label,
-                        idea.symbol, e.getMessage()));
-            }
-        }, fetchPool);
-    }
-
-    /** Выставляет ордер на Binance Futures. Возвращает orderId или -1 при ошибке. */
-    private long oePlaceOrder(String symbol, String side, String type,
-                              String qty, double stopPrice, boolean reduceOnly) {
-        try {
-            StringBuilder body = new StringBuilder();
-            body.append("symbol=").append(symbol);
-            body.append("&side=").append(side);
-            body.append("&type=").append(type);
-            body.append("&quantity=").append(qty);
-            if (stopPrice > 0)
-                body.append("&stopPrice=").append(String.format("%.4f", stopPrice));
-            if (reduceOnly)
-                body.append("&reduceOnly=true");
-            body.append("&timestamp=").append(System.currentTimeMillis());
-
-            String sig = oeHmac(body.toString());
-            body.append("&signature=").append(sig);
-
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://fapi.binance.com/fapi/v1/order"))
-                    .timeout(Duration.ofSeconds(5))
-                    .header("X-MBX-APIKEY", API_KEY)
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
-                    .build();
-
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
-                LOG.warning("[OE] Order error " + resp.statusCode() + ": " + resp.body());
-                return -1;
-            }
-            String r = resp.body();
-            int idx = r.indexOf("\"orderId\":");
-            if (idx < 0) return -1;
-            int start = idx + 10, end = r.indexOf(',', start);
-            if (end < 0) end = r.indexOf('}', start);
-            return Long.parseLong(r.substring(start, end).trim());
-        } catch (Exception e) {
-            LOG.warning("[OE] placeOrder exception: " + e.getMessage());
-            return -1;
-        }
-    }
-
-    /** Устанавливает плечо на паре через Binance API. */
-    private void oeSetLeverage(String symbol, int leverage) {
-        try {
-            String body = "symbol=" + symbol + "&leverage=" + leverage
-                    + "&timestamp=" + System.currentTimeMillis();
-            String sig = oeHmac(body);
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://fapi.binance.com/fapi/v1/leverage"))
-                    .timeout(Duration.ofSeconds(5))
-                    .header("X-MBX-APIKEY", API_KEY)
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
-                    .build();
-            http.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (Exception ignored) {}
-    }
-
-    /** Форматирует qty с правильной точностью по типу монеты. */
-    private static String oeFormatQty(String symbol, double qty) {
-        // BTC/ETH — 3 знака; большинство ALT — 1 знак; мелкие монеты — целые
-        if (symbol.startsWith("BTC") || symbol.startsWith("ETH")) return String.format("%.3f", qty);
-        if (qty >= 10) return String.format("%.1f", qty);
-        return String.format("%.0f", qty);
-    }
-
-    /** HMAC-SHA256 подпись для Binance API. */
-    private String oeHmac(String data) {
-        try {
-            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-            mac.init(new javax.crypto.spec.SecretKeySpec(
-                    API_SECRET.getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256"));
-            byte[] raw = mac.doFinal(
-                    data.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(raw.length * 2);
-            for (byte b : raw) sb.append(String.format("%02x", b));
-            return sb.toString();
-        } catch (Exception e) {
-            throw new RuntimeException("HMAC failed", e);
-        }
-    }
+    //  [v76 CLEANUP] AUTO-TRADE block removed — was DEAD CODE.
+    //  Defined `executeOrderAsync` + helpers (oePlaceOrder, oeSetLeverage, oeFormatQty,
+    //  oeHmac) and AUTO_TRADE_ENABLED/AUTO_TRADE_LEVERAGE constants — none of them were
+    //  called anywhere in the codebase (verified via `grep -rn executeOrderAsync`).
+    //  Even with ENABLE_AUTO_TRADE=1 the bot would not trade — the executor function
+    //  had no caller. This was an attack surface: any future patch wiring it up would
+    //  put a depositor's capital at risk without explicit re-review of safety gates.
+    //  Removal: ~170 lines, no behavior change. Bot remains a pure signal scanner.
+    //  Re-introduction requires deliberate decision + position-sizing audit + leverage
+    //  cap audit + paper-trade verification — not a one-line env-var flip.
 
     // Stats
     private final AtomicLong totalFetches   = new AtomicLong(0);
@@ -1539,6 +1379,12 @@ public final class SignalSender {
             if (!rrFlag.isEmpty()) sizeMode += " " + rrFlag;
             if (qualityPenalty > 0.0) sizeMode += String.format(" Q+%.0f", qualityPenalty);
             nf.add(String.format("SIZE=%.1f$%s", posSize, sizeMode));
+            // [v76] THIN_LIQ warning — render in Telegram so trader knows fill
+            // may slip 0.05–0.20% from displayed entry/SL on low-volume pairs.
+            Double pairVol = volume24hUSD.get(pair);
+            if (pairVol != null && pairVol < 5_000_000.0) {
+                nf.add("THIN_LIQ");
+            }
             idea = rebuildIdea(idea, idea.probability, nf);
 
             // SESSION WEIGHT → FLAG + SIZE REDUCTION ONLY.
@@ -2629,6 +2475,25 @@ public final class SignalSender {
             activeEntries.remove(pair);
         }
 
+        /** [v76] Slot usage snapshot for stats logging.
+         *  Format: "L/S/T cur/cap" — longs, shorts, total active vs MAX_TOTAL.
+         *  Examples: "2L/1S 3/6", "0L/0S 0/6" (idle), "5L/0S 5/6" (long-loaded). */
+        synchronized String slotsSnapshot() {
+            purgeExpired();
+            Counts c = count();
+            int active = c.longCount + c.shortCount;
+            return String.format("%dL/%dS %d/%d", c.longCount, c.shortCount, active, MAX_TOTAL);
+        }
+
+        /** [v76] Returns true when total active slots are at or above the cap.
+         *  Used to surface "saturated" state in logs without blocking — the
+         *  allow() gate already does the actual blocking. */
+        synchronized boolean isSaturated() {
+            purgeExpired();
+            Counts c = count();
+            return (c.longCount + c.shortCount) >= MAX_TOTAL;
+        }
+
         /** @deprecated resetCycle() removed — CorrelationGuard is now stateful across cycles.
          *  Entries expire via TTL (CORR_ENTRY_TTL_MS, default 4h) or explicit unregister(). */
         @Deprecated
@@ -3494,19 +3359,47 @@ public final class SignalSender {
                     et.category != null ? et.category : categorizePair(et.symbol);
             String sector = detectSector(et.symbol);
 
-            // Apply REDUCED_RISK flag to signal if in drawdown mode
-            com.bot.DecisionEngineMerged.TradeIdea finalEt = et;
-            if (!rrFlag.isEmpty()) {
+            // [v76 FIX] EARLY_TICK position sizing — was hardcoded $20 placeholder.
+            //
+            // Old behavior: EARLY_TICK signals built via generateEarlyTickSignal() did
+            // NOT carry a SIZE= flag. Trader saw the entry/SL/TP but no recommended
+            // size. The only place size was attached was the REDUCED_RISK rebuild
+            // branch below — and even there, baseSize defaulted to literal $20 if
+            // no prior SIZE= flag existed (which is always the case for EARLY_TICK).
+            // Result: trader either guessed size or used $20 regardless of balance.
+            //
+            // Fix: compute the real risk-based size via getPositionSizeUsdt() — same
+            // function that processPair uses (line ~1516). This applies all guards:
+            // riskPct by category, balance floors, EARLY_TICK ×0.85 multiplier,
+            // session weight, ISC drawdown multiplier (survival/cautious), correlation
+            // size reduction. Then the optional REDUCED_RISK rrMult is layered on top.
+            double etPosSize = getPositionSizeUsdt(et, cat);
+            if (isc.isSurvivalMode()) {
+                etPosSize *= 0.25;
+            } else if (isc.isCautiousMode()) {
+                etPosSize *= 0.5;
+            }
+            // Correlation size cut — same logic as processPair.
+            double etCorrMult = correlationGuard.getCorrelationSizeMultiplier(
+                    et.symbol, et.side, cat);
+            etPosSize *= etCorrMult;
+
+            // Apply REDUCED_RISK flag (drawdown mode) on top, if active.
+            com.bot.DecisionEngineMerged.TradeIdea finalEt;
+            {
                 List<String> nf = new ArrayList<>(et.flags);
                 nf.removeIf(f -> f.startsWith("SIZE="));
-                double baseSize = 20.0;
-                for (String f : et.flags) {
-                    if (f.startsWith("SIZE=")) {
-                        try { baseSize = Double.parseDouble(f.replace("SIZE=", "").replace("$", "").split(" ")[0]); }
-                        catch (Exception ignored) {}
-                    }
+                double finalSize = rrFlag.isEmpty() ? etPosSize : etPosSize * rrMult;
+                String sizeSuffix = isc.isSurvivalMode() ? " 🆘SURVIVAL"
+                        : isc.isCautiousMode() ? " ⚠️CAUTIOUS" : "";
+                if (!rrFlag.isEmpty()) sizeSuffix += " " + rrFlag;
+                nf.add(String.format("SIZE=%.1f$%s", finalSize, sizeSuffix));
+                // [v76] THIN_LIQ warning — flag low-volume pairs so trader knows
+                // the displayed entry/SL may slip 0.05–0.20% on real fill.
+                Double etVolWarn = volume24hUSD.get(et.symbol);
+                if (etVolWarn != null && etVolWarn < 5_000_000.0) {
+                    nf.add("THIN_LIQ");
                 }
-                nf.add(String.format("SIZE=%.1f$ %s", baseSize * rrMult, rrFlag));
                 finalEt = rebuildIdea(et, et.probability, nf);
             }
 
@@ -4008,6 +3901,16 @@ public final class SignalSender {
     public double getCycleQualityPenalty() { return cycleQualityPenalty; }
     public double getLastCycleStaleRatio() { return lastCycleStaleRatio; }
     public double getLastCycleWsCoverage() { return lastCycleWsCoverage; }
+
+    /** [v76] CorrelationGuard slot snapshot — for stats and watchdog visibility.
+     *  Format: "2L/1S 3/6". Lets the operator see correlation state at a glance
+     *  instead of having to grep [CORR-BLOCK] log lines. */
+    public String getCorrelationSlotsSnapshot() {
+        return correlationGuard.slotsSnapshot();
+    }
+    public boolean isCorrelationSaturated() {
+        return correlationGuard.isSaturated();
+    }
 
     /**
      * Returns the number of symbols currently in ISC cooldown (post-signal lockout).

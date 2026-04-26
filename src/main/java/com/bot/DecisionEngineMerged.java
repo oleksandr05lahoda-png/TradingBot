@@ -966,6 +966,11 @@ public final class DecisionEngineMerged {
                 if (f.equals("GIC_BLOCK"))         { result.add("🔴 BTC_BLOCK");   continue; }
                 if (f.equals("SESS_LOW"))          { result.add("🌙 НОЧЬ");        continue; }
                 if (f.startsWith("LIQ_MAGNET"))    { result.add("🧲 " + f);        continue; }
+                // [v76] THIN_LIQ — daily volume <$5M means real fill on this pair
+                // can slip 0.05–0.20% from displayed entry/SL. Trader needs to see
+                // this BEFORE clicking — execution slippage on thin pairs eats
+                // expected R:R asymmetrically (entry slip + exit slip on TP/SL).
+                if (f.equals("THIN_LIQ"))          { result.add("💧 ТОНК.ЛИКВИД"); continue; }
             }
 
             // ── PASS 2: execution & context flags ─────────────────────────────
@@ -1183,6 +1188,15 @@ public final class DecisionEngineMerged {
             double _slPctAbs = Math.abs(slPct);
             if (_slPctAbs > 0 && _slPctAbs < 0.60) {
                 sb.append("\n⚠️ _Стоп очень тесный — риск выноса шумом_");
+            }
+
+            // [v76] Explicit slippage warning for thin-liquidity pairs.
+            // The flag 💧 ТОНК.ЛИКВИД in Pass 1 above is a passing label; this
+            // is an explicit message telling the trader what to expect on fill.
+            // Without it, traders treat displayed entry/SL as exact when on a
+            // $2-5M-volume pair the realistic slip is ±0.05-0.20% per leg.
+            if (flags != null && flags.contains("THIN_LIQ")) {
+                sb.append("\n⚠️ _Малый объём — реальный fill ±0.05–0.20%_");
             }
 
             // [v75 FIX] Time-stop expectation. ISC auto-closes positions after
@@ -4868,12 +4882,32 @@ public final class DecisionEngineMerged {
     // BUCKETED BY VOLATILITY (FIX #7): one calibration per (symbol, vol-bucket).
     public static final class ProbabilityCalibrator {
 
-        // MIN_SAMPLES: 50→30.
-        // При 5-10 сигналов/день глобальный fallback набирает 30 за ~1 неделю (было 1.5 нед).
-        // Per-symbol-per-bucket собирается за ~2-3 нед (было 2.5+ месяца при старых границах).
-        private static final int  MIN_SAMPLES = 30;
+        // [v76] CALIBRATOR STABILITY REBALANCE.
+        //
+        // Previous: MIN_SAMPLES=30 with BUCKETS=10 → ~3 observations per bucket on
+        // average. PAV regression on 3-sample buckets is dominated by sampling
+        // noise — single coin-flip outcome can move a bucket's empirical hit rate
+        // from 33% to 67%. Each calibrate() call therefore returned wildly variable
+        // results during the first month of live data, and the shrinkage formula
+        // zetaBase = n/(n+100) couldn't compensate at n=30 (zeta=0.23 — only 23%
+        // weight to a noisy estimate, but those 23% were the difference between
+        // a signal passing the cold-start gate or not).
+        //
+        // Tradeoff analysis:
+        //   - Raising MIN_SAMPLES 30→50 delays Phase 4 ("calibrator trusted") by
+        //     ~3-5 days at typical 5-10 outcomes/day. During those extra days the
+        //     bot uses raw heuristic (already the behavior pre-30 anyway).
+        //   - Reducing BUCKETS 10→5 means each bucket holds n/5 observations
+        //     instead of n/10. At MIN_SAMPLES=50: 10 obs/bucket vs the old 3.
+        //     PAV regression error scales ~1/sqrt(n) per bucket — this is roughly
+        //     1.8× more stable per bucket.
+        //   - Combined effect: calibrator output variance reduced ~3× during
+        //     first 100 outcomes, at cost of 3-5 day later activation.
+        //   - Net for trader: fewer false-positive cold-start passes from noisy
+        //     calibrator deciding a 60% raw-prob signal is "really 75%".
+        private static final int  MIN_SAMPLES = 50;
         private static final int  WINDOW      = 500;
-        private static final int  BUCKETS     = 10;
+        private static final int  BUCKETS     = 5;
         private static final long MAX_AGE_MS  = 30L * 24 * 60 * 60 * 1000L;
 
         // UNIFIED VOL BUCKET BOUNDARIES.

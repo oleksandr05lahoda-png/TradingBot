@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.*;
 import java.util.logging.*;
 
 /**
- * BotMain v61 — SCANNER-MASTERPIECE
+ * BotMain v76 — SCANNER-MASTERPIECE
  *
  *  Mode: PURE SIGNAL SCANNER. No auto-trade, no order execution.
  *        Bot watches top-30 coins by volume and emits manual-trade signals
@@ -19,19 +19,24 @@ import java.util.logging.*;
  *               anywhere. Enforced in SignalSender.flushEarlyTickBuffer and
  *               SignalSender hot-pair rescan too.
  *
- *  WHAT'S GONE vs v60:
- *   - AFC advance forecast (the 📡 ПРОГНОЗ spam)
- *   - Watchdog re-alerting same drought every 60 min
- *   - TIME_STOP for signals the user never saw
- *   - Cosmetic probability-shrinkage shown to user
- *   - Auto-trade leverage/margin/order/margin-call notifications
+ *  v76 — CLEANUP + STABILITY
+ *   - Dead auto-trade code removed (~170 lines, no callers anywhere)
+ *   - EARLY_TICK signals now carry real position sizing (was $20 placeholder)
+ *   - ProbabilityCalibrator: MIN_SAMPLES 30→50, BUCKETS 10→5
+ *     (PAV regression ~3× more stable in cold-start phase)
+ *   - Cold-start COLD_START_MIN_OUTCOMES 30→50 (Phase 4 only when calibrator
+ *     actually has enough data to calibrate, not just return raw scores)
+ *   - Phase 3 (20-49) gets a real gate (was identical to Phase 4 — dead branch)
+ *   - MIN_SL_PCT 0.35%→0.40% (5bp margin against entry slippage)
+ *   - Walk-forward regime drift alert: |delta|>15% → |delta|>8%
+ *   - THIN_LIQ flag added to all signals on pairs with 24h vol <$5M
+ *     (rendered as "💧 ТОНК.ЛИКВИД" + "_реальный fill ±0.05–0.20%_")
+ *   - CorrelationGuard slots visible in [STATS] log: "Corr:2L/1S 3/6"
  *
- *  WHAT'S NEW vs v60:
+ *  v75 lineage preserved:
  *   - Dispatcher: single gate for ALL signal dispatches
- *   - Hard cold-start gate applied uniformly: prob>=78, clusters>=4,
- *     forecast conf>=0.55, R:R>=2.0, SL distance>=0.35%
  *   - Per-symbol dispatch dedup: same sym+side within 15min = drop
- *   - Hourly soft cap: max 4 signals/hour prevents "flood day" spam
+ *   - Hourly cap 20/h + burst cap 5/5min
  */
 public final class BotMain {
 
@@ -232,17 +237,31 @@ public final class BotMain {
         // New gate: OR-based, probability-first.
         //   Phase 1 (n<10):  prob>=73 AND (prob>=76 OR clusters>=2 OR fcConf>=0.45)
         //   Phase 2 (10-19): prob>=70 AND (prob>=74 OR clusters>=2 OR fcConf>=0.40)
-        //   Phase 3 (20-29): prob>=68
-        //   Phase 4 (30+):   no extra gate — calibrator is the authority
+        //   Phase 3 (20-49): prob>=68
+        //   Phase 4 (50+):   no extra gate — calibrator is the authority
         //
         // Rationale: a standalone signal with probability>=76 (MAX_CONF=85 ceiling)
         // represents a very high-conviction setup and is allowed through even
         // without cluster confluence. This lets EARLY_TICK breathe while still
         // rejecting the 60-72% mediocre noise.
-        private static final int    COLD_START_MIN_OUTCOMES = 30;
+        //
+        // [v76] Threshold bumped 30→50 to align with ProbabilityCalibrator.MIN_SAMPLES.
+        // Old behavior: Phase 4 activated at n=30 ("calibrator is the authority"),
+        // but the calibrator itself returned RAW scores (no calibration) until n=50,
+        // so Phase 4 was effectively disabling extra gates while trusting an
+        // un-calibrated raw score. Now Phase 4 only engages when the calibrator
+        // actually has enough data to do PAV regression with stable buckets.
+        private static final int    COLD_START_MIN_OUTCOMES = 50;
 
         private static final double MIN_RR          = 2.00;
-        private static final double MIN_SL_PCT      = 0.0035;
+        // [v76] MIN_SL_PCT 0.35% → 0.40%. The extra 5bp margin protects against
+        // a known live-vs-display gap: the engine displays exact entry/SL prices,
+        // but real fills slip. On a 0.35% SL, a 0.10% adverse fill on entry
+        // (typical for $5–10M-volume pairs) eats 28% of the stop budget before
+        // the trade has even started moving. With 0.40% SL the same slippage
+        // eats 25% — meaningful margin without rejecting much extra signal,
+        // since the bot's typical SL is 0.6–1.5%.
+        private static final double MIN_SL_PCT      = 0.0040;
         private static final long   SYMBOL_DEDUP_MS = 15 * 60_000L;
         // [v75] 12 → 20 + rolling burst protection. The hard 12/h cap caused the
         // "2 signals in 8 hours" symptom: when BTC moves and a sector wave triggers,
@@ -340,8 +359,13 @@ public final class BotMain {
                 // Phase 4 — calibrator trusted, only RR/SL/dedup enforced.
                 probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             } else if (calSamples >= 20) {
-                // Phase 3 — near-graduation. MIN_CONF upstream is sole filter.
-                probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
+                // [v76] Phase 3 — near-graduation. Was identical to Phase 4 (dead branch:
+                // probFloor=probShortcut=minClusters=minFcConf=0). With Phase 4 now at
+                // 50 outcomes, the 20-49 band needs an actual gate — calibrator returns
+                // raw scores (no PAV) until 50, so the dispatcher can't fully trust raw
+                // probability yet. Light floor of 50 with 1-cluster confluence catches
+                // junk signals without blocking real setups during the 30-50 window.
+                probFloor = 50.0; probShortcut = 53.0; minClusters = 1; minFcConf = 0.25;
             } else if (calSamples >= 10) {
                 // [v75] Phase 2 — calibrator warming up. MIN_CONF upstream + soft secondary.
                 // Floor stays at 52, but shortcut lowered 56→54 so 2-cluster setups don't
@@ -633,7 +657,7 @@ public final class BotMain {
         }, "ShutdownHook"));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v74 SCANNER started " + nowLocalStr()
+        LOG.info("═══ TradingBot v76 SCANNER started " + nowLocalStr()
                 + " (first cycle in 90s) ═══");
 
         // [v74] STARTUP SELF-VALIDATION — answers "does this strategy actually
@@ -1067,13 +1091,19 @@ public final class BotMain {
         long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
         Dispatcher d = Dispatcher.getInstance();
+        // [v76] Surface CorrelationGuard slot usage in stats so the operator can
+        // see at a glance: "is the bot quiet because nothing's setting up, or
+        // because correlation cap is full?". Format: "Corr:2L/1S 3/6".
+        String corrSlots = sender.getCorrelationSlotsSnapshot();
+        String saturatedMark = sender.isCorrelationSaturated() ? "🔒" : "";
         String msg = String.format(
                 "[STATS] Up:%dm Cyc:%d Sig:%d Trk:%d FR:%d | BTC:%s str=%.2f | "
-                        + "WS:%d Disp:%d/%d [%s] | FC:%.0f%%(%d/%d) Err:%d WD:%d | %s",
+                        + "WS:%d Corr:%s%s Disp:%d/%d [%s] | FC:%.0f%%(%d/%d) Err:%d WD:%d | %s",
                 uptimeMin, totalCycles.get(), totalSignals.get(),
                 trackedSignals.size(), forecastRecords.size(),
                 ctx.regime, ctx.impulseStrength,
                 sender.getActiveWsCount(),
+                corrSlots, saturatedMark,
                 d != null ? d.getTotalDispatched() : 0,
                 d != null ? d.getBlockedByGate() : 0,
                 d != null ? d.getBlockBreakdown() : "?",
@@ -1112,18 +1142,19 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v71`\n"
+        return "⚡ *TradingBot SCANNER* `v76`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures · TOP-30 · Scanner-only\n"
-                + "R:R min `1:2` · SL min `0.35%`\n"
+                + "R:R min `1:2` · SL min `0.40%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🎯 *v71 Critical math fixes:*\n"
-                + "• Probability formula rebalanced\n"
-                + "• 3-cluster setups теперь проходят\n"
-                + "• late_hard_block смягчён 1.8→2.5 ATR\n"
-                + "• RANGE reversal (2-cluster) разрешён\n"
-                + "• Cold-start gate: 53/57 (было 58/62)\n"
-                + "• Target: 5-10 signals/day\n"
+                + "🎯 *v76 cleanup + stability:*\n"
+                + "• Dead auto-trade code removed (~170 lines)\n"
+                + "• EARLY_TICK now uses real position sizing\n"
+                + "• Calibrator: 50 samples × 5 buckets (was 30×10)\n"
+                + "• Phase 4 trust gate aligned with calibrator\n"
+                + "• Walk-forward alert: 8% drift (was 15%)\n"
+                + "• THIN_LIQ warning on <$5M-volume pairs\n"
+                + "• Correlation slots visible in stats\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
                 + "_Реальные сигналы с Entry/TP1-3/SL._";
@@ -1222,7 +1253,14 @@ public final class BotMain {
                         secondHalf /= Math.max(1, oos.size() - half);
                         double delta = firstHalf - secondHalf;
                         totalDelta += Math.abs(delta);
-                        if (Math.abs(delta) > 15.0) alerts++;
+                        // [v76] Threshold 15% → 8%. A 15-point winRate drift between
+                        // window halves is already catastrophic (50→35% means strategy
+                        // has lost half its edge). At 8% the alert fires while there's
+                        // still time to investigate — possible regime change, stale
+                        // hardcoded thresholds, or BTC volatility regime shift. False
+                        // positives at this threshold are tolerable: the alert just
+                        // sends a Telegram message, doesn't block trading.
+                        if (Math.abs(delta) > 8.0) alerts++;
                     }
                 } catch (Throwable ignored) {}
             }
