@@ -137,14 +137,31 @@ public final class InstitutionalSignalCore {
     /** TIME_STOP cooldown — 45 min. Pair that didn't move in 90 min needs more time off. */
     private static final long TIME_STOP_COOLDOWN_MS = 45 * 60_000L;
 
-    //  TIME-STOP CHAIN GUARD
-    //  After 2 TS in a row pauses (symbol, side) for 4h.
-    //  After 3 TS pauses entire symbol for 8h.
-    //  Any decisive close (TP / SL) resets the chain.
+    //  TIME-STOP CHAIN GUARD (v78 SCANNER-MODE SOFTENED)
+    //
+    //  [v78] Penalties cut by 8×.
+    //    TIER1: 4h → 30min
+    //    TIER2: 8h → 60min
+    //
+    //  Rationale: in SCANNER MODE, TIME_STOP just means "the user didn't see
+    //  TP1 within 90 min" — it doesn't mean the signal lost money. The user
+    //  may have closed at break-even, scaled out, or held longer and got TP2
+    //  the bot never saw. A 4-8 HOUR pause on a symbol after 2 consecutive
+    //  time-stops is overcorrection: those 2 signals could have both been
+    //  real opportunities the user simply didn't take.
+    //
+    //  Even in auto-trade mode, the original 4h+8h was conservative enough
+    //  that ENJUSDT-style dead-structure pairs would naturally trigger SL
+    //  instead of time-stops — the chain guard was firing on healthy pairs
+    //  going through low-volume periods.
+    //
+    //  30min/60min still kills the runaway-loop pattern (bot keeps re-firing
+    //  the same setup that nobody is closing) but lets a pair recover by the
+    //  next high-volume window of the same session.
     private static final int  TS_CHAIN_TIER1_THRESHOLD = 2;
     private static final int  TS_CHAIN_TIER2_THRESHOLD = 3;
-    private static final long TS_CHAIN_TIER1_PAUSE_MS  = 4L * 60 * 60_000L;
-    private static final long TS_CHAIN_TIER2_PAUSE_MS  = 8L * 60 * 60_000L;
+    private static final long TS_CHAIN_TIER1_PAUSE_MS  = 30 * 60_000L;     // [v78] 4h → 30min
+    private static final long TS_CHAIN_TIER2_PAUSE_MS  = 60 * 60_000L;     // [v78] 8h → 60min
     private final Map<String, java.util.concurrent.atomic.AtomicInteger> tsChainCounters
             = new ConcurrentHashMap<>();
     private final Map<String, Long> tsChainSidePause   = new ConcurrentHashMap<>();

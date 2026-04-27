@@ -907,7 +907,13 @@ public final class SimpleBacktester {
                     totalGrossPnL, totalNetPnL, sumProfitFactor, sumExpectancy);
 
             LOG.info(report);
-            if (tg != null) {
+            // [v78 NO-SPAM] SELF-VALIDATOR Telegram report DISABLED.
+            // The report runs every 6h and almost always says either
+            // "NO SIGNALS GENERATED" or "MARGINAL/NO-GO" — neither is
+            // actionable for a manual trader. Full report stays in LOG
+            // for the operator who needs it; user gets clean chat.
+            // To re-enable: set env VALIDATOR_TELEGRAM=1.
+            if (tg != null && "1".equals(System.getenv().getOrDefault("VALIDATOR_TELEGRAM", "0"))) {
                 try { tg.sendMessageAsync(report); }
                 catch (Throwable ignore) { }
             }

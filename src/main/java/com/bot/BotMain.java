@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.*;
 import java.util.logging.*;
 
 /**
- * BotMain v76 — SCANNER-MASTERPIECE
+ * BotMain v78 — LOW-LATENCY + SILENT (production)
  *
  *  Mode: PURE SIGNAL SCANNER. No auto-trade, no order execution.
  *        Bot watches top-30 coins by volume and emits manual-trade signals
@@ -19,24 +19,33 @@ import java.util.logging.*;
  *               anywhere. Enforced in SignalSender.flushEarlyTickBuffer and
  *               SignalSender hot-pair rescan too.
  *
- *  v76 — CLEANUP + STABILITY
- *   - Dead auto-trade code removed (~170 lines, no callers anywhere)
- *   - EARLY_TICK signals now carry real position sizing (was $20 placeholder)
- *   - ProbabilityCalibrator: MIN_SAMPLES 30→50, BUCKETS 10→5
- *     (PAV regression ~3× more stable in cold-start phase)
- *   - Cold-start COLD_START_MIN_OUTCOMES 30→50 (Phase 4 only when calibrator
- *     actually has enough data to calibrate, not just return raw scores)
- *   - Phase 3 (20-49) gets a real gate (was identical to Phase 4 — dead branch)
- *   - MIN_SL_PCT 0.35%→0.40% (5bp margin against entry slippage)
- *   - Walk-forward regime drift alert: |delta|>15% → |delta|>8%
- *   - THIN_LIQ flag added to all signals on pairs with 24h vol <$5M
- *     (rendered as "💧 ТОНК.ЛИКВИД" + "_реальный fill ±0.05–0.20%_")
- *   - CorrelationGuard slots visible in [STATS] log: "Corr:2L/1S 3/6"
+ *  v78 — DEAD-CODE CLEANUP (post v77):
+ *    - Removed wasDispatchedToUser() method (no callers since v77 SL/TP HIT removal).
+ *    - Removed lastForecastReportMs / FORECAST_REPORT_INTERVAL_MS / lastSignalQualityReport
+ *      / SIGNAL_QUALITY_REPORT_MS / buildSignalQualityReport() — all referenced only
+ *      by removed Telegram-spam code paths.
+ *    - Daily Report (09:00 UTC) REMOVED. User wants strictly entries-only chat.
+ *      Stats remain visible in [STATS] log line every 30min for operators.
+ *    - sentToUser kept as accounting field (used by Dispatcher tracking).
  *
- *  v75 lineage preserved:
- *   - Dispatcher: single gate for ALL signal dispatches
- *   - Per-symbol dispatch dedup: same sym+side within 15min = drop
- *   - Hourly cap 20/h + burst cap 5/5min
+ *  v77 — anti-lag + clean chat (preserved):
+ *    - Live-splice always active (RSI veto removed)
+ *    - 15m cache TTL 2min → 30s, 1h TTL 55min → 5min, 2h 110min → 15min
+ *    - LATE_HARD_BLOCK → soft penalty (size cut + 0.85× score)
+ *    - momentum_exhausted same-direction → soft penalty (was hard reject)
+ *    - vel_decay_late → soft penalty (was hard reject)
+ *    - LM_HARD_ATR 2.5 → 4.5 (genuine parabolic only)
+ *    - EARLY_TICK velocity floors halved (TOP 0.0008, ALT 0.0012, MEME 0.0020)
+ *    - HOT_PAIR thresholds halved (TOP 0.15%, ALT 0.30%, MEME 0.50%)
+ *    - HOT_PAIR cooldown 10min → 3min, MAX_EARLY_TICK_PER_HOUR 2 → 4
+ *    - EVENT_COIN day-move floors raised (TOP 5→8%, ALT 8→12%, MEME 12→18%)
+ *    - Stale-data guards tightened (15m 20min→10min, 1h 2h→30min)
+ *    - Cold-start COLD_START_MIN_OUTCOMES 50 → 20
+ *    - Phase 1: 52/55 → 48/51, Phase 2/3: 50/53 with 1-cluster
+ *    - SYMBOL_DEDUP_MS 15min → 6min, post-dispatch cooldown 8min → 3min
+ *    - MIN_SL_PCT 0.40% → 0.30% (tighter stop, earlier entry, same R:R)
+ *    - REMOVED Telegram spam: TP1/SL HIT, TIME STOP, drought, watchdog,
+ *      market alerts, forecast accuracy, walk-forward alerts, daily report
  */
 public final class BotMain {
 
@@ -90,7 +99,7 @@ public final class BotMain {
     private static final long INFRA_ALERT_COOLDOWN_MS = 60 * 60_000L;
     private static final AtomicLong watchdogAlerts = new AtomicLong(0);
 
-    private static volatile int lastSummaryDay = -1;
+    // [v78] lastSummaryDay removed (daily summary feature removed).
 
     private static final int MAX_FORECAST_RECORDS = 500;
     static final ConcurrentHashMap<String, ForecastRecord> forecastRecords = new ConcurrentHashMap<>();
@@ -137,42 +146,13 @@ public final class BotMain {
 
     private static final ConcurrentLinkedDeque<SignalOutcome> signalOutcomes = new ConcurrentLinkedDeque<>();
     private static final int SIGNAL_OUTCOME_WINDOW = 200;
-    private static final AtomicLong lastSignalQualityReport = new AtomicLong(0);
-    private static final long SIGNAL_QUALITY_REPORT_MS = 60 * 60_000L;
+    // [v78] lastSignalQualityReport / SIGNAL_QUALITY_REPORT_MS / buildSignalQualityReport()
+    // REMOVED — they only fed the v76 hourly Telegram broadcast which v77 silenced.
+    // signalOutcomes deque kept: still pushed by Dispatcher and read by [STATS] log.
 
     public static void recordSignalOutcome(String sym, double conf, String cat, boolean hit) {
         signalOutcomes.addLast(new SignalOutcome(sym, conf, cat, hit));
         while (signalOutcomes.size() > SIGNAL_OUTCOME_WINDOW) signalOutcomes.pollFirst();
-    }
-
-    private static String buildSignalQualityReport() {
-        if (signalOutcomes.isEmpty()) return "📊 *SIGNAL QUALITY*\nNo signals tracked yet";
-        List<SignalOutcome> snap = new ArrayList<>(signalOutcomes);
-        int total = snap.size();
-        long hits = snap.stream().filter(o -> o.hit).count();
-        int[] b60 = new int[2], b70 = new int[2], b80 = new int[2];
-        for (SignalOutcome o : snap) {
-            int[] bucket = o.confidence < 70 ? b60 : o.confidence < 80 ? b70 : b80;
-            bucket[0]++; if (o.hit) bucket[1]++;
-        }
-        Map<String, int[]> byCat = new LinkedHashMap<>();
-        for (SignalOutcome o : snap) {
-            int[] pair = byCat.computeIfAbsent(o.category == null ? "?" : o.category, k -> new int[2]);
-            pair[0]++; if (o.hit) pair[1]++;
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format("📊 *SIGNAL QUALITY* (last %d)%n", total));
-        sb.append(String.format("Overall: %.1f%% (%d/%d)%n", 100.0*hits/total, hits, total));
-        sb.append("━━━ by Confidence ━━━\n");
-        if (b60[0] > 0) sb.append(String.format("60-70%%: %.0f%% (%d/%d)%n", 100.0*b60[1]/b60[0], b60[1], b60[0]));
-        if (b70[0] > 0) sb.append(String.format("70-80%%: %.0f%% (%d/%d)%n", 100.0*b70[1]/b70[0], b70[1], b70[0]));
-        if (b80[0] > 0) sb.append(String.format("80%%+:   %.0f%% (%d/%d)%n", 100.0*b80[1]/b80[0], b80[1], b80[0]));
-        sb.append("━━━ by Category ━━━\n");
-        for (var e : byCat.entrySet()) {
-            int[] p = e.getValue(); if (p[0] == 0) continue;
-            sb.append(String.format("%s: %.0f%% (%d/%d)%n", e.getKey(), 100.0*p[1]/p[0], p[1], p[0]));
-        }
-        return sb.toString();
     }
 
     static final ConcurrentHashMap<String, TrackedSignal> trackedSignals = new ConcurrentHashMap<>();
@@ -251,18 +231,20 @@ public final class BotMain {
         // so Phase 4 was effectively disabling extra gates while trusting an
         // un-calibrated raw score. Now Phase 4 only engages when the calibrator
         // actually has enough data to do PAV regression with stable buckets.
-        private static final int    COLD_START_MIN_OUTCOMES = 50;
+        // [v77 LATENCY] 50 → 20. На 50 outcomes калибратор копит ~3 дня при текущем
+        // потоке сигналов — всё это время Phase 1/2/3 режут solo-сигналы. На 20
+        // PAV regression уже стабильна для крипто (5 buckets × 4 точки/bucket).
+        private static final int    COLD_START_MIN_OUTCOMES = 20;
 
         private static final double MIN_RR          = 2.00;
-        // [v76] MIN_SL_PCT 0.35% → 0.40%. The extra 5bp margin protects against
-        // a known live-vs-display gap: the engine displays exact entry/SL prices,
-        // but real fills slip. On a 0.35% SL, a 0.10% adverse fill on entry
-        // (typical for $5–10M-volume pairs) eats 28% of the stop budget before
-        // the trade has even started moving. With 0.40% SL the same slippage
-        // eats 25% — meaningful margin without rejecting much extra signal,
-        // since the bot's typical SL is 0.6–1.5%.
-        private static final double MIN_SL_PCT      = 0.0040;
-        private static final long   SYMBOL_DEDUP_MS = 15 * 60_000L;
+        // [v77 LATENCY] MIN_SL_PCT 0.40% → 0.30%. Узкий стоп = ранний вход с
+        // меньшим риском при том же R:R 1:2. Slippage 0.05–0.10% на TOP/ALT —
+        // приемлемо при экономии 10bp на стопе.
+        private static final double MIN_SL_PCT      = 0.0030;
+        // [v77 LATENCY] 15 → 6 мин. На 15m TF новый закрытый бар = новая инфа
+        // каждые 15 мин. Дедуп 15 мин блокирует второй вход после ретеста уровня
+        // ровно тогда, когда он самый ценный.
+        private static final long   SYMBOL_DEDUP_MS = 6 * 60_000L;
         // [v75] 12 → 20 + rolling burst protection. The hard 12/h cap caused the
         // "2 signals in 8 hours" symptom: when BTC moves and a sector wave triggers,
         // the bot would fire 12 signals in 15 minutes and stay silent for the rest
@@ -358,25 +340,15 @@ public final class BotMain {
             if (calSamples >= COLD_START_MIN_OUTCOMES) {
                 // Phase 4 — calibrator trusted, only RR/SL/dedup enforced.
                 probFloor = 0; probShortcut = 0; minClusters = 0; minFcConf = 0;
-            } else if (calSamples >= 20) {
-                // [v76] Phase 3 — near-graduation. Was identical to Phase 4 (dead branch:
-                // probFloor=probShortcut=minClusters=minFcConf=0). With Phase 4 now at
-                // 50 outcomes, the 20-49 band needs an actual gate — calibrator returns
-                // raw scores (no PAV) until 50, so the dispatcher can't fully trust raw
-                // probability yet. Light floor of 50 with 1-cluster confluence catches
-                // junk signals without blocking real setups during the 30-50 window.
-                probFloor = 50.0; probShortcut = 53.0; minClusters = 1; minFcConf = 0.25;
             } else if (calSamples >= 10) {
-                // [v75] Phase 2 — calibrator warming up. MIN_CONF upstream + soft secondary.
-                // Floor stays at 52, but shortcut lowered 56→54 so 2-cluster setups don't
-                // get sandbagged just because we haven't collected 20 outcomes yet.
-                probFloor = 52.0; probShortcut = 54.0; minClusters = 2; minFcConf = 0.30;
+                // [v77 LATENCY] Phase 2/3 объединены. С COLD_START=20 промежуточная
+                // зона короткая. Пускаем при prob≥50 ИЛИ 1 кластер ИЛИ fcConf≥0.22.
+                probFloor = 50.0; probShortcut = 52.0; minClusters = 1; minFcConf = 0.22;
             } else {
-                // [v75] Phase 1 — hard cold start. Was 53/57 — too aggressive: a fresh
-                // install with empty calibrator was rejecting ~40% of valid signals,
-                // which then never became outcomes, which kept us in Phase 1 forever.
-                // Now 52/55 with 2-cluster OR fcConf=0.30 OR — clear path to Phase 2.
-                probFloor = 52.0; probShortcut = 55.0; minClusters = 2; minFcConf = 0.30;
+                // [v77 LATENCY] Phase 1 — холодный старт. Понижено: 52→48,
+                // shortcut 55→51, fcConf 0.30→0.20. Главная цель — наполнить
+                // калибратор outcomes, иначе Phase 4 не наступит никогда.
+                probFloor = 48.0; probShortcut = 51.0; minClusters = 1; minFcConf = 0.20;
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {
@@ -438,16 +410,10 @@ public final class BotMain {
                 lastSignalMs = now;
                 droughtAnnounced.set(false);
                 trackSignal(idea, true);
-                // [v75] Directional cooldown. Was: blanket 30 min lock on every dispatch
-                // — meant after a BTC LONG, BTC was muted for 30 min even if it broke
-                // structure 5 minutes later. Now:
-                //   - same-side dedup is handled by SYMBOL_DEDUP_MS=15 min above
-                //   - this cooldown blocks the pair entirely (incl. opposite side)
-                //     for 8 min — enough to let the move develop without instant flip,
-                //     short enough to catch real reversals.
-                // Direction flip protection (no instant LONG→SHORT on noise) is handled
-                // by ISC.bipolar guard which separately tracks last-side timestamps.
-                isc.setSignalCooldown(idea.symbol, 8 * 60_000L);
+                // [v77 LATENCY] 8 → 3 мин. Дедуп same-side 6 мин уже выше; этот
+                // cooldown блокирует opposite-side. 3 мин достаточно чтобы исключить
+                // мгновенный flip на одном тике, но даёт реагировать на reversals.
+                isc.setSignalCooldown(idea.symbol, 3 * 60_000L);
                 LOG.info(String.format("[DISPATCH/%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% n=%d",
                         source, idea.symbol, idea.side, idea.probability,
                         fcConf, actualRR, slPct * 100, calSamples));
@@ -549,29 +515,25 @@ public final class BotMain {
 
         com.bot.DecisionEngineMerged.USER_ZONE = ZONE;
 
+        // [v77 NO-SPAM] TIME_STOP сообщения убраны. Пользователь сам управляет
+        // выходом. ISC всё равно дёргает callback для внутренних метрик — пусть
+        // помечает в trackedSignals, но без уведомления в Telegram.
         isc.setTimeStopCallback((sym, msg) -> {
-            boolean notify = false;
             for (TrackedSignal ts : trackedSignals.values()) {
                 if (!ts.symbol.equals(sym)) continue;
                 if (!ts.sentToUser) continue;
                 if (ts.timeStopNotified) continue;
                 ts.timeStopNotified = true;
-                notify = true;
                 break;
-            }
-            if (notify) {
-                telegram.sendMessageAsync(
-                        "⏱ *TIME STOP* — #" + sym + "\n"
-                                + "━━━━━━━━━━━━━━━━━━\n"
-                                + "90 мин истекло · проверь позицию\n"
-                                + "Закрой вручную если открыта\n"
-                                + "━━━━━━━━━━━━━━━━━━");
             }
         });
 
         gic.setPanicCallback(msg -> {
+            // [v77 NO-SPAM] Market Alert → log only. GIC panic is rare but it's
+            // also informational (BTC crash detected etc.) — not actionable for the
+            // user, and the actual signal flow already adapts via aggressiveShort/
+            // longSuppression. Pure noise in the chat.
             LOG.warning("[GIC panic] " + msg);
-            telegram.sendMessageAsync("⚠ *Market Alert*\n\n" + msg);
         });
 
         ScheduledExecutorService mainSched = Executors.newScheduledThreadPool(1, r -> {
@@ -604,9 +566,8 @@ public final class BotMain {
         auxSched.scheduleAtFixedRate(
                 safe("LogStats", () -> logStats(gic, isc, sender)),
                 15, 30, TimeUnit.MINUTES);
-        auxSched.scheduleAtFixedRate(
-                safe("DailySummary", () -> maybeSendDailySummary(telegram, gic, isc, sender)),
-                1, 1, TimeUnit.MINUTES);
+        // [v78] DailySummary scheduler REMOVED — chat is entries-only.
+        // Daily stats remain in [STATS] log line every 30min for operators.
         auxSched.scheduleAtFixedRate(
                 safe("Watchdog", () -> runWatchdog(telegram, sender)),
                 5 * 60, 120, TimeUnit.SECONDS);
@@ -806,8 +767,7 @@ public final class BotMain {
                         idea.tp1, idea.stop));
     }
 
-    private static volatile long lastForecastReportMs = 0;
-    private static final long FORECAST_REPORT_INTERVAL_MS = 60 * 60_000L;
+    // [v78] lastForecastReportMs / FORECAST_REPORT_INTERVAL_MS REMOVED — only fed v76 hourly Telegram.
 
     private static void checkForecastAccuracy(com.bot.SignalSender sender,
                                               com.bot.TelegramBotSender telegram) {
@@ -899,24 +859,12 @@ public final class BotMain {
                 fr.resolved = true;
                 fr.actualOutcome = outcome;
 
-                if ((hitTP1 || hitSL) && hasOpinion
-                        && wasDispatchedToUser(fr.symbol, fr.side, fr.entryPrice)) {
-                    String emoji  = hitTP1 ? "✅" : "❌";
-                    String action = hitTP1 ? "TP1 HIT" : "SL HIT";
-                    String side   = fr.side == com.bot.TradingCore.Side.LONG ? "LONG" : "SHORT";
-                    double level  = hitTP1 ? fr.tp1Level : fr.slLevel;
-                    double pnlPct = fr.side == com.bot.TradingCore.Side.LONG
-                            ? (level - fr.entryPrice) / fr.entryPrice * 100
-                            : (fr.entryPrice - level) / fr.entryPrice * 100;
-                    String fmt = fr.entryPrice < 0.001 ? "%.6f" : fr.entryPrice < 1 ? "%.4f" : "%.2f";
-                    telegram.sendMessageAsync(String.format(
-                            emoji + " *" + action + "* — #" + fr.symbol + " " + side + "%n"
-                                    + "━━━━━━━━━━━━━━━━━━%n"
-                                    + "Вход:  `" + fmt + "`%n"
-                                    + (hitTP1 ? "TP1:   `" : "SL:    `") + fmt + "` (%+.2f%%)%n"
-                                    + "━━━━━━━━━━━━━━━━━━",
-                            fr.entryPrice, level, pnlPct));
-                }
+                // [v77] TP1 HIT / SL HIT Telegram message REMOVED.
+                // User manages exits manually and follows price themselves —
+                // these notifications were pure noise. Internal accounting
+                // (forecastTotal, forecastCorrect, calibrator outcomes) is
+                // preserved below so calibration and walk-forward continue
+                // to learn from real outcomes.
 
                 boolean decisive = hitTP1 || hitSL || !"FLAT".equals(outcome);
                 if (hasOpinion && decisive) {
@@ -944,34 +892,15 @@ public final class BotMain {
                         fr.symbol, fr.forecastBias, outcome, correct ? "✅" : "❌",
                         acc, correct2, total));
 
-                if (total > 0 && total % 20 == 0) {
-                    long nowMs = System.currentTimeMillis();
-                    if (nowMs - lastForecastReportMs >= FORECAST_REPORT_INTERVAL_MS) {
-                        lastForecastReportMs = nowMs;
-                        telegram.sendMessageAsync(String.format(
-                                "*Forecast Accuracy*\n\nTotal %d · Hit %d · *%.1f%%*",
-                                total, correct2, acc));
-                        if (nowMs - lastSignalQualityReport.get() >= SIGNAL_QUALITY_REPORT_MS) {
-                            lastSignalQualityReport.set(nowMs);
-                            telegram.sendMessageAsync(buildSignalQualityReport());
-                        }
-                    }
-                }
+                // [v77] Periodic Forecast Accuracy + Signal Quality Telegram REMOVED.
+                // Stats live in the [STATS] log line (every 30min) for operators.
             } catch (Exception ex) {
                 LOG.fine("[FC] Fetch fail: " + fr.symbol + " " + ex.getMessage());
             }
         }
     }
 
-    private static boolean wasDispatchedToUser(String sym, com.bot.TradingCore.Side side, double entryPrice) {
-        for (TrackedSignal ts : trackedSignals.values()) {
-            if (!ts.symbol.equals(sym)) continue;
-            if (ts.side != side) continue;
-            if (Math.abs(ts.entry - entryPrice) > entryPrice * 0.005) continue;
-            return ts.sentToUser;
-        }
-        return false;
-    }
+    // [v78] wasDispatchedToUser() removed — no callers since v77 SL/TP HIT silenced.
 
     private static void runWatchdog(com.bot.TelegramBotSender telegram,
                                     com.bot.SignalSender sender) {
@@ -1001,57 +930,23 @@ public final class BotMain {
         if (!infraIssues.isEmpty() && now - lastInfraAlertMs > INFRA_ALERT_COOLDOWN_MS) {
             lastInfraAlertMs = now;
             watchdogAlerts.incrementAndGet();
-            telegram.sendMessageAsync("*Watchdog* #" + watchdogAlerts.get() + "\n\n"
-                    + String.join("\n", infraIssues));
+            // [v77 NO-SPAM] Watchdog Telegram alerts → log only.
+            // Infra issues (WS low, cycle silent) are operator concerns, not trader concerns.
+            LOG.warning("[Watchdog #" + watchdogAlerts.get() + "] "
+                    + String.join(" | ", infraIssues));
         }
 
-        if (signalDrought && droughtAnnounced.compareAndSet(false, true)) {
-            long droughtMin = (now - lastSignalMs) / 60_000;
-            int cooldowned = sender.getCooldownedSymbolCount();
-            String cooldownInfo = cooldowned > 0 ? " (" + cooldowned + " в кулдауне)" : "";
-            watchdogAlerts.incrementAndGet();
-            telegram.sendMessageAsync(String.format(
-                    "📭 *Тихо на рынке*%n%n"
-                            + "%d мин без сигналов%s%n"
-                            + "Нет качественных кластеров.%n"
-                            + "_Следующий алерт когда сигнал появится._",
-                    droughtMin, cooldownInfo));
+        // [v77] DROUGHT ANNOUNCEMENT REMOVED.
+        // "📭 Тихо на рынке" message was pure status spam. The user opens
+        // the chart when signals come; no signals = no alert needed.
+        // signalDrought flag is still tracked locally for stats but no
+        // Telegram message is sent.
+        if (signalDrought) {
+            droughtAnnounced.compareAndSet(false, true);
         }
     }
 
-    private static void maybeSendDailySummary(com.bot.TelegramBotSender telegram,
-                                              com.bot.GlobalImpulseController gic,
-                                              com.bot.InstitutionalSignalCore isc,
-                                              com.bot.SignalSender sender) {
-        ZonedDateTime utc = ZonedDateTime.now(ZoneId.of("UTC"));
-        int h = utc.getHour(), m = utc.getMinute(), day = utc.getDayOfYear();
-        if (h != 9 || m > 2 || day == lastSummaryDay) return;
-        lastSummaryDay = day;
-
-        com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
-        long uptimeMin = (System.currentTimeMillis() - startTimeMs) / 60_000;
-        int fcTotal   = forecastTotal.get();
-        int fcCorrect = forecastCorrect.get();
-        double fcAcc  = fcTotal > 0 ? (double) fcCorrect / fcTotal * 100 : 0;
-        int calSamples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-        String calNote = calSamples < 30
-                ? String.format("\n⚠️ Cold-start (%d/30)", calSamples)
-                : calSamples < 100
-                  ? String.format("\n🔸 Калибровка (%d/100)", calSamples)
-                  : "";
-        String msg = String.format(
-                "*Daily Report*\n\n"
-                        + "Up %dm · Cycles %d · Signals %d\n"
-                        + "BTC %s · Vol %s · WS %d\n\n"
-                        + "Forecast *%.0f%%* (%d/%d)\n"
-                        + "Tracked %d" + calNote,
-                uptimeMin, totalCycles.get(), totalSignals.get(),
-                ctx.regime, ctx.volRegime,
-                sender.getActiveWsCount(),
-                fcAcc, fcCorrect, fcTotal,
-                trackedSignals.size());
-        telegram.sendMessageAsync(msg);
-    }
+    // [v78] maybeSendDailySummary() REMOVED — see scheduler removal above.
 
     private static void runPeriodicBacktest(com.bot.SignalSender sender,
                                             com.bot.InstitutionalSignalCore isc) {
@@ -1142,22 +1037,22 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v76`\n"
+        return "⚡ *TradingBot SCANNER* `v78`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures · TOP-30 · Scanner-only\n"
-                + "R:R min `1:2` · SL min `0.40%`\n"
+                + "R:R min `1:2` · SL min `0.30%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🎯 *v76 cleanup + stability:*\n"
-                + "• Dead auto-trade code removed (~170 lines)\n"
-                + "• EARLY_TICK now uses real position sizing\n"
-                + "• Calibrator: 50 samples × 5 buckets (was 30×10)\n"
-                + "• Phase 4 trust gate aligned with calibrator\n"
-                + "• Walk-forward alert: 8% drift (was 15%)\n"
-                + "• THIN_LIQ warning on <$5M-volume pairs\n"
-                + "• Correlation slots visible in stats\n"
+                + "🎯 *v78 — production-clean:*\n"
+                + "• Live-splice always (no RSI veto)\n"
+                + "• Cache TTL: 15m=30s · 1h=5min · 2h=15min\n"
+                + "• LATE_HARD/EXHAUST/VEL_DECAY → soft penalty\n"
+                + "• EARLY_TICK floors halved · HOT 0.30% · 3min CD\n"
+                + "• Phase 1 floor 48/51 · cold-start 20\n"
+                + "• Dedup 6min · cooldown 3min · burst 8/5min\n"
+                + "• Chat: ENTRIES ONLY (no SL/TP/TS/drought/daily)\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
-                + "_Реальные сигналы с Entry/TP1-3/SL._";
+                + "_Прогнозы Entry / TP1-3 / SL._";
     }
 
     private static String nowLocalStr() {
@@ -1264,9 +1159,13 @@ public final class BotMain {
                     }
                 } catch (Throwable ignored) {}
             }
-            if (alerts > 0 && telegram != null) {
-                telegram.sendMessageAsync(String.format(
-                        "⚠️ *Walk-Forward Alert*\n%d/%d symbols unstable\nAvg Δ: %.1f%%",
+            // [v77] Walk-Forward Alert moved from Telegram to log only.
+            // It's a developer-grade observability signal (regime drift),
+            // not actionable for the manual trader. Stays in log so it
+            // shows up if someone is checking Railway output.
+            if (alerts > 0) {
+                LOG.info(String.format(
+                        "[WalkForward] %d/%d symbols unstable, Avg Δ: %.1f%%",
                         alerts, symbols.size(),
                         totalWindows > 0 ? totalDelta / Math.max(1, totalWindows) : 0));
             }

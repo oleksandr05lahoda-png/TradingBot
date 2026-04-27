@@ -167,13 +167,21 @@ public final class SignalSender {
     // New ALT=0.55%: requires genuine momentum surge (55% of normal 15m ATR in 30s).
     // TOP unchanged — BTC/ETH 0.25% in 30s IS a real event.
     // MEME raised 0.60→0.80%: MEMEs routinely spike 0.5-0.6% on noise; 0.80% = real.
-    private static final double HOT_PAIR_TOP_PCT   = 0.0025;  // 0.25% in 30s
-    private static final double HOT_PAIR_ALT_PCT   = 0.0055;  // 0.55% in 30s
-    private static final double HOT_PAIR_MEME_PCT  = 0.0080;  // 0.80% in 30s
-    // [v62] Cooldown 90s → 10 min. SPKUSDT/UBUSDT-type illiquid pairs were
-    // triggering HOT_RESCAN every 60s, burning fetchPool CPU and producing
-    // SL=24% signals that then got blocked downstream. 10 min kills the spam.
-    private static final long   HOT_PAIR_COOLDOWN_MS = 10 * 60_000L;
+    // [v77 LATENCY] HOT_PAIR thresholds halved — catch impulses earlier.
+    //   TOP:  0.25% → 0.15% in 30 ticks
+    //   ALT:  0.55% → 0.30% in 30 ticks
+    //   MEME: 0.80% → 0.50% in 30 ticks
+    // 30 ticks on a $20M-volume coin = 1–3 minutes. The old 0.55% threshold
+    // means the move had to already be visible on chart before rescan fired.
+    // 0.30% catches the second-third of the impulse, not the tail.
+    private static final double HOT_PAIR_TOP_PCT   = 0.0015;  // 0.15% in 30s
+    private static final double HOT_PAIR_ALT_PCT   = 0.0030;  // 0.30% in 30s
+    private static final double HOT_PAIR_MEME_PCT  = 0.0050;  // 0.50% in 30s
+    // [v77 LATENCY] Cooldown 10min → 3min. After a hot rescan the same pair
+    // is muted for 10 minutes — but on volatile pairs the move continues to
+    // develop and a SECOND entry (after pullback) is often better than the
+    // first. 3min is enough to debounce noise without blocking legit re-entries.
+    private static final long   HOT_PAIR_COOLDOWN_MS = 3 * 60_000L;
     // [v62] Soft blocklist: pair that produces SL > 5% three times in a row
     // is added here for 2 hours. Prevents re-scanning ultra-volatile garbage.
     private final java.util.concurrent.ConcurrentHashMap<String, Long> hotSoftBlocklist =
@@ -213,7 +221,13 @@ public final class SignalSender {
     // [FIX] MAX_EARLY_TICK_PER_HOUR 3→2. Manual trader cannot act on 3/hour same pair.
     // Real pumps fire Early cluster once, maybe twice (entry + re-entry after pullback).
     // A third EARLY_TICK on same pair in 60 min = same move repeating = noise spam.
-    private static final int    MAX_EARLY_TICK_PER_HOUR = 2;
+    // [v77 LATENCY] 2 → 4. EARLY_TICK per pair per hour was capped at 2 to
+    // prevent "same move repeating" spam. But on a real trending day a coin
+    // legitimately produces 4-5 entry-worthy impulses (initial breakout +
+    // pullback + continuation + exhaustion-reversal). 4/hour leaves room for
+    // these without re-flooding on noise (the 5min dispatch dedup + ISC
+    // cooldown still gate the actual Telegram send rate).
+    private static final int    MAX_EARLY_TICK_PER_HOUR = 4;
     private static final long   EARLY_TICK_WINDOW_MS    = 60 * 60_000L;
     private final Map<String, Deque<Long>> earlyTickTimestamps = new ConcurrentHashMap<>();
 
@@ -258,14 +272,19 @@ public final class SignalSender {
 
     private static final Map<String, Long> CACHE_TTL = Map.of(
             "1m",  55_000L,
-            "5m",  270_000L,       // [REFACTOR] 4m30s = 90% of candle period (was 3min)
-            // 15m TTL tightened 8min → 4min. At 8min the cache could
-            // serve data that aged 53% of the candle period — on a scalping tf where
-            // entry precision matters, that's a stale-signal factory. 4min = 27%
-            // of the candle, comparable to 1m/5m ratios.
-            "15m", 2 * 60_000L,   // [v52] 4min→2min: fresher 15m data for pump detection
-            "1h",  55 * 60_000L,  // was 59min
-            "2h",  110 * 60_000L  // was 119min
+            "5m",  120_000L,       // [v77 LATENCY] 270s → 120s. На 15m TF 5m данные критичны
+            // для BoS/early reversal; 4.5min TTL делал их stale половину свечи.
+            // [v77 LATENCY] 15m TTL 2min → 30s. На 15m TF одна свеча = 900s.
+            // 30s = 3.3% свечи (раньше 13%). Вход в начале формирующейся свечи
+            // теперь работает на актуальных данных — не на 2-минутно-старых.
+            "15m", 30_000L,
+            // [v77 LATENCY] 1h TTL 55min → 5min. detectBias1H читает кэш; при
+            // флипе HTF bias (BULL→BEAR) старая логика узнавала о смене ТОЛЬКО
+            // после следующего обновления — до 55 мин запаздывания на ключевом
+            // gate. 5min TTL = свежий bias к началу каждой 15m свечи.
+            "1h",  5 * 60_000L,
+            // [v77 LATENCY] 2h TTL 110min → 15min. Тот же аргумент что для 1h.
+            "2h",  15 * 60_000L
     );
 
     private static final class CachedCandles {
@@ -1055,15 +1074,22 @@ public final class SignalSender {
             // Если последний 15m бар закрыт более 20 минут назад — данные устарели.
             // Причины: WS разрыв + REST кеш не обновился, Binance maintenance, локальный freeze.
             // Лучше пропустить сигнал чем войти на старых данных.
+            // [v77 LATENCY] Stale 15m guard tightened 20min → 10min. With
+            // 15m TTL = 30s and live-splice always on, a 20min-old last bar
+            // means WS+REST both failed twice — definitely skip. 10min still
+            // tolerates a single fetch hiccup but doesn't risk acting on
+            // old data.
             long nowMs = System.currentTimeMillis();
             long lastBarAge = nowMs - m15.get(m15.size() - 1).closeTime;
-            if (lastBarAge > 20 * 60_000L) {
+            if (lastBarAge > 10 * 60_000L) {
                 cyclePairsStale.incrementAndGet();
                 return null;
             }
-            // 1h бар старше 2 часов → HTF bias будет неверный
+            // [v77 LATENCY] 1h staleness 2h → 30min. Pair with 1h-data 2h
+            // old means HTF bias is also 2h old; coin probably delisted or
+            // WS dropped — definitely don't trade it.
             long lastH1Age = nowMs - h1.get(h1.size() - 1).closeTime;
-            if (lastH1Age > 2 * 60 * 60_000L) {
+            if (lastH1Age > 30 * 60_000L) {
                 cyclePairsStale.incrementAndGet();
                 return null;
             }
@@ -1090,10 +1116,17 @@ public final class SignalSender {
                 double dayCurrent = m15.get(n15 - 1).close;
                 double dailyChangePct = Math.abs(dayCurrent - dayOpen) / (dayOpen + 1e-9);
 
+                // [v77 LATENCY] Thresholds raised — old 5/8/12% blocked the
+                // signals that actually wanted the move to continue. Coins
+                // routinely move 8-10% in trending sessions; that's not an
+                // "event", that's the trade. New floors: 8/12/18%. Beyond
+                // these levels we still mark the direction so that DE can
+                // bias toward reversal setups, but day-trend continuation
+                // signals now pass freely.
                 double eventThreshold = switch (cat) {
-                    case TOP  -> 0.05;
-                    case ALT  -> 0.08;
-                    case MEME -> 0.12;
+                    case TOP  -> 0.08;
+                    case ALT  -> 0.12;
+                    case MEME -> 0.18;
                 };
                 if (dailyChangePct > eventThreshold) {
                     if (dayCurrent > dayOpen) eventCoinUp = true;
@@ -1551,52 +1584,29 @@ public final class SignalSender {
      * in-flight bar.
      */
     /**
-     * [v74 FIX — MAIN LATENCY SOURCE]
+     * [v77 LATENCY — FINAL FIX]
      *
-     * Old behaviour: returned false when the live bar was mid-impulse (body > 0.60×ATR),
-     * showing wick rejection, or RSI extreme — and the caller fell back to closed bars
-     * only. Result: at the exact moment a move started developing, the engine went BLIND
-     * and analysed only stale closed history. By the time the closed bar agreed, the
-     * move had already played out (= "SOON" / GALA-style late signals).
+     * Old (v74): RSI 18..82 climax-veto on the spliced series. The very moment
+     * a real impulse fires, RSI(14) on the live bar pierces 18 or 82 — exactly
+     * when the bot needed to see the move — and the splice was REFUSED, leaving
+     * analysis on stale closed bars. This is the SOON-style "signal at the
+     * local bottom" pattern: by the time RSI normalised, the move had played
+     * out. Comment in v74 named this "MAIN LATENCY SOURCE" but only narrowed
+     * the window from 28..72 to 18..82 — same disease, smaller dose.
      *
-     * New behaviour: live bar is ALWAYS spliced — analyse() needs to see the move.
-     * The two real risks the old code worried about (entering at the local top of an
-     * impulse, or chasing a wick rejection) are now handled correctly downstream:
-     *  - DecisionEngineMerged has lateMove / momentumExhausted / velocityDecay logic
-     *    that penalises chasing on its own merits, using the spliced data.
-     *  - SL placement and TP scaling already account for impulse magnitude via
-     *    robustATR. They don't need a splice-level veto on top of that.
+     * v77: NO VETO. Live bar is ALWAYS spliced. The downstream engine has
+     * lateMove / momentumExhausted / velocityDecay (now soft-penalised, not
+     * hard-rejected) and ATR-aware SL placement. Splice-level veto was
+     * double-protection that mostly blocked, never warned.
      *
-     * The remaining check (RSI 14 extreme on the spliced series) is kept only as a
-     * very narrow safety net for true climaxes (RSI < 18 or > 82) — both extremes
-     * indicate exhausted momentum where adding the live bar genuinely distorts
-     * percentile-based features. Anything inside 18..82 = analyse with the live bar.
+     * The only remaining safety check: refuse the splice when historical data
+     * is too thin to even compute ATR (n &lt; 15) — pure null-guard, not a veto.
      */
     private static boolean isLiveCandleSafeToSplice(
             List<com.bot.TradingCore.Candle> closedHistory,
             com.bot.TradingCore.Candle live) {
         if (closedHistory == null || closedHistory.size() < 15) return true;
-
-        double atr14 = com.bot.TradingCore.atr(closedHistory, 14);
-        if (atr14 <= 0) return true;
-
-        // Only veto on TRUE climax: RSI(14) < 18 or > 82 on the spliced series.
-        // 28..72 was way too tight — most healthy moves register 65-78 RSI mid-leg.
-        int n = closedHistory.size();
-        double[] closes = new double[15];
-        for (int i = 0; i < 14; i++) closes[i] = closedHistory.get(n - 14 + i).close;
-        closes[14] = live.close;
-        double gain = 0, loss = 0;
-        for (int i = 1; i <= 14; i++) {
-            double d = closes[i] - closes[i - 1];
-            if (d > 0) gain += d; else loss -= d;
-        }
-        double avgGain = gain / 14.0;
-        double avgLoss = loss / 14.0;
-        double rsi = (avgLoss < 1e-12) ? 100.0
-                : 100.0 - (100.0 / (1.0 + avgGain / avgLoss));
-        if (rsi < 18.0 || rsi > 82.0) return false;
-
+        // No more RSI veto. Splice always permitted.
         return true;
     }
 
@@ -1838,14 +1848,13 @@ public final class SignalSender {
     }
 
     private void checkBalanceMilestone(double old, double newBal) {
+        // [v78 NO-SPAM] Balance milestone Telegram messages disabled.
+        // User watches balance themselves; "достиг $200" / "$500" pings
+        // were pure noise. Log-only.
         double[] milestones = {200, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 500000, 1_000_000};
         for (double m : milestones) {
             if (old < m && newBal >= m) {
-                bot.sendMessageAsync(String.format(
-                        "🎯 СИСТЕМА | *MILESTONE*%n"
-                                + "━━━━━━━━━━━━━━━━━━%n"
-                                + "💰 Баланс достиг $%.0f%n"
-                                + "━━━━━━━━━━━━━━━━━━", m));
+                LOG.info(String.format("[MILESTONE] balance crossed $%.0f", m));
             }
         }
     }
@@ -1907,19 +1916,12 @@ public final class SignalSender {
         }
         System.out.printf("[LEVERAGE] Init done: %d OK, %d fail | %dx ISOLATED%n",
                 ok, fail, TARGET_LEVERAGE);
+        // [v78 NO-SPAM] LEVERAGE OK / LEVERAGE INIT messages → log only.
+        // Boot-time confirmation pings every restart filled the chat with
+        // green checkmarks. The startup log line above is sufficient.
         if (fail > 0) {
-            bot.sendMessageAsync(String.format(
-                    "⚠️ СИСТЕМА | *LEVERAGE INIT*%n"
-                            + "━━━━━━━━━━━━━━━━━━%n"
-                            + "%d пар настроено, %d ошибок%n"
-                            + "Проверьте %dx ISOLATED вручную%n"
-                            + "━━━━━━━━━━━━━━━━━━", ok, fail, TARGET_LEVERAGE));
-        } else {
-            bot.sendMessageAsync(String.format(
-                    "✅ СИСТЕМА | *LEVERAGE OK*%n"
-                            + "━━━━━━━━━━━━━━━━━━%n"
-                            + "Все %d пар: %dx ISOLATED%n"
-                            + "━━━━━━━━━━━━━━━━━━", ok, TARGET_LEVERAGE));
+            LOG.warning(String.format("[LEVERAGE INIT] %d ok / %d failed — verify %dx ISOLATED manually",
+                    ok, fail, TARGET_LEVERAGE));
         }
     }
 
@@ -2017,15 +2019,21 @@ public final class SignalSender {
                     // Remove from BotMain TradeResolver tracking
                     com.bot.BotMain.trackedSignals.remove(symbol + "_" + closedSide);
                     String emoji = realizedPnl >= 0 ? "✅" : "❌";
-                    bot.sendMessageAsync(String.format(
-                            "%s %s | #%s%n"
-                                    + "%s СТАТУС: *UDS CLOSED*%n"
-                                    + "━━━━━━━━━━━━━━━━━━%n"
-                                    + "💰 PnL: %+.4f$ (%+.2f%%)%n"
-                                    + "━━━━━━━━━━━━━━━━━━",
-                            com.bot.DecisionEngineMerged.detectAssetType(symbol).emoji,
-                            com.bot.DecisionEngineMerged.detectAssetType(symbol).label,
-                            symbol, emoji, realizedPnl, pnlPct));
+                    // [v78 NO-SPAM] UDS_CLOSED message off by default. Manual
+                    // trader closes by hand and watches PnL on exchange UI;
+                    // bot pinging "UDS CLOSED" duplicates that. Turn back on
+                    // with env UDS_CLOSED_NOTIFY=1 for auto-trade users.
+                    if ("1".equals(System.getenv().getOrDefault("UDS_CLOSED_NOTIFY", "0"))) {
+                        bot.sendMessageAsync(String.format(
+                                "%s %s | #%s%n"
+                                        + "%s СТАТУС: *UDS CLOSED*%n"
+                                        + "━━━━━━━━━━━━━━━━━━%n"
+                                        + "💰 PnL: %+.4f$ (%+.2f%%)%n"
+                                        + "━━━━━━━━━━━━━━━━━━",
+                                com.bot.DecisionEngineMerged.detectAssetType(symbol).emoji,
+                                com.bot.DecisionEngineMerged.detectAssetType(symbol).label,
+                                symbol, emoji, realizedPnl, pnlPct));
+                    }
                     System.out.printf("[UDS] CLOSED %s %s PnL=%+.4f%n", symbol, closedSide, realizedPnl);
                 }
             }
@@ -2151,16 +2159,14 @@ public final class SignalSender {
             }
         }
         if (!stalePairs.isEmpty()) {
-            // PATCH #19 + [SCANNER] alert if >20% of pairs are stale (not just any pair)
+            // [v78 NO-SPAM] WS DATA LOSS Telegram alert removed.
+            // Self-healing already runs (reconnectWs below) — operator-only
+            // diagnostic, not a trader-actionable event. Keeps the chat clean.
             if (stalePairs.size() > wsMap.size() * 0.20) {
-                bot.sendMessageAsync(String.format(
-                        "⚠️ СИСТЕМА | *WS DATA LOSS*%n"
-                                + "━━━━━━━━━━━━━━━━━━%n"
-                                + "%d пар без данных >60s: %s%n"
-                                + "🔄 Переподключение...%n"
-                                + "━━━━━━━━━━━━━━━━━━",
+                LOG.warning(String.format(
+                        "[WS] DATA LOSS — %d pairs without data >60s: %s — auto-reconnecting",
                         stalePairs.size(),
-                        stalePairs.size() <= 5 ? stalePairs.toString() : stalePairs.size() + " пар"));
+                        stalePairs.size() <= 5 ? stalePairs.toString() : stalePairs.size() + " pairs"));
             }
         }
         // [SCANNER MODE] Force-reconnect ALL WS channels if wsMessageCount hasn't moved in 60s.
@@ -2171,11 +2177,10 @@ public final class SignalSender {
         if (lastWsHealthCheckMessages == totalMessages && !wsMap.isEmpty()) {
             // Messages stopped — check if frozen for > 60s
             if (now - lastWsHealthCheckMs > 60_000L) {
-                LOG.info("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
-                bot.sendMessageAsync("⚠️ СИСТЕМА | *WS SILENT 60s*\n"
-                        + "━━━━━━━━━━━━━━━━━━\n"
-                        + "Форс-переподключение всех каналов\n"
-                        + "━━━━━━━━━━━━━━━━━━");
+                // [v78 NO-SPAM] Force-reconnect happens silently. The operator
+                // will see [WS-HEALTH] in logs; the trader does not need to
+                // know the bot just self-healed.
+                LOG.warning("[WS-HEALTH] FORCE-RECONNECT: no WS messages in 60s — reconnecting all pairs");
                 new ArrayList<>(wsMap.keySet()).forEach(this::reconnectWs);
                 lastWsHealthCheckMs = now; // reset ONLY after action taken
             }
@@ -2961,17 +2966,18 @@ public final class SignalSender {
         double avg  = buf.stream().mapToDouble(Double::doubleValue).average().orElse(price);
         double vel  = Math.abs(move) / (avg + 1e-9);
 
-        // Category-aware velocity threshold
-        // TOP coins (BTC/ETH) have ~3-5x lower % moves than ALTs
-        // Old: flat 0.0018 → BTC almost never triggered
-        // New: TOP=0.0008, ALT=0.0015, MEME=0.0020
+        // [v77 LATENCY] Velocity floors halved — catch the impulse 1-2 ticks
+        // earlier. On low-volume pairs (SOON, $10M/24h) 30 ticks ~= 3-10 min;
+        // the old 0.0025 ALT floor required a 0.25% move within that window
+        // — i.e. half the move was already done before EARLY_TICK considered
+        // the pair. Halving brings detection forward to "impulse forming".
+        // Counter-balanced by stronger acceleration check below + downstream
+        // gates (fcConf, conf floor) so false-positive volume doesn't grow.
         com.bot.DecisionEngineMerged.CoinCategory etCat = categorizePair(symbol);
-        // Velocity thresholds lowered for earlier detection.
-        // Old: ALT 0.0015 = move already visible on chart. New: 0.0010.
         double velThreshold = switch (etCat) {
-            case TOP  -> 0.0015;  // [REFACTOR] ×3 от 0.0005: 0.05% = нормальный шум. 0.15% = реальный импульс
-            case ALT  -> 0.0025;  // [REFACTOR] ×2.5: требуем значимый move, не micro-tick
-            case MEME -> 0.0035;  // [REFACTOR] ×2.3: MEME монеты шумные, порог выше
+            case TOP  -> 0.0008;  // [v77] 0.0015 → 0.0008. BTC/ETH 0.08% in 30s = real flow start.
+            case ALT  -> 0.0012;  // [v77] 0.0025 → 0.0012. ALT 0.12% in 30s = early impulse.
+            case MEME -> 0.0020;  // [v77] 0.0035 → 0.0020. MEME stays higher (noisy by nature).
         };
         if (vel < velThreshold) return null;
         boolean up = move > 0;

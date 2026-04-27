@@ -2629,27 +2629,44 @@ public final class DecisionEngineMerged {
             allFlags.add("LATE_ENTRY_S");
         }
 
-        // HARD veto from late-move detector — already includes ATR depth,
-        // streak count, and velocity. Replaces the old single-axis
-        // 1.8×ATR check which missed slow-grind setups entirely.
+        // [v77 LATENCY — KEY FIX]
+        // Old: hard reject on lateMove.severity == 2 same-direction.
+        // Result: SHORT signals during dumps were rejected for the duration
+        // of the impulse — bot only fired SHORT after the dump exhausted,
+        // i.e. at the local bottom (SOON-style). Same for LONG on pumps.
+        //
+        // New: lateMove.severity == 2 + same-direction → tag as LATE_HARD
+        // and let the signal pass. Position size will be cut downstream
+        // (lateEntryPenalty path) and SL is already widened by ATR. The
+        // calibrator will price the late-entry win-rate over time.
+        // LM_HARD_ATR was raised 2.5→4.5 so severity==2 now requires a
+        // genuinely parabolic move — those are rare; when they happen the
+        // soft-cut + R:R 1:2 still gives a positive expectancy.
         if (lateMove.severity == 2) {
             if ((lateMove.dirUp && side == com.bot.TradingCore.Side.LONG)
                     || (!lateMove.dirUp && side == com.bot.TradingCore.Side.SHORT)) {
-                allFlags.add(String.format("LATE_HARD_BLOCK_atr=%.2f_streak=%d",
+                allFlags.add(String.format("LATE_HARD_PENALTY_atr=%.2f_streak=%d",
                         lateMove.maxAtrMul, lateMove.streakBars));
-                return reject("late_hard_block");
+                lateEntryPenalty = true; // size cut + score penalty downstream
+                if (side == com.bot.TradingCore.Side.LONG) scoreLong  *= 0.85;
+                else                                       scoreShort *= 0.85;
             }
         }
 
-        // [v70 §7] MOMENTUM EXHAUSTION — usage изменено под reversal trading.
-        // Прежде: блокировка same-direction, мягкий +0.55 на opposite-side.
-        // Теперь: блокировка same-direction И заметный +1.0 boost opposite-side
-        // + флаг REVERSAL_SETUP чтобы cluster counting его заметил.
+        // [v77 LATENCY] momentum_exhausted same-direction: reject → soft penalty.
+        // The detector fires on shrinking bodies + growing wicks + declining
+        // volume in the LAST 3 bars. That can mean exhaustion (bot's old
+        // assumption: don't add to a dying move) but on 15m TF it ALSO means
+        // "consolidation before continuation" — base of the next leg. Hard-
+        // rejecting same-direction blocked classic flag/pennant breakouts.
+        // Soft penalty: -10pt prob and 0.80× score, still allow opposite-side
+        // boost to fire when the reversal is real.
         if (momentumExhausted) {
             if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.LONG)
                     || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.SHORT)) {
-                allFlags.add("EXHAUSTION_BLOCK");
-                return reject("momentum_exhausted");
+                allFlags.add("EXHAUSTION_SOFT_PENALTY");
+                if (side == com.bot.TradingCore.Side.LONG) scoreLong  *= 0.80;
+                else                                       scoreShort *= 0.80;
             }
             if ((exhaustionDirection > 0 && side == com.bot.TradingCore.Side.SHORT)
                     || (exhaustionDirection < 0 && side == com.bot.TradingCore.Side.LONG)) {
@@ -2663,11 +2680,22 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // [v50 §11] VELOCITY DECAY PENALTY — dying momentum even without full exhaustion
+        // [v77 LATENCY] vel_decay + lateEntryPenalty: reject → penalty.
+        // Combined trigger of both conditions still counts as a real
+        // headwind, but with widened LM_HARD_ATR (4.5) lateEntryPenalty
+        // also fires on weaker conditions; rejecting outright would lose
+        // the very entries we want to catch. Aggressive size cut + score
+        // penalty handles the residual risk; calibrator filters the rest.
         if (velocityDecay && lateEntryPenalty) {
-            allFlags.add("VEL_DECAY_LATE_BLOCK");
-            return reject("vel_decay_late"); // velocity decay + late = guaranteed loss
+            allFlags.add("VEL_DECAY_LATE_PENALTY");
+            if (side == com.bot.TradingCore.Side.LONG) scoreLong  *= 0.75;
+            else                                       scoreShort *= 0.75;
         }
+
+        // [v77] After applying LATE_HARD / EXHAUSTION / VEL_DECAY soft penalties,
+        // refresh scoreDiff so downstream gates (volume, htf, cluster checks)
+        // see the actual post-penalty values.
+        scoreDiff = Math.abs(scoreLong - scoreShort);
 
         // [v50 §1] leadBreakoutOverride REMOVED.
         // Old logic: "if BOS/AntiLag/VDA flag present → cancel late penalty."
@@ -5299,11 +5327,17 @@ public final class DecisionEngineMerged {
     //   atr 1.8→2.5  : 2.5×ATR за 4-12 баров = реальный extension, а не setup
     //   streak 6→8   : 8 баров = 2 часа one-color, реально поздно
     //   vel 2.5→3.0  : умеренное ускорение это часть тренда, не late entry
-    private static final double LM_SOFT_ATR  = 1.5;   // 1.2→1.5
-    private static final double LM_HARD_ATR  = 2.5;   // 1.8→2.5
-    private static final int    LM_STREAK_S  = 5;     // 4→5
-    private static final int    LM_STREAK_H  = 8;     // 6→8
-    private static final double LM_VEL_BLOWUP = 3.0;  // 2.5→3.0
+    //   atr 2.5→4.5  : HARD veto только на реально вытянутых движениях.
+    //                  4.5×ATR за 4-12 баров = parabolic blow-off, а не trend.
+    //                  При 2.5 каждый нормальный 5%-движ на ALT триггерил veto
+    //                  именно когда нужно было войти.
+    //   streak 8→10  : 10 баров = 2.5 часа one-color (был 8 = 2 часа).
+    //   vel 3.0→4.0  : существенное ускорение за пределы нормы.
+    private static final double LM_SOFT_ATR  = 1.8;   // [v77] 1.5→1.8
+    private static final double LM_HARD_ATR  = 4.5;   // [v77 LATENCY] 2.5→4.5
+    private static final int    LM_STREAK_S  = 6;     // [v77] 5→6
+    private static final int    LM_STREAK_H  = 10;    // [v77] 8→10
+    private static final double LM_VEL_BLOWUP = 4.0;  // [v77] 3.0→4.0
     private static final int    LM_W_FAST = 4;
     private static final int    LM_W_MID  = 8;
     private static final int    LM_W_SLOW = 12;
