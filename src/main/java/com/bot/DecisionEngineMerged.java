@@ -130,9 +130,15 @@ public final class DecisionEngineMerged {
     // RANGE penalty -2→-0.5, ALT -1→0) валидный 3-cluster setup в плоском рынке
     // выдаёт 53-58. С floor=55 он валился. С floor=52 — проходит, но Dispatcher
     // cold-start gate (53/57) и калибратор остаются authoritative quality control.
-    private static final double BASE_CONF       = 52.0;
+    // [v78.1] Floor lowered 52→48 to align with Dispatcher Phase 1 (BotMain:351).
+    // Authoritative quality control lives downstream:
+    //   1) BotMain.Dispatcher progressive gate (48→50→calibrator)
+    //   2) ProbabilityCalibrator isotonic regression (after 20+ outcomes)
+    //   3) ISC effective floor (47, ISC.java:444)
+    // DE floor at 52 made all three downstream gates dead code on cold-start.
+    private static final double BASE_CONF       = 48.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 52.0;
+    private static final double MIN_CONF_FLOOR  = 48.0;
     private static final double MIN_CONF_CEIL   = 76.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -2538,8 +2544,13 @@ public final class DecisionEngineMerged {
             boolean reversalContext = allFlags.contains("REVERSAL_SETUP")
                     || allFlags.contains("EXHAUSTION_REVERSAL_BOOST")
                     || allFlags.stream().anyMatch(f -> f != null && f.startsWith("LOCAL_REVERSAL"));
+            // [v78.1] decisiveSplit threshold 0.40 → 0.32. На сжатой консолидации
+            // 0.40 практически недостижим — Derivatives/HTF чаще всего NEUTRAL,
+            // и реальный directional split в RANGE редко выходит за 0.30-0.38.
+            // 0.32 пускает сильные pre-breakout setups с 2 кластерами; calibrator
+            // и Dispatcher остаются authoritative quality control.
             double scoreDiffNow = Math.abs(scoreLong - scoreShort);
-            boolean decisiveSplit = scoreDiffNow >= 0.40;
+            boolean decisiveSplit = scoreDiffNow >= 0.32;
             requiredClusters = (reversalContext || decisiveSplit) ? 2 : 3;
             if (decisiveSplit && !reversalContext) allFlags.add("RANGE_DECISIVE_SPLIT");
         }
@@ -2955,7 +2966,18 @@ public final class DecisionEngineMerged {
         if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
             minConf = Math.max(0.0, minConf - 4.0);
         }
-        if (probability < minConf) return reject("prob_lt_minConf_early");
+        if (probability < minConf) {
+            // [v78.1] Bucketed reject — гистограмма в [DIAG-ANALYZE].
+            // NEAR (gap < 3pt): порог настроен в точку, рынок плотный
+            // MID  (gap 3-7):   рассмотри -2pt в floor если паттерн постоянный
+            // FAR  (gap > 7):   setup'ы реально слабые, не понижай floor
+            String bucket;
+            double gap = minConf - probability;
+            if (gap < 3.0)      bucket = "prob_lt_minConf_early_NEAR";
+            else if (gap < 7.0) bucket = "prob_lt_minConf_early_MID";
+            else                bucket = "prob_lt_minConf_early_FAR";
+            return reject(bucket);
+        }
         //
         // RIVER FIX: бот ставил стоп 0.70% на монете с ATR 2-3%.
         // Причина: ATR был сжат в консолидации → стоп = noise level.
@@ -3329,7 +3351,15 @@ public final class DecisionEngineMerged {
         // Single authoritative cap via PROB_CEIL. All intermediate caps above reference
         // the same constant, so this is purely a safety net for calibrator edge cases.
         probability = Math.max(0.0, Math.min(PROB_CEIL, probability));
-        if (probability < minConf) return reject("calibrated_lt_minConf");
+        if (probability < minConf) {
+            // [v78.1] Bucketed reject — see early reject above for interpretation
+            String bucket;
+            double gap = minConf - probability;
+            if (gap < 3.0)      bucket = "calibrated_lt_minConf_NEAR";
+            else if (gap < 7.0) bucket = "calibrated_lt_minConf_MID";
+            else                bucket = "calibrated_lt_minConf_FAR";
+            return reject(bucket);
+        }
         // Одни и те же множители TP для всех режимов — главная причина
         // "недобора" в тренде и "перелёта" в боковике.
         //

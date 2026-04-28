@@ -504,6 +504,18 @@ public final class SignalSender {
     private final AtomicLong rejectedFetches = new AtomicLong(0);
     private final AtomicInteger cyclePairsSeen = new AtomicInteger(0);
     private final AtomicInteger cyclePairsStale = new AtomicInteger(0);
+
+    // [v78.1] Chronic stale tracking — пары stale в 3+ из 5 последних минут
+    // получают 30-минутный skip. Освобождает scan budget для активных пар.
+    // У пользователя сейчас стабильно 5/25 stale каждый цикл = 20% бюджета впустую.
+    private final Map<String, Deque<Long>> staleHistory =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Long> staleSkipUntil =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long STALE_HISTORY_WINDOW_MS = 5 * 60_000L;
+    private static final int  STALE_TRIGGER_COUNT = 3;
+    private static final long STALE_SKIP_DURATION_MS = 30 * 60_000L;
+
     private volatile double cycleQualityPenalty = 0.0;
     private volatile double lastCycleStaleRatio = 0.0;
     private volatile double lastCycleWsCoverage = 1.0;
@@ -602,8 +614,12 @@ public final class SignalSender {
         this.OBI_THRESHOLD    = envDouble("OBI_THRESHOLD", 0.26);
         this.DELTA_BLOCK_CONF = envDouble("DELTA_BLOCK_CONF", 73.0);
         this.ENABLE_EARLY_TICK = envInt("ENABLE_EARLY_TICK", 1) == 1;
-        // MAX_SCAN_PAIRS 50→25: при TOP_N=30 сканировать 50 пар/цикл = wasteful.
-        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 25);
+        // [PATCH 2026-04-28] MAX_SCAN_PAIRS 25 → 40. Раньше TOP_N=40 в Railway env
+        // и MAX_SCAN_PAIRS_PER_CYCLE=25 (хардкод) расходились — бот реально
+        // сканил только 25 пар из 40, остальные 15 жрали WS-коннекты вхолостую.
+        // Теперь дефолт = 40, синхронизирован с пользовательским TOP_N.
+        // Если рейт-лимит давит — computePairBudget() сам срежет до 35/30/20.
+        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 40);
         this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 10);
         this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 25);
 
@@ -919,11 +935,15 @@ public final class SignalSender {
     private int computePairBudget() {
         int base = Math.min(TOP_N, MAX_SCAN_PAIRS_PER_CYCLE);
         long now = System.currentTimeMillis();
-        if (rlIpBanned && now < rlIpBanUntil) return Math.min(12, base);
-        if (now < rlRampUntil) return Math.min(20, base);
-        if (rl429Count >= 2) return Math.min(30, base);
+        // [PATCH 2026-04-28] Caps повышены 12/20/30/35 → 18/28/36/40.
+        // Старые caps были рассчитаны на TOP_N=30 — при TOP_N=40 они без причины
+        // обрезали базу даже на лёгком RL-warmup. Реальный IP-ban ловится верхним
+        // условием rlIpBanned. RL_SAFE_WEIGHT превышение 6000/мин = вернёмся к base.
+        if (rlIpBanned && now < rlIpBanUntil) return Math.min(18, base);  // hard ban — режем
+        if (now < rlRampUntil) return Math.min(28, base);                  // post-restart warmup
+        if (rl429Count >= 2) return Math.min(36, base);                    // 429 за последние 60с
         int eff = Math.max(rlCurrentWeight.get(), rlServerWeight);
-        if (eff > RL_SAFE_WEIGHT) return Math.min(35, base);
+        if (eff > RL_SAFE_WEIGHT) return Math.min(40, base);               // soft превышение
         return base;
     }
 
@@ -1030,8 +1050,46 @@ public final class SignalSender {
 
     //  PROCESS PAIR
 
+    /**
+     * [v78.1] Returns true if pair has been chronically stale recently and should
+     * be skipped without burning a thread/REST call on it.
+     */
+    private boolean isChronicallyStale(String pair) {
+        Long until = staleSkipUntil.get(pair);
+        if (until == null) return false;
+        if (System.currentTimeMillis() < until) return true;
+        staleSkipUntil.remove(pair);
+        staleHistory.remove(pair);
+        return false;
+    }
+
+    /**
+     * [v78.1] Record a stale event; trigger 30-min skip if 3 stales in 5min window.
+     */
+    private void recordStaleEvent(String pair) {
+        long now = System.currentTimeMillis();
+        Deque<Long> hist = staleHistory.computeIfAbsent(
+                pair, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        hist.addLast(now);
+        while (!hist.isEmpty() && now - hist.peekFirst() > STALE_HISTORY_WINDOW_MS) {
+            hist.pollFirst();
+        }
+        if (hist.size() >= STALE_TRIGGER_COUNT) {
+            staleSkipUntil.put(pair, now + STALE_SKIP_DURATION_MS);
+            System.out.printf("[STALE-SKIP] %s blocked for 30min (%d stales in window)%n",
+                    pair, hist.size());
+            hist.clear();
+        }
+    }
+
     private com.bot.DecisionEngineMerged.TradeIdea processPair(String pair) {
         try {
+            // [v78.1] Chronic-stale eviction — skip pairs that consistently fail
+            // staleness guards. Frees up scan budget for active pairs.
+            if (isChronicallyStale(pair)) {
+                cyclePairsStale.incrementAndGet();
+                return null;
+            }
             // GARBAGE COIN BLOCKLIST — instant reject for known micro-cap / rug tokens
             if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return null;
             // Hard blacklist check — symbols with WR < 25% after 20 trades
@@ -1067,6 +1125,7 @@ public final class SignalSender {
             // ATR distribution exists. h1 gate stays at 160 (≈6.7 days) — unchanged.
             if (m15 == null || m15.size() < 200 || h1 == null || h1.size() < 160) {
                 cyclePairsStale.incrementAndGet();
+                recordStaleEvent(pair); // [v78.1]
                 return null;
             }
 
@@ -1083,6 +1142,7 @@ public final class SignalSender {
             long lastBarAge = nowMs - m15.get(m15.size() - 1).closeTime;
             if (lastBarAge > 10 * 60_000L) {
                 cyclePairsStale.incrementAndGet();
+                recordStaleEvent(pair); // [v78.1]
                 return null;
             }
             // [v77 LATENCY] 1h staleness 2h → 30min. Pair with 1h-data 2h
@@ -1091,6 +1151,7 @@ public final class SignalSender {
             long lastH1Age = nowMs - h1.get(h1.size() - 1).closeTime;
             if (lastH1Age > 30 * 60_000L) {
                 cyclePairsStale.incrementAndGet();
+                recordStaleEvent(pair); // [v78.1]
                 return null;
             }
 
@@ -1234,11 +1295,17 @@ public final class SignalSender {
             // qualityPenalty still reduces position size in getPositionSizeUsdt() below.
             double symbolConfBoost = isc.getSymbolMinConfBoost(pair);
             double qualityPenalty = cycleQualityPenalty;
-            // [v71] Раньше: max(MIN_CONF, isc...). При хорошем track record ISC мог
-            // выдавать floor=44, но MIN_CONF=53 всё равно блокировал. Теперь ISC может
-            // опускать порог ниже MIN_CONF на 3pt (max benefit) — но не ниже MIN_CONF-3.
-            double iscFloor = isc.getEffectiveMinConfidence() + symbolConfBoost;
-            double earlyMinConf = (iscFloor >= MIN_CONF) ? iscFloor : Math.max(MIN_CONF - 3.0, iscFloor);
+            // [PATCH 2026-04-28] env-MIN_CONF теперь имеет силу.
+            // Раньше: ISC мог поднять порог с env-MIN_CONF=48 до 56-60 → юзер думал
+            // что ослабил, а реально ISC всё перебивал. Теперь ISC ограничен сверху
+            // потолком MIN_CONF+4, снизу может опускать на 3pt при хорошем track record.
+            // Итог: env-MIN_CONF=48 → реальный диапазон [45, 52], предсказуемо.
+            double iscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
+            double iscCap  = MIN_CONF + 4.0;                          // ISC не задирает выше env+4
+            double iscFloor = Math.min(iscCap, iscRaw);               // обрезаем сверху
+            double earlyMinConf = (iscFloor >= MIN_CONF)
+                    ? iscFloor
+                    : Math.max(MIN_CONF - 3.0, iscFloor);             // ISC может опустить на 3pt
             if (idea.probability < earlyMinConf) {
                 blockedEarlyConf.incrementAndGet();
                 return null;
@@ -1450,8 +1517,12 @@ public final class SignalSender {
                 idea = rebuildIdea(idea, idea.probability, lf);
             }
 
-            // [v16.0 FIX] qualityPenalty excluded from final confidence gate (size only).
-            double finalMinConf = Math.max(MIN_CONF, isc.getEffectiveMinConfidence() + symbolConfBoost);
+            // [PATCH 2026-04-28] Согласован с earlyMinConf — env-MIN_CONF приоритетен.
+            // ISC ограничен сверху MIN_CONF+4. Раньше Math.max() позволял ISC задрать
+            // порог до 56-60 даже при env-MIN_CONF=48, что делало env-настройку фикцией.
+            double finalIscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
+            double finalIscCap  = MIN_CONF + 4.0;
+            double finalMinConf = Math.max(MIN_CONF - 1.0, Math.min(finalIscCap, finalIscRaw));
             if (idea.probability < finalMinConf) {
                 blockedFinalConf.incrementAndGet();
                 return null;
@@ -1514,7 +1585,14 @@ public final class SignalSender {
                         newTp1, newTp2, newTp3);
             }
 
-            isc.registerSignal(idea);
+            // [v78.2 CRITICAL FIX] Removed `isc.registerSignal(idea)` from this path.
+            // ROOT CAUSE: registering here caused activeSymbols.containsKey(symbol)=true,
+            // which made Dispatcher.isSymbolAvailable() return false, blocking 100% of
+            // valid signals as "bipolar/cooldown" on a fresh start with no real cooldown.
+            // Pattern matches HOT_RESCAN flow (line 3322-3326): dispatch FIRST, then
+            // registerApprovedSignal on success. ISC registration now happens in
+            // BotMain after Dispatcher.dispatch() returns dispatched=true.
+            //
             // HARD R:R GATE — raised 1.80→2.00 (user preference ≥1:2).
             // Синхронизировано с BotMain dispatch gate и tp2Mult floor в DecisionEngineMerged.
             // При tp2Mult всегда ≥ 2.00 этот gate — финальная страховка (должен почти не срабатывать).
@@ -1522,8 +1600,9 @@ public final class SignalSender {
             double _tp2Dist  = Math.abs(idea.tp2 - idea.price);
             double actualRR  = _riskDist > 1e-9 ? _tp2Dist / _riskDist : 0;
             if (actualRR < 2.00) {
-                // Undo ISC and correlation registrations — R:R is insufficient
-                isc.unregisterSignal(idea);
+                // [v78.2] No ISC unregister needed — we never registered.
+                // correlationGuard.unregister still called for safety in case
+                // a parallel correlation register slipped in. No-op if not registered.
                 correlationGuard.unregister(pair);
                 System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < 2.00 (TP2=%.6f entry=%.6f SL=%.6f)%n",
                         pair, idea.side, actualRR, idea.tp2, idea.price, idea.stop);

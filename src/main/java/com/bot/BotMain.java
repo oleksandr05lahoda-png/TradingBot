@@ -63,6 +63,14 @@ public final class BotMain {
 
     private static volatile ZoneId ZONE = ZoneId.of("Europe/Warsaw");
     private static final int INTERVAL = envInt("SIGNAL_INTERVAL_MIN", 1);
+
+    // [v78.1] Paper/observation mode. When OBSERVATION_MODE=1, signals reach
+    // Telegram tagged 🧪 [PAPER]. Calibrator still records outcomes, so the bot
+    // learns without budget risk. Required for first 50+ outcomes before any
+    // real-money consideration. Default OFF (live mode), but strongly recommended
+    // ON for the first 7-14 days after deploy.
+    public static final boolean OBSERVATION_MODE =
+            "1".equals(System.getenv().getOrDefault("OBSERVATION_MODE", "0"));
     // [v66] Read BOTH env names so one Railway variable can configure the whole bot.
     // Previously BotMain read KLINES_LIMIT (default 160) while SignalSender read KLINES
     // (default 160, now 420). Setting only one name left the other at 160 → BTC context
@@ -345,10 +353,16 @@ public final class BotMain {
                 // зона короткая. Пускаем при prob≥50 ИЛИ 1 кластер ИЛИ fcConf≥0.22.
                 probFloor = 50.0; probShortcut = 52.0; minClusters = 1; minFcConf = 0.22;
             } else {
-                // [v77 LATENCY] Phase 1 — холодный старт. Понижено: 52→48,
-                // shortcut 55→51, fcConf 0.30→0.20. Главная цель — наполнить
-                // калибратор outcomes, иначе Phase 4 не наступит никогда.
-                probFloor = 48.0; probShortcut = 51.0; minClusters = 1; minFcConf = 0.20;
+                // [PATCH 2026-04-28] Phase 1 упрощён: только probFloor, без shortcut.
+                // Раньше: prob≥48 И (prob≥51 ИЛИ clusters≥1 ИЛИ fcConf≥0.20). На
+                // холодном рынке EARLY_TICK даёт prob~48-50 без clusters и с
+                // fcConf=0.0 (forecast=null) → ~99% сигналов теряется → калибратор
+                // не наполняется → Phase 4 не наступает никогда (chicken-and-egg).
+                // Теперь: только prob≥48 floor, остальное — пропускать. Калибратор
+                // получит outcomes за 6-12ч и сам разрулит. Риск ложных сигналов
+                // в paper/observation режиме приемлем; в LIVE — пользователь
+                // должен включить OBSERVATION_MODE=1 в Railway env.
+                probFloor = 48.0; probShortcut = 0; minClusters = 0; minFcConf = 0;
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {
@@ -402,7 +416,17 @@ public final class BotMain {
             }
 
             try {
-                tg.sendMessageAsync(idea.toTelegramString());
+                // [v78.1] Paper/observation mode — prefix Telegram message with
+                // visible tag so user does NOT trade these signals with real money.
+                // Calibrator still records outcomes (learning without risk).
+                String tgMessage = idea.toTelegramString();
+                if (OBSERVATION_MODE) {
+                    tgMessage = "🧪 *PAPER MODE* — НЕ ТОРГУЙ ЖИВЫМИ ДЕНЬГАМИ\n"
+                            + "_Сигнал для валидации, не для входа в рынок_\n"
+                            + "━━━━━━━━━━━━━━━━━━━━━\n"
+                            + tgMessage;
+                }
+                tg.sendMessageAsync(tgMessage);
                 totalDispatched.incrementAndGet();
                 lastDispatchMs.put(dedupKey, now);
                 dispatchTimestamps.addLast(now);
@@ -414,8 +438,9 @@ public final class BotMain {
                 // cooldown блокирует opposite-side. 3 мин достаточно чтобы исключить
                 // мгновенный flip на одном тике, но даёт реагировать на reversals.
                 isc.setSignalCooldown(idea.symbol, 3 * 60_000L);
-                LOG.info(String.format("[DISPATCH/%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% n=%d",
-                        source, idea.symbol, idea.side, idea.probability,
+                LOG.info(String.format("[DISPATCH/%s%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% n=%d",
+                        source, OBSERVATION_MODE ? "/PAPER" : "",
+                        idea.symbol, idea.side, idea.probability,
                         fcConf, actualRR, slPct * 100, calSamples));
                 return Result.ok();
             } catch (Throwable t) {
@@ -571,6 +596,11 @@ public final class BotMain {
         auxSched.scheduleAtFixedRate(
                 safe("Watchdog", () -> runWatchdog(telegram, sender)),
                 5 * 60, 120, TimeUnit.SECONDS);
+        // [PATCH 2026-04-28] Heartbeat — внутренний кулдаун 90 мин.
+        // Проверка каждые 15 мин, реально шлёт только если 90+ мин тишина.
+        auxSched.scheduleAtFixedRate(
+                safe("Heartbeat", () -> maybeSendHeartbeat(telegram, sender, gic, isc)),
+                15, 15, TimeUnit.MINUTES);
         auxSched.scheduleAtFixedRate(
                 safe("CalibratorSave", () -> {
                     com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
@@ -676,6 +706,8 @@ public final class BotMain {
         }
 
         com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
+        // [PATCH 2026-04-28] Снапшот regime для heartbeat/drought (там нет gic-доступа).
+        lastBtcRegimeForAlert = String.valueOf(ctx.regime);
         LOG.info("BTC: " + ctx.regime
                 + " str=" + String.format("%.2f", ctx.impulseStrength)
                 + " vol=" + String.format("%.2f", ctx.volatilityExpansion)
@@ -699,9 +731,18 @@ public final class BotMain {
         int sent = 0, blocked = 0;
         for (com.bot.DecisionEngineMerged.TradeIdea s : dispatchSignals) {
             Dispatcher.Result res = Dispatcher.getInstance().dispatch(s, "CYCLE");
-            if (res.dispatched) sent++;
-            else {
+            if (res.dispatched) {
+                // [v78.2 CRITICAL FIX] Register ISC AFTER dispatch success.
+                // Matches HOT_RESCAN/EARLY_TICK pattern (SignalSender.java:3322-3326).
+                // Previously registered in processPair BEFORE dispatch, causing
+                // Dispatcher.isSymbolAvailable() to immediately block as
+                // "bipolar/cooldown" — 100% of valid signals died here.
+                isc.registerSignal(s);
+                sent++;
+            } else {
                 blocked++;
+                // [v78.2] Safety net: unregister still called in case any code path
+                // managed to register (e.g., race during refactor). No-op if not registered.
                 isc.unregisterSignal(s);
                 LOG.info("[CYCLE-BLOCK] " + s.symbol + " " + s.side + ": " + res.reason);
             }
@@ -936,14 +977,74 @@ public final class BotMain {
                     + String.join(" | ", infraIssues));
         }
 
-        // [v77] DROUGHT ANNOUNCEMENT REMOVED.
-        // "📭 Тихо на рынке" message was pure status spam. The user opens
-        // the chart when signals come; no signals = no alert needed.
-        // signalDrought flag is still tracked locally for stats but no
-        // Telegram message is sent.
-        if (signalDrought) {
-            droughtAnnounced.compareAndSet(false, true);
+        // [PATCH 2026-04-28] DROUGHT АЛЕРТ ВЕРНУЛИ.
+        // Симптом юзера: «за всю ночь не пришло ни одного сигнала».
+        // Причина проблемы: автор v77 убрал drought-сообщение как «спам», но
+        // тогда юзер не понимает — бот мёртв, в режиме PAPER, или просто рынок
+        // плоский. Возвращаем ОДНОРАЗОВОЕ сообщение через 3 часа тишины с кратким
+        // breakdown что блокирует. После прихода первого сигнала droughtAnnounced
+        // сбрасывается в Dispatcher.dispatch() (см. там).
+        if (signalDrought && droughtAnnounced.compareAndSet(false, true)) {
+            try {
+                Dispatcher disp = Dispatcher.getInstance();
+                String breakdown = (disp != null) ? disp.getBlockBreakdown() : "n/a";
+                long hoursSilent = (now - lastSignalMs) / (60 * 60_000L);
+                String regime = ctxRegimeForAlert();
+                int wsCount = sender.getActiveWsCount();
+                int calN = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+                String paperFlag = OBSERVATION_MODE ? "🧪 PAPER" : "🔴 LIVE";
+                telegram.sendMessageAsync(String.format(
+                        "📭 *Тихо на рынке* %dh\n"
+                                + "BTC: %s | WS: %d | Cal n=%d | %s\n"
+                                + "Блокировки: %s\n"
+                                + "_(`bi`=cooldown, `rr`=R:R<2.0, `sl`=SL<0.30%%, `cold`=cold-start, `dd`=dedup, `hr`=hourly cap)_",
+                        hoursSilent, regime, wsCount, calN, paperFlag, breakdown));
+            } catch (Throwable ignored) {}
         }
+    }
+
+    // [PATCH 2026-04-28] Helper для drought сообщения — берёт BTC regime у GIC.
+    private static String ctxRegimeForAlert() {
+        try {
+            // Доступа к gic тут нет напрямую — берём из последней updateBtcContext через статический snapshot
+            return lastBtcRegimeForAlert != null ? lastBtcRegimeForAlert : "?";
+        } catch (Throwable t) { return "?"; }
+    }
+    static volatile String lastBtcRegimeForAlert = null;
+
+    // [PATCH 2026-04-28] HEARTBEAT — каждые 90 мин если 0 сигналов в этот период.
+    // Решает «бот живой?» вопрос без необходимости лезть в Railway logs.
+    // Cooldown 90 мин чтобы не спамить.
+    private static volatile long lastHeartbeatMs = 0;
+    private static final long HEARTBEAT_INTERVAL_MS = 90 * 60_000L;
+    private static final long HEARTBEAT_QUIET_MS    = 90 * 60_000L; // только если 90+ мин без сигнала
+
+    private static void maybeSendHeartbeat(com.bot.TelegramBotSender telegram,
+                                           com.bot.SignalSender sender,
+                                           com.bot.GlobalImpulseController gic,
+                                           com.bot.InstitutionalSignalCore isc) {
+        long now = System.currentTimeMillis();
+        if (now - startTimeMs < 30 * 60_000L) return;             // дать 30 мин на разогрев
+        if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) return;
+        if (now - lastSignalMs   < HEARTBEAT_QUIET_MS) return;     // если есть сигналы — не нужно
+        try {
+            Dispatcher disp = Dispatcher.getInstance();
+            String breakdown = (disp != null) ? disp.getBlockBreakdown() : "n/a";
+            int wsCount = sender.getActiveWsCount();
+            int calN    = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+            com.bot.GlobalImpulseController.GlobalContext gc = gic.getContext();
+            lastBtcRegimeForAlert = String.valueOf(gc.regime);
+            long minSilent = (now - lastSignalMs) / 60_000L;
+            String paperFlag = OBSERVATION_MODE ? "🧪 PAPER" : "🔴 LIVE";
+            telegram.sendMessageAsync(String.format(
+                    "💓 *Heartbeat* (%dмин без сигнала)\n"
+                            + "BTC: %s str=%.2f | WS: %d | Cal n=%d | %s\n"
+                            + "Cycles: %d | Errors: %d\n"
+                            + "Блок: %s",
+                    minSilent, gc.regime, gc.impulseStrength, wsCount, calN, paperFlag,
+                    totalCycles.get(), errorCount.get(), breakdown));
+            lastHeartbeatMs = now;
+        } catch (Throwable ignored) {}
     }
 
     // [v78] maybeSendDailySummary() REMOVED — see scheduler removal above.
@@ -1037,19 +1138,23 @@ public final class BotMain {
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v78`\n"
+        return "⚡ *TradingBot SCANNER* `v78.1`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + "`15M` Futures · TOP-30 · Scanner-only\n"
                 + "R:R min `1:2` · SL min `0.30%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "🎯 *v78 — production-clean:*\n"
+                + (OBSERVATION_MODE
+                ? "🧪 *PAPER MODE АКТИВЕН* — сигналы только для валидации\n━━━━━━━━━━━━━━━━━━━━━\n"
+                : "")
+                + "🎯 *v78.1 — floor alignment + paper mode:*\n"
+                + "• DE floor 52→48 · RANGE split 0.40→0.32\n"
+                + "• Bucketed reject diag (NEAR/MID/FAR)\n"
+                + "• Stale pair eviction (3-in-5min → 30min skip)\n"
+                + "• OBSERVATION_MODE env flag\n"
                 + "• Live-splice always (no RSI veto)\n"
                 + "• Cache TTL: 15m=30s · 1h=5min · 2h=15min\n"
-                + "• LATE_HARD/EXHAUST/VEL_DECAY → soft penalty\n"
-                + "• EARLY_TICK floors halved · HOT 0.30% · 3min CD\n"
                 + "• Phase 1 floor 48/51 · cold-start 20\n"
                 + "• Dedup 6min · cooldown 3min · burst 8/5min\n"
-                + "• Chat: ENTRIES ONLY (no SL/TP/TS/drought/daily)\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
                 + "_Прогнозы Entry / TP1-3 / SL._";
