@@ -130,10 +130,16 @@ public final class InstitutionalSignalCore {
         pruneOldSignalTimestamps(timestamps);
     }
 
-    /** SL cooldown — 30 min, blocks falling-knife re-entry. */
+    /** SL cooldown — 30 min after stop-loss exit. Blocks falling-knife re-entry. */
     private static final long SL_COOLDOWN_MS  = 30 * 60_000L;
-    /** TP cooldown — 20 min, synced with BotMain.setSignalCooldown(20min). */
+    /** TP cooldown — 20 min after natural take-profit exit via closeTrade(). */
     private static final long TP_COOLDOWN_MS  = 20 * 60_000L;
+    /**
+     * NOTE: после dispatch BotMain.Dispatcher.dispatch() дополнительно вызывает
+     * setSignalCooldown(symbol, 3min) — это короткий cooldown между двумя
+     * последовательными сигналами на одной паре (anti-flip). Не путать с
+     * post-exit cooldown'ами выше — они срабатывают через closeTrade().
+     */
     /** TIME_STOP cooldown — 45 min. Pair that didn't move in 90 min needs more time off. */
     private static final long TIME_STOP_COOLDOWN_MS = 45 * 60_000L;
 

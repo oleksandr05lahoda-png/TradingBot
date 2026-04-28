@@ -8,6 +8,7 @@
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BotMain.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/DecisionEngineMerged.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/InstitutionalSignalCore.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -767,7 +768,18 @@
       <workItem from="1777236939337" duration="3115000" />
       <workItem from="1777284351072" duration="1668000" />
       <workItem from="1777308138830" duration="8057000" />
-      <workItem from="1777368973278" duration="3829000" />
+      <workItem from="1777368973278" duration="4098000" />
+      <workItem from="1777388810385" duration="2717000" />
+      <workItem from="1777394115188" duration="7000" />
+      <workItem from="1777394158103" duration="5000" />
+      <workItem from="1777394174349" duration="4000" />
+      <workItem from="1777394186682" duration="6000" />
+      <workItem from="1777394199408" duration="5000" />
+      <workItem from="1777394213990" duration="5000" />
+      <workItem from="1777394231278" duration="4000" />
+      <workItem from="1777394249222" duration="11000" />
+      <workItem from="1777394269773" duration="5000" />
+      <workItem from="1777394405494" duration="1746000" />
     </task>
     <servers />
   </component>

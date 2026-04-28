@@ -301,12 +301,37 @@ public final class BotMain {
             static Result blocked(String why) { return new Result(false, why); }
         }
 
+        // [PATCH 2026-04-28] HINT MODE — анти-тишина.
+        // Если 2+ часа без сигнала, временно опускаем probFloor на 5 пунктов.
+        // Hint-сигналы помечаются 💡 в Telegram, чтобы трейдер знал: качество ниже.
+        // Решает симптом юзера: «10 часов ни одного сигнала».
+        private static final long HINT_TRIGGER_MS = 2L * 60 * 60_000L;
+        private volatile boolean hintModeActive = false;
+        private final AtomicLong hintModeActivations = new AtomicLong(0);
+
+        private void updateHintMode() {
+            long silentMs = System.currentTimeMillis() - lastSignalMs;
+            boolean shouldActivate = silentMs > HINT_TRIGGER_MS;
+            if (shouldActivate != hintModeActive) {
+                hintModeActive = shouldActivate;
+                if (shouldActivate) hintModeActivations.incrementAndGet();
+                LOG.info("[HINT_MODE] " + (shouldActivate ? "ACTIVATED" : "DEACTIVATED")
+                        + " (silent " + (silentMs / 60_000L) + "min)");
+            }
+        }
+
+        public boolean isHintModeActive() { return hintModeActive; }
+        public long getHintModeActivations() { return hintModeActivations.get(); }
+
         /**
          * The single source of truth for "should this signal reach the user?"
          * Returns dispatched=true iff a Telegram message was queued.
          */
         public Result dispatch(com.bot.DecisionEngineMerged.TradeIdea idea, String source) {
             if (idea == null) return Result.blocked("null idea");
+
+            // [PATCH] Обновляем hint mode при каждом dispatch.
+            updateHintMode();
 
             if (!isc.isSymbolAvailable(idea.symbol)) {
                 blockedByGate.incrementAndGet();
@@ -363,6 +388,15 @@ public final class BotMain {
                 // в paper/observation режиме приемлем; в LIVE — пользователь
                 // должен включить OBSERVATION_MODE=1 в Railway env.
                 probFloor = 48.0; probShortcut = 0; minClusters = 0; minFcConf = 0;
+            }
+
+            // [PATCH 2026-04-28] HINT MODE: при длительной тишине снижаем порог.
+            // probFloor минус 5pt, минимум 43.0 — ниже этого качество слишком низкое.
+            // probShortcut тоже снижается симметрично если задан.
+            if (hintModeActive) {
+                probFloor    = Math.max(43.0, probFloor - 5.0);
+                if (probShortcut > 0) probShortcut = Math.max(45.0, probShortcut - 5.0);
+                if (minClusters > 0)  minClusters  = Math.max(0, minClusters - 1);
             }
 
             if (probFloor > 0 && idea.probability < probFloor) {
@@ -423,6 +457,15 @@ public final class BotMain {
                 if (OBSERVATION_MODE) {
                     tgMessage = "🧪 *PAPER MODE* — НЕ ТОРГУЙ ЖИВЫМИ ДЕНЬГАМИ\n"
                             + "_Сигнал для валидации, не для входа в рынок_\n"
+                            + "━━━━━━━━━━━━━━━━━━━━━\n"
+                            + tgMessage;
+                }
+                // [PATCH 2026-04-28] HINT MODE: явная пометка пониженной уверенности.
+                // Сигнал прошёл по сниженному probFloor (после 2+ часов тишины).
+                // Трейдер видит 💡 и понимает: качество ниже обычного, размер ×0.5.
+                if (hintModeActive) {
+                    tgMessage = "💡 *HINT* (длительная тишина — низкая уверенность)\n"
+                            + "_Прошёл по сниженному порогу. Размер позиции ×0.5._\n"
                             + "━━━━━━━━━━━━━━━━━━━━━\n"
                             + tgMessage;
                 }
@@ -648,8 +691,29 @@ public final class BotMain {
         }, "ShutdownHook"));
 
         telegram.sendMessageAsync(buildStartMessage());
-        LOG.info("═══ TradingBot v76 SCANNER started " + nowLocalStr()
-                + " (first cycle in 90s) ═══");
+        LOG.info("═══ TradingBot v78.2 SCANNER started " + nowLocalStr()
+                + " (first cycle in 90s, OBSERVATION_MODE="
+                + (OBSERVATION_MODE ? "ON/PAPER" : "OFF/LIVE") + ") ═══");
+
+        // [v78.2 SAFETY] Send explicit warning to Telegram if running LIVE
+        // without enough calibration data. The user must explicitly opt in
+        // to live trading on a cold-start system; passive default = noisy chat.
+        try {
+            int _calN = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+            if (!OBSERVATION_MODE && _calN < 50) {
+                telegram.sendMessageAsync(String.format(
+                        "🚨 *ВНИМАНИЕ: LIVE режим без калибровки*\n"
+                                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                                + "Калибратор: %d/50 исходов\n"
+                                + "Сигналы выходят с НЕкалиброванной вероятностью.\n"
+                                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                                + "_Рекомендации:_\n"
+                                + "• Установи `OBSERVATION_MODE=1` в Railway env\n"
+                                + "• Либо торгуй размером ×0.25 от обычного\n"
+                                + "• Не больше 2 позиций в одну сторону одновременно",
+                        _calN));
+            }
+        } catch (Throwable ignored) {}
 
         // [v74] STARTUP SELF-VALIDATION — answers "does this strategy actually
         // have edge?" without waiting weeks. 5min after start (volume24hUSD is
@@ -1132,29 +1196,28 @@ public final class BotMain {
 
     private static String calibrationStatus() {
         int s = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-        if (s < 30)  return String.format("⚠️ Cold-start: %d/30 исходов", s);
+        if (s < 30)  return String.format("⚠️ *Cold-start: %d/30 исходов*\n"
+                + (OBSERVATION_MODE ? "" : "🚨 *РИСК:* В LIVE без калибровки — рекомендуется `OBSERVATION_MODE=1` или размер ×0.25"), s);
         if (s < 100) return "🔸 Калибровка: " + s + "/100";
         return "✅ Калибровка: " + s + " исходов";
     }
 
     private static String buildStartMessage() {
-        return "⚡ *TradingBot SCANNER* `v78.1`\n"
+        return "⚡ *TradingBot SCANNER* `v78.2`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "`15M` Futures · TOP-30 · Scanner-only\n"
+                + "`15M` Futures · TOP-" + envInt("TOP_N", 30) + " · Scanner-only\n"
                 + "R:R min `1:2` · SL min `0.30%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + (OBSERVATION_MODE
                 ? "🧪 *PAPER MODE АКТИВЕН* — сигналы только для валидации\n━━━━━━━━━━━━━━━━━━━━━\n"
-                : "")
-                + "🎯 *v78.1 — floor alignment + paper mode:*\n"
-                + "• DE floor 52→48 · RANGE split 0.40→0.32\n"
-                + "• Bucketed reject diag (NEAR/MID/FAR)\n"
-                + "• Stale pair eviction (3-in-5min → 30min skip)\n"
-                + "• OBSERVATION_MODE env flag\n"
+                : "🔴 *LIVE MODE* — реальные сигналы в чат\n━━━━━━━━━━━━━━━━━━━━━\n")
+                + "🎯 *Конфигурация:*\n"
+                + "• DE floor 48 · ISC floor 47 · Dispatcher Phase1 floor 48\n"
+                + "• ProbabilityCalibrator: PAV regression after n≥50\n"
                 + "• Live-splice always (no RSI veto)\n"
                 + "• Cache TTL: 15m=30s · 1h=5min · 2h=15min\n"
-                + "• Phase 1 floor 48/51 · cold-start 20\n"
-                + "• Dedup 6min · cooldown 3min · burst 8/5min\n"
+                + "• Dispatcher: dedup 6min, hourly 20, burst 5/5min\n"
+                + "• Post-dispatch ISC cooldown: 3min · TIME-stop 90min\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + calibrationStatus() + "\n"
                 + "_Прогнозы Entry / TP1-3 / SL._";

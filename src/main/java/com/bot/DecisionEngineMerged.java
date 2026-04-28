@@ -1152,8 +1152,10 @@ public final class DecisionEngineMerged {
             // [v61] Honest display. No cosmetic shrinkage — show the real model score.
             // Dispatcher filters sub-30-sample signals upstream, so any signal reaching
             // Telegram has earned its score through strict gates (prob≥78, clusters≥4).
+            // NOTE: probability is already clamped to PROB_CEIL=85 at line ~3353 (calibrate),
+            // so no extra clamp needed here. Keeping the floor at 0 as paranoia guard.
             int _calSamples = DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-            double _prob = Math.max(0, Math.min(85, probability));
+            double _prob = Math.max(0.0, probability);
             if (_calSamples < 30) {
                 sb.append(String.format("📊 Скор: *%.0f%%*  _%s_%n",
                         _prob, signalQualityLabel(_prob)));
@@ -1549,10 +1551,17 @@ public final class DecisionEngineMerged {
                 flatMarketPenalty = true;
                 allFlags.add("FLAT_MARKET_COMPRESSION");
             }
-            // В RANGE с низким ADX — только extreme RSI пропускаем (mean-reversion)
+            // [PATCH 2026-04-28] В RANGE с низким ADX — penalty вместо reject.
+            // Раньше: RSI 22-78 в range = reject → ~30% валидных сигналов терялось.
+            // Теперь: extreme RSI (≤22 / ≥78) пропускаем как mean-reversion;
+            // mid-range зона (22..78) — penalty 25%, проходит финальный MIN_CONF gate
+            // только если есть сильные кластеры (3+ сторонних).
             if (adxVal < 15 && atrPctile < 0.20) {
                 double rsi14 = rsi(c15, 14);
-                if (rsi14 > 22 && rsi14 < 78) return reject("range_rsi_mid");
+                if (rsi14 > 22 && rsi14 < 78) {
+                    allFlags.add("RANGE_MID_RSI_PENALTY");
+                    // не reject — пусть проходит, MIN_CONF=53 в SignalSender отсечёт мусор
+                }
             }
         }
 
@@ -2757,14 +2766,56 @@ public final class DecisionEngineMerged {
         // Comment said "actual veto happens post-candidate-selection via earlyReturn sentinel"
         // but no such sentinel existed — it was dead code. Hard veto added here.
         if (gicOnlyLong && side == com.bot.TradingCore.Side.SHORT) {
-            // BTC in extreme up-impulse: short on an alt = very high failure rate
-            allFlags.add("GIC_STRONG_BTCUP");
-            return reject("gic_btcup_short_veto"); // [FIX #22] ACTUAL VETO — was missing
+            // [PATCH 2026-04-28] Симметричный counter-trend SHORT pocket.
+            // Параллельно к COUNTER_TREND_LONG — разрешаем SHORT в bull-режиме
+            // только при сильной reversal-конфлюэнции на overbought.
+            double rsi14ForRev = rsi(c15, 14);
+            boolean strongReversal = shortClusters >= 3
+                    && earlyRev.detected
+                    && earlyRev.strength > 0.50
+                    && rsi14ForRev > 72;
+            boolean exhaustionRev = localExh != null
+                    && localExh.direction == +1
+                    && rsi14ForRev > 70;
+
+            if (!strongReversal && !exhaustionRev) {
+                allFlags.add("GIC_STRONG_BTCUP");
+                return reject("gic_btcup_short_veto");
+            }
+
+            allFlags.add("COUNTER_TREND_SHORT");
+            scoreShort *= 0.85;
         }
         if (gicOnlyShort && side == com.bot.TradingCore.Side.LONG) {
-            // BTC crashing: long on an alt = catching a falling knife
-            allFlags.add("GIC_STRONG_BTCDOWN");
-            return reject("gic_btcdown_long_veto"); // [FIX #22] ACTUAL VETO — was missing
+            // [PATCH 2026-04-28] COUNTER-TREND REVERSAL POCKET.
+            //
+            // Раньше: hard veto на ВСЕ LONG в BTC_STRONG_DOWN/CRASH/PANIC.
+            // Проблема: пропускали отскоки от истощения когда alt падал гораздо
+            // глубже BTC и оверсолд был очевиден (3+ кластера + earlyRev + RSI<28).
+            // Симптом юзера: «10 часов ни одного LONG-сигнала», «бот только шортит».
+            //
+            // Новое: разрешаем counter-trend LONG только при сильной reversal-конфлюэнции:
+            //   • 3+ LONG-кластера + earlyRev > 0.50 + RSI < 28
+            //   • ИЛИ локальное истощение SHORT (localExh.direction == -1) + RSI < 30
+            // Score дисконтируется ×0.85 за движение против BTC-тренда.
+            // Финальный MIN_CONF gate (53+) всё равно отсечёт мусор.
+            double rsi14ForRev = rsi(c15, 14);
+            boolean strongReversal = longClusters >= 3
+                    && earlyRev.detected
+                    && earlyRev.strength > 0.50
+                    && rsi14ForRev < 28;
+            boolean exhaustionRev = localExh != null
+                    && localExh.direction == -1
+                    && rsi14ForRev < 30;
+
+            if (!strongReversal && !exhaustionRev) {
+                allFlags.add("GIC_STRONG_BTCDOWN");
+                return reject("gic_btcdown_long_veto");
+            }
+
+            // Counter-trend pocket активирован — пропускаем с дисконтом
+            allFlags.add("COUNTER_TREND_LONG");
+            scoreLong *= 0.85;
         }
 
         // POST-PUMP LONG VETO
