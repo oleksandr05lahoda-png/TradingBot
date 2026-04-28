@@ -479,8 +479,11 @@ public final class InstitutionalSignalCore {
 
     //  SIGNAL FILTERING
 
-    // Max positions per direction (signal-mode only — we don't auto-trade).
-    private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 10);
+    // [v78.3] Direction cap reduced 10 → 4. Crypto correlations during
+    // BTC-driven moves are essentially 1.0 — 8 same-side positions = 8× leverage
+    // on one trade. 4 is enough to capture sector wave without making the
+    // portfolio a single concentrated bet.
+    private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 4);
 
     // Rate-limit BIPOLAR BLOCK logs: one log per symbol per 60s to avoid Railway log flood.
     private final Map<String, Long> bipolarLogThrottle = new ConcurrentHashMap<>();
@@ -544,6 +547,35 @@ public final class InstitutionalSignalCore {
                     long remainSec = (until - now2) / 1000;
                     log("⏳ COOLDOWN BLOCK: " + signal.symbol + " cooldown " + remainSec + "s left");
                 }
+            }
+            return false;
+        }
+
+        // [v78.3] DIRECTIONAL CONCENTRATION CAP.
+        // В предыдущих версиях бот мог выпустить 8 SHORT-сигналов одновременно
+        // во время BTC_STRONG_DOWN. Все эти позиции коррелированы (~0.85-0.95
+        // на крипто-альтах), фактически = 1 позиция с 8× плечом. Если рынок
+        // развернётся — всё в SL одновременно.
+        //
+        // Жёсткий лимит: максимум 4 одновременно активных сигнала в одну
+        // сторону. После этого новые сигналы той же стороны блокируются
+        // до тех пор пока не закроется хотя бы один.
+        //
+        // Override через env: ISC_MAX_SAME_DIRECTION (default = 4).
+        int sameDirCount = 0;
+        for (List<ActiveSignal> sigs : activeSignals.values()) {
+            for (ActiveSignal s : sigs) {
+                if (s.side == signal.side) sameDirCount++;
+            }
+        }
+        if (sameDirCount >= MAX_SAME_DIRECTION) {
+            long now3 = System.currentTimeMillis();
+            String key = "__dir_cap_" + signal.side.name();
+            Long lastLog = bipolarLogThrottle.get(key);
+            if (lastLog == null || (now3 - lastLog) > BIPOLAR_LOG_THROTTLE_MS) {
+                bipolarLogThrottle.put(key, now3);
+                log(String.format("🔒 DIRECTION_CAP: %d %s already active (max=%d) — %s blocked",
+                        sameDirCount, signal.side, MAX_SAME_DIRECTION, signal.symbol));
             }
             return false;
         }

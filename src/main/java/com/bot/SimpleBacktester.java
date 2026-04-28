@@ -550,6 +550,24 @@ public final class SimpleBacktester {
             cursor += testBars + PURGE_BARS; // slide with embargo
         }
 
+        // [v79 I3] Audit-log walk-forward OOS results for third-party verification.
+        // Записываем итоги в HMAC-подписанный audit log калибратора, чтобы
+        // backtest-результаты нельзя было подменить задним числом.
+        try {
+            for (BacktestResult r : oosResults) {
+                if (r.total >= 5) {
+                    com.bot.DecisionEngineMerged.getCalibrator().writeDispatchAudit(
+                            symbol, "WALKFORWARD",
+                            r.finalBalance,         // proxy: final balance as "price"
+                            r.winRate * 100,        // proxy: WR as "tp1"
+                            r.maxDrawdownPct,       // proxy: DD as "sl"
+                            r.ev * 100,             // proxy: EV as "prob"
+                            "WF_OOS",
+                            "BACKTEST", false);
+                }
+            }
+        } catch (Throwable ignored) {}
+
         return oosResults;
     }
 

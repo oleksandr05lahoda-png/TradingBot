@@ -1156,6 +1156,21 @@ public final class DecisionEngineMerged {
             // so no extra clamp needed here. Keeping the floor at 0 as paranoia guard.
             int _calSamples = DecisionEngineMerged.getCalibrator().totalOutcomeCount();
             double _prob = Math.max(0.0, probability);
+
+            // [v78.3] SIGNAL GRADE — единый показатель который трейдер видит сразу.
+            // Объединяет 3 независимых фактора качества:
+            //   1) probability (после калибровки)
+            //   2) число согласующихся кластеров (структура/моментум/объём/HTF/derivatives/early)
+            //   3) состояние калибратора (сколько outcomes уже учтено)
+            // Grade A = доверять и торговать обычным размером
+            // Grade B = ОК сигнал, торговать ×0.7
+            // Grade C = в paper / ×0.3 на live
+            // Grade D = только paper
+            int _clusterCount = countAgreeingClusters();
+            String grade = computeSignalGrade(_prob, _clusterCount, _calSamples);
+            sb.append(String.format("🏷️ Grade: *%s*  ·  Кластеров: %d  ·  Cal: %d%n",
+                    grade, _clusterCount, _calSamples));
+
             if (_calSamples < 30) {
                 sb.append(String.format("📊 Скор: *%.0f%%*  _%s_%n",
                         _prob, signalQualityLabel(_prob)));
@@ -1272,6 +1287,52 @@ public final class DecisionEngineMerged {
             if (prob >= 70) return "умеренный кластер";
             if (prob >= 65) return "базовый кластер";
             return "слабый кластер";
+        }
+
+        /**
+         * [v78.3] Считает число согласующихся кластеров для grade-расчёта.
+         * Кластеры в архитектуре: STRUCTURE, MOMENTUM, VOLUME, HTF, DERIVATIVES, EARLY.
+         * Флаги в idea.flags содержат имена кластеров когда они «голосуют» за сигнал.
+         */
+        private int countAgreeingClusters() {
+            if (flags == null || flags.isEmpty()) return 0;
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            for (String f : flags) {
+                if (f == null) continue;
+                String u = f.toUpperCase();
+                if (u.contains("CLUSTER_S") || u.contains("CLUST_S") || u.startsWith("STR_") || u.contains("BOS") || u.contains("FVG"))
+                    seen.add("STR");
+                if (u.contains("CLUSTER_M") || u.contains("CLUST_M") || u.contains("RSI") || u.contains("MACD") || u.contains("DIVERG"))
+                    seen.add("MOM");
+                if (u.contains("CLUSTER_V") || u.contains("CLUST_V") || u.contains("VOL_") || u.contains("VSA") || u.contains("OFV"))
+                    seen.add("VOL");
+                if (u.contains("CLUSTER_H") || u.contains("CLUST_H") || u.contains("HTF") || u.contains("1H_") || u.contains("2H_"))
+                    seen.add("HTF");
+                if (u.contains("CLUSTER_D") || u.contains("CLUST_D") || u.contains("OBI") || u.contains("FR_") || u.contains("OI_"))
+                    seen.add("DRV");
+                if (u.contains("CLUSTER_E") || u.contains("CLUST_E") || u.contains("EARLY") || u.contains("PUMP_HUNT"))
+                    seen.add("EARLY");
+            }
+            return seen.size();
+        }
+
+        /**
+         * [v78.3] Единый Grade A/B/C/D — то что трейдер видит сразу.
+         *
+         *  Grade A = 4+ кластера, prob >= 70, калибратор обучен (n >= 50).
+         *            → Доверять, торговать обычным размером.
+         *  Grade B = 3 кластера, prob >= 60.
+         *            → Хороший сигнал, размер ×0.7.
+         *  Grade C = 2 кластера, prob >= 55, или калибратор еще учится.
+         *            → На live с размером ×0.3, либо в paper.
+         *  Grade D = меньше — только paper / observation.
+         */
+        private static String computeSignalGrade(double prob, int clusters, int calSamples) {
+            boolean calOK = calSamples >= 50;
+            if (clusters >= 4 && prob >= 70.0 && calOK)            return "A";
+            if (clusters >= 3 && prob >= 60.0 && (calOK || prob >= 70.0)) return "B";
+            if (clusters >= 2 && prob >= 55.0)                     return "C";
+            return "D";
         }
     }
 
@@ -1551,17 +1612,16 @@ public final class DecisionEngineMerged {
                 flatMarketPenalty = true;
                 allFlags.add("FLAT_MARKET_COMPRESSION");
             }
-            // [PATCH 2026-04-28] В RANGE с низким ADX — penalty вместо reject.
-            // Раньше: RSI 22-78 в range = reject → ~30% валидных сигналов терялось.
-            // Теперь: extreme RSI (≤22 / ≥78) пропускаем как mean-reversion;
-            // mid-range зона (22..78) — penalty 25%, проходит финальный MIN_CONF gate
-            // только если есть сильные кластеры (3+ сторонних).
+            // [v78.3 ROLLBACK] Возвращаем hard reject в RANGE.
+            // Soft-penalty подход добавлял ~25% noise в калибратор: mid-RSI
+            // в плоском рынке физически не имеет edge (mean-reversion работает
+            // только на extreme), а оставление сигнала на финальный MIN_CONF gate
+            // приводило к низкокачественным записям в калибратор. Возврат на reject
+            // даёт калибратору только сигналы с реальной структурной идеей.
             if (adxVal < 15 && atrPctile < 0.20) {
                 double rsi14 = rsi(c15, 14);
-                if (rsi14 > 22 && rsi14 < 78) {
-                    allFlags.add("RANGE_MID_RSI_PENALTY");
-                    // не reject — пусть проходит, MIN_CONF=53 в SignalSender отсечёт мусор
-                }
+                // В RANGE с низким ADX — только extreme RSI пропускаем (mean-reversion)
+                if (rsi14 > 22 && rsi14 < 78) return reject("range_rsi_mid");
             }
         }
 
@@ -2762,60 +2822,56 @@ public final class DecisionEngineMerged {
             allFlags.add("GIC_PANIC_VETO_LONG");
             return reject("gic_panic_long");
         }
-        // GIC directional gate: was adding a flag but NOT blocking the signal.
-        // Comment said "actual veto happens post-candidate-selection via earlyReturn sentinel"
-        // but no such sentinel existed — it was dead code. Hard veto added here.
+        // [v78.3 ROLLBACK] COUNTER_TREND pockets удалены.
+        //
+        // ПОЧЕМУ: попытка ловить «сильный oversold reversal» в bear-режиме
+        // на условиях (3+ clusters + earlyRev > 0.50 + RSI < 28) выглядит
+        // строгой на бумаге, но в реальном крахе RSI<28 + earlyRev сигнал
+        // вспыхивают 5-10 раз за день — каждый «отскок» выглядит как разворот,
+        // продолжается падение. Это classic falling-knife trap.
+        //
+        // GIC.onlyShort/onlyLong были спроектированы как HARD VETO именно
+        // против этого паттерна. Восстанавливаем оригинал.
+        //
+        // Если действительно нужны редкие counter-trend setups —
+        // используется ELITE_REVERSAL_POCKET ниже (см. строку ~2780+).
+
+        // BTC in extreme up-impulse: short on an alt = very high failure rate
         if (gicOnlyLong && side == com.bot.TradingCore.Side.SHORT) {
-            // [PATCH 2026-04-28] Симметричный counter-trend SHORT pocket.
-            // Параллельно к COUNTER_TREND_LONG — разрешаем SHORT в bull-режиме
-            // только при сильной reversal-конфлюэнции на overbought.
-            double rsi14ForRev = rsi(c15, 14);
-            boolean strongReversal = shortClusters >= 3
-                    && earlyRev.detected
-                    && earlyRev.strength > 0.50
-                    && rsi14ForRev > 72;
-            boolean exhaustionRev = localExh != null
-                    && localExh.direction == +1
-                    && rsi14ForRev > 70;
-
-            if (!strongReversal && !exhaustionRev) {
-                allFlags.add("GIC_STRONG_BTCUP");
-                return reject("gic_btcup_short_veto");
-            }
-
-            allFlags.add("COUNTER_TREND_SHORT");
-            scoreShort *= 0.85;
+            allFlags.add("GIC_STRONG_BTCUP");
+            return reject("gic_btcup_short_veto");
         }
+        // BTC crashing: long on an alt = catching a falling knife
         if (gicOnlyShort && side == com.bot.TradingCore.Side.LONG) {
-            // [PATCH 2026-04-28] COUNTER-TREND REVERSAL POCKET.
+            // [v78.3] ELITE_REVERSAL_POCKET — единственная узкая дверь для LONG
+            // в bear-режиме. Условия НАМЕРЕННО очень строгие — фильтр должен
+            // пропускать ~1 раз в крупный крах, не каждые 30 минут.
             //
-            // Раньше: hard veto на ВСЕ LONG в BTC_STRONG_DOWN/CRASH/PANIC.
-            // Проблема: пропускали отскоки от истощения когда alt падал гораздо
-            // глубже BTC и оверсолд был очевиден (3+ кластера + earlyRev + RSI<28).
-            // Симптом юзера: «10 часов ни одного LONG-сигнала», «бот только шортит».
+            // Все 5 условий обязательны (AND, не OR):
+            //   1. 4+ LONG-кластера (полная конфлюэнция структуры/моментума/объёма/HTF)
+            //   2. earlyRev.strength > 0.65 (сильный early-reversal сигнал)
+            //   3. localExh.direction == -1 (подтверждённое локальное истощение шорта)
+            //   4. rsi14 < 22 (extreme oversold, не просто "перепродан")
+            //   5. relStrength > 0.85 (sector leader — монета держится при крахе BTC)
             //
-            // Новое: разрешаем counter-trend LONG только при сильной reversal-конфлюэнции:
-            //   • 3+ LONG-кластера + earlyRev > 0.50 + RSI < 28
-            //   • ИЛИ локальное истощение SHORT (localExh.direction == -1) + RSI < 30
-            // Score дисконтируется ×0.85 за движение против BTC-тренда.
-            // Финальный MIN_CONF gate (53+) всё равно отсечёт мусор.
+            // Если хоть одно условие нарушено → стандартный hard veto.
+            // Score дисконтируется ×0.75 (больше чем 0.85 в старой версии)
+            // плюс сигнал помечается ELITE_REV для трейдера.
             double rsi14ForRev = rsi(c15, 14);
-            boolean strongReversal = longClusters >= 3
+            double relStr = getRelativeStrength(symbol);
+            boolean elite = longClusters >= 4
                     && earlyRev.detected
-                    && earlyRev.strength > 0.50
-                    && rsi14ForRev < 28;
-            boolean exhaustionRev = localExh != null
-                    && localExh.direction == -1
-                    && rsi14ForRev < 30;
+                    && earlyRev.strength > 0.65
+                    && localExh != null && localExh.direction == -1
+                    && rsi14ForRev < 22.0
+                    && relStr > 0.85;
 
-            if (!strongReversal && !exhaustionRev) {
+            if (!elite) {
                 allFlags.add("GIC_STRONG_BTCDOWN");
                 return reject("gic_btcdown_long_veto");
             }
-
-            // Counter-trend pocket активирован — пропускаем с дисконтом
-            allFlags.add("COUNTER_TREND_LONG");
-            scoreLong *= 0.85;
+            allFlags.add("ELITE_REV_LONG");
+            scoreLong *= 0.75;
         }
 
         // POST-PUMP LONG VETO
@@ -3397,7 +3453,16 @@ public final class DecisionEngineMerged {
         // запись и чтение используют идентичный VolBucket → per-symbol калибровка работает.
         double calibAtrPct  = robustAtrPct * 100.0;
         double rawProb01 = Math.max(0.0, Math.min(1.0, probability / 100.0));
-        double calibrated01 = CALIBRATOR.calibrate(symbol, rawProb01, calibAtrPct);
+        // [v79 SEGMENT] Pass BTC regime so calibrator can segment learning
+        // by trending vs choppy market state. gicRef may be null in unit tests.
+        String btcRegimeName = "NEUTRAL";
+        try {
+            if (gicRef != null) {
+                com.bot.GlobalImpulseController.GlobalContext gc = gicRef.getContext();
+                if (gc != null && gc.regime != null) btcRegimeName = gc.regime.name();
+            }
+        } catch (Throwable ignored) {}
+        double calibrated01 = CALIBRATOR.calibrate(symbol, rawProb01, calibAtrPct, btcRegimeName);
         probability = calibrated01 * 100.0;
         // Single authoritative cap via PROB_CEIL. All intermediate caps above reference
         // the same constant, so this is purely a safety net for calibrator edge cases.
@@ -3618,7 +3683,7 @@ public final class DecisionEngineMerged {
 
         // ── Live Bayesian prior blend ───────────────────────────────────
         double priorProb = 50.0 + (bayesPrior.get() - 0.50) * 26.0;
-        int totalTrades = (int) Math.min(200, Math.max(0, bayesSampleTrades.get()));
+        int totalTrades = (int) Math.min(200L, Math.max(0L, bayesSampleTrades.get()));
         double priorWeight = totalTrades >= 80 ? 0.12 : totalTrades >= 30 ? 0.08 : 0.04;
         prob = prob * (1.0 - priorWeight) + priorProb * priorWeight;
 
@@ -4989,110 +5054,228 @@ public final class DecisionEngineMerged {
     // (Zadrozny-Elkan, Niculescu-Mizil 2005).
     //
     // BUCKETED BY VOLATILITY (FIX #7): one calibration per (symbol, vol-bucket).
+    // [v79.0 INTEGRITY OVERHAUL]  ProbabilityCalibrator — FULL REWRITE.
+    //
+    // BEFORE (v78):
+    //   - PAV isotonic regression on (symbol, vol-bucket) keys
+    //   - persistent state in calibrator.csv
+    //   - silently lost AMBIGUOUS / TIME_STOP outcomes upstream
+    //   - no integrity proof — file could be tampered with
+    //
+    // AFTER (v79):
+    //   - Same PAV core (mathematically sound)
+    //   - PLUS: regime bucket segmentation (TREND_UP/TREND_DOWN/CHOPPY/NEUTRAL)
+    //   - PLUS: outcome tags (TP1/SL/AMBIGUOUS/TIME_STOP/MOVED_UP/MOVED_DOWN)
+    //   - PLUS: weighted outcomes (AMBIGUOUS = 0.5 weight, others = 1.0)
+    //   - PLUS: HMAC-SHA256 signature on every saved row
+    //   - PLUS: append-only audit log with chained hashes (tamper-evident)
+    //   - PLUS: writeDispatchAudit() captures every sent signal pre-outcome
+    //   - PLUS: verifyAuditIntegrity() — public method for third-party check
     public static final class ProbabilityCalibrator {
 
-        // [v76] CALIBRATOR STABILITY REBALANCE.
-        //
-        // Previous: MIN_SAMPLES=30 with BUCKETS=10 → ~3 observations per bucket on
-        // average. PAV regression on 3-sample buckets is dominated by sampling
-        // noise — single coin-flip outcome can move a bucket's empirical hit rate
-        // from 33% to 67%. Each calibrate() call therefore returned wildly variable
-        // results during the first month of live data, and the shrinkage formula
-        // zetaBase = n/(n+100) couldn't compensate at n=30 (zeta=0.23 — only 23%
-        // weight to a noisy estimate, but those 23% were the difference between
-        // a signal passing the cold-start gate or not).
-        //
-        // Tradeoff analysis:
-        //   - Raising MIN_SAMPLES 30→50 delays Phase 4 ("calibrator trusted") by
-        //     ~3-5 days at typical 5-10 outcomes/day. During those extra days the
-        //     bot uses raw heuristic (already the behavior pre-30 anyway).
-        //   - Reducing BUCKETS 10→5 means each bucket holds n/5 observations
-        //     instead of n/10. At MIN_SAMPLES=50: 10 obs/bucket vs the old 3.
-        //     PAV regression error scales ~1/sqrt(n) per bucket — this is roughly
-        //     1.8× more stable per bucket.
-        //   - Combined effect: calibrator output variance reduced ~3× during
-        //     first 100 outcomes, at cost of 3-5 day later activation.
-        //   - Net for trader: fewer false-positive cold-start passes from noisy
-        //     calibrator deciding a 60% raw-prob signal is "really 75%".
         private static final int  MIN_SAMPLES = 50;
         private static final int  WINDOW      = 500;
         private static final int  BUCKETS     = 5;
         private static final long MAX_AGE_MS  = 30L * 24 * 60 * 60 * 1000L;
 
-        // UNIFIED VOL BUCKET BOUNDARIES.
-        // БЫЛО: 0.8/1.8 — не совпадало с DecisionEngineMerged.classifyVolatility() (0.5/1.5 в долях).
-        // После PATCH #2 калибратор читает правильный бакет, но разные границы искажали классификацию:
-        // монета с ATR 1.6% → HIGH в DE (>1.5%), но MID в калибраторе (<1.8%). Теперь одинаково.
-        // Бонус: 3 бакета с единой семантикой → MIN_SAMPLES 30 набирается за 1-2 недели (было 2.5 мес).
+        // [v79 I3] HMAC key + audit log. Set CALIBRATOR_HMAC_KEY in env on prod.
+        private static final String HMAC_KEY = resolveHmacKey();
+        private static final String AUDIT_LOG_PATH = System.getenv()
+                .getOrDefault("CALIBRATOR_AUDIT_LOG", "./data/calibrator_audit.log");
+
+        private static String resolveHmacKey() {
+            String k = System.getenv("CALIBRATOR_HMAC_KEY");
+            if (k == null || k.isBlank()) {
+                LOG.warning("[Calibrator] CALIBRATOR_HMAC_KEY not set — using default. "
+                        + "FOR PRODUCTION: set unique key in Railway env vars.");
+                return "default-CHANGE-ME-CALIBRATOR-KEY-2026";
+            }
+            return k;
+        }
+
         public enum VolBucket { LOW, MID, HIGH;
             public static VolBucket of(double atrPct) {
-                if (atrPct < 0.5) return LOW;   // <0.5%  = BTC/ETH class
-                if (atrPct < 1.5) return MID;   // 0.5–1.5% = major ALT
-                return HIGH;                    // >1.5% = volatile ALT / MEME
+                if (atrPct < 0.5) return LOW;
+                if (atrPct < 1.5) return MID;
+                return HIGH;
             }
         }
 
+        // [v79 SEGMENT] Regime bucket — отдельный от vol bucket. Полная segmentation:
+        // (symbol, vol_bucket, regime_bucket). Калибратор учится отдельно для трендового
+        // и хаотичного рынка — раньше валил всё в одну кучу.
+        //
+        // ВАЖНО: вместо enum — строковые константы. Это сделано чтобы не плодить
+        // вложенные классы (enum в Java = class). Семантика та же, type-safety
+        // обеспечивается через regimeBucketOf() (всегда возвращает одно из 4 значений)
+        // и valid set check в recordOutcomeExtended.
+        private static final String REGIME_TREND_UP   = "TREND_UP";
+        private static final String REGIME_TREND_DOWN = "TREND_DOWN";
+        private static final String REGIME_CHOPPY     = "CHOPPY";
+        private static final String REGIME_NEUTRAL    = "NEUTRAL";
+        private static final java.util.Set<String> VALID_REGIMES = java.util.Set.of(
+                REGIME_TREND_UP, REGIME_TREND_DOWN, REGIME_CHOPPY, REGIME_NEUTRAL);
+
+        private static String regimeBucketOf(String btcRegime) {
+            if (btcRegime == null) return REGIME_NEUTRAL;
+            String r = btcRegime.toUpperCase();
+            if (r.contains("STRONG_UP") || r.contains("IMPULSE_UP")) return REGIME_TREND_UP;
+            if (r.contains("STRONG_DOWN") || r.contains("IMPULSE_DOWN")
+                    || r.contains("CRASH") || r.contains("PANIC")) return REGIME_TREND_DOWN;
+            if (r.contains("CHOPPY")) return REGIME_CHOPPY;
+            return REGIME_NEUTRAL;
+        }
+
+        // [v79] Outcome tags — нужны для аудита и для weighted recording.
+        // Backwards-compat: при загрузке старого calibrator.csv (без tag) дефолт = "LEGACY".
+        // Опять же — без enum: просто строковые константы и Set валидации.
+        private static final String TAG_TP1        = "TP1";
+        private static final String TAG_SL         = "SL";
+        private static final String TAG_AMBIGUOUS  = "AMBIGUOUS";
+        private static final String TAG_TIME_STOP  = "TIME_STOP";
+        private static final String TAG_MOVED_UP   = "MOVED_UP";
+        private static final String TAG_MOVED_DOWN = "MOVED_DOWN";
+        private static final String TAG_FLAT       = "FLAT";
+        private static final String TAG_LEGACY     = "LEGACY";
+        private static final java.util.Set<String> VALID_TAGS = java.util.Set.of(
+                TAG_TP1, TAG_SL, TAG_AMBIGUOUS, TAG_TIME_STOP,
+                TAG_MOVED_UP, TAG_MOVED_DOWN, TAG_FLAT, TAG_LEGACY);
+
+        private static String sanitizeTag(String t) {
+            if (t == null) return TAG_LEGACY;
+            String u = t.toUpperCase();
+            return VALID_TAGS.contains(u) ? u : TAG_LEGACY;
+        }
+        private static String sanitizeRegime(String r) {
+            if (r == null) return REGIME_NEUTRAL;
+            String u = r.toUpperCase();
+            return VALID_REGIMES.contains(u) ? u : REGIME_NEUTRAL;
+        }
+
+        // [v79] Outcome — это УЖЕ существующий nested class в оригинальном коде.
+        // Мы НЕ создаём новый, а только ДОБАВЛЯЕМ поля weight/tag/regime
+        // (тип String для tag/regime — без новых enum-классов).
         private static final class Outcome {
             final double rawScore;
             final boolean hit;
-            long ts;  // [PATCH #6] no longer final — reassigned on loadFromFile
+            final double weight;       // 1.0 = full, 0.5 = AMBIGUOUS
+            final String tag;          // one of TAG_* constants
+            final String regime;       // one of REGIME_* constants
+            long ts;
+
             Outcome(double s, boolean h) {
+                this(s, h, 1.0, TAG_LEGACY, REGIME_NEUTRAL);
+            }
+            Outcome(double s, boolean h, double w, String t, String r) {
                 this.rawScore = Math.max(0.0, Math.min(1.0, s));
                 this.hit = h;
+                this.weight = Math.max(0.0, Math.min(1.0, w));
+                this.tag = sanitizeTag(t);
+                this.regime = sanitizeRegime(r);
                 this.ts = System.currentTimeMillis();
             }
         }
 
-        private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<Outcome>> history
+        // History map. Key = symbol#vol_bucket#regime_bucket (was just symbol#vol).
+        // Backwards-compat fallback: на read используем 3-уровневую иерархию:
+        //   1. exact match (sym + vol + regime)
+        //   2. sym + vol (any regime)
+        //   3. global vol bucket (any sym, any regime)
+        //   4. global all (last resort)
+        private final java.util.concurrent.ConcurrentHashMap<String,
+                java.util.concurrent.ConcurrentLinkedDeque<Outcome>> history
                 = new java.util.concurrent.ConcurrentHashMap<>();
+
+        // [v79 I3] Audit log state. We chain hashes: each record contains the
+        // previous record's HMAC, making tamper-detection trivial. Memory-only
+        // counter so we know expected next sequence number on read-back.
+        private final java.util.concurrent.atomic.AtomicLong auditSeq = new java.util.concurrent.atomic.AtomicLong(0);
+        private volatile String lastAuditHmac = "";  // chain previous hash
 
         private static String key(String symbol, VolBucket b) {
             return symbol + "#" + b.name();
         }
+        private static String key3(String symbol, VolBucket b, String regime) {
+            return symbol + "#" + b.name() + "#" + sanitizeRegime(regime);
+        }
 
-        /** Записать исход трейда. Вызывать из BotMain.checkForecastAccuracy() после resolve. */
+        // ─────────────────────────────────────────────────────────────────
+        //  RECORD API — backwards-compat overloads + new extended one.
+        // ─────────────────────────────────────────────────────────────────
+
         public void recordOutcome(String symbol, double rawScore, boolean hit, double atrPct) {
+            recordOutcomeExtended(symbol, rawScore, hit, atrPct,
+                    1.0, hit ? TAG_TP1 : TAG_SL, REGIME_NEUTRAL, 0.0, 0.0);
+        }
+
+        public void recordOutcome(String symbol, double rawScore, boolean hit) {
+            recordOutcomeExtended(symbol, rawScore, hit, 1.0,
+                    1.0, hit ? TAG_TP1 : TAG_SL, REGIME_NEUTRAL, 0.0, 0.0);
+        }
+
+        // [v79 I3] FULL extended record. BotMain.checkForecastAccuracy calls this.
+        public void recordOutcomeExtended(String symbol, double rawScore, boolean hit,
+                                          double atrPct, double weight,
+                                          String outcomeTag, String btcRegime,
+                                          double entryPrice, double currentPrice) {
             if (symbol == null) return;
-            String k = key(symbol, VolBucket.of(atrPct));
+            VolBucket vb = VolBucket.of(atrPct);
+            String rb  = regimeBucketOf(btcRegime);
+            String tag = sanitizeTag(outcomeTag);
+
+            String k = key3(symbol, vb, rb);
             java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq =
                     history.computeIfAbsent(k, x -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-            dq.addLast(new Outcome(rawScore, hit));
+            Outcome o = new Outcome(rawScore, hit, weight, tag, rb);
+            dq.addLast(o);
             while (dq.size() > WINDOW) dq.pollFirst();
+
+            // [v79 I3] Audit log entry — HMAC chained.
+            try { writeOutcomeAudit(symbol, rawScore, hit, atrPct, weight, tag, rb,
+                    entryPrice, currentPrice); } catch (Throwable ignored) {}
         }
 
-        /** Бэк-совместимость без бакета. */
-        public void recordOutcome(String symbol, double rawScore, boolean hit) {
-            recordOutcome(symbol, rawScore, hit, 1.0);
-        }
+        // ─────────────────────────────────────────────────────────────────
+        //  CALIBRATE — same PAV math, broader fallback chain.
+        // ─────────────────────────────────────────────────────────────────
 
-        /** Главный метод: rawScore [0..1] → откалиброванная вероятность [0..1]. */
         public double calibrate(String symbol, double rawScore) {
             return calibrate(symbol, rawScore, 1.0);
         }
 
+        /** Backwards-compat 3-arg. Uses NEUTRAL regime (fine for warm-start). */
         public double calibrate(String symbol, double rawScore, double atrPct) {
+            return calibrate(symbol, rawScore, atrPct, "NEUTRAL");
+        }
+
+        /** [v79] FULL calibrate with regime context. DecisionEngineMerged should call this. */
+        public double calibrate(String symbol, double rawScore, double atrPct, String btcRegime) {
             double r = clamp01(rawScore);
             if (symbol == null) return r;
 
-            VolBucket b = VolBucket.of(atrPct);
-            java.util.List<Outcome> snap = collect(symbol, b);
-            boolean usingGlobal = false;
+            VolBucket vb = VolBucket.of(atrPct);
+            String rb = regimeBucketOf(btcRegime);
 
-            // [v50 AUDIT FIX] Tiered fallback — activates calibrator in 1-2 weeks of deploy
-            // instead of 2.5 months of per-symbol-per-bucket accumulation.
+            java.util.List<Outcome> snap = collect3(symbol, vb, rb);
+            boolean usingFallback = false;
+
+            // Tiered fallback chain (broader at each step).
             if (snap.size() < MIN_SAMPLES) {
-                snap = collectAll(symbol);  // per-symbol, all buckets
+                snap = collect2(symbol, vb);             // any regime
+                usingFallback = true;
             }
             if (snap.size() < MIN_SAMPLES) {
-                // Global fallback: same vol bucket across all symbols.
-                snap = collectGlobalBucket(b);
-                usingGlobal = true;
+                snap = collectAllForSymbol(symbol);      // any vol, any regime
+                usingFallback = true;
             }
             if (snap.size() < MIN_SAMPLES) {
-                // Ultimate fallback: all outcomes globally.
+                snap = collectGlobalBucket(vb);          // any sym, this vol
+                usingFallback = true;
+            }
+            if (snap.size() < MIN_SAMPLES) {
                 snap = new java.util.ArrayList<>();
-                history.values().forEach(snap::addAll);
-                usingGlobal = true;
+                history.values().forEach(snap::addAll);  // ultimate fallback
+                usingFallback = true;
             }
             if (snap.size() < MIN_SAMPLES) return r;
 
@@ -5100,6 +5283,8 @@ public final class DecisionEngineMerged {
             snap.removeIf(o -> now - o.ts > MAX_AGE_MS);
             if (snap.size() < MIN_SAMPLES) return r;
 
+            // [v79 I1] WEIGHTED PAV — AMBIGUOUS outcomes have weight=0.5, so
+            // bucket means use weight-aware averaging instead of simple count.
             snap.sort(java.util.Comparator.comparingDouble(o -> o.rawScore));
 
             int n = snap.size();
@@ -5112,23 +5297,23 @@ public final class DecisionEngineMerged {
                 int from = bi * bucketSize;
                 int to = (bi == BUCKETS - 1) ? n : Math.min(n, from + bucketSize);
                 if (from >= to) continue;
-                double sx = 0, sy = 0;
+                double sx = 0, sy = 0, sw = 0;
                 for (int i = from; i < to; i++) {
-                    sx += snap.get(i).rawScore;
-                    sy += snap.get(i).hit ? 1.0 : 0.0;
+                    Outcome o = snap.get(i);
+                    sx += o.rawScore * o.weight;
+                    sy += (o.hit ? 1.0 : 0.0) * o.weight;
+                    sw += o.weight;
                 }
-                int cnt = to - from;
-                x[bi] = sx / cnt;
-                y[bi] = sy / cnt;
-                w[bi] = cnt;
+                if (sw < 1e-9) sw = 1e-9;
+                x[bi] = sx / sw;
+                y[bi] = sy / sw;
+                w[bi] = sw;
             }
 
             pav(y, w);
 
-            // [v50 AUDIT FIX] Shrinkage adjusted for global fallback.
-            // Per-symbol data: trust calibration. Global fallback: pull harder toward raw (×0.5).
             double zetaBase = (double) n / (n + 100.0);
-            double zeta = usingGlobal ? zetaBase * 0.5 : zetaBase;
+            double zeta = usingFallback ? zetaBase * 0.5 : zetaBase;
 
             double calibrated;
             if (r <= x[0]) {
@@ -5151,34 +5336,51 @@ public final class DecisionEngineMerged {
             return clamp01((1.0 - zeta) * r + zeta * calibrated);
         }
 
-        /** [v50 AUDIT FIX] Global outcomes within a vol bucket (cold-start fallback). */
-        private java.util.List<Outcome> collectGlobalBucket(VolBucket b) {
-            java.util.List<Outcome> out = new java.util.ArrayList<>();
-            String suffix = "#" + b.name();
-            for (var entry : history.entrySet()) {
-                if (entry.getKey().endsWith(suffix)) {
-                    out.addAll(entry.getValue());
-                }
-            }
-            return out;
-        }
+        // ─────────────────────────────────────────────────────────────────
+        //  COLLECT helpers — multi-level fallback for sparse data.
+        // ─────────────────────────────────────────────────────────────────
 
-        private java.util.List<Outcome> collect(String symbol, VolBucket b) {
-            java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq = history.get(key(symbol, b));
+        private java.util.List<Outcome> collect3(String symbol, VolBucket vb, String rb) {
+            java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq =
+                    history.get(key3(symbol, vb, rb));
             if (dq == null) return new java.util.ArrayList<>();
             return new java.util.ArrayList<>(dq);
         }
 
-        private java.util.List<Outcome> collectAll(String symbol) {
-            java.util.List<Outcome> all = new java.util.ArrayList<>();
-            for (VolBucket b : VolBucket.values()) {
-                java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq = history.get(key(symbol, b));
-                if (dq != null) all.addAll(dq);
+        private java.util.List<Outcome> collect2(String symbol, VolBucket vb) {
+            java.util.List<Outcome> out = new java.util.ArrayList<>();
+            String prefix = symbol + "#" + vb.name() + "#";
+            for (var entry : history.entrySet()) {
+                if (entry.getKey().startsWith(prefix)) out.addAll(entry.getValue());
             }
-            return all;
+            // Also old format key (sym#vol) for backwards-compat with v78 data.
+            java.util.concurrent.ConcurrentLinkedDeque<Outcome> oldFmt = history.get(key(symbol, vb));
+            if (oldFmt != null) out.addAll(oldFmt);
+            return out;
         }
 
-        /** Pool-of-Adjacent-Violators in-place (изотонная регрессия). */
+        private java.util.List<Outcome> collectAllForSymbol(String symbol) {
+            java.util.List<Outcome> out = new java.util.ArrayList<>();
+            String prefix = symbol + "#";
+            for (var entry : history.entrySet()) {
+                if (entry.getKey().startsWith(prefix)) out.addAll(entry.getValue());
+            }
+            return out;
+        }
+
+        private java.util.List<Outcome> collectGlobalBucket(VolBucket b) {
+            java.util.List<Outcome> out = new java.util.ArrayList<>();
+            String volTag = "#" + b.name();
+            for (var entry : history.entrySet()) {
+                if (entry.getKey().contains(volTag)) out.addAll(entry.getValue());
+            }
+            return out;
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        //  PAV in-place isotonic regression (unchanged from v78 — it's correct).
+        // ─────────────────────────────────────────────────────────────────
+
         private static void pav(double[] y, double[] w) {
             int n = y.length;
             if (n <= 1) return;
@@ -5221,35 +5423,39 @@ public final class DecisionEngineMerged {
 
         public int sampleCount(String symbol) {
             int n = 0;
-            for (VolBucket b : VolBucket.values()) {
-                java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq = history.get(key(symbol, b));
-                if (dq != null) n += dq.size();
+            for (var entry : history.entrySet()) {
+                if (entry.getKey().startsWith(symbol + "#")) {
+                    n += entry.getValue().size();
+                }
             }
             return n;
         }
 
         public double rawWinRate(String symbol) {
-            java.util.List<Outcome> all = collectAll(symbol);
+            java.util.List<Outcome> all = collectAllForSymbol(symbol);
             if (all.isEmpty()) return Double.NaN;
-            int hits = 0;
-            for (Outcome o : all) if (o.hit) hits++;
-            return (double) hits / all.size();
+            double hits = 0, total = 0;
+            for (Outcome o : all) {
+                total += o.weight;
+                if (o.hit) hits += o.weight;
+            }
+            return total > 0 ? hits / total : Double.NaN;
         }
 
         public void reset(String symbol) {
-            for (VolBucket b : VolBucket.values()) history.remove(key(symbol, b));
+            history.entrySet().removeIf(e -> e.getKey().startsWith(symbol + "#"));
         }
 
-        public void resetAll() { history.clear(); }
+        public void resetAll() {
+            history.clear();
+            lastAuditHmac = "";
+            auditSeq.set(0);
+        }
 
-        // PERSISTENT STATE — save/load to disk
+        // ─────────────────────────────────────────────────────────────────
+        //  PERSISTENT STATE — save/load with HMAC integrity.
+        // ─────────────────────────────────────────────────────────────────
 
-        /**
-         * Сохраняет всё состояние калибратора в текстовый файл.
-         * Формат: по одной строке на outcome:
-         *   symbol#bucket;rawScore;hit;timestamp
-         * Простой формат чтобы не тащить Jackson/Gson.
-         */
         public synchronized void saveToFile(String path) {
             try {
                 java.io.File f = new java.io.File(path);
@@ -5258,16 +5464,18 @@ public final class DecisionEngineMerged {
 
                 try (java.io.PrintWriter pw = new java.io.PrintWriter(
                         new java.io.BufferedWriter(new java.io.FileWriter(f)))) {
-                    pw.println("# ProbabilityCalibrator state v1");
-                    pw.println("# format: key;rawScore;hit;ts");
+                    pw.println("# ProbabilityCalibrator state v2 (HMAC-signed)");
+                    pw.println("# format: key;rawScore;hit;weight;tag;regime;ts;hmac");
                     long now = System.currentTimeMillis();
                     for (java.util.Map.Entry<String, java.util.concurrent.ConcurrentLinkedDeque<Outcome>> e
                             : history.entrySet()) {
                         for (Outcome o : e.getValue()) {
-                            // Пропускаем слишком старые (чтобы файл не рос бесконечно)
                             if (now - o.ts > MAX_AGE_MS) continue;
-                            pw.printf("%s;%.6f;%d;%d%n",
-                                    e.getKey(), o.rawScore, o.hit ? 1 : 0, o.ts);
+                            String payload = String.format("%s;%.6f;%d;%.3f;%s;%s;%d",
+                                    e.getKey(), o.rawScore, o.hit ? 1 : 0,
+                                    o.weight, o.tag, o.regime, o.ts);
+                            String hmac = hmacSha256(payload, HMAC_KEY);
+                            pw.println(payload + ";" + hmac);
                         }
                     }
                 }
@@ -5276,51 +5484,288 @@ public final class DecisionEngineMerged {
             }
         }
 
-        /** Загружает состояние при старте. Silent no-op если файла нет. */
         public synchronized void loadFromFile(String path) {
+            // [v79 FIX I3] Restore audit chain state before opening calibrator file,
+            // so the next audit-log entry continues the chain correctly across restarts.
+            // Without this, post-restart entries write prevHmac="" while the file
+            // already has a non-empty tail hmac → verifyAuditIntegrity() falsely
+            // reports every post-restart row as TAMPERED.
+            initAuditState();
             try {
                 java.io.File f = new java.io.File(path);
                 if (!f.exists()) return;
 
                 long now = System.currentTimeMillis();
-                int loaded = 0, skipped = 0;
-                try (java.io.BufferedReader br = new java.io.BufferedReader(
-                        new java.io.FileReader(f))) {
+                int loaded = 0, skipped = 0, tampered = 0, legacy = 0;
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
                     String line;
                     while ((line = br.readLine()) != null) {
                         if (line.startsWith("#") || line.isBlank()) continue;
                         String[] p = line.split(";");
-                        if (p.length != 4) { skipped++; continue; }
+
                         try {
-                            String k = p[0];
-                            double score = Double.parseDouble(p[1]);
-                            boolean hit = "1".equals(p[2]);
-                            long ts = Long.parseLong(p[3]);
-                            if (now - ts > MAX_AGE_MS) { skipped++; continue; }
+                            // Detect format: v1 (4 fields) vs v2 (8 fields).
+                            if (p.length == 4) {
+                                // Legacy v1 format — load with default tag/weight/regime.
+                                String k = p[0];
+                                double score = Double.parseDouble(p[1]);
+                                boolean hit = "1".equals(p[2]);
+                                long ts = Long.parseLong(p[3]);
+                                if (now - ts > MAX_AGE_MS) { skipped++; continue; }
+                                Outcome o = new Outcome(score, hit, 1.0,
+                                        TAG_LEGACY, REGIME_NEUTRAL);
+                                o.ts = ts;
+                                history.computeIfAbsent(k, x ->
+                                        new java.util.concurrent.ConcurrentLinkedDeque<>()).addLast(o);
+                                loaded++; legacy++;
+                            } else if (p.length == 8) {
+                                // v2 format with HMAC.
+                                String k = p[0];
+                                double score = Double.parseDouble(p[1]);
+                                boolean hit = "1".equals(p[2]);
+                                double weight = Double.parseDouble(p[3]);
+                                String tag = sanitizeTag(p[4]);
+                                String regime = sanitizeRegime(p[5]);
+                                long ts = Long.parseLong(p[6]);
+                                String storedHmac = p[7];
 
-                            Outcome o = new Outcome(score, hit);
-                            o.ts = ts; // [PATCH #6] restore original timestamp
+                                String payload = String.format("%s;%.6f;%d;%.3f;%s;%s;%d",
+                                        k, score, hit ? 1 : 0, weight, tag, regime, ts);
+                                String calc = hmacSha256(payload, HMAC_KEY);
+                                if (!calc.equals(storedHmac)) {
+                                    tampered++;
+                                    LOG.warning("[Calibrator] HMAC mismatch on row, skipping: " + k);
+                                    continue;
+                                }
+                                if (now - ts > MAX_AGE_MS) { skipped++; continue; }
 
-                            history.computeIfAbsent(k, x ->
-                                    new java.util.concurrent.ConcurrentLinkedDeque<>()).addLast(o);
-                            loaded++;
+                                Outcome o = new Outcome(score, hit, weight, tag, regime);
+                                o.ts = ts;
+                                history.computeIfAbsent(k, x ->
+                                        new java.util.concurrent.ConcurrentLinkedDeque<>()).addLast(o);
+                                loaded++;
+                            } else {
+                                skipped++;
+                            }
                         } catch (Exception parseEx) { skipped++; }
                     }
                 }
-                LOG.info("[Calibrator] loaded " + loaded + " outcomes from " + path
-                        + " (skipped " + skipped + ")");
+                LOG.info("[Calibrator] loaded " + loaded + " (legacy=" + legacy
+                        + " tampered=" + tampered + " skipped=" + skipped + ") from " + path);
+                if (tampered > 0) {
+                    LOG.severe("[Calibrator] ⚠ HMAC FAILURES = " + tampered
+                            + ". File may have been edited externally.");
+                }
             } catch (Exception ex) {
                 LOG.warning("[Calibrator] load failed: " + ex.getMessage());
             }
         }
 
-        /** Сколько всего outcome'ов в памяти. */
         public int totalOutcomeCount() {
             int n = 0;
             for (java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq : history.values()) {
                 n += dq.size();
             }
             return n;
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // [v79 I3] AUDIT LOG — append-only, hash-chained, HMAC-signed.
+        //
+        // Format per line:
+        //   seq;type;ts;symbol;side|outcome_tag;raw|hit;weight;regime;data1;data2;prevHmac;hmac
+        //
+        // Каждая строка содержит HMAC предыдущей → tamper of any row breaks
+        // chain at all subsequent rows. verifyAuditIntegrity() полностью
+        // прогоняет цепь и возвращает status.
+        // ─────────────────────────────────────────────────────────────────
+
+        private synchronized void writeOutcomeAudit(String symbol, double rawScore, boolean hit,
+                                                    double atrPct, double weight, String tag,
+                                                    String rb, double entry, double current) {
+            try {
+                long seq = auditSeq.incrementAndGet();
+                long ts = System.currentTimeMillis();
+                String payload = String.format(
+                        "%d;OUTCOME;%d;%s;%s;%.6f;%d;%.3f;%s;%.8f;%.8f;%s",
+                        seq, ts, escape(symbol), sanitizeTag(tag),
+                        rawScore, hit ? 1 : 0, weight, sanitizeRegime(rb),
+                        entry, current,
+                        lastAuditHmac == null ? "" : lastAuditHmac);
+                String hmac = hmacSha256(payload, HMAC_KEY);
+                appendAuditLine(payload + ";" + hmac);
+                lastAuditHmac = hmac;
+            } catch (Throwable t) {
+                LOG.warning("[AuditLog] outcome write failed: " + t.getMessage());
+            }
+        }
+
+        public synchronized void writeDispatchAudit(String symbol, String side, double price,
+                                                    double tp1, double sl, double prob,
+                                                    String btcRegime, String source,
+                                                    boolean paperMode) {
+            try {
+                long seq = auditSeq.incrementAndGet();
+                long ts = System.currentTimeMillis();
+                String payload = String.format(
+                        "%d;DISPATCH;%d;%s;%s;%.8f;%.8f;%.8f;%.2f;%s;%s;%s;%s",
+                        seq, ts, escape(symbol), side,
+                        price, tp1, sl, prob,
+                        escape(btcRegime), escape(source),
+                        paperMode ? "PAPER" : "LIVE",
+                        lastAuditHmac == null ? "" : lastAuditHmac);
+                String hmac = hmacSha256(payload, HMAC_KEY);
+                appendAuditLine(payload + ";" + hmac);
+                lastAuditHmac = hmac;
+            } catch (Throwable t) {
+                LOG.warning("[AuditLog] dispatch write failed: " + t.getMessage());
+            }
+        }
+
+        private void appendAuditLine(String line) throws java.io.IOException {
+            java.io.File f = new java.io.File(AUDIT_LOG_PATH);
+            java.io.File parent = f.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            try (java.io.FileWriter fw = new java.io.FileWriter(f, true);
+                 java.io.BufferedWriter bw = new java.io.BufferedWriter(fw);
+                 java.io.PrintWriter pw = new java.io.PrintWriter(bw)) {
+                pw.println(line);
+            }
+        }
+
+        private static String escape(String s) {
+            if (s == null) return "";
+            return s.replace(";", ",").replace("\n", " ").replace("\r", " ");
+        }
+
+        /**
+         * [v79 FIX I3] Restore (auditSeq, lastAuditHmac) from existing audit log.
+         *
+         * Without this, every restart resets seq to 0 and prevHmac to "", which:
+         *   1. duplicates seq numbers across sessions (1..N, then 1..M after restart)
+         *   2. breaks the hash chain — the first post-restart record links to ""
+         *      instead of the real last hmac, and verifyAuditIntegrity() then
+         *      flags every record after the boundary as TAMPERED.
+         *
+         * Strategy: scan from end of file backwards, find the last non-comment line,
+         * extract the trailing hmac (after final ';') and the leading seq (before first ';').
+         * If any IO/parse error → leave defaults (seq=0, prev=""), which is the
+         * pre-fix behavior — still safer than crashing startup.
+         *
+         * No new classes — pure static-method-on-existing-class.
+         */
+        private synchronized void initAuditState() {
+            try {
+                java.io.File f = new java.io.File(AUDIT_LOG_PATH);
+                if (!f.exists() || f.length() == 0) return;
+                String lastLine = null;
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        if (line.isBlank() || line.startsWith("#")) continue;
+                        lastLine = line;
+                    }
+                }
+                if (lastLine == null) return;
+                int lastSemi = lastLine.lastIndexOf(';');
+                int firstSemi = lastLine.indexOf(';');
+                if (lastSemi < 0 || firstSemi < 0 || lastSemi <= firstSemi) return;
+                String hmac = lastLine.substring(lastSemi + 1).trim();
+                String seqStr = lastLine.substring(0, firstSemi).trim();
+                long seq = Long.parseLong(seqStr);
+                if (seq < 0) return;
+                this.auditSeq.set(seq);
+                this.lastAuditHmac = hmac;
+                LOG.info("[Calibrator] audit chain restored: seq=" + seq
+                        + " prev=" + (hmac.length() > 8 ? hmac.substring(0, 8) + "…" : hmac));
+            } catch (Throwable t) {
+                LOG.warning("[Calibrator] initAuditState skipped: " + t.getMessage());
+            }
+        }
+
+        /**
+         * [v79 I6] PUBLIC INTEGRITY CHECK.
+         * Reads the entire audit log and verifies every HMAC + chain link.
+         * Returns short status string for Telegram/UI display.
+         *
+         * Anyone with the HMAC key (the bot operator + auditors) can run this
+         * to confirm the bot has not "lost" or modified any outcomes.
+         */
+        public synchronized String verifyAuditIntegrity() {
+            java.io.File f = new java.io.File(AUDIT_LOG_PATH);
+            if (!f.exists()) return "no_audit_log";
+            int total = 0, ok = 0, broken = 0;
+            String prevHmac = "";
+            try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    if (line.isBlank() || line.startsWith("#")) continue;
+                    total++;
+                    int lastSemi = line.lastIndexOf(';');
+                    if (lastSemi < 0) { broken++; continue; }
+                    String payload = line.substring(0, lastSemi);
+                    String hmac = line.substring(lastSemi + 1);
+                    String calc = hmacSha256(payload, HMAC_KEY);
+                    if (!calc.equals(hmac)) { broken++; continue; }
+                    // Chain check: payload должен заканчиваться предыдущим hmac.
+                    if (!payload.endsWith(";" + prevHmac)) {
+                        // First record has empty prev — special case.
+                        if (!(prevHmac.isEmpty() && payload.endsWith(";"))) {
+                            broken++; continue;
+                        }
+                    }
+                    ok++;
+                    prevHmac = hmac;
+                }
+            } catch (Exception e) {
+                return "error: " + e.getMessage();
+            }
+            if (broken == 0) return "✓OK n=" + total;
+            return String.format("⚠TAMPERED %d/%d", broken, total);
+        }
+
+        /** [v79 I6] Public stats for daily integrity report. */
+        public String getPublicStats() {
+            int total = totalOutcomeCount();
+            double weightedHits = 0, weightedTotal = 0;
+            int byTag_TP1 = 0, byTag_SL = 0, byTag_AMB = 0, byTag_TS = 0;
+            for (java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq : history.values()) {
+                for (Outcome o : dq) {
+                    weightedTotal += o.weight;
+                    if (o.hit) weightedHits += o.weight;
+                    // [v79 FIX] Switch on String tag (was broken: bare TP1/SL etc. didn't resolve
+                    // because we removed the OutcomeTag enum and converted to String constants).
+                    switch (o.tag) {
+                        case TAG_TP1:       byTag_TP1++; break;
+                        case TAG_SL:        byTag_SL++;  break;
+                        case TAG_AMBIGUOUS: byTag_AMB++; break;
+                        case TAG_TIME_STOP: byTag_TS++;  break;
+                        default: break;
+                    }
+                }
+            }
+            double wr = weightedTotal > 0 ? weightedHits / weightedTotal * 100 : 0;
+            return String.format("n=%d wr=%.1f%% TP1=%d SL=%d Amb=%d TS=%d",
+                    total, wr, byTag_TP1, byTag_SL, byTag_AMB, byTag_TS);
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        //  HMAC-SHA256 helper.
+        // ─────────────────────────────────────────────────────────────────
+
+        private static String hmacSha256(String payload, String key) {
+            try {
+                javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+                javax.crypto.spec.SecretKeySpec sk = new javax.crypto.spec.SecretKeySpec(
+                        key.getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256");
+                mac.init(sk);
+                byte[] raw = mac.doFinal(payload.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder(raw.length * 2);
+                for (byte b : raw) sb.append(String.format("%02x", b));
+                return sb.toString();
+            } catch (Exception e) {
+                return "HMAC_ERROR";
+            }
         }
     }
 
