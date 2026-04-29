@@ -1272,28 +1272,11 @@ public final class SignalSender {
                 idea = rebuildIdea(idea, Math.max(0, idea.probability - 6), evFlags);
             }
 
-            // [v50 AUDIT FIX] Adaptive MAX SL% — by volatility bucket × balance scaling.
-            // Old: fixed 3%/5% by balance. Problem: a HIGH_VOL ALT with legit 6% structural stop
-            // was blocked, while a MEME with 4.9% stop (noise) passed. Now stop width is judged
-            // against the coin's natural volatility, not account size.
-            double signalSlPct = Math.abs(idea.price - idea.stop) / idea.price;
-            // Derive vol bucket from the SL distance as proxy (robust: analyze() sized SL using robustAtr)
-            com.bot.DecisionEngineMerged.VolatilityBucket bucket =
-                    com.bot.DecisionEngineMerged.classifyVolatility(signalSlPct * 0.5);
-            double volMaxSlPct = switch (bucket) {
-                case LOW     -> 0.012;
-                case MEDIUM  -> 0.025;
-                case HIGH    -> 0.045;
-                case EXTREME -> 0.075;
-            };
-            double balScale = accountBalance < 50  ? 0.6
-                    : accountBalance < 150 ? 0.8 : 1.0;
-            double maxSlPct = volMaxSlPct * balScale;
-            if (signalSlPct > maxSlPct) {
-                System.out.printf("[SL-GATE] %s BLOCKED: SL=%.2f%% > vol-max=%.2f%% (bucket=%s, balScale=%.2f)%n",
-                        pair, signalSlPct * 100, maxSlPct * 100, bucket, balScale);
-                return null;
-            }
+            // SL is authoritative via DecisionEngine.volBucket.maxStopPct
+            // (LOW=4% / MED=6% / HIGH=9% / EXT=14%). Дублирующий SS-уровень
+            // с другими константами (1.2/2.5/4.5/7.5%) создавал конфликт:
+            // DE выпускал валидный SL=4.32% для HIGH-bucket, SS блокировал на 3.6%.
+            // Источник SL — один (DE), повторная гейтировка убрана.
 
             // OLD: earlyMinConf = effConf + symbolBoost + qualityPenalty (could reach 80%+)
             // NEW: earlyMinConf = effConf + symbolBoost (max ~68+4=72%, actually achievable)

@@ -3108,10 +3108,10 @@ public final class DecisionEngineMerged {
         // At 0.2% every single ALT would trigger HIGH_ATR — meaningless label.
         if (robustAtrPct > 0.015) allFlags.add("HIGH_ATR");
 
-        // [v70] Noise gates: convert hard blocks to soft penalties.
-        // Прежде: noiseScore > 2.8 = hard reject ниже minConf. Эффект — шумные
-        // монеты (все altcoin-ы с хвостами) не могли генерировать сигналы вообще.
-        // Теперь: penalty применяется, но без hard-reject — probability decides.
+        // Noise → soft penalty only. Final minConf gate decides.
+        // Прежний combo-reject (noise>2.7 AND prob<50) был double-penalty:
+        // -15 за noise + reject за low-prob после того же штрафа. Если probability
+        // после -15 всё ещё прошла minConf, сетап валидный — пусть идёт дальше.
         if (noiseScore > 2.8) {
             probability = Math.max(0, probability - 15);
             allFlags.add("HIGH_NOISE");
@@ -3119,13 +3119,13 @@ public final class DecisionEngineMerged {
             probability = Math.max(0, probability - 8);
             allFlags.add("MOD_NOISE");
         }
-        // Combo guard stays, but tightened — only block truly broken setups
-        // [v71] Threshold 2.4→2.7, prob 58→50. До этой строки УЖЕ снято -8 за noise>2.2
-        // (line above) — повторная hard-блокировка была double-penalty. Теперь срабатывает
-        // только для реально сломанных сетапов (high noise + очень низкая probability).
-        if (noiseScore > 2.7 && probability < 50.0) {
-            allFlags.add("NOISE_PROB_COMBO_BLOCK");
-            return reject("noise_prob_combo");
+        if (probability < minConf) {
+            String bucket;
+            double gap = minConf - probability;
+            if (gap < 3.0)      bucket = "prob_lt_minConf_postNoise_NEAR";
+            else if (gap < 7.0) bucket = "prob_lt_minConf_postNoise_MID";
+            else                bucket = "prob_lt_minConf_postNoise_FAR";
+            return reject(bucket);
         }
 
         // СТОП И ТЕЙК — [v37.0] ROBUST STRUCTURAL STOP PLACEMENT

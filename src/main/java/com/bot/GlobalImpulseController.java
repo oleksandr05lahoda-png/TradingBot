@@ -513,8 +513,14 @@ public final class GlobalImpulseController {
         //
         // Symmetric LONG guard: BTC_STRONG_UP + BTC_IMPULSE_UP → veto SHORT
         //
+        // Symmetric thresholds: STRONG_UP gates LONG-only at rawStr>0.82,
+        // IMPULSE_UP теперь gates на 0.78 (было 0.72). 0.72 срабатывал слишком
+        // рано — в "переходной" зоне 0.72-0.78 шорт-сигналы получали hard veto
+        // на каждом цикле (см. лог gic_btcup_short_veto=7). При 0.78+ это
+        // realistic STRONG-impulse, шорт против него действительно опасен.
+        // В зоне 0.65-0.78 продолжает работать longSuppressionMult / penalty.
         boolean onlyLong  = (regime == GlobalRegime.BTC_STRONG_UP  && rawStrength > 0.82)
-                || (regime == GlobalRegime.BTC_IMPULSE_UP  && rawStrength > 0.72);
+                || (regime == GlobalRegime.BTC_IMPULSE_UP  && rawStrength > 0.78);
 
         boolean onlyShort = (regime == GlobalRegime.BTC_STRONG_DOWN && rawStrength > 0.78)
                 || (regime == GlobalRegime.BTC_CRASH)
