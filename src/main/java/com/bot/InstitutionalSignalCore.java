@@ -19,11 +19,13 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public final class InstitutionalSignalCore {
 
-    // [v71] MAX_EFFECTIVE_MIN_CONF 60→56. Синхронизация с DE.MIN_CONF_FLOOR=52
-    // и SignalSender.MIN_CONF=53. Старый потолок 60 не давал ISC снизить порог
-    // достаточно даже при отличном track record — daily penalty +2 двигал base
-    // выше потолка и порог застревал на 60 (выше чем фильтр в SignalSender).
-    private static final double MAX_EFFECTIVE_MIN_CONF = 56.0;
+    // [FIX-ROUND2 2026-05-02] MAX_EFFECTIVE_MIN_CONF 56 → 62.
+    // Синхронизация с DE.MIN_CONF_FLOOR=58 и SignalSender.MIN_CONF=58.
+    // Старый потолок 56 был НИЖЕ нового MIN_CONF=58 — это означало что ISC
+    // никогда не мог поднять порог даже при daily loss / SL streak. ISC де-факто
+    // становился бесполезным фильтром. Новый cap 62 = MIN_CONF + 4 (как в
+    // SignalSender.iscCap) — ISC может реально работать как track-record adjuster.
+    private static final double MAX_EFFECTIVE_MIN_CONF = 62.0;
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
@@ -47,7 +49,7 @@ public final class InstitutionalSignalCore {
                 envInt("ISC_MAX_GLOBAL_SIGNALS", 10),
                 envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
                 envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
-                envDouble("ISC_BASE_MIN_CONF", 50.0),
+                envDouble("ISC_BASE_MIN_CONF", 56.0),  // [FIX-ROUND2] 50 → 56
                 envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003),
                 envInt("ISC_MAX_SAME_SECTOR_DIR", 2)
         );
@@ -443,15 +445,17 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [v71] floor 50→47, milestones 46→44 / 48→45.
-        // Синхронизация с DE.MIN_CONF_FLOOR=52: ISC должен ВСЕГДА быть ниже DE
-        // на 3-5pt margin, иначе становится дублирующим фильтром. Реальная
-        // защита качества — Dispatcher cold-start gate (53/57) и калибратор.
-        double floor = 47.0;
+        // [FIX-ROUND2 2026-05-02] floor 47 → 54, milestones tightened.
+        // Синхронизация с новым DE.MIN_CONF_FLOOR=58 и SignalSender.MIN_CONF=58.
+        // Старый floor 47 позволял ISC ронять порог до 47 при отличном
+        // track record — это было НИЖЕ DE-floor=58 → де-факто ISC никогда
+        // не работал как ужесточающий фильтр. Новый floor 54 = MIN_CONF - 4,
+        // даёт ISC реальное пространство для adjustment без ослабления гейта.
+        double floor = 54.0;
         int totalTrades = getTotalTradeCount();
         double overallWr = getOverallWinRate();
-        if (totalTrades >= 500 && overallWr >= 0.58) floor = 44.0;
-        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 45.0;
+        if (totalTrades >= 500 && overallWr >= 0.58) floor = 51.0;
+        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 52.0;
 
         double base = Math.max(baseMinConfidence, floor);
 

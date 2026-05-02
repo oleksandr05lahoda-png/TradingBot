@@ -72,7 +72,13 @@ public final class PumpHunter {
     private static final long   EXH_PUMP_AGE_MS = 10 * 60_000L; // exhaustion only valid within 10min after pump
     private static final double EXH_VOL_DROP    = 0.65;          // recent vol < 65% of peak = divergence
     private static final double EXH_WICK_RATIO  = 0.50;          // avg upper wick > 50% body
-    private static final int    EXH_MIN_FLAGS   = 2;             // at least 2 of {volDiv, longWicks, slowdown}
+    // [FIX-9PCT 2026-05-02] EXH_MIN_FLAGS 2 → 3.
+    // На 2 флагах detectExhaustion срабатывал на каждой нормальной коррекции
+    // внутри тренда (volume divergence + wick growth — оба ЕСТЕСТВЕННЫ
+    // во время отката). Это был источник массовых SHORT-сигналов на росте.
+    // На 3 флагах требуется ВСЕ три (vol_div + wick + slowdown) — реальное
+    // exhaustion, не просто откат.
+    private static final int    EXH_MIN_FLAGS   = 3;             // at least all 3 of {volDiv, longWicks, slowdown}
 
     // [C] Pre-pump thresholds
     private static final double PRE_COMPRESSION   = 0.60;  // atr(7) < 60% atr(20) = compression
@@ -454,8 +460,11 @@ public final class PumpHunter {
         if (!(recent.isBullish() || recent.isBearish())) return null;
         if (recent.isReversal() || recent.isAnticipatory()) return null; // don't stack
         if (System.currentTimeMillis() - recent.timestamp > EXH_PUMP_AGE_MS) return null;
-        // Skip if the recent event itself is weak — no edge trying to fade noise
-        if (recent.strength < 0.45) return null;
+        // [FIX-9PCT 2026-05-02] Strength threshold 0.45 → 0.65.
+        // На 0.45 detectExhaustion срабатывал даже на слабых пампах
+        // (которые часто и не пампы вовсе, а просто шумовое движение).
+        // 0.65 = только реально мощные импульсы заслуживают reversal-внимания.
+        if (recent.strength < 0.65) return null;
 
         int n = c1m.size();
         boolean wasBullish = recent.isBullish(); // pump-up → we look for top (SHORT)

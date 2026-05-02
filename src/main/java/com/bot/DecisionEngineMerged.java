@@ -130,16 +130,17 @@ public final class DecisionEngineMerged {
     // RANGE penalty -2→-0.5, ALT -1→0) валидный 3-cluster setup в плоском рынке
     // выдаёт 53-58. С floor=55 он валился. С floor=52 — проходит, но Dispatcher
     // cold-start gate (53/57) и калибратор остаются authoritative quality control.
-    // [v78.1] Floor lowered 52→48 to align with Dispatcher Phase 1 (BotMain:351).
-    // Authoritative quality control lives downstream:
-    //   1) BotMain.Dispatcher progressive gate (48→50→calibrator)
-    //   2) ProbabilityCalibrator isotonic regression (after 20+ outcomes)
-    //   3) ISC effective floor (47, ISC.java:444)
-    // DE floor at 52 made all three downstream gates dead code on cold-start.
-    private static final double BASE_CONF       = 48.0;
+    // [FIX-9PCT 2026-05-02] BASE_CONF 48 → 58 / FLOOR 48 → 58 / CEIL 76 → 80.
+    // Корневая причина 9% WR (6/68 wins): пороги были снижены до уровня шума.
+    // На WR=9% downstream Dispatcher / Calibrator / ISC уже не успевали
+    // отфильтровать слабые сигналы — слишком много мусора пробивало DE-этап.
+    // Возврат к v70-уровню: только сигналы с реальной структурной идеей
+    // доходят до калибратора. Бот будет молчать чаще — это правильно при
+    // NEUTRAL BTC. Меньше плохих сигналов = больше edge.
+    private static final double BASE_CONF       = 58.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 48.0;
-    private static final double MIN_CONF_CEIL   = 76.0;
+    private static final double MIN_CONF_FLOOR  = 58.0;
+    private static final double MIN_CONF_CEIL   = 80.0;
 
     // Дивергенции — штраф вместо хард-лока
     private static final double DIV_PENALTY_SCORE  = 0.55;
@@ -172,6 +173,9 @@ public final class DecisionEngineMerged {
     // [v69] Отдельный per-symbol skip для post-pump пар. Key = symbol, value = until-timestamp.
     // Не переиспользуем cooldownMap (у того другая semantics: time-of-last-signal, key=sym_side).
     private final Map<String, Long>             postPumpSkipUntil = new ConcurrentHashMap<>();
+    // [FIX-SYM 2026-05-02] Зеркало postPumpSkipUntil для post-dump bounce кейсов
+    // (SHORT в отскок ножа после капитуляции). Аналогичный 30-min cooldown.
+    private final Map<String, Long>             postDumpSkipUntil = new ConcurrentHashMap<>();
     private final Map<String, Deque<String>>    recentDirs       = new ConcurrentHashMap<>();
     private final Map<String, Double>           lastSigPrice     = new ConcurrentHashMap<>();
     private final Map<String, FundingOIData>    fundingCache     = new ConcurrentHashMap<>();
@@ -1500,6 +1504,12 @@ public final class DecisionEngineMerged {
             if (now < ppUntil) return reject("post_pump_cooldown");
             postPumpSkipUntil.remove(symbol); // expired
         }
+        // [FIX-SYM 2026-05-02] Зеркальный ранний выход для post-dump bounce.
+        Long pdUntil = postDumpSkipUntil.get(symbol);
+        if (pdUntil != null) {
+            if (now < pdUntil) return reject("post_dump_cooldown");
+            postDumpSkipUntil.remove(symbol); // expired
+        }
 
         double price     = last(c15).close;
         double atr14     = atr(c15, 14);
@@ -1516,6 +1526,9 @@ public final class DecisionEngineMerged {
         com.bot.GlobalImpulseController.GlobalContext gicCtx =
                 gicRef != null ? gicRef.getContext() : null;
         boolean aggressiveShort = gicRef != null && gicRef.isAggressiveShortMode();
+        // [FIX-SYM 2026-05-02] Зеркало aggressiveShort — используется для override
+        // gicOnlyShort веток. GIC уже имеет isAggressiveLongMode() (см. GIC v69).
+        boolean aggressiveLongMode = gicRef != null && gicRef.isAggressiveLongMode();
         double btcCrashScore    = gicCtx != null ? gicCtx.btcCrashScore : 0.0;
         double btcAccel         = gicCtx != null ? gicCtx.btcMomentumAccel : 0.0;
         double gicShortBoost    = gicCtx != null ? gicCtx.shortBoost : 1.0;
@@ -1524,12 +1537,39 @@ public final class DecisionEngineMerged {
         // Old code: if (confAdj < -50) longSuppression = (confAdj+150)/100 — opaque and fragile.
         double gicLongSuppression = gicCtx != null ? gicCtx.longSuppressionMult : 1.0;
 
+        // [FIX-ROUND2 2026-05-02] Симметричный shortSuppression — самая
+        // важная асимметрия в коде. GIC уже подавляет LONG при любой
+        // слабости BTC (longSuppressionMult 0.30-0.90 при DANGER/WATCH/
+        // IMPULSE_DOWN/STRONG_DOWN). Но НЕТ зеркального для SHORT при
+        // силе BTC (IMPULSE_UP/STRONG_UP). Это и был встроенный SHORT-bias.
+        // Вычисляем зеркальную формулу здесь же в DE — не трогая GIC class.
+        double gicShortSuppression = 1.0;
+        if (gicCtx != null && !aggressiveShort) {
+            // Mirror longSuppressionMult logic but for BTC up moves.
+            // Trigger: BTC_STRONG_UP с rawStrength≥0.60 → жёсткое подавление SHORT.
+            //          BTC_IMPULSE_UP с rawStrength≥0.50 → умеренное.
+            //          aggressiveLong (cascadeLevel-эквивалент для UP) → промежуточное.
+            boolean btcDecelerating = btcAccel < 0.002 && gicCtx.impulseStrength < 0.65;
+            if (gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP
+                    && gicCtx.impulseStrength >= 0.60) {
+                if (btcDecelerating) gicShortSuppression = 0.55;
+                else                 gicShortSuppression = 0.30;
+            } else if (gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP
+                    && gicCtx.impulseStrength >= 0.50) {
+                if (btcDecelerating) gicShortSuppression = 0.78;
+                else                 gicShortSuppression = 0.55;
+            }
+        }
+
         // GIC DIRECTIONAL GATE — consume onlyLong / onlyShort that were
         // previously computed in GIC but never enforced in generate().
         // onlyLong  = BTC_STRONG_UP + strength > 0.82  → veto all SHORT signals
         // onlyShort = BTC_STRONG_DOWN / CRASH / PANIC + strength > 0.78 → veto all LONG signals
         // Applied BEFORE cluster computation so we don't waste CPU on blocked directions.
         // Exception: aggressiveShort overrides onlyLong (crash trumps BTC up-trend for altcoins).
+        // [FIX-SYM 2026-05-02] Зеркальный exception: aggressiveLongMode перекрывает
+        // onlyShort (BTC strong-up trumps onlyShort). Раньше onlyShort был жёстким
+        // вето без override — это был встроенный SHORT-bias на уровне GIC gate.
         if (gicCtx != null) {
             if (gicCtx.onlyLong && !aggressiveShort) {
                 // BTC in extreme up-impulse — only LONG signals allowed on alts
@@ -1537,14 +1577,15 @@ public final class DecisionEngineMerged {
                 // candidateSide not known yet, so we store as pre-filter flag;
                 // actual veto happens post-candidate-selection below via earlyReturn sentinel
             }
-            if (gicCtx.onlyShort) {
+            if (gicCtx.onlyShort && !aggressiveLongMode) {
                 // BTC crashing — LONG on alts = catching a falling knife
                 // Hard veto: no LONG signals during BTC CRASH/PANIC mode
+                // Exception: aggressiveLongMode (BTC own strong-up) overrides
             }
         }
         // Sentinel booleans for post-candidate veto (direction known after cluster aggregation)
         final boolean gicOnlyLong  = gicCtx != null && gicCtx.onlyLong  && !aggressiveShort;
-        final boolean gicOnlyShort = gicCtx != null && gicCtx.onlyShort;
+        final boolean gicOnlyShort = gicCtx != null && gicCtx.onlyShort && !aggressiveLongMode;
 
         MarketContext mctx = buildMarketContext(c15, price);
         MarketState state  = detectState(c15);
@@ -1558,13 +1599,18 @@ public final class DecisionEngineMerged {
         // Applied AFTER candidateSide is known (see veto below).
         LocalExhaustion localExh = detectLocalExhaustion(c15, atr14);
 
-        // POST-PUMP DETECTION
-        // Кейс SOONUSDT: +105% за ночь, потом -20% от хая → бот дал LONG в
-        // свободном падении. Блокируем LONG если монета выросла >35% за 20
-        // свечей (5h на 15m) и сейчас упала >8% от хая.
-        // Применяется ПЕРЕД кластерами — экономит CPU на заведомо битом LONG.
-        boolean postPumpDump = false;
-        double postPumpGain = 0, postPumpDropFromHi = 0;
+        // POST-PUMP / POST-DUMP DETECTION
+        // LONG case (postPumpDump): монета выросла >35% за 20 свечей, потом упала >8%
+        //                           от хая → ловля ножа на LONG. Кейс SOONUSDT.
+        // SHORT case (postDumpBounce) [FIX-SYM 2026-05-02]: монета упала >35% за 20
+        //                           свечей, потом отскочила >8% от лоу → ловля ножа
+        //                           наоборот на SHORT (классический капитуляционный bounce).
+        // Обе проверки используют ОДИН range threshold (postPumpGain ≥ 35% — это
+        // нормализованная амплитуда движения за окно, симметрично работает в обе стороны)
+        // и применяются ПЕРЕД кластерами — экономит CPU на заведомо битых сетапах.
+        boolean postPumpDump   = false;
+        boolean postDumpBounce = false;
+        double postPumpGain = 0, postPumpDropFromHi = 0, postDumpBounceFromLo = 0;
         if (c15.size() >= 20) {
             double recentHigh = 0, recentLow = Double.MAX_VALUE;
             int fromPP = c15.size() - 20;
@@ -1573,10 +1619,12 @@ public final class DecisionEngineMerged {
                 recentLow  = Math.min(recentLow,  c15.get(i).low);
             }
             if (recentLow > 0 && recentHigh > 0) {
-                postPumpGain       = (recentHigh - recentLow) / recentLow;
-                postPumpDropFromHi = (recentHigh - price)      / recentHigh;
-                if (postPumpGain >= 0.35 && postPumpDropFromHi >= 0.08) {
-                    postPumpDump = true;
+                postPumpGain         = (recentHigh - recentLow) / recentLow;
+                postPumpDropFromHi   = (recentHigh - price)      / recentHigh;
+                postDumpBounceFromLo = (price - recentLow)       / recentLow;
+                if (postPumpGain >= 0.35) {
+                    if (postPumpDropFromHi   >= 0.08) postPumpDump   = true;
+                    if (postDumpBounceFromLo >= 0.08) postDumpBounce = true;
                 }
             }
         }
@@ -1594,6 +1642,11 @@ public final class DecisionEngineMerged {
         if (postPumpDump) {
             allFlags.add(String.format("POST_PUMP_DUMP_gain%.0f_drop%.0f",
                     postPumpGain * 100, postPumpDropFromHi * 100));
+        }
+        // [FIX-SYM 2026-05-02] Зеркальный flag для post-dump bounce.
+        if (postDumpBounce) {
+            allFlags.add(String.format("POST_DUMP_BOUNCE_drop%.0f_bounce%.0f",
+                    postPumpGain * 100, postDumpBounceFromLo * 100));
         }
 
         // [v75] REGIME FILTER переделан с hard-reject на soft-penalty.
@@ -1768,6 +1821,29 @@ public final class DecisionEngineMerged {
             double accelBoost = Math.min(0.50, btcAccel * 40);
             crashBoost += accelBoost;
             allFlags.add("BTC_ACCEL" + String.format("%.0f", btcAccel * 10000));
+        }
+
+        // [FIX-ROUND2 2026-05-02] BTC PUMP boost — симметричный аналог crashBoost.
+        // Ранее: при btcCrashScore>=0.35 → totalShort += boost (даже до 0.75).
+        //         НО для LONG не было ничего эквивалентного на росте BTC.
+        //         Это асимметрия №1 — встроенный SHORT-bias на уровне scoring.
+        // Теперь: если BTC в IMPULSE_UP/STRONG_UP с rawStrength>=0.45 →
+        //         totalLong += proportional boost. Логика зеркальна crashBoost:
+        //         сильнее BTC растёт → больше LONG-confluence на альтах.
+        double pumpBoost = 0;
+        if (gicCtx != null && (gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP
+                || gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
+                && gicCtx.impulseStrength >= 0.45) {
+            // Зеркальная формула: (impulseStrength - 0.45) / (1 - 0.45) × CRASH_SHORT_BOOST_BASE
+            pumpBoost = (gicCtx.impulseStrength - 0.45) / 0.55 * CRASH_SHORT_BOOST_BASE;
+            allFlags.add("BTC_PUMP" + String.format("%.0f", gicCtx.impulseStrength * 100));
+        }
+        if (btcAccel > 0.004 && gicCtx != null
+                && (gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP
+                || gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)) {
+            double accelBoostUp = Math.min(0.50, btcAccel * 40);
+            pumpBoost += accelBoostUp;
+            allFlags.add("BTC_ACCEL_UP" + String.format("%.0f", btcAccel * 10000));
         }
 
         // КЛАСТЕР 1: STRUCTURE
@@ -2316,6 +2392,17 @@ public final class DecisionEngineMerged {
             }
         }
 
+        // [FIX-ROUND2 2026-05-02] Pump boost — зеркальное применение к totalLong.
+        // При сильном BTC pump (rawStrength >= 0.65) тоже срезаем totalShort
+        // на 60% от pumpBoost — симметрично crash logic.
+        if (pumpBoost > 0) {
+            totalLong += pumpBoost;
+            if (gicCtx != null && gicCtx.impulseStrength >= 0.65) {
+                totalShort -= pumpBoost * 0.60;
+                allFlags.add("SHORT_PUMP_PENALTY");
+            }
+        }
+
         // GIC SHORT boost при краше
         if (aggressiveShort && gicShortBoost > 1.0 && totalShort > 0) {
             totalShort *= gicShortBoost;
@@ -2329,6 +2416,15 @@ public final class DecisionEngineMerged {
         if (gicLongSuppression < 1.0 && totalLong > 0) {
             totalLong *= gicLongSuppression;
             allFlags.add("GIC_LONG_SUPPRESS" + String.format("%.0f", gicLongSuppression * 100));
+        }
+
+        // [FIX-ROUND2 2026-05-02] Зеркальное GIC SHORT SUPPRESSION.
+        // Применяется при BTC_IMPULSE_UP / BTC_STRONG_UP — режет totalShort
+        // пропорционально силе бычьего импульса, чтобы SHORT-сигналы
+        // проходили только при overwhelming confluence (как у LONG в крахе).
+        if (gicShortSuppression < 1.0 && totalShort > 0) {
+            totalShort *= gicShortSuppression;
+            allFlags.add("GIC_SHORT_SUPPRESS" + String.format("%.0f", gicShortSuppression * 100));
         }
 
         // [Hole 2 FIX] Symmetric GIC LONG boost / SHORT SUPPRESSION during extreme bull runs
@@ -2444,8 +2540,17 @@ public final class DecisionEngineMerged {
             double extDir  = Math.max(extUp, extDown);
             int extSign    = extUp > extDown ? +1 : -1; // +1 = price moved up, -1 = moved down
 
-            if (extDir > atr14 * 5.5) {
-                // Very overextended — reversal setup. Boost opposite side.
+            if (extDir > atr14 * 7.5) {
+                // [FIX-9PCT 2026-05-02] Threshold 5.5 → 7.5: в нормальной альт-
+                // волатильности 5.5×ATR за 15 баров = типичный памп-ретест
+                // (НЕ parabolic). Раньше бот шортил каждый рост альты
+                // >5.5×ATR — это и был главный источник 80/20 SHORT-перекоса.
+                // 7.5×ATR за 4 часа — реально parabolic move, заслуживающий
+                // reversal-внимания.
+                //
+                // [FIX-9PCT 2026-05-02] Reversal boost 0.55 → 0.25: даём
+                // только маленький bias, не делаем reversal-сторону
+                // доминирующей. Кластеры должны согласиться независимо.
                 boolean candLong = scoreLong > scoreShort;
                 if (extSign > 0) {
                     // Price pumped → reversal = SHORT
@@ -2454,7 +2559,7 @@ public final class DecisionEngineMerged {
                         allFlags.add("EXHAUST_LONG_VETO_" + String.format("%.1fx", extDir / atr14));
                         return reject("exhaust_hard_veto");
                     } else {
-                        scoreShort += 0.55;
+                        scoreShort += 0.25;
                         allFlags.add("EXHAUST_REV_SHORT_" + String.format("%.1fx", extDir / atr14));
                     }
                 } else {
@@ -2463,7 +2568,7 @@ public final class DecisionEngineMerged {
                         allFlags.add("EXHAUST_SHORT_VETO_" + String.format("%.1fx", extDir / atr14));
                         return reject("exhaust_hard_veto");
                     } else {
-                        scoreLong += 0.55;
+                        scoreLong += 0.25;
                         allFlags.add("EXHAUST_REV_LONG_" + String.format("%.1fx", extDir / atr14));
                     }
                 }
@@ -2600,28 +2705,17 @@ public final class DecisionEngineMerged {
         //   Effect: eliminates solo-Early misfires while keeping legitimate early pump detection.
         int requiredClusters = earlySoloAllowed ? 2 : MIN_AGREEING_CLUSTERS;
 
-        // RANGE market is treacherous — require 3 clusters minimum
-        // [v71] Exception: reversal context (LOCAL_REVERSAL/EXHAUSTION_REVERSAL_BOOST/
-        // REVERSAL_SETUP) — это легитимный mean-reversion сетап и 2 кластера достаточно.
-        // [v75] Дополнительное исключение: чистая directional conviction. Если
-        // scoreDiff >= 0.40 (то есть один из двух сторон лидирует с большим отрывом)
-        // — это сильный сетап даже на 2 кластерах. RANGE с 6 кластерами требует 3
-        // согласных, но Derivatives/HTF на сжатой бочаге часто NEUTRAL — поэтому
-        // 2 strong clusters + decisive score split = legitimate setup that DEserves
-        // to pass. Без этого исключения бот молчит весь pre-breakout период.
-        if (state == MarketState.RANGE && !earlySoloAllowed && !aggressiveShort) {
-            boolean reversalContext = allFlags.contains("REVERSAL_SETUP")
-                    || allFlags.contains("EXHAUSTION_REVERSAL_BOOST")
-                    || allFlags.stream().anyMatch(f -> f != null && f.startsWith("LOCAL_REVERSAL"));
-            // [v78.1] decisiveSplit threshold 0.40 → 0.32. На сжатой консолидации
-            // 0.40 практически недостижим — Derivatives/HTF чаще всего NEUTRAL,
-            // и реальный directional split в RANGE редко выходит за 0.30-0.38.
-            // 0.32 пускает сильные pre-breakout setups с 2 кластерами; calibrator
-            // и Dispatcher остаются authoritative quality control.
-            double scoreDiffNow = Math.abs(scoreLong - scoreShort);
-            boolean decisiveSplit = scoreDiffNow >= 0.32;
-            requiredClusters = (reversalContext || decisiveSplit) ? 2 : 3;
-            if (decisiveSplit && !reversalContext) allFlags.add("RANGE_DECISIVE_SPLIT");
+        // [FIX-9PCT 2026-05-02] RANGE = всегда 3 кластера, никаких обходов.
+        // Старая логика (decisiveSplit ≥ 0.32 / reversalContext) пропускала
+        // 2-кластерные шумовые сетапы. Это главная дыра 9% WR: большинство
+        // сигналов в логе имели "Кластеров: 2" или "Кластеров: 3 со слабым
+        // кластером" — они ВСЕ проходили именно через эту лазейку.
+        //
+        // Новое: если в RANGE нет 3 действительно согласных кластеров —
+        // edge не доказан, молчим. EARLY_SOLO (2 кластера + сильный Early)
+        // тоже больше не работает в RANGE.
+        if (state == MarketState.RANGE && !aggressiveShort) {
+            requiredClusters = 3;
         }
 
         // Insufficient clusters → penalty flag (was return null)
@@ -2677,24 +2771,29 @@ public final class DecisionEngineMerged {
         // локального истощения. Clusters уже проголосовали за reversal сторону,
         // значит confirmation уже есть (volume/structure/momentum).
         //
-        // Новое: блокируем только если clusters слабы (scoreDiff < 0.35) — это
-        // настоящий chase без подтверждения. Сильный confluence → проходим с флагом.
+        // [FIX-9PCT 2026-05-02] Threshold 0.35 → 0.50: реверсивная сторона должна
+        // иметь СЕРЬЁЗНОЕ confluence чтобы её рассматривать. На 0.35 проходило
+        // слишком много шумовых reversal-сетапов (второй источник SHORT-перекоса
+        // после EXHAUST_REV).
+        //
+        // [FIX-9PCT 2026-05-02] Boost 0.30 → 0.10: это контекстный бонус,
+        // не доминирующий фактор. Кластеры должны согласиться сами.
         if (localExh != null && !aggressiveShort) {
             boolean reversalSide = (localExh.direction == -1 && side == com.bot.TradingCore.Side.LONG)
                     || (localExh.direction == +1 && side == com.bot.TradingCore.Side.SHORT);
             if (reversalSide) {
                 double reversalScoreDiff = Math.abs(scoreLong - scoreShort);
-                if (reversalScoreDiff < 0.35) {
+                if (reversalScoreDiff < 0.50) {
                     // Weak confluence — reversal call без подтверждения = нож в падение
                     allFlags.add("LOCAL_EXHAUST_UNCONFIRMED_"
                             + String.format("%.1fATR", localExh.moveAtr));
                     return reject("local_exhaust_unconfirmed");
                 }
-                // Strong confluence — reversal trade разрешён с bonus
+                // Strong confluence — reversal trade разрешён с small bonus
                 allFlags.add("LOCAL_REVERSAL_" + (localExh.direction > 0 ? "TOP_" : "BOT_")
                         + String.format("%.1fATR", localExh.moveAtr));
-                if (side == com.bot.TradingCore.Side.LONG) scoreLong += 0.30;
-                else scoreShort += 0.30;
+                if (side == com.bot.TradingCore.Side.LONG) scoreLong += 0.10;
+                else scoreShort += 0.10;
             }
         }
 
@@ -2874,23 +2973,30 @@ public final class DecisionEngineMerged {
             scoreLong *= 0.75;
         }
 
-        // POST-PUMP LONG VETO
-        // Финальный veto после определения candidateSide/side.
-        // Если памп+дамп цикл обнаружен (gain≥35%, drop≥8%) — LONG блокируется.
-        // Это предотвращает кейс SOONUSDT: бот дал LONG на 0.2359 когда цена уже
-        // упала с 0.34 (хай памп-цикла) на -20%+. Классическая ловля ножа.
+        // POST-PUMP LONG VETO + POST-DUMP SHORT VETO
+        // Финальные veto после определения candidateSide/side.
+        // LONG: gain≥35%, drop≥8% от хая → блокируем LONG (кейс SOONUSDT).
+        // SHORT [FIX-SYM 2026-05-02]: gain≥35% range, bounce≥8% от лоу → блокируем
+        //                              SHORT (классический капитуляционный отскок).
         //
-        // [v69 FIX] post-pump skip в отдельном map'е (cooldownMap использует
+        // [v69 FIX] post-*-skip в отдельных map'ах (cooldownMap использует
         // key = sym+"_"+side и другую semantics — нельзя переиспользовать).
-        // Проверка postPumpSkipUntil вынесена в начало analyze() для раннего
-        // выхода без полного анализа. 30 минут вполне достаточно чтобы 20-барное
-        // окно сдвинулось и условие postPumpDump перестало срабатывать естественно.
+        // Проверки postPumpSkipUntil/postDumpSkipUntil вынесены в начало analyze()
+        // для раннего выхода без полного анализа. 30 минут вполне достаточно чтобы
+        // 20-барное окно сдвинулось и условие перестало срабатывать естественно.
         if (postPumpDump && side == com.bot.TradingCore.Side.LONG) {
             LOG.info("[POST-PUMP VETO] " + symbol + " LONG blocked: gain="
                     + String.format("%.0f%%", postPumpGain * 100)
                     + " dropFromHi=" + String.format("%.0f%%", postPumpDropFromHi * 100));
             postPumpSkipUntil.put(symbol, System.currentTimeMillis() + 30 * 60_000L);
             return reject("post_pump_long");
+        }
+        if (postDumpBounce && side == com.bot.TradingCore.Side.SHORT) {
+            LOG.info("[POST-DUMP VETO] " + symbol + " SHORT blocked: rangeGain="
+                    + String.format("%.0f%%", postPumpGain * 100)
+                    + " bounceFromLo=" + String.format("%.0f%%", postDumpBounceFromLo * 100));
+            postDumpSkipUntil.put(symbol, System.currentTimeMillis() + 30 * 60_000L);
+            return reject("post_dump_short");
         }
 
         // КАЛИБРОВАННАЯ УВЕРЕННОСТЬ — на кластерах
@@ -2904,15 +3010,20 @@ public final class DecisionEngineMerged {
                 bias2h, vwapVal
         );
 
-        // Crash mode confidence boost
+        // [FIX-ROUND2 2026-05-02] Симметричный confidence boost.
+        // Ранее: aggressiveShort+SHORT получал +до 10pt (btcCrashScore × 10),
+        //        aggressiveLong+LONG получал cap +4pt — асимметрия 2.5×.
+        // Теперь: оба бустера зеркальные. SHORT получает btcCrashScore × 10,
+        //         LONG получает impulseStrength × 10 (тот же масштаб).
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
             double crashConfBoost = btcCrashScore * 10.0;
             probability = Math.min(PROB_CEIL, probability + crashConfBoost);
             allFlags.add("CRASH_CONF_BOOST");
         }
         if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
-            double bullConfBoost = 1.5 + Math.max(0.0, gicCtx.impulseStrength - 0.70) * 6.0;
-            probability = Math.min(PROB_CEIL, probability + Math.min(4.0, bullConfBoost));
+            // Зеркально crashConfBoost: масштаб × 10, без жёсткого cap (только PROB_CEIL).
+            double bullConfBoost = (gicCtx != null ? gicCtx.impulseStrength : 0.5) * 10.0;
+            probability = Math.min(PROB_CEIL, probability + bullConfBoost);
             allFlags.add("BULL_CONF_BOOST");
         }
 
@@ -3067,11 +3178,15 @@ public final class DecisionEngineMerged {
         }
 
         double minConf = symbolMinConf.getOrDefault(symbol, globalMinConf.get());
+        // [FIX-ROUND2 2026-05-02] Симметричное ослабление minConf для агрессивных режимов.
+        // Ранее: aggressiveShort+SHORT получал -8pt (floor 45),
+        //        aggressiveLong+LONG получал -4pt (floor 0) — асимметрия 2× в пользу SHORT.
+        // Теперь: оба режима получают -6pt (компромисс), floor 50 для обоих.
         if (aggressiveShort && side == com.bot.TradingCore.Side.SHORT) {
-            minConf = Math.max(45.0, minConf - 8.0);
+            minConf = Math.max(50.0, minConf - 6.0);
         }
         if (aggressiveLong && side == com.bot.TradingCore.Side.LONG) {
-            minConf = Math.max(0.0, minConf - 4.0);
+            minConf = Math.max(50.0, minConf - 6.0);
         }
         if (probability < minConf) {
             // [v78.1] Bucketed reject — гистограмма в [DIAG-ANALYZE].
@@ -3562,18 +3677,39 @@ public final class DecisionEngineMerged {
             allFlags.add("SL_WIDEN_ATR");
         }
 
-        // Минимальные множители: TP1 >= 1.2R, TP2 >= 1.8R, TP3 >= 2.4R (или tp2×1.3)
-        // R:R FLOOR: tp2Mult 1.80→2.00 (user preference ≥1:2).
-        // TP1 ≥ 1.2R, TP2 ≥ 2.0R, TP3 ≥ TP2×1.30.
-        if (tp1Mult < 1.20) tp1Mult = 1.20;
-        if (tp2Mult < 2.00) tp2Mult = 2.00;
-        if (tp3Mult < tp2Mult * 1.30) tp3Mult = tp2Mult * 1.30;
+        // [FIX-9PCT 2026-05-02] R:R FLOOR не применяется в RANGE.
+        //
+        // Старая логика: в RANGE tp1=0.65, tp2=1.10 (короткие тейки —
+        // правильно для боковика), но потом floor забивал tp2=2.00.
+        // Получалось: цена в боковике, бот ставит TP за пределы канала,
+        // цена не доходит → TIME_STOP. Это объясняет 77/89 = 87% TIME_STOP
+        // в текущей выборке.
+        //
+        // Новое:
+        //   RANGE: оставляем родные короткие TP. Если downstream Dispatcher
+        //          отклонит R:R<2 — пусть отклоняет, в боковике может быть
+        //          правильно НЕ торговать.
+        //   TREND/WEAK: оригинальный floor 2.0 имеет смысл (даём цене
+        //               пространство).
+        if (state == MarketState.RANGE) {
+            // Минимальные множители для RANGE (соответствуют reality):
+            // TP1 ≥ 0.5R, TP2 ≥ 0.9R, TP3 ≥ 1.4R.
+            if (tp1Mult < 0.50) tp1Mult = 0.50;
+            if (tp2Mult < 0.90) tp2Mult = 0.90;
+            if (tp3Mult < 1.40) tp3Mult = 1.40;
+        } else {
+            // Минимальные множители: TP1 >= 1.2R, TP2 >= 2.0R, TP3 >= TP2×1.30
+            // R:R FLOOR: tp2Mult ≥ 2.00 (user preference ≥1:2).
+            if (tp1Mult < 1.20) tp1Mult = 1.20;
+            if (tp2Mult < 2.00) tp2Mult = 2.00;
+            if (tp3Mult < tp2Mult * 1.30) tp3Mult = tp2Mult * 1.30;
 
-        // Safety net: после всех принудительных значений tp2Mult всегда ≥ 2.00.
-        if (tp2Mult < 2.00) {
-            LOG.info("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
-                    + String.format("%.2f", tp2Mult) + " < 2.00 (user pref 1:2)");
-            return reject("rr_tp2_lt_2");
+            // Safety net: после всех принудительных значений tp2Mult всегда ≥ 2.00.
+            if (tp2Mult < 2.00) {
+                LOG.info("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
+                        + String.format("%.2f", tp2Mult) + " < 2.00 (user pref 1:2)");
+                return reject("rr_tp2_lt_2");
+            }
         }
         adaptiveRR = tp3Mult; // пересчитываем после возможной правки tp3Mult
 

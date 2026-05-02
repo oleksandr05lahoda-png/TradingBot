@@ -599,7 +599,7 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
         this.TOP_N            = envInt("TOP_N", 30);
-        this.MIN_CONF         = envDouble("MIN_CONF", 53.0);
+        this.MIN_CONF         = envDouble("MIN_CONF", 58.0);  // [FIX-ROUND2] 53 → 58, синхронно с DE.MIN_CONF_FLOOR
         // MIN_CONF=53 sits ~5pt above DE.MIN_CONF_FLOOR=48 — quality margin layer.
         // Effective range in processPair: [MIN_CONF-1, MIN_CONF+4] (см. строку 1525).
         // Authoritative quality control further downstream:
@@ -1283,17 +1283,17 @@ public final class SignalSender {
             // qualityPenalty still reduces position size in getPositionSizeUsdt() below.
             double symbolConfBoost = isc.getSymbolMinConfBoost(pair);
             double qualityPenalty = cycleQualityPenalty;
-            // [PATCH 2026-04-28] env-MIN_CONF теперь имеет силу.
-            // Раньше: ISC мог поднять порог с env-MIN_CONF=48 до 56-60 → юзер думал
-            // что ослабил, а реально ISC всё перебивал. Теперь ISC ограничен сверху
-            // потолком MIN_CONF+4, снизу может опускать на 3pt при хорошем track record.
-            // Итог: env-MIN_CONF=48 → реальный диапазон [45, 52], предсказуемо.
+            // [FIX-ROUND2 2026-05-02] earlyMinConf = MIN_CONF baseline,
+            // никаких discount-3pt по умолчанию.
+            // Старая логика отдавала ISC возможность снизить порог на 3pt при
+            // хорошем track record. Но ISC.getEffectiveMinConfidence на cold-start
+            // возвращает 50 < MIN_CONF=58 → discount активен ПОСТОЯННО → реальный
+            // floor = 55 вместо 58. ISC всё ещё может ПОДНЯТЬ порог (penalty за
+            // daily loss, etc.) — это сохранено через iscFloor=min(cap,iscRaw).
             double iscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
             double iscCap  = MIN_CONF + 4.0;                          // ISC не задирает выше env+4
             double iscFloor = Math.min(iscCap, iscRaw);               // обрезаем сверху
-            double earlyMinConf = (iscFloor >= MIN_CONF)
-                    ? iscFloor
-                    : Math.max(MIN_CONF - 3.0, iscFloor);             // ISC может опустить на 3pt
+            double earlyMinConf = Math.max(MIN_CONF, iscFloor);       // [FIX-ROUND2] минимум = MIN_CONF
             if (idea.probability < earlyMinConf) {
                 blockedEarlyConf.incrementAndGet();
                 return null;
@@ -1505,12 +1505,12 @@ public final class SignalSender {
                 idea = rebuildIdea(idea, idea.probability, lf);
             }
 
-            // [PATCH 2026-04-28] Согласован с earlyMinConf — env-MIN_CONF приоритетен.
-            // ISC ограничен сверху MIN_CONF+4. Раньше Math.max() позволял ISC задрать
-            // порог до 56-60 даже при env-MIN_CONF=48, что делало env-настройку фикцией.
+            // [FIX-ROUND2 2026-05-02] finalMinConf = MIN_CONF baseline.
+            // Убрана -1pt скидка. ISC всё ещё может ПОДНЯТЬ порог (track record),
+            // но не может опустить ниже env-MIN_CONF.
             double finalIscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
             double finalIscCap  = MIN_CONF + 4.0;
-            double finalMinConf = Math.max(MIN_CONF - 1.0, Math.min(finalIscCap, finalIscRaw));
+            double finalMinConf = Math.max(MIN_CONF, Math.min(finalIscCap, finalIscRaw));
             if (idea.probability < finalMinConf) {
                 blockedFinalConf.incrementAndGet();
                 return null;
