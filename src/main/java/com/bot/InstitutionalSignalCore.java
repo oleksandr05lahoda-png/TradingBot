@@ -19,13 +19,12 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public final class InstitutionalSignalCore {
 
-    // [FIX-ROUND2 2026-05-02] MAX_EFFECTIVE_MIN_CONF 56 → 62.
-    // Синхронизация с DE.MIN_CONF_FLOOR=58 и SignalSender.MIN_CONF=58.
-    // Старый потолок 56 был НИЖЕ нового MIN_CONF=58 — это означало что ISC
-    // никогда не мог поднять порог даже при daily loss / SL streak. ISC де-факто
-    // становился бесполезным фильтром. Новый cap 62 = MIN_CONF + 4 (как в
-    // SignalSender.iscCap) — ISC может реально работать как track-record adjuster.
-    private static final double MAX_EFFECTIVE_MIN_CONF = 62.0;
+    // [FIX-FLAT-MARKET 2026-05-02] MAX_EFFECTIVE_MIN_CONF 62 → 57.
+    // Синхронизация с env MIN_CONF=53 (было 58). Cap = MIN_CONF + 4 — ISC
+    // может поднять порог на penalty за daily loss / SL streak максимум до 57.
+    // Старое значение 62 было выше env=53 + 9pt — это означало что ISC
+    // мог искусственно блокировать сетапы которые env уже одобрил.
+    private static final double MAX_EFFECTIVE_MIN_CONF = 57.0;
 
     // ── Configuration ────────────────────────────────────────────
     private final int    maxGlobalSignals;
@@ -49,7 +48,7 @@ public final class InstitutionalSignalCore {
                 envInt("ISC_MAX_GLOBAL_SIGNALS", 10),
                 envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
                 envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
-                envDouble("ISC_BASE_MIN_CONF", 56.0),  // [FIX-ROUND2] 50 → 56
+                envDouble("ISC_BASE_MIN_CONF", 51.0),  // [FIX-FLAT-MARKET] 56 → 51 (< env MIN_CONF=53, чтобы env был authoritative)
                 envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003),
                 envInt("ISC_MAX_SAME_SECTOR_DIR", 2)
         );
@@ -445,17 +444,16 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [FIX-ROUND2 2026-05-02] floor 47 → 54, milestones tightened.
-        // Синхронизация с новым DE.MIN_CONF_FLOOR=58 и SignalSender.MIN_CONF=58.
-        // Старый floor 47 позволял ISC ронять порог до 47 при отличном
-        // track record — это было НИЖЕ DE-floor=58 → де-факто ISC никогда
-        // не работал как ужесточающий фильтр. Новый floor 54 = MIN_CONF - 4,
-        // даёт ISC реальное пространство для adjustment без ослабления гейта.
-        double floor = 54.0;
+        // [FIX-FLAT-MARKET 2026-05-02] floor 54 → 50, milestones симметрично сдвинуты.
+        // Синхронизация с env MIN_CONF=53. Floor=50 = MIN_CONF - 3 — ISC может
+        // опустить порог на 3pt при отличном track record (это полезно в флэте),
+        // но НЕ может опуститься ниже env-floor (защищено в SignalSender.earlyMinConf).
+        // Milestones: 500 trades + WR 58% → 47 (агрессивно), 200 + WR 55% → 49.
+        double floor = 50.0;
         int totalTrades = getTotalTradeCount();
         double overallWr = getOverallWinRate();
-        if (totalTrades >= 500 && overallWr >= 0.58) floor = 51.0;
-        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 52.0;
+        if (totalTrades >= 500 && overallWr >= 0.58) floor = 47.0;
+        else if (totalTrades >= 200 && overallWr >= 0.55) floor = 49.0;
 
         double base = Math.max(baseMinConfidence, floor);
 

@@ -599,8 +599,8 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
         this.TOP_N            = envInt("TOP_N", 30);
-        this.MIN_CONF         = envDouble("MIN_CONF", 58.0);  // [FIX-ROUND2] 53 → 58, синхронно с DE.MIN_CONF_FLOOR
-        // MIN_CONF=53 sits ~5pt above DE.MIN_CONF_FLOOR=48 — quality margin layer.
+        this.MIN_CONF         = envDouble("MIN_CONF", 53.0);  // [FIX-FLAT-MARKET] default 58→53, синхронно с DE.BASE_CONF
+        // MIN_CONF=53 sits ~3pt above DE.MIN_CONF_FLOOR=50 — quality margin layer.
         // Effective range in processPair: [MIN_CONF-1, MIN_CONF+4] (см. строку 1525).
         // Authoritative quality control further downstream:
         //   1) Dispatcher.dispatch cold-start gate (BotMain Phase 1: floor 48)

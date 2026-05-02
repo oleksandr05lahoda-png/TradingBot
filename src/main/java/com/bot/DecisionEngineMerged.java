@@ -145,9 +145,13 @@ public final class DecisionEngineMerged {
     // паралич). Калибратор + Dispatcher + ISC остаются authoritative quality
     // gate: сигналы с prob 53-58 будут проходить DE, но если калибратор
     // обучится что они часто проигрывают — он их занизит и они отвалятся.
+    // [FIX-FLAT-MARKET 2026-05-02] FLOOR 52→50. С env MIN_CONF=53 авторитетным
+    // становится SignalSender.earlyMinConf=53. DE-floor=50 даёт DE возможность
+    // выпускать setup'ы с prob 50-52 — они дойдут до SignalSender, где env-MIN_CONF
+    // решает финально. Без этого DE рубит сетапы ещё до того как они увидят env-floor.
     private static final double BASE_CONF       = 53.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 52.0;
+    private static final double MIN_CONF_FLOOR  = 50.0;
     private static final double MIN_CONF_CEIL   = 78.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -161,11 +165,14 @@ public final class DecisionEngineMerged {
 
     // Cluster confluence bonus
     private static final double CLUSTER_CONFLUENCE_BONUS = 0.15;
-    // Minimum independent cluster agreement. 3 clusters required so that
-    // 2-cluster setups (which have base prob ≈ 48 < min 55) cannot pass on
-    // score-boost alone. Pump/dump patterns reliably trigger Volume +
-    // Momentum + Structure, so 3 is not a barrier in practice.
-    private static final int    MIN_AGREEING_CLUSTERS    = 3;
+    // [FIX-FLAT-MARKET 2026-05-02] MIN_AGREEING_CLUSTERS 3→2.
+    // В NEUTRAL BTC (str < 0.4) 3-кластерные setup'ы редкость: cluster bases
+    // 56-60 минус -5 RANGE -3 ALT даёт ~48-52 prob. С 2 кластерами база ~40-45,
+    // но валидные patterns (pump/dump, structural breaks) надёжно триггерят
+    // Volume + Momentum, а Structure добавляется опционально. 3 было хорошо
+    // в трендовом рынке, 2 даёт сигналы и в флэте. Качество защищено
+    // downstream: env MIN_CONF=53, ISC track-record gate, calibrator PAV.
+    private static final int    MIN_AGREEING_CLUSTERS    = 2;
     private static final double MIN_CLUSTER_SCORE        = 0.28;
 
     // Single authoritative probability ceiling. All intermediate caps and the
