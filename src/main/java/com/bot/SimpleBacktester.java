@@ -416,8 +416,15 @@ public final class SimpleBacktester {
                 if (slice15.size() < BACKTEST_WARMUP_BARS) { i++; continue; }
 
                 long decisionTime = m15.get(i - 1).closeTime; // момент принятия решения
+                // [FIX-INVALID-CANDLES 2026-05-02] H1 slice расширен на ВСЁ окно h1 до
+                // decisionTime. Прежде брали окно с m15.get(fromBar).openTime — это 200
+                // m15-баров = 50 часов = ~50 h1-свечей. DE.generate() требует MIN_BARS=150
+                // для c1h → каждый прогон бэктестера ронялся в reject("invalid_candles").
+                // Лог-индикатор: invalid_candles=3396..8287 в DIAG-ANALYZE = 100% backtest.
+                // Live работал потому что грузит 420 h1-свечей через getCached.
+                long h1Start = h1.isEmpty() ? 0L : h1.get(0).openTime;
                 List<com.bot.TradingCore.Candle> sliceH1 = getTimeframeSlice(
-                        h1, m15.get(fromBar).openTime, decisionTime);
+                        h1, h1Start, decisionTime);
 
                 List<com.bot.TradingCore.Candle> sliceM1 = null, sliceM5 = null;
                 if (m1 != null && !m1.isEmpty())
@@ -539,8 +546,12 @@ public final class SimpleBacktester {
             int testEnd   = Math.min(testStart + testBars, m15.size());
 
             List<com.bot.TradingCore.Candle> testM15 = m15.subList(Math.max(0, testStart - 200), testEnd);
+            // [FIX-INVALID-CANDLES 2026-05-02] H1 slice расширен на ВСЁ окно h1 до конца
+            // тестового окна. Прежнее окно (200 часов = 200 h1) было ВПРИТЫК к
+            // MIN_BARS=150 — edge-cases ронялись с reject("invalid_candles").
+            long _h1Start = h1.isEmpty() ? 0L : h1.get(0).openTime;
             List<com.bot.TradingCore.Candle> testH1  = getTimeframeSlice(h1,
-                    m15.get(testStart).openTime - 200 * 3600_000L,
+                    _h1Start,
                     m15.get(testEnd - 1).openTime);
 
             BacktestResult oos = run(symbol, null, null, testM15, testH1, category);
