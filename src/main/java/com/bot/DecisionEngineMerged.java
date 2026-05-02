@@ -137,10 +137,18 @@ public final class DecisionEngineMerged {
     // Возврат к v70-уровню: только сигналы с реальной структурной идеей
     // доходят до калибратора. Бот будет молчать чаще — это правильно при
     // NEUTRAL BTC. Меньше плохих сигналов = больше edge.
-    private static final double BASE_CONF       = 58.0;
+    // [FIX-9PCT-MIDPOINT 2026-05-02] BASE 58→53 / FLOOR 58→52 / CEIL 80→78.
+    // Полный возврат к 58 оказался over-correction: на 49000 свечей backtest
+    // дал 0 сделок, на 4-часовом live окне 4 сигнала. 3-кластерные setup'ы
+    // в RANGE+ALT дают prob 55-57 (см. формулу строка 3807) — недотягивают
+    // до 58. Опускаем до 53 — середина между 48 (где был 9% WR) и 58 (где
+    // паралич). Калибратор + Dispatcher + ISC остаются authoritative quality
+    // gate: сигналы с prob 53-58 будут проходить DE, но если калибратор
+    // обучится что они часто проигрывают — он их занизит и они отвалятся.
+    private static final double BASE_CONF       = 53.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 58.0;
-    private static final double MIN_CONF_CEIL   = 80.0;
+    private static final double MIN_CONF_FLOOR  = 52.0;
+    private static final double MIN_CONF_CEIL   = 78.0;
 
     // Дивергенции — штраф вместо хард-лока
     private static final double DIV_PENALTY_SCORE  = 0.55;
