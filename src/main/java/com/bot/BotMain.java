@@ -1376,33 +1376,56 @@ public final class BotMain {
                 break;
             }
             try {
-                // [FIX-1] 4 sec pacing (was 2.5) + only 15m fetch — main load is
-                // now ~80 weight per pair instead of 240. With 40 pairs that's
-                // 3200 weight spread over 160 sec = ~1200/min, well under the
-                // 2400/min Binance Futures cap even with main cycle active.
-                Thread.sleep(4_000L);
+                // [FIX-2] 5 sec pacing + 15m (1000 bars) + h1 (250 bars).
+                // PREVIOUS BUG: passed empty h1 to backtester. DecisionEngineMerged
+                // .generate() rejects with "invalid_candles" when c1h.size()<150
+                // (MIN_BARS), so 0 trades were ever generated despite 37 pairs
+                // processed. Restoring h1 is mandatory for the engine to work.
+                //
+                // Load budget per pair: 2 fetches × 5 weight = 10 weight units.
+                // 40 pairs × 10 = 400 weight, spread over 200 sec (5s pacing) =
+                // ~120/min from backtest. Main cycle adds ~600-800/min. Total
+                // well under 2400/min Binance Futures cap.
+                Thread.sleep(5_000L);
 
-                // Fetch 15m as deep as one Binance call allows (1500 bars).
-                // h1 / m5 / m1 are optional for SimpleBacktester — pass empty lists.
-                // This cuts Binance weight 3× and dramatically reduces RL hits.
-                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 1500);
+                // 15m: 1000 bars ≈ 10 days. Reduced from 1500 to free budget for h1.
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 1000);
                 if (m15 == null) {
                     symbolsRateLimited++;
-                    LOG.warning("[STARTUP-BT] " + sym + " — fetch returned null (rate limit?)");
+                    LOG.warning("[STARTUP-BT] " + sym + " — m15 fetch returned null (rate limit?)");
                     Thread.sleep(8_000L);
                     continue;
                 }
                 if (m15.size() < 200) {
                     symbolsLowData++;
                     LOG.info("[STARTUP-BT] " + sym + " — only " + m15.size()
-                            + " bars, need ≥200");
+                            + " m15 bars, need ≥200");
                     continue;
                 }
+
+                // h1: 250 bars ≈ 10 days. MUST be ≥ MIN_BARS=150 for engine to accept.
+                // Small inter-fetch spacer to avoid burst weight spikes.
+                Thread.sleep(1_500L);
+                List<com.bot.TradingCore.Candle> h1 = sender.fetchKlines(sym, "1h", 250);
+                if (h1 == null) {
+                    symbolsRateLimited++;
+                    LOG.warning("[STARTUP-BT] " + sym + " — h1 fetch returned null (rate limit?)");
+                    Thread.sleep(8_000L);
+                    continue;
+                }
+                if (h1.size() < 150) {
+                    symbolsLowData++;
+                    LOG.info("[STARTUP-BT] " + sym + " — only " + h1.size()
+                            + " h1 bars, need ≥150 (engine MIN_BARS guard)");
+                    continue;
+                }
+
                 List<com.bot.TradingCore.Candle> empty = new ArrayList<>();
                 com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
 
+                // Pass real h1 — was the entire bug. m1/m5 stay empty (optional).
                 com.bot.SimpleBacktester.BacktestResult r =
-                        bt.run(sym, empty, empty, m15, empty, cat);
+                        bt.run(sym, empty, empty, m15, h1, cat);
                 if (r == null || r.trades == null || r.trades.isEmpty()) {
                     symbolsRun++;
                     LOG.info("[STARTUP-BT] " + sym + " — 0 trades on history (filters too tight)");
