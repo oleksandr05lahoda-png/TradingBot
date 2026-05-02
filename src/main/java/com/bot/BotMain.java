@@ -1305,25 +1305,14 @@ public final class BotMain {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // [STARTUP-BACKTEST 2026-05-02]
+    // [STARTUP-BACKTEST 2026-05-02 / FIX-1 2026-05-02]
     // Full one-shot backtest at boot. Pre-trains the ProbabilityCalibrator
-    // on 6 months of historical data across the entire trading universe so
-    // that LIVE signals start with calibrated probabilities, not Cal=0.
+    // on historical data across the entire trading universe so that LIVE
+    // signals start with calibrated probabilities, not Cal=0.
     //
-    // Pipeline:
-    //   1. Pull universe snapshot (top-N by 24h volume).
-    //   2. For each symbol: fetch 1500 × 15m candles (~16 days; Binance hard
-    //      cap on a single REST call is 1500 — wider history would require
-    //      windowed pagination which is rate-limited and slow on Railway).
-    //      Sliding window: deeper history (6 months) is collected naturally
-    //      across daily runPeriodicBacktest invocations — the startup phase
-    //      provides the FIRST cohort so calibrator is non-empty by cycle #1.
-    //   3. Run SimpleBacktester per symbol — get per-trade outcomes.
-    //   4. Feed each trade into CALIBRATOR.recordOutcomeExtended with the
-    //      same VolBucket / RegimeBucket layout used at live time.
-    //   5. Save calibrator to disk + send Telegram summary.
-    //
-    // Safe to run repeatedly — guarded by min-samples check at scheduling site.
+    // [FIX-1] Separates technical failures from "weak strategy" verdict.
+    // Previous version flagged 🔴 even when 0 pairs ran due to rate-limits.
+    // Plus: 3-min boot delay, 15m-only fetch (3× less weight), 4-sec pacing.
     // ═══════════════════════════════════════════════════════════════════════
     private static void runStartupBacktest(com.bot.SignalSender sender,
                                            com.bot.InstitutionalSignalCore isc,
@@ -1341,7 +1330,13 @@ public final class BotMain {
                             + "Сводка придёт по завершении.");
         } catch (Throwable ignored) {}
 
-        // 1. Universe — wait briefly for sender to populate cachedPairs.
+        // [FIX-1] Wait 3 min before starting fetches — first main cycle starts
+        // at t+90s, fetches BTC+ETH+top pairs and populates cachedPairs.
+        // By t+180s the rate-limit headroom recovers from boot warmup.
+        try { Thread.sleep(180_000L); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+
+        // 1. Universe — should be populated by now after first cycle.
         List<String> universe = new ArrayList<>();
         for (int waitS = 0; waitS < 60 && universe.isEmpty(); waitS++) {
             try { Thread.sleep(2_000L); }
@@ -1349,7 +1344,13 @@ public final class BotMain {
             universe = sender.getScanUniverseSnapshot(40);
         }
         if (universe.isEmpty()) {
-            LOG.warning("[STARTUP-BT] universe empty after 2 min wait — aborted");
+            LOG.warning("[STARTUP-BT] universe empty — aborted");
+            try { telegram.sendMessageAsync(
+                    "⚠️ *Стартовый backtest пропущен*\n"
+                            + "Не удалось получить список пар (universe empty).\n"
+                            + "Бот продолжает работу в обычном режиме.\n"
+                            + "Калибратор будет обучаться на live-сделках."); }
+            catch (Throwable ignored) {}
             return;
         }
         LOG.info("[STARTUP-BT] Universe: " + universe.size() + " pairs");
@@ -1357,10 +1358,13 @@ public final class BotMain {
         // 2. Backtester instance.
         com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
 
-        // 3. Aggregate counters.
+        // 3. Aggregate counters — separate failures from low-data skips.
         int totalTrades = 0, totalWins = 0, totalLosses = 0, totalTimeStops = 0;
         double totalNetPnL = 0.0;
-        int symbolsRun = 0, symbolsFailed = 0;
+        int symbolsRun = 0;          // pairs that completed bt.run()
+        int symbolsRateLimited = 0;  // fetchKlines returned null
+        int symbolsLowData = 0;      // fetched but <200 bars
+        int symbolsErrored = 0;      // exception during run()
 
         com.bot.DecisionEngineMerged.ProbabilityCalibrator cal =
                 com.bot.DecisionEngineMerged.getCalibrator();
@@ -1372,34 +1376,43 @@ public final class BotMain {
                 break;
             }
             try {
-                // Polite pacing — Binance weight budget shared with main cycle.
-                Thread.sleep(2_500L);
+                // [FIX-1] 4 sec pacing (was 2.5) + only 15m fetch — main load is
+                // now ~80 weight per pair instead of 240. With 40 pairs that's
+                // 3200 weight spread over 160 sec = ~1200/min, well under the
+                // 2400/min Binance Futures cap even with main cycle active.
+                Thread.sleep(4_000L);
 
                 // Fetch 15m as deep as one Binance call allows (1500 bars).
+                // h1 / m5 / m1 are optional for SimpleBacktester — pass empty lists.
+                // This cuts Binance weight 3× and dramatically reduces RL hits.
                 List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 1500);
-                if (m15 == null || m15.size() < 200) {
-                    symbolsFailed++;
+                if (m15 == null) {
+                    symbolsRateLimited++;
+                    LOG.warning("[STARTUP-BT] " + sym + " — fetch returned null (rate limit?)");
+                    Thread.sleep(8_000L);
                     continue;
                 }
-                List<com.bot.TradingCore.Candle> h1 = sender.fetchKlines(sym, "1h", 500);
-                if (h1 == null) h1 = new ArrayList<>();
-                List<com.bot.TradingCore.Candle> m5 = sender.fetchKlines(sym, "5m", 500);
-                if (m5 == null) m5 = new ArrayList<>();
-                // m1 not used by SimpleBacktester unless useM1Resolution=true; pass empty.
-                List<com.bot.TradingCore.Candle> m1 = new ArrayList<>();
-
+                if (m15.size() < 200) {
+                    symbolsLowData++;
+                    LOG.info("[STARTUP-BT] " + sym + " — only " + m15.size()
+                            + " bars, need ≥200");
+                    continue;
+                }
+                List<com.bot.TradingCore.Candle> empty = new ArrayList<>();
                 com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
 
-                com.bot.SimpleBacktester.BacktestResult r = bt.run(sym, m1, m5, m15, h1, cat);
-                if (r == null || r.trades == null || r.trades.isEmpty()) continue;
+                com.bot.SimpleBacktester.BacktestResult r =
+                        bt.run(sym, empty, empty, m15, empty, cat);
+                if (r == null || r.trades == null || r.trades.isEmpty()) {
+                    symbolsRun++;
+                    LOG.info("[STARTUP-BT] " + sym + " — 0 trades on history (filters too tight)");
+                    continue;
+                }
 
                 // 4. FEED CALIBRATOR — this is the entire point of the exercise.
                 for (com.bot.SimpleBacktester.TradeRecord tr : r.trades) {
                     boolean hit = tr.pnlPct > 0;
-                    // confidence stored on TradeRecord is the raw 0..100 prob.
                     double rawScore01 = Math.max(0.0, Math.min(1.0, tr.confidence / 100.0));
-                    // VolBucket is keyed off ATR%. We approximate it via pnl-based
-                    // proxy: large stops (≥4%) → HIGH, small (<1.5%) → LOW, else MID.
                     double atrPctApprox = Math.abs(tr.entry > 0
                             ? (tr.sl - tr.entry) / tr.entry * 100.0 : 1.5);
                     String tag = "TIME_STOP".equals(tr.exitReason) ? "TIME_STOP"
@@ -1422,8 +1435,8 @@ public final class BotMain {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt(); break;
             } catch (Exception e) {
-                symbolsFailed++;
-                LOG.warning("[STARTUP-BT] " + sym + " failed: " + e.getMessage());
+                symbolsErrored++;
+                LOG.warning("[STARTUP-BT] " + sym + " errored: " + e.getMessage());
             }
         }
 
@@ -1437,37 +1450,61 @@ public final class BotMain {
 
         long elapsedSec = (System.currentTimeMillis() - t0) / 1000L;
         double wr = totalTrades > 0 ? 100.0 * totalWins / totalTrades : 0.0;
-        double avgPF;
-        {
-            // Profit factor approximation from net PnL signs requires per-trade
-            // accumulation; recomputed in detail at periodic backtest. Here we
-            // surface only the headline metrics to the user.
-            avgPF = totalLosses > 0 ? (double) totalWins / totalLosses : 0.0;
-        }
+        double wlRatio = totalLosses > 0 ? (double) totalWins / totalLosses : 0.0;
         int newCalCount = cal.totalOutcomeCount();
+
+        // [FIX-1] Differentiate technical failure vs strategy verdict.
+        String verdict;
+        boolean techFailure = totalTrades == 0
+                && (symbolsRateLimited + symbolsErrored) >= Math.max(1, symbolsRun);
+        if (techFailure) {
+            verdict = "⚠️ *Технический сбой* — пары не загрузились.\n"
+                    + "Калибратор не обучен через backtest. Бот продолжает\n"
+                    + "работу — калибровка пойдёт через live-сделки (медленнее).";
+        } else if (totalTrades == 0) {
+            verdict = "ℹ️ *0 сделок на истории*\n"
+                    + "Фильтры стратегии слишком строгие для последних 16 дней\n"
+                    + "(BTC в глубоком флэте). Это не плохо — стратегия осторожна.\n"
+                    + "Калибровка пойдёт через live.";
+        } else if (totalTrades < 50) {
+            verdict = "🟡 *Малая выборка* — " + totalTrades + " сделок.\n"
+                    + "Слишком мало для статистических выводов. Продолжайте paper.";
+        } else if (wr >= 50.0) {
+            verdict = "🟢 *Стратегия показывает edge на истории.*\n"
+                    + "WR=" + String.format("%.1f%%", wr) + " на " + totalTrades + " сделках.\n"
+                    + "Калибратор обучен. Дальше paper-режим для подтверждения.";
+        } else if (wr >= 45.0) {
+            verdict = "🟡 *Граничный результат* — WR=" + String.format("%.1f%%", wr) + ".\n"
+                    + "На грани прибыльности. Реальные деньги пока нельзя.";
+        } else {
+            verdict = "🔴 *Слабый результат на истории* — WR="
+                    + String.format("%.1f%%", wr) + ".\n"
+                    + "На текущем рынке стратегия не показывает edge.\n"
+                    + "Реальные деньги категорически нельзя.";
+        }
 
         String summary = String.format(
                 "✅ *Стартовый backtest завершён*\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "⏱ Время: %d сек\n"
-                        + "📊 Пар обработано: %d (ошибок: %d)\n"
+                        + "📊 Пар обработано: %d\n"
+                        + "  ⚠️ Rate-limited: %d\n"
+                        + "  📉 Мало данных: %d\n"
+                        + "  ❌ Ошибок: %d\n"
                         + "🎯 Сделок: %d\n"
                         + "  ✅ Wins: %d (%.1f%%)\n"
                         + "  ❌ Losses: %d\n"
                         + "  ⏳ Time-stops: %d\n"
                         + "💰 Net PnL (sum %%): %+.2f\n"
                         + "📈 W/L ratio: %.2f\n"
-                        + "🧠 Калибратор: %d outcomes (было ≈%d)\n"
+                        + "🧠 Калибратор: %d outcomes\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "%s",
-                elapsedSec, symbolsRun, symbolsFailed, totalTrades,
+                elapsedSec, symbolsRun, symbolsRateLimited, symbolsLowData,
+                symbolsErrored, totalTrades,
                 totalWins, wr, totalLosses, totalTimeStops, totalNetPnL,
-                avgPF, newCalCount, Math.max(0, newCalCount - totalTrades),
-                wr >= 50.0 && totalTrades >= 100
-                        ? "🟢 Стратегия показывает edge на истории."
-                        : wr >= 45.0
-                          ? "🟡 Граничный результат. Нужно больше данных."
-                          : "🔴 Слабый результат. Не доверять реальные деньги.");
+                wlRatio, newCalCount,
+                verdict);
 
         try { telegram.sendMessageAsync(summary); } catch (Throwable ignored) {}
         LOG.info("[STARTUP-BT] ✓ Done in " + elapsedSec + "s | trades=" + totalTrades
