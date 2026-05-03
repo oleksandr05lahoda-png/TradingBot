@@ -75,6 +75,15 @@ public final class BotMain {
     public static final boolean OBSERVATION_MODE =
             "1".equals(System.getenv().getOrDefault("OBSERVATION_MODE", "0"));
 
+    // [v83 PHASE-3] Live auto-trading flag. Default OFF (paper-only).
+    // To enable: BOT_AUTO_TRADE=1 in Railway env. Requires OBSERVATION_MODE=0
+    // (mutually exclusive). Even when ON, it goes through RiskGuard.canTrade()
+    // first — daily loss limit, BTC crash, trade limits all block automatically.
+    // Default starts on TESTNET (BINANCE_USE_TESTNET=1). To use real money you
+    // must explicitly set BINANCE_USE_TESTNET=0 with valid real API keys.
+    public static final boolean AUTO_TRADE_ENABLED =
+            "1".equals(System.getenv().getOrDefault("BOT_AUTO_TRADE", "0"));
+
     // [v79 I5] Cross-exchange price validation. Compares Binance kline last close
     // with Bybit/OKX. If discrepancy >0.5% → log warning + dispatch blocked.
     // Default OFF — Binance is generally trustworthy, but available for paranoid setups.
@@ -477,6 +486,16 @@ public final class BotMain {
                             source, OBSERVATION_MODE);
                 } catch (Throwable ignored) {}
 
+                // [v83 PHASE-3] AUTO-TRADE HOOK
+                // Only when: BOT_AUTO_TRADE=1, OBSERVATION_MODE=0, executor ready.
+                // Goes through RiskGuard.canTrade() — daily loss, BTC crash,
+                // trade limits all enforced here. Failure → message in Telegram,
+                // bot continues normally. Success → position opened on exchange,
+                // SL placed, tracker watching.
+                if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE) {
+                    autoTradeHook(idea, tg);
+                }
+
                 isc.setSignalCooldown(idea.symbol, 3 * 60_000L);
                 LOG.info(String.format("[DISPATCH/%s%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% n=%d",
                         source, OBSERVATION_MODE ? "/PAPER" : "",
@@ -487,6 +506,103 @@ public final class BotMain {
                 LOG.warning("[DISPATCH/" + source + "] " + idea.symbol + " failed: " + t.getMessage());
                 return Result.blocked("exception");
             }
+        }
+
+        /**
+         * [v83 PHASE-3] Auto-trade execution path.
+         *
+         * Flow:
+         *   1. RiskGuard.canTrade()  — pre-trade safety checks. BLOCK → notify, return.
+         *   2. fetch live balance   — needed for position sizing + RG day-baseline.
+         *   3. BinanceTradeExecutor.openPositionWithSl() — atomic open+SL.
+         *   4. PositionTracker.trackOpened() — start watching for close.
+         *   5. Telegram notification with all execution details.
+         *
+         * Any failure mid-flow is logged, sent to Telegram, but doesn't crash the
+         * bot. Worst case: signal was sent to Telegram, position was NOT opened.
+         */
+        private void autoTradeHook(com.bot.DecisionEngineMerged.TradeIdea idea,
+                                   com.bot.TelegramBotSender tg) {
+            try {
+                com.bot.RiskGuard rg = com.bot.RiskGuard.getInstance();
+                com.bot.BinanceTradeExecutor ex = com.bot.BinanceTradeExecutor.getInstance();
+                com.bot.PositionTracker tracker = com.bot.PositionTracker.getInstance();
+
+                if (!ex.isReady()) {
+                    tg.sendMessageAsync("⚠️ Auto-trade " + idea.symbol
+                            + ": API ключи не настроены, пропуск.");
+                    return;
+                }
+
+                // 1. Fetch live balance (this also feeds RiskGuard's day baseline)
+                double balance = ex.fetchAvailableBalance();
+                if (balance <= 0) {
+                    tg.sendMessageAsync("⚠️ Auto-trade " + idea.symbol
+                            + ": не удалось получить баланс с биржи.");
+                    return;
+                }
+
+                // 2. Pre-trade safety checks
+                com.bot.RiskGuard.Decision d = rg.canTrade(idea.symbol, balance);
+                if (!d.allowed) {
+                    tg.sendMessageAsync(String.format(
+                            "🛡️ *RiskGuard BLOCK* %s\n" +
+                                    "Причина: %s\n%s",
+                            idea.symbol, d.reason,
+                            d.hint.isEmpty() ? "" : "_" + d.hint + "_"));
+                    LOG.info("[AUTO-TRADE/" + idea.symbol + "] blocked: " + d);
+                    return;
+                }
+
+                // 3. Open position
+                com.bot.BinanceTradeExecutor.ExecutionResult r =
+                        ex.openPositionWithSl(idea, balance);
+                if (!r.success) {
+                    tg.sendMessageAsync(String.format(
+                            "❌ *Auto-trade FAIL* %s %s\n_%s_",
+                            idea.symbol, idea.side.name(), r.reason));
+                    LOG.warning("[AUTO-TRADE/" + idea.symbol + "] exec failed: " + r.reason);
+                    return;
+                }
+
+                // 4. Hand off to tracker, register with RiskGuard
+                rg.recordTradeOpened(idea.symbol, r.notionalUsd);
+                tracker.trackOpened(idea.symbol,
+                        idea.side == com.bot.TradingCore.Side.LONG,
+                        r.entryPrice, r.qty, r.slPrice, r.notionalUsd,
+                        r.orderId, r.slOrderId);
+
+                // 5. Notify
+                tg.sendMessageAsync(String.format(
+                        "🤖 *Auto-trade ОТКРЫТА* %s\n" +
+                                "%s %s | qty=%s\n" +
+                                "Entry: %.6f | SL: %.6f\n" +
+                                "Notional: $%.2f | Risk: $%.2f\n" +
+                                "Балaнс до: $%.2f | Mode: %s",
+                        idea.symbol,
+                        idea.side.name(),
+                        ex.isTestnet() ? "🧪TESTNET" : "🔴LIVE",
+                        formatNum(r.qty),
+                        r.entryPrice, r.slPrice,
+                        r.notionalUsd,
+                        balance * (ex.getRiskPct() / 100.0),
+                        balance,
+                        rg.statusLine()));
+                LOG.info("[AUTO-TRADE/" + idea.symbol + "] OPENED " + r);
+            } catch (Throwable t) {
+                LOG.severe("[AUTO-TRADE] " + idea.symbol + " unexpected: " + t.getMessage());
+                try {
+                    tg.sendMessageAsync("🆘 Auto-trade exception on " + idea.symbol
+                            + ": " + t.getClass().getSimpleName() + " " + t.getMessage());
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        private static String formatNum(double v) {
+            return java.math.BigDecimal.valueOf(v)
+                    .setScale(8, java.math.RoundingMode.DOWN)
+                    .stripTrailingZeros()
+                    .toPlainString();
         }
 
         private void pruneDispatchTimestamps(long now) {
@@ -753,6 +869,47 @@ public final class BotMain {
             LOG.info("[BOOT] " + rg.statusLine());
         } catch (Throwable t) {
             LOG.warning("[BOOT] RiskGuard init failed: " + t.getMessage());
+        }
+
+        // [v83 PHASE-3] Initialize Executor + Tracker. They are no-ops until
+        // BOT_AUTO_TRADE=1 AND OBSERVATION_MODE=0. Even then, every trade
+        // passes through RiskGuard.canTrade() first.
+        try {
+            com.bot.BinanceTradeExecutor ex = com.bot.BinanceTradeExecutor.getInstance();
+            com.bot.PositionTracker tracker = com.bot.PositionTracker.getInstance();
+            tracker.setTelegram(telegram); // for close notifications
+            // Only start polling if auto-trade is enabled — otherwise tracker
+            // would just spin uselessly.
+            if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady()) {
+                tracker.start();
+                LOG.info("[BOOT] Auto-trade ENABLED. Mode: "
+                        + (ex.isTestnet() ? "TESTNET" : "REAL/LIVE")
+                        + " leverage=" + ex.getLeverage()
+                        + "x risk=" + ex.getRiskPct() + "%");
+                telegram.sendMessageAsync(String.format(
+                        "🤖 *Auto-trade АКТИВИРОВАН*\n" +
+                                "Режим: %s\n" +
+                                "Плечо: %dx | Риск: %.1f%%/сделка\n" +
+                                "Защиты: dailyLoss -10%%, weeklyLoss -20%%, max 3 сделки/день, max 2 одновременно\n" +
+                                "_Любая сделка → автоматическая остановка при срабатывании защит._",
+                        ex.isTestnet() ? "🧪 TESTNET" : "🔴 REAL/LIVE",
+                        ex.getLeverage(), ex.getRiskPct()));
+            } else if (AUTO_TRADE_ENABLED && OBSERVATION_MODE) {
+                LOG.warning("[BOOT] BOT_AUTO_TRADE=1 but OBSERVATION_MODE=1 — paper wins, no live trades.");
+            } else if (AUTO_TRADE_ENABLED && !ex.isReady()) {
+                LOG.warning("[BOOT] BOT_AUTO_TRADE=1 but Binance API keys missing — auto-trade DISABLED.");
+                telegram.sendMessageAsync(
+                        "⚠️ *Auto-trade НЕ запустился*\n" +
+                                "Причина: API ключи Binance не настроены.\n" +
+                                "Нужны env: `BINANCE_TESTNET_API_KEY` + `BINANCE_TESTNET_API_SECRET` (для testnet)\n" +
+                                "или `BINANCE_API_KEY` + `BINANCE_API_SECRET` (для real).");
+            } else {
+                LOG.info("[BOOT] Auto-trade disabled (BOT_AUTO_TRADE="
+                        + (AUTO_TRADE_ENABLED ? "1" : "0")
+                        + " OBSERVATION_MODE=" + (OBSERVATION_MODE ? "1" : "0") + ").");
+            }
+        } catch (Throwable t) {
+            LOG.warning("[BOOT] Executor/Tracker init failed: " + t.getMessage());
         }
 
         try {
