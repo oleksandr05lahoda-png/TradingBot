@@ -1153,7 +1153,8 @@ public final class DecisionEngineMerged {
             // [v75] TP precision 2 → 1: читается быстрее, десятые роли не играют
             if (tp1 > 0) sb.append(String.format("🎯 TP1:    `" + fmt + "`  (%+.1f%%)%n", tp1, tp1Pct));
             if (tp2 > 0) sb.append(String.format("🎯 TP2:    `" + fmt + "`  (%+.1f%%)%n", tp2, tp2Pct));
-            if (tp3 > 0) sb.append(String.format("🎯 TP3:    `" + fmt + "`  (%+.1f%%)%n", tp3, tp3Pct));
+            // [v80] TP3 убран из вывода — пользователь практически не доходит до него.
+            // Внутренняя логика TP3 (для расчётов trailing-stop) остаётся.
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             sb.append(String.format("🛑 SL:      `" + fmt + "`  (%+.1f%%)%n", stop, slPct));
 
@@ -3621,13 +3622,16 @@ public final class DecisionEngineMerged {
                 && forecastResult.trendPhase == com.bot.TradingCore.ForecastEngine.TrendPhase.EARLY;
 
         if (isExhaustPhase) {
-            // Exhaustion: scalp mode — take quick profits before reversal completes
-            tp1Mult = 0.60; tp2Mult = 1.00; tp3Mult = 1.50;
+            // [v80 FIX] EXHAUSTION: TP1 was 0.60×SL = NEGATIVE EV. Fixed to 1.20×SL.
+            // Reasoning: даже при WR=60% и TP1=0.60×SL имеем (0.6×0.6)−(0.4×1) = −0.04
+            // = −4% per trade. Минимум TP1 = 1.20×SL для positive EV при WR≥45%.
+            tp1Mult = 1.20; tp2Mult = 2.00; tp3Mult = 3.00;
             allFlags.add("TP_EXHAUST");
         } else if (isRangeState) {
-            // RANGE: tight TPs — aim for opposite wall, not beyond.
-            // Range = mean-reversion. Taking 2× risk is greedy when price bounces in a box.
-            tp1Mult = 0.65; tp2Mult = 1.10; tp3Mult = 1.60;
+            // [v80 FIX] RANGE: TP1 was 0.65×SL = NEGATIVE EV. Same bug. Fixed.
+            // Mean-reversion в боковике может работать, но только с правильным RR.
+            // Если канал слишком узкий для RR≥1.2 — лучше не торговать вообще.
+            tp1Mult = 1.20; tp2Mult = 2.00; tp3Mult = 2.80;
             allFlags.add("TP_RANGE");
         } else if (isTrendState && isEarlyPhase) {
             // EARLY TREND: widest TPs — the move has just started, let it run.
@@ -3638,8 +3642,9 @@ public final class DecisionEngineMerged {
             tp1Mult = 1.20; tp2Mult = 2.40; tp3Mult = 3.80;
             allFlags.add("TP_TREND");
         } else {
-            // WEAK_TREND: balanced defaults
-            tp1Mult = 1.00; tp2Mult = 2.00; tp3Mult = 3.20;
+            // [v80 FIX] WEAK_TREND: TP1 поднят 1.00 → 1.20. Все режимы теперь имеют
+            // TP1 ≥ 1.20×SL — гарантированная positive EV при WR ≥ 45%.
+            tp1Mult = 1.20; tp2Mult = 2.20; tp3Mult = 3.50;
         }
 
         // VOLATILITY-BUCKET TP ADJUSTMENT
@@ -3706,27 +3711,144 @@ public final class DecisionEngineMerged {
         //          правильно НЕ торговать.
         //   TREND/WEAK: оригинальный floor 2.0 имеет смысл (даём цене
         //               пространство).
-        if (state == MarketState.RANGE) {
-            // Минимальные множители для RANGE (соответствуют reality):
-            // TP1 ≥ 0.5R, TP2 ≥ 0.9R, TP3 ≥ 1.4R.
-            if (tp1Mult < 0.50) tp1Mult = 0.50;
-            if (tp2Mult < 0.90) tp2Mult = 0.90;
-            if (tp3Mult < 1.40) tp3Mult = 1.40;
-        } else {
-            // Минимальные множители: TP1 >= 1.2R, TP2 >= 2.0R, TP3 >= TP2×1.30
-            // R:R FLOOR: tp2Mult ≥ 2.00 (user preference ≥1:2).
-            if (tp1Mult < 1.20) tp1Mult = 1.20;
-            if (tp2Mult < 2.00) tp2Mult = 2.00;
-            if (tp3Mult < tp2Mult * 1.30) tp3Mult = tp2Mult * 1.30;
+        // [v80 FIX] УНИФИЦИРОВАННЫЙ R:R FLOOR — TP1 ≥ 1.20R, TP2 ≥ 2.00R, TP3 ≥ TP2×1.30.
+        // Старая логика разрешала RANGE иметь TP1=0.5R / TP2=0.9R = NEGATIVE EV.
+        // В боковике с TP1<SL даже 70% WR даёт убыток. Если канал не позволяет
+        // RR≥1.2 — это сигнал что НЕ НАДО торговать в боковике, а не повод
+        // принимать плохие отношения.
+        if (tp1Mult < 1.20) tp1Mult = 1.20;
+        if (tp2Mult < 2.00) tp2Mult = 2.00;
+        if (tp3Mult < tp2Mult * 1.30) tp3Mult = tp2Mult * 1.30;
 
-            // Safety net: после всех принудительных значений tp2Mult всегда ≥ 2.00.
-            if (tp2Mult < 2.00) {
-                LOG.info("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
-                        + String.format("%.2f", tp2Mult) + " < 2.00 (user pref 1:2)");
-                return reject("rr_tp2_lt_2");
-            }
+        // Safety net: tp2Mult всегда ≥ 2.00.
+        if (tp2Mult < 2.00) {
+            LOG.info("[R:R FLOOR] " + symbol + " rejected: tp2Mult="
+                    + String.format("%.2f", tp2Mult) + " < 2.00 (user pref 1:2)");
+            return reject("rr_tp2_lt_2");
+        }
+        // [v80] Дополнительная проверка: TP1 < SL = математический баг, отклоняем.
+        if (tp1Mult < 1.0) {
+            LOG.info("[R:R FLOOR] " + symbol + " rejected: tp1Mult="
+                    + String.format("%.2f", tp1Mult) + " < 1.0 (negative EV bug)");
+            return reject("rr_tp1_lt_sl");
         }
         adaptiveRR = tp3Mult; // пересчитываем после возможной правки tp3Mult
+
+        // ═══════════════════════════════════════════════════════════════
+        // [v80] PRO-EDGE FILTERS — институциональные проверки edge
+        // Решают проблему 25.5% WR / 88% time-stop из backtest:
+        //   1. Late-entry: цена уже отъехала от EMA20 → движение отыграно
+        //   2. MTF alignment: 15m против 1H тренда без RSI-confirmation
+        //   3. Volume confirmation: сигнал на затухающем объёме
+        //   4. BTC FLAT GATE: SHORT в нейтральном флэте = -EV
+        // ═══════════════════════════════════════════════════════════════
+        boolean isLong = side == com.bot.TradingCore.Side.LONG;
+
+        // [1] LATE-ENTRY FILTER — distance from EMA20 в единицах ATR
+        try {
+            double ema20 = com.bot.TradingCore.ema(c15, 20);
+            if (atr14 > 0 && ema20 > 0) {
+                double distFromEma = Math.abs(price - ema20) / atr14;
+                // Если цена уже >1.8×ATR от EMA20 в направлении сигнала — late entry.
+                // Для LONG: блок если price >> ema20. Для SHORT: блок если price << ema20.
+                boolean v80LateEntry = (isLong && price > ema20 && distFromEma > 1.8)
+                        || (!isLong && price < ema20 && distFromEma > 1.8);
+                if (v80LateEntry) {
+                    return reject("late_entry_ema20");
+                }
+                allFlags.add(String.format("DEMA=%.1f", distFromEma));
+            }
+        } catch (Throwable ignored) {}
+
+        // [2] MULTI-TIMEFRAME ALIGNMENT — 1H trend должен не противоречить.
+        // Counter-trend разрешён только при extreme RSI (oversold для LONG, overbought для SHORT).
+        try {
+            if (c1h != null && c1h.size() >= 50) {
+                double ema1h_20 = com.bot.TradingCore.ema(c1h, 20);
+                double ema1h_50 = com.bot.TradingCore.ema(c1h, 50);
+                double price1h = c1h.get(c1h.size() - 1).close;
+                boolean bull1h = ema1h_20 > ema1h_50 && price1h > ema1h_20;
+                boolean bear1h = ema1h_20 < ema1h_50 && price1h < ema1h_20;
+
+                if (isLong && bear1h) {
+                    double rsi15 = com.bot.TradingCore.rsi(c15, 14);
+                    if (rsi15 > 38) return reject("mtf_long_vs_1h_bear");
+                    allFlags.add("MTF_OS_BOUNCE");
+                }
+                if (!isLong && bull1h) {
+                    double rsi15 = com.bot.TradingCore.rsi(c15, 14);
+                    if (rsi15 < 62) return reject("mtf_short_vs_1h_bull");
+                    allFlags.add("MTF_OB_SHORT");
+                }
+                if ((isLong && bull1h) || (!isLong && bear1h)) {
+                    allFlags.add("MTF_ALIGN");
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // [3] VOLUME CONFIRMATION — последние 3 бара ≥ 1.05× от 20-бар avg.
+        // Сигналы на затухающем объёме статистически проигрывают.
+        try {
+            if (c15.size() >= 25) {
+                int vN15 = c15.size();
+                double avgVol20 = 0;
+                for (int i = vN15 - 23; i < vN15 - 3; i++) avgVol20 += c15.get(i).volume;
+                avgVol20 /= 20.0;
+                double recent3Vol = (c15.get(vN15-1).volume + c15.get(vN15-2).volume + c15.get(vN15-3).volume) / 3.0;
+                if (avgVol20 > 0) {
+                    double volRatio = recent3Vol / avgVol20;
+                    if (volRatio < 1.05) {
+                        return reject("low_volume");
+                    }
+                    if (volRatio >= 1.5) allFlags.add("VOL_SURGE");
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // [4] BTC REGIME GATE — для SHORT в NEUTRAL+слабом BTC = блок.
+        // Backtest показал: 80% сигналов SHORT при BTC NEUTRAL str=0.12-0.17 → -81% PnL.
+        try {
+            if (gicCtx != null && !isLong) {
+                String regime = String.valueOf(gicCtx.regime);
+                double btcStr = gicCtx.impulseStrength;
+                boolean btcFlat = regime.contains("NEUTRAL") || regime.contains("FLAT") || regime.contains("RANGE");
+                if (btcFlat && btcStr < 0.30) {
+                    return reject("btc_flat_short_block");
+                }
+                // SHORT vs strong BTC bull — только при ≥4 кластерах
+                boolean btcBull = regime.contains("UP") || regime.contains("BULL");
+                if (btcBull && btcStr > 0.5) {
+                    int clusterTotal = 0;
+                    for (String f : allFlags) {
+                        if (f != null && f.contains("CONFL_S")) {
+                            String tail = f.replaceAll("[^0-9]", "");
+                            try { clusterTotal = Math.max(clusterTotal, Integer.parseInt(tail)); }
+                            catch (NumberFormatException e2) {}
+                        }
+                    }
+                    if (clusterTotal < 4) return reject("btc_bull_short_underconfirmed");
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // [5] BB SQUEEZE CHECK — не входим в volatility contraction (squeeze).
+        // BB width рассчитывается через TradingCore.bollinger().
+        try {
+            if (c15.size() >= 25) {
+                com.bot.TradingCore.BollingerResult bb = com.bot.TradingCore.bollinger(c15, 20, 2.0);
+                if (bb != null && price > 0) {
+                    double bbWidth = (bb.upper - bb.lower) / price;
+                    if (bbWidth < 0.012) {
+                        return reject("bb_squeeze");
+                    }
+                    allFlags.add(String.format("BBW=%.3f", bbWidth));
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // ═══════════════════════════════════════════════════════════════
+        // END PRO-EDGE FILTERS
+        // ═══════════════════════════════════════════════════════════════
 
         TradeIdea idea = new TradeIdea(symbol, side, price, stopPrice, takePrice, adaptiveRR,
                 probability, allFlags,

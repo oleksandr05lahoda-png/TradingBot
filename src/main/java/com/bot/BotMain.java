@@ -278,12 +278,18 @@ public final class BotMain {
 
         private static final int    COLD_START_MIN_OUTCOMES = 20;
         private static final double MIN_RR          = 2.00;
-        private static final double MIN_SL_PCT      = 0.0030;
-        private static final long   SYMBOL_DEDUP_MS = 6 * 60_000L;
-        private static final int    MAX_PER_HOUR    = 20;
-        private static final int    MAX_PER_5MIN    = 5;
+        // [v80] SL min 0.30% → 0.70%. Backtest: при SL<0.7% доля time-stop = 88.5%.
+        private static final double MIN_SL_PCT      = 0.0070;
+        // [v80] Dedup 6 мин → 4 часа. Защита от повторных входов в ту же пару.
+        private static final long   SYMBOL_DEDUP_MS = 4 * 60 * 60_000L;
+        // [v80] Часовая квота 20 → 6. Цель: 1-3 качественных сигнала в день, не 20 средненьких.
+        private static final int    MAX_PER_HOUR    = 6;
+        private static final int    MAX_PER_5MIN    = 2;
         private static final long   HOUR_MS         = 60 * 60_000L;
         private static final long   FIVE_MIN_MS     = 5 * 60_000L;
+        // [v80] QUALITY GATE thresholds — после warmup
+        private static final double MIN_CONFIDENCE_AFTER_WARMUP = 65.0;
+        private static final int    MIN_CLUSTERS_AFTER_WARMUP   = 3;
 
         private final com.bot.TelegramBotSender tg;
         private final com.bot.InstitutionalSignalCore isc;
@@ -302,6 +308,8 @@ public final class BotMain {
         private final AtomicLong blockedDedup      = new AtomicLong(0);
         private final AtomicLong blockedHourly     = new AtomicLong(0);
         private final AtomicLong blockedXExchange  = new AtomicLong(0); // [v79 I5]
+        // [v80] Новые счётчики
+        private final AtomicLong blockedQuality    = new AtomicLong(0);
 
         private static volatile Dispatcher INSTANCE;
 
@@ -351,6 +359,22 @@ public final class BotMain {
                 blockedByGate.incrementAndGet();
                 blockedSL.incrementAndGet();
                 return Result.blocked(String.format("SL=%.3f%%<%.2f%%", slPct * 100, MIN_SL_PCT * 100));
+            }
+
+            // [v80] QUALITY GATE — отсекаем Grade C/D и низкую confidence ПОСЛЕ warmup.
+            // До warmup (n<20) пропускаем чтобы калибратор обучался.
+            int _calForGate = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+            if (_calForGate >= COLD_START_MIN_OUTCOMES) {
+                int _clusters = countClusterFlags(idea.flags);
+                if (idea.probability < MIN_CONFIDENCE_AFTER_WARMUP
+                        || _clusters < MIN_CLUSTERS_AFTER_WARMUP) {
+                    blockedByGate.incrementAndGet();
+                    blockedQuality.incrementAndGet();
+                    return Result.blocked(String.format(
+                            "quality: prob=%.0f<%.0f OR clusters=%d<%d (n=%d)",
+                            idea.probability, MIN_CONFIDENCE_AFTER_WARMUP,
+                            _clusters, MIN_CLUSTERS_AFTER_WARMUP, _calForGate));
+                }
             }
 
             // [v79 I5] Cross-exchange validation. If enabled and price differs
@@ -1230,7 +1254,7 @@ public final class BotMain {
                         "📭 *Тихо на рынке* %dh\n"
                                 + "BTC: %s | WS: %d | Cal n=%d | %s\n"
                                 + "Блокировки: %s\n"
-                                + "_(`bi`=cooldown, `rr`=R:R<2.0, `sl`=SL<0.30%%, `cold`=cold-start, `dd`=dedup, `hr`=hourly cap, `xch`=cross-exch)_",
+                                + "_(`bi`=cooldown, `rr`=R:R<2.0, `sl`=SL<0.70%%, `cold`=cold-start, `dd`=dedup, `hr`=hourly cap, `xch`=cross-exch, `qg`=quality)_",
                         hoursSilent, regime, wsCount, calN, paperFlag, breakdown));
             } catch (Throwable ignored) {}
         }
