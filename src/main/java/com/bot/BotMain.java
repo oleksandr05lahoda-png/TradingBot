@@ -744,6 +744,17 @@ public final class BotMain {
                 + (OBSERVATION_MODE ? "ON/PAPER" : "OFF/LIVE")
                 + ", X-EXCHANGE_CHECK=" + (CROSS_EXCHANGE_VALIDATION ? "ON" : "OFF") + ") ═══");
 
+        // [v83 PHASE-1] Force RiskGuard to load now so we see its init line in
+        // logs even before any trading code calls it. RiskGuard is a no-op at
+        // this stage — it only gets wired into BotMain.Dispatcher in PHASE-3.
+        // This call is just "ping, are you there" and prints status.
+        try {
+            com.bot.RiskGuard rg = com.bot.RiskGuard.getInstance();
+            LOG.info("[BOOT] " + rg.statusLine());
+        } catch (Throwable t) {
+            LOG.warning("[BOOT] RiskGuard init failed: " + t.getMessage());
+        }
+
         try {
             int _calN = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
             if (!OBSERVATION_MODE && _calN < 50) {
