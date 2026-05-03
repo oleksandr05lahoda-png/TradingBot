@@ -3831,6 +3831,18 @@ public final class DecisionEngineMerged {
             }
         } catch (Throwable ignored) {}
 
+        // [5b v81] ADX FILTER — не входим если ADX<18 (чистый флэт по структуре).
+        // ADX<18 означает что движение направления отсутствует. Любой сигнал в этих
+        // условиях с большой вероятностью попадёт в time-stop.
+        try {
+            com.bot.TradingCore.ADXResult adxRes = com.bot.TradingCore.adx(c15, 14);
+            double adxVal = adxRes != null ? adxRes.adx : 0;
+            if (adxVal > 0 && adxVal < 18.0) {
+                return reject("adx_flat_lt_18");
+            }
+            if (adxVal > 0) allFlags.add(String.format("ADX=%.0f", adxVal));
+        } catch (Throwable ignored) {}
+
         // [5] BB SQUEEZE CHECK — не входим в volatility contraction (squeeze).
         // BB width рассчитывается через TradingCore.bollinger().
         try {

@@ -17,7 +17,7 @@ public final class SimpleBacktester {
     // Backtester at 8 (120 min) was inflating PnL by giving setups 33% more time
     // to come back — totally invalidating walk-forward results. Now both are 90min.
     // toTelegramString also displays "Time-stop: 90 мин" — single source of truth.
-    private int    timeStopBars     = 6;           // 90 min at 15m, matches ISC.TIME_STOP_BARS
+    private int    timeStopBars     = 4;           // [v81] 60 min at 15m, sync with ISC.TIME_STOP_BARS
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
@@ -649,6 +649,26 @@ public final class SimpleBacktester {
                                             double slippage) {
         boolean isLong = pos.side == com.bot.TradingCore.Side.LONG;
         int barsHeld = currentBar - pos.entryBar;
+
+        // [v81] EARLY BE MOVE — если цена ушла в плюс на 0.5R, двигаем SL
+        // на entry+0.1R. Это режет time-stop losses пополам: вместо tiny loss
+        // получаем tiny win при равных условиях.
+        if (!pos.tp1Hit && barsHeld >= 1) {
+            double risk = Math.abs(pos.entry - pos.sl);
+            com.bot.TradingCore.Candle currentCandle = m15.get(currentBar);
+            double favorableMove = isLong
+                    ? currentCandle.high - pos.entry
+                    : pos.entry - currentCandle.low;
+            if (favorableMove >= risk * 0.5) {
+                // Move SL to entry + 0.1R in our favor
+                double newSL = isLong
+                        ? pos.entry + risk * 0.1
+                        : pos.entry - risk * 0.1;
+                // Only tighten, never loosen
+                if (isLong && newSL > pos.currentSL) pos.currentSL = newSL;
+                if (!isLong && newSL < pos.currentSL) pos.currentSL = newSL;
+            }
+        }
 
         // Time stop
         if (barsHeld >= timeStopBars) {

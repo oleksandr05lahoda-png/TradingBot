@@ -34,8 +34,11 @@ public final class InstitutionalSignalCore {
     private final double minSignalPriceDiff;
     private final int    maxSameSectorSameDir;
 
-    // Time stop
-    private static final int  TIME_STOP_BARS  = 6;    // 6 × 15m = 90 min
+    // [v81] Time stop 6 → 4 bars (60 min). Backtest показал: 88% сделок
+    // закрывались по time-stop за 90 мин — значит цена топчется. 60 мин
+    // достаточно для реализации entry; если за час не пошло — вход неверный,
+    // выходим в безубыток вместо лотереи.
+    private static final int  TIME_STOP_BARS  = 4;    // 4 × 15m = 60 min
     private static final long TIME_STOP_MS    = TIME_STOP_BARS * 15 * 60_000L;
     private static final int  MAX_HISTORY     = 100;
 
