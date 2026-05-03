@@ -1360,12 +1360,19 @@ public final class BotMain {
         try { Thread.sleep(180_000L); }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
 
+        // [v82.1] Universe size — было хардкод 40, теперь env STARTUP_BT_PAIRS.
+        // Дефолт 40 = старое поведение. Подняв до 60-80 получим больше сделок
+        // в стартовом бэктесте за счёт большей выборки пар. Каждая пара = ~7сек
+        // (5с пейсинг + 1.5с между fetch'ами + сам fetch), так что 80 пар = ~10 мин
+        // только на пейсинге. Учитывайте время прогона.
+        final int btPairsLimit = Math.max(10, envInt("STARTUP_BT_PAIRS", 40));
+
         // 1. Universe — should be populated by now after first cycle.
         List<String> universe = new ArrayList<>();
         for (int waitS = 0; waitS < 60 && universe.isEmpty(); waitS++) {
             try { Thread.sleep(2_000L); }
             catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
-            universe = sender.getScanUniverseSnapshot(40);
+            universe = sender.getScanUniverseSnapshot(btPairsLimit);
         }
         if (universe.isEmpty()) {
             LOG.warning("[STARTUP-BT] universe empty — aborted");
@@ -1393,6 +1400,21 @@ public final class BotMain {
         com.bot.DecisionEngineMerged.ProbabilityCalibrator cal =
                 com.bot.DecisionEngineMerged.getCalibrator();
 
+        // [v82.1] History depth + pacing — было хардкод (1000 m15, 250 h1, 5s pacing).
+        // ENV:
+        //  STARTUP_BT_BARS_15M  — кол-во m15 свечей на пару (default 1000 = ~10 дней).
+        //                         Cap 1500 — Binance лимит на один запрос. Для большей
+        //                         истории нужна пагинация (не реализована).
+        //  STARTUP_BT_BARS_1H   — кол-во h1 свечей (default 250). Минимум 150 = MIN_BARS
+        //                         движка, иначе reject("invalid_candles").
+        //  STARTUP_BT_PACING_MS — задержка между парами (default 5000ms). Не понижайте
+        //                         меньше 3000 — Binance rate limit (2400 weight/min).
+        final int bars15mTarget = Math.min(1500,
+                Math.max(300, envInt("STARTUP_BT_BARS_15M", 1000)));
+        final int bars1hTarget  = Math.min(1500,
+                Math.max(150, envInt("STARTUP_BT_BARS_1H", 250)));
+        final long pacingMs     = Math.max(3000L, envInt("STARTUP_BT_PACING_MS", 5000));
+
         for (String sym : universe) {
             // Cooperative cancellation if JVM is shutting down.
             if (Thread.currentThread().isInterrupted()) {
@@ -1400,20 +1422,15 @@ public final class BotMain {
                 break;
             }
             try {
-                // [FIX-2] 5 sec pacing + 15m (1000 bars) + h1 (250 bars).
+                // [FIX-2] / [v82.1] Configurable pacing + bar counts.
                 // PREVIOUS BUG: passed empty h1 to backtester. DecisionEngineMerged
                 // .generate() rejects with "invalid_candles" when c1h.size()<150
                 // (MIN_BARS), so 0 trades were ever generated despite 37 pairs
                 // processed. Restoring h1 is mandatory for the engine to work.
-                //
-                // Load budget per pair: 2 fetches × 5 weight = 10 weight units.
-                // 40 pairs × 10 = 400 weight, spread over 200 sec (5s pacing) =
-                // ~120/min from backtest. Main cycle adds ~600-800/min. Total
-                // well under 2400/min Binance Futures cap.
-                Thread.sleep(5_000L);
+                Thread.sleep(pacingMs);
 
-                // 15m: 1000 bars ≈ 10 days. Reduced from 1500 to free budget for h1.
-                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 1000);
+                // 15m: env STARTUP_BT_BARS_15M (default 1000 ≈ 10 days, cap 1500).
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", bars15mTarget);
                 if (m15 == null) {
                     symbolsRateLimited++;
                     LOG.warning("[STARTUP-BT] " + sym + " — m15 fetch returned null (rate limit?)");
@@ -1427,10 +1444,9 @@ public final class BotMain {
                     continue;
                 }
 
-                // h1: 250 bars ≈ 10 days. MUST be ≥ MIN_BARS=150 for engine to accept.
-                // Small inter-fetch spacer to avoid burst weight spikes.
+                // h1: env STARTUP_BT_BARS_1H (default 250). Min 150 = MIN_BARS guard.
                 Thread.sleep(1_500L);
-                List<com.bot.TradingCore.Candle> h1 = sender.fetchKlines(sym, "1h", 250);
+                List<com.bot.TradingCore.Candle> h1 = sender.fetchKlines(sym, "1h", bars1hTarget);
                 if (h1 == null) {
                     symbolsRateLimited++;
                     LOG.warning("[STARTUP-BT] " + sym + " — h1 fetch returned null (rate limit?)");
