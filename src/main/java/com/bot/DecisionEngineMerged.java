@@ -1242,11 +1242,12 @@ public final class DecisionEngineMerged {
                 sb.append("\n⚠️ _Малый объём — реальный fill ±0.05–0.20%_");
             }
 
-            // [v75 FIX] Time-stop expectation. ISC auto-closes positions after
-            // TIME_STOP_BARS=6 bars (90 min @ 15m). Without this line trader
-            // can sit in a setup for hours wondering why the bot is silent —
-            // not knowing the bot has internally given up on the idea.
-            sb.append(String.format("%n⏳ Time-stop: 90 мин"));
+            // [v82] Time-stop expectation. SYNC с ISC.TIME_STOP_BARS (default 12 = 180 min).
+            // История бага: v75 заявлял 90 мин, v81 укоротил до 60 мин но строка осталась
+            // 90 — пользователь видел одно, бот делал другое. Сейчас default ISC = 12 баров
+            // = 180 мин. Если меняешь ISC_TIME_STOP_BARS env, обнови соответствующее число
+            // здесь. (Не делаем cross-class import чтобы не плодить зависимости.)
+            sb.append(String.format("%n⏳ Time-stop: 180 мин"));
 
             sb.append("\n⏱ ").append(timeStr).append(" · ").append(city);
 

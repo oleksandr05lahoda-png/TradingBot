@@ -13,13 +13,39 @@ public final class SimpleBacktester {
     private double takerFee         = 0.0004;     // 0.04% per side
     private double fundingPer15m    = 0.0001 / 32; // ~0.01%/8h → per 15m
     private int    maxConcurrent    = 6;
-    // [v75] 8 → 6 bars. SYNC FIX: ISC.TIME_STOP_BARS=6 (90 min) is the live rule.
-    // Backtester at 8 (120 min) was inflating PnL by giving setups 33% more time
-    // to come back — totally invalidating walk-forward results. Now both are 90min.
-    // toTelegramString also displays "Time-stop: 90 мин" — single source of truth.
-    private int    timeStopBars     = 4;           // [v81] 60 min at 15m, sync with ISC.TIME_STOP_BARS
+    // [v82] 4 → 12 bars (60min → 180min).
+    //
+    // Постмортем v81: укорочение time-stop до 60 мин не починило 88%-time-stop проблему,
+    // оно лишь ускорило её обнаружение. С TP1=1.20×R≈1×ATR-15m реалистичная медиана
+    // time-to-target = 8–16 баров. На 4 барах большинство сделок физически НЕ УСПЕВАЕТ
+    // дойти до TP1, время выходит и позиция режется по close — какой бы ни был знак.
+    // Это объясняет 89.7% time-stops и WR=32% (близко к 1/3 ≈ random walk без edge).
+    //
+    // Решение: вернуть time-stop в окрестность 180 мин = 12 баров. Если за 3 часа
+    // setup не сработал — да, выходим, но даём цене реалистичный шанс.
+    //
+    // ENV: BACKTEST_TIME_STOP_BARS (default 12). Установить = 4 чтобы воспроизвести
+    // старое v81-поведение для сравнения. ISC.TIME_STOP_BARS должен совпадать
+    // (env ISC_TIME_STOP_BARS, тоже default=12 после v82).
+    //
+    // toTelegramString DEM теперь печатает "180 мин" (раньше врал "90 мин" на v81).
+    private int    timeStopBars     = envInt("BACKTEST_TIME_STOP_BARS", 12);
     private boolean compound        = true;
     private boolean useM1Resolution = true;
+
+    // [v82] BACKTEST_MIN_CONF — фильтр воронки сигналов в бэктесте.
+    // Раньше backtest вызывал engine.analyze() напрямую и принимал любую идею
+    // с probability ≥ DE.MIN_CONF_FLOOR=50. В live env MIN_CONF=53 — backtest
+    // был НА 3pp шире воронки чем production, что искажало WR в худшую сторону.
+    // Default 50 = старое поведение. Поставьте 53 чтобы синхронизировать с env,
+    // или 65 чтобы посмотреть только high-confidence subset (тест на едж скора).
+    private final double backtestMinConf = envDouble("BACKTEST_MIN_CONF", 50.0);
+
+    // [v82] EARLY-BE behaviour. Старый код: при движении 0.5R в плюс SL → entry+0.1R.
+    // Это превращало "будущие 1.5R-победы" в "+0.1R крошки", сжимая правый хвост.
+    // Default v82: триггер 1.0R (вместо 0.5R) — даём сделке развиться прежде чем
+    // фиксировать BE. ENV BACKTEST_BE_TRIGGER_R может перезаписать (-1 = отключить).
+    private final double earlyBeTriggerR = envDouble("BACKTEST_BE_TRIGGER_R", 1.0);
 
     // Single source of truth for warmup.
     // Must match DecisionEngineMerged.MIN_BARS (150) — that's the gate
@@ -79,6 +105,16 @@ public final class SimpleBacktester {
     private double volume24hUSD = 0.0;
     public void setVolume24hUSD(double v)    { this.volume24hUSD = Math.max(0.0, v); }
 
+    // [v82] Class-level env helpers (старые жили в SelfValidator).
+    private static int envInt(String key, int def) {
+        try { return Integer.parseInt(System.getenv().getOrDefault(key, String.valueOf(def))); }
+        catch (Exception e) { return def; }
+    }
+    private static double envDouble(String key, double def) {
+        try { return Double.parseDouble(System.getenv().getOrDefault(key, String.valueOf(def))); }
+        catch (Exception e) { return def; }
+    }
+
     //  RESULTS
 
     public static final class BacktestResult {
@@ -103,6 +139,16 @@ public final class SimpleBacktester {
         public int    longestWinStreak;
         public double medianPnlPct;
         public double stdPnlPct;          // std of single-trade pnl
+
+        // [v82] TIME-STOP BREAKDOWN — главная диагностика.
+        // Если timeStops доминируют (>60% всех сделок), смотреть распределение их PnL:
+        //  - medianTimeStopPnl ≈ 0.0%   → шум, чистый random-walk = entry без edge
+        //  - medianTimeStopPnl <  0.0%  → systematic wrong-direction bias, лечить вход
+        //  - medianTimeStopPnl >  0.0%, но мало hit-rate TP → TP стоит слишком далеко
+        //                                для текущего time-stop, лечить горизонт
+        public int    timeStopWins, timeStopLosses, timeStopBreakEvens;
+        public double medianTimeStopPnl;
+        public double avgTimeStopPnl;
 
         // Detailed trade log
         public final List<TradeRecord> trades = new ArrayList<>();
@@ -200,6 +246,28 @@ public final class SimpleBacktester {
                 stdPnlPct = Math.sqrt(var);
             }
 
+            // [v82] TIME-STOP DIAGNOSTIC. Сегментируем time-stops по знаку PnL +
+            // считаем медиану/среднее. Это главный показатель когда time-stops
+            // доминируют: если медиана ≈ 0% → entry без edge на этом горизонте,
+            // если медиана < 0% → systematic wrong-side bias.
+            double[] tsPnls = trades.stream()
+                    .filter(t -> "TIME_STOP".equals(t.exitReason))
+                    .mapToDouble(t -> t.pnlPct)
+                    .sorted()
+                    .toArray();
+            for (TradeRecord t : trades) {
+                if (!"TIME_STOP".equals(t.exitReason)) continue;
+                if (t.pnlPct > 0.05)        timeStopWins++;
+                else if (t.pnlPct < -0.05)  timeStopLosses++;
+                else                        timeStopBreakEvens++;
+            }
+            if (tsPnls.length > 0) {
+                medianTimeStopPnl = tsPnls.length % 2 == 0
+                        ? (tsPnls[tsPnls.length / 2 - 1] + tsPnls[tsPnls.length / 2]) / 2.0
+                        : tsPnls[tsPnls.length / 2];
+                avgTimeStopPnl = java.util.Arrays.stream(tsPnls).average().orElse(0);
+            }
+
             // Calmar ratio
             double annualReturn = dailyReturns.isEmpty() ? 0 :
                     dailyReturns.stream().mapToDouble(Double::doubleValue).average().orElse(0) * 365;
@@ -224,6 +292,7 @@ public final class SimpleBacktester {
                             "║ EV: %+.4f | Sharpe: %.2f | Sortino: %.2f | PF: %.2f\n" +
                             "║ MaxDD: %.1f%% (%d bars) | Calmar: %.2f | Expectancy: %+.3f%%\n" +
                             "║ Median: %+.3f%% | StdDev: %.3f%% | Streak: +%d/-%d\n" +
+                            "║ TimeStops: %d (W:%d L:%d BE:%d) median:%+.3f%% avg:%+.3f%%\n" +
                             "║ Reliability: %.0f%% %s\n" +
                             "╚══════════════════════════════════════════════════╝",
                     symbol, total, wins, losses, breakEvens, timeStops,
@@ -233,6 +302,8 @@ public final class SimpleBacktester {
                     ev, sharpeDaily, sortinoDaily, profitFactor,
                     maxDrawdownPct, (int) maxDDDurationBars, calmarRatio, expectancy,
                     medianPnlPct, stdPnlPct, longestWinStreak, longestLossStreak,
+                    timeStops, timeStopWins, timeStopLosses, timeStopBreakEvens,
+                    medianTimeStopPnl, avgTimeStopPnl,
                     reliabilityScore * 100,
                     total < 30 ? "⚠️ LOW SAMPLE" : total < 50 ? "⚠️ MODERATE" : "✅");
         }
@@ -434,6 +505,16 @@ public final class SimpleBacktester {
 
                 com.bot.DecisionEngineMerged.TradeIdea idea = engine.analyze(
                         symbol, sliceM1, sliceM5, slice15, sliceH1, category);
+
+                // [v82] BACKTEST_MIN_CONF gate. Раньше backtest принимал любую идею
+                // с prob ≥ DE.MIN_CONF_FLOOR=50, в то время как live SignalSender гейтит
+                // на env MIN_CONF=53. Из-за этого backtest систематически показывал
+                // результаты на 3pp шире воронки чем production. Теперь ENV
+                // BACKTEST_MIN_CONF (default 50) контролирует backtest-фильтр; ставьте
+                // 53 чтобы синхронизировать с live, или 65+ для теста edge скора.
+                if (idea != null && idea.probability < backtestMinConf) {
+                    idea = null;
+                }
 
                 if (idea != null) {
                     // ENTRY = open текущего бара i (в live именно в этот момент бот входит)
@@ -650,16 +731,28 @@ public final class SimpleBacktester {
         boolean isLong = pos.side == com.bot.TradingCore.Side.LONG;
         int barsHeld = currentBar - pos.entryBar;
 
-        // [v81] EARLY BE MOVE — если цена ушла в плюс на 0.5R, двигаем SL
-        // на entry+0.1R. Это режет time-stop losses пополам: вместо tiny loss
-        // получаем tiny win при равных условиях.
-        if (!pos.tp1Hit && barsHeld >= 1) {
+        // [v82] EARLY BE MOVE — теперь конфигурируемый.
+        //
+        // Старый v81: при движении 0.5R в плюс SL подтягивался на entry+0.1R.
+        // Это превращало "будущие 1.5R-победы" (которые сначала идут на 0.5R, потом
+        // откат до 0.2R, потом разворот и пробой) в "+0.1R-крошки". Сжатие правого
+        // хвоста = падение expectancy даже при том же winrate.
+        //
+        // Новый default: триггер 1.0R вместо 0.5R — даём сделке физически дойти
+        // до уровня TP1=1.20R прежде чем фиксировать BE. Если откат с 1.0R до
+        // entry+0.1R — это уже не "тонкий разворот", а "trade провалился".
+        //
+        // ENV BACKTEST_BE_TRIGGER_R:
+        //   1.0  (default v82)  — триггер на 1.0R, реалистичный pullback-protect
+        //   0.5  (legacy v81)   — старое поведение для воспроизводимости
+        //  -1.0  (off)          — полностью отключить early-BE, чистый SL/TP/time
+        if (earlyBeTriggerR > 0 && !pos.tp1Hit && barsHeld >= 1) {
             double risk = Math.abs(pos.entry - pos.sl);
             com.bot.TradingCore.Candle currentCandle = m15.get(currentBar);
             double favorableMove = isLong
                     ? currentCandle.high - pos.entry
                     : pos.entry - currentCandle.low;
-            if (favorableMove >= risk * 0.5) {
+            if (favorableMove >= risk * earlyBeTriggerR) {
                 // Move SL to entry + 0.1R in our favor
                 double newSL = isLong
                         ? pos.entry + risk * 0.1
@@ -906,6 +999,11 @@ public final class SimpleBacktester {
             double totalGrossPnL = 0, totalNetPnL = 0;
             double sumProfitFactor = 0, sumExpectancy = 0;
             int pairsWithSignals = 0;
+            // [v82] time-stop aggregate diagnostics
+            int totalTsWins = 0, totalTsLosses = 0, totalTsBreakEvens = 0;
+            // weighted-average median across pairs (weight = #time-stops on that pair)
+            double weightedTsMedianSum = 0;
+            int weightedTsMedianN = 0;
 
             SimpleBacktester bt = new SimpleBacktester();
             bt.setInitialBalance(100.0);
@@ -948,12 +1046,22 @@ public final class SimpleBacktester {
                 if (r.profitFactor > 0 && !Double.isInfinite(r.profitFactor))
                     sumProfitFactor += r.profitFactor;
                 sumExpectancy += r.expectancy;
+                // [v82]
+                totalTsWins        += r.timeStopWins;
+                totalTsLosses      += r.timeStopLosses;
+                totalTsBreakEvens  += r.timeStopBreakEvens;
+                if (r.timeStops > 0) {
+                    weightedTsMedianSum += r.medianTimeStopPnl * r.timeStops;
+                    weightedTsMedianN   += r.timeStops;
+                }
             }
 
             long elapsed = System.currentTimeMillis() - t0;
+            double aggTsMedian = weightedTsMedianN > 0 ? weightedTsMedianSum / weightedTsMedianN : 0;
             String report = formatReport(daysOfHistory, pairs.size(), pairsWithSignals,
                     elapsed, totalSignals, totalWins, totalLosses, totalTimeStops,
-                    totalGrossPnL, totalNetPnL, sumProfitFactor, sumExpectancy);
+                    totalGrossPnL, totalNetPnL, sumProfitFactor, sumExpectancy,
+                    totalTsWins, totalTsLosses, totalTsBreakEvens, aggTsMedian);
 
             LOG.info(report);
             // [v78 NO-SPAM] SELF-VALIDATOR Telegram report DISABLED.
@@ -971,7 +1079,9 @@ public final class SimpleBacktester {
         private static String formatReport(int days, int pairsScanned, int pairsWithSignals,
                                            long elapsedMs, int signals, int wins, int losses,
                                            int timeStops, double grossPnL, double netPnL,
-                                           double sumPF, double sumExpectancy) {
+                                           double sumPF, double sumExpectancy,
+                                           int tsWins, int tsLosses, int tsBreakEvens,
+                                           double tsMedianPnl) {
             if (signals == 0) {
                 return String.format(
                         "🧪 SELF-VALIDATOR (%dd × %d pairs, %.1fs)\n" +
@@ -984,11 +1094,25 @@ public final class SimpleBacktester {
             double avgPF   = pairsWithSignals > 0 ? sumPF / pairsWithSignals : 0.0;
             double avgExp  = pairsWithSignals > 0 ? sumExpectancy / pairsWithSignals : 0.0;
             double sigPerDayPerPair = signals / (double) Math.max(1, days * pairsWithSignals);
+            double tsShare = signals > 0 ? 100.0 * timeStops / signals : 0.0;
 
             String verdict =
                     (winRate >= 55 && avgPF > 1.50 && netPnL > 0) ? "✅ GO — viable edge"
                             : (winRate >= 48 && avgPF > 1.10 && netPnL > 0) ? "⚠️ MARGINAL — edge thin"
                               : "❌ NO-GO — no edge / negative expectancy";
+
+            // [v82] Time-stop dominance diagnostic. Если >60% — структурная проблема:
+            // вход без edge на горизонте удержания ИЛИ TP слишком далеко для time-stop.
+            String tsHint = "";
+            if (tsShare > 60) {
+                if (Math.abs(tsMedianPnl) < 0.05) {
+                    tsHint = "\n⚠️ TS-dominance: median≈0 → entry без edge на горизонте.";
+                } else if (tsMedianPnl < 0) {
+                    tsHint = "\n⚠️ TS-dominance: median<0 → systematic wrong-side bias.";
+                } else {
+                    tsHint = "\n⚠️ TS-dominance: median>0 но TP не достигаются → TP далеко.";
+                }
+            }
 
             StringBuilder sb = new StringBuilder();
             sb.append(String.format("🧪 SELF-VALIDATOR  %dd × %d pairs  (%.1fs)\n",
@@ -997,11 +1121,14 @@ public final class SimpleBacktester {
                     signals, sigPerDayPerPair, pairsWithSignals));
             sb.append(String.format("Win-rate: %.1f%%  (W=%d, L=%d, T-stop=%d)\n",
                     winRate, wins, losses, timeStops));
+            // [v82] T-stop breakdown
+            sb.append(String.format("T-stops: %.0f%% of all  (W:%d L:%d BE:%d  median:%+.2f%%)\n",
+                    tsShare, tsWins, tsLosses, tsBreakEvens, tsMedianPnl));
             sb.append(String.format("Gross PnL: %+.2f%%   Net PnL: %+.2f%%\n",
                     grossPnL, netPnL));
             sb.append(String.format("Avg profit-factor: %.2f   Avg expectancy: $%+.2f / trade\n",
                     avgPF, avgExp));
-            sb.append("\n").append(verdict).append("\n");
+            sb.append("\n").append(verdict).append(tsHint).append("\n");
             return sb.toString();
         }
 
