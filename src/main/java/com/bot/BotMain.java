@@ -1521,32 +1521,32 @@ public final class BotMain {
             // При RR 1:2 стратегия с WR=35% уже прибыльна. WR в отрыве от RR
             // — бесполезная метрика. Старая логика "WR<45% = слабо" ВРАЛА:
             // помечала прибыльную стратегию (+33% PnL) как провальную.
-            double avgPnLPerTrade = totalPnLPct / totalTrades;
+            double avgPnLPerTrade = totalNetPnL / totalTrades;
             double expectancyR = avgPnLPerTrade / 1.0; // assume avg risk = 1% (estimate)
             double monthlyPnL  = avgPnLPerTrade * 30; // grobering daily count
 
-            if (totalPnLPct > 20.0 && wr >= 35.0) {
+            if (totalNetPnL > 20.0 && wr >= 35.0) {
                 verdict = "🟢 *Стратегия показывает РЕАЛЬНЫЙ edge.*\n"
                         + "WR=" + String.format("%.1f%%", wr)
-                        + " · Net PnL=" + String.format("%+.1f%%", totalPnLPct)
+                        + " · Net PnL=" + String.format("%+.1f%%", totalNetPnL)
                         + " на " + totalTrades + " сделках.\n"
                         + "Avg/trade=" + String.format("%+.2f%%", avgPnLPerTrade) + ".\n"
                         + "Низкий WR при positive PnL — это профессиональная норма для RR 1:2.\n"
                         + "Дальше paper для подтверждения 100+ сделок.";
-            } else if (totalPnLPct > 0 && wr >= 30.0) {
+            } else if (totalNetPnL > 0 && wr >= 30.0) {
                 verdict = "🟡 *Положительный edge, но слабый.*\n"
                         + "WR=" + String.format("%.1f%%", wr)
-                        + " · Net PnL=" + String.format("%+.1f%%", totalPnLPct) + ".\n"
+                        + " · Net PnL=" + String.format("%+.1f%%", totalNetPnL) + ".\n"
                         + "Прибыльно, но margin тонкая. Нужно больше сделок для подтверждения.\n"
                         + "Реальные деньги — только мелкими размерами после 100+ paper.";
-            } else if (totalPnLPct > -5.0) {
+            } else if (totalNetPnL > -5.0) {
                 verdict = "🟡 *Граничный результат* — Net PnL="
-                        + String.format("%+.1f%%", totalPnLPct) + ", WR=" + String.format("%.1f%%", wr) + ".\n"
+                        + String.format("%+.1f%%", totalNetPnL) + ", WR=" + String.format("%.1f%%", wr) + ".\n"
                         + "Нет явного edge. Реальные деньги категорически нельзя.";
             } else {
                 verdict = "🔴 *Стратегия убыточна на истории.*\n"
                         + "WR=" + String.format("%.1f%%", wr)
-                        + " · Net PnL=" + String.format("%+.1f%%", totalPnLPct) + ".\n"
+                        + " · Net PnL=" + String.format("%+.1f%%", totalNetPnL) + ".\n"
                         + "Структурная проблема логики входа.\n"
                         + "Реальные деньги категорически нельзя.";
             }
