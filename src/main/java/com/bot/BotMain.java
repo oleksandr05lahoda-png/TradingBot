@@ -297,15 +297,7 @@ public final class BotMain {
         private static final long   HOUR_MS         = 60 * 60_000L;
         private static final long   FIVE_MIN_MS     = 5 * 60_000L;
         // [v80] QUALITY GATE thresholds — после warmup
-        // [v83.4] 65.0 → 58.0. Логика: validator показал WR=29.8% при N=124 сигналах,
-        // т.е. наша probability в среднем переоценивает шансы на ~5pp. Калибратор
-        // PAV это позже выправит сам, но до накопления 200+ outcomes лучше держать
-        // gate на уровне 58, чтобы сигналы РЕАЛЬНО доходили до него и кормили
-        // калибратор. С gate=65 после warmup (n>=50) почти ВСЕ сигналы блокируются
-        // (см. лог: SKYAIUSDT prob=60<65), и калибратор перестаёт обучаться.
-        // Цена этого: 1-2pp WR drop в краткосроке. Окупается ускорением калибровки
-        // в 3-5×. После того как калибратор накопит 200+ outcomes — поднять обратно.
-        private static final double MIN_CONFIDENCE_AFTER_WARMUP = 58.0;
+        private static final double MIN_CONFIDENCE_AFTER_WARMUP = 65.0;
         private static final int    MIN_CLUSTERS_AFTER_WARMUP   = 3;
 
         private final com.bot.TelegramBotSender tg;
@@ -745,6 +737,17 @@ public final class BotMain {
         final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram, gic, isc);
 
         Dispatcher.init(telegram, isc).setSender(sender); // [v79 I5]
+
+        // [v84.0 PROBE] One-shot live-trade probe — runs only if PROBE_RUN env var is set.
+        // Purpose: verify automation end-to-end on Binance demo before trusting real signals.
+        // Opens a tiny BTCUSDT position with 5x leverage + SL + TP1 + TP2,
+        // holds for PROBE_HOLD_SECONDS, then closes and cleans up.
+        // Set PROBE_RUN=BTCUSDT in Railway env to enable. REMOVE after success.
+        try {
+            com.bot.LiveTradeProbe.runIfRequested(telegram);
+        } catch (Throwable t) {
+            LOG.warning("[PROBE] launch error (non-fatal, bot continues): " + t.getMessage());
+        }
 
         final String calibratorFile = System.getenv()
                 .getOrDefault("CALIBRATOR_FILE", "./data/calibrator.csv");
