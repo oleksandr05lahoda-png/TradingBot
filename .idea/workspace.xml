@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BinanceTradeExecutor.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BinanceTradeExecutor.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -14,7 +13,7 @@
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="23" />
+    <option name="cachedIndexableFilesCount" value="26" />
   </component>
   <component name="ExternalProjectsData">
     <projectState path="$PROJECT_DIR$">
@@ -786,6 +785,8 @@
       <workItem from="1777732656142" duration="6523000" />
       <workItem from="1777760948956" duration="1319000" />
       <workItem from="1777794056611" duration="14599000" />
+      <workItem from="1777878575284" duration="275000" />
+      <workItem from="1777889953232" duration="437000" />
     </task>
     <servers />
   </component>

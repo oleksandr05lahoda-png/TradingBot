@@ -15,20 +15,30 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 /**
- * BinanceTradeExecutor v1.0 — live order execution for Binance USD-M Futures.
+ * BinanceTradeExecutor v83.3 — live order execution for Binance USD-M Futures.
  *
  * ┌─────────────────────────────────────────────────────────────────────┐
  * │  ВАЖНО: этот класс ничего не делает без явного вызова из BotMain.   │
  * │  Сам по себе он лежит "в спячке". Активация — на Этапе 3.           │
  * └─────────────────────────────────────────────────────────────────────┘
  *
+ * [v83.3] BREAKING CHANGE на стороне Binance (effective 2025-12-09):
+ * условные ордера (STOP_MARKET / TAKE_PROFIT_MARKET / STOP / TAKE_PROFIT /
+ * TRAILING_STOP_MARKET) больше НЕ принимаются на /fapi/v1/order. Они
+ * мигрировали в Algo Service: POST /fapi/v1/algoOrder. Старый эндпоинт
+ * возвращает ошибку -4120 (STOP_ORDER_SWITCH_ALGO). Поправлены два
+ * метода: sendStopMarketOrder() — теперь шлёт на /fapi/v1/algoOrder,
+ * и cancelAllOpenOrders() — теперь дополнительно гасит алго-ордера
+ * через /fapi/v1/allAlgoOpenOrders, иначе SL висит как orphan.
+ * Источник: developers.binance.com/docs/derivatives/change-log (2025-11-06).
+ *
  * Принципы безопасности:
  *
  *  1. NEVER OPEN WITHOUT SL.
  *     После MARKET-открытия позиции — немедленно (в той же транзакции,
- *     одним методом) отправляется STOP_MARKET ордер на SL. Если SL
- *     не подтвердился за 5 секунд — позиция закрывается принудительно.
- *     Лучше потерять комиссию, чем остаться без стопа.
+ *     одним методом) отправляется STOP_MARKET ордер на SL через algoOrder.
+ *     Если SL не подтвердился за 5 секунд — позиция закрывается
+ *     принудительно. Лучше потерять комиссию, чем остаться без стопа.
  *
  *  2. NO FUNDS, NO MOVE.
  *     Перед каждой сделкой проверяется реальный баланс на бирже. Если
@@ -329,9 +339,11 @@ public final class BinanceTradeExecutor {
 
             double actualNotional = qty * actualEntry;
 
-            // 5. Place SL — STOP_MARKET, reduceOnly, closePosition.
-            // Use slPriceRounded (snapped to tickSize) — raw idea.stop would
-            // get rejected by Binance for tick alignment.
+            // 5. Place SL — STOP_MARKET через Algo Service.
+            // [v83.3] С 2025-12-09 условные ордера живут на /fapi/v1/algoOrder.
+            // Параметр closePosition=true оставляем — закрывает всю позицию
+            // при срабатывании. reduceOnly с closePosition несовместим, не шлём.
+            // slPriceRounded уже снап на tickSize — иначе Binance отклонит.
             String slOrderId = null;
             long slDeadline = System.currentTimeMillis() + slPlacementTimeoutMs;
             int attempts = 0;
@@ -543,20 +555,38 @@ public final class BinanceTradeExecutor {
         return new JSONObject(resp.body()).optString("orderId", null);
     }
 
-    /** Send a STOP_MARKET order. Returns orderId on success, null otherwise. */
+    /**
+     * [v83.3] Send a STOP_MARKET order via the new Algo Service endpoint.
+     *
+     * Migration context: до 2025-12-09 условные ордера принимались на
+     * POST /fapi/v1/order. После — Binance переключил их на отдельный
+     * Algo Service. Старый эндпоинт теперь возвращает -4120
+     * "Order type not supported for this endpoint. Please use the
+     * Algo Order API endpoints instead."
+     *
+     * Изменения по сравнению со старой реализацией:
+     *   - URL:        /fapi/v1/order  →  /fapi/v1/algoOrder
+     *   - Добавлено:  algoType=CONDITIONAL  (обязательный параметр)
+     *   - Параметр:   stopPrice  →  triggerPrice  (имя поменялось)
+     *   - Ответ:      orderId (string)  →  algoId (long)
+     *
+     * Возвращает algoId как строку (для совместимости с интерфейсом, где
+     * SL-ID хранится как String). Возвращает null при ошибке.
+     */
     private String sendStopMarketOrder(String symbol, boolean buy, double stopPrice) throws Exception {
         long ts = System.currentTimeMillis();
-        String body = "symbol=" + symbol
+        String body = "algoType=CONDITIONAL"
+                + "&symbol=" + symbol
                 + "&side=" + (buy ? "BUY" : "SELL")
                 + "&type=STOP_MARKET"
-                + "&stopPrice=" + formatPrice(stopPrice)
+                + "&triggerPrice=" + formatPrice(stopPrice)
                 + "&closePosition=true"
                 + "&workingType=MARK_PRICE"
                 + "&timestamp=" + ts + "&recvWindow=5000";
         String sig = hmacSHA256(apiSecret, body);
         HttpResponse<String> resp = http.send(
                 HttpRequest.newBuilder()
-                        .uri(URI.create(baseUrl + "/fapi/v1/order"))
+                        .uri(URI.create(baseUrl + "/fapi/v1/algoOrder"))
                         .timeout(Duration.ofSeconds(10))
                         .header("X-MBX-APIKEY", apiKey)
                         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -564,15 +594,35 @@ public final class BinanceTradeExecutor {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
-            LOG.warning("[Executor] STOP_MARKET " + symbol + " HTTP " + resp.statusCode()
+            LOG.warning("[Executor] STOP_MARKET(algo) " + symbol + " HTTP " + resp.statusCode()
                     + ": " + resp.body());
             return null;
         }
-        return new JSONObject(resp.body()).optString("orderId", null);
+        // Успешный ответ содержит algoId (long), а не orderId (string)
+        JSONObject o = new JSONObject(resp.body());
+        long algoId = o.optLong("algoId", 0L);
+        if (algoId <= 0) {
+            LOG.warning("[Executor] STOP_MARKET(algo) " + symbol
+                    + " 200 OK but no algoId in body: " + resp.body());
+            return null;
+        }
+        return String.valueOf(algoId);
     }
 
-    /** Cancel ALL open orders on a symbol. */
+    /**
+     * Cancel ALL open orders on a symbol — обычные И алго-ордера.
+     *
+     * [v83.3] После миграции SL/TP в Algo Service обычный
+     * DELETE /fapi/v1/allOpenOrders больше не убивает условные ордера —
+     * они живут отдельно. Без второго вызова orphan-SL остаётся висеть
+     * на бирже после ручного закрытия позиции и может позже вылететь
+     * по триггеру в пустом стакане. Поэтому гасим обе очереди.
+     *
+     * Оба запроса делаются с try/catch вокруг каждого, чтобы падение
+     * одного не мешало второму отработать.
+     */
     private void cancelAllOpenOrders(String symbol) {
+        // 1) Обычные ордера
         try {
             long ts = System.currentTimeMillis();
             String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
@@ -585,7 +635,23 @@ public final class BinanceTradeExecutor {
                             .DELETE().build(),
                     HttpResponse.BodyHandlers.ofString());
         } catch (Exception e) {
-            LOG.warning("[Executor] cancelAllOrders " + symbol + " error: " + e.getMessage());
+            LOG.warning("[Executor] cancelAllOrders(plain) " + symbol + " error: " + e.getMessage());
+        }
+
+        // 2) Алго-ордера (SL/TP/трейлинги — теперь отдельная очередь)
+        try {
+            long ts = System.currentTimeMillis();
+            String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, body);
+            http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/allAlgoOpenOrders?" + body + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .DELETE().build(),
+                    HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            LOG.warning("[Executor] cancelAllOrders(algo) " + symbol + " error: " + e.getMessage());
         }
     }
 
