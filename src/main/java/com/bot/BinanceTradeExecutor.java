@@ -93,7 +93,12 @@ public final class BinanceTradeExecutor {
         if (useTestnet) {
             this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
             this.apiSecret = pick("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET", "");
-            this.baseUrl   = "https://testnet.binancefuture.com";
+            // [v83.1 FIX] Binance переименовал testnet с "testnet.binancefuture.com"
+            // на "demo-fapi.binance.com" (UI = demo.binance.com). Старый URL может
+            // ещё работать по легаси, но официальная документация
+            // (developers.binance.com/docs/derivatives/usds-margined-futures/general-info)
+            // указывает demo-fapi.binance.com как актуальный testnet REST endpoint.
+            this.baseUrl   = "https://demo-fapi.binance.com";
         } else {
             this.apiKey    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
             this.apiSecret = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
