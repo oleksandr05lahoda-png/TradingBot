@@ -96,9 +96,9 @@ public final class LiveTradeProbe {
                         "Символ: `%s`\n" +
                         "Целевой размер: ~$%.2f\n" +
                         "Плечо: 5x (как у боевого режима)\n" +
-                        "SL: −0.5%%\n" +
-                        "TP1: +0.3%% (50%% позиции)\n" +
-                        "TP2: +0.6%% (50%% позиции)\n" +
+                        "SL: −2.0%%\n" +
+                        "TP1: +1.2%% (50%% позиции)\n" +
+                        "TP2: +2.4%% (50%% позиции)\n" +
                         "Удержание: %d сек\n\n" +
                         "Если всё работает — увидишь сделку в Binance demo UI " +
                         "и второе сообщение через %d сек.",
@@ -166,10 +166,16 @@ public final class LiveTradeProbe {
 
             // STEP 3: Compute SL/TP levels
             //   LONG entry → SL below, TP above
-            //   SL: -0.5%, TP1: +0.3%, TP2: +0.6%
-            double slPrice  = currentPrice * 0.995;
-            double tp1Price = currentPrice * 1.003;
-            double tp2Price = currentPrice * 1.006;
+            //   SL: -2.0%, TP1: +1.2%, TP2: +2.4%
+            //   [v84.1] Расширены с -0.5/+0.3/+0.6 до -2.0/+1.2/+2.4 чтобы
+            //   удовлетворить safety check executor'а: margin ≤ 50% баланса.
+            //   При SL=-0.5% риск 2% от баланса требует огромную позицию
+            //   (qty * entry / leverage > 50% balance) → executor отказывает.
+            //   При SL=-2.0% позиция будет умеренной, тест проходит.
+            //   R:R остаётся 1:1.2 — реалистично для боевых сигналов.
+            double slPrice  = currentPrice * 0.980;
+            double tp1Price = currentPrice * 1.012;
+            double tp2Price = currentPrice * 1.024;
 
             LOG.info(String.format("[PROBE] step 3: levels entry≈%.6f sl=%.6f tp1=%.6f tp2=%.6f",
                     currentPrice, slPrice, tp1Price, tp2Price));
