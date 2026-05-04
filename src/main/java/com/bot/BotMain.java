@@ -297,7 +297,15 @@ public final class BotMain {
         private static final long   HOUR_MS         = 60 * 60_000L;
         private static final long   FIVE_MIN_MS     = 5 * 60_000L;
         // [v80] QUALITY GATE thresholds — после warmup
-        private static final double MIN_CONFIDENCE_AFTER_WARMUP = 65.0;
+        // [v83.4] 65.0 → 58.0. Логика: validator показал WR=29.8% при N=124 сигналах,
+        // т.е. наша probability в среднем переоценивает шансы на ~5pp. Калибратор
+        // PAV это позже выправит сам, но до накопления 200+ outcomes лучше держать
+        // gate на уровне 58, чтобы сигналы РЕАЛЬНО доходили до него и кормили
+        // калибратор. С gate=65 после warmup (n>=50) почти ВСЕ сигналы блокируются
+        // (см. лог: SKYAIUSDT prob=60<65), и калибратор перестаёт обучаться.
+        // Цена этого: 1-2pp WR drop в краткосроке. Окупается ускорением калибровки
+        // в 3-5×. После того как калибратор накопит 200+ outcomes — поднять обратно.
+        private static final double MIN_CONFIDENCE_AFTER_WARMUP = 58.0;
         private static final int    MIN_CLUSTERS_AFTER_WARMUP   = 3;
 
         private final com.bot.TelegramBotSender tg;

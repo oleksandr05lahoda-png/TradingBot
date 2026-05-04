@@ -513,7 +513,11 @@ public final class SignalSender {
     private final Map<String, Long> staleSkipUntil =
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final long STALE_HISTORY_WINDOW_MS = 5 * 60_000L;
-    private static final int  STALE_TRIGGER_COUNT = 3;
+    // [v83.4] STALE_TRIGGER_COUNT 3→5. Старое значение блокировало пару на 30мин
+    // после 3-х stale событий за 5 минут — это часто срабатывало на временных
+    // glitch'ах WS, не на хронически битых парах. Поднимаем порог чтобы только
+    // действительно проблемные пары попадали в blacklist.
+    private static final int  STALE_TRIGGER_COUNT = 5;
     private static final long STALE_SKIP_DURATION_MS = 30 * 60_000L;
 
     private volatile double cycleQualityPenalty = 0.0;
@@ -599,8 +603,12 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
         this.TOP_N            = envInt("TOP_N", 30);
-        this.MIN_CONF         = envDouble("MIN_CONF", 53.0);  // [FIX-FLAT-MARKET] default 58→53, синхронно с DE.BASE_CONF
-        // MIN_CONF=53 sits ~3pt above DE.MIN_CONF_FLOOR=50 — quality margin layer.
+        this.MIN_CONF         = envDouble("MIN_CONF", 50.0);  // [v83.4] 53→50 sync с DE.MIN_CONF_FLOOR
+        // [v83.4] MIN_CONF=50 = одна линия с DE.MIN_CONF_FLOOR. Был лишний 3pt margin
+        // ("quality margin layer"), который вместе с Dispatcher-gate=65 закрывал
+        // воронку на 95%. Убираем margin здесь, gate в Dispatcher тоже опущен
+        // (65→58 в BotMain). В env Railway можно поставить MIN_CONF=50 явно или
+        // удалить переменную — подхватится этот дефолт.
         // Effective range in processPair: [MIN_CONF-1, MIN_CONF+4] (см. строку 1525).
         // Authoritative quality control further downstream:
         //   1) Dispatcher.dispatch cold-start gate (BotMain Phase 1: floor 48)
