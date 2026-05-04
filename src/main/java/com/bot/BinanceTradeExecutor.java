@@ -84,6 +84,17 @@ public final class BinanceTradeExecutor {
     /** symbols where we have already set leverage + isolated. */
     private final java.util.Set<String> initializedSymbols = ConcurrentHashMap.newKeySet();
 
+    /**
+     * [v83.2] Cache of exchange filters per symbol. Populated lazily on first
+     * trade by reading /fapi/v1/exchangeInfo. Without this, qty/price rounding
+     * is wrong for many alts → MARKET order rejected by Binance.
+     *
+     * Each entry holds the actual stepSize / tickSize / minNotional rules
+     * Binance enforces. Cache lives until process restart, which is fine —
+     * exchangeInfo changes maybe once a quarter for any given symbol.
+     */
+    private final ConcurrentHashMap<String, SymbolInfo> symbolInfoCache = new ConcurrentHashMap<>();
+
     private static final BinanceTradeExecutor INSTANCE = new BinanceTradeExecutor();
     public static BinanceTradeExecutor getInstance() { return INSTANCE; }
 
@@ -93,11 +104,9 @@ public final class BinanceTradeExecutor {
         if (useTestnet) {
             this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
             this.apiSecret = pick("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET", "");
-            // [v83.1 FIX] Binance переименовал testnet с "testnet.binancefuture.com"
-            // на "demo-fapi.binance.com" (UI = demo.binance.com). Старый URL может
-            // ещё работать по легаси, но официальная документация
-            // (developers.binance.com/docs/derivatives/usds-margined-futures/general-info)
-            // указывает demo-fapi.binance.com как актуальный testnet REST endpoint.
+            // [v83.1] Binance переименовал testnet с testnet.binancefuture.com
+            // на demo-fapi.binance.com. UI открыт на demo.binance.com, REST API
+            // на demo-fapi.binance.com. Источник: developers.binance.com docs.
             this.baseUrl   = "https://demo-fapi.binance.com";
         } else {
             this.apiKey    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
@@ -269,6 +278,16 @@ public final class BinanceTradeExecutor {
             double slDistance = Math.abs(entry - idea.stop);
             if (slDistance <= 0) return ExecutionResult.fail("zero SL distance");
 
+            // [v83.2] Load real exchange filters for this symbol. Critical:
+            // every pair has its own stepSize (qty granularity), tickSize
+            // (price granularity), minNotional (smallest position). Hardcoded
+            // 3-decimal rounding of v1 worked for BTC/ETH/SOL but rejected
+            // exotic alts like BABYUSDT (need integer qty in thousands).
+            SymbolInfo si = loadSymbolInfo(symbol);
+            if (si == null) {
+                return ExecutionResult.fail("cannot load exchangeInfo for " + symbol);
+            }
+
             double riskUsd = balanceUsd * (riskPctPerTrade / 100.0);
             double qty = riskUsd / slDistance;
             double notional = qty * entry;
@@ -280,14 +299,28 @@ public final class BinanceTradeExecutor {
                         marginUsed, balanceUsd));
             }
 
-            // Round qty to symbol precision (we use 6 decimals as safe default;
-            // ideally we'd query exchangeInfo but for now this works for most pairs)
-            qty = roundQuantity(qty, symbol);
+            // Round qty DOWN to step size (truncate, never inflate position).
+            qty = roundDownToStep(qty, si.stepSize);
             if (qty <= 0) return ExecutionResult.fail("qty rounded to zero");
+
+            // Recompute notional after rounding — must satisfy minNotional.
+            double notionalAfterRound = qty * entry;
+            if (notionalAfterRound < si.minNotional) {
+                return ExecutionResult.fail(String.format(
+                        "notional $%.2f < min $%.2f for %s. Need bigger balance "
+                                + "or smaller SL distance to fit min size.",
+                        notionalAfterRound, si.minNotional, symbol));
+            }
+
+            // Round SL price to tick size (Binance rejects unaligned prices).
+            double slPriceRounded = roundToTick(idea.stop, si.tickSize, isLong);
 
             // 4. Send MARKET order
             String entryOrderId = sendMarketOrder(symbol, isLong, qty);
-            if (entryOrderId == null) return ExecutionResult.fail("MARKET order rejected");
+            if (entryOrderId == null) {
+                return ExecutionResult.fail("MARKET order rejected by Binance "
+                        + "(see [Executor] log for code+msg)");
+            }
 
             // Wait briefly for fill, fetch actual fill price
             Thread.sleep(800);
@@ -296,13 +329,15 @@ public final class BinanceTradeExecutor {
 
             double actualNotional = qty * actualEntry;
 
-            // 5. Place SL — STOP_MARKET, reduceOnly, closePosition
+            // 5. Place SL — STOP_MARKET, reduceOnly, closePosition.
+            // Use slPriceRounded (snapped to tickSize) — raw idea.stop would
+            // get rejected by Binance for tick alignment.
             String slOrderId = null;
             long slDeadline = System.currentTimeMillis() + slPlacementTimeoutMs;
             int attempts = 0;
             while (System.currentTimeMillis() < slDeadline && attempts < 3) {
                 attempts++;
-                slOrderId = sendStopMarketOrder(symbol, !isLong, idea.stop);
+                slOrderId = sendStopMarketOrder(symbol, !isLong, slPriceRounded);
                 if (slOrderId != null) break;
                 Thread.sleep(500);
             }
@@ -316,12 +351,12 @@ public final class BinanceTradeExecutor {
             }
 
             LOG.info(String.format(
-                    "[Executor] OPENED %s %s qty=%.6f entry=%.6f notional=$%.2f sl=%.6f orderId=%s slId=%s",
-                    symbol, isLong ? "LONG" : "SHORT", qty, actualEntry,
-                    actualNotional, idea.stop, entryOrderId, slOrderId));
+                    "[Executor] OPENED %s %s qty=%s entry=%.8f notional=$%.2f sl=%.8f orderId=%s slId=%s",
+                    symbol, isLong ? "LONG" : "SHORT", formatQtyForLog(qty), actualEntry,
+                    actualNotional, slPriceRounded, entryOrderId, slOrderId));
 
             return ExecutionResult.ok(entryOrderId, slOrderId, actualEntry, qty,
-                    actualNotional, idea.stop);
+                    actualNotional, slPriceRounded);
         } catch (Exception e) {
             LOG.severe("[Executor] openPosition exception: " + e.getMessage());
             return ExecutionResult.fail("exception: " + e.getMessage());
@@ -603,22 +638,128 @@ public final class BinanceTradeExecutor {
         }
     }
 
-    // ─── Formatting helpers ───────────────────────────────────────────
+    // ─── [v83.2] Exchange filters: exchangeInfo cache + rounding ──────
 
     /**
-     * Round qty to safe precision. For 99% of perp pairs, 6 decimals work.
-     * Production-quality would query /fapi/v1/exchangeInfo for stepSize.
-     * For testnet first-pass this is fine.
+     * Holds the Binance per-symbol filter values that we actually need to
+     * round qty/price correctly. Loaded once per symbol from /fapi/v1/exchangeInfo.
+     *
+     * Filter sources on Binance:
+     *   - LOT_SIZE.stepSize       → quantity granularity (e.g., 0.001, 1, 1000)
+     *   - PRICE_FILTER.tickSize   → price granularity   (e.g., 0.01, 0.0001)
+     *   - MIN_NOTIONAL.notional   → smallest position $ allowed
      */
-    private static double roundQuantity(double qty, String symbol) {
-        // Simple heuristic: high-priced symbols (BTC/ETH) → 3 decimals,
-        // mid (most alts) → 1-2 decimals, low (memes) → integer
-        // We use 3 decimals as conservative default.
-        return Math.floor(qty * 1000.0) / 1000.0;
+    private static final class SymbolInfo {
+        final double stepSize;
+        final double tickSize;
+        final double minNotional;
+        SymbolInfo(double stepSize, double tickSize, double minNotional) {
+            this.stepSize = stepSize;
+            this.tickSize = tickSize;
+            this.minNotional = minNotional;
+        }
     }
 
+    /**
+     * Load (or fetch from cache) per-symbol filter rules. Returns null if
+     * exchangeInfo couldn't be fetched. We intentionally fetch ALL symbols
+     * once and populate the cache on first miss — exchangeInfo is one big
+     * payload (~1MB) but we only do it once per process lifetime.
+     */
+    private SymbolInfo loadSymbolInfo(String symbol) {
+        SymbolInfo cached = symbolInfoCache.get(symbol);
+        if (cached != null) return cached;
+
+        // Cache miss → fetch full exchangeInfo and populate ALL symbols.
+        try {
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/exchangeInfo"))
+                            .timeout(Duration.ofSeconds(15))
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                LOG.warning("[Executor] exchangeInfo HTTP " + resp.statusCode());
+                return null;
+            }
+            JSONObject root = new JSONObject(resp.body());
+            JSONArray symbols = root.getJSONArray("symbols");
+            int populated = 0;
+            for (int i = 0; i < symbols.length(); i++) {
+                JSONObject s = symbols.getJSONObject(i);
+                String sym = s.optString("symbol", "");
+                if (sym.isEmpty()) continue;
+                double stepSize = 0, tickSize = 0, minNotional = 0;
+                JSONArray filters = s.optJSONArray("filters");
+                if (filters == null) continue;
+                for (int j = 0; j < filters.length(); j++) {
+                    JSONObject f = filters.getJSONObject(j);
+                    String type = f.optString("filterType", "");
+                    if ("LOT_SIZE".equals(type)) {
+                        stepSize = f.optDouble("stepSize", 0);
+                    } else if ("PRICE_FILTER".equals(type)) {
+                        tickSize = f.optDouble("tickSize", 0);
+                    } else if ("MIN_NOTIONAL".equals(type)) {
+                        // Field name varies: some endpoints use "notional",
+                        // futures uses "notional" or "minNotional".
+                        double v = f.optDouble("notional", 0);
+                        if (v == 0) v = f.optDouble("minNotional", 0);
+                        minNotional = v;
+                    }
+                }
+                if (stepSize > 0 && tickSize > 0) {
+                    if (minNotional <= 0) minNotional = 5.0; // Binance default
+                    symbolInfoCache.put(sym, new SymbolInfo(stepSize, tickSize, minNotional));
+                    populated++;
+                }
+            }
+            LOG.info("[Executor] exchangeInfo loaded: " + populated + " symbols cached");
+        } catch (Exception e) {
+            LOG.warning("[Executor] exchangeInfo error: " + e.getMessage());
+            return null;
+        }
+        return symbolInfoCache.get(symbol);
+    }
+
+    /**
+     * Round qty DOWN to nearest multiple of stepSize. We always round DOWN
+     * (truncate), never UP — this guarantees we never accidentally inflate
+     * the position size beyond what risk math says.
+     *
+     * Example: qty=1234567.89, stepSize=1 → 1234567
+     *          qty=0.123456, stepSize=0.001 → 0.123
+     */
+    private static double roundDownToStep(double value, double step) {
+        if (step <= 0) return value;
+        // BigDecimal to avoid floating-point drift on large multipliers
+        java.math.BigDecimal v = java.math.BigDecimal.valueOf(value);
+        java.math.BigDecimal s = java.math.BigDecimal.valueOf(step);
+        java.math.BigDecimal steps = v.divide(s, 0, java.math.RoundingMode.DOWN);
+        return steps.multiply(s).doubleValue();
+    }
+
+    /**
+     * Round price to tick size. For SHORT positions (isLong=false), SL is
+     * ABOVE entry — round UP so we never shrink the protective distance.
+     * For LONG, SL is BELOW entry — round DOWN. Symmetric logic.
+     */
+    private static double roundToTick(double price, double tick, boolean isLong) {
+        if (tick <= 0) return price;
+        java.math.BigDecimal p = java.math.BigDecimal.valueOf(price);
+        java.math.BigDecimal t = java.math.BigDecimal.valueOf(tick);
+        java.math.RoundingMode mode = isLong
+                ? java.math.RoundingMode.DOWN  // LONG SL below entry → don't pull closer
+                : java.math.RoundingMode.UP;   // SHORT SL above entry → don't pull closer
+        java.math.BigDecimal ticks = p.divide(t, 0, mode);
+        return ticks.multiply(t).doubleValue();
+    }
+
+    // ─── Formatting helpers (used by HTTP body builders) ──────────────
+
     private static String formatQty(double q) {
-        // Trim trailing zeros, max 8 decimals
+        // Trim trailing zeros, max 8 decimals. Note: actual rounding to
+        // stepSize is done by roundDownToStep BEFORE this is called — so
+        // q here is already a valid multiple of stepSize.
         return java.math.BigDecimal.valueOf(q)
                 .setScale(8, java.math.RoundingMode.DOWN)
                 .stripTrailingZeros()
@@ -626,8 +767,17 @@ public final class BinanceTradeExecutor {
     }
 
     private static String formatPrice(double p) {
+        // Same: tickSize alignment is done by roundToTick before this.
         return java.math.BigDecimal.valueOf(p)
                 .setScale(8, java.math.RoundingMode.HALF_UP)
+                .stripTrailingZeros()
+                .toPlainString();
+    }
+
+    /** Pretty qty for log lines (avoids 1.23e+6 scientific notation on big numbers). */
+    private static String formatQtyForLog(double q) {
+        return java.math.BigDecimal.valueOf(q)
+                .setScale(8, java.math.RoundingMode.DOWN)
                 .stripTrailingZeros()
                 .toPlainString();
     }
