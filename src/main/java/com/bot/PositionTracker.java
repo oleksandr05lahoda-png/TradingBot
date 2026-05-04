@@ -144,13 +144,26 @@ public final class PositionTracker {
         boolean stillOpen = Math.abs(exchangeQty) > 1e-9;
 
         if (!stillOpen) {
-            // Position closed on exchange — likely SL hit, or someone closed manually
+            // Position closed on exchange — likely SL hit, TP hit, or someone closed manually.
             // Compute realized PnL from current price (approximation; exact would
             // require fetching order history, but for our purpose this is enough).
             double exitPrice = guessClosingPrice(t);
             double pnl = computePnl(t, exitPrice);
 
             String reason = pnl < 0 ? "SL_HIT" : pnl > 0 ? "TP_OR_MANUAL" : "ZERO";
+
+            // [v84.0] Cancel orphan algo orders (other-side TP if SL fired,
+            // or remaining SL/TP if TP fired). Without this, after SL triggers
+            // the unfilled TP1/TP2 stay in algo queue indefinitely. They're
+            // reduceOnly so they can't open new positions, but they clutter
+            // the order book and may need manual cleanup.
+            try {
+                executor.cancelAllOrdersOnSymbol(symbol);
+            } catch (Throwable cleanupEx) {
+                LOG.warning("[Tracker] orphan cleanup failed for " + symbol + ": "
+                        + cleanupEx.getMessage());
+            }
+
             tracked.remove(symbol);
             riskGuard.recordTradeClosed(symbol, pnl);
             sendCloseNotification(t, exitPrice, pnl, reason);
@@ -163,6 +176,8 @@ public final class PositionTracker {
             LOG.info("[Tracker] " + symbol + " hit time-stop ("
                     + (age / 60_000L) + "min) — closing");
             boolean closed = executor.closePosition(symbol, "time-stop");
+            // closePosition() already calls cancelAllOpenOrders internally,
+            // so orphan TP/SL are cleaned up automatically here.
             if (closed) {
                 double exitPrice = guessClosingPrice(t);
                 double pnl = computePnl(t, exitPrice);

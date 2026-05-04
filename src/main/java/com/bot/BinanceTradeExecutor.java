@@ -167,33 +167,50 @@ public final class BinanceTradeExecutor {
         public final String  reason;
         public final String  orderId;        // main entry order id
         public final String  slOrderId;      // SL order id
+        public final String  tp1OrderId;     // TP1 algo id (may be null/empty)
+        public final String  tp2OrderId;     // TP2 algo id (may be null/empty)
+        public final int     tpsPlaced;      // 0..2 — how many TP orders confirmed
         public final double  entryPrice;     // actual fill price
         public final double  qty;            // base quantity
         public final double  notionalUsd;
         public final double  slPrice;
+        public final double  tp1Price;
+        public final double  tp2Price;
         public final long    timestampMs;
 
         private ExecutionResult(boolean ok, String reason, String orderId, String slOrderId,
-                                double entry, double qty, double notional, double sl) {
+                                String tp1Id, String tp2Id, int tpsPlaced,
+                                double entry, double qty, double notional,
+                                double sl, double tp1, double tp2) {
             this.success = ok; this.reason = reason;
             this.orderId = orderId; this.slOrderId = slOrderId;
+            this.tp1OrderId = tp1Id == null ? "" : tp1Id;
+            this.tp2OrderId = tp2Id == null ? "" : tp2Id;
+            this.tpsPlaced = tpsPlaced;
             this.entryPrice = entry; this.qty = qty;
             this.notionalUsd = notional; this.slPrice = sl;
+            this.tp1Price = tp1; this.tp2Price = tp2;
             this.timestampMs = System.currentTimeMillis();
         }
 
         public static ExecutionResult fail(String reason) {
-            return new ExecutionResult(false, reason, "", "", 0, 0, 0, 0);
+            return new ExecutionResult(false, reason, "", "", "", "", 0, 0, 0, 0, 0, 0, 0);
         }
         public static ExecutionResult ok(String orderId, String slOrderId,
-                                         double entry, double qty, double notional, double sl) {
-            return new ExecutionResult(true, "OK", orderId, slOrderId, entry, qty, notional, sl);
+                                         String tp1Id, String tp2Id, int tpsPlaced,
+                                         double entry, double qty, double notional,
+                                         double sl, double tp1, double tp2) {
+            return new ExecutionResult(true, "OK", orderId, slOrderId,
+                    tp1Id, tp2Id, tpsPlaced,
+                    entry, qty, notional, sl, tp1, tp2);
         }
 
         @Override public String toString() {
             return success
-                    ? String.format("OK orderId=%s slId=%s entry=%.6f qty=%.6f notional=$%.2f sl=%.6f",
-                    orderId, slOrderId, entryPrice, qty, notionalUsd, slPrice)
+                    ? String.format("OK orderId=%s slId=%s tp1=%s tp2=%s tpsPlaced=%d "
+                                    + "entry=%.6f qty=%.6f notional=$%.2f sl=%.6f tp1p=%.6f tp2p=%.6f",
+                    orderId, slOrderId, tp1OrderId, tp2OrderId, tpsPlaced,
+                    entryPrice, qty, notionalUsd, slPrice, tp1Price, tp2Price)
                     : "FAIL " + reason;
         }
     }
@@ -344,31 +361,118 @@ public final class BinanceTradeExecutor {
             // Параметр closePosition=true оставляем — закрывает всю позицию
             // при срабатывании. reduceOnly с closePosition несовместим, не шлём.
             // slPriceRounded уже снап на tickSize — иначе Binance отклонит.
+            //
+            // [v84.0 DIAGNOSTIC] При фейле логируем тело ответа ПОЛНОСТЬЮ
+            // и SEVERE-уровнем. До этого ошибка терялась в WARNING.
             String slOrderId = null;
+            String slLastError = "no attempts";
             long slDeadline = System.currentTimeMillis() + slPlacementTimeoutMs;
             int attempts = 0;
             while (System.currentTimeMillis() < slDeadline && attempts < 3) {
                 attempts++;
-                slOrderId = sendStopMarketOrder(symbol, !isLong, slPriceRounded);
+                String[] slResult = sendStopMarketOrderDiag(symbol, !isLong, slPriceRounded);
+                slOrderId = slResult[0];
+                slLastError = slResult[1];
                 if (slOrderId != null) break;
+                LOG.warning("[Executor] SL attempt " + attempts + "/3 failed for "
+                        + symbol + ": " + slLastError);
                 Thread.sleep(500);
             }
 
             // 6. SL FAILED — emergency close
             if (slOrderId == null) {
                 LOG.severe("[Executor] CRITICAL: SL placement failed after " + attempts
-                        + " attempts on " + symbol + " — emergency closing position");
+                        + " attempts on " + symbol + " (lastError=" + slLastError
+                        + ") — emergency closing position");
                 emergencyClosePosition(symbol, isLong, qty);
-                return ExecutionResult.fail("SL not placed → emergency close");
+                return ExecutionResult.fail("SL not placed (" + slLastError + ") → emergency close");
+            }
+
+            // 7. Place TP1 + TP2 — partial profit-taking via TAKE_PROFIT_MARKET algo orders.
+            //
+            // Дизайн:
+            //   - TP1: закрывает ~50% позиции по цене idea.tp1
+            //   - TP2: закрывает оставшиеся ~50% по цене idea.tp2
+            //   - Используем reduceOnly=true (без closePosition) → частичное закрытие
+            //   - Если qty/2 → 0 после rounding (мелкий контракт): fallback на единичный
+            //     TAKE_PROFIT_MARKET с closePosition=true на цене tp2 (более консервативно
+            //     ждать дальнюю цель чем взять ближнюю и упустить)
+            //
+            // ВАЖНО: TP-фейл НЕ триггерит emergency close. SL уже стоит, позиция защищена.
+            // Просто логируем warning — пользователь увидит сколько TP реально встало.
+            String tp1OrderId = null;
+            String tp2OrderId = null;
+            int tpsPlaced = 0;
+            double tp1Price = idea.tp1;
+            double tp2Price = idea.tp2;
+
+            try {
+                // Round TP prices to tick size (same direction as SL: rounds toward
+                // entry → conservative, locks profit slightly earlier).
+                double tp1Rounded = (idea.tp1 > 0)
+                        ? roundToTick(idea.tp1, si.tickSize, isLong) : 0;
+                double tp2Rounded = (idea.tp2 > 0)
+                        ? roundToTick(idea.tp2, si.tickSize, isLong) : 0;
+                tp1Price = tp1Rounded;
+                tp2Price = tp2Rounded;
+
+                // Split qty 50/50, ensuring sum doesn't exceed total.
+                double tp1Qty = roundDownToStep(qty * 0.5, si.stepSize);
+                double tp2Qty = qty - tp1Qty; // remainder, already a step multiple
+
+                // Check minNotional for partial TPs
+                double tp1Notional = tp1Qty * actualEntry;
+                double tp2Notional = tp2Qty * actualEntry;
+                boolean partialOk = tp1Qty > 0 && tp2Qty > 0
+                        && tp1Notional >= si.minNotional
+                        && tp2Notional >= si.minNotional;
+
+                if (partialOk && tp1Rounded > 0) {
+                    String[] r1 = sendTakeProfitMarketOrderDiag(
+                            symbol, !isLong, tp1Rounded, tp1Qty, false);
+                    tp1OrderId = r1[0];
+                    if (tp1OrderId != null) tpsPlaced++;
+                    else LOG.warning("[Executor] TP1 failed " + symbol + ": " + r1[1]);
+                }
+                if (partialOk && tp2Rounded > 0) {
+                    String[] r2 = sendTakeProfitMarketOrderDiag(
+                            symbol, !isLong, tp2Rounded, tp2Qty, false);
+                    tp2OrderId = r2[0];
+                    if (tp2OrderId != null) tpsPlaced++;
+                    else LOG.warning("[Executor] TP2 failed " + symbol + ": " + r2[1]);
+                }
+
+                // Fallback: position too small for partial TPs → single TP at tp2
+                // with closePosition=true. Better one TP than none.
+                if (!partialOk && tp2Rounded > 0) {
+                    LOG.info("[Executor] " + symbol + " too small for partial TPs "
+                            + "(notional=$" + String.format("%.2f", actualNotional)
+                            + " min=$" + si.minNotional + ") — single TP at tp2 fallback");
+                    String[] rSingle = sendTakeProfitMarketOrderDiag(
+                            symbol, !isLong, tp2Rounded, 0, true);
+                    tp2OrderId = rSingle[0];
+                    if (tp2OrderId != null) tpsPlaced++;
+                    else LOG.warning("[Executor] TP fallback failed " + symbol
+                            + ": " + rSingle[1]);
+                }
+
+                LOG.info("[Executor] TPs result " + symbol + ": tpsPlaced=" + tpsPlaced
+                        + " tp1=" + tp1OrderId + " tp2=" + tp2OrderId);
+            } catch (Exception tpEx) {
+                LOG.warning("[Executor] TP block exception " + symbol + ": "
+                        + tpEx.getMessage() + " — position remains with SL only");
             }
 
             LOG.info(String.format(
-                    "[Executor] OPENED %s %s qty=%s entry=%.8f notional=$%.2f sl=%.8f orderId=%s slId=%s",
+                    "[Executor] OPENED %s %s qty=%s entry=%.8f notional=$%.2f sl=%.8f "
+                            + "tp1=%.8f tp2=%.8f tpsPlaced=%d orderId=%s slId=%s",
                     symbol, isLong ? "LONG" : "SHORT", formatQtyForLog(qty), actualEntry,
-                    actualNotional, slPriceRounded, entryOrderId, slOrderId));
+                    actualNotional, slPriceRounded, tp1Price, tp2Price, tpsPlaced,
+                    entryOrderId, slOrderId));
 
-            return ExecutionResult.ok(entryOrderId, slOrderId, actualEntry, qty,
-                    actualNotional, slPriceRounded);
+            return ExecutionResult.ok(entryOrderId, slOrderId, tp1OrderId, tp2OrderId,
+                    tpsPlaced, actualEntry, qty, actualNotional,
+                    slPriceRounded, tp1Price, tp2Price);
         } catch (Exception e) {
             LOG.severe("[Executor] openPosition exception: " + e.getMessage());
             return ExecutionResult.fail("exception: " + e.getMessage());
@@ -573,8 +677,19 @@ public final class BinanceTradeExecutor {
      * Возвращает algoId как строку (для совместимости с интерфейсом, где
      * SL-ID хранится как String). Возвращает null при ошибке.
      */
-    private String sendStopMarketOrder(String symbol, boolean buy, double stopPrice) throws Exception {
+    /**
+     * [v84.0] Diagnostic STOP_MARKET sender. Returns String[2]:
+     *   [0] = algoId (success) or null (failure)
+     *   [1] = error reason string (always populated for diagnostics)
+     *
+     * Replaces the old sendStopMarketOrder() — same endpoint, same params,
+     * but full request body + response body are now captured for the caller.
+     * This is what makes "SL not placed" debuggable instead of mysterious.
+     */
+    private String[] sendStopMarketOrderDiag(String symbol, boolean buy, double stopPrice) throws Exception {
         long ts = System.currentTimeMillis();
+        // recvWindow bumped to 60000 per Binance recommendation for high-latency
+        // environments — testnet often has 200-500ms RTT spikes.
         String body = "algoType=CONDITIONAL"
                 + "&symbol=" + symbol
                 + "&side=" + (buy ? "BUY" : "SELL")
@@ -582,31 +697,119 @@ public final class BinanceTradeExecutor {
                 + "&triggerPrice=" + formatPrice(stopPrice)
                 + "&closePosition=true"
                 + "&workingType=MARK_PRICE"
-                + "&timestamp=" + ts + "&recvWindow=5000";
+                + "&timestamp=" + ts + "&recvWindow=60000";
         String sig = hmacSHA256(apiSecret, body);
-        HttpResponse<String> resp = http.send(
-                HttpRequest.newBuilder()
-                        .uri(URI.create(baseUrl + "/fapi/v1/algoOrder"))
-                        .timeout(Duration.ofSeconds(10))
-                        .header("X-MBX-APIKEY", apiKey)
-                        .header("Content-Type", "application/x-www-form-urlencoded")
-                        .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp;
+        try {
+            resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/algoOrder"))
+                            .timeout(Duration.ofSeconds(10))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .header("Content-Type", "application/x-www-form-urlencoded")
+                            .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            String err = "HTTP exception: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage();
+            LOG.severe("[Executor] STOP_MARKET(algo) " + symbol + " " + err
+                    + " | sentBody=" + body);
+            return new String[]{null, err};
+        }
+
         if (resp.statusCode() != 200) {
-            LOG.warning("[Executor] STOP_MARKET(algo) " + symbol + " HTTP " + resp.statusCode()
-                    + ": " + resp.body());
-            return null;
+            String err = "HTTP " + resp.statusCode() + " body=" + resp.body();
+            LOG.severe("[Executor] STOP_MARKET(algo) FAIL " + symbol + " " + err
+                    + " | sentBody=" + body);
+            return new String[]{null, err};
         }
-        // Успешный ответ содержит algoId (long), а не orderId (string)
-        JSONObject o = new JSONObject(resp.body());
-        long algoId = o.optLong("algoId", 0L);
-        if (algoId <= 0) {
-            LOG.warning("[Executor] STOP_MARKET(algo) " + symbol
-                    + " 200 OK but no algoId in body: " + resp.body());
-            return null;
+
+        try {
+            JSONObject o = new JSONObject(resp.body());
+            long algoId = o.optLong("algoId", 0L);
+            if (algoId <= 0) {
+                String err = "200 OK but no algoId. body=" + resp.body();
+                LOG.severe("[Executor] STOP_MARKET(algo) " + symbol + " " + err);
+                return new String[]{null, err};
+            }
+            return new String[]{String.valueOf(algoId), "OK"};
+        } catch (Exception parseEx) {
+            String err = "JSON parse: " + parseEx.getMessage() + " body=" + resp.body();
+            LOG.severe("[Executor] STOP_MARKET(algo) " + symbol + " " + err);
+            return new String[]{null, err};
         }
-        return String.valueOf(algoId);
+    }
+
+    /**
+     * [v84.0] Send a TAKE_PROFIT_MARKET algo order. Two modes:
+     *
+     *   1) Partial close (useClosePosition=false):
+     *        sends quantity + reduceOnly=true. When triggered, closes only
+     *        that quantity. Used for TP1 (50%) and TP2 (50%).
+     *
+     *   2) Full close (useClosePosition=true):
+     *        sends closePosition=true (no quantity, no reduceOnly).
+     *        When triggered, closes the entire remaining position.
+     *        Used as fallback when position is too small for partial split.
+     *
+     * Returns String[2]: [0]=algoId or null, [1]=reason.
+     */
+    private String[] sendTakeProfitMarketOrderDiag(String symbol, boolean buy,
+                                                   double triggerPrice, double qty,
+                                                   boolean useClosePosition) throws Exception {
+        long ts = System.currentTimeMillis();
+        StringBuilder body = new StringBuilder();
+        body.append("algoType=CONDITIONAL")
+                .append("&symbol=").append(symbol)
+                .append("&side=").append(buy ? "BUY" : "SELL")
+                .append("&type=TAKE_PROFIT_MARKET")
+                .append("&triggerPrice=").append(formatPrice(triggerPrice))
+                .append("&workingType=MARK_PRICE");
+        if (useClosePosition) {
+            body.append("&closePosition=true");
+        } else {
+            body.append("&quantity=").append(formatQty(qty))
+                    .append("&reduceOnly=true");
+        }
+        body.append("&timestamp=").append(ts).append("&recvWindow=60000");
+
+        String bodyStr = body.toString();
+        String sig = hmacSHA256(apiSecret, bodyStr);
+
+        HttpResponse<String> resp;
+        try {
+            resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/algoOrder"))
+                            .timeout(Duration.ofSeconds(10))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .header("Content-Type", "application/x-www-form-urlencoded")
+                            .POST(HttpRequest.BodyPublishers.ofString(bodyStr + "&signature=" + sig))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            String err = "HTTP exception: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage();
+            return new String[]{null, err};
+        }
+
+        if (resp.statusCode() != 200) {
+            return new String[]{null, "HTTP " + resp.statusCode() + " body=" + resp.body()
+                    + " | sentBody=" + bodyStr};
+        }
+
+        try {
+            JSONObject o = new JSONObject(resp.body());
+            long algoId = o.optLong("algoId", 0L);
+            if (algoId <= 0) {
+                return new String[]{null, "200 OK but no algoId. body=" + resp.body()};
+            }
+            return new String[]{String.valueOf(algoId), "OK"};
+        } catch (Exception parseEx) {
+            return new String[]{null, "JSON parse: " + parseEx.getMessage()
+                    + " body=" + resp.body()};
+        }
     }
 
     /**
@@ -621,6 +824,20 @@ public final class BinanceTradeExecutor {
      * Оба запроса делаются с try/catch вокруг каждого, чтобы падение
      * одного не мешало второму отработать.
      */
+    /**
+     * [v84.0] Public wrapper for cleanup. Cancels both regular orders and algo
+     * orders (SL/TP/TRAILING) for the given symbol. Used by PositionTracker
+     * when it detects a position has closed (e.g., SL triggered naturally) —
+     * needed to evict orphan TP/SL algo orders that would otherwise sit in
+     * the queue forever and possibly trigger spuriously later.
+     *
+     * Idempotent and exception-safe. Both queues are attempted independently;
+     * failure of one does not prevent the other from being cleared.
+     */
+    public void cancelAllOrdersOnSymbol(String symbol) {
+        cancelAllOpenOrders(symbol);
+    }
+
     private void cancelAllOpenOrders(String symbol) {
         // 1) Обычные ордера
         try {
