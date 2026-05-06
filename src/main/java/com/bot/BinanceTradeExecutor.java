@@ -838,6 +838,236 @@ public final class BinanceTradeExecutor {
         cancelAllOpenOrders(symbol);
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    // [v84.5] PositionTracker support: targeted algo cancel,
+    //         move-to-breakeven, real-fill PnL, position enumeration.
+    //
+    // These methods are added to support PositionTracker v2.0 which fixes:
+    //   • PnL miscalculation (using slPrice instead of real fills)
+    //   • Lack of breakeven SL after TP1
+    //   • Inability to cancel a single SL without nuking TPs
+    //   • Startup orphan-position detection
+    //
+    // None of these methods are called by openPositionWithSl — existing
+    // open/close flows are untouched.
+    // ═════════════════════════════════════════════════════════════════
+
+    /**
+     * Cancel a SINGLE algo order by algoId. Does NOT touch other algo orders
+     * on the symbol — critical for breakeven moves where we want to replace
+     * just the SL without killing the TPs.
+     *
+     * Treats "-2011" / "-2013" / "Unknown order" as success (the order is
+     * gone — either filled or already cancelled — which is what we wanted).
+     *
+     * @return true if order is gone (cancelled or already gone), false on hard error.
+     */
+    public boolean cancelAlgoOrder(String symbol, String algoId) {
+        if (!isReady()) return false;
+        if (algoId == null || algoId.isBlank()) {
+            LOG.warning("[Executor] cancelAlgoOrder " + symbol + ": empty algoId");
+            return false;
+        }
+        try {
+            long ts = System.currentTimeMillis();
+            String qs = "symbol=" + symbol + "&algoId=" + algoId
+                    + "&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/algoOrder?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .DELETE().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            int code = resp.statusCode();
+            if (code == 200) {
+                LOG.info("[Executor] cancelAlgoOrder OK " + symbol + "/" + algoId);
+                return true;
+            }
+            // Order already gone — treat as success
+            String body = resp.body() == null ? "" : resp.body();
+            if (body.contains("-2011") || body.contains("-2013")
+                    || body.toLowerCase().contains("unknown order")) {
+                LOG.info("[Executor] cancelAlgoOrder " + symbol + "/" + algoId
+                        + " already gone (treated as success)");
+                return true;
+            }
+            LOG.warning("[Executor] cancelAlgoOrder " + symbol + "/" + algoId
+                    + " HTTP " + code + ": " + body);
+            return false;
+        } catch (Exception e) {
+            LOG.warning("[Executor] cancelAlgoOrder " + symbol + "/" + algoId
+                    + " exception: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Replace the SL with a new breakeven SL atomically.
+     *
+     * Sequence (NOT a single transaction — Binance has no such primitive,
+     * so we do it in the safest possible order):
+     *   1. Cancel old SL via DELETE algoOrder (targeted).
+     *   2. If cancel fails → ABORT (don't place a second SL on top of the
+     *      live one — that creates two SLs which can both fire).
+     *   3. Place new SL via algoOrder (closePosition=true).
+     *   4. If new SL placement fails → log SEVERE. The position is now
+     *      UNPROTECTED. Caller should send loud Telegram alert. We don't
+     *      auto-restore the old SL because the cancel may have already
+     *      partially propagated and a re-place could conflict.
+     *
+     * @param oldSlAlgoId  algoId of the existing SL to be cancelled
+     * @param newSlPrice   the new SL price (will be tick-rounded internally)
+     * @return new algoId on success, null on any failure
+     */
+    public String replaceSlWithBreakeven(String symbol, boolean isLong,
+                                         String oldSlAlgoId, double newSlPrice) {
+        if (!isReady()) return null;
+        SymbolInfo si = loadSymbolInfo(symbol);
+        if (si == null) {
+            LOG.warning("[Executor] BE move " + symbol + ": no symbolInfo, abort");
+            return null;
+        }
+        // 1. Cancel old SL
+        boolean cancelled = cancelAlgoOrder(symbol, oldSlAlgoId);
+        if (!cancelled) {
+            LOG.severe("[Executor] BE move " + symbol + ": old SL cancel FAILED. "
+                    + "Aborting — old SL may still be alive.");
+            return null;
+        }
+
+        // 2. Round new SL to tick. For LONG, BE SL is ABOVE entry (sl is normally
+        // below entry, but BE flips that — we set it slightly above to lock a
+        // tiny profit / cover fees). Use HALF_UP-ish rounding via roundToTick:
+        //   - For LONG: round DOWN (don't go further from spot than asked).
+        //   - For SHORT: round UP. roundToTick already does this correctly.
+        double rounded = roundToTick(newSlPrice, si.tickSize, isLong);
+
+        // 3. Place new SL
+        try {
+            String[] r = sendStopMarketOrderDiag(symbol, !isLong, rounded);
+            if (r[0] != null) {
+                LOG.info("[Executor] BE move " + symbol + " OK: oldSl=" + oldSlAlgoId
+                        + " → newSl=" + r[0] + " price=" + rounded);
+                return r[0];
+            }
+            LOG.severe("[Executor] BE move " + symbol + " — new SL placement FAILED: "
+                    + r[1] + " — POSITION NOW UNPROTECTED. Manual intervention may be required.");
+            return null;
+        } catch (Exception e) {
+            LOG.severe("[Executor] BE move " + symbol + " exception: " + e.getMessage()
+                    + " — POSITION NOW UNPROTECTED");
+            return null;
+        }
+    }
+
+    /**
+     * Fetch the VWAP of CLOSING fills for a symbol since a given timestamp.
+     *
+     * "Closing" = trades on the side opposite to the original entry direction.
+     * If you opened LONG (BUY), closing trades are SELL. We pull /fapi/v1/userTrades
+     * with startTime=sinceMs and average all SELL trades by qty.
+     *
+     * Why this exists: the old PositionTracker.guessClosingPrice() returned
+     * t.slPrice unconditionally, which made PnL totally wrong when:
+     *   • TP1 fired (50% closed at +R) followed by SL on remainder — pnl
+     *     was reported as 100% × slPrice instead of 50% TP + 50% SL.
+     *   • User manually closed in profit — pnl was reported as SL_HIT loss.
+     *   • Slippage caused real fill 0.3% worse than configured SL.
+     *
+     * @param symbol               trading pair
+     * @param originalEntryWasLong true if the original entry side was BUY (long)
+     * @param sinceMs              ms epoch — start of the window to look for fills
+     * @return VWAP of closing fills, or 0.0 if API failed / no closing fills found
+     */
+    public double fetchRealizedClosingPrice(String symbol,
+                                            boolean originalEntryWasLong,
+                                            long sinceMs) {
+        if (!isReady()) return 0.0;
+        try {
+            long ts = System.currentTimeMillis();
+            // limit=500 is the max for userTrades. For a single trade this is
+            // way more than enough (TP1 + SL = 2 fills, plus the entry = 3).
+            String qs = "symbol=" + symbol + "&startTime=" + sinceMs
+                    + "&limit=500&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/userTrades?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                LOG.warning("[Executor] userTrades " + symbol + " HTTP "
+                        + resp.statusCode() + ": " + resp.body());
+                return 0.0;
+            }
+            JSONArray arr = new JSONArray(resp.body());
+            String closingSide = originalEntryWasLong ? "SELL" : "BUY";
+            double totalQty = 0.0;
+            double weightedPrice = 0.0;
+            int closingCount = 0;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject tr = arr.getJSONObject(i);
+                if (!closingSide.equals(tr.optString("side"))) continue;
+                double qty = tr.optDouble("qty", 0);
+                double price = tr.optDouble("price", 0);
+                if (qty > 0 && price > 0) {
+                    totalQty += qty;
+                    weightedPrice += qty * price;
+                    closingCount++;
+                }
+            }
+            if (totalQty > 0) {
+                double vwap = weightedPrice / totalQty;
+                LOG.info(String.format(
+                        "[Executor] realizedClosePrice %s: %d fills totalQty=%.6f VWAP=%.8f",
+                        symbol, closingCount, totalQty, vwap));
+                return vwap;
+            }
+            LOG.fine("[Executor] realizedClosePrice " + symbol + ": no closing fills found");
+            return 0.0;
+        } catch (Exception e) {
+            LOG.warning("[Executor] realizedClosePrice " + symbol + " exception: "
+                    + e.getMessage());
+            return 0.0;
+        }
+    }
+
+    /**
+     * Fetch ALL non-zero positions on the futures account. Used by PositionTracker
+     * at startup to detect orphan positions (Railway restart while a trade was open).
+     *
+     * @return JSONArray of position objects (positionAmt, entryPrice, markPrice,
+     *         unRealizedProfit, symbol, …) or null on API failure.
+     */
+    public JSONArray fetchAllOpenPositionsRaw() {
+        if (!isReady()) return null;
+        try {
+            long ts = System.currentTimeMillis();
+            String qs = "timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v2/positionRisk?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(10))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                LOG.warning("[Executor] fetchAllPositions HTTP " + resp.statusCode()
+                        + ": " + resp.body());
+                return null;
+            }
+            return new JSONArray(resp.body());
+        } catch (Exception e) {
+            LOG.warning("[Executor] fetchAllPositions exception: " + e.getMessage());
+            return null;
+        }
+    }
+
     private void cancelAllOpenOrders(String symbol) {
         // 1) Обычные ордера
         try {
