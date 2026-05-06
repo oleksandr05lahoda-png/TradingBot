@@ -149,9 +149,12 @@ public final class DecisionEngineMerged {
     // становится SignalSender.earlyMinConf=53. DE-floor=50 даёт DE возможность
     // выпускать setup'ы с prob 50-52 — они дойдут до SignalSender, где env-MIN_CONF
     // решает финально. Без этого DE рубит сетапы ещё до того как они увидят env-floor.
-    private static final double BASE_CONF       = 53.0;
+    // [FLAT-MARKET LOOSEN 2026-05-05] BASE_CONF 53→50. В NEUTRAL str=0.06-0.22 BTC
+    // RANGE adapt даёт base+1=54, что отсекало 99% сетапов. Снижение до 50 = равно
+    // floor; адаптации (RANGE +1, vol +2, UTC -1.5) теперь работают вокруг 50.
+    private static final double BASE_CONF       = 50.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 50.0;
+    private static final double MIN_CONF_FLOOR  = 48.0;
     private static final double MIN_CONF_CEIL   = 78.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -3752,8 +3755,10 @@ public final class DecisionEngineMerged {
                 double distFromEma = Math.abs(price - ema20) / atr14;
                 // Если цена уже >1.8×ATR от EMA20 в направлении сигнала — late entry.
                 // Для LONG: блок если price >> ema20. Для SHORT: блок если price << ema20.
-                boolean v80LateEntry = (isLong && price > ema20 && distFromEma > 1.8)
-                        || (!isLong && price < ema20 && distFromEma > 1.8);
+                // [FLAT-MARKET LOOSEN 2026-05-05] 1.8 → 2.4. В широких ATR coins
+                // 1.8×ATR срабатывает на нормальных trend-following entries.
+                boolean v80LateEntry = (isLong && price > ema20 && distFromEma > 2.4)
+                        || (!isLong && price < ema20 && distFromEma > 2.4);
                 if (v80LateEntry) {
                     return reject("late_entry_ema20");
                 }
@@ -3773,12 +3778,15 @@ public final class DecisionEngineMerged {
 
                 if (isLong && bear1h) {
                     double rsi15 = com.bot.TradingCore.rsi(c15, 14);
-                    if (rsi15 > 38) return reject("mtf_long_vs_1h_bear");
+                    // [FLAT-MARKET LOOSEN 2026-05-05] 38 → 45. RSI<38 = глубокий
+                    // oversold, бывает редко. 45 разрешает counter-trend bounce setup'ы.
+                    if (rsi15 > 45) return reject("mtf_long_vs_1h_bear");
                     allFlags.add("MTF_OS_BOUNCE");
                 }
                 if (!isLong && bull1h) {
                     double rsi15 = com.bot.TradingCore.rsi(c15, 14);
-                    if (rsi15 < 62) return reject("mtf_short_vs_1h_bull");
+                    // [FLAT-MARKET LOOSEN 2026-05-05] 62 → 55. Аналогично симметрично.
+                    if (rsi15 < 55) return reject("mtf_short_vs_1h_bull");
                     allFlags.add("MTF_OB_SHORT");
                 }
                 if ((isLong && bull1h) || (!isLong && bear1h)) {
@@ -3798,7 +3806,10 @@ public final class DecisionEngineMerged {
                 double recent3Vol = (c15.get(vN15-1).volume + c15.get(vN15-2).volume + c15.get(vN15-3).volume) / 3.0;
                 if (avgVol20 > 0) {
                     double volRatio = recent3Vol / avgVol20;
-                    if (volRatio < 1.05) {
+                    // [FLAT-MARKET LOOSEN 2026-05-05] 1.05 → 0.85. В flat-market объёмы
+                    // часто ниже avg. 0.85 = разрешаем сигналы с до -15% от среднего объёма.
+                    // VOL_SURGE флаг при ≥1.5 сохранён.
+                    if (volRatio < 0.85) {
                         return reject("low_volume");
                     }
                     if (volRatio >= 1.5) allFlags.add("VOL_SURGE");
@@ -3813,7 +3824,11 @@ public final class DecisionEngineMerged {
                 String regime = String.valueOf(gicCtx.regime);
                 double btcStr = gicCtx.impulseStrength;
                 boolean btcFlat = regime.contains("NEUTRAL") || regime.contains("FLAT") || regime.contains("RANGE");
-                if (btcFlat && btcStr < 0.30) {
+                // [FLAT-MARKET LOOSEN 2026-05-05] 0.30 → 0.18. Был блок ВСЕХ SHORT
+                // в течение суток (BTC NEUTRAL str=0.06-0.22). 0.18 оставляет защиту
+                // от полностью stagnant рынка (str<0.18 = реально без направления),
+                // но даёт SHORT-сигналам пройти при слабом боковом движении.
+                if (btcFlat && btcStr < 0.18) {
                     return reject("btc_flat_short_block");
                 }
                 // SHORT vs strong BTC bull — только при ≥4 кластерах
@@ -3838,7 +3853,10 @@ public final class DecisionEngineMerged {
         try {
             com.bot.TradingCore.ADXResult adxRes = com.bot.TradingCore.adx(c15, 14);
             double adxVal = adxRes != null ? adxRes.adx : 0;
-            if (adxVal > 0 && adxVal < 18.0) {
+            // [FLAT-MARKET LOOSEN 2026-05-05] 18 → 14. ADX<18 — стандарт "no trend",
+            // но в крипто-15m реальные импульсы стартуют с ADX 14-16. Жёсткий блок 18
+            // отсекал ранние entries. 14 оставляет защиту только от полного флэта.
+            if (adxVal > 0 && adxVal < 14.0) {
                 return reject("adx_flat_lt_18");
             }
             if (adxVal > 0) allFlags.add(String.format("ADX=%.0f", adxVal));
@@ -3851,7 +3869,10 @@ public final class DecisionEngineMerged {
                 com.bot.TradingCore.BollingerResult bb = com.bot.TradingCore.bollinger(c15, 20, 2.0);
                 if (bb != null && price > 0) {
                     double bbWidth = (bb.upper - bb.lower) / price;
-                    if (bbWidth < 0.012) {
+                    // [FLAT-MARKET LOOSEN 2026-05-05] 0.012 → 0.008. 1.2% BB width
+                    // блокировал нормальный low-vol альт. 0.8% оставляет защиту
+                    // только от extreme squeeze (pre-breakout coiling).
+                    if (bbWidth < 0.008) {
                         return reject("bb_squeeze");
                     }
                     allFlags.add(String.format("BBW=%.3f", bbWidth));
@@ -5364,6 +5385,16 @@ public final class DecisionEngineMerged {
         private static final int  BUCKETS     = 5;
         private static final long MAX_AGE_MS  = 30L * 24 * 60 * 60 * 1000L;
 
+        // [LOOSEN 2026-05-05] Env-выключатель калибратора. Если калибратор обучен
+        // на bias dataset (например, startup-backtest дал WR=27%), он системно
+        // занижает все вероятности и убивает любые сигналы. CALIBRATOR_DISABLED=1
+        // переводит calibrate() в pass-through (возвращает сырой score без коррекции).
+        // Записи outcomes (recordOutcome) продолжаются — данные копятся для будущего
+        // включения. Включай обратно (CALIBRATOR_DISABLED=0) когда наберётся
+        // ≥100 свежих outcomes с целевым WR≥45%.
+        private static final boolean DISABLED =
+                "1".equals(System.getenv().getOrDefault("CALIBRATOR_DISABLED", "0"));
+
         // [v79 I3] HMAC key + audit log. Set CALIBRATOR_HMAC_KEY in env on prod.
         private static final String HMAC_KEY = resolveHmacKey();
         private static final String AUDIT_LOG_PATH = System.getenv()
@@ -5537,6 +5568,8 @@ public final class DecisionEngineMerged {
         /** [v79] FULL calibrate with regime context. DecisionEngineMerged should call this. */
         public double calibrate(String symbol, double rawScore, double atrPct, String btcRegime) {
             double r = clamp01(rawScore);
+            // [LOOSEN 2026-05-05] Pass-through когда калибратор выключен через env.
+            if (DISABLED) return r;
             if (symbol == null) return r;
 
             VolBucket vb = VolBucket.of(atrPct);

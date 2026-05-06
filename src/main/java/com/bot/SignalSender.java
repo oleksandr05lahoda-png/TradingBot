@@ -513,12 +513,13 @@ public final class SignalSender {
     private final Map<String, Long> staleSkipUntil =
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final long STALE_HISTORY_WINDOW_MS = 5 * 60_000L;
-    // [v83.4] STALE_TRIGGER_COUNT 3→5. Старое значение блокировало пару на 30мин
-    // после 3-х stale событий за 5 минут — это часто срабатывало на временных
-    // glitch'ах WS, не на хронически битых парах. Поднимаем порог чтобы только
-    // действительно проблемные пары попадали в blacklist.
-    private static final int  STALE_TRIGGER_COUNT = 5;
-    private static final long STALE_SKIP_DURATION_MS = 30 * 60_000L;
+    // [LOOSEN 2026-05-05] STALE_TRIGGER_COUNT 5→8, SKIP_DURATION 30→15 мин.
+    // Текущая Railway-latency давала 5+ stales за 5 мин на топ-парах
+    // (ETH/BNB/SOL/AVAX/LINK/DOGE) → они уходили в 30-мин blacklist каждый цикл.
+    // 8 stales = реально хронически битая пара. 15 мин skip достаточно
+    // чтобы WS успел переподключиться, не теряя пару на полчаса.
+    private static final int  STALE_TRIGGER_COUNT = 8;
+    private static final long STALE_SKIP_DURATION_MS = 15 * 60_000L;
 
     private volatile double cycleQualityPenalty = 0.0;
     private volatile double lastCycleStaleRatio = 0.0;
