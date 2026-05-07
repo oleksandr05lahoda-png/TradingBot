@@ -6,7 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/GlobalImpulseController.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/PositionTracker.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/PositionTracker.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -806,7 +806,7 @@
       <workItem from="1777977107078" duration="1178000" />
       <workItem from="1778003756492" duration="2757000" />
       <workItem from="1778074673971" duration="3056000" />
-      <workItem from="1778151254358" duration="4553000" />
+      <workItem from="1778151254358" duration="5753000" />
     </task>
     <servers />
   </component>

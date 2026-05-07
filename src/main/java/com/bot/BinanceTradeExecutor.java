@@ -621,6 +621,39 @@ public final class BinanceTradeExecutor {
         }
     }
 
+    /**
+     * [v86 EXIT-FIX] Get current mark price for a symbol via positionRisk endpoint.
+     * Used by PositionTracker for active management (trailing-stop / profit-lock /
+     * stagnation exit) — needs current price each poll, not just qty.
+     * @return mark price, or 0 if no position / API failed.
+     */
+    public double fetchMarkPrice(String symbol) {
+        if (!isReady()) return 0;
+        try {
+            long ts = System.currentTimeMillis();
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v2/positionRisk?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) return 0;
+            JSONArray arr = new JSONArray(resp.body());
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                if (symbol.equals(o.optString("symbol"))) {
+                    return o.optDouble("markPrice", 0);
+                }
+            }
+            return 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     // ─── Internal: HTTP signed calls ──────────────────────────────────
 
     private boolean initSymbolMargin(String symbol) throws Exception {

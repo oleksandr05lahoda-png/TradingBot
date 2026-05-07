@@ -47,6 +47,15 @@ public final class SimpleBacktester {
     // фиксировать BE. ENV BACKTEST_BE_TRIGGER_R может перезаписать (-1 = отключить).
     private final double earlyBeTriggerR = envDouble("BACKTEST_BE_TRIGGER_R", 1.0);
 
+    // [v86 EXIT-FIX] Active exit management toggles. All ON by default.
+    // Set =0 in env to disable individual layers for A/B comparison.
+    private final boolean trailEnabled       =
+            !"0".equals(System.getenv().getOrDefault("BACKTEST_TRAIL_ENABLED",       "1"));
+    private final boolean profitLockEnabled  =
+            !"0".equals(System.getenv().getOrDefault("BACKTEST_PROFIT_LOCK_ENABLED", "1"));
+    private final boolean stagnationEnabled  =
+            !"0".equals(System.getenv().getOrDefault("BACKTEST_STAGNATION_ENABLED",  "1"));
+
     // Single source of truth for warmup.
     // Must match DecisionEngineMerged.MIN_BARS (150) — that's the gate
     // engine.analyze() uses internally. Previously backtester used 160
@@ -149,6 +158,12 @@ public final class SimpleBacktester {
         public int    timeStopWins, timeStopLosses, timeStopBreakEvens;
         public double medianTimeStopPnl;
         public double avgTimeStopPnl;
+
+        // [v86 EXIT-FIX] Active exit counters — separate visibility for the new
+        // management layers. profitLocks = trades closed at 60% time-window with
+        // ≥+0.3R. trailExits = trades stopped on a trailing SL after a 1.0R+ peak.
+        // stagnationExits = trades closed because price didn't move ±0.3R in 4 bars.
+        public int profitLocks, trailExits, stagnationExits;
 
         // Detailed trade log
         public final List<TradeRecord> trades = new ArrayList<>();
@@ -461,6 +476,14 @@ public final class SimpleBacktester {
                     else if (netPnl < -0.05) result.losses++;
                     else                      result.breakEvens++;
                     if ("TIME_STOP".equals(outcome.reason)) result.timeStops++;
+                        // [v86 EXIT-FIX] Track new active-exit reasons separately.
+                        // Note: a trail exit shows up as "SL" or "BE_STOP" reason —
+                        // we infer it via trailLevel > 0 at exit time. Here we only
+                        // count the explicit new reasons.
+                    else if ("PROFIT_LOCK".equals(outcome.reason)) result.profitLocks++;
+                    else if ("STAGNATION".equals(outcome.reason)) result.stagnationExits++;
+                    else if (("SL".equals(outcome.reason) || "BE_STOP".equals(outcome.reason))
+                            && currentPos.trailLevel > 0)         result.trailExits++;
 
                     dailyPnL.merge(barDay, netPnl, Double::sum);
 
@@ -705,6 +728,10 @@ public final class SimpleBacktester {
         final int entryBar;
         boolean tp1Hit = false;
         double currentSL;
+        // [v86 EXIT-FIX] high-water-mark and trail level for active management
+        double maxFavR     = 0.0;  // peak favorable movement in R-units
+        double maxAdvR     = 0.0;  // peak adverse movement in R-units (for stagnation detection)
+        int    trailLevel  = 0;    // 0=none, 1=locked@0.4R, 2=locked@0.8R, 3=locked@1.4R
 
         ActivePosition(com.bot.TradingCore.Side side, double entry, double sl, double tp1, double tp2,
                        double conf, long time, int bar) {
@@ -730,6 +757,97 @@ public final class SimpleBacktester {
                                             double slippage) {
         boolean isLong = pos.side == com.bot.TradingCore.Side.LONG;
         int barsHeld = currentBar - pos.entryBar;
+
+        // [v86 EXIT-FIX 2026-05-07] ──────────────────────────────────────
+        // ACTIVE EXIT MANAGEMENT — превращает >50% time-stop'ов в выходы с
+        // фиксированной прибылью или break-even, вместо ожидания истечения
+        // 12 баров с PnL близким к нулю (минус комиссии × leverage).
+        //
+        // Бэктест v85 показал WR 32.3% / 68% time-stops при R:R 1:2 — точка
+        // безубытка 33.3%. Активные выходы дают expectancy lift даже при
+        // том же winrate за счёт банковки промежуточных wins.
+        //
+        // Четыре уровня (порядок имеет значение, проверяются каждый бар):
+        //   1. TRAILING STOP (HWM-based)
+        //      fav peak ≥ 1.0R → SL = entry + 0.4R (lock 0.4R win)
+        //      fav peak ≥ 1.5R → SL = entry + 0.8R (lock 0.8R win)
+        //      fav peak ≥ 2.0R → SL = entry + 1.4R (lock 1.4R win)
+        //      Уровни ratchet — никогда не откатываемся.
+        //
+        //   2. PROFIT LOCK на 60% time-window
+        //      barsHeld ≥ 7 (60% of 12) AND current ≥ +0.3R → market exit.
+        //      Мы потратили большую часть времени, дальше движение не идёт —
+        //      фиксируем что есть.
+        //
+        //   3. STAGNATION EXIT
+        //      barsHeld ≥ 4 AND maxFavR < 0.30 AND maxAdvR < 0.30 →
+        //      market exit. Цена не двинулась никуда за 4 бара — это не наш
+        //      сетап, выходим до time-stop'а.
+        //
+        //   4. FALLBACK time-stop @ 12 баров — без изменений.
+        //
+        // ENV controls (для отключения отдельных уровней при сравнении):
+        //   BACKTEST_TRAIL_ENABLED=1
+        //   BACKTEST_PROFIT_LOCK_ENABLED=1
+        //   BACKTEST_STAGNATION_ENABLED=1
+        com.bot.TradingCore.Candle curC = m15.get(currentBar);
+        double risk = Math.abs(pos.entry - pos.sl);
+        if (risk > 1e-12) {
+            double curHigh = curC.high;
+            double curLow  = curC.low;
+            // Update high-water marks using bar extremes (most accurate without M1)
+            double favPeak = isLong ? (curHigh - pos.entry) / risk : (pos.entry - curLow) / risk;
+            double advPeak = isLong ? (pos.entry - curLow) / risk  : (curHigh - pos.entry) / risk;
+            if (favPeak > pos.maxFavR) pos.maxFavR = favPeak;
+            if (advPeak > pos.maxAdvR) pos.maxAdvR = advPeak;
+
+            // [Level 1] TRAILING STOP — ratchet up SL based on max favorable move
+            if (trailEnabled && barsHeld >= 1) {
+                double newTrailSL = Double.NaN;
+                int newLevel = pos.trailLevel;
+                if (pos.maxFavR >= 2.0 && pos.trailLevel < 3) {
+                    newTrailSL = isLong ? pos.entry + risk * 1.4 : pos.entry - risk * 1.4;
+                    newLevel = 3;
+                } else if (pos.maxFavR >= 1.5 && pos.trailLevel < 2) {
+                    newTrailSL = isLong ? pos.entry + risk * 0.8 : pos.entry - risk * 0.8;
+                    newLevel = 2;
+                } else if (pos.maxFavR >= 1.0 && pos.trailLevel < 1) {
+                    newTrailSL = isLong ? pos.entry + risk * 0.4 : pos.entry - risk * 0.4;
+                    newLevel = 1;
+                }
+                if (!Double.isNaN(newTrailSL)) {
+                    // ratchet: only tighten, never loosen
+                    if (isLong  && newTrailSL > pos.currentSL) {
+                        pos.currentSL = newTrailSL; pos.trailLevel = newLevel;
+                    } else if (!isLong && newTrailSL < pos.currentSL) {
+                        pos.currentSL = newTrailSL; pos.trailLevel = newLevel;
+                    }
+                }
+            }
+
+            // [Level 2] PROFIT LOCK — at 60% of time-window with at least +0.3R, exit at market
+            int profitLockBar = Math.max(1, (int) Math.round(timeStopBars * 0.60));
+            if (profitLockEnabled && barsHeld >= profitLockBar && !pos.tp1Hit) {
+                double curR = isLong ? (curC.close - pos.entry) / risk : (pos.entry - curC.close) / risk;
+                if (curR >= 0.30) {
+                    double exitPrice = curC.close;
+                    double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+                            : (pos.entry - exitPrice) / pos.entry * 100;
+                    return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, "PROFIT_LOCK");
+                }
+            }
+
+            // [Level 3] STAGNATION EXIT — market hasn't moved meaningfully in 4 bars
+            int stagnationBar = Math.max(3, (int) Math.round(timeStopBars * 0.35));
+            if (stagnationEnabled && barsHeld >= stagnationBar
+                    && pos.maxFavR < 0.30 && pos.maxAdvR < 0.30 && !pos.tp1Hit) {
+                double exitPrice = curC.close;
+                double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+                        : (pos.entry - exitPrice) / pos.entry * 100;
+                return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, "STAGNATION");
+            }
+        }
+        // ─── end v86 active exit management ─────────────────────────────
 
         // [v82] EARLY BE MOVE — теперь конфигурируемый.
         //

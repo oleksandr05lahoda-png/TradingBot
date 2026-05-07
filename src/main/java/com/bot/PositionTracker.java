@@ -76,6 +76,15 @@ public final class PositionTracker {
     private final double  BE_TRIGGER_FRAC;     // 0.55 → fire BE if remaining ≤ 55% of initial
     private final boolean REAL_PNL_ENABLED;
 
+    // [v86 EXIT-FIX 2026-05-07] Active risk-management toggles. Mirror of
+    // SimpleBacktester flags so live and backtest behave identically.
+    //   PT_TRAIL_ENABLED       — multi-level ratchet trail (1.0R→0.4R, 1.5R→0.8R, 2.0R→1.4R)
+    //   PT_PROFIT_LOCK_ENABLED — at 60% time-window with ≥+0.3R, market-close
+    //   PT_STAGNATION_ENABLED  — at 35% time-window with no movement ±0.3R, market-close
+    private final boolean TRAIL_ENABLED;
+    private final boolean PROFIT_LOCK_ENABLED;
+    private final boolean STAGNATION_ENABLED;
+
     /** Symbol → tracked position state. */
     private final Map<String, Tracked> tracked = new ConcurrentHashMap<>();
 
@@ -95,12 +104,22 @@ public final class PositionTracker {
         this.BE_ENABLED        = "1".equals(System.getenv().getOrDefault("PT_BE_ENABLED", "1"));
         this.BE_TRIGGER_FRAC   = envDouble("PT_BE_TRIGGER_FRAC", 0.55);
         this.REAL_PNL_ENABLED  = "1".equals(System.getenv().getOrDefault("PT_REAL_PNL_ENABLED", "1"));
+        this.TRAIL_ENABLED       =
+                !"0".equals(System.getenv().getOrDefault("PT_TRAIL_ENABLED",       "1"));
+        this.PROFIT_LOCK_ENABLED =
+                !"0".equals(System.getenv().getOrDefault("PT_PROFIT_LOCK_ENABLED", "1"));
+        this.STAGNATION_ENABLED  =
+                !"0".equals(System.getenv().getOrDefault("PT_STAGNATION_ENABLED",  "1"));
 
-        LOG.info(String.format("[Tracker] init v2.0: poll=%dms timeStop=%dmin "
-                        + "BE=%s offset=%.2f%% trigger=%.2f realPnL=%s",
+        LOG.info(String.format("[Tracker] init v2.0+v86: poll=%dms timeStop=%dmin "
+                        + "BE=%s offset=%.2f%% trigger=%.2f realPnL=%s "
+                        + "trail=%s profitLock=%s stagnation=%s",
                 POLL_INTERVAL_MS, TIME_STOP_MS / 60_000L,
                 BE_ENABLED ? "ON" : "OFF", BE_OFFSET_PCT, BE_TRIGGER_FRAC,
-                REAL_PNL_ENABLED ? "ON" : "OFF"));
+                REAL_PNL_ENABLED ? "ON" : "OFF",
+                TRAIL_ENABLED ? "ON" : "OFF",
+                PROFIT_LOCK_ENABLED ? "ON" : "OFF",
+                STAGNATION_ENABLED ? "ON" : "OFF"));
     }
 
     public void setTelegram(TelegramBotSender tg) { this.telegram = tg; }
@@ -153,6 +172,7 @@ public final class PositionTracker {
         t.initialQty = qty;
         t.qty    = qty;
         t.slPrice = slPrice;
+        t.initialSlPrice = slPrice;  // [v86] immutable snapshot for R calculation
         t.tp1Price = tp1Price;
         t.tp2Price = tp2Price;
         t.notionalUsd = notionalUsd;
@@ -237,8 +257,149 @@ public final class PositionTracker {
             }
         }
 
-        // 3) Update tracked qty so next poll has fresh number
+        // 3) [v86 EXIT-FIX] Active risk management — fetch mark price, update HWM,
+        //    apply trailing stop / profit-lock / stagnation exit.
+        //    All four actions short-circuit on success; we don't combine them in one poll.
+        if (TRAIL_ENABLED || PROFIT_LOCK_ENABLED || STAGNATION_ENABLED) {
+            applyActiveManagement(t, age);
+        }
+
+        // 4) Update tracked qty so next poll has fresh number
         t.qty = absQty;
+    }
+
+    /**
+     * [v86 EXIT-FIX] Active risk management for an open position.
+     *
+     * Reads current mark price, updates favorable/adverse high-water-marks
+     * in R-units, then evaluates three exit triggers in priority order:
+     *
+     *   1. PROFIT LOCK — at ≥60% of time-window with ≥+0.3R, market-close.
+     *      Locks in any positive ground when the trade can't make TP1 in time.
+     *
+     *   2. STAGNATION  — at ≥35% of time-window with neither side hitting 0.3R,
+     *      market-close. Trade is dead; releasing capital for next setup.
+     *
+     *   3. TRAIL       — multi-level ratchet. Move SL closer to spot as the trade
+     *      goes our way. Replaces the 1-shot BE-on-TP1 with continuous protection.
+     *
+     * Exits via {@link BinanceTradeExecutor#closePosition} for (1)+(2),
+     * or via {@link BinanceTradeExecutor#replaceSlWithBreakeven} (which is
+     * actually a generic SL-replace) for (3). All three are guarded by env
+     * flags for surgical A/B testing.
+     */
+    private void applyActiveManagement(Tracked t, long age) {
+        double mark = executor.fetchMarkPrice(t.symbol);
+        if (mark <= 0) return; // API hiccup — try again next poll
+
+        double risk = Math.abs(t.entry - t.initialSlPrice);
+        if (risk <= 1e-12) return; // can't compute R without sane initial SL
+
+        // Compute current R (signed: positive = our way, negative = adverse)
+        double curR = t.isLong ? (mark - t.entry) / risk : (t.entry - mark) / risk;
+        // Update HWM. We only have point-in-time mark, so peaks are approximate
+        // (better than nothing — backtester uses bar high/low which is more accurate).
+        if (curR > 0 && curR > t.maxFavR) t.maxFavR = curR;
+        if (curR < 0 && -curR > t.maxAdvR) t.maxAdvR = -curR;
+
+        // Window position: 0.0 = just opened, 1.0 = at time-stop.
+        double agePct = (double) age / Math.max(1L, TIME_STOP_MS);
+
+        // ── PROFIT LOCK ────────────────────────────────────────────────
+        // Past 60% of time-window, currently in profit ≥0.3R, and not yet
+        // ratcheted to a meaningful trail level. Take what we have.
+        if (PROFIT_LOCK_ENABLED && !t.beActivated && agePct >= 0.60 && curR >= 0.30) {
+            LOG.info(String.format(
+                    "[Tracker] %s PROFIT_LOCK: age=%.0f%% curR=%+.2f maxFav=%.2f → market close",
+                    t.symbol, agePct * 100, curR, t.maxFavR));
+            boolean closed = executor.closePosition(t.symbol, "profit-lock");
+            if (closed) {
+                if (telegram != null) {
+                    telegram.sendMessageAsync(String.format(
+                            "🎯 *PROFIT LOCK* %s\n" +
+                                    "Прошло %.0f%% времени, фиксируем +%.2fR.\n" +
+                                    "_Market close: цена %.6f_",
+                            t.symbol, agePct * 100, curR, mark));
+                }
+                handlePositionClosedAfterForce(t, "PROFIT_LOCK");
+            }
+            return;
+        }
+
+        // ── STAGNATION ─────────────────────────────────────────────────
+        // Past 35% of window, neither favorable nor adverse exceeded 0.3R —
+        // trade is dead, release capital for next setup. Skip if BE already moved
+        // (we have a partial fill in profit; let TP2 / trail handle).
+        if (STAGNATION_ENABLED && !t.beActivated
+                && agePct >= 0.35
+                && t.maxFavR < 0.30 && t.maxAdvR < 0.30) {
+            LOG.info(String.format(
+                    "[Tracker] %s STAGNATION: age=%.0f%% maxFav=%.2f maxAdv=%.2f → market close",
+                    t.symbol, agePct * 100, t.maxFavR, t.maxAdvR));
+            boolean closed = executor.closePosition(t.symbol, "stagnation");
+            if (closed) {
+                if (telegram != null) {
+                    telegram.sendMessageAsync(String.format(
+                            "💤 *STAGNATION* %s\n" +
+                                    "Прошло %.0f%% времени, движение ±%.2fR — закрываем.\n" +
+                                    "_Освобождаем капитал для следующего сетапа_",
+                            t.symbol, agePct * 100, Math.max(t.maxFavR, t.maxAdvR)));
+                }
+                handlePositionClosedAfterForce(t, "STAGNATION");
+            }
+            return;
+        }
+
+        // ── TRAILING STOP ──────────────────────────────────────────────
+        // Multi-level ratchet. Each level is one-way — once we move SL to
+        // entry+0.4R, we never go back to entry+0.0R. trailLevel records
+        // the highest level reached so we don't churn the SL order book.
+        if (TRAIL_ENABLED) {
+            double newTrailSl = Double.NaN;
+            int newLevel = t.trailLevel;
+            if (t.maxFavR >= 2.0 && t.trailLevel < 3) {
+                newTrailSl = t.isLong ? t.entry + risk * 1.4 : t.entry - risk * 1.4;
+                newLevel = 3;
+            } else if (t.maxFavR >= 1.5 && t.trailLevel < 2) {
+                newTrailSl = t.isLong ? t.entry + risk * 0.8 : t.entry - risk * 0.8;
+                newLevel = 2;
+            } else if (t.maxFavR >= 1.0 && t.trailLevel < 1) {
+                newTrailSl = t.isLong ? t.entry + risk * 0.4 : t.entry - risk * 0.4;
+                newLevel = 1;
+            }
+            if (!Double.isNaN(newTrailSl)) {
+                // Sanity: only tighten SL toward us, never loosen.
+                boolean tighter = t.isLong ? newTrailSl > t.slPrice : newTrailSl < t.slPrice;
+                if (tighter) {
+                    LOG.info(String.format(
+                            "[Tracker] %s TRAIL L%d: maxFav=%.2fR new SL %.6f (was %.6f)",
+                            t.symbol, newLevel, t.maxFavR, newTrailSl, t.slPrice));
+                    String newSlAlgoId = executor.replaceSlWithBreakeven(
+                            t.symbol, t.isLong, t.slOrderId, newTrailSl);
+                    if (newSlAlgoId != null) {
+                        String oldId = t.slOrderId;
+                        t.slOrderId  = newSlAlgoId;
+                        t.slPrice    = newTrailSl;
+                        t.trailLevel = newLevel;
+                        if (telegram != null) {
+                            double lockedR = newLevel == 3 ? 1.4 : (newLevel == 2 ? 0.8 : 0.4);
+                            telegram.sendMessageAsync(String.format(
+                                    "🪜 *TRAIL L%d* %s — SL подтянут\n" +
+                                            "maxFav=%.2fR → SL зафиксировал +%.1fR прибыли\n" +
+                                            "Новый SL: %.6f (был %.6f)\n" +
+                                            "_oldId=%s newId=%s_",
+                                    newLevel, t.symbol, t.maxFavR, lockedR,
+                                    newTrailSl, t.slPrice, oldId, newSlAlgoId));
+                        }
+                    } else {
+                        // Don't bump trailLevel — retry on next poll. But cap retries
+                        // implicitly by not flooding logs (replaceSl already logs SEVERE).
+                        LOG.warning("[Tracker] " + t.symbol
+                                + " TRAIL L" + newLevel + " failed — will retry next poll");
+                    }
+                }
+            }
+        }
     }
 
     // ─── Position-closed handling ─────────────────────────────────────
@@ -496,6 +657,12 @@ public final class PositionTracker {
         String tp2OrderId;
         long   openedAtMs;
         boolean beActivated; // true once BE move was attempted (success or failure)
+
+        // [v86 EXIT-FIX] Active management state.
+        double initialSlPrice;       // saved at trackOpened — needed to compute R reliably
+        double maxFavR     = 0.0;    // peak favorable movement in R-units (HWM)
+        double maxAdvR     = 0.0;    // peak adverse movement in R-units (for stagnation detection)
+        int    trailLevel  = 0;      // 0=none, 1=locked@0.4R, 2=locked@0.8R, 3=locked@1.4R
     }
 
     // ─── Env helpers ──────────────────────────────────────────────────
