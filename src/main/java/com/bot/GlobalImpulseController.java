@@ -533,13 +533,21 @@ public final class GlobalImpulseController {
         boolean onlyLong  = (regime == GlobalRegime.BTC_STRONG_UP  && rawStrength > 0.82)
                 || (regime == GlobalRegime.BTC_IMPULSE_UP  && rawStrength > 0.78);
 
+        // [v85 LONG-FIX 2026-05-07] BTC_IMPULSE_DOWN trigger был слишком чутким.
+        // Старое условие (rawStr>0.65 + velocity>VELOCITY_WATCH=0.0025) срабатывало
+        // практически на каждой 15m свече с move<-0.4%. Это превращало любую
+        // ночную сессию в "только шорты". Новое условие требует одновременно:
+        //   - rawStrength > 0.72 (импульс реальный, не шум)
+        //   - velocity   > VELOCITY_DANGER (0.0060, ускорение падения)
+        //   - >= 2 consecutive bear bars (не однобарная свеча)
+        // CRASH/PANIC/STRONG_DOWN остаются жёсткими hard-veto без изменений.
         boolean onlyShort = (regime == GlobalRegime.BTC_STRONG_DOWN && rawStrength > 0.78)
                 || (regime == GlobalRegime.BTC_CRASH)
                 || (regime == GlobalRegime.BTC_PANIC)
-                // NEW: IMPULSE_DOWN with velocity also blocks all LONG
                 || (regime == GlobalRegime.BTC_IMPULSE_DOWN
-                && rawStrength > 0.65
-                && btcDropVelocity > VELOCITY_WATCH);
+                && rawStrength > 0.72
+                && btcDropVelocity > VELOCITY_DANGER
+                && btcConsecutiveBearBars >= 2);
 
         // TIME-DECAY LONG SUPPRESSION
         // Старая логика: фиксированные коэффициенты (0.30 / 0.55 / 0.45) держались

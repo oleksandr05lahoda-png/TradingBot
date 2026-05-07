@@ -2966,35 +2966,35 @@ public final class DecisionEngineMerged {
         }
         // BTC crashing: long on an alt = catching a falling knife
         if (gicOnlyShort && side == com.bot.TradingCore.Side.LONG) {
-            // [v78.3] ELITE_REVERSAL_POCKET — единственная узкая дверь для LONG
-            // в bear-режиме. Условия НАМЕРЕННО очень строгие — фильтр должен
-            // пропускать ~1 раз в крупный крах, не каждые 30 минут.
+            // [v85 LONG-FIX 2026-05-07] Старое условие требовало 5 из 5 условий
+            // одновременно — empirically нереализуемо. В медвежьих режимах LONG
+            // получали perma-veto даже на классических oversold-отскоках.
             //
-            // Все 5 условий обязательны (AND, не OR):
-            //   1. 4+ LONG-кластера (полная конфлюэнция структуры/моментума/объёма/HTF)
-            //   2. earlyRev.strength > 0.65 (сильный early-reversal сигнал)
-            //   3. localExh.direction == -1 (подтверждённое локальное истощение шорта)
-            //   4. rsi14 < 22 (extreme oversold, не просто "перепродан")
-            //   5. relStrength > 0.85 (sector leader — монета держится при крахе BTC)
-            //
-            // Если хоть одно условие нарушено → стандартный hard veto.
-            // Score дисконтируется ×0.75 (больше чем 0.85 в старой версии)
-            // плюс сигнал помечается ELITE_REV для трейдера.
+            // Новая логика: считаем сколько из 5 условий выполнено и градуируем
+            // размер позиции. <3 → жёсткий veto. 3 → counter-trend (×0.40).
+            // 4 → strong reversal (×0.55). 5 → elite (×0.75).
+            // Это даёт LONG-ам выйти на действительно перепроданном дне с
+            // urgency, но штрафует размер пропорционально слабости setup'а.
             double rsi14ForRev = rsi(c15, 14);
             double relStr = getRelativeStrength(symbol);
-            boolean elite = longClusters >= 4
-                    && earlyRev.detected
-                    && earlyRev.strength > 0.65
-                    && localExh != null && localExh.direction == -1
-                    && rsi14ForRev < 22.0
-                    && relStr > 0.85;
+            int revScore = 0;
+            if (longClusters >= 4)                              revScore++;
+            if (earlyRev.detected && earlyRev.strength > 0.65)  revScore++;
+            if (localExh != null && localExh.direction == -1)   revScore++;
+            if (rsi14ForRev < 22.0)                             revScore++;
+            if (relStr > 0.85)                                  revScore++;
 
-            if (!elite) {
+            if (revScore < 3) {
                 allFlags.add("GIC_STRONG_BTCDOWN");
                 return reject("gic_btcdown_long_veto");
             }
-            allFlags.add("ELITE_REV_LONG");
-            scoreLong *= 0.75;
+            double sizeMult;
+            String revTag;
+            if      (revScore == 5) { sizeMult = 0.75; revTag = "ELITE_REV_LONG";    }
+            else if (revScore == 4) { sizeMult = 0.55; revTag = "STRONG_REV_LONG";   }
+            else                    { sizeMult = 0.40; revTag = "COUNTER_TREND_LONG";}
+            allFlags.add(revTag);
+            scoreLong *= sizeMult;
         }
 
         // POST-PUMP LONG VETO + POST-DUMP SHORT VETO

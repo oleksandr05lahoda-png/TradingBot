@@ -149,6 +149,50 @@ public final class BinanceTradeExecutor {
                 useTestnet ? "TESTNET" : "REAL/LIVE",
                 leverage, riskPctPerTrade,
                 apiKey.isBlank() ? "MISSING" : "present"));
+
+        // [v85 ORDER-FIX 2026-05-07] Normalize position mode to ONE_WAY at boot.
+        // На свежих testnet/mainnet аккаунтах часто включён HEDGE (dual-side).
+        // В HEDGE MARKET без positionSide=LONG/SHORT отвергается с -4061
+        // ("Order's position side does not match user's setting"). Это и есть
+        // основная причина "MARKET order rejected" на новых аккаунтах.
+        // Если уже ONE_WAY — Binance вернёт -4059 ("No need to change..."),
+        // проигнорируем безболезненно.
+        if (!apiKey.isBlank() && !apiSecret.isBlank()) {
+            try { ensureOneWayMode(); } catch (Exception e) {
+                LOG.warning("[Executor] ensureOneWayMode failed (non-fatal): " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * [v85] POST /fapi/v1/positionSide/dual?dualSidePosition=false
+     * Force account into ONE_WAY position mode so MARKET orders without
+     * positionSide=LONG/SHORT are accepted. Idempotent — safe to call repeatedly.
+     */
+    private void ensureOneWayMode() throws Exception {
+        long ts = System.currentTimeMillis();
+        String body = "dualSidePosition=false&timestamp=" + ts + "&recvWindow=5000";
+        String sig = hmacSHA256(apiSecret, body);
+        HttpResponse<String> resp = http.send(
+                HttpRequest.newBuilder()
+                        .uri(URI.create(baseUrl + "/fapi/v1/positionSide/dual"))
+                        .timeout(Duration.ofSeconds(8))
+                        .header("X-MBX-APIKEY", apiKey)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() == 200) {
+            LOG.info("[Executor] position mode set to ONE_WAY");
+        } else {
+            String b = resp.body() == null ? "" : resp.body();
+            // -4059 = "No need to change position side" — already ONE_WAY, OK.
+            if (b.contains("-4059") || b.contains("No need")) {
+                LOG.info("[Executor] position mode already ONE_WAY");
+            } else {
+                LOG.warning("[Executor] positionSide/dual HTTP " + resp.statusCode() + ": " + b);
+            }
+        }
     }
 
     /** True if exchange credentials are configured and we can call API. */
@@ -652,8 +696,40 @@ public final class BinanceTradeExecutor {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
+            String b = resp.body() == null ? "" : resp.body();
+            // [v85 ORDER-FIX] -4061 = "Order's position side does not match
+            // user's setting." Account is in HEDGE mode despite our boot-time
+            // ensureOneWayMode() call (could be permission-restricted testnet
+            // key). Retry once with explicit positionSide.
+            if (b.contains("-4061") || b.contains("position side")) {
+                LOG.warning("[Executor] " + symbol + " HEDGE mode detected, retrying with positionSide");
+                long ts2 = System.currentTimeMillis();
+                String body2 = "symbol=" + symbol
+                        + "&side=" + (buy ? "BUY" : "SELL")
+                        + "&positionSide=" + (buy ? "LONG" : "SHORT")
+                        + "&type=MARKET"
+                        + "&quantity=" + formatQty(qty)
+                        + "&newOrderRespType=RESULT"
+                        + "&timestamp=" + ts2 + "&recvWindow=5000";
+                String sig2 = hmacSHA256(apiSecret, body2);
+                HttpResponse<String> resp2 = http.send(
+                        HttpRequest.newBuilder()
+                                .uri(URI.create(baseUrl + "/fapi/v1/order"))
+                                .timeout(Duration.ofSeconds(10))
+                                .header("X-MBX-APIKEY", apiKey)
+                                .header("Content-Type", "application/x-www-form-urlencoded")
+                                .POST(HttpRequest.BodyPublishers.ofString(body2 + "&signature=" + sig2))
+                                .build(),
+                        HttpResponse.BodyHandlers.ofString());
+                if (resp2.statusCode() == 200) {
+                    return new JSONObject(resp2.body()).optString("orderId", null);
+                }
+                LOG.warning("[Executor] MARKET retry " + symbol + " HTTP " + resp2.statusCode()
+                        + ": " + resp2.body());
+                return null;
+            }
             LOG.warning("[Executor] MARKET order " + symbol + " HTTP " + resp.statusCode()
-                    + ": " + resp.body());
+                    + ": " + b);
             return null;
         }
         return new JSONObject(resp.body()).optString("orderId", null);

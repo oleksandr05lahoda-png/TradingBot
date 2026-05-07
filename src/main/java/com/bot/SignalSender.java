@@ -1891,6 +1891,28 @@ public final class SignalSender {
 
     private void refreshAccountBalance() {
         if (API_KEY.isBlank() || rlIpBanned) return; // [v10.0]
+
+        // [v85 BALANCE-FIX 2026-05-07] On TESTNET (BINANCE_USE_TESTNET=1) the
+        // direct call to fapi.binance.com below hits MAINNET — wrong balance,
+        // wrong account, displayed SIZE in signal text gets stuck at default.
+        // Delegate to BinanceTradeExecutor which already uses the correct base
+        // URL (demo-fapi for testnet). This fixes the cosmetic SIZE=$X.X mismatch
+        // in Telegram messages without changing actual auto-trade sizing
+        // (auto-trade always uses ex.fetchAvailableBalance() directly via BotMain).
+        try {
+            com.bot.BinanceTradeExecutor ex = com.bot.BinanceTradeExecutor.getInstance();
+            if (ex != null && ex.isReady()) {
+                double nb = ex.fetchAvailableBalance();
+                if (nb > 0) {
+                    double old = accountBalance;
+                    accountBalance = nb;
+                    lastBalanceRefresh = System.currentTimeMillis();
+                    checkBalanceMilestone(old, nb);
+                    return;
+                }
+            }
+        } catch (Exception ignored) { /* fall through to direct call */ }
+
         try {
             long ts = System.currentTimeMillis();
             String qs = "timestamp=" + ts;
