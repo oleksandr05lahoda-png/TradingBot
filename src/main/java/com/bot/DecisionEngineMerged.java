@@ -176,7 +176,11 @@ public final class DecisionEngineMerged {
     // в трендовом рынке, 2 даёт сигналы и в флэте. Качество защищено
     // downstream: env MIN_CONF=53, ISC track-record gate, calibrator PAV.
     private static final int    MIN_AGREEING_CLUSTERS    = 2;
-    private static final double MIN_CLUSTER_SCORE        = 0.28;
+    // [FLAT-FIX 2026-05-07] 0.28 → 0.22. Кластер квалифицируется как "agreeing"
+    // если его направленный score ≥ 0.22 (было 0.28). На флэте кластеры дают
+    // score 0.20-0.30 — старый порог отсекал большинство. 0.22 оставляет защиту
+    // от чисто шумовых ассоциаций (random < 0.15).
+    private static final double MIN_CLUSTER_SCORE        = 0.22;
 
     // Single authoritative probability ceiling. All intermediate caps and the
     // final calibrator clamp must reference this constant. Previously hardcoded 85 in 5+ places.
@@ -3778,16 +3782,26 @@ public final class DecisionEngineMerged {
 
                 if (isLong && bear1h) {
                     double rsi15 = com.bot.TradingCore.rsi(c15, 14);
-                    // [FLAT-MARKET LOOSEN 2026-05-05] 38 → 45. RSI<38 = глубокий
-                    // oversold, бывает редко. 45 разрешает counter-trend bounce setup'ы.
-                    if (rsi15 > 45) return reject("mtf_long_vs_1h_bear");
-                    allFlags.add("MTF_OS_BOUNCE");
+                    // [FLAT-FIX 2026-05-07] reject → penalty. На флэте 1h EMA20/50
+                    // постоянно перекрещиваются — bear1h/bull1h становятся шумом.
+                    // Reject убивал валидные counter-trend bounce setup'ы. Penalty -4pt
+                    // оставляет защиту, но не парализует.
+                    if (rsi15 > 45) {
+                        probability = Math.max(0, probability - 4.0);
+                        allFlags.add("MTF_LONG_VS_1H_BEAR_PENALTY");
+                    } else {
+                        allFlags.add("MTF_OS_BOUNCE");
+                    }
                 }
                 if (!isLong && bull1h) {
                     double rsi15 = com.bot.TradingCore.rsi(c15, 14);
-                    // [FLAT-MARKET LOOSEN 2026-05-05] 62 → 55. Аналогично симметрично.
-                    if (rsi15 < 55) return reject("mtf_short_vs_1h_bull");
-                    allFlags.add("MTF_OB_SHORT");
+                    // [FLAT-FIX 2026-05-07] Аналогично симметрично — penalty вместо reject.
+                    if (rsi15 < 55) {
+                        probability = Math.max(0, probability - 4.0);
+                        allFlags.add("MTF_SHORT_VS_1H_BULL_PENALTY");
+                    } else {
+                        allFlags.add("MTF_OB_SHORT");
+                    }
                 }
                 if ((isLong && bull1h) || (!isLong && bear1h)) {
                     allFlags.add("MTF_ALIGN");
@@ -3795,7 +3809,7 @@ public final class DecisionEngineMerged {
             }
         } catch (Throwable ignored) {}
 
-        // [3] VOLUME CONFIRMATION — последние 3 бара ≥ 1.05× от 20-бар avg.
+        // [3] VOLUME CONFIRMATION — последние 3 бара ≥ 0.65× от 20-бар avg.
         // Сигналы на затухающем объёме статистически проигрывают.
         try {
             if (c15.size() >= 25) {
@@ -3806,11 +3820,18 @@ public final class DecisionEngineMerged {
                 double recent3Vol = (c15.get(vN15-1).volume + c15.get(vN15-2).volume + c15.get(vN15-3).volume) / 3.0;
                 if (avgVol20 > 0) {
                     double volRatio = recent3Vol / avgVol20;
-                    // [FLAT-MARKET LOOSEN 2026-05-05] 1.05 → 0.85. В flat-market объёмы
-                    // часто ниже avg. 0.85 = разрешаем сигналы с до -15% от среднего объёма.
-                    // VOL_SURGE флаг при ≥1.5 сохранён.
-                    if (volRatio < 0.85) {
+                    // [FLAT-FIX 2026-05-07] 0.85 → 0.65. На ночном флэте/выходных
+                    // объёмы стабильно 0.5-0.8× от среднего. Старый порог 0.85
+                    // блокировал 70% setup'ов в low-volume периоды. 0.65 = разрешаем
+                    // сигналы при -35% от avg. Сохранён LOW_VOL флаг для prob penalty
+                    // ниже, и VOL_SURGE при ≥1.5 для бонуса.
+                    if (volRatio < 0.65) {
                         return reject("low_volume");
+                    }
+                    if (volRatio < 0.85) {
+                        // [FLAT-FIX 2026-05-07] Penalty -2pt вместо block.
+                        probability = Math.max(0, probability - 2.0);
+                        allFlags.add("LOW_VOL_PENALTY");
                     }
                     if (volRatio >= 1.5) allFlags.add("VOL_SURGE");
                 }
@@ -3824,12 +3845,16 @@ public final class DecisionEngineMerged {
                 String regime = String.valueOf(gicCtx.regime);
                 double btcStr = gicCtx.impulseStrength;
                 boolean btcFlat = regime.contains("NEUTRAL") || regime.contains("FLAT") || regime.contains("RANGE");
-                // [FLAT-MARKET LOOSEN 2026-05-05] 0.30 → 0.18. Был блок ВСЕХ SHORT
-                // в течение суток (BTC NEUTRAL str=0.06-0.22). 0.18 оставляет защиту
-                // от полностью stagnant рынка (str<0.18 = реально без направления),
-                // но даёт SHORT-сигналам пройти при слабом боковом движении.
+                // [FLAT-FIX 2026-05-07] Блок убран: за сутки 0 сигналов из-за этого.
+                // Старая логика: btcStr<0.18 → block ALL SHORT. Это парализовало бот
+                // в любой период когда BTC во флэте (большую часть времени в крипте).
+                // Новая логика: SHORT в NEUTRAL+слабом BTC проходит, но требует
+                // дополнительного penalty -3pt к probability. Если сетап дотягивает
+                // до minConf после штрафа — он реально качественный. Если нет — отвалится
+                // нормальным prob check, без хардкода.
                 if (btcFlat && btcStr < 0.18) {
-                    return reject("btc_flat_short_block");
+                    probability = Math.max(0, probability - 3.0);
+                    allFlags.add("BTC_FLAT_SHORT_PENALTY");
                 }
                 // SHORT vs strong BTC bull — только при ≥4 кластерах
                 boolean btcBull = regime.contains("UP") || regime.contains("BULL");
@@ -4058,7 +4083,10 @@ public final class DecisionEngineMerged {
     private boolean priceMovedEnough(String sym, double price, double atr14Pct) {
         Double last = lastSigPrice.get(sym);
         if (last == null) return true;
-        double dynThreshold = Math.max(0.0035, atr14Pct * 0.15);
+        // [FLAT-FIX 2026-05-07] 0.0035 → 0.0020. На флэте альты двигаются 0.1-0.3%
+        // между сигналами, старый порог 0.35% блокировал валидные re-entries.
+        // 0.20% оставляет защиту от same-bar duplicates.
+        double dynThreshold = Math.max(0.0020, atr14Pct * 0.15);
         return Math.abs(price - last) / last >= dynThreshold;
     }
 
