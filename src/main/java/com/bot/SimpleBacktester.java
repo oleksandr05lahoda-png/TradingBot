@@ -865,7 +865,10 @@ public final class SimpleBacktester {
         //   0.5  (legacy v81)   — старое поведение для воспроизводимости
         //  -1.0  (off)          — полностью отключить early-BE, чистый SL/TP/time
         if (earlyBeTriggerR > 0 && !pos.tp1Hit && barsHeld >= 1) {
-            double risk = Math.abs(pos.entry - pos.sl);
+            // [v86 FIX] `risk` уже объявлен выше (строка 794) на уровне метода,
+            // повторное `double risk = ...` ронялось компилятором с
+            // "Variable 'risk' is already defined in the scope". Используем
+            // существующее значение — оно идентичное.
             com.bot.TradingCore.Candle currentCandle = m15.get(currentBar);
             double favorableMove = isLong
                     ? currentCandle.high - pos.entry
