@@ -994,14 +994,25 @@ public final class BotMain {
                         + (ex.isTestnet() ? "TESTNET" : "REAL/LIVE")
                         + " leverage=" + ex.getLeverage()
                         + "x risk=" + ex.getRiskPct() + "%");
+                // [v87] Берём фактические лимиты из RiskGuard вместо хардкода.
+                // Если оператор поднял RG_DAILY_TRADE_LIMIT=9999 — сообщение
+                // должно это отразить, иначе Telegram-баннер врёт.
+                com.bot.RiskGuard rg = com.bot.RiskGuard.getInstance();
+                int    dailyLim     = rg.getDailyTradeLimit();
+                int    concurrentLim= rg.getMaxConcurrentPositions();
+                double dlPct        = rg.getDailyLossLimitPct();
+                double wlPct        = rg.getWeeklyLossLimitPct();
+                String dailyStr     = (dailyLim     >= 1000) ? "∞" : String.valueOf(dailyLim);
+                String concurrentStr= (concurrentLim>= 1000) ? "∞" : String.valueOf(concurrentLim);
                 telegram.sendMessageAsync(String.format(
                         "🤖 *Auto-trade АКТИВИРОВАН*\n" +
                                 "Режим: %s\n" +
                                 "Плечо: %dx | Риск: %.1f%%/сделка\n" +
-                                "Защиты: dailyLoss -10%%, weeklyLoss -20%%, max 3 сделки/день, max 2 одновременно\n" +
+                                "Защиты: dailyLoss -%.0f%%, weeklyLoss -%.0f%%, max %s сделок/день, max %s одновременно\n" +
                                 "_Любая сделка → автоматическая остановка при срабатывании защит._",
                         ex.isTestnet() ? "🧪 TESTNET" : "🔴 REAL/LIVE",
-                        ex.getLeverage(), ex.getRiskPct()));
+                        ex.getLeverage(), ex.getRiskPct(),
+                        dlPct, wlPct, dailyStr, concurrentStr));
             } else if (AUTO_TRADE_ENABLED && OBSERVATION_MODE) {
                 LOG.warning("[BOOT] BOT_AUTO_TRADE=1 but OBSERVATION_MODE=1 — paper wins, no live trades.");
             } else if (AUTO_TRADE_ENABLED && !ex.isReady()) {
