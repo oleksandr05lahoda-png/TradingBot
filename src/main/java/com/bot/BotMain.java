@@ -297,8 +297,68 @@ public final class BotMain {
         private static final long   HOUR_MS         = 60 * 60_000L;
         private static final long   FIVE_MIN_MS     = 5 * 60_000L;
         // [v80] QUALITY GATE thresholds — после warmup
+        // [v85 FLAT-FIX] Static defaults preserved for back-compat & strict (TREND) regime.
         private static final double MIN_CONFIDENCE_AFTER_WARMUP = 65.0;
         private static final int    MIN_CLUSTERS_AFTER_WARMUP   = 3;
+
+        // [v85 FLAT-FIX] Regime-aware thresholds.
+        //
+        // Проблема: единый порог 65/3 параличует бота в NEUTRAL-флэте, где
+        // 4-кластерная модель физически не может собрать 3 согласных
+        // кластера (Volume низкий, Momentum около нуля). За 1024 цикла —
+        // 0 сигналов. На вчерашнем трендовом дне — 3 сигнала с prob 65-67%.
+        //
+        // Решение: пороги масштабируются по силе BTC trend.
+        //   STRONG_TREND  (|str| >= 0.50)  → 65/3 строго (как было)
+        //   WEAK_TREND    (|str| 0.30-0.50)→ 60/2 умеренно
+        //   FLAT/NEUTRAL  (|str| < 0.30)   → 56/2 + extra checks
+        //
+        // Защита качества во флэте:
+        //   - R:R на TP2 ≥ 2.2 (было 2.0) — компенсация WR risk premium
+        //   - SL ≥ 0.85% (было 0.70%) — на флэте noise шире
+        //   - max 2 signals/hour, 4/day (вместо 6/h, no daily cap)
+        //
+        // Это НЕ "ослабление" — это адаптация к режиму. Если бот не торгует
+        // вообще, edge=0 by design. Если торгует на флэте плохо подобранными
+        // сетапами — edge<0. Цель: торговать средне-качественно тогда, когда
+        // высоко-качественных сетапов нет физически.
+        private static final double FLAT_MARKET_MIN_CONF      = 56.0;
+        private static final int    FLAT_MARKET_MIN_CLUSTERS  = 2;
+        private static final double FLAT_MARKET_MIN_RR        = 2.20;
+        private static final double FLAT_MARKET_MIN_SL_PCT    = 0.0085;
+        private static final int    FLAT_MARKET_MAX_PER_HOUR  = 2;
+        private static final int    FLAT_MARKET_MAX_PER_DAY   = 4;
+
+        private static final double WEAK_TREND_MIN_CONF       = 60.0;
+        private static final int    WEAK_TREND_MIN_CLUSTERS   = 2;
+
+        private static final double TREND_THRESHOLD_STRONG    = 0.50;
+        private static final double TREND_THRESHOLD_WEAK      = 0.30;
+
+        /**
+         * [v85 FLAT-FIX] Read current BTC regime via GIC singleton.
+         * Returns trend strength magnitude. 0 = no GIC available (defensive).
+         */
+        private static double currentTrendStrength() {
+            try {
+                com.bot.GlobalImpulseController gic = com.bot.GlobalImpulseController.getLatest();
+                if (gic == null) return 0;
+                com.bot.GlobalImpulseController.GlobalContext ctx = gic.getContext();
+                if (ctx == null) return 0;
+                return Math.abs(ctx.impulseStrength);
+            } catch (Throwable t) { return 0; }
+        }
+
+        /** Daily counter for per-day cap (resets at UTC midnight). */
+        private final ConcurrentLinkedDeque<Long> dailyDispatchTimestamps = new ConcurrentLinkedDeque<>();
+        private void pruneDailyTimestamps(long now) {
+            long cutoff = now - 24L * 60 * 60_000L;
+            while (!dailyDispatchTimestamps.isEmpty()) {
+                Long head = dailyDispatchTimestamps.peekFirst();
+                if (head == null || head < cutoff) dailyDispatchTimestamps.pollFirst();
+                else break;
+            }
+        }
 
         private final com.bot.TelegramBotSender tg;
         private final com.bot.InstitutionalSignalCore isc;
@@ -357,32 +417,59 @@ public final class BotMain {
             double riskDist = Math.abs(idea.stop - idea.price);
             double tp2Dist  = Math.abs(idea.tp2 - idea.price);
             double actualRR = riskDist > 1e-9 ? tp2Dist / riskDist : 0;
-            if (actualRR < MIN_RR) {
+
+            // [v85 FLAT-FIX] Regime-aware thresholds
+            double trendStr = currentTrendStrength();
+            boolean isFlat = trendStr < TREND_THRESHOLD_WEAK;
+            boolean isWeakTrend = !isFlat && trendStr < TREND_THRESHOLD_STRONG;
+            double effMinRR = isFlat ? FLAT_MARKET_MIN_RR : MIN_RR;
+            double effMinSlPct = isFlat ? FLAT_MARKET_MIN_SL_PCT : MIN_SL_PCT;
+            int effMaxPerHour = isFlat ? FLAT_MARKET_MAX_PER_HOUR : MAX_PER_HOUR;
+
+            if (actualRR < effMinRR) {
                 blockedByGate.incrementAndGet();
                 blockedRR.incrementAndGet();
-                return Result.blocked(String.format("R:R=%.2f<%.1f", actualRR, MIN_RR));
+                return Result.blocked(String.format("R:R=%.2f<%.1f (%s)",
+                        actualRR, effMinRR, isFlat ? "flat" : isWeakTrend ? "weak" : "trend"));
             }
 
             double slPct = riskDist / idea.price;
-            if (slPct < MIN_SL_PCT) {
+            if (slPct < effMinSlPct) {
                 blockedByGate.incrementAndGet();
                 blockedSL.incrementAndGet();
-                return Result.blocked(String.format("SL=%.3f%%<%.2f%%", slPct * 100, MIN_SL_PCT * 100));
+                return Result.blocked(String.format("SL=%.3f%%<%.2f%% (%s)",
+                        slPct * 100, effMinSlPct * 100, isFlat ? "flat" : "trend"));
             }
 
             // [v80] QUALITY GATE — отсекаем Grade C/D и низкую confidence ПОСЛЕ warmup.
             // До warmup (n<20) пропускаем чтобы калибратор обучался.
+            // [v85 FLAT-FIX] Regime-aware thresholds.
             int _calForGate = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
             if (_calForGate >= COLD_START_MIN_OUTCOMES) {
                 int _clusters = countClusterFlags(idea.flags);
-                if (idea.probability < MIN_CONFIDENCE_AFTER_WARMUP
-                        || _clusters < MIN_CLUSTERS_AFTER_WARMUP) {
+                double effMinConf;
+                int effMinClusters;
+                String regimeLabel;
+                if (isFlat) {
+                    effMinConf = FLAT_MARKET_MIN_CONF;
+                    effMinClusters = FLAT_MARKET_MIN_CLUSTERS;
+                    regimeLabel = "flat";
+                } else if (isWeakTrend) {
+                    effMinConf = WEAK_TREND_MIN_CONF;
+                    effMinClusters = WEAK_TREND_MIN_CLUSTERS;
+                    regimeLabel = "weak";
+                } else {
+                    effMinConf = MIN_CONFIDENCE_AFTER_WARMUP;
+                    effMinClusters = MIN_CLUSTERS_AFTER_WARMUP;
+                    regimeLabel = "trend";
+                }
+                if (idea.probability < effMinConf || _clusters < effMinClusters) {
                     blockedByGate.incrementAndGet();
                     blockedQuality.incrementAndGet();
                     return Result.blocked(String.format(
-                            "quality: prob=%.0f<%.0f OR clusters=%d<%d (n=%d)",
-                            idea.probability, MIN_CONFIDENCE_AFTER_WARMUP,
-                            _clusters, MIN_CLUSTERS_AFTER_WARMUP, _calForGate));
+                            "quality[%s]: prob=%.0f<%.0f OR clusters=%d<%d (str=%.2f n=%d)",
+                            regimeLabel, idea.probability, effMinConf,
+                            _clusters, effMinClusters, trendStr, _calForGate));
                 }
             }
 
@@ -445,10 +532,19 @@ public final class BotMain {
             }
 
             pruneDispatchTimestamps(now);
-            if (dispatchTimestamps.size() >= MAX_PER_HOUR) {
+            pruneDailyTimestamps(now);
+
+            // [v85 FLAT-FIX] Daily cap (only enforced in flat market)
+            if (isFlat && dailyDispatchTimestamps.size() >= FLAT_MARKET_MAX_PER_DAY) {
                 blockedByGate.incrementAndGet();
                 blockedHourly.incrementAndGet();
-                return Result.blocked("hourly cap " + MAX_PER_HOUR);
+                return Result.blocked("flat daily cap " + FLAT_MARKET_MAX_PER_DAY);
+            }
+            if (dispatchTimestamps.size() >= effMaxPerHour) {
+                blockedByGate.incrementAndGet();
+                blockedHourly.incrementAndGet();
+                return Result.blocked("hourly cap " + effMaxPerHour
+                        + (isFlat ? " (flat)" : ""));
             }
             int recentBurst = 0;
             for (Long t : dispatchTimestamps) {
@@ -472,6 +568,7 @@ public final class BotMain {
                 totalDispatched.incrementAndGet();
                 lastDispatchMs.put(dedupKey, now);
                 dispatchTimestamps.addLast(now);
+                dailyDispatchTimestamps.addLast(now);  // [v85 FLAT-FIX]
                 totalSignals.incrementAndGet();
                 lastSignalMs = now;
                 droughtAnnounced.set(false);

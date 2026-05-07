@@ -292,14 +292,25 @@ public final class GlobalImpulseController {
 
     //  CONSTRUCTORS
 
+    // [v85.0] Static reference to most-recently-constructed instance.
+    // Populated in the constructor. Allows code that doesn't have a
+    // direct reference (e.g. Dispatcher in BotMain) to read current BTC
+    // regime via GlobalImpulseController.getLatest() without dependency
+    // injection plumbing. Volatile because constructor and reader run
+    // on different threads.
+    private static volatile GlobalImpulseController LATEST = null;
+    public static GlobalImpulseController getLatest() { return LATEST; }
+
     public GlobalImpulseController() {
         this.VOL_LOOKBACK  = 20;
         this.BODY_LOOKBACK = 10;
+        LATEST = this;
     }
 
     public GlobalImpulseController(int volLookback, int bodyLookback) {
         this.VOL_LOOKBACK  = volLookback;
         this.BODY_LOOKBACK = bodyLookback;
+        LATEST = this;
     }
 
     public void setPanicCallback(java.util.function.Consumer<String> cb) {
