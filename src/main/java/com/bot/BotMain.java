@@ -91,7 +91,12 @@ public final class BotMain {
             "1".equals(System.getenv().getOrDefault("CROSS_EXCHANGE_VALIDATION", "0"));
 
     private static final int KLINES = envIntAny(420, "KLINES", "KLINES_LIMIT");
-    private static final int MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 3);
+    // [HOLE-FUNNEL FIX 2026-05-08] Default 3 → 5. Лимит был узким горлом
+    // в высоковолатильных окнах (Asia open / US close), где 5+ валидных
+    // setups существуют одновременно. Можно переопределить через env.
+    // ISC + RiskGuard.MAX_CONCURRENT_POSITIONS остаются authoritative
+    // ограничителями реальной торговли.
+    private static final int MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 5);
 
     // [v79 I4] SINGLE SOURCE OF TRUTH for time-stop window across the bot.
     // Live: ISC.TIME_STOP_BARS = 6 (90 min)
@@ -631,6 +636,22 @@ public final class BotMain {
                     return;
                 }
 
+                // [HOLE-FRESHNESS FIX 2026-05-08] Sanity-check idea не старше 90 сек.
+                // Дисптчер мог отложить сигнал в очередь Telegram, и к моменту попытки
+                // открыть позицию idea.price уже устарела на 2-3 свечи. Открывать
+                // MARKET по старой idea.stop = высокая вероятность что SL уже невалидный.
+                // 90s = чуть больше одной 15m свечи (тики ходят), но < 1 свечи 1m.
+                long ideaAgeMs = System.currentTimeMillis() - idea.createdAtMs;
+                if (ideaAgeMs > 90_000L) {
+                    tg.sendMessageAsync(String.format(
+                            "⏰ *Auto-trade SKIP* %s — сигнал старый (%.1f сек), "
+                                    + "цена/SL могли уйти. Жду свежего setup.",
+                            idea.symbol, ideaAgeMs / 1000.0));
+                    LOG.info("[AUTO-TRADE/" + idea.symbol + "] stale idea, age="
+                            + ideaAgeMs + "ms");
+                    return;
+                }
+
                 // 1. Fetch live balance (this also feeds RiskGuard's day baseline)
                 double balance = ex.fetchAvailableBalance();
                 if (balance <= 0) {
@@ -669,20 +690,24 @@ public final class BotMain {
                         r.entryPrice, r.qty, r.slPrice, r.notionalUsd,
                         r.orderId, r.slOrderId);
 
-                // 5. Notify
+                // 5. Notify — теперь с РЕАЛЬНЫМ риском (margin = notional/leverage)
+                // и явно указываем сколько fees/spread заберёт минимум.
+                double marginUsed = r.notionalUsd / Math.max(1, ex.getLeverage());
+                double riskUsd    = Math.abs(r.entryPrice - r.slPrice) * r.qty;
                 tg.sendMessageAsync(String.format(
                         "🤖 *Auto-trade ОТКРЫТА* %s\n" +
                                 "%s %s | qty=%s\n" +
                                 "Entry: %.6f | SL: %.6f\n" +
-                                "Notional: $%.2f | Risk: $%.2f\n" +
+                                "Notional: $%.2f | Margin: $%.2f (lev=%dx)\n" +
+                                "Risk if SL: $%.2f (%.2f%% депо)\n" +
                                 "Балaнс до: $%.2f | Mode: %s",
                         idea.symbol,
                         idea.side.name(),
                         ex.isTestnet() ? "🧪TESTNET" : "🔴LIVE",
                         formatNum(r.qty),
                         r.entryPrice, r.slPrice,
-                        r.notionalUsd,
-                        balance * (ex.getRiskPct() / 100.0),
+                        r.notionalUsd, marginUsed, ex.getLeverage(),
+                        riskUsd, balance > 0 ? (riskUsd / balance * 100.0) : 0.0,
                         balance,
                         rg.statusLine()));
                 LOG.info("[AUTO-TRADE/" + idea.symbol + "] OPENED " + r);
@@ -986,6 +1011,12 @@ public final class BotMain {
             com.bot.BinanceTradeExecutor ex = com.bot.BinanceTradeExecutor.getInstance();
             com.bot.PositionTracker tracker = com.bot.PositionTracker.getInstance();
             tracker.setTelegram(telegram); // for close notifications
+            // [HOLE-3 FIX 2026-05-08] Wire emergency-close failure alerts to Telegram.
+            // Если SL не встал И emergencyClose не смог закрыть позицию (HTTP fail
+            // или verification timeout) — оператор получит alert немедленно.
+            com.bot.BinanceTradeExecutor.setEmergencyAlertSink(msg -> {
+                try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
+            });
             // Only start polling if auto-trade is enabled — otherwise tracker
             // would just spin uselessly.
             if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady()) {

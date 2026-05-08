@@ -105,6 +105,48 @@ public final class BinanceTradeExecutor {
      */
     private final ConcurrentHashMap<String, SymbolInfo> symbolInfoCache = new ConcurrentHashMap<>();
 
+    // ─── [HOLE-CLOCK-DRIFT FIX 2026-05-08] Server-time sync ───────────
+    // Binance отвергает запросы с timestamp дрейфом > recvWindow (5s).
+    // На VPS с плохими часами все ордера рubиrabятся с -1021. Sync раз в 30 мин
+    // через /fapi/v1/time, прибавляем offset ко всем timestamp= параметрам.
+    private volatile long timeOffsetMs = 0L;
+    private volatile long lastTimeSync = 0L;
+    private static final long TIME_SYNC_INTERVAL_MS = 30 * 60_000L;
+
+    /** Returns server-time-corrected millis for use as Binance "timestamp" param. */
+    private long ts() {
+        long now = System.currentTimeMillis();
+        if (now - lastTimeSync > TIME_SYNC_INTERVAL_MS) {
+            syncServerTime();
+        }
+        return now + timeOffsetMs;
+    }
+
+    /** Syncs local clock with Binance server time. Called lazily from ts(). */
+    private void syncServerTime() {
+        try {
+            HttpResponse<String> r = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/time"))
+                            .timeout(Duration.ofSeconds(3))
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() == 200) {
+                JSONObject o = new JSONObject(r.body());
+                long server = o.optLong("serverTime", 0);
+                if (server > 0) {
+                    long offset = server - System.currentTimeMillis();
+                    timeOffsetMs = offset;
+                    lastTimeSync = System.currentTimeMillis();
+                    if (Math.abs(offset) > 1000) {
+                        LOG.warning("[Executor] clock drift detected: " + offset
+                                + "ms — applying offset");
+                    }
+                }
+            }
+        } catch (Exception ignored) { /* keep last offset, retry next time */ }
+    }
+
     private static final BinanceTradeExecutor INSTANCE = new BinanceTradeExecutor();
     public static BinanceTradeExecutor getInstance() { return INSTANCE; }
 
@@ -137,7 +179,11 @@ public final class BinanceTradeExecutor {
             LOG.warning("[Executor] RISK_PCT_PER_TRADE=" + rp + " requested, capped to 5");
         }
 
-        this.slPlacementTimeoutMs = envLong("SL_PLACEMENT_TIMEOUT_MS", 5000L);
+        // [v83.5 LATENCY-FIX] Default 5000ms → 2000ms. На demo-fapi подтверждение
+        // SL приходит за 200-400ms. 5 секунд — это легаси для нестабильных сетей.
+        // Меньшее окно = меньше naked-position window после MARKET-открытия.
+        // ENV SL_PLACEMENT_TIMEOUT_MS позволяет переопределить (для отладки).
+        this.slPlacementTimeoutMs = envLong("SL_PLACEMENT_TIMEOUT_MS", 2000L);
         this.maxSpreadPct         = envDouble("MAX_SPREAD_PCT", 0.5);
 
         this.http = HttpClient.newBuilder()
@@ -170,7 +216,7 @@ public final class BinanceTradeExecutor {
      * positionSide=LONG/SHORT are accepted. Idempotent — safe to call repeatedly.
      */
     private void ensureOneWayMode() throws Exception {
-        long ts = System.currentTimeMillis();
+        long ts = ts();
         String body = "dualSidePosition=false&timestamp=" + ts + "&recvWindow=5000";
         String sig = hmacSHA256(apiSecret, body);
         HttpResponse<String> resp = http.send(
@@ -203,6 +249,54 @@ public final class BinanceTradeExecutor {
     public boolean isTestnet() { return useTestnet; }
     public int  getLeverage()    { return leverage; }
     public double getRiskPct()   { return riskPctPerTrade; }
+
+    /**
+     * [HOLE-3 FIX 2026-05-08] Public emergency-close helper used by PositionTracker
+     * startup reconcile when an orphan position is detected (no SL on exchange).
+     *
+     * Closes the position via opposite-side MARKET reduceOnly, then cancels all
+     * remaining algo orders for the symbol so nothing dangles. Returns true on
+     * successful close (or position already empty), false on hard failure that
+     * needs manual intervention.
+     *
+     * positionAmt sign: + = LONG, − = SHORT. Pass the raw value from
+     * /fapi/v2/positionRisk (we infer side and absolute qty internally).
+     */
+    public boolean closeOrphanPosition(String symbol, double positionAmt) {
+        if (!isReady()) return false;
+        if (Math.abs(positionAmt) < 1e-9) return true; // already empty
+        boolean wasLong = positionAmt > 0;
+        double qty = Math.abs(positionAmt);
+        try {
+            emergencyClosePosition(symbol, wasLong, qty);
+            // Verify close succeeded by re-checking positionAmt within ~1.5s.
+            for (int i = 0; i < 3; i++) {
+                Thread.sleep(500);
+                JSONArray ps = fetchAllOpenPositionsRaw();
+                if (ps == null) break;
+                boolean stillOpen = false;
+                for (int k = 0; k < ps.length(); k++) {
+                    JSONObject p = ps.getJSONObject(k);
+                    if (symbol.equals(p.optString("symbol", ""))
+                            && Math.abs(p.optDouble("positionAmt", 0)) > 1e-9) {
+                        stillOpen = true; break;
+                    }
+                }
+                if (!stillOpen) {
+                    cancelAllOpenOrders(symbol);
+                    return true;
+                }
+            }
+            // Position still showing as open after emergency close — log and bail.
+            LOG.severe("[Executor] closeOrphanPosition: " + symbol
+                    + " still open after emergency close — MANUAL INTERVENTION");
+            return false;
+        } catch (Throwable t) {
+            LOG.severe("[Executor] closeOrphanPosition " + symbol + " exception: "
+                    + t.getMessage());
+            return false;
+        }
+    }
 
     // ─── Public API ───────────────────────────────────────────────────
 
@@ -266,7 +360,7 @@ public final class BinanceTradeExecutor {
     public double fetchAvailableBalance() {
         if (!isReady()) return -1;
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String qs = "timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpRequest req = HttpRequest.newBuilder()
@@ -349,6 +443,35 @@ public final class BinanceTradeExecutor {
             double slDistance = Math.abs(entry - idea.stop);
             if (slDistance <= 0) return ExecutionResult.fail("zero SL distance");
 
+            // [HOLE-7 FIX 2026-05-08] Sanity-check SL distance vs current price.
+            // Если idea.stop пришла с лагом (старая цена 5+ минут назад), entry уже
+            // ушла далеко, и slDistance может оказаться огромной → qty = крохотное →
+            // позиция размером с пыль ИЛИ наоборот SL стоит на 30% от цены, что =
+            // де-факто disabled risk control. Отсекаем оба края: SL д.б. в диапазоне
+            // 0.10%–10% от цены.
+            double slDistancePct = slDistance / entry;
+            if (slDistancePct < 0.001) {
+                return ExecutionResult.fail(String.format(
+                        "SL too tight: %.3f%% from entry (need ≥0.10%%) — likely stale data",
+                        slDistancePct * 100));
+            }
+            if (slDistancePct > 0.10) {
+                return ExecutionResult.fail(String.format(
+                        "SL too wide: %.2f%% from entry (max 10%%) — idea.stop=%.6f vs entry=%.6f, "
+                                + "stale signal or wrong direction",
+                        slDistancePct * 100, idea.stop, entry));
+            }
+            // Дополнительная проверка направления: SL для LONG должен быть НИЖЕ entry,
+            // для SHORT — ВЫШЕ. Если перепутано — фатальный баг в DecisionEngine.
+            if (isLong && idea.stop >= entry) {
+                return ExecutionResult.fail(String.format(
+                        "LONG SL=%.6f >= entry=%.6f (wrong direction)", idea.stop, entry));
+            }
+            if (!isLong && idea.stop <= entry) {
+                return ExecutionResult.fail(String.format(
+                        "SHORT SL=%.6f <= entry=%.6f (wrong direction)", idea.stop, entry));
+            }
+
             // [v83.2] Load real exchange filters for this symbol. Critical:
             // every pair has its own stepSize (qty granularity), tickSize
             // (price granularity), minNotional (smallest position). Hardcoded
@@ -361,6 +484,19 @@ public final class BinanceTradeExecutor {
 
             double riskUsd = balanceUsd * (riskPctPerTrade / 100.0);
             double qty = riskUsd / slDistance;
+
+            // [HOLE-1 FIX 2026-05-08] Apply unified size multiplier from idea.
+            // SignalSender stores its display-time ratio here (category, flag,
+            // session, ISC modifiers) so on-exchange size matches Telegram.
+            // Default 1.0 = legacy behaviour for ideas that didn't go through
+            // SignalSender (probe, manual). Already clamped [0.20, 1.20] in setter.
+            double sizeMult = idea.getExecutorSizeMultiplier();
+            if (sizeMult != 1.0) {
+                qty *= sizeMult;
+                LOG.fine("[Executor] " + symbol + " sizeMult=" + sizeMult
+                        + " applied → qty=" + qty);
+            }
+
             double notional = qty * entry;
             double marginUsed = notional / leverage;
 
@@ -393,11 +529,48 @@ public final class BinanceTradeExecutor {
                         + "(see [Executor] log for code+msg)");
             }
 
-            // Wait briefly for fill, fetch actual fill price
-            Thread.sleep(800);
-            double actualEntry = fetchOrderAvgPrice(symbol, entryOrderId);
-            if (actualEntry <= 0) actualEntry = entry; // fallback
+            // [LATENCY-FIX 2026-05-08] Active poll вместо blind sleep(800).
+            // На demo-fapi MARKET fill приходит за 50–200ms; ждать 800ms
+            // во всех случаях = терять 600+ms на быстрых рынках, где SL
+            // должен встать максимально быстро. Polling 10×50ms=500ms max,
+            // но обычно выходим на первой-второй итерации.
+            double actualEntry = 0;
+            for (int pollI = 0; pollI < 10; pollI++) {
+                actualEntry = fetchOrderAvgPrice(symbol, entryOrderId);
+                if (actualEntry > 0) break;
+                Thread.sleep(50);
+            }
+            if (actualEntry <= 0) actualEntry = entry; // fallback на квоту
 
+            // [HOLE-NEW FIX 2026-05-08] Partial-fill detection.
+            // sendMarketOrder возвращает только orderId; fetchOrderAvgPrice — только
+            // avgPrice. На illiquid alts MARKET может филить частично — позиция
+            // на бирже < requested qty, но SL/TP/Tracker считали бы по requested.
+            // SL имеет closePosition=true (закроет реальный остаток корректно), но
+            // TP1+TP2 split при partial fill могут отклоняться "qty exceeds position".
+            // Решение: после fill читаем реальный positionAmount и сверяем.
+            // Если расхождение >5% — используем меньшее значение для SL/TP.
+            double filledQty = qty;
+            try {
+                double posAmt = Math.abs(fetchPositionAmount(symbol));
+                if (posAmt > 0 && posAmt < qty * 0.95) {
+                    LOG.warning(String.format(
+                            "[Executor] %s PARTIAL FILL: requested=%.6f filled=%.6f (%.0f%%)",
+                            symbol, qty, posAmt, posAmt / qty * 100.0));
+                    filledQty = posAmt;
+                    // Re-round to step size to avoid TP/SL precision issues
+                    filledQty = roundDownToStep(filledQty, si.stepSize);
+                    if (filledQty <= 0) {
+                        emergencyClosePosition(symbol, isLong, qty);
+                        return ExecutionResult.fail("partial fill rounded to zero");
+                    }
+                }
+            } catch (Throwable t) {
+                LOG.fine("[Executor] partial-fill check failed for " + symbol
+                        + ": " + t.getMessage() + " — using requested qty");
+            }
+            // From here on, qty refers to the actual on-exchange position.
+            qty = filledQty;
             double actualNotional = qty * actualEntry;
 
             // 5. Place SL — STOP_MARKET через Algo Service.
@@ -408,19 +581,23 @@ public final class BinanceTradeExecutor {
             //
             // [v84.0 DIAGNOSTIC] При фейле логируем тело ответа ПОЛНОСТЬЮ
             // и SEVERE-уровнем. До этого ошибка терялась в WARNING.
+            //
+            // [LATENCY-FIX 2026-05-08] Sleep между попытками 500→200ms,
+            // attempts 3→4. На 2-секундном таймауте это даёт окно: 4 попытки
+            // × ~250ms (request+wait) = укладываемся в дедлайн.
             String slOrderId = null;
             String slLastError = "no attempts";
             long slDeadline = System.currentTimeMillis() + slPlacementTimeoutMs;
             int attempts = 0;
-            while (System.currentTimeMillis() < slDeadline && attempts < 3) {
+            while (System.currentTimeMillis() < slDeadline && attempts < 4) {
                 attempts++;
                 String[] slResult = sendStopMarketOrderDiag(symbol, !isLong, slPriceRounded);
                 slOrderId = slResult[0];
                 slLastError = slResult[1];
                 if (slOrderId != null) break;
-                LOG.warning("[Executor] SL attempt " + attempts + "/3 failed for "
+                LOG.warning("[Executor] SL attempt " + attempts + "/4 failed for "
                         + symbol + ": " + slLastError);
-                Thread.sleep(500);
+                Thread.sleep(200);
             }
 
             // 6. SL FAILED — emergency close
@@ -565,7 +742,7 @@ public final class BinanceTradeExecutor {
     public double fetchPositionAmount(String symbol) {
         if (!isReady()) return 0;
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
@@ -597,7 +774,7 @@ public final class BinanceTradeExecutor {
     public double fetchUnrealizedPnl(String symbol) {
         if (!isReady()) return 0;
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
@@ -630,7 +807,7 @@ public final class BinanceTradeExecutor {
     public double fetchMarkPrice(String symbol) {
         if (!isReady()) return 0;
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
@@ -657,7 +834,7 @@ public final class BinanceTradeExecutor {
     // ─── Internal: HTTP signed calls ──────────────────────────────────
 
     private boolean initSymbolMargin(String symbol) throws Exception {
-        long ts = System.currentTimeMillis();
+        long ts = ts();
         String qs = "symbol=" + symbol + "&marginType=ISOLATED&timestamp=" + ts + "&recvWindow=5000";
         String sig = hmacSHA256(apiSecret, qs);
         HttpResponse<String> resp = http.send(
@@ -678,7 +855,7 @@ public final class BinanceTradeExecutor {
     }
 
     private boolean initSymbolLeverage(String symbol) throws Exception {
-        long ts = System.currentTimeMillis();
+        long ts = ts();
         String qs = "symbol=" + symbol + "&leverage=" + leverage + "&timestamp=" + ts + "&recvWindow=5000";
         String sig = hmacSHA256(apiSecret, qs);
         HttpResponse<String> resp = http.send(
@@ -711,7 +888,7 @@ public final class BinanceTradeExecutor {
 
     /** Send a MARKET order. Returns orderId on success, null on failure. */
     private String sendMarketOrder(String symbol, boolean buy, double qty) throws Exception {
-        long ts = System.currentTimeMillis();
+        long ts = ts();
         String body = "symbol=" + symbol
                 + "&side=" + (buy ? "BUY" : "SELL")
                 + "&type=MARKET"
@@ -736,7 +913,7 @@ public final class BinanceTradeExecutor {
             // key). Retry once with explicit positionSide.
             if (b.contains("-4061") || b.contains("position side")) {
                 LOG.warning("[Executor] " + symbol + " HEDGE mode detected, retrying with positionSide");
-                long ts2 = System.currentTimeMillis();
+                long ts2 = ts();
                 String body2 = "symbol=" + symbol
                         + "&side=" + (buy ? "BUY" : "SELL")
                         + "&positionSide=" + (buy ? "LONG" : "SHORT")
@@ -796,7 +973,7 @@ public final class BinanceTradeExecutor {
      * This is what makes "SL not placed" debuggable instead of mysterious.
      */
     private String[] sendStopMarketOrderDiag(String symbol, boolean buy, double stopPrice) throws Exception {
-        long ts = System.currentTimeMillis();
+        long ts = ts();
         // recvWindow bumped to 60000 per Binance recommendation for high-latency
         // environments — testnet often has 200-500ms RTT spikes.
         String body = "algoType=CONDITIONAL"
@@ -867,7 +1044,7 @@ public final class BinanceTradeExecutor {
     private String[] sendTakeProfitMarketOrderDiag(String symbol, boolean buy,
                                                    double triggerPrice, double qty,
                                                    boolean useClosePosition) throws Exception {
-        long ts = System.currentTimeMillis();
+        long ts = ts();
         StringBuilder body = new StringBuilder();
         body.append("algoType=CONDITIONAL")
                 .append("&symbol=").append(symbol)
@@ -978,7 +1155,7 @@ public final class BinanceTradeExecutor {
             return false;
         }
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String qs = "symbol=" + symbol + "&algoId=" + algoId
                     + "&timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, qs);
@@ -1095,7 +1272,7 @@ public final class BinanceTradeExecutor {
                                             long sinceMs) {
         if (!isReady()) return 0.0;
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             // limit=500 is the max for userTrades. For a single trade this is
             // way more than enough (TP1 + SL = 2 fills, plus the entry = 3).
             String qs = "symbol=" + symbol + "&startTime=" + sinceMs
@@ -1155,7 +1332,7 @@ public final class BinanceTradeExecutor {
     public JSONArray fetchAllOpenPositionsRaw() {
         if (!isReady()) return null;
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String qs = "timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
@@ -1180,7 +1357,7 @@ public final class BinanceTradeExecutor {
     private void cancelAllOpenOrders(String symbol) {
         // 1) Обычные ордера
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, body);
             http.send(
@@ -1196,7 +1373,7 @@ public final class BinanceTradeExecutor {
 
         // 2) Алго-ордера (SL/TP/трейлинги — теперь отдельная очередь)
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, body);
             http.send(
@@ -1211,37 +1388,237 @@ public final class BinanceTradeExecutor {
         }
     }
 
-    /** Emergency: close just-opened position by sending opposite market order. */
-    private void emergencyClosePosition(String symbol, boolean wasLong, double qty) {
+    /**
+     * [HOLE-3 FIX 2026-05-08] Returns true if there is an active STOP_MARKET (SL)
+     * order on the exchange for this symbol — checked across both the plain
+     * order queue (legacy) AND the algo order queue (current standard since
+     * Binance breaking change 2025-12-09).
+     *
+     * Used by PositionTracker.reconcileAtStartup to decide if an orphan
+     * position is "naked" (needs auto-close) or "protected" (just leave it).
+     *
+     * Returns false on API error — fail-safe: prefer auto-close to leaving
+     * an orphan that we wrongly think has SL.
+     */
+    public boolean hasActiveStopLoss(String symbol) {
+        if (!isReady()) return false;
+        // 1. Check plain open orders queue
         try {
-            // Opposite side, reduceOnly to ensure we don't accidentally flip
-            long ts = System.currentTimeMillis();
-            String body = "symbol=" + symbol
-                    + "&side=" + (wasLong ? "SELL" : "BUY")
-                    + "&type=MARKET"
-                    + "&quantity=" + formatQty(qty)
-                    + "&reduceOnly=true"
-                    + "&timestamp=" + ts + "&recvWindow=5000";
-            String sig = hmacSHA256(apiSecret, body);
-            http.send(
+            long ts = ts();
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> r = http.send(
                     HttpRequest.newBuilder()
-                            .uri(URI.create(baseUrl + "/fapi/v1/order"))
-                            .timeout(Duration.ofSeconds(10))
+                            .uri(URI.create(baseUrl + "/fapi/v1/openOrders?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
                             .header("X-MBX-APIKEY", apiKey)
-                            .header("Content-Type", "application/x-www-form-urlencoded")
-                            .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
-                            .build(),
+                            .GET().build(),
                     HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() == 200) {
+                JSONArray arr = new JSONArray(r.body());
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.getJSONObject(i);
+                    String type = o.optString("type", "").toUpperCase();
+                    if (type.contains("STOP")) return true;
+                }
+            }
         } catch (Exception e) {
-            LOG.severe("[Executor] EMERGENCY CLOSE FAILED " + symbol + ": " + e.getMessage()
-                    + " — MANUAL INTERVENTION REQUIRED");
+            LOG.warning("[Executor] hasActiveStopLoss(plain) " + symbol + " error: " + e.getMessage());
+            return false;
         }
+        // 2. Check algo open orders queue
+        try {
+            long ts = ts();
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> r = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/algoOpenOrders?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() == 200) {
+                // Endpoint can return JSONArray OR {"orders":[...]} depending on version.
+                String body = r.body() == null ? "" : r.body().trim();
+                if (body.startsWith("[")) {
+                    JSONArray arr = new JSONArray(body);
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject o = arr.getJSONObject(i);
+                        String type = o.optString("algoType", o.optString("type", "")).toUpperCase();
+                        if (type.contains("STOP")) return true;
+                    }
+                } else if (body.startsWith("{")) {
+                    JSONObject obj = new JSONObject(body);
+                    JSONArray arr = obj.optJSONArray("orders");
+                    if (arr != null) {
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject o = arr.getJSONObject(i);
+                            String type = o.optString("algoType", o.optString("type", "")).toUpperCase();
+                            if (type.contains("STOP")) return true;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.warning("[Executor] hasActiveStopLoss(algo) " + symbol + " error: " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * [HOLE-3 FIX 2026-05-08] Emergency close — теперь с проверкой HTTP-статуса,
+     * 3-кратным retry (300ms, 600ms backoff) и пост-верификацией позиции.
+     *
+     * До правки: один fire-and-forget POST. Если Binance возвращал 4xx/5xx —
+     * бот тихо считал что закрыл, депозит мог потеряться. Теперь:
+     *   1. Проверяем resp.statusCode() == 200 на каждой попытке
+     *   2. После 200 — verify через /fapi/v2/positionRisk: позиция реально =0
+     *   3. До 3 попыток с экспоненциальным backoff
+     *   4. Если все попытки упали — Telegram alert (через staticTelegram если задан)
+     *
+     * Returns true если позиция подтверждённо закрыта, false иначе.
+     * Старые callers ожидали void — обёртки оставлены ниже для совместимости.
+     */
+    private boolean emergencyClosePositionWithVerify(String symbol, boolean wasLong, double qty) {
+        if (Math.abs(qty) < 1e-9) return true;
+        Exception lastEx = null;
+        int    lastStatus = 0;
+        String lastBody   = "";
+        final int maxAttempts = 3;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                long ts = ts();
+                String body = "symbol=" + symbol
+                        + "&side=" + (wasLong ? "SELL" : "BUY")
+                        + "&type=MARKET"
+                        + "&quantity=" + formatQty(qty)
+                        + "&reduceOnly=true"
+                        + "&timestamp=" + ts + "&recvWindow=5000";
+                String sig = hmacSHA256(apiSecret, body);
+                HttpResponse<String> resp = http.send(
+                        HttpRequest.newBuilder()
+                                .uri(URI.create(baseUrl + "/fapi/v1/order"))
+                                .timeout(Duration.ofSeconds(10))
+                                .header("X-MBX-APIKEY", apiKey)
+                                .header("Content-Type", "application/x-www-form-urlencoded")
+                                .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
+                                .build(),
+                        HttpResponse.BodyHandlers.ofString());
+                lastStatus = resp.statusCode();
+                lastBody   = resp.body() == null ? "" : resp.body();
+                if (lastStatus == 200) {
+                    // [v83.6 RETRY] HEDGE-mode fallback. -4061 here is rare (we
+                    // should've ensured ONE_WAY at boot), but if positionSide
+                    // is required, retry with explicit positionSide once.
+                    // Verify position closed within ~1.5s.
+                    boolean verified = false;
+                    for (int v = 0; v < 3; v++) {
+                        try { Thread.sleep(500); } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt(); break;
+                        }
+                        double remaining = fetchPositionAmount(symbol);
+                        if (Math.abs(remaining) < 1e-9) { verified = true; break; }
+                    }
+                    if (verified) {
+                        LOG.info("[Executor] emergencyClose " + symbol + " OK (attempt "
+                                + attempt + ")");
+                        return true;
+                    }
+                    LOG.severe("[Executor] emergencyClose " + symbol
+                            + " HTTP200 but position still open after 1.5s verify — retrying");
+                } else if (lastBody.contains("-4061") || lastBody.contains("position side")) {
+                    // HEDGE-mode require explicit positionSide
+                    long ts2 = ts();
+                    String body2 = "symbol=" + symbol
+                            + "&side=" + (wasLong ? "SELL" : "BUY")
+                            + "&positionSide=" + (wasLong ? "LONG" : "SHORT")
+                            + "&type=MARKET"
+                            + "&quantity=" + formatQty(qty)
+                            + "&timestamp=" + ts2 + "&recvWindow=5000";
+                    String sig2 = hmacSHA256(apiSecret, body2);
+                    HttpResponse<String> resp2 = http.send(
+                            HttpRequest.newBuilder()
+                                    .uri(URI.create(baseUrl + "/fapi/v1/order"))
+                                    .timeout(Duration.ofSeconds(10))
+                                    .header("X-MBX-APIKEY", apiKey)
+                                    .header("Content-Type", "application/x-www-form-urlencoded")
+                                    .POST(HttpRequest.BodyPublishers.ofString(body2 + "&signature=" + sig2))
+                                    .build(),
+                            HttpResponse.BodyHandlers.ofString());
+                    lastStatus = resp2.statusCode();
+                    lastBody   = resp2.body() == null ? "" : resp2.body();
+                    if (lastStatus == 200) {
+                        // verify
+                        for (int v = 0; v < 3; v++) {
+                            try { Thread.sleep(500); } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt(); break;
+                            }
+                            double remaining = fetchPositionAmount(symbol);
+                            if (Math.abs(remaining) < 1e-9) {
+                                LOG.info("[Executor] emergencyClose " + symbol
+                                        + " OK via HEDGE retry");
+                                return true;
+                            }
+                        }
+                    } else {
+                        LOG.warning("[Executor] emergencyClose " + symbol
+                                + " attempt " + attempt + " HEDGE retry failed: HTTP "
+                                + lastStatus + " " + lastBody);
+                    }
+                } else {
+                    LOG.warning("[Executor] emergencyClose " + symbol
+                            + " attempt " + attempt + " HTTP " + lastStatus + ": " + lastBody);
+                }
+            } catch (Exception e) {
+                lastEx = e;
+                LOG.warning("[Executor] emergencyClose " + symbol
+                        + " attempt " + attempt + " exception: " + e.getMessage());
+            }
+            if (attempt < maxAttempts) {
+                try { Thread.sleep(300L * attempt); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); break;
+                }
+            }
+        }
+        // All attempts exhausted — escalate
+        String reason = lastEx != null ? ("exception: " + lastEx.getMessage())
+                : ("HTTP " + lastStatus + ": " + lastBody);
+        LOG.severe("[Executor] EMERGENCY CLOSE FAILED " + symbol + " after " + maxAttempts
+                + " attempts (" + reason + ") — MANUAL INTERVENTION REQUIRED");
+        emergencyAlert(symbol, wasLong, qty, reason);
+        return false;
+    }
+
+    /** Backwards-compat shim for callers that just need fire-and-verify. */
+    private void emergencyClosePosition(String symbol, boolean wasLong, double qty) {
+        emergencyClosePositionWithVerify(symbol, wasLong, qty);
+    }
+
+    /** Telegram alert for failed emergency close. Static hook set by SignalSender. */
+    private static volatile java.util.function.Consumer<String> emergencyAlertSink = null;
+    public static void setEmergencyAlertSink(java.util.function.Consumer<String> sink) {
+        emergencyAlertSink = sink;
+    }
+    private void emergencyAlert(String symbol, boolean wasLong, double qty, String reason) {
+        try {
+            java.util.function.Consumer<String> sink = emergencyAlertSink;
+            if (sink != null) {
+                sink.accept(String.format(
+                        "🚨 *EMERGENCY CLOSE FAILED* %s\n"
+                                + "Side: %s | qty: %s\n"
+                                + "Причина: %s\n"
+                                + "*РУЧНОЕ ВМЕШАТЕЛЬСТВО:* зайди в Binance и закрой позицию вручную.",
+                        symbol, wasLong ? "LONG (close=SELL)" : "SHORT (close=BUY)",
+                        formatQty(qty), reason));
+            }
+        } catch (Throwable ignored) {}
     }
 
     /** Fetch average fill price from order. Returns 0 if not filled. */
     private double fetchOrderAvgPrice(String symbol, String orderId) {
         try {
-            long ts = System.currentTimeMillis();
+            long ts = ts();
             String qs = "symbol=" + symbol + "&orderId=" + orderId
                     + "&timestamp=" + ts + "&recvWindow=5000";
             String sig = hmacSHA256(apiSecret, qs);

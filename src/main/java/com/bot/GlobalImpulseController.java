@@ -31,6 +31,21 @@ public final class GlobalImpulseController {
     // Sector contagion: если сектор упал больше этого % за 8 свечей → вето лонгов
     private static final double SECTOR_CONTAGION_DROP = 0.040;  // -4%
 
+    // [HOLE-LONG FIX 2026-05-08] Минимальный пол для longSuppressionMult.
+    // Default 0.0 = сохраняет старое поведение (suppression может быть до 0.30).
+    // Поставить env GIC_LONG_SUPPRESS_MIN=0.85 чтобы LONG никогда не резался
+    // ниже 85% от изначального score (фактически отключение GIC long-suppression).
+    // Применяется к выходному longSuppressionMult в isLongAllowed-логике.
+    private static final double GIC_LONG_SUPPRESS_MIN = envDoubleStaticGic("GIC_LONG_SUPPRESS_MIN", 0.0);
+
+    private static double envDoubleStaticGic(String key, double def) {
+        try {
+            String v = System.getenv(key);
+            if (v == null || v.isBlank()) return def;
+            return Double.parseDouble(v.trim());
+        } catch (Throwable t) { return def; }
+    }
+
     // ATR history для режима волатильности
     private final Deque<Double> btcAtrHistory = new ConcurrentLinkedDeque<>();
     private static final int ATR_HISTORY_SIZE = 96; // 96 × 15m = 24h
@@ -603,6 +618,14 @@ public final class GlobalImpulseController {
             } else if (cascadeLevel == CascadeLevel.WATCH) {
                 longSuppressionMult = btcRecovering ? 0.90 : 0.75;
             }
+        }
+
+        // [HOLE-LONG FIX 2026-05-08] Apply env-controlled floor on suppression.
+        // Default GIC_LONG_SUPPRESS_MIN=0.0 = noop (старое поведение).
+        // Установка =0.85 = LONG никогда не режется ниже 85% от изначального score.
+        // Не применяется когда onlyShort=true (там hard veto, не suppression).
+        if (!onlyShort && GIC_LONG_SUPPRESS_MIN > 0.0) {
+            longSuppressionMult = Math.max(longSuppressionMult, GIC_LONG_SUPPRESS_MIN);
         }
 
         // ── SHORT Boost — усиление шортов при краше ──────────────

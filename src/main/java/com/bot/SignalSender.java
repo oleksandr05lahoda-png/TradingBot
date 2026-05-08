@@ -1021,6 +1021,11 @@ public final class SignalSender {
             // [ДЫРА №1/№2] Очищаем CVD и ликвидации для ротированных пар
             cvdMap.remove(zombie);
             liqHeatmap.remove(zombie);
+            // [HOLE-NEW FIX 2026-05-08] liqTimestamps keyed by "symbol_bucket" —
+            // удаляем все записи начинающиеся с zombie+"_". Без этого map растёт
+            // неограниченно (десятки тыс. записей за месяц uptime).
+            final String zPrefix = zombie + "_";
+            liqTimestamps.keySet().removeIf(k -> k.startsWith(zPrefix));
             // Clean candle caches for all timeframes
             for (String tf : List.of("1m","5m","15m","1h","2h")) {
                 candleCache.remove(zombie + "_" + tf);
@@ -1454,19 +1459,31 @@ public final class SignalSender {
             // SURVIVAL MODE (day <= -6%): position size ×0.25.
             // CAUTIOUS MODE (day <= -3%): position size ×0.5.
             // This replaces the old hard signal block with meaningful size reduction.
+            //
+            // [HOLE-1 REGRESSION FIX 2026-05-08] Эти множители применяются и к
+            // posSize (для Telegram-display), И к idea.executorSizeMultiplier
+            // (через extraMult ниже), чтобы биржа открывала тот же размер.
+            // Раньше они были только display-side → биржа в SURVIVAL открывала
+            // в 4× больше чем показано (катастрофа в худший день).
+            double extraMult = 1.0;
             if (isc.isSurvivalMode()) {
                 posSize = posSize * 0.25;
+                extraMult *= 0.25;
             } else if (isc.isCautiousMode()) {
                 posSize = posSize * 0.5;
+                extraMult *= 0.5;
             }
             if (qualityPenalty > 0.0) {
-                posSize *= Math.max(0.55, 1.0 - qualityPenalty * 0.06);
+                double qm = Math.max(0.55, 1.0 - qualityPenalty * 0.06);
+                posSize *= qm;
+                extraMult *= qm;
             }
             // CORRELATION SIZE REDUCTION
             // Каждая дополнительная позиция в том же направлении уменьшает размер.
             // 8 ALT LONG = фактически 1 позиция с 8× риском (corr ~0.85).
             double corrMult = correlationGuard.getCorrelationSizeMultiplier(pair, idea.side, cat);
             posSize *= corrMult;
+            extraMult *= corrMult;
 
             List<String> nf = new ArrayList<>(idea.flags);
             String sizeMode = isc.isSurvivalMode() ? " 🆘SURVIVAL"
@@ -1555,12 +1572,16 @@ public final class SignalSender {
                     double newTp3 = Math.max(1.50, idea.tp3Mult * 0.85);
                     List<String> wf = new ArrayList<>(idea.flags);
                     wf.add(String.format("OB_WALL%.1fx", obstacleDepth / supportDepth));
+                    // [HOLE-1 REGRESSION FIX 2026-05-08] Preserve executorSizeMultiplier
+                    // when constructing new TradeIdea directly (bypasses rebuildIdea).
+                    double prevMult = idea.getExecutorSizeMultiplier();
                     idea = new com.bot.DecisionEngineMerged.TradeIdea(
                             idea.symbol, idea.side, idea.price, idea.stop, idea.take,
                             idea.rr, idea.probability, wf,
                             idea.fundingRate, idea.fundingDelta, idea.oiChange,
                             idea.htfBias, idea.category, idea.forecast,
                             newTp1, newTp2, newTp3);
+                    if (prevMult > 0 && prevMult != 1.0) idea.setExecutorSizeMultiplier(prevMult);
                 }
             }
 
@@ -1574,12 +1595,16 @@ public final class SignalSender {
                 double newTp3 = Math.max(1.50, idea.tp3Mult * scale);
                 List<String> tf = new ArrayList<>(idea.flags);
                 tf.add(String.format("TP_CAL×%.1f", scale));
+                // [HOLE-1 REGRESSION FIX 2026-05-08] Preserve executorSizeMultiplier
+                // when constructing new TradeIdea directly (bypasses rebuildIdea).
+                double prevMult = idea.getExecutorSizeMultiplier();
                 idea = new com.bot.DecisionEngineMerged.TradeIdea(
                         idea.symbol, idea.side, idea.price, idea.stop, idea.take,
                         idea.rr, idea.probability, tf,
                         idea.fundingRate, idea.fundingDelta, idea.oiChange,
                         idea.htfBias, idea.category, idea.forecast,
                         newTp1, newTp2, newTp3);
+                if (prevMult > 0 && prevMult != 1.0) idea.setExecutorSizeMultiplier(prevMult);
             }
 
             // [v78.2 CRITICAL FIX] Removed `isc.registerSignal(idea)` from this path.
@@ -1608,6 +1633,17 @@ public final class SignalSender {
             // Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
             decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, System.currentTimeMillis());
             correlationGuard.register(pair, idea.side, cat, sector);
+
+            // [HOLE-1 REGRESSION FIX 2026-05-08] Apply accumulated extraMult
+            // (survival/cautious/quality/corr) to executorSizeMultiplier AFTER
+            // all rebuildIdea + direct constructor calls (OB_WALL/TP_CAL paths
+            // create new TradeIdea via constructor, which resets the multiplier).
+            // Do it here, at the last point before return — guarantees the
+            // multiplier survives to autoTradeHook.
+            if (extraMult > 0 && extraMult != 1.0) {
+                double base = idea.getExecutorSizeMultiplier();
+                idea.setExecutorSizeMultiplier(base * extraMult);
+            }
 
             return idea;
         } catch (Exception e) {
@@ -1814,74 +1850,75 @@ public final class SignalSender {
      */
     public double getPositionSizeUsdt(com.bot.DecisionEngineMerged.TradeIdea idea,
                                       com.bot.DecisionEngineMerged.CoinCategory cat) {
-        // [v17.0 FIX] Removed hardcoded floor $100. Now uses actual balance.
-        // OLD: Math.max(accountBalance, 100.0) → on $18 balance, bot sized for $100 → 36% risk per trade.
-        // NEW: actual balance used, with proportional risk scaling.
+        // [HOLE-1+2 FIX 2026-05-08+v2] UNIFIED RISK CALC + EXECUTOR PASSTHROUGH.
+        //
+        // Раньше Telegram показывал posSize вычисленный с модификаторами (catMult,
+        // flag mods, sessionW, ISC, smallBalance), а Executor открывал позицию
+        // ИГНОРИРУЯ эти модификаторы — только base RISK_PCT × balance / SL_dist.
+        // Расхождение до 4× для сигналов с COUNTER_TREND/MEME флагами.
+        //
+        // FIX: вычисляем итоговый sizeMultiplier (отношение posSize_with_mods
+        //      к posSize_without_mods) и пишем его на idea через
+        //      idea.setExecutorSizeMultiplier(). Executor читает и применяет
+        //      к qty в openPositionWithSl(). Теперь Telegram = биржа.
+        //
+        // Авторитетный источник: env RISK_PCT_PER_TRADE и LEVERAGE.
+        if (System.currentTimeMillis() - lastBalanceRefresh > 30_000L) {
+            try { refreshAccountBalance(); } catch (Throwable ignored) {}
+        }
+
         double balance = Math.max(accountBalance, 5.0); // floor at $5 only (min viable order)
 
-        double riskPct = switch (cat) {
-            case TOP  -> 0.010; // 1.0% of balance per trade
-            case ALT  -> 0.010; // 1.0% of balance per trade
-            case MEME -> 0.006; // 0.6% of balance per trade
-        };
+        double envRiskPct = envDouble("RISK_PCT_PER_TRADE", 2.0);
+        envRiskPct = Math.max(0.5, Math.min(5.0, envRiskPct));
+        int envLeverage = envInt("LEVERAGE", 5);
+        envLeverage = Math.max(1, Math.min(10, envLeverage));
 
-        // Small-balance safety: under $50, cut risk in half.
-        // At $18 × 1% = $0.18 risk. With SL ~1% this gives $18 position — 100% of balance.
-        // Corrected: under $50, max 0.5% risk → max 10% balance per trade.
-        if (balance < 50.0) {
-            riskPct *= 0.50;
-        } else if (balance < 150.0) {
-            riskPct *= 0.75;
-        }
+        // Aggregate modifier — start at 1.0, multiply each applicable factor.
+        double sizeMult = 1.0;
 
-        // Сужен диапазон confidence-based sizing: ×0.60..×1.50 → ×0.85..×1.15.
-        // Причина: до калибровки сигналов (WR > 45%) уверенность бота inflated.
-        // "85% confidence" часто = 55-60% реальный WR. Давать ×1.50 размер на inflated сигналы
-        // усиливает потери, а не прибыль. После стабилизации WR — расширить диапазон обратно.
-        // Сохраняем небольшой градиент чтобы высококонфидентные сигналы всё же чуть крупнее.
-        // Flat sizing until WR > 45% calibrated.
-        // Confidence-based scaling was amplifying losses from inflated base confidence.
-        // When WR is properly validated (>45%), re-enable differential multipliers.
-        // riskPct *= 1.00; // flat for all signals
+        // Category modifier (MEME режется)
+        if (cat == com.bot.DecisionEngineMerged.CoinCategory.MEME) sizeMult *= 0.60;
 
-        // PRE_BREAK signals are predictive — slightly larger size
-        if (idea.flags.contains("PRE_BREAK_UP") || idea.flags.contains("PRE_BREAK_DN")) {
-            riskPct *= 1.15;
-        }
-        // EARLY_TICK is faster but less reliable — smaller size
-        if (idea.flags.contains("EARLY_TICK")) {
-            riskPct *= 0.85;
-        }
-        // Exhaustion reversal entries — smaller (counter-trend, higher fail rate)
-        if (idea.flags.contains("EXHAUSTION_REVERSAL_BOOST")) {
-            riskPct *= 0.80;
-        }
+        // Small-balance safety (защита от копеечных аккаунтов)
+        if (balance < 50.0)        sizeMult *= 0.50;
+        else if (balance < 150.0)  sizeMult *= 0.75;
 
-        double riskUsdt  = balance * riskPct;
-        riskUsdt *= isc.getRiskSizeMultiplier();
+        // Flag-based modifiers (синхрон с DE.java tags)
+        if (idea.flags.contains("PRE_BREAK_UP") || idea.flags.contains("PRE_BREAK_DN"))
+            sizeMult *= 1.15;
+        if (idea.flags.contains("EARLY_TICK"))             sizeMult *= 0.85;
+        if (idea.flags.contains("EXHAUSTION_REVERSAL_BOOST")) sizeMult *= 0.80;
+        if (idea.flags.contains("LATE_ENTRY_SIZE_CUT"))    sizeMult *= 0.80;
+        if (idea.flags.contains("ELITE_REV_LONG"))         sizeMult *= 0.75;
+        else if (idea.flags.contains("STRONG_REV_LONG"))   sizeMult *= 0.55;
+        else if (idea.flags.contains("COUNTER_TREND_LONG")) sizeMult *= 0.40;
+        else if (idea.flags.contains("WEAK_REV_LONG"))     sizeMult *= 0.25;
+        // [HOLE-LONG FIX] GIC panic soft-veto — реальный size cut
+        if (idea.flags.contains("GIC_PANIC_SIZE_CUT"))     sizeMult *= 0.40;
 
-        // SESSION LIQUIDITY → size multiplier
+        // ISC institutional risk multiplier (depends on signal strength)
+        sizeMult *= isc.getRiskSizeMultiplier();
+
+        // Session liquidity (time-of-day)
         double sessionW = getSessionWeight();
-        if (sessionW < 0.85) {
-            riskUsdt *= Math.max(0.50, sessionW);
-        } else if (sessionW >= 1.20) {
-            riskUsdt *= 1.10;
-        }
+        if (sessionW < 0.85)        sizeMult *= Math.max(0.50, sessionW);
+        else if (sessionW >= 1.20)  sizeMult *= 1.10;
 
-        // LATE_ENTRY flag → reduce size 20%
-        if (idea.flags.contains("LATE_ENTRY_SIZE_CUT")) {
-            riskUsdt *= 0.80;
-        }
+        // Pass to Executor via idea (clamped to [0.20, 1.20] in setter).
+        idea.setExecutorSizeMultiplier(sizeMult);
 
-        double stopPct   = Math.max(0.005, Math.abs(idea.price - idea.stop) / idea.price);
-        double posSize   = riskUsdt / stopPct;
+        // Compute display posSize for Telegram (same formula as Executor + mult).
+        double riskUsdt = balance * (envRiskPct / 100.0) * sizeMult;
 
-        // [v17.0 FIX] Balance-relative limits instead of hardcoded $6.5 min.
-        // OLD: Math.max(posSize, 6.5) → on $18 balance: min order = 36% of balance = catastrophic.
-        // NEW: min order = 3% of balance, max order = 15% of balance (conservative for small accounts).
-        double maxPosPct = balance < 50.0 ? 0.15 : 0.20; // 15% cap for small accounts, 20% for larger
-        double minPosAbs = Math.max(balance * 0.03, 1.0);  // min 3% of balance, floor $1
-        posSize = Math.min(posSize, balance * maxPosPct);
+        // Floor stopPct=0.001 (0.1%) — синхронизация с executor sanity-check.
+        double stopPct = Math.max(0.001, Math.abs(idea.price - idea.stop) / idea.price);
+        double posSize = riskUsdt / stopPct;
+
+        // CAP идентичный Executor: marginUsed ≤ balance × 0.5.
+        double maxNotionalByMargin = balance * 0.5 * envLeverage;
+        double minPosAbs = Math.max(balance * 0.01, 1.0);  // min 1% balance, floor $1
+        posSize = Math.min(posSize, maxNotionalByMargin);
         posSize = Math.max(posSize, minPosAbs);
 
         return Math.round(posSize * 100.0) / 100.0;
@@ -3786,11 +3823,26 @@ public final class SignalSender {
 
     private com.bot.DecisionEngineMerged.TradeIdea rebuildIdea(com.bot.DecisionEngineMerged.TradeIdea src, double p, List<String> f) {
         // Передаём адаптивные TP-множители из оригинала — они не должны теряться при перестройке
-        return new com.bot.DecisionEngineMerged.TradeIdea(
+        com.bot.DecisionEngineMerged.TradeIdea ni = new com.bot.DecisionEngineMerged.TradeIdea(
                 src.symbol, src.side, src.price, src.stop, src.take, src.rr, p, f,
                 src.fundingRate, src.fundingDelta, src.oiChange, src.htfBias, src.category,
                 src.forecast,
                 src.tp1Mult, src.tp2Mult, src.tp3Mult);
+        // [HOLE-1 REGRESSION FIX 2026-05-08] Сохраняем executorSizeMultiplier
+        // (volatile поле). Без этого rebuildIdea создавал новый TradeIdea с
+        // дефолтным 1.0 и затирал результат предыдущего getPositionSizeUsdt /
+        // setExecutorSizeMultiplier — все extra-множители (survival/cautious/
+        // quality/corr) терялись по дороге к Executor'у.
+        double srcMult = src.getExecutorSizeMultiplier();
+        if (srcMult > 0 && srcMult != 1.0) {
+            ni.setExecutorSizeMultiplier(srcMult);
+        }
+        // Также сохраняем robustAtrPct override если был установлен
+        double srcAtr = src.getRobustAtrPct();
+        if (srcAtr > 0 && Math.abs(srcAtr - src.robustAtrPct) > 1e-9) {
+            ni.setRobustAtrPct(srcAtr);
+        }
+        return ni;
     }
 
     //  [ДЫРА №1] CVD — Cumulative Volume Delta

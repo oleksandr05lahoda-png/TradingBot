@@ -154,7 +154,11 @@ public final class DecisionEngineMerged {
     // floor; адаптации (RANGE +1, vol +2, UTC -1.5) теперь работают вокруг 50.
     private static final double BASE_CONF       = 50.0;
     private static final int    CALIBRATION_WIN = 120;
-    private static final double MIN_CONF_FLOOR  = 48.0;
+    // [HOLE-5 FIX 2026-05-08] MIN_CONF_FLOOR 48 → 52. С env MIN_CONF=53 (рекомендация
+    // в коде SignalSender:608) DE выпускал идеи в диапазоне 48-52 которые СРАЗУ
+    // отсекались downstream — wasted compute ~30%. Поднимаем floor до 52, чтобы
+    // ранний reject экономил CPU. Authoritative env-MIN_CONF остаётся в SignalSender.
+    private static final double MIN_CONF_FLOOR  = 52.0;
     private static final double MIN_CONF_CEIL   = 78.0;
 
     // Дивергенции — штраф вместо хард-лока
@@ -168,19 +172,44 @@ public final class DecisionEngineMerged {
 
     // Cluster confluence bonus
     private static final double CLUSTER_CONFLUENCE_BONUS = 0.15;
-    // [FIX-FLAT-MARKET 2026-05-02] MIN_AGREEING_CLUSTERS 3→2.
-    // В NEUTRAL BTC (str < 0.4) 3-кластерные setup'ы редкость: cluster bases
-    // 56-60 минус -5 RANGE -3 ALT даёт ~48-52 prob. С 2 кластерами база ~40-45,
-    // но валидные patterns (pump/dump, structural breaks) надёжно триггерят
-    // Volume + Momentum, а Structure добавляется опционально. 3 было хорошо
-    // в трендовом рынке, 2 даёт сигналы и в флэте. Качество защищено
-    // downstream: env MIN_CONF=53, ISC track-record gate, calibrator PAV.
+
+    // [HOLE-4 FIX 2026-05-08] MIN_AGREEING_CLUSTERS теперь АДАПТИВНЫЙ.
+    // OLD: фиксированно 2 — пропускало шумовые сетапы в RANGE-рынке.
+    // NEW: 2 для TREND/STRONG_TREND (импульс достаточно говорит сам за себя)
+    //      3 для RANGE (чтобы 2 случайно совпавших cluster'а не дали сигнал)
+    // Метод clustersRequired(MarketState) ниже возвращает нужное значение в runtime.
+    // Default fallback всё ещё 2 для совместимости с unit-тестами/legacy callers.
     private static final int    MIN_AGREEING_CLUSTERS    = 2;
+    private static final int    MIN_AGREEING_CLUSTERS_RANGE = 3;
     // [FLAT-FIX 2026-05-07] 0.28 → 0.22. Кластер квалифицируется как "agreeing"
     // если его направленный score ≥ 0.22 (было 0.28). На флэте кластеры дают
     // score 0.20-0.30 — старый порог отсекал большинство. 0.22 оставляет защиту
     // от чисто шумовых ассоциаций (random < 0.15).
     private static final double MIN_CLUSTER_SCORE        = 0.22;
+
+    // [HOLE-LONG FIX 2026-05-08] Env-параметризация LONG-suppression слоёв.
+    // Дефолты сохраняют старое поведение. Чтобы разморозить LONG в bear-market:
+    //   HTF_OPPOSE_PENALTY=0           — убирает -5 баллов за HTF mismatch
+    //   GIC_LONG_HARD_VETO=0           — конвертирует hard-reject в soft penalty
+    //   DUAL_HTF_PENALTY_MULT=0.85     — мягче чем 0.65 (default)
+    private static final double HTF_OPPOSE_PENALTY = envDoubleStatic("HTF_OPPOSE_PENALTY", 5.0);
+    private static final boolean GIC_LONG_HARD_VETO = !"0".equals(
+            System.getenv().getOrDefault("GIC_LONG_HARD_VETO", "1"));
+    private static final double DUAL_HTF_PENALTY_MULT = envDoubleStatic("DUAL_HTF_PENALTY_MULT", 0.65);
+    private static final double SINGLE_HTF_PENALTY_MULT = envDoubleStatic("SINGLE_HTF_PENALTY_MULT", 0.85);
+
+    private static double envDoubleStatic(String key, double def) {
+        try {
+            String v = System.getenv(key);
+            if (v == null || v.isBlank()) return def;
+            return Double.parseDouble(v.trim());
+        } catch (Throwable t) { return def; }
+    }
+
+    /** [HOLE-4] Required agreeing clusters for the given market state. */
+    private static int clustersRequired(MarketState ms) {
+        return ms == MarketState.RANGE ? MIN_AGREEING_CLUSTERS_RANGE : MIN_AGREEING_CLUSTERS;
+    }
 
     // Single authoritative probability ceiling. All intermediate caps and the
     // final calibrator clamp must reference this constant. Previously hardcoded 85 in 5+ places.
@@ -880,6 +909,20 @@ public final class DecisionEngineMerged {
             if (age <= 0) return 1.0;
             if (age >= staleThresholdMs) return 0.0;
             return 1.0 - ((double) age / staleThresholdMs);
+        }
+
+        // [HOLE-1 FIX 2026-05-08] Unified size multiplier passthrough.
+        // SignalSender computes ALL modifiers (category, flag-based, session, ISC,
+        // small-balance) when building Telegram display, then stores the resulting
+        // ratio here. Executor reads it and applies to base qty so on-exchange size
+        // matches what Telegram showed. Default 1.0 = no modifier (safe fallback
+        // when idea didn't go through SignalSender path, e.g. LiveTradeProbe).
+        // Clamped to [0.20, 1.20] in setter to prevent malformed values.
+        private volatile double executorSizeMultiplier = 1.0;
+        public double getExecutorSizeMultiplier() { return executorSizeMultiplier; }
+        public void setExecutorSizeMultiplier(double m) {
+            if (Double.isNaN(m) || Double.isInfinite(m) || m <= 0) return;
+            this.executorSizeMultiplier = Math.max(0.20, Math.min(1.20, m));
         }
 
         /** Главный конструктор — с адаптивными TP множителями */
@@ -2493,32 +2536,32 @@ public final class DecisionEngineMerged {
                         || f.equals("VSA_NO_DEMAND"));
 
         // [v70] DUAL-HTF — штраф смягчён 0.45 → 0.65.
-        // HTF EMA на 1H/2H лагает 2-4 часа на разворотах. При нейтральном BTC
-        // альты часто разворачиваются первыми, HTF остаётся в прежнем направлении.
-        // Старый 0.45 убивал эти ранние reversal signals.
+        // [HOLE-LONG FIX 2026-05-08] Множитель параметризован через env
+        // DUAL_HTF_PENALTY_MULT (default 0.65). Поставить 0.85 = почти отключить.
         boolean aggressiveLongHtf = gicRef != null && gicRef.isAggressiveLongMode();
         if (bias1h == HTFBias.BEAR && bias2h == HTFBias.BEAR
                 && !aggressiveLongHtf && prelimSide == com.bot.TradingCore.Side.LONG) {
-            totalLong *= 0.65;
+            totalLong *= DUAL_HTF_PENALTY_MULT;
             allFlags.add("DUAL_HTF_BEAR_PENALTY");
         }
         if (bias1h == HTFBias.BULL && bias2h == HTFBias.BULL
                 && !aggressiveShort && prelimSide == com.bot.TradingCore.Side.SHORT) {
-            totalShort *= 0.65;
+            totalShort *= DUAL_HTF_PENALTY_MULT;
             allFlags.add("DUAL_HTF_BULL_PENALTY");
         }
 
-        // [v70] SINGLE-HTF смягчён 0.75 → 0.85
+        // [v70] SINGLE-HTF смягчён 0.75 → 0.85.
+        // [HOLE-LONG FIX 2026-05-08] env SINGLE_HTF_PENALTY_MULT (default 0.85).
         if (prelimSide == com.bot.TradingCore.Side.LONG
                 && (bias1h == HTFBias.BEAR || bias2h == HTFBias.BEAR)
                 && bias1h != HTFBias.BULL && bias2h != HTFBias.BULL) {
-            totalLong *= 0.85;
+            totalLong *= SINGLE_HTF_PENALTY_MULT;
             allFlags.add("SINGLE_HTF_BEAR_PENALTY");
         }
         if (prelimSide == com.bot.TradingCore.Side.SHORT
                 && (bias1h == HTFBias.BULL || bias2h == HTFBias.BULL)
                 && bias1h != HTFBias.BEAR && bias2h != HTFBias.BEAR) {
-            totalShort *= 0.85;
+            totalShort *= SINGLE_HTF_PENALTY_MULT;
             allFlags.add("SINGLE_HTF_BULL_PENALTY");
         }
 
@@ -2935,15 +2978,30 @@ public final class DecisionEngineMerged {
         if (isPostExitBlocked(symbol, side)) return reject("post_exit_block");
 
         // Panic remains a hard veto for LONG.
-        // Outside panic, SignalSender reapplies nuanced GIC weights after all downstream
-        // probability adjustments. Returning null here was double-counting the same filter
-        // and zeroing out counter-trend reversals before RS/sector overrides could act.
+        // [HOLE-LONG FIX 2026-05-08] Behaviour теперь зависит от env GIC_LONG_HARD_VETO:
+        //   =1 (default) — hard reject, как раньше (защита falling-knife)
+        //   =0           — soft penalty -15pt, signal может пройти при overwhelming confluence
         if (gicCtx != null
                 && (gicCtx.panicMode
                 || gicCtx.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
                 && side == com.bot.TradingCore.Side.LONG) {
-            allFlags.add("GIC_PANIC_VETO_LONG");
-            return reject("gic_panic_long");
+            if (GIC_LONG_HARD_VETO) {
+                allFlags.add("GIC_PANIC_VETO_LONG");
+                return reject("gic_panic_long");
+            } else {
+                // [HOLE-NEW FIX 2026-05-08] Раньше флаг назывался "GIC_PANIC_SOFT_LONG_-15"
+                // (вводил в заблуждение — никакого -15 не происходит) и был ТОЛЬКО score cut,
+                // а коммент обещал "size cut". Чиним:
+                //   1. Flag GIC_PANIC_SOFT_LONG (правда о действии)
+                //   2. Flag GIC_PANIC_SIZE_CUT — читается SignalSender'ом и Executor'ом,
+                //      реально режет размер позиции на 60% (multiplier 0.40)
+                //   3. scoreLong cut на 60% сохраняется
+                //   4. scoreDiff пересчитываем — иначе downstream видит stale спред
+                allFlags.add("GIC_PANIC_SOFT_LONG");
+                allFlags.add("GIC_PANIC_SIZE_CUT");
+                scoreLong *= 0.40;
+                scoreDiff = Math.abs(scoreLong - scoreShort);
+            }
         }
         // [v78.3 ROLLBACK] COUNTER_TREND pockets удалены.
         //
@@ -2973,8 +3031,10 @@ public final class DecisionEngineMerged {
             // Новая логика: считаем сколько из 5 условий выполнено и градуируем
             // размер позиции. <3 → жёсткий veto. 3 → counter-trend (×0.40).
             // 4 → strong reversal (×0.55). 5 → elite (×0.75).
-            // Это даёт LONG-ам выйти на действительно перепроданном дне с
-            // urgency, но штрафует размер пропорционально слабости setup'а.
+            //
+            // [HOLE-LONG FIX 2026-05-08] Threshold revScore (default 3) теперь
+            // env-параметризован GIC_BTCDOWN_REV_THRESHOLD (1..5). При =2 проходят
+            // setups с 2 из 5 условий с самым жёстким size cut.
             double rsi14ForRev = rsi(c15, 14);
             double relStr = getRelativeStrength(symbol);
             int revScore = 0;
@@ -2984,7 +3044,9 @@ public final class DecisionEngineMerged {
             if (rsi14ForRev < 22.0)                             revScore++;
             if (relStr > 0.85)                                  revScore++;
 
-            if (revScore < 3) {
+            int revThresh = (int) envDoubleStatic("GIC_BTCDOWN_REV_THRESHOLD", 3.0);
+            revThresh = Math.max(1, Math.min(5, revThresh));
+            if (revScore < revThresh) {
                 allFlags.add("GIC_STRONG_BTCDOWN");
                 return reject("gic_btcdown_long_veto");
             }
@@ -2992,7 +3054,8 @@ public final class DecisionEngineMerged {
             String revTag;
             if      (revScore == 5) { sizeMult = 0.75; revTag = "ELITE_REV_LONG";    }
             else if (revScore == 4) { sizeMult = 0.55; revTag = "STRONG_REV_LONG";   }
-            else                    { sizeMult = 0.40; revTag = "COUNTER_TREND_LONG";}
+            else if (revScore == 3) { sizeMult = 0.40; revTag = "COUNTER_TREND_LONG";}
+            else                    { sizeMult = 0.25; revTag = "WEAK_REV_LONG";     }
             allFlags.add(revTag);
             scoreLong *= sizeMult;
         }
@@ -3123,12 +3186,15 @@ public final class DecisionEngineMerged {
         //   SHORT with BULL HTF → -5 additional penalty
         // This is NOT applied when: aggressiveShort (crash), EXHAUSTION_REVERSAL (HTF lags reversals),
         //   or when htfBias == NONE (HTF is neutral — ambiguous is OK).
-        if (!aggressiveShort && !allFlags.contains("EXHAUSTION_REVERSAL_BOOST")) {
+        // [HOLE-LONG FIX 2026-05-08] Penalty value параметризован env HTF_OPPOSE_PENALTY
+        // (default 5.0). Ставить =0 чтобы полностью отключить эту секцию штрафов.
+        if (!aggressiveShort && !allFlags.contains("EXHAUSTION_REVERSAL_BOOST")
+                && HTF_OPPOSE_PENALTY > 0.01) {
             boolean htfOpposes = (side == com.bot.TradingCore.Side.LONG && bias2h == HTFBias.BEAR)
                     || (side == com.bot.TradingCore.Side.SHORT && bias2h == HTFBias.BULL);
             if (htfOpposes) {
-                probability = Math.max(0, probability - 5.0);
-                allFlags.add("HTF_OPPOSE-5");
+                probability = Math.max(0, probability - HTF_OPPOSE_PENALTY);
+                allFlags.add(String.format("HTF_OPPOSE-%.0f", HTF_OPPOSE_PENALTY));
             }
         }
 

@@ -136,6 +136,13 @@ public final class PositionTracker {
             scheduler.schedule(this::reconcileAtStartup, 5, TimeUnit.SECONDS);
             scheduler.scheduleAtFixedRate(this::pollAll,
                     POLL_INTERVAL_MS, POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+            // [HOLE-NEW FIX 2026-05-08] Periodic orphan reconcile.
+            // pollAll итерирует только tracked.keySet() — runtime-orphans
+            // (позиции на бирже, которых нет в tracked) не обнаруживаются.
+            // Раз в 15 минут перезапускаем reconcileAtStartup; он молчит когда
+            // orphan'ов нет, и шлёт алерт если что-то нашёл.
+            scheduler.scheduleAtFixedRate(this::reconcileAtStartup,
+                    15, 15, TimeUnit.MINUTES);
             started = true;
             LOG.info("[Tracker] started");
         }
@@ -571,21 +578,37 @@ public final class PositionTracker {
     // ─── Startup reconcile ────────────────────────────────────────────
 
     /**
-     * On bot start: enumerate all open futures positions on the exchange.
-     * If we find positions we don't know about (Railway restart while a trade
-     * was open), we WARN loudly via Telegram so user can investigate, but we
-     * do NOT auto-adopt them — entry price and SL details aren't recoverable
-     * cleanly from the exchange alone, and a wrong adoption is worse than none.
+     * [HOLE-3 FIX 2026-05-08] On bot start: enumerate all open futures positions.
+     *
+     * Old behaviour: just WARN about orphans, leave position naked. This is
+     * dangerous — Railway/cloud рестарт во время открытой позиции с висящим
+     * SL на бирже = SL остаётся, ок. Но если SL не успел встать (наша 5s naked
+     * window после MARKET) и бот рестартанул — позиция БЕЗ СТОПА на бирже.
+     *
+     * New behaviour:
+     *   1. Перечисляем все открытые позиции через /fapi/v2/positionRisk
+     *   2. Для orphans (которых tracker не знает) проверяем есть ли SL на бирже
+     *      через /fapi/v1/openOrders + algo orders
+     *   3. Если SL есть — оставляем (трейд под защитой, просто без tracker'а)
+     *   4. Если SL НЕТ — это naked position, ОПАСНО, авто-закрываем через
+     *      executor.closeOrphanPosition()
+     *   5. Шлём отчёт в Telegram с детализацией: "закрыто N, оставлено M"
+     *
+     * Поведение можно отключить через env AUTO_CLOSE_ORPHANS=0 (по умолчанию 1).
+     * При =0 возвращается старое поведение (только warn).
      */
     private void reconcileAtStartup() {
         if (!executor.isReady()) return;
+        boolean autoClose = !"0".equals(System.getenv().getOrDefault("AUTO_CLOSE_ORPHANS", "1"));
         try {
             JSONArray positions = executor.fetchAllOpenPositionsRaw();
             if (positions == null) {
                 LOG.info("[Tracker] startup reconcile: positionRisk fetch returned null (skipped)");
                 return;
             }
-            int orphan = 0;
+            int orphanWithSl = 0;
+            int orphanNakedClosed = 0;
+            int orphanNakedFailed = 0;
             StringBuilder report = new StringBuilder();
             for (int i = 0; i < positions.length(); i++) {
                 JSONObject p = positions.getJSONObject(i);
@@ -595,21 +618,43 @@ public final class PositionTracker {
                 double entry = p.optDouble("entryPrice", 0);
                 double mark  = p.optDouble("markPrice", 0);
                 double upnl  = p.optDouble("unRealizedProfit", 0);
-                if (!tracked.containsKey(sym)) {
-                    orphan++;
+                if (tracked.containsKey(sym)) continue; // not orphan
+
+                boolean hasSl = executor.hasActiveStopLoss(sym);
+                if (hasSl) {
+                    orphanWithSl++;
                     report.append(String.format(
-                            "  • %s amt=%.6f entry=%.6f mark=%.6f uPnL=$%+.4f\n",
+                            "  • %s amt=%.6f entry=%.6f mark=%.6f uPnL=$%+.4f [SL on exchange ✓]\n",
                             sym, amt, entry, mark, upnl));
+                } else if (autoClose) {
+                    LOG.severe("[Tracker] NAKED orphan " + sym + " amt=" + amt
+                            + " — auto-closing for safety");
+                    boolean ok = executor.closeOrphanPosition(sym, amt);
+                    if (ok) {
+                        orphanNakedClosed++;
+                        report.append(String.format(
+                                "  • %s amt=%.6f uPnL=$%+.4f [NAKED → CLOSED ✓]\n",
+                                sym, amt, upnl));
+                    } else {
+                        orphanNakedFailed++;
+                        report.append(String.format(
+                                "  • %s amt=%.6f uPnL=$%+.4f [NAKED → CLOSE FAILED ❌ MANUAL]\n",
+                                sym, amt, upnl));
+                    }
+                } else {
+                    orphanNakedFailed++;
+                    report.append(String.format(
+                            "  • %s amt=%.6f uPnL=$%+.4f [NAKED — auto-close disabled]\n",
+                            sym, amt, upnl));
                 }
             }
-            if (orphan > 0) {
+            int total = orphanWithSl + orphanNakedClosed + orphanNakedFailed;
+            if (total > 0) {
                 String msg = String.format(
                         "⚠️ *Startup reconcile: %d orphan position(s)*\n" +
-                                "Бот рестартанулся при открытых позициях. " +
-                                "Информация о SL/TP/entry потеряна — tracker не " +
-                                "может корректно отслеживать. Закрой их вручную " +
-                                "или дождись срабатывания SL/TP на бирже.\n\n%s",
-                        orphan, report.toString());
+                                "withSL=%d  closed=%d  manual=%d\n%s",
+                        total, orphanWithSl, orphanNakedClosed, orphanNakedFailed,
+                        report.toString());
                 LOG.warning("[Tracker] " + msg.replace("\n", " | "));
                 if (telegram != null) telegram.sendMessageAsync(msg);
             } else {
