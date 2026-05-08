@@ -451,7 +451,12 @@ public final class BotMain {
             // [v85 FLAT-FIX] Regime-aware thresholds.
             int _calForGate = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
             if (_calForGate >= COLD_START_MIN_OUTCOMES) {
-                int _clusters = countClusterFlags(idea.flags);
+                // [B1 2026-05-08] Use direction-correct supportingClusters from analyze()
+                // when available; fall back to substring counting only for paths that
+                // bypass DE.generate() (EARLY_TICK, LiveTradeProbe, manual ideas).
+                int _clusters = idea.getAgreeingClusters() >= 0
+                        ? idea.getAgreeingClusters()
+                        : countClusterFlags(idea.flags);
                 double effMinConf;
                 int effMinClusters;
                 String regimeLabel;
@@ -492,7 +497,10 @@ public final class BotMain {
             }
 
             int calSamples = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-            int clusters   = countClusterFlags(idea.flags);
+            // [B1 2026-05-08] Same direction-correct fallback for cold-start gate.
+            int clusters   = idea.getAgreeingClusters() >= 0
+                    ? idea.getAgreeingClusters()
+                    : countClusterFlags(idea.flags);
             double fcConf  = idea.forecast != null ? idea.forecast.confidence : 0.0;
 
             double probFloor;
@@ -742,10 +750,14 @@ public final class BotMain {
         }
 
         public String getBlockBreakdown() {
-            return String.format("bi:%d rr:%d sl:%d cold:%d dd:%d hr:%d xch:%d",
+            // [A2 2026-05-08] Added qg (quality gate) counter — was already incremented
+            // at line ~473 (blockedQuality.incrementAndGet()) but invisible in heartbeat.
+            // The "always 0" line was giving false comfort that pipeline was clean while
+            // hundreds of signals were being killed by quality gate every cycle.
+            return String.format("bi:%d rr:%d sl:%d cold:%d dd:%d hr:%d xch:%d qg:%d",
                     blockedBipolar.get(), blockedRR.get(), blockedSL.get(),
                     blockedColdStart.get(), blockedDedup.get(), blockedHourly.get(),
-                    blockedXExchange.get());
+                    blockedXExchange.get(), blockedQuality.get());
         }
     }
 
@@ -873,6 +885,42 @@ public final class BotMain {
 
         final String calibratorFile = System.getenv()
                 .getOrDefault("CALIBRATOR_FILE", "./data/calibrator.csv");
+
+        // [A1+ 2026-05-08] One-shot calibrator wipe via env. Use when:
+        //   1. Startup backtest poisoned the file (WR=32% baseline → blocks live).
+        //   2. Switching strategy and want to start clean.
+        // Procedure on Railway:
+        //   - Set RESET_CALIBRATOR_ON_BOOT=1 in env.
+        //   - Redeploy. On boot the .csv is moved to .bak (kept for forensic
+        //     review), in-memory state is cleared.
+        //   - REMOVE the env var (or set =0) immediately after this deploy
+        //     succeeds — otherwise EVERY restart wipes the calibrator and you
+        //     never accumulate live data.
+        if ("1".equals(System.getenv().getOrDefault("RESET_CALIBRATOR_ON_BOOT", "0"))) {
+            try {
+                java.io.File f = new java.io.File(calibratorFile);
+                if (f.exists()) {
+                    java.io.File bak = new java.io.File(calibratorFile + ".bak."
+                            + System.currentTimeMillis());
+                    if (f.renameTo(bak)) {
+                        LOG.warning("[Calibrator] RESET_CALIBRATOR_ON_BOOT=1 — "
+                                + "renamed " + calibratorFile + " → " + bak.getName());
+                    } else {
+                        // renameTo can fail across mount boundaries — try delete instead.
+                        if (f.delete()) {
+                            LOG.warning("[Calibrator] RESET_CALIBRATOR_ON_BOOT=1 — "
+                                    + "deleted " + calibratorFile + " (rename failed)");
+                        }
+                    }
+                }
+                com.bot.DecisionEngineMerged.getCalibrator().resetAll();
+                LOG.warning("[Calibrator] in-memory state cleared. "
+                        + "REMEMBER to unset RESET_CALIBRATOR_ON_BOOT after this deploy.");
+            } catch (Throwable t) {
+                LOG.warning("[Calibrator] reset-on-boot failed: " + t.getMessage());
+            }
+        }
+
         try {
             com.bot.DecisionEngineMerged.getCalibrator().loadFromFile(calibratorFile);
         } catch (Throwable t) {
@@ -1604,13 +1652,39 @@ public final class BotMain {
             lastBtcRegimeForAlert = String.valueOf(gc.regime);
             long minSilent = (now - lastSignalMs) / 60_000L;
             String paperFlag = OBSERVATION_MODE ? "🧪 PAPER" : "🔴 LIVE";
-            telegram.sendMessageAsync(String.format(
+
+            // [A3 2026-05-08] DE-side rejection trace. peekRejectTrace() does NOT reset
+            // counters — getAndResetRejectTrace() (called elsewhere by SignalSender DIAG
+            // logs) still owns the reset semantics, so the same trace can be sent to
+            // both heartbeat (humans) and diag log (Railway logs) without one wiping
+            // the other. Top-8 keys is enough to reveal the dominant funnel-killer.
+            String deRejects = "";
+            try {
+                deRejects = com.bot.DecisionEngineMerged.peekRejectTrace(8);
+            } catch (Throwable ignored) {}
+
+            // [A3 2026-05-08] processPair-side rejection breakdown (liq/corr/early/final/isc).
+            // Same fail-soft contract: if SignalSender doesn't expose the getter we just skip.
+            String ppRejects = "";
+            try {
+                ppRejects = sender.getProcessPairBreakdown();
+            } catch (Throwable ignored) {}
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format(
                     "💓 *Heartbeat* (%dмин без сигнала)\n"
                             + "BTC: %s str=%.2f | WS: %d | Cal n=%d | %s\n"
                             + "Cycles: %d | Errors: %d\n"
                             + "Блок: %s",
                     minSilent, gc.regime, gc.impulseStrength, wsCount, calN, paperFlag,
                     totalCycles.get(), errorCount.get(), breakdown));
+            if (ppRejects != null && !ppRejects.isEmpty()) {
+                sb.append("\nprocessPair: ").append(ppRejects);
+            }
+            if (deRejects != null && !deRejects.isEmpty()) {
+                sb.append("\nDE-rejects: ").append(deRejects);
+            }
+            telegram.sendMessageAsync(sb.toString());
             lastHeartbeatMs = now;
         } catch (Throwable ignored) {}
     }
@@ -1791,15 +1865,27 @@ public final class BotMain {
                 }
 
                 // 4. FEED CALIBRATOR — this is the entire point of the exercise.
-                for (com.bot.SimpleBacktester.TradeRecord tr : r.trades) {
-                    boolean hit = tr.pnlPct > 0;
-                    double rawScore01 = Math.max(0.0, Math.min(1.0, tr.confidence / 100.0));
-                    double atrPctApprox = Math.abs(tr.entry > 0
-                            ? (tr.sl - tr.entry) / tr.entry * 100.0 : 1.5);
-                    String tag = "TIME_STOP".equals(tr.exitReason) ? "TIME_STOP"
-                            : (hit ? (tr.exitReason != null ? tr.exitReason : "TP1") : "SL");
-                    cal.recordOutcomeExtended(sym, rawScore01, hit, atrPctApprox,
-                            1.0, tag, "NEUTRAL", tr.entry, tr.exit);
+                // [A1 2026-05-08] Optional skip: SKIP_STARTUP_CALIBRATION=1 prevents
+                // back-tested outcomes from being written into the live calibrator.
+                // Reason: a strategy with negative edge on history (WR=32%, Net=-63%)
+                // poisons the PAV regression — every live raw-prob is mapped to the
+                // empirical loser distribution and reject("calibrated_lt_minConf_*")
+                // becomes the dominant rejection reason. Set this env when you want
+                // to use backtest only for EV-per-symbol (still fed via setSymbolBacktestResult)
+                // and let the calibrator learn purely on live/paper outcomes.
+                boolean skipCalRecord = "1".equals(System.getenv()
+                        .getOrDefault("SKIP_STARTUP_CALIBRATION", "0"));
+                if (!skipCalRecord) {
+                    for (com.bot.SimpleBacktester.TradeRecord tr : r.trades) {
+                        boolean hit = tr.pnlPct > 0;
+                        double rawScore01 = Math.max(0.0, Math.min(1.0, tr.confidence / 100.0));
+                        double atrPctApprox = Math.abs(tr.entry > 0
+                                ? (tr.sl - tr.entry) / tr.entry * 100.0 : 1.5);
+                        String tag = "TIME_STOP".equals(tr.exitReason) ? "TIME_STOP"
+                                : (hit ? (tr.exitReason != null ? tr.exitReason : "TP1") : "SL");
+                        cal.recordOutcomeExtended(sym, rawScore01, hit, atrPctApprox,
+                                1.0, tag, "NEUTRAL", tr.entry, tr.exit);
+                    }
                 }
 
                 // 5. Aggregate.

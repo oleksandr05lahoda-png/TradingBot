@@ -95,6 +95,14 @@ public final class BinanceTradeExecutor {
     private final java.util.Set<String> initializedSymbols = ConcurrentHashMap.newKeySet();
 
     /**
+     * [C5 2026-05-08] Last error body returned by initSymbolMargin / initSymbolLeverage.
+     * Allows openPositionWithSl() to surface the real reason ("symbol not on testnet",
+     * "already in hedge mode", "leverage too high for symbol") in ExecutionResult.fail
+     * instead of the opaque "init margin failed for X". Cleared at start of each attempt.
+     */
+    private volatile String lastInitErrorBody = "";
+
+    /**
      * [v83.2] Cache of exchange filters per symbol. Populated lazily on first
      * trade by reading /fapi/v1/exchangeInfo. Without this, qty/price rounding
      * is wrong for many alts → MARKET order rejected by Binance.
@@ -413,10 +421,15 @@ public final class BinanceTradeExecutor {
             // 1. Initialize symbol settings (leverage + isolated)
             if (!initializedSymbols.contains(symbol)) {
                 if (!initSymbolMargin(symbol)) {
-                    return ExecutionResult.fail("init margin failed for " + symbol);
+                    // [C5 2026-05-08] Include real Binance error body so user can act on it
+                    // (e.g. symbol not on testnet → add to GARBAGE_COIN_BLOCKLIST; hedge mode
+                    // mismatch → switch account to one-way; -4046 already isolated → bug).
+                    return ExecutionResult.fail("init margin failed for " + symbol
+                            + (lastInitErrorBody.isEmpty() ? "" : " — " + lastInitErrorBody));
                 }
                 if (!initSymbolLeverage(symbol)) {
-                    return ExecutionResult.fail("init leverage failed for " + symbol);
+                    return ExecutionResult.fail("init leverage failed for " + symbol
+                            + (lastInitErrorBody.isEmpty() ? "" : " — " + lastInitErrorBody));
                 }
                 initializedSymbols.add(symbol);
             }
@@ -848,9 +861,12 @@ public final class BinanceTradeExecutor {
                 HttpResponse.BodyHandlers.ofString());
         // 200 = OK, or already isolated (Binance returns "No need to change margin type" code -4046)
         int code = resp.statusCode();
-        if (code == 200) return true;
-        if (resp.body() != null && resp.body().contains("-4046")) return true;
-        LOG.warning("[Executor] marginType " + symbol + " HTTP " + code + ": " + resp.body());
+        String body = resp.body() == null ? "" : resp.body();
+        if (code == 200) { lastInitErrorBody = ""; return true; }
+        if (body.contains("-4046")) { lastInitErrorBody = ""; return true; }
+        // [C5 2026-05-08] Save body so caller can surface real reason in Telegram.
+        lastInitErrorBody = "HTTP " + code + ": " + body;
+        LOG.warning("[Executor] marginType " + symbol + " " + lastInitErrorBody);
         return false;
     }
 
@@ -867,8 +883,11 @@ public final class BinanceTradeExecutor {
                         .POST(HttpRequest.BodyPublishers.ofString(qs + "&signature=" + sig))
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() == 200) return true;
-        LOG.warning("[Executor] leverage " + symbol + " HTTP " + resp.statusCode() + ": " + resp.body());
+        if (resp.statusCode() == 200) { lastInitErrorBody = ""; return true; }
+        // [C5 2026-05-08] Save body so caller can surface real reason in Telegram.
+        String body = resp.body() == null ? "" : resp.body();
+        lastInitErrorBody = "HTTP " + resp.statusCode() + ": " + body;
+        LOG.warning("[Executor] leverage " + symbol + " " + lastInitErrorBody);
         return false;
     }
 

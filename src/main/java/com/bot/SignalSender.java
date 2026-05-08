@@ -1307,7 +1307,25 @@ public final class SignalSender {
             double iscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
             double iscCap  = MIN_CONF + 4.0;                          // ISC не задирает выше env+4
             double iscFloor = Math.min(iscCap, iscRaw);               // обрезаем сверху
-            double earlyMinConf = Math.max(MIN_CONF, iscFloor);       // [FIX-ROUND2] минимум = MIN_CONF
+            // [A4 2026-05-08] Calibrator warmup bypass.
+            // Symptom: env MIN_CONF=58 + DE.MIN_CONF_FLOOR=52 + cold calibrator
+            // = dead zone 52..57. Signals are produced by DE but always die at
+            // earlyMinConf check before they can reach the calibrator and contribute
+            // to learning. Result: calibrator never gets enough samples to mature,
+            // earlyMinConf never falls — permanent block.
+            // Fix: while calibrator has fewer than the warmup threshold of outcomes
+            // (default 50), let signals down to MIN_CALIBRATOR_FLOOR=52 through.
+            // Once enough live data exists, snap back to env-MIN_CONF.
+            // Override:
+            //   CAL_WARMUP_OUTCOMES — outcome count needed to disable bypass (default 50)
+            //   CAL_WARMUP_FLOOR    — floor used during warmup (default 52, == DE floor)
+            int _calOutcomes = decisionEngine.getCalibrator().totalOutcomeCount();
+            int _calWarmupTarget = envInt("CAL_WARMUP_OUTCOMES", 50);
+            double _calWarmupFloor = envDouble("CAL_WARMUP_FLOOR", 52.0);
+            double effMinConfBase = (_calOutcomes < _calWarmupTarget)
+                    ? Math.min(MIN_CONF, _calWarmupFloor)
+                    : MIN_CONF;
+            double earlyMinConf = Math.max(effMinConfBase, iscFloor);
             if (idea.probability < earlyMinConf) {
                 blockedEarlyConf.incrementAndGet();
                 return null;
@@ -1534,9 +1552,14 @@ public final class SignalSender {
             // [FIX-ROUND2 2026-05-02] finalMinConf = MIN_CONF baseline.
             // Убрана -1pt скидка. ISC всё ещё может ПОДНЯТЬ порог (track record),
             // но не может опустить ниже env-MIN_CONF.
+            // [A4 2026-05-08] Same warmup bypass as earlyMinConf — both gates must
+            // agree on the floor or the looser early gate is meaningless.
             double finalIscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
             double finalIscCap  = MIN_CONF + 4.0;
-            double finalMinConf = Math.max(MIN_CONF, Math.min(finalIscCap, finalIscRaw));
+            double effFinalBase = (_calOutcomes < _calWarmupTarget)
+                    ? Math.min(MIN_CONF, _calWarmupFloor)
+                    : MIN_CONF;
+            double finalMinConf = Math.max(effFinalBase, Math.min(finalIscCap, finalIscRaw));
             if (idea.probability < finalMinConf) {
                 blockedFinalConf.incrementAndGet();
                 return null;
@@ -1618,16 +1641,27 @@ public final class SignalSender {
             // HARD R:R GATE — raised 1.80→2.00 (user preference ≥1:2).
             // Синхронизировано с BotMain dispatch gate и tp2Mult floor в DecisionEngineMerged.
             // При tp2Mult всегда ≥ 2.00 этот gate — финальная страховка (должен почти не срабатывать).
+            // [B6 2026-05-08] Adaptive RR floor by BTC regime — closes the 2.00..2.20
+            // pass-through gap where signals slipped past SignalSender then died at
+            // Dispatcher.FLAT_MARKET_MIN_RR=2.20 (wasted CPU, wasted REST weight, no
+            // calibrator data). When BTC trend is weak (|str|<0.30), demand 2.20 here
+            // already, matching Dispatcher; otherwise the historical 2.00.
             double _riskDist = Math.abs(idea.stop - idea.price);
             double _tp2Dist  = Math.abs(idea.tp2 - idea.price);
             double actualRR  = _riskDist > 1e-9 ? _tp2Dist / _riskDist : 0;
-            if (actualRR < 2.00) {
+            double _trendStrForRR = 0.0;
+            try {
+                com.bot.GlobalImpulseController.GlobalContext _gc = gic.getContext();
+                if (_gc != null) _trendStrForRR = Math.abs(_gc.impulseStrength);
+            } catch (Throwable ignored) {}
+            double effMinRR = (_trendStrForRR < 0.30) ? 2.20 : 2.00;
+            if (actualRR < effMinRR) {
                 // [v78.2] No ISC unregister needed — we never registered.
                 // correlationGuard.unregister still called for safety in case
                 // a parallel correlation register slipped in. No-op if not registered.
                 correlationGuard.unregister(pair);
-                System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < 2.00 (TP2=%.6f entry=%.6f SL=%.6f)%n",
-                        pair, idea.side, actualRR, idea.tp2, idea.price, idea.stop);
+                System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < %.2f (TP2=%.6f entry=%.6f SL=%.6f trendStr=%.2f)%n",
+                        pair, idea.side, actualRR, effMinRR, idea.tp2, idea.price, idea.stop, _trendStrForRR);
                 return null;
             }
             // Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
@@ -3842,6 +3876,13 @@ public final class SignalSender {
         if (srcAtr > 0 && Math.abs(srcAtr - src.robustAtrPct) > 1e-9) {
             ni.setRobustAtrPct(srcAtr);
         }
+        // [B1 2026-05-08] Propagate the direction-correct agreeing-cluster count
+        // through rebuildIdea — otherwise every penalty/boost layer would reset
+        // it to -1 and Dispatcher would fall back to flag substring counting.
+        int srcClusters = src.getAgreeingClusters();
+        if (srcClusters >= 0) {
+            ni.setAgreeingClusters(srcClusters);
+        }
         return ni;
     }
 
@@ -4106,6 +4147,23 @@ public final class SignalSender {
     public com.bot.PumpHunter getPumpHunter()               { return pumpHunter; }
     public com.bot.GlobalImpulseController getGIC()         { return gic; }
     public Map<String, Deque<Double>> getTickDeque()        { return tickPriceDeque; }
+
+    /**
+     * [A2 2026-05-08] Per-process-pair rejection breakdown — exposed for heartbeat.
+     * The Dispatcher.getBlockBreakdown shows the OUTER funnel; this shows the INNER
+     * funnel inside processPair() that runs before a TradeIdea ever reaches the
+     * dispatcher. Without it, a clean dispatcher-side breakdown was misleading
+     * because the real bottleneck was upstream (early-conf gate, ISC reject, etc.).
+     *
+     * Counters are cumulative (lifetime), formatted compact for Telegram.
+     */
+    public String getProcessPairBreakdown() {
+        return String.format(
+                "liq:%d corr:%d early:%d opt:%d vpoc:%d final:%d isc:%d",
+                blockedLiq.get(), blockedCorr.get(),
+                blockedEarlyConf.get(), blockedOptConf.get(), blockedVpoc.get(),
+                blockedFinalConf.get(), blockedIsc.get());
+    }
 
     //  STATIC MATH UTILS
 

@@ -266,6 +266,30 @@ public final class DecisionEngineMerged {
         return sb.toString();
     }
 
+    /**
+     * [A3 2026-05-08] Peek-only variant of getAndResetRejectTrace.
+     * Returns top-N reasons WITHOUT resetting counters, so the same trace
+     * can be sent to multiple destinations (heartbeat + diag log) without
+     * one consumer wiping data needed by the other.
+     * Used by BotMain.maybeSendHeartbeat for "DE-rejects:" line.
+     */
+    public static String peekRejectTrace(int top) {
+        if (REJECT_TRACE.isEmpty()) return "";
+        java.util.List<java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLong>> entries =
+                new java.util.ArrayList<>(REJECT_TRACE.entrySet());
+        entries.sort((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()));
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (var e : entries) {
+            long v = e.getValue().get();
+            if (v == 0) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(e.getKey()).append('=').append(v);
+            if (++count >= Math.max(1, top)) break;
+        }
+        return sb.toString();
+    }
+
     // [v42.0 FIX #12] Last GC timestamp for postExitCooldown leak fix
     private volatile long lastCooldownGcMs = 0L;
     private static final int POST_EXIT_MAX_SIZE = 5000;
@@ -923,6 +947,21 @@ public final class DecisionEngineMerged {
         public void setExecutorSizeMultiplier(double m) {
             if (Double.isNaN(m) || Double.isInfinite(m) || m <= 0) return;
             this.executorSizeMultiplier = Math.max(0.20, Math.min(1.20, m));
+        }
+
+        // [B1 2026-05-08] Direction-correct count of clusters agreeing with the chosen side.
+        // Default -1 = "not set" → consumer (Dispatcher) falls back to flag-substring counting.
+        // Set by analyze() right after TradeIdea construction with `supportingClusters`.
+        // Why: BotMain.countClusterFlags() counts SUBSTRINGS (HTF_, BREAKOUT, DIV, etc.) which
+        // double-counts: one signal can carry both HTF_BULL and HTF_OPPOSE flags, BREAKOUT
+        // appears regardless of side, BULL_DIV/BEAR_DIV both match "DIV". Result:
+        // dispatcher saw "5 clusters" when reality was 2. This was likely the single biggest
+        // contributor to low-confidence signals leaking through the quality gate.
+        private volatile int agreeingClusters = -1;
+        public int getAgreeingClusters() { return agreeingClusters; }
+        public void setAgreeingClusters(int n) {
+            if (n < 0 || n > 20) return;
+            this.agreeingClusters = n;
         }
 
         /** Главный конструктор — с адаптивными TP множителями */
@@ -3983,6 +4022,9 @@ public final class DecisionEngineMerged {
         // [v50 AUDIT FIX] Thread the real robustAtrPct through to the TradeIdea so that
         // ProbabilityCalibrator gets the correct VolBucket instead of a stop-distance proxy.
         idea.setRobustAtrPct(robustAtrPct);
+        // [B1 2026-05-08] Stamp the real, direction-correct agreeing-cluster count.
+        // Dispatcher uses this instead of substring-counting flags.
+        idea.setAgreeingClusters(supportingClusters);
         return idea;
     }
 
