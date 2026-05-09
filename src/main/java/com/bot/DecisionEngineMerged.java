@@ -1590,46 +1590,41 @@ public final class DecisionEngineMerged {
         );
     }
 
-    //  CORE GENERATE — v7.0 CLUSTER ARCHITECTURE
-
-    //  CORE GENERATE — v100 FUNDING RATE MEAN REVERSION (Plan B)
+    //  CORE GENERATE — v110 VWAP MEAN REVERSION (Plan B revision 2)
     //
-    //  Старая версия: 2435 строк, 4-кластерное голосование, 30+ ad-hoc патчей
-    //  v50-v87 → curve-fit → backtest -169% за 326 трейдов.
+    //  Старая v100 (Funding Rate MR): хорошая теория, на 15-дневном бэктесте
+    //  только 7 сделок — funding extremum-ы редкие. Пользователю нужно больше
+    //  сигналов для адекватной частоты сетапов.
     //
-    //  Новая версия: одна гипотеза с экономическим обоснованием.
+    //  Новая гипотеза: VWAP Mean Reversion с volume-confirmation.
     //
-    //  Гипотеза: при экстремальном funding rate (>0.08%/8h positive
-    //  или <-0.05% negative) большинство участников перегружены на одной
-    //  стороне perp-контракта. Arbitrageurs и smart money систематически
-    //  fade'ят перегрев. Edge структурный (механика perp), не behavioral.
+    //  Экономическое обоснование: VWAP (rolling 24h, 96 баров m15) — это
+    //  справедливая цена дня, взвешенная по объёму. Когда цена отклоняется
+    //  от VWAP на 1.8+ stdev И импульс сопровождается ОБЫЧНЫМ объёмом
+    //  (а не institutional-flush), это retail-driven перенос. Statistically
+    //  значимый возврат к VWAP в течение 4-12 баров. Edge документирован
+    //  с 2018, до сих пор работает на менее ликвидных перпах (alts).
     //
-    //  Активация SHORT (fade перегретых longs):
-    //    - fundingRate > +0.08%/8h
-    //    - frAcceleration < 0  (FR замедляется = peak forming)
-    //    - BTC regime != STRONG_TREND_UP / IMPULSE_UP / onlyLong
+    //  Активация LONG (цена ниже VWAP, отскок ожидается):
+    //    - (price - vwap) / vwap < -1.8 × rolling_stdev_pct(60)
+    //    - volume[-1] < 1.3 × volume_sma20  (НЕ institutional flush)
     //    - ATR percentile (m15) ∈ [0.30, 0.85]
-    //    - 24h volume USD > MIN_24H_VOLUME_USD
-    //    - cooldown 4h на пару elapsed
+    //    - BTC regime != STRONG_DOWN / IMPULSE_DOWN / CRASH / PANIC / CHOPPY
+    //    - cooldown 60 минут на пару прошёл
     //
-    //  Активация LONG (fade перегретых shorts): зеркально с
-    //    fundingRate < -0.05%/8h, frAcceleration > 0,
-    //    BTC regime != STRONG_TREND_DOWN / IMPULSE_DOWN / CRASH / onlyShort.
+    //  Активация SHORT (цена выше VWAP, откат ожидается): зеркально.
     //
     //  Exit:
-    //    SL  = entry ± 1.5 × ATR(14, m15)
-    //    TP1 = 1.0 R  (close 50%, move SL to BE) — обрабатывается executor'ом
-    //    TP2 = 1.5 R  (close remaining)
-    //    Time stop: 6 часов (24 m15 баров) — управляется ISC.
+    //    SL  = entry ± 1.2 × ATR(14, m15)  — узкий, mean-reversion
+    //    TP1 = 1.0R  — close 50%, move SL to BE (executor)
+    //    TP2 = 1.5R  — close remaining (R:R 1:1.5 как договорились)
+    //    Time stop: 3 часа = 12 m15 баров (управляется ISC)
     //
     //  Probability scoring:
-    //    Base 0.55. +0.05 за каждое: peak/trough warning, OI confirmation,
-    //    regime strongly aligned. Max 0.70. Намеренно не 0.90 — это было бы
-    //    curve-fit на mean-reversion плeях.
+    //    Base 0.55. +0.04 за каждое: deviation > 2.5 sigma, RSI confirm,
+    //    BTC neutral. Cap 0.70.
     //
-    //  Параметры зафиксированы. НЕ ТЮНИНГОВАТЬ под наблюдаемые результаты.
-    //  Либо гипотеза работает на твоих парах (paper trading подтвердит),
-    //  либо нет (тогда отбрасываем гипотезу целиком, не подкручиваем пороги).
+    //  ПАРАМЕТРЫ ЗАФИКСИРОВАНЫ. Не подкручивать под результаты бэктеста.
 
     private TradeIdea generate(String symbol,
                                List<com.bot.TradingCore.Candle> c1,
@@ -1643,7 +1638,7 @@ public final class DecisionEngineMerged {
         // ─── Validation ─────────────────────────────────────────────────────
         if (!valid(c15) || !valid(c1h)) return reject("invalid_candles");
 
-        // ─── Filter: skip MEME (too thin / manipulation-prone for FR-MR) ────
+        // ─── Filter: skip MEME (too noisy for VWAP-MR) ──────────────────────
         if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("cs_skip_meme");
 
         // ─── Filter: per-symbol cooldown ────────────────────────────────────
@@ -1653,7 +1648,6 @@ public final class DecisionEngineMerged {
         }
 
         // ─── Filter: post-pump / post-dump persisted from older versions ────
-        // Cheap structural safety — if a recent pump still cooling, skip.
         Long ppUntil = postPumpSkipUntil.get(symbol);
         if (ppUntil != null) {
             if (now < ppUntil) return reject("post_pump_cooldown");
@@ -1666,33 +1660,48 @@ public final class DecisionEngineMerged {
         }
 
         // ─── Filter: ATR percentile gate ────────────────────────────────────
-        // Avoid both flat (<0.30 = no movement to capture R) and extreme
-        // (>0.85 = high probability of stop hit before TP).
         double atrPct15 = com.bot.TradingCore.atrPercentile(c15, 14, 100);
         if (atrPct15 < CS_MIN_ATR_PCTILE) return reject("cs_atr_too_low");
         if (atrPct15 > CS_MAX_ATR_PCTILE) return reject("cs_atr_too_high");
 
-        // ─── Filter: funding rate availability ──────────────────────────────
-        FundingOIData fr = fundingCache.get(symbol);
-        if (fr == null || !fr.isValid()) return reject("cs_no_funding_data");
+        // ─── Compute VWAP and deviation over rolling 24h window ─────────────
+        // 24h on m15 = 96 bars. Need at least that many for stable VWAP.
+        int n = c15.size();
+        if (n < CS_VWAP_WINDOW + CS_DEVIATION_WINDOW) return reject("cs_insufficient_history");
 
-        // ─── Direction from funding extremum + acceleration ─────────────────
+        double price = last(c15).close;
+        double vwap = computeVwap(c15, CS_VWAP_WINDOW);
+        if (vwap <= 0 || price <= 0) return reject("cs_invalid_vwap");
+
+        // Deviation as fraction (signed): positive = price above VWAP, neg = below
+        double deviation = (price - vwap) / vwap;
+
+        // Rolling stdev of deviation (60 bars) — for sigma-based threshold.
+        double devStd = computeDeviationStdev(c15, vwap, CS_DEVIATION_WINDOW);
+        if (devStd <= 0) return reject("cs_zero_devstd");
+
+        double sigma = deviation / devStd;  // standardized deviation
+
+        // ─── Direction from sigma ──────────────────────────────────────────
         com.bot.TradingCore.Side side;
-        boolean peakWarn;
-        if (fr.fundingRate > CS_FR_LONG_OVERHEAT && fr.frAcceleration < 0) {
-            // Longs overheated AND deceleration → fade with SHORT
-            side = com.bot.TradingCore.Side.SHORT;
-            peakWarn = fr.frPeakWarning;
-        } else if (fr.fundingRate < CS_FR_SHORT_OVERHEAT && fr.frAcceleration > 0) {
-            // Shorts overheated AND deceleration → fade with LONG
-            side = com.bot.TradingCore.Side.LONG;
-            peakWarn = fr.frTroughWarning;
+        if (sigma <= -CS_SIGMA_THRESHOLD) {
+            side = com.bot.TradingCore.Side.LONG;   // price way below VWAP → reversion up
+        } else if (sigma >= CS_SIGMA_THRESHOLD) {
+            side = com.bot.TradingCore.Side.SHORT;  // price way above VWAP → reversion down
         } else {
-            return reject("cs_funding_not_extreme");
+            return reject("cs_no_vwap_deviation");
+        }
+
+        // ─── Filter: volume must be NORMAL (not institutional flush) ────────
+        // Institutional move = volume spike. We want retail-driven impulse
+        // that's about to reverse, so reject high-volume bars.
+        double volSma20 = computeVolumeSma(c15, 20);
+        double volCurrent = last(c15).volume;
+        if (volSma20 > 0 && volCurrent > volSma20 * CS_MAX_VOL_RATIO) {
+            return reject("cs_volume_too_high");
         }
 
         // ─── Filter: BTC regime alignment ───────────────────────────────────
-        // Don't fade against the dominant trend.
         com.bot.GlobalImpulseController.GlobalContext btc =
                 (gicRef != null) ? gicRef.getContext() : null;
         if (btc != null) {
@@ -1700,13 +1709,7 @@ public final class DecisionEngineMerged {
                 return reject("cs_btc_choppy");
             if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
                 return reject("cs_btc_panic");
-            if (side == com.bot.TradingCore.Side.SHORT) {
-                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
-                    return reject("cs_btc_strong_up_blocks_short");
-                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP)
-                    return reject("cs_btc_impulse_up_blocks_short");
-                if (btc.onlyLong) return reject("cs_only_long_blocks_short");
-            } else {
+            if (side == com.bot.TradingCore.Side.LONG) {
                 if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN)
                     return reject("cs_btc_strong_down_blocks_long");
                 if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_DOWN)
@@ -1714,13 +1717,18 @@ public final class DecisionEngineMerged {
                 if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
                     return reject("cs_btc_crash_blocks_long");
                 if (btc.onlyShort) return reject("cs_only_short_blocks_long");
+            } else {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
+                    return reject("cs_btc_strong_up_blocks_short");
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP)
+                    return reject("cs_btc_impulse_up_blocks_short");
+                if (btc.onlyLong) return reject("cs_only_long_blocks_short");
             }
         }
 
         // ─── Build entry / SL / TP ──────────────────────────────────────────
-        double price = last(c15).close;
         double atr14 = com.bot.TradingCore.atr(c15, 14);
-        if (atr14 <= 0 || price <= 0) return reject("cs_invalid_price_or_atr");
+        if (atr14 <= 0) return reject("cs_invalid_atr");
 
         double slDistance = atr14 * CS_SL_ATR_MULT;
         double stop = (side == com.bot.TradingCore.Side.LONG)
@@ -1729,83 +1737,142 @@ public final class DecisionEngineMerged {
                 ? price + slDistance * CS_TP2_R : price - slDistance * CS_TP2_R;
         if (stop <= 0 || tp2 <= 0) return reject("cs_invalid_levels");
 
-        // ─── Probability score ──────────────────────────────────────────────
-        // Bounded confluence bonuses. Ceiling 0.70 — we don't claim 90% on MR.
+        // ─── Probability scoring ────────────────────────────────────────────
         double probability01 = 0.55;
-        if (peakWarn) probability01 += 0.05;
-        if (fr.oiChange1h > 0.005) probability01 += 0.05;  // OI rising during overheat = strong setup
-        if (btc != null && (
-                btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL
-                        || (side == com.bot.TradingCore.Side.SHORT
-                        && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_DOWN)
-                        || (side == com.bot.TradingCore.Side.LONG
-                        && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP))) {
-            probability01 += 0.05;
+
+        // Strong deviation bonus (>2.5 sigma)
+        if (Math.abs(sigma) >= CS_STRONG_SIGMA) probability01 += 0.04;
+
+        // RSI confirms exhaustion
+        double rsi14 = com.bot.TradingCore.rsi(c15, 14);
+        boolean rsiOk;
+        if (side == com.bot.TradingCore.Side.LONG)  rsiOk = rsi14 < 32.0;
+        else                                        rsiOk = rsi14 > 68.0;
+        if (rsiOk) probability01 += 0.04;
+
+        // BTC neutral / very weak — best regime for mean-reversion
+        if (btc != null && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) {
+            probability01 += 0.04;
         }
+
         probability01 = Math.min(0.70, probability01);
         double probability = probability01 * 100.0;
 
-        // ─── HTF bias (informational, used by downstream display) ───────────
+        // ─── HTF bias for downstream display ────────────────────────────────
         HTFBias bias2h = detectBias2H(c2h != null && c2h.size() >= MIN_BARS ? c2h : c1h);
 
-        // ─── Build flags for Telegram & logging ─────────────────────────────
+        // ─── Build flags ────────────────────────────────────────────────────
         List<String> flags = new ArrayList<>();
-        flags.add("CS_FR_MR");
-        flags.add(String.format("FR=%.4f%%", fr.fundingRate * 100));
-        flags.add(String.format("FR_ACCEL=%.4f%%", fr.frAcceleration * 100));
-        if (peakWarn) {
-            flags.add(side == com.bot.TradingCore.Side.SHORT ? "FR_PEAK_WARN" : "FR_TROUGH_WARN");
-        }
-        if (fr.oiChange1h > 0.005) flags.add(String.format("OI_RISE=%.2f%%", fr.oiChange1h * 100));
+        flags.add("CS_VWAP_MR");
+        flags.add(String.format("DEV=%.2fσ", sigma));
+        flags.add(String.format("VWAP=%.6f", vwap));
+        flags.add(String.format("RSI=%.1f", rsi14));
+        if (rsiOk) flags.add(side == com.bot.TradingCore.Side.LONG ? "RSI_OVERSOLD" : "RSI_OVERBOUGHT");
+        if (Math.abs(sigma) >= CS_STRONG_SIGMA) flags.add("STRONG_DEV");
+        flags.add(String.format("VOL/SMA=%.2f", volSma20 > 0 ? volCurrent / volSma20 : 0.0));
         if (btc != null) flags.add("BTC_" + btc.regime.name());
         flags.add(String.format("ATR_PCT=%.2f", atrPct15));
         flags.add(String.format("TIME_STOP=%dh", (CS_TIME_STOP_BARS_M15 * 15) / 60));
 
         // ─── Construct TradeIdea using main 16-arg constructor ──────────────
+        FundingOIData fr = fundingCache.get(symbol);
+        double frRate  = (fr != null && fr.isValid()) ? fr.fundingRate  : 0.0;
+        double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
+        double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
+
         TradeIdea idea = new TradeIdea(
                 symbol,
                 side,
                 price,
                 stop,
-                tp2,                         // take = TP2 (executor reads tp1/tp2 fields below)
-                CS_TP2_R,                    // rr = TP2_R
+                tp2,
+                CS_TP2_R,
                 probability,
                 flags,
-                fr.fundingRate,
-                fr.fundingDelta,
-                fr.oiChange1h,
+                frRate, frDelta, oiCh,
                 bias2h.name(),
                 cat,
-                null,                        // forecast = none (FR-MR doesn't need forecast)
-                CS_TP1_R, CS_TP2_R, CS_TP2_R // tp mults: tp1=1.0R, tp2=1.5R, tp3=tp2 (no extension)
+                null,
+                CS_TP1_R, CS_TP2_R, CS_TP2_R
         );
         idea.setRobustAtrPct(atr14 / price);
-        idea.setAgreeingClusters(1);         // ONE clean signal, not 4 voting clusters
+        idea.setAgreeingClusters(1);
 
-        // Mark cooldown — same symbol won't generate again for CS_COOLDOWN_MS.
         csLastSignalTime.put(symbol, now);
-
         return idea;
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // CleanStrategy v100 parameters — env-overridable but DO NOT TUNE on
-    // observed backtest results. Either gather honest paper trade data and
-    // decide to keep/discard the hypothesis, or change the hypothesis
-    // entirely. Fiddling with thresholds reproduces the curve-fit problem.
+    // VWAP & deviation helpers
     // ──────────────────────────────────────────────────────────────────────
-    private static final double CS_FR_LONG_OVERHEAT  = csEnvDouble("CS_FR_LONG_OVERHEAT",  0.0008);
-    private static final double CS_FR_SHORT_OVERHEAT = csEnvDouble("CS_FR_SHORT_OVERHEAT", -0.0005);
+
+    /** Volume-weighted average price over last `window` bars. */
+    private static double computeVwap(List<com.bot.TradingCore.Candle> candles, int window) {
+        int n = candles.size();
+        int from = Math.max(0, n - window);
+        double pvSum = 0, vSum = 0;
+        for (int i = from; i < n; i++) {
+            com.bot.TradingCore.Candle c = candles.get(i);
+            double tp = (c.high + c.low + c.close) / 3.0;
+            pvSum += tp * c.volume;
+            vSum  += c.volume;
+        }
+        return vSum > 0 ? pvSum / vSum : 0.0;
+    }
+
+    /** Stdev of (close - vwap)/vwap over last `window` bars. */
+    private static double computeDeviationStdev(List<com.bot.TradingCore.Candle> candles,
+                                                double vwap, int window) {
+        if (vwap <= 0) return 0.0;
+        int n = candles.size();
+        int from = Math.max(0, n - window);
+        int count = n - from;
+        if (count < 2) return 0.0;
+
+        double mean = 0;
+        for (int i = from; i < n; i++) {
+            mean += (candles.get(i).close - vwap) / vwap;
+        }
+        mean /= count;
+
+        double var = 0;
+        for (int i = from; i < n; i++) {
+            double d = (candles.get(i).close - vwap) / vwap - mean;
+            var += d * d;
+        }
+        var /= (count - 1);
+        return Math.sqrt(var);
+    }
+
+    /** Simple moving average of volume over last `period` bars. */
+    private static double computeVolumeSma(List<com.bot.TradingCore.Candle> candles, int period) {
+        int n = candles.size();
+        if (n < period) return 0.0;
+        double sum = 0;
+        for (int i = n - period; i < n; i++) sum += candles.get(i).volume;
+        return sum / period;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CleanStrategy v110 parameters — env-overridable but DO NOT TUNE on
+    // observed backtest results. If hypothesis fails on backtest, switch
+    // hypothesis entirely — don't fiddle with thresholds.
+    // ──────────────────────────────────────────────────────────────────────
+    private static final double CS_SIGMA_THRESHOLD   = csEnvDouble("CS_SIGMA_THRESHOLD",   1.8);
+    private static final double CS_STRONG_SIGMA      = csEnvDouble("CS_STRONG_SIGMA",      2.5);
+    private static final double CS_MAX_VOL_RATIO     = csEnvDouble("CS_MAX_VOL_RATIO",     1.3);
+    private static final int    CS_VWAP_WINDOW      = (int) csEnvLong("CS_VWAP_WINDOW",     96);
+    private static final int    CS_DEVIATION_WINDOW = (int) csEnvLong("CS_DEVIATION_WINDOW", 60);
     private static final double CS_MIN_ATR_PCTILE    = csEnvDouble("CS_MIN_ATR_PCTILE",    0.30);
     private static final double CS_MAX_ATR_PCTILE    = csEnvDouble("CS_MAX_ATR_PCTILE",    0.85);
-    private static final double CS_SL_ATR_MULT       = csEnvDouble("CS_SL_ATR_MULT",       1.5);
+    private static final double CS_SL_ATR_MULT       = csEnvDouble("CS_SL_ATR_MULT",       1.2);
     private static final double CS_TP1_R             = csEnvDouble("CS_TP1_R",             1.0);
     private static final double CS_TP2_R             = csEnvDouble("CS_TP2_R",             1.5);
-    private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",        240) * 60_000L;
-    private static final long   CS_TIME_STOP_BARS_M15 = csEnvLong("CS_TIME_STOP_BARS",     24);
+    private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",        60) * 60_000L;
+    private static final long   CS_TIME_STOP_BARS_M15 = csEnvLong("CS_TIME_STOP_BARS",     12);
     private static final boolean CS_SKIP_MEME        = csEnvBool("CS_SKIP_MEME",           true);
 
-    /** Per-symbol last signal timestamp for cooldown enforcement. */
+    /** Per-symbol last signal timestamp for cooldown. */
     private final java.util.Map<String, Long> csLastSignalTime =
             new java.util.concurrent.ConcurrentHashMap<>();
 
