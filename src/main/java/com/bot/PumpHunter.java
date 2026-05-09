@@ -98,6 +98,21 @@ public final class PumpHunter {
         if (symbol != null) garbageSymbols.add(symbol);
     }
 
+    // [v87 DIAGNOSTIC 2026-05-09] Read-only state snapshot for health monitoring.
+    // Useful for telegram /status and operator visibility into PumpHunter internals.
+    // Intentionally returns counts (not contents) — content can be PII-sensitive
+    // in some deployments (specific symbol names exposed).
+    public java.util.Map<String, Integer> stateStats() {
+        java.util.Map<String, Integer> stats = new java.util.LinkedHashMap<>();
+        stats.put("recentPumps", recentPumps.size());
+        stats.put("pumpHistory", pumpHistory.size());
+        stats.put("lastPumpTime", lastPumpTime.size());
+        stats.put("lastExhaustionTime", lastExhaustionTime.size());
+        stats.put("lastPrePumpTime", lastPrePumpTime.size());
+        stats.put("garbageSymbols", garbageSymbols.size());
+        return stats;
+    }
+
     // ── [v61] TTL cleanup — prevents unbounded state growth on Railway ────
     private volatile long lastCleanupMs = 0L;
     private static final long CLEANUP_INTERVAL_MS = 10 * 60_000L;
@@ -119,6 +134,23 @@ public final class PumpHunter {
             q.removeIf(pe -> pe.timestamp < cutoff);
             return q.isEmpty();
         });
+        // [v87 GARBAGE-CAP 2026-05-09] Cap garbageSymbols set size. The set is
+        // populated externally (SignalSender chronic-stale eviction, etc.) without
+        // TTL. On long-running deployments (>30 days) it could grow to thousands of
+        // entries. Hard cap = 500 — beyond that, we evict oldest insertion order
+        // (best effort with LinkedHashSet semantics; ConcurrentHashMap.newSetFromMap
+        // doesn't guarantee order, so we just clear half if oversize).
+        if (garbageSymbols.size() > 500) {
+            int target = 250;
+            int toRemove = garbageSymbols.size() - target;
+            java.util.Iterator<String> it = garbageSymbols.iterator();
+            while (it.hasNext() && toRemove > 0) {
+                it.next();
+                it.remove();
+                toRemove--;
+            }
+            LOG.info("[PumpHunter] garbageSymbols trimmed to " + garbageSymbols.size());
+        }
     }
 
     private final Map<String, Long> lastPumpTime       = new ConcurrentHashMap<>();
@@ -584,6 +616,17 @@ public final class PumpHunter {
 
     // ==================== generateSignal ====================
 
+    /**
+     * @deprecated [v87 2026-05-09] This method is NOT called from the live signal
+     * pipeline. It returns a synthetic confidence score (55-85) that has no
+     * statistical basis — confidence is derived by linear formula from event.strength,
+     * which itself is a heuristic. Use only for: (a) historical compatibility with
+     * external integrations, (b) manual debugging.
+     *
+     * The PRODUCTION pipeline uses {@link #detectPump} for FLAG-only annotation
+     * (no probability scaling). See SignalSender.processPair() v18.0 REFACTOR comment.
+     */
+    @Deprecated
     public PumpSignal generateSignal(PumpEvent event, double currentPrice) {
         if (event == null || event.type == PumpType.NONE) return null;
 

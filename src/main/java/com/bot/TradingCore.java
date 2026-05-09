@@ -1025,6 +1025,24 @@ public final class TradingCore {
      * 0.0 = lowest volatility, 1.0 = highest volatility in history.
      * Used to calibrate position sizing and signal confidence.
      */
+    /**
+     * ATR percentile rank — what fraction of the historical ATR window is the
+     * current ATR greater than or equal to.
+     *
+     * v10.5 FIX: tied-value handling.
+     *   Previous logic used strict `>` which under-counted ranks when current
+     *   ATR equaled multiple historical bars (common in flat-vol regimes).
+     *   Result: percentile dipped below the 0.08 "compression" threshold even
+     *   on perfectly normal volatility → spurious COMPRESSION flags in DE
+     *   during stable BTC vol periods. Switching to `>=` interprets percentile
+     *   as "fraction of historical bars ≤ current" — standard statistical
+     *   convention for tied ranks. Effect on existing thresholds:
+     *     - 0.08 compression gate: slightly easier to clear (fewer false flats).
+     *     - 0.50 mid-vol: unchanged in practice.
+     *     - 0.90 high-vol: marginally easier to reach in clustered-high regimes.
+     *   All directional indicators in DE that consume this remain semantically
+     *   correct — the change only fixes the floor bias in tied regimes.
+     */
     public static double atrPercentile(List<Candle> candles, int atrPeriod, int lookback) {
         if (candles == null || candles.size() < atrPeriod + lookback) return 0.5;
         double[] atrArr = atrSeries(candles, atrPeriod);
@@ -1034,7 +1052,7 @@ public final class TradingCore {
         int start = Math.max(atrPeriod, atrArr.length - lookback);
         int count = 0, rank = 0;
         for (int i = start; i < atrArr.length - 1; i++) {
-            if (atrArr[i] > 0) { count++; if (current > atrArr[i]) rank++; }
+            if (atrArr[i] > 0) { count++; if (current >= atrArr[i]) rank++; }
         }
         return count > 0 ? (double) rank / count : 0.5;
     }

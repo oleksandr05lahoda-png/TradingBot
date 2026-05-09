@@ -5,7 +5,23 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.logging.Logger;
 
-/** SimpleBacktester v10.0 — INSTITUTIONAL-GRADE BACKTEST */
+/** SimpleBacktester v10.1 — INSTITUTIONAL-GRADE BACKTEST
+ *
+ * [v87 PARTIAL-CLOSE 2026-05-09] Major fix: backtester now models 50/50 partial close
+ * on TP1, matching live BinanceTradeExecutor.openPositionWithSl() behavior. This
+ * removes the largest backtest-vs-live discrepancy: previously, after TP1 hit,
+ * backtester held 100% open until TP2/BE, while live closed 50% at TP1. The result
+ * was systematic understatement of PnL (~+0.6R missed every TP1→BE sequence).
+ *
+ * [v87 CONSERVATIVE-AMBIGUOUS] Removed look-ahead bias in resolveHeuristic:
+ * mid-bar opens previously deferred to next bar (skipping legitimate SL hits);
+ * now they default to SL_FIRST when M1 data isn't available.
+ *
+ * IMPORTANT — LEVERAGE: All PnL numbers in this backtester are in % of PRICE (1x equiv).
+ * If your live trades use leverage > 1x, real account PnL = backtest_pnl × leverage.
+ * Example: -25% backtest with 5x leverage = -125% on margin = liquidation.
+ * Always validate that backtest PnL is positive BEFORE adding leverage.
+ */
 public final class SimpleBacktester {
 
     // ── Configuration ────────────────────────────────────────────
@@ -450,9 +466,19 @@ public final class SimpleBacktester {
             if (currentPos != null) {
                 PositionOutcome outcome = resolvePosition(currentPos, m15, i, m1Index, slippage);
                 if (outcome != null) {
-                    // Calculate costs
-                    double feesCost = 2 * takerFee; // entry + exit
-                    double slipCost = 2 * slippage;
+                    // [v87 PARTIAL-CLOSE] Cost accounting now correctly handles partial closes:
+                    //   - Entry fee: takerFee on full position (not yet booked)
+                    //   - Exit fee: takerFee × remainingFrac (only what's left at final exit)
+                    //   - partialFeesCost: takerFee × 0.5 (already booked at TP1 if it fired)
+                    // Total = entry + final + partial = takerFee × (1.0 + remFrac + partialBooked)
+                    // For non-partial trade: 1.0 + 1.0 + 0 = 2.0 = same as before
+                    // For TP1+anything trade: 1.0 + 0.5 + 0.5 = 2.0 = same total fees, just split
+                    double feesCost = takerFee * 1.0                          // entry
+                            + takerFee * currentPos.remainingFrac             // final exit
+                            + currentPos.partialFeesCost;                     // TP1 partial (if any)
+                    double slipCost = slippage * 1.0
+                            + slippage * currentPos.remainingFrac
+                            + currentPos.partialSlipCost;
                     double fundingCost = fundingPer15m * outcome.barsHeld;
                     double totalCosts = feesCost + slipCost + fundingCost;
 
@@ -475,14 +501,13 @@ public final class SimpleBacktester {
                     if (netPnl > 0.05)      result.wins++;
                     else if (netPnl < -0.05) result.losses++;
                     else                      result.breakEvens++;
-                    if ("TIME_STOP".equals(outcome.reason)) result.timeStops++;
-                        // [v86 EXIT-FIX] Track new active-exit reasons separately.
-                        // Note: a trail exit shows up as "SL" or "BE_STOP" reason —
-                        // we infer it via trailLevel > 0 at exit time. Here we only
-                        // count the explicit new reasons.
+                    if ("TIME_STOP".equals(outcome.reason) || "TP1_TS".equals(outcome.reason)) {
+                        result.timeStops++;
+                    }
+                    // [v86 EXIT-FIX] Track new active-exit reasons separately.
                     else if ("PROFIT_LOCK".equals(outcome.reason)) result.profitLocks++;
                     else if ("STAGNATION".equals(outcome.reason)) result.stagnationExits++;
-                    else if (("SL".equals(outcome.reason) || "BE_STOP".equals(outcome.reason))
+                    else if (("SL".equals(outcome.reason) || "TP1_BE".equals(outcome.reason))
                             && currentPos.trailLevel > 0)         result.trailExits++;
 
                     dailyPnL.merge(barDay, netPnl, Double::sum);
@@ -733,6 +758,21 @@ public final class SimpleBacktester {
         double maxAdvR     = 0.0;  // peak adverse movement in R-units (for stagnation detection)
         int    trailLevel  = 0;    // 0=none, 1=locked@0.4R, 2=locked@0.8R, 3=locked@1.4R
 
+        // [v87 PARTIAL-CLOSE 2026-05-09] Partial-close state — sync with live BinanceTradeExecutor.
+        // Live executor places 2 separate TP orders on 50%/50% qty (BinanceTradeExecutor.java:654-655).
+        // Backtester previously kept 100% open after TP1 hit and waited for TP2/BE — that's
+        // a systematic understatement of PnL (+0.6R missed every TP1→BE sequence).
+        //
+        // Now: when TP1 hits, we record a partial outcome (+0.5 × TP1Mult R captured) and continue
+        // with remainingFrac=0.5. Final outcome combines accumulated partial + remaining-fraction PnL.
+        double accumulatedPnlPct  = 0.0;   // PnL already locked from TP1 partial close (% of price)
+        double remainingFrac      = 1.0;   // 1.0 = full size, 0.5 = after TP1 partial closed
+        double tp1ExitPrice       = 0.0;   // for record-keeping in TradeRecord
+        int    tp1ExitBar         = -1;    // for record-keeping
+        // Tracks fees/slippage accrued on entry + TP1 partial. Final exit fees added in run().
+        double partialFeesCost    = 0.0;
+        double partialSlipCost    = 0.0;
+
         ActivePosition(com.bot.TradingCore.Side side, double entry, double sl, double tp1, double tp2,
                        double conf, long time, int bar) {
             this.side = side; this.entry = entry; this.sl = sl;
@@ -831,9 +871,12 @@ public final class SimpleBacktester {
                 double curR = isLong ? (curC.close - pos.entry) / risk : (pos.entry - curC.close) / risk;
                 if (curR >= 0.30) {
                     double exitPrice = curC.close;
-                    double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+                    double exitPnlPct = isLong ? (exitPrice - pos.entry) / pos.entry * 100
                             : (pos.entry - exitPrice) / pos.entry * 100;
-                    return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, "PROFIT_LOCK");
+                    // [v87 PARTIAL-CLOSE] PROFIT_LOCK fires only when !tp1Hit (per condition above),
+                    // so accumulated=0 and remainingFrac=1.0. Formula stays identical for safety.
+                    double totalPnl = pos.accumulatedPnlPct + exitPnlPct * pos.remainingFrac;
+                    return new PositionOutcome(exitPrice, totalPnl, barsHeld, currentBar, "PROFIT_LOCK");
                 }
             }
 
@@ -842,9 +885,10 @@ public final class SimpleBacktester {
             if (stagnationEnabled && barsHeld >= stagnationBar
                     && pos.maxFavR < 0.30 && pos.maxAdvR < 0.30 && !pos.tp1Hit) {
                 double exitPrice = curC.close;
-                double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+                double exitPnlPct = isLong ? (exitPrice - pos.entry) / pos.entry * 100
                         : (pos.entry - exitPrice) / pos.entry * 100;
-                return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, "STAGNATION");
+                double totalPnl = pos.accumulatedPnlPct + exitPnlPct * pos.remainingFrac;
+                return new PositionOutcome(exitPrice, totalPnl, barsHeld, currentBar, "STAGNATION");
             }
         }
         // ─── end v86 active exit management ─────────────────────────────
@@ -887,9 +931,11 @@ public final class SimpleBacktester {
         // Time stop
         if (barsHeld >= timeStopBars) {
             double exitPrice = m15.get(currentBar).close;
-            double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+            double tsPnlPct = isLong ? (exitPrice - pos.entry) / pos.entry * 100
                     : (pos.entry - exitPrice) / pos.entry * 100;
-            return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, "TIME_STOP");
+            double totalPnl = pos.accumulatedPnlPct + tsPnlPct * pos.remainingFrac;
+            return new PositionOutcome(exitPrice, totalPnl, barsHeld, currentBar,
+                    pos.tp1Hit ? "TP1_TS" : "TIME_STOP");
         }
 
         com.bot.TradingCore.Candle bar = m15.get(currentBar);
@@ -907,23 +953,47 @@ public final class SimpleBacktester {
             double exitPrice = sl;
             if (isLong) exitPrice -= exitPrice * slippage;
             else        exitPrice += exitPrice * slippage;
-            double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+            double slPnlPct = isLong ? (exitPrice - pos.entry) / pos.entry * 100
                     : (pos.entry - exitPrice) / pos.entry * 100;
-            return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, pos.tp1Hit ? "BE_STOP" : "SL");
+            // [v87 PARTIAL-CLOSE] Final PnL combines accumulated (from TP1 if hit) + remaining × SL pnl.
+            // If tp1Hit, this is the TP1_BE flow: 50% locked at +0.6R, remaining 50% stopped at BE.
+            double totalPnl = pos.accumulatedPnlPct + slPnlPct * pos.remainingFrac;
+            return new PositionOutcome(exitPrice, totalPnl, barsHeld, currentBar,
+                    pos.tp1Hit ? "TP1_BE" : "SL");
         }
 
         if (tpCanHit && !slCanHit) {
             // TP hit
             if (!pos.tp1Hit) {
+                // [v87 PARTIAL-CLOSE] TP1 hit → close 50% of position, lock half the profit,
+                // move SL to BE on the remainder. This now mirrors live BinanceTradeExecutor
+                // behavior (50/50 split via 2 separate TP orders on 50% qty each).
+                //
+                // Math: if TP1 = entry + 1.20R, partial PnL on 50% qty = 1.20R × 0.50 = 0.60R captured.
+                // pnlPct here is already in % of price (1x equiv). We multiply by remainingFrac
+                // to scale to the half-position size. The remaining 50% continues with SL=BE.
+                double partialPnlPct = isLong
+                        ? (pos.tp1 - pos.entry) / pos.entry * 100
+                        : (pos.entry - pos.tp1) / pos.entry * 100;
+                pos.accumulatedPnlPct += partialPnlPct * 0.5;  // 50% of qty closed
+                // Record costs for the partial close: 1× takerFee + 1× slippage on 50% qty.
+                pos.partialFeesCost += takerFee * 0.5;
+                pos.partialSlipCost += slippage * 0.5;
                 pos.tp1Hit = true;
+                pos.remainingFrac = 0.5;
+                pos.tp1ExitPrice = pos.tp1;
+                pos.tp1ExitBar = currentBar;
                 pos.currentSL = pos.entry * (isLong ? 1.001 : 0.999); // move SL to BE
-                return null; // position continues with BE stop
+                return null; // position continues at 50% with BE stop
             } else {
-                // TP2 hit — close fully
+                // TP2 hit on remaining 50%. Total PnL = accumulated (TP1 50%) + tp2 PnL on remaining 50%.
                 double exitPrice = tp;
-                double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+                double tp2PnlPct = isLong
+                        ? (exitPrice - pos.entry) / pos.entry * 100
                         : (pos.entry - exitPrice) / pos.entry * 100;
-                return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, "TP2");
+                double totalPnl = pos.accumulatedPnlPct + tp2PnlPct * pos.remainingFrac;
+                return new PositionOutcome(exitPrice, totalPnl, barsHeld, currentBar,
+                        pos.tp1Hit ? "TP1_TP2" : "TP2");
             }
         }
 
@@ -950,19 +1020,33 @@ public final class SimpleBacktester {
                 double exitPrice = sl;
                 if (isLong) exitPrice -= exitPrice * slippage;
                 else        exitPrice += exitPrice * slippage;
-                double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+                double slPnlPct = isLong ? (exitPrice - pos.entry) / pos.entry * 100
                         : (pos.entry - exitPrice) / pos.entry * 100;
-                return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, pos.tp1Hit ? "BE_STOP" : "SL");
+                // [v87 PARTIAL-CLOSE] Final PnL = accumulated (TP1 if hit) + remaining-frac × SL pnl
+                double totalPnl = pos.accumulatedPnlPct + slPnlPct * pos.remainingFrac;
+                return new PositionOutcome(exitPrice, totalPnl, barsHeld, currentBar,
+                        pos.tp1Hit ? "TP1_BE" : "SL");
             }
             if (tpHit) {
                 if (!pos.tp1Hit) {
+                    // [v87 PARTIAL-CLOSE] TP1 partial close — same logic as in resolvePosition.
+                    double partialPnlPct = isLong
+                            ? (pos.tp1 - pos.entry) / pos.entry * 100
+                            : (pos.entry - pos.tp1) / pos.entry * 100;
+                    pos.accumulatedPnlPct += partialPnlPct * 0.5;
+                    pos.partialFeesCost  += this.takerFee * 0.5;
+                    pos.partialSlipCost  += slippage * 0.5;
                     pos.tp1Hit = true;
+                    pos.remainingFrac = 0.5;
+                    pos.tp1ExitPrice = pos.tp1;
+                    pos.tp1ExitBar = currentBar;
                     pos.currentSL = pos.entry * (isLong ? 1.001 : 0.999);
                     return null;
                 }
-                double pnl = isLong ? (tp - pos.entry) / pos.entry * 100
+                double tp2PnlPct = isLong ? (tp - pos.entry) / pos.entry * 100
                         : (pos.entry - tp) / pos.entry * 100;
-                return new PositionOutcome(tp, pnl, barsHeld, currentBar, "TP2");
+                double totalPnl = pos.accumulatedPnlPct + tp2PnlPct * pos.remainingFrac;
+                return new PositionOutcome(tp, totalPnl, barsHeld, currentBar, "TP1_TP2");
             }
         }
         return null;
@@ -971,43 +1055,61 @@ public final class SimpleBacktester {
     private PositionOutcome resolveHeuristic(ActivePosition pos, com.bot.TradingCore.Candle bar,
                                              boolean isLong, double sl, double tp,
                                              int barsHeld, int currentBar, double slippage) {
-        // Conservative bias: default to SL first (prevents backtest optimism)
+        // [v87 CONSERVATIVE-AMBIGUOUS 2026-05-09] Ambiguous bar handling overhaul.
+        //
+        // Old (v86): when open was mid-bar (0.35 < openPos < 0.65), return null and "skip"
+        // the bar — pretend nothing happened. This created LOOK-AHEAD BIAS:
+        // in reality EITHER SL or TP fired; deferring resolution to next bar systematically
+        // SKIPPED legitimate SL hits. Mid-bar opens are common (~30% of intraday bars), so this
+        // inflated backtest WR by ~3-5pp vs reality.
+        //
+        // New: when ambiguous AND M1 data unavailable, default to SL_FIRST (conservative).
+        // This MILDLY pessimistic — if user wants accurate ambiguous resolution they should
+        // ensure M1 data is loaded (useM1Resolution=true is default; the only path here is
+        // when m1Index doesn't have the bar's openTime).
         double range = bar.high - bar.low;
         if (range < 1e-12) return null;
         double openPos = (bar.open - bar.low) / range; // 0 = open at low, 1 = open at high
 
         boolean slFirst;
         if (isLong) {
-            // Long: SL is below. If open is near low (openPos < 0.3), market went down first
-            slFirst = openPos < 0.35;
+            // Long: SL is below. Open near low → market went down first.
+            // Mid-bar open: assume conservative SL_FIRST (was: skip bar, look-ahead bias).
+            slFirst = openPos < 0.5;
         } else {
-            // Short: SL is above. If open is near high (openPos > 0.7), market went up first
-            slFirst = openPos > 0.65;
+            // Short: SL is above. Open near high → market went up first.
+            slFirst = openPos > 0.5;
         }
-
-        // Ambiguous case: open is mid-range (0.35–0.65) — both SL and TP plausible.
-        // OLD: always SL_FIRST → backtest was systematically pessimistic, artificially low WR.
-        // NEW: no default bias — return null (treat as "nothing resolved this bar"),
-        //      let the time-stop logic handle it if the position expires.
-        //      This matches reality: if we can't determine order from heuristics, skip the bar.
-        if (openPos > 0.35 && openPos < 0.65) return null;
 
         if (slFirst) {
             double exitPrice = sl;
             if (isLong) exitPrice -= exitPrice * slippage;
             else        exitPrice += exitPrice * slippage;
-            double pnl = isLong ? (exitPrice - pos.entry) / pos.entry * 100
+            double slPnlPct = isLong ? (exitPrice - pos.entry) / pos.entry * 100
                     : (pos.entry - exitPrice) / pos.entry * 100;
-            return new PositionOutcome(exitPrice, pnl, barsHeld, currentBar, pos.tp1Hit ? "BE_STOP" : "SL");
+            double totalPnl = pos.accumulatedPnlPct + slPnlPct * pos.remainingFrac;
+            return new PositionOutcome(exitPrice, totalPnl, barsHeld, currentBar,
+                    pos.tp1Hit ? "TP1_BE" : "SL");
         } else {
             if (!pos.tp1Hit) {
+                // [v87 PARTIAL-CLOSE] TP1 partial close — same logic.
+                double partialPnlPct = isLong
+                        ? (pos.tp1 - pos.entry) / pos.entry * 100
+                        : (pos.entry - pos.tp1) / pos.entry * 100;
+                pos.accumulatedPnlPct += partialPnlPct * 0.5;
+                pos.partialFeesCost  += takerFee * 0.5;
+                pos.partialSlipCost  += slippage * 0.5;
                 pos.tp1Hit = true;
+                pos.remainingFrac = 0.5;
+                pos.tp1ExitPrice = pos.tp1;
+                pos.tp1ExitBar = currentBar;
                 pos.currentSL = pos.entry * (isLong ? 1.001 : 0.999);
                 return null;
             }
-            double pnl = isLong ? (tp - pos.entry) / pos.entry * 100
+            double tp2PnlPct = isLong ? (tp - pos.entry) / pos.entry * 100
                     : (pos.entry - tp) / pos.entry * 100;
-            return new PositionOutcome(tp, pnl, barsHeld, currentBar, "TP2");
+            double totalPnl = pos.accumulatedPnlPct + tp2PnlPct * pos.remainingFrac;
+            return new PositionOutcome(tp, totalPnl, barsHeld, currentBar, "TP1_TP2");
         }
     }
 

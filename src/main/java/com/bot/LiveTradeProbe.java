@@ -300,73 +300,74 @@ public final class LiveTradeProbe {
     // ─── Helpers ──────────────────────────────────────────────────────
 
     /**
-     * Build a TradeIdea using reflection — we don't know the exact constructor
-     * signature without coupling, but we know the public final fields. We use
-     * sun.misc.Unsafe-style: instantiate via Unsafe.allocateInstance and write
-     * fields reflectively. This avoids editing DecisionEngineMerged.
+     * Build a TradeIdea for the probe.
      *
-     * Простая альтернатива: создавать через JSON ничего не получится — поля final.
-     * Но Unsafe здесь не нужен — мы можем дёрнуть конструктор если он есть.
-     * Для пробы делаем proxy: создаём минимальный объект только с нужными полями.
+     * v10.5 FIX: removed dependency on sun.misc.Unsafe.
+     *   Old version used Unsafe.allocateInstance(TradeIdea.class) to bypass the
+     *   constructor and then wrote final fields via reflection. sun.misc.Unsafe
+     *   is officially deprecated for removal in JDK 23+ — code would break on
+     *   future JVM upgrades with no warning at compile time.
+     *
+     *   New approach: call the public 10-arg TradeIdea constructor directly
+     *   (symbol, side, price, stop, take, probability, flags, fundingRate,
+     *   oiChange, htfBias). The constructor internally derives tp1/tp2/tp3 via
+     *   tp_mults (default 1.0/2.0/3.2). For the probe we then OVERRIDE tp1, tp2,
+     *   tp3 with the explicit values via regular reflection (final-field write).
+     *   Reflection on final fields is supported on JDK 9–24 with --illegal-access
+     *   permit; this matches the existing setField() helper which has worked
+     *   throughout the project.
+     *
+     *   Net result: probe no longer depends on a removal-marked API; it compiles
+     *   cleanly without --add-opens or --enable-native-access flags on JDK 21.
      */
     private static DecisionEngineMerged.TradeIdea buildProbeIdea(double entry,
                                                                  double sl,
                                                                  double tp1,
                                                                  double tp2) throws Exception {
-        // Try reflection on the public-fields-only TradeIdea.
-        // We allocate without calling constructor (final fields can't be changed
-        // post-construction normally, but reflection with setAccessible bypasses).
-        sun.misc.Unsafe unsafe = getUnsafe();
-        DecisionEngineMerged.TradeIdea idea = (DecisionEngineMerged.TradeIdea)
-                unsafe.allocateInstance(DecisionEngineMerged.TradeIdea.class);
-
-        setField(idea, "symbol", "BTCUSDT");
-        // Assume side is enum; we want LONG. Find the enum value.
+        // Resolve LONG side enum without static coupling
         Class<?> sideCls = Class.forName("com.bot.TradingCore$Side");
         Object longSide = null;
         for (Object e : sideCls.getEnumConstants()) {
             if ("LONG".equals(e.toString())) { longSide = e; break; }
         }
-        setField(idea, "side", longSide);
+        if (longSide == null) {
+            throw new IllegalStateException("LONG side enum not found in TradingCore.Side");
+        }
 
-        setField(idea, "price", entry);
-        setField(idea, "stop", sl);
-        setField(idea, "take", tp2);
+        // Use the public 10-arg constructor — no Unsafe needed.
+        java.util.List<String> flags = new java.util.ArrayList<>();
+        flags.add("PROBE");
+
+        DecisionEngineMerged.TradeIdea idea = new DecisionEngineMerged.TradeIdea(
+                "BTCUSDT",
+                (com.bot.TradingCore.Side) longSide,
+                entry,         // price
+                sl,            // stop
+                tp2,           // take (final TP, used as tp2 baseline)
+                0.95,          // probability
+                flags,         // flags
+                0.0,           // fundingRate
+                0.0,           // oiChange
+                "PROBE"        // htfBias
+        );
+
+        // Override tp1, tp2, tp3 with explicit probe values via reflection.
+        // The constructor would have derived them from tp_mults; for a probe
+        // we want exact prices so executor places SL/TP1/TP2 at known levels.
         setField(idea, "tp1", tp1);
         setField(idea, "tp2", tp2);
         setField(idea, "tp3", tp2);
-        setField(idea, "probability", 0.95);
-        // flags = empty list
-        setField(idea, "flags", new java.util.ArrayList<String>());
-        setField(idea, "fundingRate", 0.0);
-        setField(idea, "fundingDelta", 0.0);
-        setField(idea, "oiChange", 0.0);
-        setField(idea, "htfBias", "PROBE");
-        setField(idea, "rr", 2.0);
-        setField(idea, "trendPhase", "PROBE");
-        setField(idea, "tp1Mult", 1.0);
-        setField(idea, "tp2Mult", 1.0);
-        setField(idea, "tp3Mult", 1.0);
         setField(idea, "robustAtrPct", 0.005);
-        setField(idea, "createdAtMs", System.currentTimeMillis());
-
-        // category is enum; try to find a sensible default
-        try {
-            Class<?> catCls = Class.forName("com.bot.DecisionEngineMerged$CoinCategory");
-            Object[] vals = catCls.getEnumConstants();
-            if (vals != null && vals.length > 0) setField(idea, "category", vals[0]);
-        } catch (Throwable ignored) {}
 
         return idea;
     }
 
-    @SuppressWarnings("removal")
-    private static sun.misc.Unsafe getUnsafe() throws Exception {
-        java.lang.reflect.Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-        f.setAccessible(true);
-        return (sun.misc.Unsafe) f.get(null);
-    }
-
+    /**
+     * Reflection-based field writer. Used for final-field overrides where the
+     * constructor doesn't expose a setter. Silently skips fields that don't
+     * exist on this version of TradeIdea — keeps the probe compatible with
+     * minor schema changes in DecisionEngineMerged.
+     */
     private static void setField(Object obj, String name, Object value) {
         try {
             java.lang.reflect.Field f = obj.getClass().getDeclaredField(name);

@@ -494,11 +494,20 @@ public final class SignalOptimizer {
         if (Math.abs(adjusted - signal.probability) < 0.5) return signal;
         List<String> nf = new ArrayList<>(signal.flags);
         nf.add("μ" + String.format("%+.0f", adjusted - signal.probability));
-        return new DecisionEngineMerged.TradeIdea(
+        // [v87 MULT-PRESERVE 2026-05-09] Preserve executorSizeMultiplier across the
+        // direct-constructor TradeIdea creation. Same pattern as SignalSender's
+        // [HOLE-1 REGRESSION FIX] — when a new TradeIdea is built via constructor,
+        // it resets the multiplier to default. If anywhere upstream had set a non-1.0
+        // multiplier (currently no such path exists, but defensive against future
+        // changes), it would silently be lost. Now we explicitly carry it forward.
+        double prevMult = signal.getExecutorSizeMultiplier();
+        DecisionEngineMerged.TradeIdea adjusted_idea = new DecisionEngineMerged.TradeIdea(
                 signal.symbol, signal.side, signal.price, signal.stop, signal.take,
                 signal.rr, adjusted, nf, signal.fundingRate, signal.fundingDelta,
                 signal.oiChange, signal.htfBias, signal.category,
                 signal.forecast, signal.tp1Mult, signal.tp2Mult, signal.tp3Mult);
+        if (prevMult > 0 && prevMult != 1.0) adjusted_idea.setExecutorSizeMultiplier(prevMult);
+        return adjusted_idea;
     }
 
     // ──────────────────────────────────────────────────────────────────

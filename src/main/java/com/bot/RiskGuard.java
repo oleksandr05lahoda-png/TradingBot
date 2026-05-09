@@ -330,6 +330,65 @@ public final class RiskGuard {
         return System.currentTimeMillis() - startupTime < COLD_START_MS;
     }
 
+    // [v87 HEALTHCHECK 2026-05-09] Snapshot for telegram /status and external monitoring.
+    // Returns a single immutable record with the most useful diagnostic info.
+    public static final class HealthSnapshot {
+        public final boolean coldStart;
+        public final boolean manualLock;
+        public final String  manualLockReason;
+        public final long    dailyTradesOpened;
+        public final int     dailyTradeLimit;
+        public final double  dailyPnlUsd;
+        public final double  dailyDrawdownPct;     // signed; negative = loss
+        public final double  weeklyPnlUsd;
+        public final double  weeklyDrawdownPct;
+        public final int     openPositionsCount;
+        public final int     maxConcurrent;
+        public final boolean btcCrashBlockActive;
+        public final long    btcCrashBlockMinutesLeft;
+        public final String  summary;
+
+        HealthSnapshot(boolean cs, boolean ml, String mlr, long dt, int dtl,
+                       double dp, double ddp, double wp, double wdp,
+                       int op, int mc, boolean bb, long bbm, String s) {
+            this.coldStart = cs; this.manualLock = ml; this.manualLockReason = mlr;
+            this.dailyTradesOpened = dt; this.dailyTradeLimit = dtl;
+            this.dailyPnlUsd = dp; this.dailyDrawdownPct = ddp;
+            this.weeklyPnlUsd = wp; this.weeklyDrawdownPct = wdp;
+            this.openPositionsCount = op; this.maxConcurrent = mc;
+            this.btcCrashBlockActive = bb; this.btcCrashBlockMinutesLeft = bbm;
+            this.summary = s;
+        }
+    }
+
+    public synchronized HealthSnapshot health() {
+        long now = System.currentTimeMillis();
+        double ddp = dayStartBalance > 0
+                ? -100.0 * dailyPnlUsd / dayStartBalance : 0.0;
+        double weeklyPnl = computeWeeklyPnl();
+        double wdp = weekStartBalance > 0
+                ? -100.0 * weeklyPnl / weekStartBalance : 0.0;
+        boolean bb = now < btcCrashBlockUntil;
+        long bbm = bb ? Math.max(0, (btcCrashBlockUntil - now) / 60_000L) : 0L;
+        String state;
+        if (manualLock) state = "LOCKED";
+        else if (bb) state = "BTC-CRASH-BLOCK(" + bbm + "min)";
+        else if (dailyTradesOpened.get() >= DAILY_TRADE_LIMIT) state = "DAILY-LIMIT";
+        else if (openPositions.size() >= MAX_CONCURRENT_POSITIONS) state = "FULL-SLOTS";
+        else if (isColdStart()) state = "COLD-START";
+        else state = "OK";
+        String summary = String.format(
+                "RG:%s trades=%d/%d dayDD=%.1f%% open=%d/%d",
+                state, dailyTradesOpened.get(), DAILY_TRADE_LIMIT, ddp,
+                openPositions.size(), MAX_CONCURRENT_POSITIONS);
+        return new HealthSnapshot(
+                isColdStart(), manualLock, manualLockReason,
+                dailyTradesOpened.get(), DAILY_TRADE_LIMIT,
+                dailyPnlUsd, ddp, weeklyPnl, wdp,
+                openPositions.size(), MAX_CONCURRENT_POSITIONS,
+                bb, bbm, summary);
+    }
+
     // ─── Diagnostic ───────────────────────────────────────────────────
 
     public synchronized String statusLine() {

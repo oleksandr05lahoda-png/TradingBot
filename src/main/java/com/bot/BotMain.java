@@ -1870,19 +1870,54 @@ public final class BotMain {
                 // Reason: a strategy with negative edge on history (WR=32%, Net=-63%)
                 // poisons the PAV regression — every live raw-prob is mapped to the
                 // empirical loser distribution and reject("calibrated_lt_minConf_*")
-                // becomes the dominant rejection reason. Set this env when you want
-                // to use backtest only for EV-per-symbol (still fed via setSymbolBacktestResult)
-                // and let the calibrator learn purely on live/paper outcomes.
-                boolean skipCalRecord = "1".equals(System.getenv()
-                        .getOrDefault("SKIP_STARTUP_CALIBRATION", "0"));
+                // becomes the dominant rejection reason.
+                //
+                // [v87 2026-05-09] DEFAULT FLIPPED 0→1.
+                // Empirically: every prior backtest run that fed the live calibrator with
+                // negative-edge data caused permanent reject("calibrated_lt_minConf_*")
+                // downstream — calibrator learned "every signal loses" and snapped raw
+                // scores to ~0.40, while MIN_CONF gate is 0.58. Result: 4 signals/28h
+                // when paper mode would expect 30+.
+                //
+                // SAFE default = "do not poison". To opt INTO the old behavior (feed
+                // calibrator from backtest), explicitly set env SKIP_STARTUP_CALIBRATION=0.
+                // Only do that AFTER you've validated the strategy has positive edge on
+                // history (otherwise you're feeding the calibrator a loser distribution).
+                boolean skipCalRecord = !"0".equals(System.getenv()
+                        .getOrDefault("SKIP_STARTUP_CALIBRATION", "1"));
+
+                // [v87 BIAS-GUARD 2026-05-09] Even with skipCalRecord=false, refuse to
+                // record outcomes if the backtest itself shows the strategy is losing
+                // (Net < 0% OR WR < 40%). Feeding a known-bad strategy's outcomes to PAV
+                // teaches it to under-rate EVERY future signal — the opposite of what
+                // calibration is for.
+                boolean negativeEdge = (r.netPnL < 0.0) || (r.winRate < 0.40);
+                if (!skipCalRecord && negativeEdge) {
+                    LOG.warning("[STARTUP-BT] " + sym
+                            + " SKIPPING calibrator record: backtest shows negative edge "
+                            + String.format("(WR=%.1f%% NetPnL=%+.2f%%) — would poison PAV.",
+                            r.winRate * 100, r.netPnL));
+                    skipCalRecord = true;
+                }
+
                 if (!skipCalRecord) {
                     for (com.bot.SimpleBacktester.TradeRecord tr : r.trades) {
                         boolean hit = tr.pnlPct > 0;
                         double rawScore01 = Math.max(0.0, Math.min(1.0, tr.confidence / 100.0));
                         double atrPctApprox = Math.abs(tr.entry > 0
                                 ? (tr.sl - tr.entry) / tr.entry * 100.0 : 1.5);
-                        String tag = "TIME_STOP".equals(tr.exitReason) ? "TIME_STOP"
-                                : (hit ? (tr.exitReason != null ? tr.exitReason : "TP1") : "SL");
+                        // [v87] Updated to recognize new partial-close exit reasons from
+                        // SimpleBacktester v10.1: TP1_TP2 (full TP success), TP1_BE (partial
+                        // win + breakeven on remainder), TP1_TS (partial win + time-stop),
+                        // SL (full loss), TIME_STOP (no movement).
+                        String tag;
+                        if ("TIME_STOP".equals(tr.exitReason) || "TP1_TS".equals(tr.exitReason)) {
+                            tag = "TIME_STOP";
+                        } else if (hit) {
+                            tag = (tr.exitReason != null ? tr.exitReason : "TP1");
+                        } else {
+                            tag = "SL";
+                        }
                         cal.recordOutcomeExtended(sym, rawScore01, hit, atrPctApprox,
                                 1.0, tag, "NEUTRAL", tr.entry, tr.exit);
                     }
@@ -1964,11 +1999,31 @@ public final class BotMain {
                         + String.format("%+.1f%%", totalNetPnL) + ", WR=" + String.format("%.1f%%", wr) + ".\n"
                         + "Нет явного edge. Реальные деньги категорически нельзя.";
             } else {
-                verdict = "🔴 *Стратегия убыточна на истории.*\n"
-                        + "WR=" + String.format("%.1f%%", wr)
-                        + " · Net PnL=" + String.format("%+.1f%%", totalNetPnL) + ".\n"
-                        + "Структурная проблема логики входа.\n"
-                        + "Реальные деньги категорически нельзя.";
+                // [v87 LEVERAGE-WARN 2026-05-09] Backtest PnL is at 1× equiv. With leverage
+                // > 1 the real account loss is multiplied. Make this explicit in the verdict
+                // so a casual reader doesn't underestimate the disaster scale.
+                int leverage = 1;
+                try {
+                    leverage = com.bot.BinanceTradeExecutor.getInstance().getLeverage();
+                } catch (Throwable ignore) {}
+
+                StringBuilder vb = new StringBuilder();
+                vb.append("🔴 *Стратегия убыточна на истории.*\n");
+                vb.append("WR=").append(String.format("%.1f%%", wr));
+                vb.append(" · Net PnL=").append(String.format("%+.1f%%", totalNetPnL)).append(".\n");
+                if (leverage > 1) {
+                    double leveragedLoss = totalNetPnL * leverage;
+                    vb.append(String.format(
+                            "⚠️ С плечом %dx реальный убыток ≈ %+.1f%% от маржи",
+                            leverage, leveragedLoss));
+                    if (leveragedLoss <= -100.0) {
+                        vb.append(" → *ЛИКВИДАЦИЯ*");
+                    }
+                    vb.append(".\n");
+                }
+                vb.append("Структурная проблема логики входа.\n");
+                vb.append("Реальные деньги категорически нельзя.");
+                verdict = vb.toString();
             }
         }
 

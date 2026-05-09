@@ -1207,11 +1207,32 @@ public final class GlobalImpulseController {
         }
 
         // ── Корректировка по волатильностному режиму ─────────────
+        // [v87 SYMMETRY-FIX 2026-05-09] Old asymmetry: only LONG was penalised on
+        // HIGH/EXTREME vol; SHORT was unaffected. Comment claimed "волатильность в
+        // нашу пользу" (volatility favors us) — but high vol cuts BOTH directions
+        // (whipsaws kill both LONGs at the bottom AND SHORTs at the top). The
+        // asymmetric penalty contributed to the bot's structural SHORT-bias visible
+        // in user logs (~70% SHORT signals, all losing). Now penalty applies symmetrically.
+        //
+        // ENV override: GIC_SYMMETRIC_VOL=0 reverts to old asymmetric behavior (NOT
+        // recommended — only for A/B comparison vs prior data).
+        boolean symmetricVolPenalty = !"0".equals(System.getenv()
+                .getOrDefault("GIC_SYMMETRIC_VOL", "1"));
         if (ctx.volRegime == VolatilityRegime.EXTREME) {
-            if (isLong) weight *= 0.80; // [SCANNER MODE] was 0.55 — EXTREME vol kills LONGs unfairly
-            // SHORT при extreme vol — не штрафуем (волатильность в нашу пользу)
+            if (isLong) {
+                weight *= 0.80; // [SCANNER MODE] was 0.55 — EXTREME vol kills LONGs unfairly
+            } else if (symmetricVolPenalty) {
+                // [v87] Symmetric: SHORT also penalised on EXTREME vol (whipsaw risk).
+                // Slightly lighter than LONG (0.85 vs 0.80) because SHORT does benefit
+                // marginally from vol via wider TP capture.
+                weight *= 0.85;
+            }
         } else if (ctx.volRegime == VolatilityRegime.HIGH) {
-            if (isLong) weight *= 0.90; // [SCANNER MODE] was 0.80
+            if (isLong) {
+                weight *= 0.90; // [SCANNER MODE] was 0.80
+            } else if (symmetricVolPenalty) {
+                weight *= 0.93; // [v87] Symmetric (slightly lighter for SHORT, same logic).
+            }
         }
 
         // ── Hurst Exponent regime adjustment ─────────────────────

@@ -118,7 +118,20 @@ public final class InstitutionalSignalCore {
 
     // Daily kill-switch threshold. At -5% daily PnL, block ALL new signals
     // until next UTC day. resetDailyIfNeeded() will clear dailyPnLPct automatically.
-    private static final double DAILY_KILL_SWITCH_PCT = -0.05;
+    //
+    // [v87 BUG-FIX 2026-05-09] UNIT MISMATCH RESTORED.
+    // Old value: -0.05. Comment said "At -5%", but the value is in FRACTION units.
+    // Meanwhile dailyPnLPct is accumulated in PERCENT (closeTrade passes pnlPct = ×100).
+    // Result: kill-switch triggered at -0.05% daily PnL — effectively after ANY first
+    // small losing trade, killing the bot for the rest of the UTC day. This was the
+    // silent reason for "bot stopped sending signals" reports in addition to calibrator
+    // poison and ISC backtest penalty.
+    //
+    // Correct value: -5.0 (matches the comment, matches sibling constants
+    // DAILY_LOSS_SURVIVAL_PCT=-6.0 and DAILY_LOSS_CAUTIOUS_PCT=-3.0 which are in percent).
+    // Override via env ISC_DAILY_KILL_SWITCH_PCT for tighter/looser thresholds.
+    private static final double DAILY_KILL_SWITCH_PCT =
+            envDouble("ISC_DAILY_KILL_SWITCH_PCT", -5.0);
 
     // DAILY SIGNAL LIMIT PER SYMBOL — prevents "milking" one volatile coin all day.
     // [v18] 4 → 5 per 8h (slightly more headroom in trending day).
@@ -480,8 +493,39 @@ public final class InstitutionalSignalCore {
             base += 1.0;
         }
 
-        if (lastBacktestEV < -0.02 && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L)
+        // [v87 BACKTEST-DECOUPLE 2026-05-09] Old behavior: any negative backtest EV
+        // within 2h would add +2 to minConf. Combined with poisoned calibrator
+        // (which already snaps raw probs to ~0.40), this caused a DOUBLE block:
+        // calibrator drops scores AND ISC raises the gate. Result: zero signals.
+        //
+        // New behavior:
+        //   - If calibrator is healthy (≥100 outcomes, recent WR ≥ 40%): keep
+        //     legacy +2 penalty for bad recent backtest. The system is mature
+        //     enough that an additional caution layer makes sense.
+        //   - If calibrator is in warmup or disabled: SKIP the penalty. Otherwise
+        //     we're stacking two safety nets that together produce paralysis.
+        //     The calibrator pass-through already reflects strategy uncertainty;
+        //     no need for a second multiplicative penalty.
+        //
+        // ENV override: ISC_LEGACY_BT_PENALTY=1 forces the old always-on behavior
+        // (use only if you've explicitly diagnosed and trust your calibrator state).
+        boolean btPenaltyEligible = "1".equals(System.getenv()
+                .getOrDefault("ISC_LEGACY_BT_PENALTY", "0"));
+        if (!btPenaltyEligible) {
+            // Auto-decide: only apply when calibrator is mature.
+            try {
+                int calN = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
+                btPenaltyEligible = calN >= 100;
+            } catch (Throwable ignored) {
+                // If we can't read calibrator state, default to NO penalty.
+                btPenaltyEligible = false;
+            }
+        }
+        if (btPenaltyEligible
+                && lastBacktestEV < -0.02
+                && System.currentTimeMillis() - lastBacktestTime < 2 * 3600_000L) {
             base += 2.0;
+        }
 
         return Math.max(floor, Math.min(base, MAX_EFFECTIVE_MIN_CONF));
     }

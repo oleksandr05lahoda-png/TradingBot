@@ -182,8 +182,15 @@ public final class BinanceTradeExecutor {
         }
 
         double rp = envDouble("RISK_PCT_PER_TRADE", 2.0);
-        this.riskPctPerTrade = Math.max(0.5, Math.min(5.0, rp));
-        if (rp > 5.0) {
+        // [v87 RISK-FLOOR 2026-05-09] Floor lowered 0.5% → 0.05%.
+        // Old floor blocked micro-test scenarios: user wanted RISK_PCT_PER_TRADE=0.1
+        // (10bp risk, conservative paper-to-live transition), got silent override to 0.5%.
+        // New floor 0.05% (5bp) prevents accidental 0% (which would zero-out qty calculation
+        // and fail every order) while allowing legitimate small-size tests. Ceiling stays 5%.
+        this.riskPctPerTrade = Math.max(0.05, Math.min(5.0, rp));
+        if (rp < 0.05 && rp > 0) {
+            LOG.warning("[Executor] RISK_PCT_PER_TRADE=" + rp + " requested (below 0.05% floor), using 0.05%");
+        } else if (rp > 5.0) {
             LOG.warning("[Executor] RISK_PCT_PER_TRADE=" + rp + " requested, capped to 5");
         }
 
@@ -192,7 +199,16 @@ public final class BinanceTradeExecutor {
         // Меньшее окно = меньше naked-position window после MARKET-открытия.
         // ENV SL_PLACEMENT_TIMEOUT_MS позволяет переопределить (для отладки).
         this.slPlacementTimeoutMs = envLong("SL_PLACEMENT_TIMEOUT_MS", 2000L);
-        this.maxSpreadPct         = envDouble("MAX_SPREAD_PCT", 0.5);
+        // [v87 SPREAD-FIX 2026-05-09] Testnet has THIN order books — spread 0.4-0.8% on
+        // ALT pairs is normal there but rare on mainnet (where ALTs are usually 0.02-0.10%).
+        // Old single default (0.5%) was too strict for testnet (lost legitimate fills like
+        // the user's NEARUSDT case "spread 0.50% > max 0.50%") and too loose for mainnet
+        // (allowed entries on illiquid books with 0.4% slippage = 80% of typical edge gone).
+        //
+        // New: testnet default 1.0% (loose, focus on functional testing), mainnet 0.30%
+        // (strict, protect edge). MAX_SPREAD_PCT env override always wins.
+        double defaultSpread = useTestnet ? 1.0 : 0.30;
+        this.maxSpreadPct         = envDouble("MAX_SPREAD_PCT", defaultSpread);
 
         this.http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
@@ -442,8 +458,11 @@ public final class BinanceTradeExecutor {
             if (mid <= 0) return ExecutionResult.fail("invalid book");
             double spreadPct = 100.0 * (ask - bid) / mid;
             if (spreadPct > maxSpreadPct) {
-                return ExecutionResult.fail(String.format("spread %.2f%% > max %.2f%%",
-                        spreadPct, maxSpreadPct));
+                // [v87 SPREAD-LOG 2026-05-09] %.3f instead of %.2f — old format showed
+                // "0.50% > max 0.50%" when actual was 0.503% > 0.500%, hiding the
+                // micro-overage and confusing operator. Now visible.
+                return ExecutionResult.fail(String.format("spread %.3f%% > max %.3f%% (bid=%.6f ask=%.6f)",
+                        spreadPct, maxSpreadPct, bid, ask));
             }
 
             // 3. Position size calculation

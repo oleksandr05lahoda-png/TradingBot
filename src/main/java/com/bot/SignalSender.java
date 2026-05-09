@@ -908,6 +908,17 @@ public final class SignalSender {
         if (!rejectTrace.isEmpty()) {
             LOG.info("[DIAG-ANALYZE] " + rejectTrace);
         }
+        // [v87 HEALTHCHECK 2026-05-09] Print calibrator + ISC state every cycle so the
+        // user can see at a glance WHY signals are being blocked. The health snapshot is
+        // a lightweight read-only operation. If calibrator is DISABLED or in BIAS-RISK
+        // state, the rest of the DIAG output makes more sense in context.
+        try {
+            com.bot.DecisionEngineMerged.ProbabilityCalibrator.HealthSnapshot calHealth =
+                    com.bot.DecisionEngineMerged.getCalibrator().health();
+            LOG.info("[DIAG-CAL] " + calHealth.summary);
+        } catch (Throwable ignored) {
+            // Health method is optional — older DE versions may not expose it.
+        }
         prevLiq = blockedLiq.get(); prevCorr = blockedCorr.get(); // prevStale: no-op — per-cycle
         prevProfit = blockedProfit.get(); prevEarlyConf = blockedEarlyConf.get();
         prevOptConf = blockedOptConf.get(); prevVpoc = blockedVpoc.get();
@@ -1326,6 +1337,16 @@ public final class SignalSender {
                     ? Math.min(MIN_CONF, _calWarmupFloor)
                     : MIN_CONF;
             double earlyMinConf = Math.max(effMinConfBase, iscFloor);
+            // [v87 EARLY-GATE-OVERRIDE 2026-05-09] Debug option: lower the early gate
+            // by N points to see how many signals would pass if calibrator/ISC weren't
+            // suppressing them. This is a TELEMETRY KNOB ONLY — does NOT bypass the
+            // authoritative finalMinConf gate downstream. Useful for the exact case
+            // where DIAG shows early=0 but no signals get through (rare, but proves
+            // the issue is BEFORE earlyMinConf, e.g. inside DE.generate() rejects).
+            double earlyGateBoostDown = envDouble("EARLY_GATE_LOOSEN", 0.0);
+            if (earlyGateBoostDown > 0 && earlyGateBoostDown <= 5.0) {
+                earlyMinConf = Math.max(0.0, earlyMinConf - earlyGateBoostDown);
+            }
             if (idea.probability < earlyMinConf) {
                 blockedEarlyConf.incrementAndGet();
                 return null;

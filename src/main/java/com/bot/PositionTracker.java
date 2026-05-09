@@ -494,7 +494,28 @@ public final class PositionTracker {
      */
     private String classifyCloseReason(Tracked t, double exitPrice, double pnl) {
         if (exitPrice <= 0) return pnl > 0 ? "PROFIT_UNKNOWN" : "LOSS_UNKNOWN";
-        double tol = 0.001; // 0.1% tolerance
+        // [v87 SLIPPAGE-TOL 2026-05-09] Tolerance widened from fixed 0.1% to category-aware:
+        //   TOP coins   (BTC/ETH/SOL/BNB):  0.20% — tight order books, low slippage expected
+        //   MEME / volatile:                 0.80% — wide books, frequent gaps, slippage 0.4-0.7%
+        //   ALT default:                     0.50% — typical slippage on Binance perp ALTs
+        //
+        // Old (0.10%): EVERY SL hit on ALT/MEME with normal slippage was misclassified as
+        // MANUAL_LOSS. User saw "❌ Позиция закрыта · Reason: MANUALLOSS" in Telegram even
+        // though SL fired naturally with 0.3-0.5% slippage past the level — pure log noise
+        // and undermined trust in the bot's reporting.
+        double tol;
+        String catUpper = t.symbol == null ? "" : t.symbol.toUpperCase();
+        if (catUpper.startsWith("BTC") || catUpper.startsWith("ETH")
+                || catUpper.startsWith("SOL") || catUpper.startsWith("BNB")) {
+            tol = 0.0020;
+        } else if (catUpper.contains("PEPE") || catUpper.contains("DOGE")
+                || catUpper.contains("SHIB") || catUpper.contains("FLOKI")
+                || catUpper.contains("BONK") || catUpper.contains("WIF")
+                || catUpper.contains("MEME")) {
+            tol = 0.0080;
+        } else {
+            tol = 0.0050; // ALT default
+        }
 
         // Helper: is exitPrice near level (within tolerance)?
         java.util.function.DoubleFunction<Boolean> near = level ->
@@ -505,7 +526,25 @@ public final class PositionTracker {
         if (t.beActivated && near.apply(t.slPrice)) return "TP1_THEN_BE";
         if (near.apply(t.slPrice)) return "SL_HIT";
 
-        // No level matched — likely manual close or odd execution
+        // [v87] Extended check: did exit price OVERSHOOT SL with slippage?
+        // Common case: market gapped through SL, executed past the level.
+        // Direction: for LONG, SL is below entry → overshoot means exitPrice < slPrice.
+        //            for SHORT, SL is above entry → overshoot means exitPrice > slPrice.
+        boolean overshootSl = (t.isLong && t.slPrice > 0 && exitPrice < t.slPrice)
+                || (!t.isLong && t.slPrice > 0 && exitPrice > t.slPrice);
+        if (overshootSl && pnl < 0) return "SL_SLIPPED";
+
+        // Symmetric check: did exit price OVERSHOOT TP1/TP2 (rare, market gapped through)?
+        boolean overshootTp1 = t.tp1Price > 0
+                && ((t.isLong && exitPrice > t.tp1Price)
+                || (!t.isLong && exitPrice < t.tp1Price));
+        boolean overshootTp2 = t.tp2Price > 0
+                && ((t.isLong && exitPrice > t.tp2Price)
+                || (!t.isLong && exitPrice < t.tp2Price));
+        if (overshootTp2 && pnl > 0) return "TP2_SLIPPED";
+        if (overshootTp1 && pnl > 0) return "TP1_SLIPPED";
+
+        // Truly out-of-band close — likely manual close or forced kill-switch
         if (pnl > 0) return "MANUAL_PROFIT";
         if (pnl < 0) return "MANUAL_LOSS";
         return "FLAT_CLOSE";

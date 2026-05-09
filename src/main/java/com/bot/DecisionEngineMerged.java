@@ -5528,8 +5528,17 @@ public final class DecisionEngineMerged {
         // Записи outcomes (recordOutcome) продолжаются — данные копятся для будущего
         // включения. Включай обратно (CALIBRATOR_DISABLED=0) когда наберётся
         // ≥100 свежих outcomes с целевым WR≥45%.
+        //
+        // [v87 2026-05-09] DEFAULT FLIPPED 0 → 1 (safety-first).
+        // Justification: calibrator is a probability mapping that REQUIRES a clean
+        // training dataset. With BotMain's startup-backtest path historically feeding
+        // poison (WR=39.9%, NetPnL=-25%), the calibrator learned to map raw probs to
+        // ~0.40, blocking all live signals at MIN_CONF=0.58. Default pass-through is
+        // the only safe state until the user has empirically confirmed positive edge.
+        // To re-enable PAV calibration (after ≥100 live outcomes with WR≥45%):
+        // set env CALIBRATOR_DISABLED=0 explicitly.
         private static final boolean DISABLED =
-                "1".equals(System.getenv().getOrDefault("CALIBRATOR_DISABLED", "0"));
+                !"0".equals(System.getenv().getOrDefault("CALIBRATOR_DISABLED", "1"));
 
         // [v79 I3] HMAC key + audit log. Set CALIBRATOR_HMAC_KEY in env on prod.
         private static final String HMAC_KEY = resolveHmacKey();
@@ -5672,6 +5681,49 @@ public final class DecisionEngineMerged {
                                           String outcomeTag, String btcRegime,
                                           double entryPrice, double currentPrice) {
             if (symbol == null) return;
+
+            // [v87 BIAS-DETECTION 2026-05-09] Refuse to add outcomes when the recent
+            // window is overwhelmingly losses. Protects against a single bad period
+            // (flash crash, exchange hiccup causing mass time-stops, or feeding from
+            // a known-bad backtest) flipping the entire PAV regression.
+            //
+            // Logic: scan up to 30 most-recent records (across all keys, last 24h only).
+            // If recent WR < 25%, decline this new record. Once WR recovers above
+            // threshold via natural trade flow, recording resumes.
+            //
+            // Override: env BIAS_GUARD=0 disables this check (only do this if you
+            // intentionally want to feed bad data, e.g. for a unit test).
+            //
+            // Note: the audit log still writes — full visibility, just no PAV poison.
+            if (!"0".equals(System.getenv().getOrDefault("BIAS_GUARD", "1"))
+                    && totalOutcomeCount() >= 30) {
+                int recentWins = 0, recentTotal = 0;
+                long now2 = System.currentTimeMillis();
+                long horizon = 24L * 3600_000L;
+                outerScan:
+                for (var dq2 : history.values()) {
+                    java.util.Iterator<Outcome> iter = dq2.descendingIterator();
+                    while (iter.hasNext()) {
+                        Outcome o2 = iter.next();
+                        if (now2 - o2.ts > horizon) continue;
+                        if (o2.hit) recentWins++;
+                        recentTotal++;
+                        if (recentTotal >= 30) break outerScan;
+                    }
+                }
+                if (recentTotal >= 30 && recentWins * 4 < recentTotal) {
+                    // Recent rolling WR < 25% — decline new record.
+                    LOG.fine("[Calibrator] BIAS-GUARD declining recordOutcome for "
+                            + symbol + " (recent WR " + recentWins + "/" + recentTotal
+                            + " < 25%). Set env BIAS_GUARD=0 to disable.");
+                    // Still write audit log — visibility is independent of PAV.
+                    try { writeOutcomeAudit(symbol, rawScore, hit, atrPct, weight,
+                            sanitizeTag(outcomeTag), regimeBucketOf(btcRegime),
+                            entryPrice, currentPrice); } catch (Throwable ignored) {}
+                    return;
+                }
+            }
+
             VolBucket vb = VolBucket.of(atrPct);
             String rb  = regimeBucketOf(btcRegime);
             String tag = sanitizeTag(outcomeTag);
@@ -6022,6 +6074,61 @@ public final class DecisionEngineMerged {
                 n += dq.size();
             }
             return n;
+        }
+
+        // [v87 HEALTHCHECK 2026-05-09] Diagnostics for external monitoring (Telegram
+        // heartbeat, /status endpoint). Returns a snapshot of calibrator state without
+        // exposing internals. All values are computed on a best-effort basis — this
+        // method is read-only and safe to call from any thread.
+        public static final class HealthSnapshot {
+            public final boolean disabled;          // is PAV currently in pass-through mode
+            public final int    totalOutcomes;      // total outcomes across all keys
+            public final int    recent24hCount;     // outcomes in last 24h
+            public final double recent24hWinRate;   // WR in last 24h, [0..1]
+            public final int    keysCount;          // distinct (sym, vol, regime) buckets
+            public final long   oldestOutcomeAgeMs; // age of oldest outcome
+            public final String summary;            // human-readable one-liner
+
+            HealthSnapshot(boolean disabled, int total, int rc, double rwr,
+                           int keys, long oldestAge, String summary) {
+                this.disabled = disabled;
+                this.totalOutcomes = total;
+                this.recent24hCount = rc;
+                this.recent24hWinRate = rwr;
+                this.keysCount = keys;
+                this.oldestOutcomeAgeMs = oldestAge;
+                this.summary = summary;
+            }
+        }
+
+        public HealthSnapshot health() {
+            int total = totalOutcomeCount();
+            int recent = 0, recentWins = 0;
+            int keys = history.size();
+            long now = System.currentTimeMillis();
+            long oldestAge = 0L;
+            long horizon24h = 24L * 3600_000L;
+            for (java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq : history.values()) {
+                for (Outcome o : dq) {
+                    long age = now - o.ts;
+                    if (age > oldestAge) oldestAge = age;
+                    if (age <= horizon24h) {
+                        recent++;
+                        if (o.hit) recentWins++;
+                    }
+                }
+            }
+            double rwr = recent > 0 ? (double) recentWins / recent : 0.0;
+            String state;
+            if (DISABLED) state = "DISABLED(passthrough)";
+            else if (total < MIN_SAMPLES) state = "WARMUP(" + total + "/" + MIN_SAMPLES + ")";
+            else if (recent < 30) state = "STALE(only " + recent + " in 24h)";
+            else if (rwr < 0.30) state = "BIAS-RISK(WR=" + String.format("%.0f%%", rwr * 100) + ")";
+            else state = "OK";
+            String summary = String.format(
+                    "Cal:%s n=%d 24h=%d/%.0f%% keys=%d",
+                    state, total, recent, rwr * 100, keys);
+            return new HealthSnapshot(DISABLED, total, recent, rwr, keys, oldestAge, summary);
         }
 
         // ─────────────────────────────────────────────────────────────────
