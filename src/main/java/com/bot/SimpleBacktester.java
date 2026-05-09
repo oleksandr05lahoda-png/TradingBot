@@ -140,6 +140,123 @@ public final class SimpleBacktester {
         catch (Exception e) { return def; }
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    // [Plan B v100] Historical funding rate fetcher.
+    //
+    // Pulls per-symbol funding rate history from Binance Futures public API
+    // (no auth required). Returns NavigableMap<timestamp_ms, fundingRate>.
+    //
+    // Endpoint: /fapi/v1/fundingRate?symbol={SYM}&startTime={MS}&endTime={MS}&limit=1000
+    // Funding rate granularity is 8 hours, so 30 days = ~90 entries. Single
+    // HTTP call per symbol per backtest run.
+    //
+    // Returns empty map on any error → caller treats as "no FR data, skip".
+    // ──────────────────────────────────────────────────────────────────────
+    private static java.util.NavigableMap<Long, Double> fetchFundingHistory(
+            String symbol, long startMs, long endMs) {
+        java.util.NavigableMap<Long, Double> out = new java.util.TreeMap<>();
+        try {
+            String fapiBase = System.getenv().getOrDefault(
+                    "BINANCE_FAPI_BASE", "https://fapi.binance.com");
+            String url = String.format(
+                    "%s/fapi/v1/fundingRate?symbol=%s&startTime=%d&endTime=%d&limit=1000",
+                    fapiBase, symbol, startMs, endMs);
+
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                    .connectTimeout(java.time.Duration.ofSeconds(8))
+                    .build();
+            java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create(url))
+                    .timeout(java.time.Duration.ofSeconds(15))
+                    .GET()
+                    .build();
+            java.net.http.HttpResponse<String> resp =
+                    client.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) return out;
+
+            String body = resp.body();
+            if (body == null || body.length() < 4) return out;
+
+            // Parse array of {"fundingTime":N,"fundingRate":"0.00012",...}
+            int pos = 0;
+            while (pos < body.length()) {
+                int objStart = body.indexOf('{', pos);
+                if (objStart < 0) break;
+                int objEnd = body.indexOf('}', objStart);
+                if (objEnd < 0) break;
+                String entry = body.substring(objStart, objEnd + 1);
+                Long ts = bt_extractJsonLong(entry, "fundingTime");
+                Double fr = bt_extractJsonDouble(entry, "fundingRate");
+                if (ts != null && fr != null) out.put(ts, fr);
+                pos = objEnd + 1;
+            }
+        } catch (Throwable ignored) {
+            // Network error / parse error → return whatever we got
+        }
+        return out;
+    }
+
+    /**
+     * [Plan B v100] Inject historical funding into the engine's fundingCache so
+     * generate() reads correct FR + delta + acceleration at the given backtest
+     * timestamp.
+     *
+     * Engine.updateFundingOI computes: delta = fr - prevFr, accel = delta - prevDelta.
+     * To get accel, we need 3 consecutive FR events. So we replay the 3 most-recent
+     * funding events ending at or before `now`.
+     */
+    private static void injectHistoricalFunding(
+            com.bot.DecisionEngineMerged engine,
+            String symbol,
+            java.util.NavigableMap<Long, Double> history,
+            long now) {
+        if (history == null || history.isEmpty()) return;
+
+        // Find 3 most-recent funding events ≤ now
+        java.util.NavigableMap<Long, Double> head = history.headMap(now, true);
+        if (head.isEmpty()) return;
+
+        // Replay last 3 events in chronological order — engine builds delta+accel naturally
+        java.util.List<java.util.Map.Entry<Long, Double>> recent = new java.util.ArrayList<>(head.entrySet());
+        int from = Math.max(0, recent.size() - 3);
+        for (int i = from; i < recent.size(); i++) {
+            engine.updateFundingOI(symbol, recent.get(i).getValue(), 0.0, 0.0, 0.0);
+        }
+    }
+
+    private static Long bt_extractJsonLong(String json, String key) {
+        try {
+            String pat = "\"" + key + "\":";
+            int idx = json.indexOf(pat);
+            if (idx < 0) return null;
+            int start = idx + pat.length();
+            while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == '"')) start++;
+            int end = start;
+            while (end < json.length()
+                    && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) end++;
+            if (end == start) return null;
+            return Long.parseLong(json.substring(start, end).trim());
+        } catch (Throwable t) { return null; }
+    }
+
+    private static Double bt_extractJsonDouble(String json, String key) {
+        try {
+            String pat = "\"" + key + "\":";
+            int idx = json.indexOf(pat);
+            if (idx < 0) return null;
+            int start = idx + pat.length();
+            while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == '"')) start++;
+            int end = start;
+            while (end < json.length()) {
+                char c = json.charAt(end);
+                if (Character.isDigit(c) || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+') end++;
+                else break;
+            }
+            if (end == start) return null;
+            return Double.parseDouble(json.substring(start, end).trim());
+        } catch (Throwable t) { return null; }
+    }
+
     //  RESULTS
 
     public static final class BacktestResult {
@@ -440,6 +557,25 @@ public final class SimpleBacktester {
         com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
         com.bot.GlobalImpulseController btGic = new com.bot.GlobalImpulseController();
         engine.setGIC(btGic);
+
+        // [Plan B v100] Load historical funding rates for this symbol so the new
+        // FR-mean-reversion generate() has data to evaluate. Single HTTP call
+        // (~30-day window = ~90 funding events @ 8h granularity, ~5KB payload).
+        // If fetch fails: backtest returns empty result (consistent with no-data
+        // behavior of CleanStrategy in live).
+        java.util.NavigableMap<Long, Double> btFundingHistory;
+        try {
+            long historyStart = m15.get(0).openTime;
+            long historyEnd   = m15.get(m15.size() - 1).closeTime;
+            btFundingHistory = fetchFundingHistory(symbol, historyStart, historyEnd);
+            if (btFundingHistory == null || btFundingHistory.isEmpty()) {
+                // Without funding history, FR-MR has no signal — return empty result.
+                return result;
+            }
+        } catch (Throwable t) {
+            return result;
+        }
+
         // Effective slippage = base × (1 + position/volume) capped at 3× base.
         // When setVolume24hUSD() not called (default = 0), falls back to base rate
         // preserving pre-patch behavior.
@@ -550,6 +686,13 @@ public final class SimpleBacktester {
                     sliceM1 = getTimeframeSlice(m1, m15.get(Math.max(0, i - 20)).openTime, decisionTime);
                 if (m5 != null && !m5.isEmpty())
                     sliceM5 = getTimeframeSlice(m5, m15.get(Math.max(0, i - 40)).openTime, decisionTime);
+
+                // [Plan B v100] Feed the engine with the funding rate that was
+                // current at this backtest timestamp. The engine reads
+                // fundingCache.get(symbol) inside generate(); we update cache
+                // with two consecutive FR events to get correct delta+accel
+                // (mimics what live updateFundingOI() chain produces).
+                injectHistoricalFunding(engine, symbol, btFundingHistory, decisionTime);
 
                 com.bot.DecisionEngineMerged.TradeIdea idea = engine.analyze(
                         symbol, sliceM1, sliceM5, slice15, sliceH1, category);
