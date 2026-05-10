@@ -1626,6 +1626,63 @@ public final class DecisionEngineMerged {
     //
     //  ПАРАМЕТРЫ ЗАФИКСИРОВАНЫ. Не подкручивать под результаты бэктеста.
 
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE 2: REGIME-AWARE STRATEGY ROUTER  [v92 2026-05-10]
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // Phase 1: generate() called only VWAP-MR. Other detectors (PumpHunter,
+    // BoS) ran but only as TAGS, not as trade generators. Result: ~1.5
+    // trades/pair/day ceiling, blind to trends and pumps.
+    //
+    // Phase 2: generate() is now a ROUTER. Detects market regime (1h ADX-based),
+    // routes to appropriate strategy. Each strategy can independently open
+    // trades. Cross-strategy cooldown via csLastSignalTime prevents whipsaw
+    // (one symbol → max one open trade across all strategies).
+    //
+    // Strategies:
+    //   1. PumpHunter setup     — pre-pump/exhaustion (any regime, top priority)
+    //   2. Breakout             — when 1h ADX > PHASE2_BREAKOUT_MIN_ADX + BoS
+    //   3. VWAP Mean Reversion  — when ranging (1h ADX < PHASE2_RANGE_MAX_ADX)
+    //
+    // Why this is safe (no whipsaw, no double-fire):
+    //   - Only ONE strategy fires per pair per cycle (router selects)
+    //   - csLastSignalTime is GLOBAL across all strategies (cross-lock)
+    //   - correlationGuard in SignalSender still active (cluster-cap)
+    //   - CHOPPY/UNCLEAR regime → fallback to MR or reject
+    //
+    // Env tunables (all optional, sensible defaults):
+    //   PHASE2_PUMPHUNTER_ENABLE   — enable PumpHunter as generator (default true)
+    //   PHASE2_BREAKOUT_ENABLE     — enable Breakout strategy (default true)
+    //   PHASE2_BREAKOUT_MIN_ADX    — 1h ADX threshold for TREND (default 25.0)
+    //   PHASE2_RANGE_MAX_ADX       — 1h ADX threshold for RANGE (default 22.0)
+    //   PHASE2_PUMP_MIN_STRENGTH   — min PumpHunter strength to fire (default 0.50)
+    // ──────────────────────────────────────────────────────────────────────
+
+    private enum MarketRegime {
+        TREND_UP,        // 1h ADX > threshold AND +DI > -DI
+        TREND_DOWN,      // 1h ADX > threshold AND -DI > +DI
+        RANGE,           // 1h ADX < threshold (MR works)
+        UNCLEAR          // ambiguous — fallback to MR
+    }
+
+    private MarketRegime detectMarketRegime(List<com.bot.TradingCore.Candle> c1h) {
+        if (c1h == null || c1h.size() < 30) return MarketRegime.UNCLEAR;
+
+        com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
+        double adxValue = adx1h.adx;
+        boolean dirUp   = adx1h.plusDI  > adx1h.minusDI;
+        boolean dirDown = adx1h.minusDI > adx1h.plusDI;
+
+        if (adxValue > PHASE2_BREAKOUT_MIN_ADX) {
+            if (dirUp)   return MarketRegime.TREND_UP;
+            if (dirDown) return MarketRegime.TREND_DOWN;
+        }
+        if (adxValue < PHASE2_RANGE_MAX_ADX) {
+            return MarketRegime.RANGE;
+        }
+        return MarketRegime.UNCLEAR;
+    }
+
     private TradeIdea generate(String symbol,
                                List<com.bot.TradingCore.Candle> c1,
                                List<com.bot.TradingCore.Candle> c5,
@@ -1634,6 +1691,300 @@ public final class DecisionEngineMerged {
                                List<com.bot.TradingCore.Candle> c2h,
                                CoinCategory cat,
                                long now) {
+
+        // ─── Common pre-filters (apply to ALL strategies) ───
+        if (!valid(c15) || !valid(c1h)) return reject("invalid_candles");
+
+        // CROSS-STRATEGY COOLDOWN — single global lock per symbol.
+        // Once any strategy fires here, all strategies blocked until cooldown.
+        Long lastSig = csLastSignalTime.get(symbol);
+        if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) {
+            return reject("cs_cooldown");
+        }
+
+        // Post-pump / post-dump persisted skips from other systems
+        Long ppUntil = postPumpSkipUntil.get(symbol);
+        if (ppUntil != null) {
+            if (now < ppUntil) return reject("post_pump_cooldown");
+            postPumpSkipUntil.remove(symbol);
+        }
+        Long pdUntil = postDumpSkipUntil.get(symbol);
+        if (pdUntil != null) {
+            if (now < pdUntil) return reject("post_dump_cooldown");
+            postDumpSkipUntil.remove(symbol);
+        }
+
+        // MEME blanket-skip across all strategies
+        if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("cs_skip_meme");
+
+        // ─── REGIME DETECTION ───
+        MarketRegime regime = detectMarketRegime(c1h);
+
+        // ─── ROUTER: try strategies by priority ───
+        TradeIdea idea;
+
+        // Priority 1: PumpHunter (anticipatory + reversal — highest signal value)
+        if (PHASE2_PUMPHUNTER_ENABLE) {
+            idea = generateFromPumpHunter(symbol, c1, c5, c15, cat, now);
+            if (idea != null) {
+                csLastSignalTime.put(symbol, now);
+                return idea;
+            }
+        }
+
+        // Priority 2: Breakout for trending markets
+        if (PHASE2_BREAKOUT_ENABLE &&
+                (regime == MarketRegime.TREND_UP || regime == MarketRegime.TREND_DOWN)) {
+            idea = generateBreakout(symbol, c5, c15, c1h, c2h, cat, regime, now);
+            if (idea != null) {
+                csLastSignalTime.put(symbol, now);
+                return idea;
+            }
+        }
+
+        // Priority 3: VWAP Mean Reversion for ranging / unclear
+        if (regime == MarketRegime.RANGE || regime == MarketRegime.UNCLEAR) {
+            idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
+            if (idea != null) {
+                csLastSignalTime.put(symbol, now);
+                return idea;
+            }
+        }
+
+        return reject("regime_" + regime.name().toLowerCase() + "_no_setup");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STRATEGY: BREAKOUT — for TREND regime (1h ADX > 25, +DI/-DI directional)
+    // ─────────────────────────────────────────────────────────────────────
+    //   1. 5m BoS detected (existing detectBoS)
+    //   2. Volume spike: 5m vol > 1.3× SMA20
+    //   3. Direction matches 1h trend (no ChoCh — only continuation)
+    //   4. ATR percentile in [0.40, 0.95]
+    //   5. SL = broken swing level + 0.3% buffer; TP = 2R; R:R = 1:2
+    //   6. Probability: base 0.58 + bonuses (vol, HTF, BTC, pullback) cap 0.78
+    private TradeIdea generateBreakout(String symbol,
+                                       List<com.bot.TradingCore.Candle> c5,
+                                       List<com.bot.TradingCore.Candle> c15,
+                                       List<com.bot.TradingCore.Candle> c1h,
+                                       List<com.bot.TradingCore.Candle> c2h,
+                                       CoinCategory cat,
+                                       MarketRegime regime,
+                                       long now) {
+        if (c5 == null || c5.size() < 30) return reject("bo_insufficient_5m");
+
+        double atrPct15 = com.bot.TradingCore.atrPercentile(c15, 14, 100);
+        if (atrPct15 < 0.40) return reject("bo_atr_too_low");
+        if (atrPct15 > 0.95) return reject("bo_atr_too_high");
+
+        boolean trendUp = (regime == MarketRegime.TREND_UP);
+        int htfStructure = trendUp ? 1 : -1;
+        BosResult bos = detectBoS(c5, htfStructure);
+        if (!bos.detected) return reject("bo_no_bos");
+        if (bos.isChoch)   return reject("bo_choch_skipped");
+        if (bos.isBullish != trendUp) return reject("bo_direction_mismatch");
+
+        double volSma20_5m = computeVolumeSma(c5, 20);
+        double volCurrent_5m = last(c5).volume;
+        if (volSma20_5m <= 0 || volCurrent_5m < volSma20_5m * 1.30) {
+            return reject("bo_no_volume_confirm");
+        }
+
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
+                return reject("bo_btc_panic");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
+                return reject("bo_btc_crash");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CHOPPY)
+                return reject("bo_btc_choppy");
+            if (trendUp) {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN)
+                    return reject("bo_btc_strong_down_blocks_long");
+                if (btc.onlyShort) return reject("bo_only_short_blocks_long");
+            } else {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
+                    return reject("bo_btc_strong_up_blocks_short");
+                if (btc.onlyLong) return reject("bo_only_long_blocks_short");
+            }
+        }
+
+        double price = last(c5).close;
+        double swingLevel = bos.swingLevel;
+        double slBuffer = 0.003;
+        double stop = trendUp
+                ? swingLevel * (1.0 - slBuffer)
+                : swingLevel * (1.0 + slBuffer);
+        double riskDist = Math.abs(price - stop);
+        if (riskDist / price < 0.005) return reject("bo_sl_too_tight");
+        if (riskDist / price > 0.05)  return reject("bo_sl_too_wide");
+        double tp = trendUp ? price + riskDist * 2.0 : price - riskDist * 2.0;
+        com.bot.TradingCore.Side side = trendUp
+                ? com.bot.TradingCore.Side.LONG
+                : com.bot.TradingCore.Side.SHORT;
+
+        double probability01 = 0.58;
+        if (volCurrent_5m > volSma20_5m * 1.50) probability01 += 0.04;
+
+        HTFBias bias2h = detectBias2H(c2h != null && c2h.size() >= MIN_BARS ? c2h : c1h);
+        if (bias2h != null) {
+            boolean alignedHTF = (trendUp && bias2h == HTFBias.BULL) ||
+                    (!trendUp && bias2h == HTFBias.BEAR);
+            if (alignedHTF) probability01 += 0.04;
+        }
+        if (btc != null) {
+            if (trendUp && (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP
+                    || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP)) {
+                probability01 += 0.04;
+            } else if (!trendUp && (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN
+                    || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_DOWN)) {
+                probability01 += 0.04;
+            }
+        }
+        if (pullback(c5, trendUp)) probability01 += 0.04;
+
+        probability01 = Math.min(0.78, probability01);
+        double probability = probability01 * 100.0;
+
+        List<String> flags = new ArrayList<>();
+        flags.add("BREAKOUT");
+        flags.add(trendUp ? "BOS_UP" : "BOS_DOWN");
+        flags.add(String.format("SWING=%.6f", swingLevel));
+        flags.add(String.format("VOL/SMA=%.2f", volCurrent_5m / volSma20_5m));
+        flags.add(String.format("ATR_PCT=%.2f", atrPct15));
+        flags.add(trendUp ? "REGIME_TREND_UP" : "REGIME_TREND_DOWN");
+        if (btc != null) flags.add("BTC_" + btc.regime.name());
+
+        FundingOIData fr = fundingCache.get(symbol);
+        double frRate  = (fr != null && fr.isValid()) ? fr.fundingRate  : 0.0;
+        double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
+        double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
+
+        TradeIdea idea = new TradeIdea(
+                symbol, side, price, stop, tp, 2.0,
+                probability, flags,
+                frRate, frDelta, oiCh,
+                bias2h.name(), cat,
+                null,
+                1.0, 2.0, 2.0
+        );
+        idea.setRobustAtrPct(riskDist / price);
+        idea.setAgreeingClusters(1);
+        return idea;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STRATEGY: FROM PUMPHUNTER — anticipatory + reversal setups
+    // ─────────────────────────────────────────────────────────────────────
+    // Consumes existing pumpHunter.detectPump() output. Acts ONLY on
+    // anticipatory (PRE_PUMP_LONG/PRE_DUMP_SHORT) and reversal
+    // (PUMP_EXHAUSTION_SHORT/DUMP_EXHAUSTION_LONG) events. Continuation
+    // pumps are skipped — chasing pumps has poor expectancy.
+    private TradeIdea generateFromPumpHunter(String symbol,
+                                             List<com.bot.TradingCore.Candle> c1,
+                                             List<com.bot.TradingCore.Candle> c5,
+                                             List<com.bot.TradingCore.Candle> c15,
+                                             CoinCategory cat,
+                                             long now) {
+        if (pumpHunter == null) return null;
+        if (c1 == null || c1.size() < 20) return null;
+        if (c15 == null || c15.size() < MIN_BARS) return null;
+
+        com.bot.PumpHunter.PumpEvent event = pumpHunter.detectPump(symbol, c1, c5, c15, cat);
+        if (event == null || event.type == com.bot.PumpHunter.PumpType.NONE) return null;
+        if (event.strength < PHASE2_PUMP_MIN_STRENGTH) return reject("ph_strength_too_low");
+
+        // Only act on anticipatory or reversal — NOT continuation
+        if (!event.isAnticipatory() && !event.isReversal()) return reject("ph_continuation_skipped");
+
+        double price = last(c15).close;
+        @SuppressWarnings("deprecation")
+        com.bot.PumpHunter.PumpSignal sig = pumpHunter.generateSignal(event, price);
+        if (sig == null) return reject("ph_signal_null");
+
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
+                return reject("ph_btc_panic");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
+                return reject("ph_btc_crash");
+            if (sig.side == com.bot.TradingCore.Side.LONG  && btc.onlyShort) return reject("ph_only_short");
+            if (sig.side == com.bot.TradingCore.Side.SHORT && btc.onlyLong)  return reject("ph_only_long");
+        }
+
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return reject("ph_invalid_atr");
+
+        // Anticipatory → tighter SL (compression breaks cleanly), wider TP
+        // Reversal     → wider SL (pump tops are messy), conservative TP
+        double slMult = event.isAnticipatory() ? 1.2 : 1.6;
+        double tpR    = event.isAnticipatory() ? 2.5 : 2.0;
+        double slDist = atr14 * slMult;
+        double stop = (sig.side == com.bot.TradingCore.Side.LONG)
+                ? price - slDist : price + slDist;
+        double tp = (sig.side == com.bot.TradingCore.Side.LONG)
+                ? price + slDist * tpR : price - slDist * tpR;
+
+        // pumpHunter.generateSignal returns confidence on 55-85 scale — use directly,
+        // cap at 78 to align with global MIN_CONF_CEIL.
+        double probability01 = sig.confidence / 100.0;
+        probability01 = Math.min(0.78, Math.max(0.55, probability01));
+        double probability = probability01 * 100.0;
+
+        List<String> flags = new ArrayList<>();
+        flags.add("PHASE2_PH");
+        flags.add("PH_" + event.type.name());
+        flags.add(String.format("STRENGTH=%.2f", event.strength));
+        flags.add(String.format("VOL_RATIO=%.1fx", event.volumeRatio));
+        flags.add(String.format("MOVE=%.2f%%", event.movePct * 100));
+        if (event.isAnticipatory()) flags.add("ANTICIPATORY");
+        if (event.isReversal())     flags.add("REVERSAL");
+        if (btc != null) flags.add("BTC_" + btc.regime.name());
+        flags.addAll(event.flags);
+
+        HTFBias bias2hPH = detectBias2H(c15);
+
+        FundingOIData fr = fundingCache.get(symbol);
+        double frRate  = (fr != null && fr.isValid()) ? fr.fundingRate  : 0.0;
+        double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
+        double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
+
+        TradeIdea idea = new TradeIdea(
+                symbol, sig.side, price, stop, tp, tpR,
+                probability, flags,
+                frRate, frDelta, oiCh,
+                bias2hPH.name(), cat,
+                null,
+                1.0, tpR, tpR
+        );
+        idea.setRobustAtrPct(atr14 / price);
+        idea.setAgreeingClusters(1);
+        return idea;
+    }
+
+    // ─── Phase 2 env tunables (resolved once at class load) ───
+    private static final boolean PHASE2_PUMPHUNTER_ENABLE = csEnvBool("PHASE2_PUMPHUNTER_ENABLE", true);
+    private static final boolean PHASE2_BREAKOUT_ENABLE   = csEnvBool("PHASE2_BREAKOUT_ENABLE",   true);
+    private static final double  PHASE2_BREAKOUT_MIN_ADX  = csEnvDouble("PHASE2_BREAKOUT_MIN_ADX", 25.0);
+    private static final double  PHASE2_RANGE_MAX_ADX     = csEnvDouble("PHASE2_RANGE_MAX_ADX",    22.0);
+    private static final double  PHASE2_PUMP_MIN_STRENGTH = csEnvDouble("PHASE2_PUMP_MIN_STRENGTH", 0.50);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STRATEGY: VWAP MEAN REVERSION (was generate(), Phase 1)
+    // ─────────────────────────────────────────────────────────────────────
+    // Body unchanged from Phase 1. Pre-filters (validation, MEME, cooldown,
+    // post-pump skips) are now in router — kept here as defensive duplicates,
+    // they never trigger because router already passed them, no perf impact.
+    private TradeIdea generateMR(String symbol,
+                                 List<com.bot.TradingCore.Candle> c1,
+                                 List<com.bot.TradingCore.Candle> c5,
+                                 List<com.bot.TradingCore.Candle> c15,
+                                 List<com.bot.TradingCore.Candle> c1h,
+                                 List<com.bot.TradingCore.Candle> c2h,
+                                 CoinCategory cat,
+                                 long now) {
 
         // ─── Validation ─────────────────────────────────────────────────────
         if (!valid(c15) || !valid(c1h)) return reject("invalid_candles");
