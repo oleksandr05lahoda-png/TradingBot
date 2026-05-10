@@ -693,6 +693,21 @@ public final class PositionTracker {
             } else {
                 LOG.info("[Tracker] startup reconcile: clean (no orphan positions)");
             }
+
+            // After reconcile: cancel any orphan orders account-wide and
+            // re-attempt ONE_WAY mode. The boot-time call may have failed
+            // silently if orders were hanging. Now positions are dealt with,
+            // sweep any lingering orders and retry the position-mode switch.
+            try {
+                int cancelled = executor.cancelAllOrdersAccountWide();
+                if (cancelled > 0) {
+                    LOG.info("[Tracker] post-reconcile: cancelled "
+                            + cancelled + " orphan orders account-wide");
+                }
+                executor.ensureCleanAccountAndOneWayMode();
+            } catch (Throwable t) {
+                LOG.warning("[Tracker] post-reconcile cleanup failed: " + t.getMessage());
+            }
         } catch (Throwable t) {
             LOG.warning("[Tracker] reconcile error: " + t.getMessage());
         }

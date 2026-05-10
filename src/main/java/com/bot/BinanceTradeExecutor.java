@@ -220,8 +220,16 @@ public final class BinanceTradeExecutor {
      * POST /fapi/v1/positionSide/dual?dualSidePosition=false
      * Force account into ONE_WAY position mode so MARKET orders without
      * positionSide=LONG/SHORT are accepted. Idempotent — safe to call repeatedly.
+     *
+     * Auto-handles -4067 ("Position side cannot be changed if there exists
+     * open orders") by enumerating all open orders, cancelling them, then
+     * retrying the position-side switch once.
      */
     private void ensureOneWayMode() throws Exception {
+        ensureOneWayMode(false); // first attempt without cancel
+    }
+
+    private void ensureOneWayMode(boolean afterCancel) throws Exception {
         long ts = ts();
         String body = "dualSidePosition=false&timestamp=" + ts + "&recvWindow=5000";
         String sig = hmacSHA256(apiSecret, body);
@@ -241,9 +249,76 @@ public final class BinanceTradeExecutor {
             // -4059 = "No need to change position side" — already ONE_WAY, OK.
             if (b.contains("-4059") || b.contains("No need")) {
                 LOG.info("[Executor] position mode already ONE_WAY");
+            }
+            // -4067 = "Position side cannot be changed if there exists open
+            // orders" — cancel ALL open orders across all symbols, then retry.
+            // Only retry once (afterCancel guard) to avoid infinite loop.
+            else if ((b.contains("-4067") || b.contains("open orders")) && !afterCancel) {
+                LOG.warning("[Executor] -4067 detected — cancelling all open orders before retry");
+                int cancelled = cancelAllOrdersAccountWide();
+                LOG.info("[Executor] cancelled " + cancelled + " open orders, retrying ensureOneWayMode");
+                ensureOneWayMode(true); // single retry
             } else {
                 LOG.warning("[Executor] positionSide/dual HTTP " + resp.statusCode() + ": " + b);
             }
+        }
+    }
+
+    /**
+     * Account-wide cleanup: enumerates all symbols with open orders via
+     * GET /fapi/v1/openOrders (no symbol = all), then DELETE /fapi/v1/allOpenOrders
+     * per symbol. Returns count of orders cancelled.
+     *
+     * Used by ensureOneWayMode to clear blockers preventing position-mode
+     * change, and exposed publicly for callers (PositionTracker reconcile)
+     * that need to wipe stale orders.
+     */
+    public int cancelAllOrdersAccountWide() {
+        int total = 0;
+        try {
+            long ts = ts();
+            String qs = "timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/openOrders?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                LOG.warning("[Executor] cancelAllOrdersAccountWide list HTTP " + resp.statusCode());
+                return 0;
+            }
+            org.json.JSONArray arr = new org.json.JSONArray(resp.body());
+            java.util.Set<String> symbols = new java.util.HashSet<>();
+            for (int i = 0; i < arr.length(); i++) {
+                symbols.add(arr.getJSONObject(i).getString("symbol"));
+            }
+            for (String sym : symbols) {
+                try {
+                    cancelAllOpenOrders(sym);
+                    total += arr.length(); // approximate
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            LOG.warning("[Executor] cancelAllOrdersAccountWide error: " + t.getMessage());
+        }
+        return total;
+    }
+
+    /**
+     * Public re-entry point for one-way mode setup. Called by PositionTracker
+     * after startup reconcile completes (positions closed, orders cancelled).
+     * At this point the account is "clean" and the switch should succeed.
+     */
+    public void ensureCleanAccountAndOneWayMode() {
+        if (!isReady()) return;
+        try {
+            ensureOneWayMode();
+        } catch (Exception e) {
+            LOG.warning("[Executor] post-reconcile ensureOneWayMode failed: " + e.getMessage());
         }
     }
 
