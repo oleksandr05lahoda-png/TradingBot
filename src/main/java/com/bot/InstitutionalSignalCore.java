@@ -34,25 +34,22 @@ public final class InstitutionalSignalCore {
     private final double minSignalPriceDiff;
     private final int    maxSameSectorSameDir;
 
-    // [v82] TIME_STOP_BARS 4 → 12 (60min → 180min). REVERSE v81.
+    // [v90 1H-PRIMARY 2026-05-09] TIME_STOP_BARS scales with PRIMARY_TF.
+    //   PRIMARY_TF=15m: 12 bars × 15min = 180 min stop window
+    //   PRIMARY_TF=1h:   8 bars × 60min = 480 min (8h) stop window
     //
-    // Постмортем v81: укорочение time-stop с 6 до 4 баров было сделано на ошибочном
-    // выводе "88% сделок упирается в time-stop за 90 мин = цена топчется".
-    // На самом деле 88% time-stops означали "TP1=1.20×R≈1×ATR-15m физически НЕ
-    // успевает реализоваться за 4-6 баров для большинства setup'ов". Уменьшение
-    // окна до 60 мин просто ускорило фиксацию того же отсутствия движения и
-    // дало 89.7% time-stops в новом backtest = тот же результат, ускоренный.
+    // The 8h window on 1h primary fits the slower price discovery on hourly
+    // bars: typical mean-reversion target (1.0R ≈ 1.5×ATR-1h) takes 4-12
+    // bars on liquid alts, 8 is the median compromise.
     //
-    // Решение: вернуть в окрестность 180 мин (12 баров). Реалистичный медианный
-    // time-to-target для 1×ATR на 15m ≈ 8–16 баров. 12 — компромисс.
-    //
-    // ENV ISC_TIME_STOP_BARS позволяет точечно подкрутить (default 12). Должен
-    // совпадать с BACKTEST_TIME_STOP_BARS в SimpleBacktester — иначе walk-forward
-    // снова разъедется с live (та же ловушка, что v75 пытался закрыть).
-    // DecisionEngineMerged.toTelegramString должен печатать соответствующее число
-    // минут (180 при default=12) — захардкожено там же [v82].
-    private static final int  TIME_STOP_BARS  = envInt("ISC_TIME_STOP_BARS", 12);
-    private static final long TIME_STOP_MS    = TIME_STOP_BARS * 15 * 60_000L;
+    // ENV ISC_TIME_STOP_BARS overrides; must match BACKTEST_TIME_STOP_BARS.
+    // TIME_STOP_MS auto-computes from PRIMARY_TF (60min vs 15min per bar).
+    private static final boolean ISC_IS_15M = "15m".equals(
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+    private static final long ISC_BAR_MS = ISC_IS_15M ? 15 * 60_000L : 60 * 60_000L;
+    private static final int  TIME_STOP_BARS  = envInt("ISC_TIME_STOP_BARS",
+            ISC_IS_15M ? 12 : 8);
+    private static final long TIME_STOP_MS    = TIME_STOP_BARS * ISC_BAR_MS;
     private static final int  MAX_HISTORY     = 100;
 
     public InstitutionalSignalCore() {

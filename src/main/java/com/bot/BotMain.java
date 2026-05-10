@@ -66,7 +66,19 @@ public final class BotMain {
     }
 
     private static volatile ZoneId ZONE = ZoneId.of("Europe/Warsaw");
-    private static final int INTERVAL = envInt("SIGNAL_INTERVAL_MIN", 1);
+    private static final int INTERVAL = envInt("SIGNAL_INTERVAL_MIN", 5);
+
+    // [v90 1H-PRIMARY 2026-05-09] Primary timeframe — string used for fetchKlines
+    // and HTF derivation. Default "1h" (was hardcoded "15m" pre-v90). To revert
+    // set env PRIMARY_TF=15m. Must match SignalSender.PRIMARY_TF.
+    public static final String PRIMARY_TF =
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+    public static final String HTF_FAST =
+            System.getenv().getOrDefault("HTF_FAST",
+                    "1h".equals(PRIMARY_TF) ? "4h" : "1h").trim();
+    public static final boolean PRIMARY_IS_15M = "15m".equals(PRIMARY_TF);
+    public static final long PRIMARY_TF_MS = "1h".equals(PRIMARY_TF) ? 60 * 60_000L
+            : "30m".equals(PRIMARY_TF) ? 30 * 60_000L : 15 * 60_000L;
 
     // [v78.1] Paper/observation mode. When OBSERVATION_MODE=1, signals reach
     // Telegram tagged 🧪 [PAPER]. Calibrator still records outcomes, so the bot
@@ -90,7 +102,11 @@ public final class BotMain {
     public static final boolean CROSS_EXCHANGE_VALIDATION =
             "1".equals(System.getenv().getOrDefault("CROSS_EXCHANGE_VALIDATION", "0"));
 
-    private static final int KLINES = envIntAny(420, "KLINES", "KLINES_LIMIT");
+    // [v90] KLINES default scales with PRIMARY_TF.
+    //   15m primary: 420 bars = 4.4 days
+    //   1h primary:  168 bars = 7 days (more history available, fewer bars needed)
+    private static final int KLINES = envIntAny(
+            PRIMARY_IS_15M ? 420 : 168, "KLINES", "KLINES_LIMIT");
     // [HOLE-FUNNEL FIX 2026-05-08] Default 3 → 5. Лимит был узким горлом
     // в высоковолатильных окнах (Asia open / US close), где 5+ валидных
     // setups существуют одновременно. Можно переопределить через env.
@@ -1328,9 +1344,9 @@ public final class BotMain {
             boolean forceTimeStop = fr.ageMs() > maxAgeMs;
 
             try {
-                int barsNeeded = (int) Math.ceil(fr.ageMs() / (15.0 * 60_000L)) + 2;
+                int barsNeeded = (int) Math.ceil(fr.ageMs() / (double) PRIMARY_TF_MS) + 2;
                 barsNeeded = Math.max(5, Math.min(30, barsNeeded));
-                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, "15m", barsNeeded);
+                List<com.bot.TradingCore.Candle> c = sender.fetchKlines(fr.symbol, PRIMARY_TF, barsNeeded);
                 if (c == null || c.isEmpty()) {
                     if (forceTimeStop) it.remove();
                     continue;
@@ -1699,11 +1715,12 @@ public final class BotMain {
         for (String sym : universe) {
             try {
                 Thread.sleep(3_000L);
-                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 300);
-                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  100);
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, PRIMARY_TF, 300);
+                List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, HTF_FAST,  100);
                 List<com.bot.TradingCore.Candle> m1  = sender.getM1FromWs(sym);
                 List<com.bot.TradingCore.Candle> m5  = sender.fetchKlines(sym, "5m",  200);
-                if (m15 == null || m15.size() < 200) continue;
+                int periodicMinBars = PRIMARY_IS_15M ? 200 : 150;
+                if (m15 == null || m15.size() < periodicMinBars) continue;
                 com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
                 com.bot.SimpleBacktester.BacktestResult r = bt.run(sym, m1, m5, m15, h1, cat);
                 if (r.total >= 5) {
@@ -1792,20 +1809,32 @@ public final class BotMain {
         com.bot.DecisionEngineMerged.ProbabilityCalibrator cal =
                 com.bot.DecisionEngineMerged.getCalibrator();
 
-        // [v82.1] History depth + pacing — было хардкод (1000 m15, 250 h1, 5s pacing).
+        // [v82.1 / v90 1H-PRIMARY] History depth + pacing.
         // ENV:
-        //  STARTUP_BT_BARS_15M  — кол-во m15 свечей на пару (default 1000 = ~10 дней).
-        //                         Cap 1500 — Binance лимит на один запрос. Для большей
-        //                         истории нужна пагинация (не реализована).
-        //  STARTUP_BT_BARS_1H   — кол-во h1 свечей (default 250). Минимум 150 = MIN_BARS
-        //                         движка, иначе reject("invalid_candles").
-        //  STARTUP_BT_PACING_MS — задержка между парами (default 5000ms). Не понижайте
-        //                         меньше 3000 — Binance rate limit (2400 weight/min).
-        final int bars15mTarget = Math.min(1500,
-                Math.max(300, envInt("STARTUP_BT_BARS_15M", 1000)));
-        final int bars1hTarget  = Math.min(1500,
-                Math.max(150, envInt("STARTUP_BT_BARS_1H", 250)));
+        //  STARTUP_BT_BARS_PRIMARY — кол-во primary-TF свечей (default 720 для 1h
+        //                            ≈ 30 дней; 1000 для 15m ≈ 10 дней). Cap 1500.
+        //  STARTUP_BT_BARS_HTF     — кол-во HTF свечей (default 250). Минимум 150
+        //                            = MIN_BARS движка.
+        //  STARTUP_BT_PACING_MS    — задержка между парами (default 5000ms).
+        final boolean btIs15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+        final String btPrimaryTf = btIs15m ? "15m" : "1h";
+        final String btHtfTf     = btIs15m ? "1h"  : "4h";
+        final int defaultPrimaryBars = btIs15m ? 1000 : 720; // 1h: 30 days
+
+        // Backward compat: read both legacy STARTUP_BT_BARS_15M and new STARTUP_BT_BARS_PRIMARY.
+        int legacyBars = envInt("STARTUP_BT_BARS_15M", -1);
+        int primaryBarsCfg = (legacyBars > 0 && btIs15m) ? legacyBars
+                : envInt("STARTUP_BT_BARS_PRIMARY", defaultPrimaryBars);
+        final int barsPrimaryTarget = Math.min(1500, Math.max(300, primaryBarsCfg));
+
+        int legacyHtf = envInt("STARTUP_BT_BARS_1H", -1);
+        int htfBarsCfg = (legacyHtf > 0 && btIs15m) ? legacyHtf
+                : envInt("STARTUP_BT_BARS_HTF", 250);
+        final int barsHtfTarget = Math.min(1500, Math.max(150, htfBarsCfg));
         final long pacingMs     = Math.max(3000L, envInt("STARTUP_BT_PACING_MS", 5000));
+
+        // Min bars guard for primary TF: 200 on 15m, 150 on 1h.
+        final int primaryMinBars = btIs15m ? 200 : 150;
 
         for (String sym : universe) {
             // Cooperative cancellation if JVM is shutting down.
@@ -1814,41 +1843,38 @@ public final class BotMain {
                 break;
             }
             try {
-                // [FIX-2] / [v82.1] Configurable pacing + bar counts.
-                // PREVIOUS BUG: passed empty h1 to backtester. DecisionEngineMerged
-                // .generate() rejects with "invalid_candles" when c1h.size()<150
-                // (MIN_BARS), so 0 trades were ever generated despite 37 pairs
-                // processed. Restoring h1 is mandatory for the engine to work.
                 Thread.sleep(pacingMs);
 
-                // 15m: env STARTUP_BT_BARS_15M (default 1000 ≈ 10 days, cap 1500).
-                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", bars15mTarget);
+                // Primary TF candles (PRIMARY_TF env, default 1h).
+                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, btPrimaryTf, barsPrimaryTarget);
                 if (m15 == null) {
                     symbolsRateLimited++;
-                    LOG.warning("[STARTUP-BT] " + sym + " — m15 fetch returned null (rate limit?)");
+                    LOG.warning("[STARTUP-BT] " + sym + " — primary " + btPrimaryTf
+                            + " fetch returned null (rate limit?)");
                     Thread.sleep(8_000L);
                     continue;
                 }
-                if (m15.size() < 200) {
+                if (m15.size() < primaryMinBars) {
                     symbolsLowData++;
                     LOG.info("[STARTUP-BT] " + sym + " — only " + m15.size()
-                            + " m15 bars, need ≥200");
+                            + " " + btPrimaryTf + " bars, need ≥" + primaryMinBars);
                     continue;
                 }
 
-                // h1: env STARTUP_BT_BARS_1H (default 250). Min 150 = MIN_BARS guard.
+                // HTF candles (HTF_FAST env, default 4h on 1h primary, 1h on 15m primary).
                 Thread.sleep(1_500L);
-                List<com.bot.TradingCore.Candle> h1 = sender.fetchKlines(sym, "1h", bars1hTarget);
+                List<com.bot.TradingCore.Candle> h1 = sender.fetchKlines(sym, btHtfTf, barsHtfTarget);
                 if (h1 == null) {
                     symbolsRateLimited++;
-                    LOG.warning("[STARTUP-BT] " + sym + " — h1 fetch returned null (rate limit?)");
+                    LOG.warning("[STARTUP-BT] " + sym + " — HTF " + btHtfTf
+                            + " fetch returned null (rate limit?)");
                     Thread.sleep(8_000L);
                     continue;
                 }
                 if (h1.size() < 150) {
                     symbolsLowData++;
                     LOG.info("[STARTUP-BT] " + sym + " — only " + h1.size()
-                            + " h1 bars, need ≥150 (engine MIN_BARS guard)");
+                            + " " + btHtfTf + " bars, need ≥150 (engine MIN_BARS guard)");
                     continue;
                 }
 
@@ -2089,7 +2115,7 @@ public final class BotMain {
 
     private static void updateBtcContext(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         try {
-            List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", "15m", KLINES);
+            List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", PRIMARY_TF, KLINES);
             if (btc != null && btc.size() > 30) gic.update(btc);
         } catch (Exception e) { LOG.warning("[BTC ctx] " + e.getMessage()); }
     }
@@ -2097,7 +2123,7 @@ public final class BotMain {
     private static void updateSectors(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         for (Map.Entry<String, String> e : SECTOR_LEADERS.entrySet()) {
             try {
-                List<com.bot.TradingCore.Candle> sc = sender.fetchKlines(e.getKey(), "15m", 80);
+                List<com.bot.TradingCore.Candle> sc = sender.fetchKlines(e.getKey(), PRIMARY_TF, 80);
                 if (sc != null && sc.size() > 25) gic.updateSector(e.getValue(), sc);
             } catch (Exception ignored) {}
         }
@@ -2114,7 +2140,7 @@ public final class BotMain {
     private static String buildStartMessage() {
         return "⚡ *TradingBot SCANNER* `v79.0`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
-                + "`15M` Futures · TOP-" + envInt("TOP_N", 30) + " · Scanner-only\n"
+                + "`" + PRIMARY_TF.toUpperCase() + "` Futures · TOP-" + envInt("TOP_N", 20) + " · Scanner-only\n"
                 + "R:R min `1:2` · SL min `0.30%`\n"
                 + "━━━━━━━━━━━━━━━━━━━━━\n"
                 + (OBSERVATION_MODE
@@ -2206,13 +2232,21 @@ public final class BotMain {
             double totalDelta = 0;
             for (String sym : symbols) {
                 try {
-                    List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, "15m", 2880);
-                    List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, "1h",  720);
-                    if (m15 == null || m15.size() < 1500) continue;
+                    // [v90] Walk-forward bars scale with TF.
+                    //   15m: 2880 bars = 30 days; window 1344 = 14 days, step 288 = 3 days
+                    //   1h:   720 bars = 30 days; window  336 = 14 days, step  72 = 3 days
+                    int wfTotalBars = PRIMARY_IS_15M ? 2880 : 720;
+                    int wfHtfBars   = PRIMARY_IS_15M ? 720 : 180;
+                    int wfMinBars   = PRIMARY_IS_15M ? 1500 : 400;
+                    int wfWindow    = PRIMARY_IS_15M ? 1344 : 336;
+                    int wfStep      = PRIMARY_IS_15M ? 288  : 72;
+                    List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, PRIMARY_TF, wfTotalBars);
+                    List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, HTF_FAST,  wfHtfBars);
+                    if (m15 == null || m15.size() < wfMinBars) continue;
                     com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
                     if (cat == null) cat = com.bot.DecisionEngineMerged.CoinCategory.ALT;
                     List<com.bot.SimpleBacktester.BacktestResult> oos =
-                            bt.walkForward(sym, m15, h1, cat, 1344, 288);
+                            bt.walkForward(sym, m15, h1, cat, wfWindow, wfStep);
                     for (com.bot.SimpleBacktester.BacktestResult r : oos) totalWindows++;
                     if (oos.size() >= 2) {
                         double firstHalf = 0, secondHalf = 0;

@@ -1854,22 +1854,43 @@ public final class DecisionEngineMerged {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // CleanStrategy v110 parameters — env-overridable but DO NOT TUNE on
+    // CleanStrategy v111 parameters — env-overridable. DO NOT TUNE on
     // observed backtest results. If hypothesis fails on backtest, switch
     // hypothesis entirely — don't fiddle with thresholds.
+    //
+    // [v90 1H-PRIMARY 2026-05-09] Defaults retuned for 1h primary TF:
+    //   - VWAP window: 96 bars × 1h = 96h (4 days) — was 24h on 15m
+    //   - Deviation window: 48 bars × 1h = 2 days — was 60 × 15m = 15h
+    //   - Time stop: 8 bars × 1h = 8h — was 12 × 15m = 3h
+    //   - Cooldown: 240 min = 4h — was 60 min on 15m
+    //   - SL multiplier: 1.5× ATR — wider on 1h to absorb intra-bar noise
+    //   - Sigma threshold: 1.6 — slightly looser, fewer 1h bars exist than 15m
+    //
+    // To revert to 15m defaults set env CS_PROFILE=15m (overrides below).
     // ──────────────────────────────────────────────────────────────────────
-    private static final double CS_SIGMA_THRESHOLD   = csEnvDouble("CS_SIGMA_THRESHOLD",   1.8);
-    private static final double CS_STRONG_SIGMA      = csEnvDouble("CS_STRONG_SIGMA",      2.5);
+    private static final boolean CS_IS_15M = "15m".equals(
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+
+    private static final double CS_SIGMA_THRESHOLD   = csEnvDouble("CS_SIGMA_THRESHOLD",
+            CS_IS_15M ? 1.8 : 1.6);
+    private static final double CS_STRONG_SIGMA      = csEnvDouble("CS_STRONG_SIGMA",
+            CS_IS_15M ? 2.5 : 2.2);
     private static final double CS_MAX_VOL_RATIO     = csEnvDouble("CS_MAX_VOL_RATIO",     1.3);
-    private static final int    CS_VWAP_WINDOW      = (int) csEnvLong("CS_VWAP_WINDOW",     96);
-    private static final int    CS_DEVIATION_WINDOW = (int) csEnvLong("CS_DEVIATION_WINDOW", 60);
+    private static final int    CS_VWAP_WINDOW      = (int) csEnvLong("CS_VWAP_WINDOW",
+            CS_IS_15M ? 96 : 96);   // 24h on 15m / 4 days on 1h
+    private static final int    CS_DEVIATION_WINDOW = (int) csEnvLong("CS_DEVIATION_WINDOW",
+            CS_IS_15M ? 60 : 48);   // 15h on 15m / 2 days on 1h
     private static final double CS_MIN_ATR_PCTILE    = csEnvDouble("CS_MIN_ATR_PCTILE",    0.30);
     private static final double CS_MAX_ATR_PCTILE    = csEnvDouble("CS_MAX_ATR_PCTILE",    0.85);
-    private static final double CS_SL_ATR_MULT       = csEnvDouble("CS_SL_ATR_MULT",       1.2);
+    private static final double CS_SL_ATR_MULT       = csEnvDouble("CS_SL_ATR_MULT",
+            CS_IS_15M ? 1.2 : 1.5);
     private static final double CS_TP1_R             = csEnvDouble("CS_TP1_R",             1.0);
-    private static final double CS_TP2_R             = csEnvDouble("CS_TP2_R",             1.5);
-    private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",        60) * 60_000L;
-    private static final long   CS_TIME_STOP_BARS_M15 = csEnvLong("CS_TIME_STOP_BARS",     12);
+    private static final double CS_TP2_R             = csEnvDouble("CS_TP2_R",
+            CS_IS_15M ? 1.5 : 1.8);
+    private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",
+            CS_IS_15M ? 60 : 240) * 60_000L;
+    private static final long   CS_TIME_STOP_BARS_M15 = csEnvLong("CS_TIME_STOP_BARS",
+            CS_IS_15M ? 12 : 8);
     private static final boolean CS_SKIP_MEME        = csEnvBool("CS_SKIP_MEME",           true);
 
     /** Per-symbol last signal timestamp for cooldown. */

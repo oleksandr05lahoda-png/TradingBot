@@ -60,6 +60,50 @@ public final class SignalSender {
     private static final long FUNDING_REFRESH_MS  = 15 * 60_000L;
     private static final long DELTA_WINDOW_MS     = 60_000L;
 
+    // ════════════════════════════════════════════════════════════════════
+    // [v90 PRIMARY-TF 2026-05-09] Primary timeframe abstraction.
+    //
+    // Pre-v90: hardcoded "15m" everywhere. Result on backtest:
+    //   WR 27.8%, R:R 1:1.5, NetPnL -35.46% on 36 trades.
+    // The 15m TF has signal/noise ratio ~50/50: typical bar moves 0.2-0.6%
+    // while bid/ask noise is ±0.15-0.30%. Friction (fees+slippage) eats
+    // ~25% of average TP move on 15m.
+    //
+    // Switching to 1h:
+    //   - Typical bar moves 0.6-1.5% (3× larger), noise stays ±0.15-0.30%
+    //   - Friction drops to ~7-8% of TP (3× better economics)
+    //   - Trends are more reliable, less microstructure manipulation
+    //   - Trade-off: 5-15 signals/day on 20 pairs (vs noisy 30+ on 15m)
+    //
+    // Override via env PRIMARY_TF=15m to revert. Use HTF_FAST/HTF_SLOW for
+    // higher timeframe filters (default 4h / 1d when PRIMARY_TF=1h).
+    // ════════════════════════════════════════════════════════════════════
+    private static final String PRIMARY_TF =
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+    private static final long PRIMARY_TF_MS = primaryTfMs(PRIMARY_TF);
+    private static final int PRIMARY_TF_MIN = (int) (PRIMARY_TF_MS / 60_000L);
+    // HTF (higher timeframe) used for bias filters. For 1h primary, default 4h.
+    private static final String HTF_FAST =
+            System.getenv().getOrDefault("HTF_FAST",
+                    "1h".equals(PRIMARY_TF) ? "4h" : "1h").trim();
+    private static final String HTF_SLOW =
+            System.getenv().getOrDefault("HTF_SLOW",
+                    "1h".equals(PRIMARY_TF) ? "1d" : "2h").trim();
+
+    private static long primaryTfMs(String tf) {
+        switch (tf) {
+            case "1m":  return 60_000L;
+            case "5m":  return 5 * 60_000L;
+            case "15m": return 15 * 60_000L;
+            case "30m": return 30 * 60_000L;
+            case "1h":  return 60 * 60_000L;
+            case "2h":  return 2 * 60 * 60_000L;
+            case "4h":  return 4 * 60 * 60_000L;
+            default:
+                throw new IllegalArgumentException("Unsupported PRIMARY_TF: " + tf);
+        }
+    }
+
     private static final double MIN_PROFIT_TOP  = 0.0025;
     private static final double MIN_PROFIT_ALT  = 0.0035;
     private static final double MIN_PROFIT_MEME = 0.0050;
@@ -270,21 +314,19 @@ public final class SignalSender {
     // Candle Cache
     private final Map<String, CachedCandles> candleCache = new ConcurrentHashMap<>();
 
-    private static final Map<String, Long> CACHE_TTL = Map.of(
-            "1m",  55_000L,
-            "5m",  120_000L,       // [v77 LATENCY] 270s → 120s. На 15m TF 5m данные критичны
-            // для BoS/early reversal; 4.5min TTL делал их stale половину свечи.
-            // [v77 LATENCY] 15m TTL 2min → 30s. На 15m TF одна свеча = 900s.
-            // 30s = 3.3% свечи (раньше 13%). Вход в начале формирующейся свечи
-            // теперь работает на актуальных данных — не на 2-минутно-старых.
-            "15m", 30_000L,
-            // [v77 LATENCY] 1h TTL 55min → 5min. detectBias1H читает кэш; при
-            // флипе HTF bias (BULL→BEAR) старая логика узнавала о смене ТОЛЬКО
-            // после следующего обновления — до 55 мин запаздывания на ключевом
-            // gate. 5min TTL = свежий bias к началу каждой 15m свечи.
-            "1h",  5 * 60_000L,
-            // [v77 LATENCY] 2h TTL 110min → 15min. Тот же аргумент что для 1h.
-            "2h",  15 * 60_000L
+    // [v90] Extended for 1h-primary mode: 4h cache (HTF_FAST) and 1d cache (HTF_SLOW).
+    //   4h TTL = 30 min (1/8 bar)
+    //   1d TTL = 60 min (1/24 bar — slow-moving, refresh once an hour is plenty)
+    //   30m TTL = 2 min (for completeness if PRIMARY_TF=30m used)
+    private static final Map<String, Long> CACHE_TTL = Map.ofEntries(
+            Map.entry("1m",  55_000L),
+            Map.entry("5m",  120_000L),
+            Map.entry("15m", 30_000L),
+            Map.entry("30m", 120_000L),
+            Map.entry("1h",  5 * 60_000L),
+            Map.entry("2h",  15 * 60_000L),
+            Map.entry("4h",  30 * 60_000L),
+            Map.entry("1d",  60 * 60_000L)
     );
 
     private static final class CachedCandles {
@@ -1037,8 +1079,8 @@ public final class SignalSender {
             // неограниченно (десятки тыс. записей за месяц uptime).
             final String zPrefix = zombie + "_";
             liqTimestamps.keySet().removeIf(k -> k.startsWith(zPrefix));
-            // Clean candle caches for all timeframes
-            for (String tf : List.of("1m","5m","15m","1h","2h")) {
+            // [v90] Clean candle caches for all timeframes (extended for 1h-primary TFs).
+            for (String tf : List.of("1m","5m","15m","30m","1h","2h","4h","1d")) {
                 candleCache.remove(zombie + "_" + tf);
             }
         }
@@ -1130,56 +1172,50 @@ public final class SignalSender {
             // 5m из WS-буфера (liveM1Buffer) вместо REST getCached("5m").
             // При достаточном буфере (≥5 баров) — 0 REST weight. Fallback на REST при холодном старте.
             // Экономия: ~25% klines REST weight (~$6-8/мес при TOP_N=30).
+            // [v90] Primary TF candles. Pre-v90 was hardcoded "15m"; now respects PRIMARY_TF.
+            // Variable name `m15` preserved for downstream compatibility — it now contains
+            // PRIMARY_TF candles (1h by default). Live-splice gracefully falls back when
+            // primary TF != 15m (no partial 1h-candle assembly yet — see v91 todo).
             List<com.bot.TradingCore.Candle> m5  = getM5FromWsOrRest(pair, KLINES_LIMIT);
-            List<com.bot.TradingCore.Candle> m15 = getCached15mWithLive(pair); // [FIX-BLIND]
-            List<com.bot.TradingCore.Candle> h1  = getCached(pair, "1h",  KLINES_LIMIT);
-            List<com.bot.TradingCore.Candle> h2  = getCached(pair, "2h",  120);
+            List<com.bot.TradingCore.Candle> m15 = getPrimaryTfCandles(pair); // [v90]
+            List<com.bot.TradingCore.Candle> h1  = getCached(pair, HTF_FAST, KLINES_LIMIT);
+            List<com.bot.TradingCore.Candle> h2  = getCached(pair, HTF_SLOW, 120);
             // updateLiveM1Buffer больше не нужен — буфер заполняется из processAggTrade()
 
             // [ДЫРА №1] CVD — считаем накопленную дельту из 1m свечей
             double cvdNormalized = computeAndStoreCVD(pair, m1);
             decisionEngine.setCVD(pair, cvdNormalized);
 
-            // [v50 UPDATE] History gate raised 160→400 bars (40h → 100h / 4 days of 15m history).
-            // Fresh listings (<4 days old) have no reliable volatility profile — robustAtr is
-            // undefined, structural levels are synthetic. These are the coins most prone to
-            // listing-pump rugs. 4 days = minimum to have stable ATR percentile distribution.
-            // h1 requirement unchanged at 160 (≈6.7 days, already sufficient).
-            // [v66] History gate 400 → 200. The original 400-bar requirement (100h / 4 days
-            // of 15m history) was overly conservative. 200 bars = 50h ≈ 2 days — sufficient
-            // for EMA200 stabilization (requires ≥200 bars exactly), ATR percentile over
-            // 96-bar window, and 96-bar "day open" computation in the event-coin filter.
-            // Paired with KLINES_LIMIT=420 default above, pairs consistently have ≥420
-            // bars available. 200 is a safety floor for freshly listed pairs that just
-            // crossed the 2-day history mark, which is the earliest point where robust
-            // ATR distribution exists. h1 gate stays at 160 (≈6.7 days) — unchanged.
-            if (m15 == null || m15.size() < 200 || h1 == null || h1.size() < 160) {
+            // [v90 HISTORY-GATE] On 1h primary TF: 200 bars = 8.3 days (vs 50h on 15m).
+            // For VWAP-MR strategy we want ≥120 bars (5 days) to compute stable VWAP/dev.
+            // Min keeps strict floor at 100; relaxes from 200 because each 1h bar carries
+            // 4× more information than a 15m bar.
+            int primaryMinBars = "15m".equals(PRIMARY_TF) ? 200 : 100;
+            int htfMinBars     = "15m".equals(PRIMARY_TF) ? 160 : 60;
+            if (m15 == null || m15.size() < primaryMinBars || h1 == null || h1.size() < htfMinBars) {
                 cyclePairsStale.incrementAndGet();
                 recordStaleEvent(pair); // [v78.1]
                 return null;
             }
 
-            // STALE DATA GUARD
-            // Если последний 15m бар закрыт более 20 минут назад — данные устарели.
-            // Причины: WS разрыв + REST кеш не обновился, Binance maintenance, локальный freeze.
-            // Лучше пропустить сигнал чем войти на старых данных.
-            // [v77 LATENCY] Stale 15m guard tightened 20min → 10min. With
-            // 15m TTL = 30s and live-splice always on, a 20min-old last bar
-            // means WS+REST both failed twice — definitely skip. 10min still
-            // tolerates a single fetch hiccup but doesn't risk acting on
-            // old data.
+            // STALE DATA GUARD — scaled to PRIMARY_TF.
+            // 15m primary: skip if last bar > 10 min old (was original guard).
+            // 1h primary: skip if last bar > 75 min old (1.25× bar period).
             long nowMs = System.currentTimeMillis();
             long lastBarAge = nowMs - m15.get(m15.size() - 1).closeTime;
-            if (lastBarAge > 10 * 60_000L) {
+            long staleThresholdMs = (long)(PRIMARY_TF_MS * 1.25);
+            if ("15m".equals(PRIMARY_TF)) staleThresholdMs = 10 * 60_000L; // legacy
+            if (lastBarAge > staleThresholdMs) {
                 cyclePairsStale.incrementAndGet();
                 recordStaleEvent(pair); // [v78.1]
                 return null;
             }
-            // [v77 LATENCY] 1h staleness 2h → 30min. Pair with 1h-data 2h
-            // old means HTF bias is also 2h old; coin probably delisted or
-            // WS dropped — definitely don't trade it.
+            // HTF staleness: skip if last HTF bar > 1.5× HTF period old.
+            long htfBarMs = "4h".equals(HTF_FAST) ? 4 * 60 * 60_000L
+                    : "2h".equals(HTF_FAST) ? 2 * 60 * 60_000L
+                      : 60 * 60_000L;
             long lastH1Age = nowMs - h1.get(h1.size() - 1).closeTime;
-            if (lastH1Age > 30 * 60_000L) {
+            if (lastH1Age > (long)(htfBarMs * 1.5)) {
                 cyclePairsStale.incrementAndGet();
                 recordStaleEvent(pair); // [v78.1]
                 return null;
@@ -1719,6 +1755,27 @@ public final class SignalSender {
      * (max wick &gt; 1.5× body), the historical (closed) series is returned
      * unmodified — analyzing such a live bar pins entries at local tops.
      */
+    /**
+     * [v90] Primary-TF candle accessor. Routes to legacy 15m-with-live-splice
+     * when PRIMARY_TF=15m, otherwise returns plain cached candles for the
+     * configured PRIMARY_TF.
+     *
+     * Live-splice for 1h is intentionally NOT done here. Reasons:
+     *   - 1h bar early-stage (e.g. 5min in) produces wildly noisy partial bar
+     *     that misleads strategy signals more than it helps.
+     *   - VWAP-MR strategy needs CLOSED bar for stable σ-deviation calc.
+     *   - The 1h cache has 5-min TTL (see TF_CACHE_TTL map) which keeps last
+     *     bar fresh enough for end-of-bar decisions.
+     * If lower latency on 1h primary is needed in future, implement an
+     * assembleLive1hCandle that gates on (now - barStart) ≥ 30min.
+     */
+    private List<com.bot.TradingCore.Candle> getPrimaryTfCandles(String pair) {
+        if ("15m".equals(PRIMARY_TF)) {
+            return getCached15mWithLive(pair);
+        }
+        return getCached(pair, PRIMARY_TF, KLINES_LIMIT);
+    }
+
     private List<com.bot.TradingCore.Candle> getCached15mWithLive(String pair) {
         List<com.bot.TradingCore.Candle> historical = getCached(pair, "15m", KLINES_LIMIT);
         if (historical == null || historical.isEmpty()) return historical;
@@ -2440,7 +2497,8 @@ public final class SignalSender {
 
     private double getBtcReturn15m() {
         if (System.currentTimeMillis() - lastBtcReturnTime < 30_000) return cachedBtcReturn;
-        CachedCandles c = candleCache.get("BTCUSDT_15m");
+        // [v90] Use PRIMARY_TF cache key, not hardcoded 15m.
+        CachedCandles c = candleCache.get("BTCUSDT_" + PRIMARY_TF);
         if (c == null || c.candles.size() < 5) return 0;
         int n = c.candles.size();
         cachedBtcReturn = (c.candles.get(n-1).close - c.candles.get(n-4).close) / (c.candles.get(n-4).close + 1e-9);
@@ -3288,10 +3346,12 @@ public final class SignalSender {
         // and Dispatcher's probability-solo-pass path will still let strong signals through.
         com.bot.TradingCore.ForecastEngine.ForecastResult etForecast = null;
         try {
-            List<com.bot.TradingCore.Candle> etC15 = getCached15mWithLive(symbol);
+            List<com.bot.TradingCore.Candle> etC15 = getPrimaryTfCandles(symbol);
             List<com.bot.TradingCore.Candle> etC5  = getM5FromWsOrRest(symbol, 100);
-            List<com.bot.TradingCore.Candle> etC1h = getCached(symbol, "1h", 100);
-            if (etC15 != null && etC15.size() >= 100 && etC1h != null && etC1h.size() >= 50) {
+            List<com.bot.TradingCore.Candle> etC1h = getCached(symbol, HTF_FAST, 100);
+            int etC15MinBars = "15m".equals(PRIMARY_TF) ? 100 : 60;
+            int etC1hMinBars = "15m".equals(PRIMARY_TF) ? 50  : 30;
+            if (etC15 != null && etC15.size() >= etC15MinBars && etC1h != null && etC1h.size() >= etC1hMinBars) {
                 double etDelta = getNormalizedDelta(symbol);
                 etForecast = forecastEngineDirect.forecast(etC5, etC15, etC1h, etDelta);
             }

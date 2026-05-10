@@ -45,7 +45,13 @@ public final class SimpleBacktester {
     // (env ISC_TIME_STOP_BARS, тоже default=12 после v82).
     //
     // toTelegramString DEM теперь печатает "180 мин" (раньше врал "90 мин" на v81).
-    private int    timeStopBars     = envInt("BACKTEST_TIME_STOP_BARS", 12);
+    // [v90 1H-PRIMARY 2026-05-09] timeStopBars default scales with PRIMARY_TF.
+    //   PRIMARY_TF=15m: 12 bars (180 min stop window)
+    //   PRIMARY_TF=1h:   8 bars (480 min = 8h stop window)
+    // ENV BACKTEST_TIME_STOP_BARS overrides; must match ISC_TIME_STOP_BARS in
+    // live ISC for walk-forward consistency.
+    private int    timeStopBars     = envInt("BACKTEST_TIME_STOP_BARS",
+            "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 12 : 8);
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
@@ -435,7 +441,12 @@ public final class SimpleBacktester {
                               List<com.bot.TradingCore.Candle> h1,
                               com.bot.DecisionEngineMerged.CoinCategory category) {
         BacktestResult result = new BacktestResult(symbol);
-        if (m15 == null || m15.size() < 200) return result;
+        // [v90] Min bars: 200 on 15m primary (50 hours), 150 on 1h primary
+        // (6.25 days). The lower floor on 1h is offset by each bar carrying
+        // 4× more information; 150 bars = stable VWAP/sigma calc.
+        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+        int minBars = is15m ? 200 : 150;
+        if (m15 == null || m15.size() < minBars) return result;
 
         com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
         com.bot.GlobalImpulseController btGic = new com.bot.GlobalImpulseController();
