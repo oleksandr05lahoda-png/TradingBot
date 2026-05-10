@@ -107,19 +107,13 @@ public final class BotMain {
     //   1h primary:  168 bars = 7 days (more history available, fewer bars needed)
     private static final int KLINES = envIntAny(
             PRIMARY_IS_15M ? 420 : 168, "KLINES", "KLINES_LIMIT");
-    // [HOLE-FUNNEL FIX 2026-05-08] Default 3 → 5. Лимит был узким горлом
-    // в высоковолатильных окнах (Asia open / US close), где 5+ валидных
-    // setups существуют одновременно. Можно переопределить через env.
-    // ISC + RiskGuard.MAX_CONCURRENT_POSITIONS остаются authoritative
-    // ограничителями реальной торговли.
+    // Max signals per scan cycle. ISC + RiskGuard.MAX_CONCURRENT_POSITIONS
+    // remain authoritative limiters on actual trading.
     private static final int MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 5);
 
-    // [v79 I4] SINGLE SOURCE OF TRUTH for time-stop window across the bot.
-    // Live: ISC.TIME_STOP_BARS = 6 (90 min)
-    // Backtester: SimpleBacktester.timeStopBars = 6 (90 min)
-    // Verifier: was 5h — INCONSISTENT, now 90 min + 30 min grace = 120 min.
-    // The grace window covers the case where price hits TP1/SL exactly at
-    // bar 6 close — verifier needs to see that bar.
+    // Time-stop window for the verifier — single source of truth across bot.
+    // 90 min stop + 30 min grace = 120 min total. Grace covers the case where
+    // price hits TP1/SL exactly at bar 6 close.
     private static final long VERIFIER_TIME_STOP_MS = 90 * 60_000L;
     private static final long VERIFIER_GRACE_MS     = 30 * 60_000L;
     private static final long VERIFIER_MAX_AGE_MS   = VERIFIER_TIME_STOP_MS + VERIFIER_GRACE_MS;
@@ -660,11 +654,8 @@ public final class BotMain {
                     return;
                 }
 
-                // [HOLE-FRESHNESS FIX 2026-05-08] Sanity-check idea не старше 90 сек.
-                // Дисптчер мог отложить сигнал в очередь Telegram, и к моменту попытки
-                // открыть позицию idea.price уже устарела на 2-3 свечи. Открывать
-                // MARKET по старой idea.stop = высокая вероятность что SL уже невалидный.
-                // 90s = чуть больше одной 15m свечи (тики ходят), но < 1 свечи 1m.
+                // Sanity-check idea isn't older than 90 sec. Stale idea →
+                // price/SL may have drifted, risking invalid SL placement.
                 long ideaAgeMs = System.currentTimeMillis() - idea.createdAtMs;
                 if (ideaAgeMs > 90_000L) {
                     tg.sendMessageAsync(String.format(
@@ -1075,9 +1066,9 @@ public final class BotMain {
             com.bot.BinanceTradeExecutor ex = com.bot.BinanceTradeExecutor.getInstance();
             com.bot.PositionTracker tracker = com.bot.PositionTracker.getInstance();
             tracker.setTelegram(telegram); // for close notifications
-            // [HOLE-3 FIX 2026-05-08] Wire emergency-close failure alerts to Telegram.
-            // Если SL не встал И emergencyClose не смог закрыть позицию (HTTP fail
-            // или verification timeout) — оператор получит alert немедленно.
+            // Wire emergency-close failure alerts to Telegram. If SL placement
+            // fails AND emergencyClose can't close the position, operator gets
+            // alerted immediately.
             com.bot.BinanceTradeExecutor.setEmergencyAlertSink(msg -> {
                 try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
             });
@@ -1089,9 +1080,8 @@ public final class BotMain {
                         + (ex.isTestnet() ? "TESTNET" : "REAL/LIVE")
                         + " leverage=" + ex.getLeverage()
                         + "x risk=" + ex.getRiskPct() + "%");
-                // [v87] Берём фактические лимиты из RiskGuard вместо хардкода.
-                // Если оператор поднял RG_DAILY_TRADE_LIMIT=9999 — сообщение
-                // должно это отразить, иначе Telegram-баннер врёт.
+                // Pull actual limits from RiskGuard so Telegram boot banner
+                // reflects any env overrides.
                 com.bot.RiskGuard rg = com.bot.RiskGuard.getInstance();
                 int    dailyLim     = rg.getDailyTradeLimit();
                 int    concurrentLim= rg.getMaxConcurrentPositions();

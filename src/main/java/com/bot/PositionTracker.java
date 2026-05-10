@@ -76,8 +76,8 @@ public final class PositionTracker {
     private final double  BE_TRIGGER_FRAC;     // 0.55 → fire BE if remaining ≤ 55% of initial
     private final boolean REAL_PNL_ENABLED;
 
-    // [v86 EXIT-FIX 2026-05-07] Active risk-management toggles. Mirror of
-    // SimpleBacktester flags so live and backtest behave identically.
+    // Active risk-management toggles. Mirror of SimpleBacktester flags so
+    // live and backtest behave identically.
     //   PT_TRAIL_ENABLED       — multi-level ratchet trail (1.0R→0.4R, 1.5R→0.8R, 2.0R→1.4R)
     //   PT_PROFIT_LOCK_ENABLED — at 60% time-window with ≥+0.3R, market-close
     //   PT_STAGNATION_ENABLED  — at 35% time-window with no movement ±0.3R, market-close
@@ -136,11 +136,9 @@ public final class PositionTracker {
             scheduler.schedule(this::reconcileAtStartup, 5, TimeUnit.SECONDS);
             scheduler.scheduleAtFixedRate(this::pollAll,
                     POLL_INTERVAL_MS, POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
-            // [HOLE-NEW FIX 2026-05-08] Periodic orphan reconcile.
-            // pollAll итерирует только tracked.keySet() — runtime-orphans
-            // (позиции на бирже, которых нет в tracked) не обнаруживаются.
-            // Раз в 15 минут перезапускаем reconcileAtStartup; он молчит когда
-            // orphan'ов нет, и шлёт алерт если что-то нашёл.
+            // Periodic orphan reconcile (every 15min). pollAll only iterates
+            // tracked.keySet() — runtime-orphans (exchange positions not in
+            // tracked) need this scan to be detected.
             scheduler.scheduleAtFixedRate(this::reconcileAtStartup,
                     15, 15, TimeUnit.MINUTES);
             started = true;
@@ -264,9 +262,9 @@ public final class PositionTracker {
             }
         }
 
-        // 3) [v86 EXIT-FIX] Active risk management — fetch mark price, update HWM,
-        //    apply trailing stop / profit-lock / stagnation exit.
-        //    All four actions short-circuit on success; we don't combine them in one poll.
+        // 3) Active risk management — fetch mark price, update HWM, apply
+        //    trailing stop / profit-lock / stagnation exit.
+        //    All four actions short-circuit on success; not combined in one poll.
         if (TRAIL_ENABLED || PROFIT_LOCK_ENABLED || STAGNATION_ENABLED) {
             applyActiveManagement(t, age);
         }
@@ -276,7 +274,7 @@ public final class PositionTracker {
     }
 
     /**
-     * [v86 EXIT-FIX] Active risk management for an open position.
+     * Active risk management for an open position.
      *
      * Reads current mark price, updates favorable/adverse high-water-marks
      * in R-units, then evaluates three exit triggers in priority order:
@@ -494,15 +492,11 @@ public final class PositionTracker {
      */
     private String classifyCloseReason(Tracked t, double exitPrice, double pnl) {
         if (exitPrice <= 0) return pnl > 0 ? "PROFIT_UNKNOWN" : "LOSS_UNKNOWN";
-        // [v87 SLIPPAGE-TOL 2026-05-09] Tolerance widened from fixed 0.1% to category-aware:
-        //   TOP coins   (BTC/ETH/SOL/BNB):  0.20% — tight order books, low slippage expected
-        //   MEME / volatile:                 0.80% — wide books, frequent gaps, slippage 0.4-0.7%
-        //   ALT default:                     0.50% — typical slippage on Binance perp ALTs
-        //
-        // Old (0.10%): EVERY SL hit on ALT/MEME with normal slippage was misclassified as
-        // MANUAL_LOSS. User saw "❌ Позиция закрыта · Reason: MANUALLOSS" in Telegram even
-        // though SL fired naturally with 0.3-0.5% slippage past the level — pure log noise
-        // and undermined trust in the bot's reporting.
+        // Category-aware slippage tolerance for SL classification:
+        //   TOP coins (BTC/ETH/SOL/BNB):  0.20% — tight books
+        //   MEME / volatile:               0.80% — wide books, frequent gaps
+        //   ALT default:                   0.50% — typical Binance perp slippage
+        // Without this, normal-slippage SL fills get misclassified as MANUAL_LOSS.
         double tol;
         String catUpper = t.symbol == null ? "" : t.symbol.toUpperCase();
         if (catUpper.startsWith("BTC") || catUpper.startsWith("ETH")
@@ -526,7 +520,7 @@ public final class PositionTracker {
         if (t.beActivated && near.apply(t.slPrice)) return "TP1_THEN_BE";
         if (near.apply(t.slPrice)) return "SL_HIT";
 
-        // [v87] Extended check: did exit price OVERSHOOT SL with slippage?
+        // Extended check: did exit price OVERSHOOT SL with slippage?
         // Common case: market gapped through SL, executed past the level.
         // Direction: for LONG, SL is below entry → overshoot means exitPrice < slPrice.
         //            for SHORT, SL is above entry → overshoot means exitPrice > slPrice.
@@ -742,7 +736,7 @@ public final class PositionTracker {
         long   openedAtMs;
         boolean beActivated; // true once BE move was attempted (success or failure)
 
-        // [v86 EXIT-FIX] Active management state.
+        // Active management state.
         double initialSlPrice;       // saved at trackOpened — needed to compute R reliably
         double maxFavR     = 0.0;    // peak favorable movement in R-units (HWM)
         double maxAdvR     = 0.0;    // peak adverse movement in R-units (for stagnation detection)

@@ -88,9 +88,6 @@ public final class RiskGuard {
     }
 
     // ─── Public config getters (for status messages / Telegram boot banner) ───
-    // [v87] Раньше BotMain хардкодил "max 3 / max 2" в стартовом сообщении.
-    // После RG_DAILY_TRADE_LIMIT=9999 / RG_MAX_CONCURRENT_POSITIONS=999 текст
-    // продолжал врать. Эти геттеры позволяют сообщению брать актуальные значения.
     public int    getDailyTradeLimit()        { return DAILY_TRADE_LIMIT; }
     public int    getMaxConcurrentPositions() { return MAX_CONCURRENT_POSITIONS; }
     public double getDailyLossLimitPct()      { return DAILY_LOSS_LIMIT_PCT; }
@@ -330,7 +327,7 @@ public final class RiskGuard {
         return System.currentTimeMillis() - startupTime < COLD_START_MS;
     }
 
-    // [v87 HEALTHCHECK 2026-05-09] Snapshot for telegram /status and external monitoring.
+    // Snapshot for telegram /status and external monitoring.
     // Returns a single immutable record with the most useful diagnostic info.
     public static final class HealthSnapshot {
         public final boolean coldStart;

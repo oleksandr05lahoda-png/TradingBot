@@ -113,10 +113,9 @@ public final class BinanceTradeExecutor {
      */
     private final ConcurrentHashMap<String, SymbolInfo> symbolInfoCache = new ConcurrentHashMap<>();
 
-    // ─── [HOLE-CLOCK-DRIFT FIX 2026-05-08] Server-time sync ───────────
+    // ─── Server-time sync ───────────
     // Binance отвергает запросы с timestamp дрейфом > recvWindow (5s).
-    // На VPS с плохими часами все ордера рubиrabятся с -1021. Sync раз в 30 мин
-    // через /fapi/v1/time, прибавляем offset ко всем timestamp= параметрам.
+    // Sync раз в 30 мин через /fapi/v1/time, прибавляем offset ко всем timestamp.
     private volatile long timeOffsetMs = 0L;
     private volatile long lastTimeSync = 0L;
     private static final long TIME_SYNC_INTERVAL_MS = 30 * 60_000L;
@@ -164,9 +163,7 @@ public final class BinanceTradeExecutor {
         if (useTestnet) {
             this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
             this.apiSecret = pick("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET", "");
-            // [v83.1] Binance переименовал testnet с testnet.binancefuture.com
-            // на demo-fapi.binance.com. UI открыт на demo.binance.com, REST API
-            // на demo-fapi.binance.com. Источник: developers.binance.com docs.
+            // Testnet API endpoint (UI is on demo.binance.com, REST on demo-fapi).
             this.baseUrl   = "https://demo-fapi.binance.com";
         } else {
             this.apiKey    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
@@ -182,11 +179,8 @@ public final class BinanceTradeExecutor {
         }
 
         double rp = envDouble("RISK_PCT_PER_TRADE", 2.0);
-        // [v87 RISK-FLOOR 2026-05-09] Floor lowered 0.5% → 0.05%.
-        // Old floor blocked micro-test scenarios: user wanted RISK_PCT_PER_TRADE=0.1
-        // (10bp risk, conservative paper-to-live transition), got silent override to 0.5%.
-        // New floor 0.05% (5bp) prevents accidental 0% (which would zero-out qty calculation
-        // and fail every order) while allowing legitimate small-size tests. Ceiling stays 5%.
+        // Risk per trade: floor 0.05%, ceiling 5%. Floor prevents accidental 0%
+        // (zeroes-out qty calc); ceiling caps overcommit.
         this.riskPctPerTrade = Math.max(0.05, Math.min(5.0, rp));
         if (rp < 0.05 && rp > 0) {
             LOG.warning("[Executor] RISK_PCT_PER_TRADE=" + rp + " requested (below 0.05% floor), using 0.05%");
@@ -194,19 +188,11 @@ public final class BinanceTradeExecutor {
             LOG.warning("[Executor] RISK_PCT_PER_TRADE=" + rp + " requested, capped to 5");
         }
 
-        // [v83.5 LATENCY-FIX] Default 5000ms → 2000ms. На demo-fapi подтверждение
-        // SL приходит за 200-400ms. 5 секунд — это легаси для нестабильных сетей.
-        // Меньшее окно = меньше naked-position window после MARKET-открытия.
-        // ENV SL_PLACEMENT_TIMEOUT_MS позволяет переопределить (для отладки).
+        // SL placement timeout. Default 2s — demo-fapi confirms in 200-400ms;
+        // larger window = longer naked-position exposure after MARKET-fill.
         this.slPlacementTimeoutMs = envLong("SL_PLACEMENT_TIMEOUT_MS", 2000L);
-        // [v87 SPREAD-FIX 2026-05-09] Testnet has THIN order books — spread 0.4-0.8% on
-        // ALT pairs is normal there but rare on mainnet (where ALTs are usually 0.02-0.10%).
-        // Old single default (0.5%) was too strict for testnet (lost legitimate fills like
-        // the user's NEARUSDT case "spread 0.50% > max 0.50%") and too loose for mainnet
-        // (allowed entries on illiquid books with 0.4% slippage = 80% of typical edge gone).
-        //
-        // New: testnet default 1.0% (loose, focus on functional testing), mainnet 0.30%
-        // (strict, protect edge). MAX_SPREAD_PCT env override always wins.
+        // Max spread % — looser on testnet (thin books), stricter on mainnet
+        // (protect edge from illiquid fills). MAX_SPREAD_PCT env override wins.
         double defaultSpread = useTestnet ? 1.0 : 0.30;
         this.maxSpreadPct         = envDouble("MAX_SPREAD_PCT", defaultSpread);
 
@@ -220,13 +206,9 @@ public final class BinanceTradeExecutor {
                 leverage, riskPctPerTrade,
                 apiKey.isBlank() ? "MISSING" : "present"));
 
-        // [v85 ORDER-FIX 2026-05-07] Normalize position mode to ONE_WAY at boot.
-        // На свежих testnet/mainnet аккаунтах часто включён HEDGE (dual-side).
-        // В HEDGE MARKET без positionSide=LONG/SHORT отвергается с -4061
-        // ("Order's position side does not match user's setting"). Это и есть
-        // основная причина "MARKET order rejected" на новых аккаунтах.
-        // Если уже ONE_WAY — Binance вернёт -4059 ("No need to change..."),
-        // проигнорируем безболезненно.
+        // Normalize position mode to ONE_WAY at boot. HEDGE-mode accounts
+        // reject MARKET orders without positionSide=LONG/SHORT (-4061).
+        // Idempotent: if already ONE_WAY, Binance returns -4059 (ignored).
         if (!apiKey.isBlank() && !apiSecret.isBlank()) {
             try { ensureOneWayMode(); } catch (Exception e) {
                 LOG.warning("[Executor] ensureOneWayMode failed (non-fatal): " + e.getMessage());
@@ -235,7 +217,7 @@ public final class BinanceTradeExecutor {
     }
 
     /**
-     * [v85] POST /fapi/v1/positionSide/dual?dualSidePosition=false
+     * POST /fapi/v1/positionSide/dual?dualSidePosition=false
      * Force account into ONE_WAY position mode so MARKET orders without
      * positionSide=LONG/SHORT are accepted. Idempotent — safe to call repeatedly.
      */
@@ -458,9 +440,6 @@ public final class BinanceTradeExecutor {
             if (mid <= 0) return ExecutionResult.fail("invalid book");
             double spreadPct = 100.0 * (ask - bid) / mid;
             if (spreadPct > maxSpreadPct) {
-                // [v87 SPREAD-LOG 2026-05-09] %.3f instead of %.2f — old format showed
-                // "0.50% > max 0.50%" when actual was 0.503% > 0.500%, hiding the
-                // micro-overage and confusing operator. Now visible.
                 return ExecutionResult.fail(String.format("spread %.3f%% > max %.3f%% (bid=%.6f ask=%.6f)",
                         spreadPct, maxSpreadPct, bid, ask));
             }
@@ -475,12 +454,9 @@ public final class BinanceTradeExecutor {
             double slDistance = Math.abs(entry - idea.stop);
             if (slDistance <= 0) return ExecutionResult.fail("zero SL distance");
 
-            // [HOLE-7 FIX 2026-05-08] Sanity-check SL distance vs current price.
-            // Если idea.stop пришла с лагом (старая цена 5+ минут назад), entry уже
-            // ушла далеко, и slDistance может оказаться огромной → qty = крохотное →
-            // позиция размером с пыль ИЛИ наоборот SL стоит на 30% от цены, что =
-            // де-факто disabled risk control. Отсекаем оба края: SL д.б. в диапазоне
-            // 0.10%–10% от цены.
+            // SL distance sanity: must be 0.10%–10% of price.
+            // < 0.10% = stale-data tight stop → tiny qty, no real position.
+            // > 10%   = de-facto disabled risk control or wrong direction.
             double slDistancePct = slDistance / entry;
             if (slDistancePct < 0.001) {
                 return ExecutionResult.fail(String.format(
@@ -504,11 +480,8 @@ public final class BinanceTradeExecutor {
                         "SHORT SL=%.6f <= entry=%.6f (wrong direction)", idea.stop, entry));
             }
 
-            // [v83.2] Load real exchange filters for this symbol. Critical:
-            // every pair has its own stepSize (qty granularity), tickSize
-            // (price granularity), minNotional (smallest position). Hardcoded
-            // 3-decimal rounding of v1 worked for BTC/ETH/SOL but rejected
-            // exotic alts like BABYUSDT (need integer qty in thousands).
+            // Load real exchange filters: stepSize (qty), tickSize (price),
+            // minNotional (smallest position) — all per-symbol from exchangeInfo.
             SymbolInfo si = loadSymbolInfo(symbol);
             if (si == null) {
                 return ExecutionResult.fail("cannot load exchangeInfo for " + symbol);
@@ -517,11 +490,9 @@ public final class BinanceTradeExecutor {
             double riskUsd = balanceUsd * (riskPctPerTrade / 100.0);
             double qty = riskUsd / slDistance;
 
-            // [HOLE-1 FIX 2026-05-08] Apply unified size multiplier from idea.
-            // SignalSender stores its display-time ratio here (category, flag,
-            // session, ISC modifiers) so on-exchange size matches Telegram.
-            // Default 1.0 = legacy behaviour for ideas that didn't go through
-            // SignalSender (probe, manual). Already clamped [0.20, 1.20] in setter.
+            // Apply unified size multiplier from idea (set upstream by
+            // SignalSender for category/flag/session/ISC adjustments).
+            // Default 1.0 = no scaling; clamped [0.20, 1.20] in setter.
             double sizeMult = idea.getExecutorSizeMultiplier();
             if (sizeMult != 1.0) {
                 qty *= sizeMult;
@@ -561,11 +532,8 @@ public final class BinanceTradeExecutor {
                         + "(see [Executor] log for code+msg)");
             }
 
-            // [LATENCY-FIX 2026-05-08] Active poll вместо blind sleep(800).
-            // На demo-fapi MARKET fill приходит за 50–200ms; ждать 800ms
-            // во всех случаях = терять 600+ms на быстрых рынках, где SL
-            // должен встать максимально быстро. Polling 10×50ms=500ms max,
-            // но обычно выходим на первой-второй итерации.
+            // Active poll for fill (50ms × 10 = 500ms max). Beats blind sleep
+            // since demo-fapi typically confirms in 50-200ms.
             double actualEntry = 0;
             for (int pollI = 0; pollI < 10; pollI++) {
                 actualEntry = fetchOrderAvgPrice(symbol, entryOrderId);
@@ -574,14 +542,10 @@ public final class BinanceTradeExecutor {
             }
             if (actualEntry <= 0) actualEntry = entry; // fallback на квоту
 
-            // [HOLE-NEW FIX 2026-05-08] Partial-fill detection.
-            // sendMarketOrder возвращает только orderId; fetchOrderAvgPrice — только
-            // avgPrice. На illiquid alts MARKET может филить частично — позиция
-            // на бирже < requested qty, но SL/TP/Tracker считали бы по requested.
-            // SL имеет closePosition=true (закроет реальный остаток корректно), но
-            // TP1+TP2 split при partial fill могут отклоняться "qty exceeds position".
-            // Решение: после fill читаем реальный positionAmount и сверяем.
-            // Если расхождение >5% — используем меньшее значение для SL/TP.
+            // Partial-fill detection: on illiquid alts MARKET may fill < requested.
+            // SL has closePosition=true (handles real qty), but TP1+TP2 split
+            // could fail with "qty exceeds position". If filled < 95% of requested,
+            // use the smaller value for SL/TP sizing.
             double filledQty = qty;
             try {
                 double posAmt = Math.abs(fetchPositionAmount(symbol));
@@ -605,18 +569,9 @@ public final class BinanceTradeExecutor {
             qty = filledQty;
             double actualNotional = qty * actualEntry;
 
-            // 5. Place SL — STOP_MARKET через Algo Service.
-            // [v83.3] С 2025-12-09 условные ордера живут на /fapi/v1/algoOrder.
-            // Параметр closePosition=true оставляем — закрывает всю позицию
-            // при срабатывании. reduceOnly с closePosition несовместим, не шлём.
-            // slPriceRounded уже снап на tickSize — иначе Binance отклонит.
-            //
-            // [v84.0 DIAGNOSTIC] При фейле логируем тело ответа ПОЛНОСТЬЮ
-            // и SEVERE-уровнем. До этого ошибка терялась в WARNING.
-            //
-            // [LATENCY-FIX 2026-05-08] Sleep между попытками 500→200ms,
-            // attempts 3→4. На 2-секундном таймауте это даёт окно: 4 попытки
-            // × ~250ms (request+wait) = укладываемся в дедлайн.
+            // 5. Place SL — STOP_MARKET via Algo Service (/fapi/v1/algoOrder).
+            // closePosition=true closes the full position on trigger.
+            // 4 attempts × ~250ms each fits within slPlacementTimeoutMs (2s default).
             String slOrderId = null;
             String slLastError = "no attempts";
             long slDeadline = System.currentTimeMillis() + slPlacementTimeoutMs;
@@ -945,10 +900,9 @@ public final class BinanceTradeExecutor {
                 HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
             String b = resp.body() == null ? "" : resp.body();
-            // [v85 ORDER-FIX] -4061 = "Order's position side does not match
-            // user's setting." Account is in HEDGE mode despite our boot-time
-            // ensureOneWayMode() call (could be permission-restricted testnet
-            // key). Retry once with explicit positionSide.
+            // -4061 = "Order's position side does not match." HEDGE mode
+            // detected despite ensureOneWayMode() at boot — retry with explicit
+            // positionSide as fallback.
             if (b.contains("-4061") || b.contains("position side")) {
                 LOG.warning("[Executor] " + symbol + " HEDGE mode detected, retrying with positionSide");
                 long ts2 = ts();
@@ -1163,17 +1117,9 @@ public final class BinanceTradeExecutor {
     }
 
     // ═════════════════════════════════════════════════════════════════
-    // [v84.5] PositionTracker support: targeted algo cancel,
-    //         move-to-breakeven, real-fill PnL, position enumeration.
-    //
-    // These methods are added to support PositionTracker v2.0 which fixes:
-    //   • PnL miscalculation (using slPrice instead of real fills)
-    //   • Lack of breakeven SL after TP1
-    //   • Inability to cancel a single SL without nuking TPs
-    //   • Startup orphan-position detection
-    //
-    // None of these methods are called by openPositionWithSl — existing
-    // open/close flows are untouched.
+    // PositionTracker support: targeted algo cancel, move-to-breakeven,
+    // real-fill PnL, position enumeration. Used by PositionTracker; not
+    // called from openPositionWithSl (existing flows untouched).
     // ═════════════════════════════════════════════════════════════════
 
     /**
@@ -1546,9 +1492,6 @@ public final class BinanceTradeExecutor {
                 lastStatus = resp.statusCode();
                 lastBody   = resp.body() == null ? "" : resp.body();
                 if (lastStatus == 200) {
-                    // [v83.6 RETRY] HEDGE-mode fallback. -4061 here is rare (we
-                    // should've ensured ONE_WAY at boot), but if positionSide
-                    // is required, retry with explicit positionSide once.
                     // Verify position closed within ~1.5s.
                     boolean verified = false;
                     for (int v = 0; v < 3; v++) {
@@ -1675,7 +1618,7 @@ public final class BinanceTradeExecutor {
         }
     }
 
-    // ─── [v83.2] Exchange filters: exchangeInfo cache + rounding ──────
+    // ─── Exchange filters: exchangeInfo cache + rounding ──────
 
     /**
      * Holds the Binance per-symbol filter values that we actually need to

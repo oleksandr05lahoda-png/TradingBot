@@ -4,6 +4,13 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.logging.Logger;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 /** SimpleBacktester v10.1 — INSTITUTIONAL-GRADE BACKTEST
  *
@@ -136,14 +143,73 @@ public final class SimpleBacktester {
     private double volume24hUSD = 0.0;
     public void setVolume24hUSD(double v)    { this.volume24hUSD = Math.max(0.0, v); }
 
+    // [Phase 5.0] Historical funding rate timeline for backtest.
+    // Sorted (timestamp_ms → fundingRate) entries. Set by main() before run()
+    // by fetching /fapi/v1/fundingRate?symbol=X&startTime=Y&endTime=Z&limit=1000.
+    // Binance funding intervals are 8h, so a 13-day window has ~39 entries.
+    // During run(), each bar's fundingAt(time) is injected via
+    // engine.setSimulatedFunding() so generateFromFundingMomentum sees realistic
+    // historical funding. If empty/null → Funding Momentum simply won't trigger
+    // (DE returns "fm_no_funding_data") — backward compatible.
+    private TreeMap<Long, Double> fundingHistory = new TreeMap<>();
+    public void setFundingHistory(TreeMap<Long, Double> hist) {
+        this.fundingHistory = hist != null ? hist : new TreeMap<>();
+    }
+    /** Returns funding rate active at `timestamp` (last entry ≤ timestamp), or 0 if none. */
+    private double fundingAt(long timestamp) {
+        if (fundingHistory == null || fundingHistory.isEmpty()) return 0.0;
+        Map.Entry<Long, Double> e = fundingHistory.floorEntry(timestamp);
+        return e != null ? e.getValue() : 0.0;
+    }
+
     // [v82] Class-level env helpers (старые жили в SelfValidator).
     private static int envInt(String key, int def) {
         try { return Integer.parseInt(System.getenv().getOrDefault(key, String.valueOf(def))); }
         catch (Exception e) { return def; }
     }
     private static double envDouble(String key, double def) {
-        try { return Double.parseDouble(System.getenv().getOrDefault(key, String.valueOf(def))); }
-        catch (Exception e) { return def; }
+        try { return Double.parseDouble(System.getenv().getOrDefault(key, String.valueOf(def))); }     catch (Exception e) { return def; }
+    }
+
+    // [Phase 5.0 2026-05-10] Historical funding rate fetcher for backtest.
+    //
+    // Fetches funding rate history for `symbol` from Binance Futures REST API:
+    //   GET /fapi/v1/fundingRate?symbol=X&startTime=Y&endTime=Z&limit=1000
+    //
+    // Funding rates settle every 8h on Binance (00:00, 08:00, 16:00 UTC), so a
+    // 13-day window contains ~39 entries. limit=1000 is sufficient for windows
+    // up to ~333 days. No API key required (public endpoint, weight=1).
+    //
+    // Returns TreeMap of {fundingTime → fundingRate}. Empty on error/no data
+    // (Funding Momentum strategy will simply not trigger — backward compatible).
+    public static TreeMap<Long, Double> fetchFundingHistory(String symbol, long startMs, long endMs) {
+        TreeMap<Long, Double> hist = new TreeMap<>();
+        try {
+            String url = String.format(
+                    "https://fapi.binance.com/fapi/v1/fundingRate?symbol=%s&startTime=%d&endTime=%d&limit=1000",
+                    symbol, startMs, endMs);
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(10))
+                    .build();
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(15))
+                    .GET()
+                    .build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) return hist;
+            JSONArray arr = new JSONArray(resp.body());
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                long t = o.getLong("fundingTime");
+                double r = Double.parseDouble(o.getString("fundingRate"));
+                hist.put(t, r);
+            }
+        } catch (Throwable e) {
+            // Silent fallback — empty map means Funding Momentum stays dormant
+            System.err.println("[Backtester] fetchFundingHistory failed for " + symbol + ": " + e.getMessage());
+        }
+        return hist;
     }
 
     //  RESULTS
@@ -562,6 +628,18 @@ public final class SimpleBacktester {
                     sliceM1 = getTimeframeSlice(m1, m15.get(Math.max(0, i - 20)).openTime, decisionTime);
                 if (m5 != null && !m5.isEmpty())
                     sliceM5 = getTimeframeSlice(m5, m15.get(Math.max(0, i - 40)).openTime, decisionTime);
+
+                // [Phase 5.0] Inject historical funding rate at this decision moment.
+                // This populates engine's fundingCache so generateFromFundingMomentum
+                // can evaluate the rate active at this historical bar.
+                // Falls through silently (DE returns null) if fundingHistory is empty.
+                double currentFr = fundingAt(decisionTime);
+                // For frPeakWarning/frTroughWarning we need previous funding too.
+                // Use entry one funding-cycle (8h = 28800000 ms) before current.
+                double prevFr = fundingAt(decisionTime - 28_800_000L);
+                if (currentFr != 0.0 || prevFr != 0.0) {
+                    engine.setSimulatedFunding(symbol, currentFr, prevFr);
+                }
 
                 com.bot.DecisionEngineMerged.TradeIdea idea = engine.analyze(
                         symbol, sliceM1, sliceM5, slice15, sliceH1, category);
@@ -1274,6 +1352,13 @@ public final class SimpleBacktester {
                 if (h1  == null || h1.size()  < 80)         continue;
 
                 DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(pair);
+
+                // [Phase 5.0] Load historical funding rates for this symbol.
+                // Window matches the candle window for this backtest run.
+                long fhStart = m15.get(0).openTime;
+                long fhEnd   = m15.get(m15.size() - 1).openTime + 3_600_000L;
+                TreeMap<Long, Double> fundingHist = fetchFundingHistory(pair, fhStart, fhEnd);
+                bt.setFundingHistory(fundingHist);
 
                 // run() expects (m1, m5, m15, h1, category). m1/m5 = null is fine —
                 // the backtest engine handles it; this is the conservative path

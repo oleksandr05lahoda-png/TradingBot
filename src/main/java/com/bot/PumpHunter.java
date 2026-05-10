@@ -39,9 +39,7 @@ import java.util.logging.Logger;
  *   8. Volume climax / confirmation (kept)
  */
 public final class PumpHunter {
-    // [v72] Unified logger
     private static final Logger LOG = Logger.getLogger(PumpHunter.class.getName());
-
 
     // ==================== CONFIG ====================
 
@@ -62,8 +60,7 @@ public final class PumpHunter {
     // [A2] Confirmation: 1 bar (was 3). Squeeze/breakout conflict guards still filter dead-cat.
     private static final int PUMP_CONFIRM_BARS = 1;
 
-    // [v61] Cooldowns increased. Was 3min/90s/2min — too short, produced
-    // 2-3 duplicate signals per real event. New values: 12/4/6 min.
+    // Cooldowns: prevent duplicate signals per real event.
     private static final long PUMP_COOLDOWN_MS       = 12 * 60_000L;
     private static final long EXHAUSTION_COOLDOWN_MS = 4 * 60_000L;
     private static final long PREPUMP_COOLDOWN_MS    = 6 * 60_000L;
@@ -72,12 +69,8 @@ public final class PumpHunter {
     private static final long   EXH_PUMP_AGE_MS = 10 * 60_000L; // exhaustion only valid within 10min after pump
     private static final double EXH_VOL_DROP    = 0.65;          // recent vol < 65% of peak = divergence
     private static final double EXH_WICK_RATIO  = 0.50;          // avg upper wick > 50% body
-    // [FIX-9PCT 2026-05-02] EXH_MIN_FLAGS 2 → 3.
-    // На 2 флагах detectExhaustion срабатывал на каждой нормальной коррекции
-    // внутри тренда (volume divergence + wick growth — оба ЕСТЕСТВЕННЫ
-    // во время отката). Это был источник массовых SHORT-сигналов на росте.
-    // На 3 флагах требуется ВСЕ три (vol_div + wick + slowdown) — реальное
-    // exhaustion, не просто откат.
+    // EXH_MIN_FLAGS = 3: ALL three of {volDiv, longWicks, slowdown} required.
+    // Setting to 2 fires on normal pullbacks within trends → false SHORTs on rallies.
     private static final int    EXH_MIN_FLAGS   = 3;             // at least all 3 of {volDiv, longWicks, slowdown}
 
     // [C] Pre-pump thresholds
@@ -88,7 +81,7 @@ public final class PumpHunter {
 
     // ==================== STATE ====================
 
-    // [FIX] Symbols to skip entirely — garbage coins that produce noise events.
+    // Symbols to skip entirely — garbage coins that produce noise events.
     // Populated by SignalSender via addGarbageSymbol() or constructor.
     // Keeps PumpHunter logs clean and prevents memory growth on meme pumps.
     private final java.util.Set<String> garbageSymbols =
@@ -98,8 +91,8 @@ public final class PumpHunter {
         if (symbol != null) garbageSymbols.add(symbol);
     }
 
-    // [v87 DIAGNOSTIC 2026-05-09] Read-only state snapshot for health monitoring.
-    // Useful for telegram /status and operator visibility into PumpHunter internals.
+    // Read-only state snapshot for health monitoring (telegram /status).
+    // Useful for operator visibility into PumpHunter internals.
     // Intentionally returns counts (not contents) — content can be PII-sensitive
     // in some deployments (specific symbol names exposed).
     public java.util.Map<String, Integer> stateStats() {
@@ -113,7 +106,7 @@ public final class PumpHunter {
         return stats;
     }
 
-    // ── [v61] TTL cleanup — prevents unbounded state growth on Railway ────
+    // ── TTL cleanup — prevents unbounded state growth on Railway ────
     private volatile long lastCleanupMs = 0L;
     private static final long CLEANUP_INTERVAL_MS = 10 * 60_000L;
     private static final long STATE_TTL_MS        = 2 * 60 * 60_000L;
@@ -134,12 +127,8 @@ public final class PumpHunter {
             q.removeIf(pe -> pe.timestamp < cutoff);
             return q.isEmpty();
         });
-        // [v87 GARBAGE-CAP 2026-05-09] Cap garbageSymbols set size. The set is
-        // populated externally (SignalSender chronic-stale eviction, etc.) without
-        // TTL. On long-running deployments (>30 days) it could grow to thousands of
-        // entries. Hard cap = 500 — beyond that, we evict oldest insertion order
-        // (best effort with LinkedHashSet semantics; ConcurrentHashMap.newSetFromMap
-        // doesn't guarantee order, so we just clear half if oversize).
+        // Cap garbageSymbols at 500 to prevent unbounded growth on long deploys.
+        // Set is populated externally without TTL; evict half when oversize.
         if (garbageSymbols.size() > 500) {
             int target = 250;
             int toRemove = garbageSymbols.size() - target;
@@ -313,7 +302,7 @@ public final class PumpHunter {
                                          List<com.bot.TradingCore.Candle> c15m,
                                          double catMult) {
 
-        // [FIX] Skip known garbage coins — prevent log spam and memory waste
+        // Skip known garbage coins — prevent log spam and memory waste
         if (garbageSymbols.contains(symbol)) return null;
 
         if (c1m == null || c1m.size() < 20
@@ -492,10 +481,8 @@ public final class PumpHunter {
         if (!(recent.isBullish() || recent.isBearish())) return null;
         if (recent.isReversal() || recent.isAnticipatory()) return null; // don't stack
         if (System.currentTimeMillis() - recent.timestamp > EXH_PUMP_AGE_MS) return null;
-        // [FIX-9PCT 2026-05-02] Strength threshold 0.45 → 0.65.
-        // На 0.45 detectExhaustion срабатывал даже на слабых пампах
-        // (которые часто и не пампы вовсе, а просто шумовое движение).
-        // 0.65 = только реально мощные импульсы заслуживают reversal-внимания.
+        // Strength threshold 0.65 — only mighty impulses deserve reversal attention;
+        // lower thresholds trigger on weak/noise moves.
         if (recent.strength < 0.65) return null;
 
         int n = c1m.size();
@@ -820,7 +807,7 @@ public final class PumpHunter {
         double recentLow  = Double.MAX_VALUE;
         double volSum = 0;
         int volCount = 0;
-        // [v51 FIX] Window [n-20, n-1) — excludes only the current bar being broken.
+        // Window [n-21, n-1) — excludes only the current bar being broken.
         for (int i = n - 21; i < n - 1; i++) {
             recentHigh = Math.max(recentHigh, c15m.get(i).high);
             recentLow  = Math.min(recentLow,  c15m.get(i).low);

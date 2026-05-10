@@ -43,9 +43,7 @@ import java.util.logging.Logger;
  *  [F7] isHealthy() returns false if worker stuck >30s or 10+ consecutive send failures.
  */
 public final class TelegramBotSender {
-    // [v72] Unified logger
     private static final Logger LOG = Logger.getLogger(TelegramBotSender.class.getName());
-
 
     private final String token;
     private final String chatId;

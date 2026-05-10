@@ -9,9 +9,7 @@ import java.util.logging.Logger;
 
 /** GlobalImpulseController — TRADINGBOT PRO EDITION v7.0 */
 public final class GlobalImpulseController {
-    // [v72] Unified logger
     private static final Logger LOG = Logger.getLogger(GlobalImpulseController.class.getName());
-
 
     //  CONFIGURATION
 
@@ -31,11 +29,9 @@ public final class GlobalImpulseController {
     // Sector contagion: если сектор упал больше этого % за 8 свечей → вето лонгов
     private static final double SECTOR_CONTAGION_DROP = 0.040;  // -4%
 
-    // [HOLE-LONG FIX 2026-05-08] Минимальный пол для longSuppressionMult.
-    // Default 0.0 = сохраняет старое поведение (suppression может быть до 0.30).
-    // Поставить env GIC_LONG_SUPPRESS_MIN=0.85 чтобы LONG никогда не резался
-    // ниже 85% от изначального score (фактически отключение GIC long-suppression).
-    // Применяется к выходному longSuppressionMult в isLongAllowed-логике.
+    // Floor for longSuppressionMult. Default 0 = legacy (suppression to 0.30 OK).
+    // Set GIC_LONG_SUPPRESS_MIN=0.85 to never cut LONG below 85% of input score
+    // (effectively disables GIC long-suppression).
     private static final double GIC_LONG_SUPPRESS_MIN = envDoubleStaticGic("GIC_LONG_SUPPRESS_MIN", 0.0);
 
     private static double envDoubleStaticGic(String key, double def) {
@@ -307,12 +303,8 @@ public final class GlobalImpulseController {
 
     //  CONSTRUCTORS
 
-    // [v85.0] Static reference to most-recently-constructed instance.
-    // Populated in the constructor. Allows code that doesn't have a
-    // direct reference (e.g. Dispatcher in BotMain) to read current BTC
-    // regime via GlobalImpulseController.getLatest() without dependency
-    // injection plumbing. Volatile because constructor and reader run
-    // on different threads.
+    // Most-recently-constructed instance. Allows callers without direct
+    // reference (e.g. Dispatcher) to read BTC regime via getLatest().
     private static volatile GlobalImpulseController LATEST = null;
     public static GlobalImpulseController getLatest() { return LATEST; }
 
@@ -548,14 +540,13 @@ public final class GlobalImpulseController {
         boolean onlyLong  = (regime == GlobalRegime.BTC_STRONG_UP  && rawStrength > 0.82)
                 || (regime == GlobalRegime.BTC_IMPULSE_UP  && rawStrength > 0.78);
 
-        // [v85 LONG-FIX 2026-05-07] BTC_IMPULSE_DOWN trigger был слишком чутким.
-        // Старое условие (rawStr>0.65 + velocity>VELOCITY_WATCH=0.0025) срабатывало
-        // практически на каждой 15m свече с move<-0.4%. Это превращало любую
-        // ночную сессию в "только шорты". Новое условие требует одновременно:
-        //   - rawStrength > 0.72 (импульс реальный, не шум)
-        //   - velocity   > VELOCITY_DANGER (0.0060, ускорение падения)
-        //   - >= 2 consecutive bear bars (не однобарная свеча)
-        // CRASH/PANIC/STRONG_DOWN остаются жёсткими hard-veto без изменений.
+        // BTC_IMPULSE_DOWN trigger requires conjunction of all three to avoid
+        // false positives on single-bar drops (which used to flip the bot to
+        // "shorts only" on routine night sessions):
+        //   - rawStrength > 0.72 (impulse real, not noise)
+        //   - velocity > VELOCITY_DANGER (drop accelerating)
+        //   - ≥ 2 consecutive bear bars
+        // CRASH / PANIC / STRONG_DOWN remain hard-veto.
         boolean onlyShort = (regime == GlobalRegime.BTC_STRONG_DOWN && rawStrength > 0.78)
                 || (regime == GlobalRegime.BTC_CRASH)
                 || (regime == GlobalRegime.BTC_PANIC)
@@ -620,19 +611,14 @@ public final class GlobalImpulseController {
             }
         }
 
-        // [HOLE-LONG FIX 2026-05-08] Apply env-controlled floor on suppression.
-        // Default GIC_LONG_SUPPRESS_MIN=0.0 = noop (старое поведение).
-        // Установка =0.85 = LONG никогда не режется ниже 85% от изначального score.
-        // Не применяется когда onlyShort=true (там hard veto, не suppression).
+        // Apply env-controlled floor on suppression. Default 0 = legacy.
+        // Skipped when onlyShort=true (hard veto path, not suppression).
         if (!onlyShort && GIC_LONG_SUPPRESS_MIN > 0.0) {
             longSuppressionMult = Math.max(longSuppressionMult, GIC_LONG_SUPPRESS_MIN);
         }
 
         // ── SHORT Boost — усиление шортов при краше ──────────────
         double shortBoost = computeShortBoost(cascadeLevel, btcCrashScore, btcDropVelocity, btcMomentumAccel);
-
-        // longSuppressionMult now passed directly as explicit field.
-        // Removed sentinel encoding (confAdj < -50) which was fragile and opaque.
 
         // ── Hurst Exponent (R/S Analysis) ─────────────────────────
         // Measures long-range memory of BTC returns.
@@ -806,9 +792,8 @@ public final class GlobalImpulseController {
     private CascadeLevel determineCascadeLevel(double crashScore, double move3, double move5) {
         if (panicMode.get()) return CascadeLevel.PANIC;
 
-        // [v64 FIX] All levels now require minimum real price drop as a gate.
-        // Previously CRASH could fire on score>=0.70 alone (purely velocity-based),
-        // which caused the production bug: move3=-0.91% CrashScore=0.77 → CRASH → panic.
+        // All levels require minimum real price drop as a gate. Velocity-only
+        // triggers (e.g. crashScore alone) cause false panic on minor moves.
 
         // PANIC: сверхбыстрое падение — unchanged, already requires drop
         if (move3 < -PANIC_DROP_3BAR || (move5 < -0.040 && btcConsecutiveBearBars >= 4)) {
@@ -870,10 +855,9 @@ public final class GlobalImpulseController {
         // Уже в панике
         if (panicMode.get()) return false;
 
-        // [v64 FIX] Panic triggered at move3=-0.91% in production log.
-        // Root cause: velocity+score combo fired without real price drop guard.
-        // All panic branches NOW require a minimum REAL price drop. Velocity
-        // alone is NOT sufficient — otherwise normal volatility becomes "panic".
+        // All panic branches require a minimum REAL price drop guard.
+        // Velocity/score alone is NOT sufficient — otherwise normal volatility
+        // becomes "panic".
 
         // (1) Hard trigger: BTC упал > 3% за 3 свечи (45 минут)
         if (move3 < -PANIC_DROP_3BAR) return true;
@@ -881,8 +865,7 @@ public final class GlobalImpulseController {
         // (2) Hard trigger: BTC упал > 4% за 5 свечей
         if (move5 < -0.040) return true;
 
-        // (3) CRASH level cascade — now requires move3 < -1.5% AND 5+ bears AND score>=0.80.
-        // Old rule let crashScore=0.77 + 4 bars trigger panic at move3=-0.9%.
+        // (3) CRASH level cascade — requires move3 < -1.5% AND 5+ bears AND score≥0.80.
         // Tightened to prevent false alarms on normal corrections.
         if (level == CascadeLevel.CRASH
                 && btcConsecutiveBearBars >= 5
@@ -1056,10 +1039,8 @@ public final class GlobalImpulseController {
         }
 
         // CHOPPY MARKET — penalize but don't kill.
-        // Old: 0.05 = effectively blocked everything.
-        // [v74] 0.40 — still aggressive in practice (-15..-20 prob).
-        // [v75] 0.55 — penalty becomes -8..-12 prob. Lets high-RS coins on clean
-        // technical setups through during BTC chop. The whole point of relStrength
+        // 0.55 = penalty becomes -8..-12 prob. Lets high-RS coins on clean
+        // technical setups through during BTC chop. The point of relStrength
         // is to find coins that DON'T behave like the index — penalizing them
         // 60% when BTC chops defeats that signal. PANIC keeps full 0.0 veto.
         if (ctx.regime == GlobalRegime.BTC_CHOPPY) {
@@ -1207,31 +1188,24 @@ public final class GlobalImpulseController {
         }
 
         // ── Корректировка по волатильностному режиму ─────────────
-        // [v87 SYMMETRY-FIX 2026-05-09] Old asymmetry: only LONG was penalised on
-        // HIGH/EXTREME vol; SHORT was unaffected. Comment claimed "волатильность в
-        // нашу пользу" (volatility favors us) — but high vol cuts BOTH directions
-        // (whipsaws kill both LONGs at the bottom AND SHORTs at the top). The
-        // asymmetric penalty contributed to the bot's structural SHORT-bias visible
-        // in user logs (~70% SHORT signals, all losing). Now penalty applies symmetrically.
-        //
-        // ENV override: GIC_SYMMETRIC_VOL=0 reverts to old asymmetric behavior (NOT
-        // recommended — only for A/B comparison vs prior data).
+        // Symmetric vol penalty: high/extreme volatility hurts BOTH LONGs (at
+        // bottom) AND SHORTs (at top) via whipsaws. SHORT gets slightly lighter
+        // hit (0.85/0.93 vs 0.80/0.90) since SHORT benefits marginally from
+        // wider TP capture in vol expansions.
+        // Override: GIC_SYMMETRIC_VOL=0 reverts to old LONG-only penalty.
         boolean symmetricVolPenalty = !"0".equals(System.getenv()
                 .getOrDefault("GIC_SYMMETRIC_VOL", "1"));
         if (ctx.volRegime == VolatilityRegime.EXTREME) {
             if (isLong) {
-                weight *= 0.80; // [SCANNER MODE] was 0.55 — EXTREME vol kills LONGs unfairly
+                weight *= 0.80;
             } else if (symmetricVolPenalty) {
-                // [v87] Symmetric: SHORT also penalised on EXTREME vol (whipsaw risk).
-                // Slightly lighter than LONG (0.85 vs 0.80) because SHORT does benefit
-                // marginally from vol via wider TP capture.
                 weight *= 0.85;
             }
         } else if (ctx.volRegime == VolatilityRegime.HIGH) {
             if (isLong) {
-                weight *= 0.90; // [SCANNER MODE] was 0.80
+                weight *= 0.90;
             } else if (symmetricVolPenalty) {
-                weight *= 0.93; // [v87] Symmetric (slightly lighter for SHORT, same logic).
+                weight *= 0.93;
             }
         }
 

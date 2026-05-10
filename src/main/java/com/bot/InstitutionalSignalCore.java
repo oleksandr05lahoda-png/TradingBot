@@ -19,11 +19,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public final class InstitutionalSignalCore {
 
-    // [FIX-FLAT-MARKET 2026-05-02] MAX_EFFECTIVE_MIN_CONF 62 → 57.
-    // Синхронизация с env MIN_CONF=53 (было 58). Cap = MIN_CONF + 4 — ISC
-    // может поднять порог на penalty за daily loss / SL streak максимум до 57.
-    // Старое значение 62 было выше env=53 + 9pt — это означало что ISC
-    // мог искусственно блокировать сетапы которые env уже одобрил.
+    // Cap on ISC's adjusted MIN_CONF. Set to env MIN_CONF + 4 ceiling so ISC
+    // can raise the bar via penalties (daily loss / SL streak) without
+    // blocking setups env already approved.
     private static final double MAX_EFFECTIVE_MIN_CONF = 57.0;
 
     // ── Configuration ────────────────────────────────────────────
@@ -34,16 +32,11 @@ public final class InstitutionalSignalCore {
     private final double minSignalPriceDiff;
     private final int    maxSameSectorSameDir;
 
-    // [v90 1H-PRIMARY 2026-05-09] TIME_STOP_BARS scales with PRIMARY_TF.
-    //   PRIMARY_TF=15m: 12 bars × 15min = 180 min stop window
-    //   PRIMARY_TF=1h:   8 bars × 60min = 480 min (8h) stop window
-    //
-    // The 8h window on 1h primary fits the slower price discovery on hourly
-    // bars: typical mean-reversion target (1.0R ≈ 1.5×ATR-1h) takes 4-12
-    // bars on liquid alts, 8 is the median compromise.
-    //
-    // ENV ISC_TIME_STOP_BARS overrides; must match BACKTEST_TIME_STOP_BARS.
-    // TIME_STOP_MS auto-computes from PRIMARY_TF (60min vs 15min per bar).
+    // TIME_STOP_BARS scales with PRIMARY_TF:
+    //   15m: 12 bars × 15min = 180 min
+    //   1h:   8 bars × 60min = 480 min (8h)
+    // Must match BACKTEST_TIME_STOP_BARS in SimpleBacktester for walk-forward
+    // consistency.
     private static final boolean ISC_IS_15M = "15m".equals(
             System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
     private static final long ISC_BAR_MS = ISC_IS_15M ? 15 * 60_000L : 60 * 60_000L;
@@ -53,15 +46,14 @@ public final class InstitutionalSignalCore {
     private static final int  MAX_HISTORY     = 100;
 
     public InstitutionalSignalCore() {
-        // [v75] ISC_MAX_GLOBAL_SIGNALS 6→10. With 30 active pairs and a sector wave,
-        // 6 simultaneous open positions was too tight — fresh signals were dropped
-        // because the slot was occupied by an already-tracked position that hadn't
-        // hit TP/SL yet. 10 leaves headroom without diluting the portfolio.
+        // 10 simultaneous open positions = headroom for 30 active pairs + sector
+        // wave, without diluting the portfolio (was 6 — too tight, fresh signals
+        // dropped because slots held by already-tracked positions).
         this(
                 envInt("ISC_MAX_GLOBAL_SIGNALS", 10),
                 envInt("ISC_MAX_SIGNALS_PER_SYMBOL", 1),
                 envDouble("ISC_MAX_PORTFOLIO_HEAT", 0.06),
-                envDouble("ISC_BASE_MIN_CONF", 51.0),  // [FIX-FLAT-MARKET] 56 → 51 (< env MIN_CONF=53, чтобы env был authoritative)
+                envDouble("ISC_BASE_MIN_CONF", 51.0),  // < env MIN_CONF=53, env authoritative
                 envDouble("ISC_MIN_SIGNAL_PRICE_DIFF", 0.003),
                 envInt("ISC_MAX_SAME_SECTOR_DIR", 2)
         );
@@ -105,33 +97,21 @@ public final class InstitutionalSignalCore {
     private final Map<String, Long> symbolCooldownUntil = new ConcurrentHashMap<>();
 
     // Global signal rate limit — defends against signal floods.
-    // [v75] 16 → 30 per 2h. The previous cap was the binding constraint:
-    // BotMain.MAX_PER_HOUR=20 means 40 in 2h is theoretically possible, but
-    // ISC capped at 16/2h, making the effective limit ~8/h. 30/2h = 15/h average,
-    // matching BotMain's burst-protection model. Override via ISC_MAX_GLOBAL_2H env.
+    // 30 per 2h = 15/h average, matches BotMain's burst-protection model.
+    // Override via ISC_MAX_GLOBAL_2H env.
     private final ConcurrentLinkedDeque<Long> globalSignalTimestamps = new ConcurrentLinkedDeque<>();
     private static final int  MAX_GLOBAL_SIGNALS_2H = envInt("ISC_MAX_GLOBAL_2H", 30);
     private static final long GLOBAL_WINDOW_2H_MS   = 2L * 60 * 60_000L;
 
     // Daily kill-switch threshold. At -5% daily PnL, block ALL new signals
-    // until next UTC day. resetDailyIfNeeded() will clear dailyPnLPct automatically.
-    //
-    // [v87 BUG-FIX 2026-05-09] UNIT MISMATCH RESTORED.
-    // Old value: -0.05. Comment said "At -5%", but the value is in FRACTION units.
-    // Meanwhile dailyPnLPct is accumulated in PERCENT (closeTrade passes pnlPct = ×100).
-    // Result: kill-switch triggered at -0.05% daily PnL — effectively after ANY first
-    // small losing trade, killing the bot for the rest of the UTC day. This was the
-    // silent reason for "bot stopped sending signals" reports in addition to calibrator
-    // poison and ISC backtest penalty.
-    //
-    // Correct value: -5.0 (matches the comment, matches sibling constants
-    // DAILY_LOSS_SURVIVAL_PCT=-6.0 and DAILY_LOSS_CAUTIOUS_PCT=-3.0 which are in percent).
-    // Override via env ISC_DAILY_KILL_SWITCH_PCT for tighter/looser thresholds.
+    // until next UTC day. Units: PERCENT (matches dailyPnLPct accumulator
+    // which uses pnlPct × 100, and sibling constants like
+    // DAILY_LOSS_SURVIVAL_PCT=-6.0, DAILY_LOSS_CAUTIOUS_PCT=-3.0).
+    // Override via env ISC_DAILY_KILL_SWITCH_PCT.
     private static final double DAILY_KILL_SWITCH_PCT =
             envDouble("ISC_DAILY_KILL_SWITCH_PCT", -5.0);
 
     // DAILY SIGNAL LIMIT PER SYMBOL — prevents "milking" one volatile coin all day.
-    // [v18] 4 → 5 per 8h (slightly more headroom in trending day).
     private static final int    MAX_SIGNALS_PER_SYMBOL_8H = 5;
     private static final long   SIGNAL_WINDOW_8H_MS       = 8 * 60 * 60_000L;
     private final Map<String, Deque<Long>> symbolSignalTimestamps = new ConcurrentHashMap<>();
@@ -170,27 +150,12 @@ public final class InstitutionalSignalCore {
     /** TIME_STOP cooldown — 45 min. Pair that didn't move in 90 min needs more time off. */
     private static final long TIME_STOP_COOLDOWN_MS = 45 * 60_000L;
 
-    //  TIME-STOP CHAIN GUARD (v78 SCANNER-MODE SOFTENED)
+    //  TIME-STOP CHAIN GUARD
     //
-    //  [v78] Penalties cut by 8×.
-    //    TIER1: 4h → 30min
-    //    TIER2: 8h → 60min
-    //
-    //  Rationale: in SCANNER MODE, TIME_STOP just means "the user didn't see
-    //  TP1 within 90 min" — it doesn't mean the signal lost money. The user
-    //  may have closed at break-even, scaled out, or held longer and got TP2
-    //  the bot never saw. A 4-8 HOUR pause on a symbol after 2 consecutive
-    //  time-stops is overcorrection: those 2 signals could have both been
-    //  real opportunities the user simply didn't take.
-    //
-    //  Even in auto-trade mode, the original 4h+8h was conservative enough
-    //  that ENJUSDT-style dead-structure pairs would naturally trigger SL
-    //  instead of time-stops — the chain guard was firing on healthy pairs
-    //  going through low-volume periods.
-    //
-    //  30min/60min still kills the runaway-loop pattern (bot keeps re-firing
-    //  the same setup that nobody is closing) but lets a pair recover by the
-    //  next high-volume window of the same session.
+    //  After 2/3 consecutive time-stops on same symbol+side, pause new entries
+    //  for 30/60 min respectively. Short pause (vs old 4h/8h) avoids over-
+    //  correcting when a healthy pair is just going through a low-volume window.
+    //  Still kills the runaway-loop pattern (bot re-firing the same dead setup).
     private static final int  TS_CHAIN_TIER1_THRESHOLD = 2;
     private static final int  TS_CHAIN_TIER2_THRESHOLD = 3;
     private static final long TS_CHAIN_TIER1_PAUSE_MS  = 30 * 60_000L;     // [v78] 4h → 30min
@@ -470,11 +435,10 @@ public final class InstitutionalSignalCore {
     public double getEffectiveMinConfidence() {
         resetDailyIfNeeded();
 
-        // [FIX-FLAT-MARKET 2026-05-02] floor 54 → 50, milestones симметрично сдвинуты.
-        // Синхронизация с env MIN_CONF=53. Floor=50 = MIN_CONF - 3 — ISC может
-        // опустить порог на 3pt при отличном track record (это полезно в флэте),
-        // но НЕ может опуститься ниже env-floor (защищено в SignalSender.earlyMinConf).
-        // Milestones: 500 trades + WR 58% → 47 (агрессивно), 200 + WR 55% → 49.
+        // Min-confidence floor scales down with track record:
+        //   500+ trades, WR ≥ 58% → 47.0 (aggressive)
+        //   200+ trades, WR ≥ 55% → 49.0
+        //   default              → 50.0 (sync with env MIN_CONF=53, ISC can drop 3pt)
         double floor = 50.0;
         int totalTrades = getTotalTradeCount();
         double overallWr = getOverallWinRate();
@@ -490,22 +454,11 @@ public final class InstitutionalSignalCore {
             base += 1.0;
         }
 
-        // [v87 BACKTEST-DECOUPLE 2026-05-09] Old behavior: any negative backtest EV
-        // within 2h would add +2 to minConf. Combined with poisoned calibrator
-        // (which already snaps raw probs to ~0.40), this caused a DOUBLE block:
-        // calibrator drops scores AND ISC raises the gate. Result: zero signals.
-        //
-        // New behavior:
-        //   - If calibrator is healthy (≥100 outcomes, recent WR ≥ 40%): keep
-        //     legacy +2 penalty for bad recent backtest. The system is mature
-        //     enough that an additional caution layer makes sense.
-        //   - If calibrator is in warmup or disabled: SKIP the penalty. Otherwise
-        //     we're stacking two safety nets that together produce paralysis.
-        //     The calibrator pass-through already reflects strategy uncertainty;
-        //     no need for a second multiplicative penalty.
-        //
-        // ENV override: ISC_LEGACY_BT_PENALTY=1 forces the old always-on behavior
-        // (use only if you've explicitly diagnosed and trust your calibrator state).
+        // Backtest-EV penalty (decouple from cold calibrator).
+        // Apply +2pt minConf for bad recent backtest ONLY when calibrator is
+        // mature (≥100 outcomes). On a warm/cold calibrator, calibrator already
+        // adjusts scores — stacking ISC's +2pt produces paralysis.
+        // Override: ISC_LEGACY_BT_PENALTY=1 forces always-on (diagnose-only).
         boolean btPenaltyEligible = "1".equals(System.getenv()
                 .getOrDefault("ISC_LEGACY_BT_PENALTY", "0"));
         if (!btPenaltyEligible) {
@@ -538,10 +491,9 @@ public final class InstitutionalSignalCore {
 
     //  SIGNAL FILTERING
 
-    // [v78.3] Direction cap reduced 10 → 4. Crypto correlations during
-    // BTC-driven moves are essentially 1.0 — 8 same-side positions = 8× leverage
-    // on one trade. 4 is enough to capture sector wave without making the
-    // portfolio a single concentrated bet.
+    // Direction cap: crypto correlations during BTC moves are ~1.0, so 8 same-
+    // side positions = 8× leverage on a single bet. 4 captures a sector wave
+    // without portfolio concentration risk.
     private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 4);
 
     // Rate-limit BIPOLAR BLOCK logs: one log per symbol per 60s to avoid Railway log flood.
@@ -610,17 +562,9 @@ public final class InstitutionalSignalCore {
             return false;
         }
 
-        // [v78.3] DIRECTIONAL CONCENTRATION CAP.
-        // В предыдущих версиях бот мог выпустить 8 SHORT-сигналов одновременно
-        // во время BTC_STRONG_DOWN. Все эти позиции коррелированы (~0.85-0.95
-        // на крипто-альтах), фактически = 1 позиция с 8× плечом. Если рынок
-        // развернётся — всё в SL одновременно.
-        //
-        // Жёсткий лимит: максимум 4 одновременно активных сигнала в одну
-        // сторону. После этого новые сигналы той же стороны блокируются
-        // до тех пор пока не закроется хотя бы один.
-        //
-        // Override через env: ISC_MAX_SAME_DIRECTION (default = 4).
+        // Directional concentration cap: max 4 active sigals same direction.
+        // Crypto-alt correlations ~0.85-0.95 mean 8 same-side positions =
+        // 1 position with 8× leverage. Override via ISC_MAX_SAME_DIRECTION.
         int sameDirCount = 0;
         for (List<ActiveSignal> sigs : activeSignals.values()) {
             for (ActiveSignal s : sigs) {

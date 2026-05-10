@@ -145,19 +145,13 @@ public final class DecisionEngineMerged {
     // паралич). Калибратор + Dispatcher + ISC остаются authoritative quality
     // gate: сигналы с prob 53-58 будут проходить DE, но если калибратор
     // обучится что они часто проигрывают — он их занизит и они отвалятся.
-    // [FIX-FLAT-MARKET 2026-05-02] FLOOR 52→50. С env MIN_CONF=53 авторитетным
-    // становится SignalSender.earlyMinConf=53. DE-floor=50 даёт DE возможность
-    // выпускать setup'ы с prob 50-52 — они дойдут до SignalSender, где env-MIN_CONF
-    // решает финально. Без этого DE рубит сетапы ещё до того как они увидят env-floor.
-    // [FLAT-MARKET LOOSEN 2026-05-05] BASE_CONF 53→50. В NEUTRAL str=0.06-0.22 BTC
-    // RANGE adapt даёт base+1=54, что отсекало 99% сетапов. Снижение до 50 = равно
-    // floor; адаптации (RANGE +1, vol +2, UTC -1.5) теперь работают вокруг 50.
+    //
+    // BASE_CONF=50 = MIN_CONF_FLOOR. Адаптации (RANGE +1, vol +2, UTC -1.5)
+    // работают вокруг 50. Authoritative env-MIN_CONF в SignalSender (default 53).
     private static final double BASE_CONF       = 50.0;
     private static final int    CALIBRATION_WIN = 120;
-    // [HOLE-5 FIX 2026-05-08] MIN_CONF_FLOOR 48 → 52. С env MIN_CONF=53 (рекомендация
-    // в коде SignalSender:608) DE выпускал идеи в диапазоне 48-52 которые СРАЗУ
-    // отсекались downstream — wasted compute ~30%. Поднимаем floor до 52, чтобы
-    // ранний reject экономил CPU. Authoritative env-MIN_CONF остаётся в SignalSender.
+    // MIN_CONF_FLOOR=52 — DE early-reject порог. Env MIN_CONF (default 53)
+    // остаётся authoritative downstream в SignalSender.earlyMinConf.
     private static final double MIN_CONF_FLOOR  = 52.0;
     private static final double MIN_CONF_CEIL   = 78.0;
 
@@ -173,21 +167,16 @@ public final class DecisionEngineMerged {
     // Cluster confluence bonus
     private static final double CLUSTER_CONFLUENCE_BONUS = 0.15;
 
-    // [HOLE-4 FIX 2026-05-08] MIN_AGREEING_CLUSTERS теперь АДАПТИВНЫЙ.
-    // OLD: фиксированно 2 — пропускало шумовые сетапы в RANGE-рынке.
-    // NEW: 2 для TREND/STRONG_TREND (импульс достаточно говорит сам за себя)
-    //      3 для RANGE (чтобы 2 случайно совпавших cluster'а не дали сигнал)
-    // Метод clustersRequired(MarketState) ниже возвращает нужное значение в runtime.
-    // Default fallback всё ещё 2 для совместимости с unit-тестами/legacy callers.
+    // Adaptive minimum agreeing clusters: 2 for TREND/STRONG_TREND (impulse
+    // speaks for itself), 3 for RANGE (avoid random pairs of cluster agreement).
+    // clustersRequired(MarketState) returns runtime value.
     private static final int    MIN_AGREEING_CLUSTERS    = 2;
     private static final int    MIN_AGREEING_CLUSTERS_RANGE = 3;
-    // [FLAT-FIX 2026-05-07] 0.28 → 0.22. Кластер квалифицируется как "agreeing"
-    // если его направленный score ≥ 0.22 (было 0.28). На флэте кластеры дают
-    // score 0.20-0.30 — старый порог отсекал большинство. 0.22 оставляет защиту
-    // от чисто шумовых ассоциаций (random < 0.15).
+    // MIN_CLUSTER_SCORE=0.22: cluster qualifies as "agreeing" if directional
+    // score ≥ 0.22. Lower would let random noise associations through.
     private static final double MIN_CLUSTER_SCORE        = 0.22;
 
-    // [HOLE-LONG FIX 2026-05-08] Env-параметризация LONG-suppression слоёв.
+    // Env-параметризация LONG-suppression слоёв.
     // Дефолты сохраняют старое поведение. Чтобы разморозить LONG в bear-market:
     //   HTF_OPPOSE_PENALTY=0           — убирает -5 баллов за HTF mismatch
     //   GIC_LONG_HARD_VETO=0           — конвертирует hard-reject в soft penalty
@@ -935,13 +924,10 @@ public final class DecisionEngineMerged {
             return 1.0 - ((double) age / staleThresholdMs);
         }
 
-        // [HOLE-1 FIX 2026-05-08] Unified size multiplier passthrough.
-        // SignalSender computes ALL modifiers (category, flag-based, session, ISC,
-        // small-balance) when building Telegram display, then stores the resulting
-        // ratio here. Executor reads it and applies to base qty so on-exchange size
-        // matches what Telegram showed. Default 1.0 = no modifier (safe fallback
-        // when idea didn't go through SignalSender path, e.g. LiveTradeProbe).
-        // Clamped to [0.20, 1.20] in setter to prevent malformed values.
+        // Unified size multiplier passthrough. SignalSender computes ALL modifiers
+        // (category, flag-based, session, ISC, small-balance) and stores result here.
+        // Executor applies to base qty so on-exchange size matches Telegram display.
+        // Clamped to [0.20, 1.20] in setter; 1.0 = no modifier (safe fallback).
         private volatile double executorSizeMultiplier = 1.0;
         public double getExecutorSizeMultiplier() { return executorSizeMultiplier; }
         public void setExecutorSizeMultiplier(double m) {
@@ -1738,16 +1724,19 @@ public final class DecisionEngineMerged {
             return idea;
         }
 
-        // Priority 2: Advanced Confluence (Phase 4.0) — smart-money indicators
-        // Different signal type from MR → triggers in different situations.
-        // No conflict with MR (MR already rejected this bar).
-        idea = generateFromConfluence(symbol, c1, c5, c15, c1h, c2h, cat, now);
+        // Priority 2: Funding Rate Momentum (Phase 5.0) — short-squeeze / long-flush hunter
+        // Different signal type from MR (positioning-based, not price-based).
+        // Triggers ONLY on extreme funding rates that historically predict reversion
+        // (short squeezes when crowd is short, long flushes when crowd is long).
+        // No conflict with MR (MR Phase 2.4 funding filter blocks MR on these same
+        // extremes, so Funding Momentum gets a clean slot).
+        idea = generateFromFundingMomentum(symbol, c1, c5, c15, c1h, c2h, cat, now);
         if (idea != null) {
             csLastSignalTime.put(symbol, now);
             return idea;
         }
 
-        // Priority 3: Breakout for trending markets (only if MR/Confluence found nothing)
+        // Priority 3: Breakout for trending markets (only if MR/FM found nothing)
         if (PHASE2_BREAKOUT_ENABLE &&
                 (regime == MarketRegime.TREND_UP || regime == MarketRegime.TREND_DOWN)) {
             idea = generateBreakout(symbol, c5, c15, c1h, c2h, cat, regime, now);
@@ -1987,198 +1976,6 @@ public final class DecisionEngineMerged {
         return idea;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // STRATEGY: ADVANCED CONFLUENCE (Phase 4.0 2026-05-10)
-    // ─────────────────────────────────────────────────────────────────────
-    // Wires up the previously UNUSED TradingCore.advancedConfluence() which
-    // aggregates 8 smart-money indicators into bull/bear scores:
-    //   - Order Blocks (institutional demand/supply zones)
-    //   - Fair Value Gaps (price inefficiencies)
-    //   - SuperTrend regime
-    //   - KAMA slope (adaptive moving average)
-    //   - Anchored VWAP from daily open
-    //   - CVD divergence (cumulative volume delta)
-    //   - Premium/Discount zones
-    //   - Liquidity sweeps (stop hunts)
-    //   - Pre-move patterns (Wyckoff Spring/Upthrust, compression breakout)
-    //
-    // Why this is different from Phase 2 PumpHunter/Breakout:
-    //   - PumpHunter and Breakout used SAME data type as MR (price/volume TA)
-    //     → competed for the same setups → less trades, not more.
-    //   - Confluence uses INSTITUTIONAL/SMART-MONEY data (OB, FVG, sweeps,
-    //     CVD) → triggers in DIFFERENT situations than MR → additive, not
-    //     subtractive.
-    //
-    // Routing position: PRIORITY 2 in router (after MR, before Breakout/PH).
-    // MR remains the productivity floor. Confluence fires only when MR
-    // didn't find setup AND smart-money signals strongly agree on direction.
-    //
-    // Filter strictness (designed to avoid noise on this market):
-    //   - Requires diff() ≥ 0.30 (strong directional bias, not 0.15 default)
-    //   - Requires winning side score ≥ 0.45 (meaningful absolute strength)
-    //   - Standard SL: 1.5×ATR (matches MR conservatism)
-    //   - TP at 2R (matches MR risk profile)
-    //   - Requires same BTC regime gates as MR (no LONG in BTC_PANIC etc)
-    private TradeIdea generateFromConfluence(String symbol,
-                                             List<com.bot.TradingCore.Candle> c1,
-                                             List<com.bot.TradingCore.Candle> c5,
-                                             List<com.bot.TradingCore.Candle> c15,
-                                             List<com.bot.TradingCore.Candle> c1h,
-                                             List<com.bot.TradingCore.Candle> c2h,
-                                             CoinCategory cat,
-                                             long now) {
-        if (!PHASE4_CONFLUENCE_ENABLE) return null;
-        if (!valid(c15) || !valid(c1h)) return reject("conf_invalid_candles");
-        if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("conf_skip_meme");
-
-        // Cooldown — same per-symbol lock as MR (whipsaw protection).
-        Long lastSig = csLastSignalTime.get(symbol);
-        if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) {
-            return reject("conf_cooldown");
-        }
-
-        // Note: post-pump/dump cooldown already enforced by router pre-filter
-        // (lines ~1706-1715), so no duplicate check needed here.
-
-        // Need enough bars for Order Block / FVG / CVD lookback (50+).
-        // 1h primary: 1h candles; advancedConfluence needs ~50 candles.
-        if (c1h.size() < 60) return reject("conf_insufficient_history");
-
-        com.bot.TradingCore.Candle lastBar = last(c1h);
-        double price = lastBar.close;
-        if (price <= 0) return reject("conf_invalid_price");
-
-        // ── Run the aggregator ──
-        com.bot.TradingCore.ConfluenceReport conf =
-                com.bot.TradingCore.advancedConfluence(c1h, price);
-
-        // ── Filter 1: must have STRONG directional bias ──
-        // diff() = bullScore - bearScore. Default bias threshold is ±0.15 (loose);
-        // we require ±0.30 (strict) to avoid 50/50 noise sigals.
-        double diff = conf.diff();
-        if (Math.abs(diff) < PHASE4_MIN_DIFF) {
-            return reject(String.format("conf_no_bias_diff=%.2f", diff));
-        }
-
-        // ── Filter 2: winning side score must be meaningful in absolute terms ──
-        // Even with high diff, if both sides are weak (e.g. bull=0.20, bear=0.05),
-        // we don't have enough institutional signals to trust the call.
-        boolean wantLong = diff > 0;
-        double winningScore = wantLong ? conf.bullScore : conf.bearScore;
-        if (winningScore < PHASE4_MIN_SCORE) {
-            return reject(String.format("conf_winning_score_too_low=%.2f", winningScore));
-        }
-
-        com.bot.TradingCore.Side side = wantLong
-                ? com.bot.TradingCore.Side.LONG
-                : com.bot.TradingCore.Side.SHORT;
-
-        // ── Filter 3: ATR sanity (skip dead/extreme pairs) ──
-        double atrPct15 = com.bot.TradingCore.atrPercentile(c15, 14, 100);
-        if (atrPct15 < CS_MIN_ATR_PCTILE) return reject("conf_atr_too_low");
-        if (atrPct15 > CS_MAX_ATR_PCTILE) return reject("conf_atr_too_high");
-
-        // ── Filter 4: BTC regime gate (mirror of MR logic) ──
-        com.bot.GlobalImpulseController.GlobalContext btc =
-                (gicRef != null) ? gicRef.getContext() : null;
-        if (btc != null) {
-            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
-                return reject("conf_btc_panic");
-            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
-                return reject("conf_btc_crash");
-            if (wantLong) {
-                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN)
-                    return reject("conf_btc_strong_down_blocks_long");
-                if (btc.onlyShort) return reject("conf_only_short_blocks_long");
-            } else {
-                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
-                    return reject("conf_btc_strong_up_blocks_short");
-                if (btc.onlyLong) return reject("conf_only_long_blocks_short");
-            }
-        }
-
-        // ── Filter 5: ATR-based stop sanity ──
-        double atr14 = com.bot.TradingCore.atr(c15, 14);
-        if (atr14 <= 0) return reject("conf_invalid_atr");
-
-        // ── Filter 6: Funding overcrowding (mirror of MR Phase 2.4 filter) ──
-        FundingOIData fr = fundingCache.get(symbol);
-        if (fr != null && fr.isValid()) {
-            boolean longOvercrowded  = fr.fundingRate >  0.0005 || fr.frPeakWarning;
-            boolean shortOvercrowded = fr.fundingRate < -0.0005 || fr.frTroughWarning;
-            if (wantLong && longOvercrowded) {
-                return reject(String.format("conf_funding_overheated_long_fr=%.4f%%",
-                        fr.fundingRate * 100));
-            }
-            if (!wantLong && shortOvercrowded) {
-                return reject(String.format("conf_funding_overheated_short_fr=%.4f%%",
-                        fr.fundingRate * 100));
-            }
-        }
-        double frRate  = (fr != null && fr.isValid()) ? fr.fundingRate  : 0.0;
-        double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
-        double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
-
-        // ── SL / TP / Risk distance ──
-        double slDist = atr14 * PHASE4_SL_ATR_MULT;
-        double stop   = wantLong ? price - slDist : price + slDist;
-        double tp2    = wantLong ? price + slDist * PHASE4_TP_R : price - slDist * PHASE4_TP_R;
-
-        // Sanity on stop distance vs price
-        if (slDist / price < 0.001 || slDist / price > 0.10) {
-            return reject(String.format("conf_sl_dist_invalid=%.4f", slDist / price));
-        }
-
-        // ── HTF bias from 2h (mirrors MR pattern) ──
-        HTFBias bias2h = detectBias2H(c2h != null && c2h.size() >= MIN_BARS ? c2h : c1h);
-        boolean htfAligned = bias2h != null &&
-                ((wantLong && bias2h == HTFBias.BULL) ||
-                        (!wantLong && bias2h == HTFBias.BEAR));
-
-        // ── Probability scoring ──
-        // Confluence probability is derived from the strength of agreement.
-        // diff range [0.30, 1.0] maps to probability [55, 75].
-        // Cap at 75 — confluence alone shouldn't claim higher than well-tested MR.
-        double probability = 55.0 + Math.min(20.0, (Math.abs(diff) - 0.30) * 30.0);
-        if (htfAligned) probability = Math.min(78.0, probability + 3.0);
-
-        // ── Build flags ──
-        List<String> flags = new ArrayList<>();
-        flags.add("CONFLUENCE");
-        flags.add(String.format("CONF_DIFF=%.2f", diff));
-        flags.add(String.format("CONF_BULL=%.2f", conf.bullScore));
-        flags.add(String.format("CONF_BEAR=%.2f", conf.bearScore));
-        // Add up to 3 most important contributing factors for transparency
-        List<String> contributors = wantLong ? conf.bullFactors : conf.bearFactors;
-        int factorsAdded = 0;
-        for (String f : contributors) {
-            if (factorsAdded >= 3) break;
-            flags.add("CF_" + f);
-            factorsAdded++;
-        }
-        if (htfAligned) flags.add("HTF_ALIGN");
-
-        TradeIdea idea = new TradeIdea(
-                symbol,
-                side,
-                price,
-                stop,
-                tp2,
-                PHASE4_TP_R,
-                probability,
-                flags,
-                frRate, frDelta, oiCh,
-                bias2h != null ? bias2h.name() : "NEUTRAL",
-                cat,
-                null,
-                1.0, PHASE4_TP_R, PHASE4_TP_R
-        );
-        idea.setRobustAtrPct(atr14 / price);
-        idea.setAgreeingClusters(1);
-
-        return idea;
-    }
-
 
     // [Phase 2.3 rollback 2026-05-10] Defaults flipped true→false. Backtests
     // showed Phase 2.1 and 2.2 underperforming Phase 1 (+4.92% vs +7.57%) on
@@ -2193,17 +1990,178 @@ public final class DecisionEngineMerged {
     private static final double  PHASE2_RANGE_MAX_ADX     = csEnvDouble("PHASE2_RANGE_MAX_ADX",    22.0);
     private static final double  PHASE2_PUMP_MIN_STRENGTH = csEnvDouble("PHASE2_PUMP_MIN_STRENGTH", 0.50);
 
-    // ─── Phase 4.0 confluence tunables (advanced indicators) ───
-    // Default: ENABLED. Activates the 8 dormant smart-money indicators in
-    // TradingCore.advancedConfluence() as an additive third path in router.
-    // Different signal type from MR (institutional vs price-action) →
-    // additive, not subtractive. To disable without code changes, set
-    // PHASE4_CONFLUENCE_ENABLE=false in Railway env.
-    private static final boolean PHASE4_CONFLUENCE_ENABLE = csEnvBool("PHASE4_CONFLUENCE_ENABLE", true);
-    private static final double  PHASE4_MIN_DIFF          = csEnvDouble("PHASE4_MIN_DIFF",          0.30);
-    private static final double  PHASE4_MIN_SCORE         = csEnvDouble("PHASE4_MIN_SCORE",         0.45);
-    private static final double  PHASE4_SL_ATR_MULT       = csEnvDouble("PHASE4_SL_ATR_MULT",       1.5);
-    private static final double  PHASE4_TP_R              = csEnvDouble("PHASE4_TP_R",              2.0);
+    // ─── Phase 5.0 Funding Momentum tunables ───────────────────────────────
+    // Triggers on extreme funding rates that historically predict reversion:
+    //   - funding ≤ -0.04% (-0.0004) → crowd is heavily SHORT → expect short squeeze → LONG
+    //   - funding ≥ +0.04% (+0.0004) → crowd is heavily LONG  → expect long flush   → SHORT
+    //
+    // SL wider than MR (2.0×ATR vs 1.5×ATR) — squeeze events are noisy at start.
+    // TP at 2R — squeeze moves typically extend further than mean-reversion.
+    //
+    // Variables can override:
+    //   PHASE5_FUNDING_MOMENTUM_ENABLE=false → kill switch
+    //   PHASE5_FUNDING_THRESHOLD=0.0005     → tighter (less trades, higher quality)
+    //   PHASE5_FUNDING_THRESHOLD=0.0003     → looser (more trades, more noise)
+    private static final boolean PHASE5_FUNDING_MOMENTUM_ENABLE = csEnvBool("PHASE5_FUNDING_MOMENTUM_ENABLE", true);
+    private static final double  PHASE5_FUNDING_THRESHOLD       = csEnvDouble("PHASE5_FUNDING_THRESHOLD",      0.0004);
+    private static final double  PHASE5_SL_ATR_MULT             = csEnvDouble("PHASE5_SL_ATR_MULT",            2.0);
+    private static final double  PHASE5_TP_R                    = csEnvDouble("PHASE5_TP_R",                   2.0);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STRATEGY: FUNDING RATE MOMENTUM (Phase 5.0 — 2026-05-10)
+    // ─────────────────────────────────────────────────────────────────────
+    // Hypothesis: extreme funding rates indicate one-sided positioning that
+    // the market historically resolves via squeezes/flushes. Academic research
+    // (Cube Exchange, OUINEX, ScienceDirect 2025) supports a stable edge on
+    // ±0.04%+ funding events with ~58-65% win rate on 6-24h horizons.
+    //
+    // This strategy is FUNDAMENTALLY DIFFERENT from MR:
+    //   - MR uses price (deviation from VWAP)
+    //   - FM uses POSITIONING (funding rate of perpetual contract)
+    //   - Both can fire on the same bar — they rarely will (extreme funding
+    //     usually coincides with extreme prices that MR already filters as
+    //     mr_funding_overheated_*, leaving the slot clean for FM).
+    //
+    // Backtest support:
+    //   - SimpleBacktester now loads historical funding rates per symbol
+    //   - DE.setSimulatedFunding() injects per-bar funding into fundingCache
+    //   - Live: fundingCache populated by SignalSender.refreshAllFundingRates()
+    private TradeIdea generateFromFundingMomentum(String symbol,
+                                                  List<com.bot.TradingCore.Candle> c1,
+                                                  List<com.bot.TradingCore.Candle> c5,
+                                                  List<com.bot.TradingCore.Candle> c15,
+                                                  List<com.bot.TradingCore.Candle> c1h,
+                                                  List<com.bot.TradingCore.Candle> c2h,
+                                                  CoinCategory cat,
+                                                  long now) {
+        if (!PHASE5_FUNDING_MOMENTUM_ENABLE) return null;
+        if (!valid(c15) || !valid(c1h)) return reject("fm_invalid_candles");
+        if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("fm_skip_meme");
+
+        // Cooldown — same per-symbol lock as MR (whipsaw protection).
+        Long lastSig = csLastSignalTime.get(symbol);
+        if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) {
+            return reject("fm_cooldown");
+        }
+
+        // ── Need funding data ──
+        FundingOIData fr = fundingCache.get(symbol);
+        if (fr == null) return reject("fm_no_funding_data");
+        if (!fr.isValid()) return reject("fm_funding_stale");
+
+        double rate = fr.fundingRate;
+
+        // ── Filter 1: must be extreme funding ──
+        // Below threshold → not extreme enough → no edge
+        if (Math.abs(rate) < PHASE5_FUNDING_THRESHOLD) {
+            return reject(String.format("fm_funding_not_extreme=%.4f%%", rate * 100));
+        }
+
+        // ── Direction: contrarian to crowd ──
+        // Negative funding = crowd is short → LONG to ride squeeze
+        // Positive funding = crowd is long  → SHORT to ride flush
+        boolean wantLong = rate < 0;
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG
+                : com.bot.TradingCore.Side.SHORT;
+
+        // ── Filter 2: ATR sanity (skip dead/extreme pairs) ──
+        double atrPct15 = com.bot.TradingCore.atrPercentile(c15, 14, 100);
+        if (atrPct15 < CS_MIN_ATR_PCTILE) return reject("fm_atr_too_low");
+        if (atrPct15 > CS_MAX_ATR_PCTILE) return reject("fm_atr_too_high");
+
+        // ── Filter 3: BTC regime gate (mirror of MR logic) ──
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
+                return reject("fm_btc_panic");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
+                return reject("fm_btc_crash");
+            if (wantLong) {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN)
+                    return reject("fm_btc_strong_down_blocks_long");
+                if (btc.onlyShort) return reject("fm_only_short_blocks_long");
+            } else {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
+                    return reject("fm_btc_strong_up_blocks_short");
+                if (btc.onlyLong) return reject("fm_only_long_blocks_short");
+            }
+        }
+
+        // ── Pricing & SL/TP ──
+        com.bot.TradingCore.Candle lastBar = last(c15);
+        double price = lastBar.close;
+        if (price <= 0) return reject("fm_invalid_price");
+
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return reject("fm_invalid_atr");
+
+        double slDist = atr14 * PHASE5_SL_ATR_MULT;
+        double stop   = wantLong ? price - slDist : price + slDist;
+        double tp2    = wantLong ? price + slDist * PHASE5_TP_R : price - slDist * PHASE5_TP_R;
+
+        // Sanity on stop distance vs price
+        if (slDist / price < 0.001 || slDist / price > 0.10) {
+            return reject(String.format("fm_sl_dist_invalid=%.4f", slDist / price));
+        }
+
+        // ── HTF bias from 2h ──
+        HTFBias bias2h = detectBias2H(c2h != null && c2h.size() >= MIN_BARS ? c2h : c1h);
+        boolean htfAligned = bias2h != null &&
+                ((wantLong && bias2h == HTFBias.BULL) ||
+                        (!wantLong && bias2h == HTFBias.BEAR));
+
+        // ── Probability scoring based on funding extremity ──
+        // The more extreme the funding, the higher the confidence.
+        // ±0.04% = base 56 → up to 70 at ±0.10%+
+        double absRate = Math.abs(rate);
+        double extremityScore = Math.min(14.0, (absRate - PHASE5_FUNDING_THRESHOLD) * 25000);
+        double probability = 56.0 + extremityScore;
+        if (htfAligned) probability = Math.min(72.0, probability + 2.0);
+
+        // ── Build flags ──
+        List<String> flags = new ArrayList<>();
+        flags.add("FUNDING_MOMENTUM");
+        flags.add(String.format("FR=%.4f%%", rate * 100));
+        if (wantLong) flags.add("SHORT_SQUEEZE_HUNT");
+        else          flags.add("LONG_FLUSH_HUNT");
+        if (fr.frPeakWarning)   flags.add("FR_PEAK_WARN");
+        if (fr.frTroughWarning) flags.add("FR_TROUGH_WARN");
+        if (htfAligned)         flags.add("HTF_ALIGN");
+
+        TradeIdea idea = new TradeIdea(
+                symbol,
+                side,
+                price,
+                stop,
+                tp2,
+                PHASE5_TP_R,
+                probability,
+                flags,
+                rate, fr.fundingDelta, fr.oiChange1h,
+                bias2h != null ? bias2h.name() : "NEUTRAL",
+                cat,
+                null,
+                1.0, PHASE5_TP_R, PHASE5_TP_R
+        );
+        idea.setRobustAtrPct(atr14 / price);
+        idea.setAgreeingClusters(1);
+
+        return idea;
+    }
+
+    /**
+     * Inject simulated funding rate for backtest replay.
+     * Called by SimpleBacktester before each analyze() invocation to populate
+     * fundingCache with the historical funding rate that was active at that bar.
+     * In live mode, fundingCache is populated by SignalSender.refreshAllFundingRates().
+     */
+    public void setSimulatedFunding(String symbol, double fundingRate, double prevFundingRate) {
+        double delta = fundingRate - prevFundingRate;
+        FundingOIData data = new FundingOIData(fundingRate, 0, 0, 0, prevFundingRate, delta, 0);
+        fundingCache.put(symbol, data);
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // STRATEGY: VWAP MEAN REVERSION (was generate(), Phase 1)

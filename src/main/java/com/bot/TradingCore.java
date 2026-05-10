@@ -1779,11 +1779,8 @@ public final class TradingCore {
             exhaustionScore = clamp(exhaustionScore, 0, 1);
             f.put("EXHAUSTION", exhaustionScore);
 
-            // STEP 3: TREND BRAIN — [v38.0] SIMPLIFIED
-            // Удалены мультиколлинеарные факторы:
-            //   LR_8 ≈ SWING (оба = краткосрочное направление) → оставляем SWING
-            //   FISHER ≈ OF (оба = осцилляторы потока) → оставляем OF
-            // Оставлены 3 ключевых: SWING (структура), OF (поток), HTF (тренд)
+            // STEP 3: TREND BRAIN
+            // 3 ключевых: SWING (структура), OF (поток), HTF (тренд)
             // + 2 опережающих: CVD_RT (реальное время), ACCEL (ускорение)
             double trendDir = 0;
 
@@ -1797,7 +1794,7 @@ public final class TradingCore {
             f.put("OF", ofScore);
             trendDir += ofScore * 0.18;
 
-            // HTF alignment (1h) — [BUG A] weight reduced, slope-based fix in calcHTF
+            // HTF alignment (1h) — slope-based via calcHTF
             double htfScore = calcHTF(c15, c1h);
             f.put("HTF", htfScore);
             trendDir += htfScore * 0.15;
@@ -1824,9 +1821,9 @@ public final class TradingCore {
                     accelScore = clamp(mom1 * 15, -0.35, 0.35);
                 }
                 f.put("ACCEL", accelScore);
-                trendDir += accelScore * 0.20; // [BUG B] raised from 0.12
+                trendDir += accelScore * 0.20;
             }
-            // [BUG B] Sum of weights: 0.22 + 0.18 + 0.15 + 0.25 + 0.20 = 1.00 (normalized)
+            // Sum of weights: 0.22 + 0.18 + 0.15 + 0.25 + 0.20 = 1.00 (normalized)
 
             // LEADING FACTOR: Chaikin Money Flow — institutional intent.
             // CMF > 0 = close near top of range × volume = institutional buying.
@@ -1895,9 +1892,7 @@ public final class TradingCore {
             // HTF (часовой тренд) и OF (orderflow/CVD) = фундаментальные.
             // LR_8 и FISHER = быстрые осцилляторы, менее надёжны.
             // Веса: HTF×3, OF×3, SWING×2, EXHAUST×2, VPOC×1.5
-            // [v36-FIX Дыра4] FACTOR_WEIGHTS вынесены в static final (нет аллокаций на каждый вызов).
-            // Удалены мультиколлинеарные факторы: LR_8 (≈SWING), Fisher (≈OF/dir), SQUEEZE (шум вес=0.5).
-            // Оставлены 5 ключевых факторов с наибольшей предиктивной силой.
+            // FACTOR_WEIGHTS — static final (no allocs per call).
             double conf;
             if (exhaustionScore > 0.55 && exhaustionSignals >= 3) {
                 conf = clamp(0.50 + exhaustionScore * 0.30, 0.50, 0.85);
@@ -2678,7 +2673,7 @@ public final class TradingCore {
         private double calcFisher(List<Candle> c, int p) {
             int n = c.size();
             if (n < p + 2) return 0;
-            // [v24.0 FIX BUG-5] Double.MIN_VALUE = 4.9E-324 (POSITIVE!) → always < any price.
+            // NOTE: Double.MIN_VALUE = 4.9E-324 (POSITIVE!) → always < any price.
             // Must use NEGATIVE_INFINITY for maximum search initialization.
             double hi = Double.NEGATIVE_INFINITY, lo = Double.MAX_VALUE;
             for (int i = n - p; i < n; i++) {
@@ -2769,7 +2764,7 @@ public final class TradingCore {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  ADVANCED INDICATORS BLOCK [v75]
+    //  ADVANCED INDICATORS BLOCK
     //  ───────────────────────────
     //  All institutional-grade indicators added in-place to avoid new files.
     //  Methods are static and pure — they read List<Candle> and return primitives

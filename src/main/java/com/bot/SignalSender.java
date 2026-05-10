@@ -646,13 +646,9 @@ public final class SignalSender {
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
         this.TOP_N            = envInt("TOP_N", 30);
-        this.MIN_CONF         = envDouble("MIN_CONF", 50.0);  // [v83.4] 53→50 sync с DE.MIN_CONF_FLOOR
-        // [v83.4] MIN_CONF=50 = одна линия с DE.MIN_CONF_FLOOR. Был лишний 3pt margin
-        // ("quality margin layer"), который вместе с Dispatcher-gate=65 закрывал
-        // воронку на 95%. Убираем margin здесь, gate в Dispatcher тоже опущен
-        // (65→58 в BotMain). В env Railway можно поставить MIN_CONF=50 явно или
-        // удалить переменную — подхватится этот дефолт.
-        // Effective range in processPair: [MIN_CONF-1, MIN_CONF+4] (см. строку 1525).
+        this.MIN_CONF         = envDouble("MIN_CONF", 50.0);  // sync с DE.MIN_CONF_FLOOR
+        // MIN_CONF=50 == DE.MIN_CONF_FLOOR — no extra quality margin here.
+        // Effective range in processPair: [MIN_CONF-1, MIN_CONF+4].
         // Authoritative quality control further downstream:
         //   1) Dispatcher.dispatch cold-start gate (BotMain Phase 1: floor 48)
         //   2) ProbabilityCalibrator PAV regression (after n>=50 outcomes)
@@ -950,10 +946,8 @@ public final class SignalSender {
         if (!rejectTrace.isEmpty()) {
             LOG.info("[DIAG-ANALYZE] " + rejectTrace);
         }
-        // [v87 HEALTHCHECK 2026-05-09] Print calibrator + ISC state every cycle so the
-        // user can see at a glance WHY signals are being blocked. The health snapshot is
-        // a lightweight read-only operation. If calibrator is DISABLED or in BIAS-RISK
-        // state, the rest of the DIAG output makes more sense in context.
+        // Print calibrator state every cycle so we see at a glance WHY signals
+        // are being blocked (DISABLED / BIAS-RISK / mature, etc.).
         try {
             com.bot.DecisionEngineMerged.ProbabilityCalibrator.HealthSnapshot calHealth =
                     com.bot.DecisionEngineMerged.getCalibrator().health();
@@ -1354,18 +1348,10 @@ public final class SignalSender {
             double iscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
             double iscCap  = MIN_CONF + 4.0;                          // ISC не задирает выше env+4
             double iscFloor = Math.min(iscCap, iscRaw);               // обрезаем сверху
-            // [A4 2026-05-08] Calibrator warmup bypass.
-            // Symptom: env MIN_CONF=58 + DE.MIN_CONF_FLOOR=52 + cold calibrator
-            // = dead zone 52..57. Signals are produced by DE but always die at
-            // earlyMinConf check before they can reach the calibrator and contribute
-            // to learning. Result: calibrator never gets enough samples to mature,
-            // earlyMinConf never falls — permanent block.
-            // Fix: while calibrator has fewer than the warmup threshold of outcomes
-            // (default 50), let signals down to MIN_CALIBRATOR_FLOOR=52 through.
-            // Once enough live data exists, snap back to env-MIN_CONF.
-            // Override:
-            //   CAL_WARMUP_OUTCOMES — outcome count needed to disable bypass (default 50)
-            //   CAL_WARMUP_FLOOR    — floor used during warmup (default 52, == DE floor)
+            // Calibrator warmup bypass. With cold calibrator, env MIN_CONF dead-
+            // zone would block all signals before they could mature the calibrator.
+            // While outcomes < CAL_WARMUP_OUTCOMES (default 50), use lower floor
+            // CAL_WARMUP_FLOOR (default 52 == DE floor). Snap back when mature.
             int _calOutcomes = decisionEngine.getCalibrator().totalOutcomeCount();
             int _calWarmupTarget = envInt("CAL_WARMUP_OUTCOMES", 50);
             double _calWarmupFloor = envDouble("CAL_WARMUP_FLOOR", 52.0);
@@ -1373,12 +1359,9 @@ public final class SignalSender {
                     ? Math.min(MIN_CONF, _calWarmupFloor)
                     : MIN_CONF;
             double earlyMinConf = Math.max(effMinConfBase, iscFloor);
-            // [v87 EARLY-GATE-OVERRIDE 2026-05-09] Debug option: lower the early gate
-            // by N points to see how many signals would pass if calibrator/ISC weren't
-            // suppressing them. This is a TELEMETRY KNOB ONLY — does NOT bypass the
-            // authoritative finalMinConf gate downstream. Useful for the exact case
-            // where DIAG shows early=0 but no signals get through (rare, but proves
-            // the issue is BEFORE earlyMinConf, e.g. inside DE.generate() rejects).
+            // Debug option: lower early gate by N points to see how many signals
+            // would pass without calibrator/ISC suppression. Telemetry knob only —
+            // does NOT bypass authoritative finalMinConf gate downstream.
             double earlyGateBoostDown = envDouble("EARLY_GATE_LOOSEN", 0.0);
             if (earlyGateBoostDown > 0 && earlyGateBoostDown <= 5.0) {
                 earlyMinConf = Math.max(0.0, earlyMinConf - earlyGateBoostDown);
