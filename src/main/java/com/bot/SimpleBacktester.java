@@ -86,12 +86,9 @@ public final class SimpleBacktester {
             !"0".equals(System.getenv().getOrDefault("BACKTEST_STAGNATION_ENABLED",  "1"));
 
     // Single source of truth for warmup.
-    // Must match DecisionEngineMerged.MIN_BARS (150) — that's the gate
-    // engine.analyze() uses internally. Previously backtester used 160
-    // while live could accept 150, causing backtest signals to never fire
-    // in the early window and live to fire signals the backtest never saw.
-    // The extra 10 bars are kept as a safety margin for EMA200 stabilization.
-    private static final int BACKTEST_WARMUP_BARS = 150;
+    // Matches DecisionEngineMerged.MIN_BARS (100) — the gate engine.analyze()
+    // uses internally. Lowered from 150 to admit pairs with limited history.
+    private static final int BACKTEST_WARMUP_BARS = 100;
 
     // Volume-adaptive slippage.
     //
@@ -1345,9 +1342,9 @@ public final class SimpleBacktester {
                 } catch (Throwable e) {
                     continue;
                 }
-                // [v91] Min-bars guard scales with primary TF — 1h needs ~150,
-                // 15m needs ~250 (matches engine MIN_BARS gate).
-                int minBarsBT = "1h".equals(primaryTfBT) ? 150 : 250;
+                // Min-bars guard: 100 on 1h primary (4 days), 250 on 15m primary
+                // (matches engine MIN_BARS gate after 150→100 lowering).
+                int minBarsBT = "1h".equals(primaryTfBT) ? 100 : 250;
                 if (m15 == null || m15.size() < minBarsBT) continue;
                 if (h1  == null || h1.size()  < 80)         continue;
 
