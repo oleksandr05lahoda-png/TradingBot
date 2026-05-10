@@ -1738,9 +1738,16 @@ public final class DecisionEngineMerged {
         if (stop <= 0 || tp2 <= 0) return reject("cs_invalid_levels");
 
         // ─── Probability scoring ────────────────────────────────────────────
+        // [v91 1H-RETUNE 2026-05-10] Expanded scoring & cap raised 0.70 → 0.78.
+        //   Old cap=0.70 with MIN_CONF=0.58 left only 12pp window — every signal
+        //   was hugging the floor and calibrator couldn't separate quality.
+        //   New: 0.55 base → up to 0.78 with 5 possible bonuses.
+        //   Bonuses: strong-σ +0.04, RSI-extreme +0.04, BTC-NEUTRAL +0.04,
+        //            HTF-bias-aligned +0.04, volume-fading +0.03.
+        //   Realistic best-case: 0.55+0.04+0.04+0.04+0.04+0.03 = 0.74 → cap holds.
         double probability01 = 0.55;
 
-        // Strong deviation bonus (>2.5 sigma)
+        // Strong deviation bonus (>2.2σ on 1h, >2.5σ on 15m — see CS_STRONG_SIGMA)
         if (Math.abs(sigma) >= CS_STRONG_SIGMA) probability01 += 0.04;
 
         // RSI confirms exhaustion
@@ -1755,7 +1762,28 @@ public final class DecisionEngineMerged {
             probability01 += 0.04;
         }
 
-        probability01 = Math.min(0.70, probability01);
+        // [v91-NEW] HTF bias alignment — MR works MUCH better when 2h bias
+        // is on the side of the reversion (e.g. 2h bullish + price 2σ below
+        // VWAP = high-quality long). Misaligned setups (2h bearish + long)
+        // get NO bonus, not a penalty — they still pass if other criteria hit.
+        HTFBias bias2hForScore = detectBias2H(c2h != null && c2h.size() >= MIN_BARS ? c2h : c1h);
+        if (bias2hForScore != null) {
+            boolean aligned =
+                    (side == com.bot.TradingCore.Side.LONG  && bias2hForScore == HTFBias.BULL) ||
+                            (side == com.bot.TradingCore.Side.SHORT && bias2hForScore == HTFBias.BEAR);
+            if (aligned) probability01 += 0.04;
+        }
+
+        // [v91-NEW] Volume-fading bonus — last bar volume BELOW SMA20 means the
+        // impulse that pushed price away from VWAP is exhausting (no fresh
+        // buyers/sellers). This is the textbook MR pre-condition.
+        // Note: cs_volume_too_high already rejected loud bars above; here we
+        // additionally reward QUIET bars (vol < 0.7× SMA20).
+        if (volSma20 > 0 && volCurrent < volSma20 * 0.70) {
+            probability01 += 0.03;
+        }
+
+        probability01 = Math.min(0.78, probability01);
         double probability = probability01 * 100.0;
 
         // ─── HTF bias for downstream display ────────────────────────────────

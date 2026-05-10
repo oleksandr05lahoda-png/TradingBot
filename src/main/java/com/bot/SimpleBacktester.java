@@ -1226,8 +1226,18 @@ public final class SimpleBacktester {
                 return;
             }
 
-            int barsNeeded = daysOfHistory * 96 + 250; // warmup + window
-            int h1Limit    = Math.max(200, barsNeeded / 4 + 50);
+            // [v91 1H-FIX 2026-05-10] barsNeeded must scale with PRIMARY_TF.
+            // 15m → 96 bars/day, 1h → 24 bars/day. Without this fix the backtest
+            // pulled enough bars for 13 days of 15m but only ~3 days of 1h, yet
+            // the engine was configured for 1h primary — root cause of the
+            // "13 days, 5 trades" anomaly.
+            String primaryTfBT = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+            int barsPerDayPrimary = "1h".equals(primaryTfBT) ? 24
+                    : "30m".equals(primaryTfBT) ? 48 : 96;
+            int barsNeeded = daysOfHistory * barsPerDayPrimary + 250; // warmup + window
+            int h1Limit    = "1h".equals(primaryTfBT)
+                    ? Math.max(200, barsNeeded + 50)            // primary IS 1h
+                    : Math.max(200, barsNeeded / 4 + 50);       // 15m primary, 1h is HTF
 
             // Aggregate across all pairs
             int totalSignals = 0, totalWins = 0, totalLosses = 0, totalTimeStops = 0;
@@ -1249,13 +1259,19 @@ public final class SimpleBacktester {
                 List<com.bot.TradingCore.Candle> m15;
                 List<com.bot.TradingCore.Candle> h1;
                 try {
-                    m15 = sender.fetchKlines(pair, "15m", barsNeeded);
-                    h1  = sender.fetchKlines(pair, "1h",  h1Limit);
+                    // [v91 1H-FIX 2026-05-10] use PRIMARY_TF, NOT hardcoded "15m".
+                    // Variable name kept as `m15` for diff size; semantically it's
+                    // the primary-TF series (1h on 1h-primary, 15m on 15m-primary).
+                    m15 = sender.fetchKlines(pair, primaryTfBT, barsNeeded);
+                    h1  = sender.fetchKlines(pair, "1h",        h1Limit);
                 } catch (Throwable e) {
                     continue;
                 }
-                if (m15 == null || m15.size() < 250) continue;
-                if (h1  == null || h1.size()  < 80)  continue;
+                // [v91] Min-bars guard scales with primary TF — 1h needs ~150,
+                // 15m needs ~250 (matches engine MIN_BARS gate).
+                int minBarsBT = "1h".equals(primaryTfBT) ? 150 : 250;
+                if (m15 == null || m15.size() < minBarsBT) continue;
+                if (h1  == null || h1.size()  < 80)         continue;
 
                 DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(pair);
 
