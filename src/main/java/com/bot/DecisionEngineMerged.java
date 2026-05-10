@@ -2180,6 +2180,37 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
+        // ─── Phase 2.4: Funding rate contrarian filter ────────────────────
+        // Block MR setups when crowd is already heavily on the same side.
+        // MR is counter-trend by design — taking LONG when funding is +0.05%+
+        // means betting against price action AND against crowd positioning,
+        // which historically has poor expectancy (knife-catch pattern).
+        //
+        // Thresholds:
+        //   normal funding: ±0.01%/8h
+        //   moderately crowded: ±0.05%/8h  ← our filter boundary
+        //   extreme: ±0.08%/8h (caught by frPeakWarning/frTroughWarning)
+        //
+        // The pre-computed frPeakWarning/frTroughWarning flags trigger on
+        // extreme funding WITH decelerating momentum — strong reversal signal
+        // already forming, definitely don't enter against it.
+        //
+        // If funding data is missing/stale (fr == null or !isValid), filter
+        // does NOT activate — fall through to normal sizing. We don't want
+        // an API hiccup to silently kill all signals.
+        if (fr != null && fr.isValid()) {
+            boolean longOvercrowded  = fr.fundingRate >  0.0005 || fr.frPeakWarning;
+            boolean shortOvercrowded = fr.fundingRate < -0.0005 || fr.frTroughWarning;
+            if (side == com.bot.TradingCore.Side.LONG && longOvercrowded) {
+                return reject(String.format("mr_funding_overheated_long_fr=%.4f%%",
+                        fr.fundingRate * 100));
+            }
+            if (side == com.bot.TradingCore.Side.SHORT && shortOvercrowded) {
+                return reject(String.format("mr_funding_overheated_short_fr=%.4f%%",
+                        fr.fundingRate * 100));
+            }
+        }
+
         TradeIdea idea = new TradeIdea(
                 symbol,
                 side,
