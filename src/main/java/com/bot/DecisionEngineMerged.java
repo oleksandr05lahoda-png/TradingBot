@@ -1651,8 +1651,8 @@ public final class DecisionEngineMerged {
     //   - CHOPPY/UNCLEAR regime → fallback to MR or reject
     //
     // Env tunables (all optional, sensible defaults):
-    //   PHASE2_PUMPHUNTER_ENABLE   — enable PumpHunter as generator (default true)
-    //   PHASE2_BREAKOUT_ENABLE     — enable Breakout strategy (default true)
+    //   PHASE2_PUMPHUNTER_ENABLE   — enable PumpHunter as generator (default false; set "true" to experiment)
+    //   PHASE2_BREAKOUT_ENABLE     — enable Breakout strategy (default false; set "true" to experiment)
     //   PHASE2_BREAKOUT_MIN_ADX    — 1h ADX threshold for TREND (default 25.0)
     //   PHASE2_RANGE_MAX_ADX       — 1h ADX threshold for RANGE (default 22.0)
     //   PHASE2_PUMP_MIN_STRENGTH   — min PumpHunter strength to fire (default 0.50)
@@ -1979,8 +1979,15 @@ public final class DecisionEngineMerged {
     }
 
     // ─── Phase 2 env tunables (resolved once at class load) ───
-    private static final boolean PHASE2_PUMPHUNTER_ENABLE = csEnvBool("PHASE2_PUMPHUNTER_ENABLE", true);
-    private static final boolean PHASE2_BREAKOUT_ENABLE   = csEnvBool("PHASE2_BREAKOUT_ENABLE",   true);
+    // [Phase 2.3 rollback 2026-05-10] Defaults flipped true→false. Backtests
+    // showed Phase 2.1 and 2.2 underperforming Phase 1 (+4.92% vs +7.57%) on
+    // identical 13-day window. PumpHunter exhaustion + Breakout opened "extra"
+    // trades on bars where MR rejected, but those trades had worse expectancy
+    // than skipping the bar. With both defaults=false, the router falls
+    // through to MR-only — behaviorally identical to Phase 1. To re-enable
+    // experimentally without code changes, set env vars to "true" in Railway.
+    private static final boolean PHASE2_PUMPHUNTER_ENABLE = csEnvBool("PHASE2_PUMPHUNTER_ENABLE", false);
+    private static final boolean PHASE2_BREAKOUT_ENABLE   = csEnvBool("PHASE2_BREAKOUT_ENABLE",   false);
     private static final double  PHASE2_BREAKOUT_MIN_ADX  = csEnvDouble("PHASE2_BREAKOUT_MIN_ADX", 25.0);
     private static final double  PHASE2_RANGE_MAX_ADX     = csEnvDouble("PHASE2_RANGE_MAX_ADX",    22.0);
     private static final double  PHASE2_PUMP_MIN_STRENGTH = csEnvDouble("PHASE2_PUMP_MIN_STRENGTH", 0.50);
