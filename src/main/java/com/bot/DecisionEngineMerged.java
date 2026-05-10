@@ -1720,19 +1720,25 @@ public final class DecisionEngineMerged {
         // ─── REGIME DETECTION ───
         MarketRegime regime = detectMarketRegime(c1h);
 
-        // ─── ROUTER: try strategies by priority ───
+        // ─── ROUTER: try strategies by priority (Phase 2.2 ordering) ───
+        // RATIONALE: Phase 2.1 had PumpHunter first → it preempted MR setups
+        // on the same bar (same 22 trades but lower PnL: +4.92% vs Phase 1
+        // +7.57%). PH "stole" slots from more profitable MR trades because
+        // cs_cooldown blocked MR for 120 min after PH fired.
+        //
+        // Phase 2.2: MR runs first (productivity floor — proven +7.57%).
+        // Breakout and PumpHunter run AFTER MR rejects, as additive paths
+        // for setups MR doesn't see (trends + reversals on pump tops).
         TradeIdea idea;
 
-        // Priority 1: PumpHunter (anticipatory + reversal — highest signal value)
-        if (PHASE2_PUMPHUNTER_ENABLE) {
-            idea = generateFromPumpHunter(symbol, c1, c5, c15, cat, now);
-            if (idea != null) {
-                csLastSignalTime.put(symbol, now);
-                return idea;
-            }
+        // Priority 1: VWAP Mean Reversion — fundament (highest historical EV)
+        idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
+        if (idea != null) {
+            csLastSignalTime.put(symbol, now);
+            return idea;
         }
 
-        // Priority 2: Breakout for trending markets
+        // Priority 2: Breakout for trending markets (only if MR found nothing)
         if (PHASE2_BREAKOUT_ENABLE &&
                 (regime == MarketRegime.TREND_UP || regime == MarketRegime.TREND_DOWN)) {
             idea = generateBreakout(symbol, c5, c15, c1h, c2h, cat, regime, now);
@@ -1742,16 +1748,13 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // Priority 3: VWAP Mean Reversion — runs ALWAYS (Phase 2.1).
-        // Phase 2 regime-gate (RANGE/UNCLEAR only) caused a 22→7 trade regression.
-        // MR has its own internal ATR-percentile / sigma filter; if a trending
-        // pair has no MR setup, MR will reject internally — extra ADX gate was
-        // redundant and harmful. MR is now the productivity floor; Breakout and
-        // PumpHunter run as parallel additive paths above it.
-        idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
-        if (idea != null) {
-            csLastSignalTime.put(symbol, now);
-            return idea;
+        // Priority 3: PumpHunter exhaustion (reversal at pump top / dump bottom)
+        if (PHASE2_PUMPHUNTER_ENABLE) {
+            idea = generateFromPumpHunter(symbol, c1, c5, c15, cat, now);
+            if (idea != null) {
+                csLastSignalTime.put(symbol, now);
+                return idea;
+            }
         }
 
         return reject("regime_" + regime.name().toLowerCase() + "_no_setup");
