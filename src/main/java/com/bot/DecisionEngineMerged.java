@@ -1738,7 +1738,16 @@ public final class DecisionEngineMerged {
             return idea;
         }
 
-        // Priority 2: Breakout for trending markets (only if MR found nothing)
+        // Priority 2: Advanced Confluence (Phase 4.0) — smart-money indicators
+        // Different signal type from MR → triggers in different situations.
+        // No conflict with MR (MR already rejected this bar).
+        idea = generateFromConfluence(symbol, c1, c5, c15, c1h, c2h, cat, now);
+        if (idea != null) {
+            csLastSignalTime.put(symbol, now);
+            return idea;
+        }
+
+        // Priority 3: Breakout for trending markets (only if MR/Confluence found nothing)
         if (PHASE2_BREAKOUT_ENABLE &&
                 (regime == MarketRegime.TREND_UP || regime == MarketRegime.TREND_DOWN)) {
             idea = generateBreakout(symbol, c5, c15, c1h, c2h, cat, regime, now);
@@ -1748,7 +1757,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // Priority 3: PumpHunter exhaustion (reversal at pump top / dump bottom)
+        // Priority 4: PumpHunter exhaustion (reversal at pump top / dump bottom)
         if (PHASE2_PUMPHUNTER_ENABLE) {
             idea = generateFromPumpHunter(symbol, c1, c5, c15, cat, now);
             if (idea != null) {
@@ -1978,7 +1987,199 @@ public final class DecisionEngineMerged {
         return idea;
     }
 
-    // ─── Phase 2 env tunables (resolved once at class load) ───
+    // ─────────────────────────────────────────────────────────────────────
+    // STRATEGY: ADVANCED CONFLUENCE (Phase 4.0 2026-05-10)
+    // ─────────────────────────────────────────────────────────────────────
+    // Wires up the previously UNUSED TradingCore.advancedConfluence() which
+    // aggregates 8 smart-money indicators into bull/bear scores:
+    //   - Order Blocks (institutional demand/supply zones)
+    //   - Fair Value Gaps (price inefficiencies)
+    //   - SuperTrend regime
+    //   - KAMA slope (adaptive moving average)
+    //   - Anchored VWAP from daily open
+    //   - CVD divergence (cumulative volume delta)
+    //   - Premium/Discount zones
+    //   - Liquidity sweeps (stop hunts)
+    //   - Pre-move patterns (Wyckoff Spring/Upthrust, compression breakout)
+    //
+    // Why this is different from Phase 2 PumpHunter/Breakout:
+    //   - PumpHunter and Breakout used SAME data type as MR (price/volume TA)
+    //     → competed for the same setups → less trades, not more.
+    //   - Confluence uses INSTITUTIONAL/SMART-MONEY data (OB, FVG, sweeps,
+    //     CVD) → triggers in DIFFERENT situations than MR → additive, not
+    //     subtractive.
+    //
+    // Routing position: PRIORITY 2 in router (after MR, before Breakout/PH).
+    // MR remains the productivity floor. Confluence fires only when MR
+    // didn't find setup AND smart-money signals strongly agree on direction.
+    //
+    // Filter strictness (designed to avoid noise on this market):
+    //   - Requires diff() ≥ 0.30 (strong directional bias, not 0.15 default)
+    //   - Requires winning side score ≥ 0.45 (meaningful absolute strength)
+    //   - Standard SL: 1.5×ATR (matches MR conservatism)
+    //   - TP at 2R (matches MR risk profile)
+    //   - Requires same BTC regime gates as MR (no LONG in BTC_PANIC etc)
+    private TradeIdea generateFromConfluence(String symbol,
+                                             List<com.bot.TradingCore.Candle> c1,
+                                             List<com.bot.TradingCore.Candle> c5,
+                                             List<com.bot.TradingCore.Candle> c15,
+                                             List<com.bot.TradingCore.Candle> c1h,
+                                             List<com.bot.TradingCore.Candle> c2h,
+                                             CoinCategory cat,
+                                             long now) {
+        if (!PHASE4_CONFLUENCE_ENABLE) return null;
+        if (!valid(c15) || !valid(c1h)) return reject("conf_invalid_candles");
+        if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("conf_skip_meme");
+
+        // Cooldown — same per-symbol lock as MR (whipsaw protection).
+        Long lastSig = csLastSignalTime.get(symbol);
+        if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) {
+            return reject("conf_cooldown");
+        }
+
+        // Note: post-pump/dump cooldown already enforced by router pre-filter
+        // (lines ~1706-1715), so no duplicate check needed here.
+
+        // Need enough bars for Order Block / FVG / CVD lookback (50+).
+        // 1h primary: 1h candles; advancedConfluence needs ~50 candles.
+        if (c1h.size() < 60) return reject("conf_insufficient_history");
+
+        com.bot.TradingCore.Candle lastBar = last(c1h);
+        double price = lastBar.close;
+        if (price <= 0) return reject("conf_invalid_price");
+
+        // ── Run the aggregator ──
+        com.bot.TradingCore.ConfluenceReport conf =
+                com.bot.TradingCore.advancedConfluence(c1h, price);
+
+        // ── Filter 1: must have STRONG directional bias ──
+        // diff() = bullScore - bearScore. Default bias threshold is ±0.15 (loose);
+        // we require ±0.30 (strict) to avoid 50/50 noise sigals.
+        double diff = conf.diff();
+        if (Math.abs(diff) < PHASE4_MIN_DIFF) {
+            return reject(String.format("conf_no_bias_diff=%.2f", diff));
+        }
+
+        // ── Filter 2: winning side score must be meaningful in absolute terms ──
+        // Even with high diff, if both sides are weak (e.g. bull=0.20, bear=0.05),
+        // we don't have enough institutional signals to trust the call.
+        boolean wantLong = diff > 0;
+        double winningScore = wantLong ? conf.bullScore : conf.bearScore;
+        if (winningScore < PHASE4_MIN_SCORE) {
+            return reject(String.format("conf_winning_score_too_low=%.2f", winningScore));
+        }
+
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG
+                : com.bot.TradingCore.Side.SHORT;
+
+        // ── Filter 3: ATR sanity (skip dead/extreme pairs) ──
+        double atrPct15 = com.bot.TradingCore.atrPercentile(c15, 14, 100);
+        if (atrPct15 < CS_MIN_ATR_PCTILE) return reject("conf_atr_too_low");
+        if (atrPct15 > CS_MAX_ATR_PCTILE) return reject("conf_atr_too_high");
+
+        // ── Filter 4: BTC regime gate (mirror of MR logic) ──
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
+                return reject("conf_btc_panic");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
+                return reject("conf_btc_crash");
+            if (wantLong) {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN)
+                    return reject("conf_btc_strong_down_blocks_long");
+                if (btc.onlyShort) return reject("conf_only_short_blocks_long");
+            } else {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
+                    return reject("conf_btc_strong_up_blocks_short");
+                if (btc.onlyLong) return reject("conf_only_long_blocks_short");
+            }
+        }
+
+        // ── Filter 5: ATR-based stop sanity ──
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return reject("conf_invalid_atr");
+
+        // ── Filter 6: Funding overcrowding (mirror of MR Phase 2.4 filter) ──
+        FundingOIData fr = fundingCache.get(symbol);
+        if (fr != null && fr.isValid()) {
+            boolean longOvercrowded  = fr.fundingRate >  0.0005 || fr.frPeakWarning;
+            boolean shortOvercrowded = fr.fundingRate < -0.0005 || fr.frTroughWarning;
+            if (wantLong && longOvercrowded) {
+                return reject(String.format("conf_funding_overheated_long_fr=%.4f%%",
+                        fr.fundingRate * 100));
+            }
+            if (!wantLong && shortOvercrowded) {
+                return reject(String.format("conf_funding_overheated_short_fr=%.4f%%",
+                        fr.fundingRate * 100));
+            }
+        }
+        double frRate  = (fr != null && fr.isValid()) ? fr.fundingRate  : 0.0;
+        double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
+        double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
+
+        // ── SL / TP / Risk distance ──
+        double slDist = atr14 * PHASE4_SL_ATR_MULT;
+        double stop   = wantLong ? price - slDist : price + slDist;
+        double tp2    = wantLong ? price + slDist * PHASE4_TP_R : price - slDist * PHASE4_TP_R;
+
+        // Sanity on stop distance vs price
+        if (slDist / price < 0.001 || slDist / price > 0.10) {
+            return reject(String.format("conf_sl_dist_invalid=%.4f", slDist / price));
+        }
+
+        // ── HTF bias from 2h (mirrors MR pattern) ──
+        HTFBias bias2h = detectBias2H(c2h != null && c2h.size() >= MIN_BARS ? c2h : c1h);
+        boolean htfAligned = bias2h != null &&
+                ((wantLong && bias2h == HTFBias.BULL) ||
+                        (!wantLong && bias2h == HTFBias.BEAR));
+
+        // ── Probability scoring ──
+        // Confluence probability is derived from the strength of agreement.
+        // diff range [0.30, 1.0] maps to probability [55, 75].
+        // Cap at 75 — confluence alone shouldn't claim higher than well-tested MR.
+        double probability = 55.0 + Math.min(20.0, (Math.abs(diff) - 0.30) * 30.0);
+        if (htfAligned) probability = Math.min(78.0, probability + 3.0);
+
+        // ── Build flags ──
+        List<String> flags = new ArrayList<>();
+        flags.add("CONFLUENCE");
+        flags.add(String.format("CONF_DIFF=%.2f", diff));
+        flags.add(String.format("CONF_BULL=%.2f", conf.bullScore));
+        flags.add(String.format("CONF_BEAR=%.2f", conf.bearScore));
+        // Add up to 3 most important contributing factors for transparency
+        List<String> contributors = wantLong ? conf.bullFactors : conf.bearFactors;
+        int factorsAdded = 0;
+        for (String f : contributors) {
+            if (factorsAdded >= 3) break;
+            flags.add("CF_" + f);
+            factorsAdded++;
+        }
+        if (htfAligned) flags.add("HTF_ALIGN");
+
+        TradeIdea idea = new TradeIdea(
+                symbol,
+                side,
+                price,
+                stop,
+                tp2,
+                PHASE4_TP_R,
+                probability,
+                flags,
+                frRate, frDelta, oiCh,
+                bias2h != null ? bias2h.name() : "NEUTRAL",
+                cat,
+                null,
+                1.0, PHASE4_TP_R, PHASE4_TP_R
+        );
+        idea.setRobustAtrPct(atr14 / price);
+        idea.setAgreeingClusters(1);
+
+        return idea;
+    }
+
+
     // [Phase 2.3 rollback 2026-05-10] Defaults flipped true→false. Backtests
     // showed Phase 2.1 and 2.2 underperforming Phase 1 (+4.92% vs +7.57%) on
     // identical 13-day window. PumpHunter exhaustion + Breakout opened "extra"
@@ -1991,6 +2192,18 @@ public final class DecisionEngineMerged {
     private static final double  PHASE2_BREAKOUT_MIN_ADX  = csEnvDouble("PHASE2_BREAKOUT_MIN_ADX", 25.0);
     private static final double  PHASE2_RANGE_MAX_ADX     = csEnvDouble("PHASE2_RANGE_MAX_ADX",    22.0);
     private static final double  PHASE2_PUMP_MIN_STRENGTH = csEnvDouble("PHASE2_PUMP_MIN_STRENGTH", 0.50);
+
+    // ─── Phase 4.0 confluence tunables (advanced indicators) ───
+    // Default: ENABLED. Activates the 8 dormant smart-money indicators in
+    // TradingCore.advancedConfluence() as an additive third path in router.
+    // Different signal type from MR (institutional vs price-action) →
+    // additive, not subtractive. To disable without code changes, set
+    // PHASE4_CONFLUENCE_ENABLE=false in Railway env.
+    private static final boolean PHASE4_CONFLUENCE_ENABLE = csEnvBool("PHASE4_CONFLUENCE_ENABLE", true);
+    private static final double  PHASE4_MIN_DIFF          = csEnvDouble("PHASE4_MIN_DIFF",          0.30);
+    private static final double  PHASE4_MIN_SCORE         = csEnvDouble("PHASE4_MIN_SCORE",         0.45);
+    private static final double  PHASE4_SL_ATR_MULT       = csEnvDouble("PHASE4_SL_ATR_MULT",       1.5);
+    private static final double  PHASE4_TP_R              = csEnvDouble("PHASE4_TP_R",              2.0);
 
     // ─────────────────────────────────────────────────────────────────────
     // STRATEGY: VWAP MEAN REVERSION (was generate(), Phase 1)
@@ -2311,27 +2524,15 @@ public final class DecisionEngineMerged {
             CS_IS_15M ? 96 : 96);   // 24h on 15m / 4 days on 1h
     private static final int    CS_DEVIATION_WINDOW = (int) csEnvLong("CS_DEVIATION_WINDOW",
             CS_IS_15M ? 60 : 48);   // 15h on 15m / 2 days on 1h
-    // [Phase 3.0 2026-05-10] ATR percentile band widened.
-    // Lower bound 0.30→0.20: includes "quiet" pairs that still have valid MR
-    //   setups (compressed market 2026 has many such pairs).
-    // Upper bound 0.85→0.92: includes more volatile pairs (extreme tail 0.95+
-    //   stays excluded — those are pump events, not MR setups).
-    // Effect: ~30% more pairs pass the volatility gate per cycle.
-    private static final double CS_MIN_ATR_PCTILE    = csEnvDouble("CS_MIN_ATR_PCTILE",    0.20);
-    private static final double CS_MAX_ATR_PCTILE    = csEnvDouble("CS_MAX_ATR_PCTILE",    0.92);
+    private static final double CS_MIN_ATR_PCTILE    = csEnvDouble("CS_MIN_ATR_PCTILE",    0.30);
+    private static final double CS_MAX_ATR_PCTILE    = csEnvDouble("CS_MAX_ATR_PCTILE",    0.85);
     private static final double CS_SL_ATR_MULT       = csEnvDouble("CS_SL_ATR_MULT",
             CS_IS_15M ? 1.2 : 1.5);
     private static final double CS_TP1_R             = csEnvDouble("CS_TP1_R",             1.0);
     private static final double CS_TP2_R             = csEnvDouble("CS_TP2_R",
             CS_IS_15M ? 1.5 : 1.8);
-    // [Phase 3.0 2026-05-10] Cooldown defaults reduced.
-    // 1h: 240→180 min (4h→3h). Math: 25 pairs × 13 days × 24h ÷ 4h cooldown
-    //   = 1950 slots for 22 actual trades. Reducing to 3h gives 2600 slots
-    //   → ~28-32 trades expected (1.1% conversion stays).
-    // 15m: 60→45 min (proportional reduction).
-    // Whipsaw risk: low (price-action settles within 3h on liquid alts).
     private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",
-            CS_IS_15M ? 45 : 180) * 60_000L;
+            CS_IS_15M ? 60 : 240) * 60_000L;
     private static final long   CS_TIME_STOP_BARS_M15 = csEnvLong("CS_TIME_STOP_BARS",
             CS_IS_15M ? 12 : 8);
     private static final boolean CS_SKIP_MEME        = csEnvBool("CS_SKIP_MEME",           true);
