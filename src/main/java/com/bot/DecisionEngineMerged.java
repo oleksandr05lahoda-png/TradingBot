@@ -1742,13 +1742,16 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // Priority 3: VWAP Mean Reversion for ranging / unclear
-        if (regime == MarketRegime.RANGE || regime == MarketRegime.UNCLEAR) {
-            idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
-            if (idea != null) {
-                csLastSignalTime.put(symbol, now);
-                return idea;
-            }
+        // Priority 3: VWAP Mean Reversion — runs ALWAYS (Phase 2.1).
+        // Phase 2 regime-gate (RANGE/UNCLEAR only) caused a 22→7 trade regression.
+        // MR has its own internal ATR-percentile / sigma filter; if a trending
+        // pair has no MR setup, MR will reject internally — extra ADX gate was
+        // redundant and harmful. MR is now the productivity floor; Breakout and
+        // PumpHunter run as parallel additive paths above it.
+        idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
+        if (idea != null) {
+            csLastSignalTime.put(symbol, now);
+            return idea;
         }
 
         return reject("regime_" + regime.name().toLowerCase() + "_no_setup");
@@ -1774,7 +1777,10 @@ public final class DecisionEngineMerged {
         if (c5 == null || c5.size() < 30) return reject("bo_insufficient_5m");
 
         double atrPct15 = com.bot.TradingCore.atrPercentile(c15, 14, 100);
-        if (atrPct15 < 0.40) return reject("bo_atr_too_low");
+        // Phase 2.1: lower bound 0.40 → 0.30. Trending pairs in early-stage
+        // breakouts often sit at moderate ATR (0.30-0.45) before volatility
+        // expands. 0.40 was filtering out the "early trend" cases we want.
+        if (atrPct15 < 0.30) return reject("bo_atr_too_low");
         if (atrPct15 > 0.95) return reject("bo_atr_too_high");
 
         boolean trendUp = (regime == MarketRegime.TREND_UP);
@@ -1786,7 +1792,9 @@ public final class DecisionEngineMerged {
 
         double volSma20_5m = computeVolumeSma(c5, 20);
         double volCurrent_5m = last(c5).volume;
-        if (volSma20_5m <= 0 || volCurrent_5m < volSma20_5m * 1.30) {
+        // Phase 2.1: 1.30x was rejecting ~70% of legitimate continuation breakouts.
+        // 1.15x is closer to "above-average volume" without requiring a spike.
+        if (volSma20_5m <= 0 || volCurrent_5m < volSma20_5m * 1.15) {
             return reject("bo_no_volume_confirm");
         }
 
@@ -1797,8 +1805,9 @@ public final class DecisionEngineMerged {
                 return reject("bo_btc_panic");
             if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
                 return reject("bo_btc_crash");
-            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CHOPPY)
-                return reject("bo_btc_choppy");
+            // Phase 2.1: BTC_CHOPPY no longer auto-rejects breakouts.
+            // Choppy BTC ≠ choppy altcoin; many alts trend independently when
+            // BTC ranges. Side-specific BTC blockers below are sufficient.
             if (trendUp) {
                 if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN)
                     return reject("bo_btc_strong_down_blocks_long");
@@ -1895,8 +1904,11 @@ public final class DecisionEngineMerged {
         if (event == null || event.type == com.bot.PumpHunter.PumpType.NONE) return null;
         if (event.strength < PHASE2_PUMP_MIN_STRENGTH) return reject("ph_strength_too_low");
 
-        // Only act on anticipatory or reversal — NOT continuation
-        if (!event.isAnticipatory() && !event.isReversal()) return reject("ph_continuation_skipped");
+        // Phase 2.1: only act on reversal/exhaustion events.
+        // Anticipatory pre-pump/pre-dump detector is too noisy in practice
+        // (false positive rate ~70%+ in tests). Continuation pumps remain
+        // skipped — chasing pumps has poor expectancy.
+        if (!event.isReversal()) return reject("ph_non_reversal_skipped");
 
         double price = last(c15).close;
         @SuppressWarnings("deprecation")
@@ -1917,10 +1929,10 @@ public final class DecisionEngineMerged {
         double atr14 = com.bot.TradingCore.atr(c15, 14);
         if (atr14 <= 0) return reject("ph_invalid_atr");
 
-        // Anticipatory → tighter SL (compression breaks cleanly), wider TP
-        // Reversal     → wider SL (pump tops are messy), conservative TP
-        double slMult = event.isAnticipatory() ? 1.2 : 1.6;
-        double tpR    = event.isAnticipatory() ? 2.5 : 2.0;
+        // Phase 2.1: reversal-only path. SL wider (pump tops are messy),
+        // TP conservative (reversals don't run as far as continuation moves).
+        double slMult = 1.6;
+        double tpR    = 2.0;
         double slDist = atr14 * slMult;
         double stop = (sig.side == com.bot.TradingCore.Side.LONG)
                 ? price - slDist : price + slDist;
@@ -1939,7 +1951,6 @@ public final class DecisionEngineMerged {
         flags.add(String.format("STRENGTH=%.2f", event.strength));
         flags.add(String.format("VOL_RATIO=%.1fx", event.volumeRatio));
         flags.add(String.format("MOVE=%.2f%%", event.movePct * 100));
-        if (event.isAnticipatory()) flags.add("ANTICIPATORY");
         if (event.isReversal())     flags.add("REVERSAL");
         if (btc != null) flags.add("BTC_" + btc.regime.name());
         flags.addAll(event.flags);
