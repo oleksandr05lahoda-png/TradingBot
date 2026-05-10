@@ -2311,15 +2311,27 @@ public final class DecisionEngineMerged {
             CS_IS_15M ? 96 : 96);   // 24h on 15m / 4 days on 1h
     private static final int    CS_DEVIATION_WINDOW = (int) csEnvLong("CS_DEVIATION_WINDOW",
             CS_IS_15M ? 60 : 48);   // 15h on 15m / 2 days on 1h
-    private static final double CS_MIN_ATR_PCTILE    = csEnvDouble("CS_MIN_ATR_PCTILE",    0.30);
-    private static final double CS_MAX_ATR_PCTILE    = csEnvDouble("CS_MAX_ATR_PCTILE",    0.85);
+    // [Phase 3.0 2026-05-10] ATR percentile band widened.
+    // Lower bound 0.30→0.20: includes "quiet" pairs that still have valid MR
+    //   setups (compressed market 2026 has many such pairs).
+    // Upper bound 0.85→0.92: includes more volatile pairs (extreme tail 0.95+
+    //   stays excluded — those are pump events, not MR setups).
+    // Effect: ~30% more pairs pass the volatility gate per cycle.
+    private static final double CS_MIN_ATR_PCTILE    = csEnvDouble("CS_MIN_ATR_PCTILE",    0.20);
+    private static final double CS_MAX_ATR_PCTILE    = csEnvDouble("CS_MAX_ATR_PCTILE",    0.92);
     private static final double CS_SL_ATR_MULT       = csEnvDouble("CS_SL_ATR_MULT",
             CS_IS_15M ? 1.2 : 1.5);
     private static final double CS_TP1_R             = csEnvDouble("CS_TP1_R",             1.0);
     private static final double CS_TP2_R             = csEnvDouble("CS_TP2_R",
             CS_IS_15M ? 1.5 : 1.8);
+    // [Phase 3.0 2026-05-10] Cooldown defaults reduced.
+    // 1h: 240→180 min (4h→3h). Math: 25 pairs × 13 days × 24h ÷ 4h cooldown
+    //   = 1950 slots for 22 actual trades. Reducing to 3h gives 2600 slots
+    //   → ~28-32 trades expected (1.1% conversion stays).
+    // 15m: 60→45 min (proportional reduction).
+    // Whipsaw risk: low (price-action settles within 3h on liquid alts).
     private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",
-            CS_IS_15M ? 60 : 240) * 60_000L;
+            CS_IS_15M ? 45 : 180) * 60_000L;
     private static final long   CS_TIME_STOP_BARS_M15 = csEnvLong("CS_TIME_STOP_BARS",
             CS_IS_15M ? 12 : 8);
     private static final boolean CS_SKIP_MEME        = csEnvBool("CS_SKIP_MEME",           true);
