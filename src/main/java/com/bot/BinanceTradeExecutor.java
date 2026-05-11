@@ -275,6 +275,7 @@ public final class BinanceTradeExecutor {
      */
     public int cancelAllOrdersAccountWide() {
         int total = 0;
+        // Cancel regular orders (LIMIT, MARKET) via /fapi/v1/openOrders
         try {
             long ts = ts();
             String qs = "timestamp=" + ts + "&recvWindow=5000";
@@ -287,24 +288,86 @@ public final class BinanceTradeExecutor {
                             .GET()
                             .build(),
                     HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
-                LOG.warning("[Executor] cancelAllOrdersAccountWide list HTTP " + resp.statusCode());
-                return 0;
-            }
-            org.json.JSONArray arr = new org.json.JSONArray(resp.body());
-            java.util.Set<String> symbols = new java.util.HashSet<>();
-            for (int i = 0; i < arr.length(); i++) {
-                symbols.add(arr.getJSONObject(i).getString("symbol"));
-            }
-            for (String sym : symbols) {
-                try {
-                    cancelAllOpenOrders(sym);
-                    total += arr.length(); // approximate
-                } catch (Throwable ignored) {}
+            if (resp.statusCode() == 200) {
+                org.json.JSONArray arr = new org.json.JSONArray(resp.body());
+                java.util.Set<String> symbols = new java.util.HashSet<>();
+                for (int i = 0; i < arr.length(); i++) {
+                    symbols.add(arr.getJSONObject(i).getString("symbol"));
+                }
+                for (String sym : symbols) {
+                    try {
+                        cancelAllOpenOrders(sym);
+                        total += arr.length(); // approximate
+                    } catch (Throwable ignored) {}
+                }
+                if (!symbols.isEmpty()) {
+                    LOG.info("[Executor] cancelled regular orders on " + symbols.size() + " symbols");
+                }
+            } else {
+                LOG.warning("[Executor] cancelAllOrdersAccountWide regular HTTP " + resp.statusCode());
             }
         } catch (Throwable t) {
-            LOG.warning("[Executor] cancelAllOrdersAccountWide error: " + t.getMessage());
+            LOG.warning("[Executor] cancelAllOrdersAccountWide regular error: " + t.getMessage());
         }
+
+        // Cancel algo orders (STOP_MARKET, TAKE_PROFIT_MARKET = SL/TP) via
+        // /fapi/v1/algoOrders. These don't show up in /openOrders endpoint
+        // and previously kept blocking position-mode changes with -4067.
+        try {
+            long ts2 = ts();
+            String qs2 = "timestamp=" + ts2 + "&recvWindow=5000";
+            String sig2 = hmacSHA256(apiSecret, qs2);
+            HttpResponse<String> resp2 = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/algoOrders?" + qs2 + "&signature=" + sig2))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp2.statusCode() == 200) {
+                String body = resp2.body();
+                // Response format may vary — try as array or as {data: [...]}
+                org.json.JSONArray algos = null;
+                try {
+                    algos = new org.json.JSONArray(body);
+                } catch (Throwable parseErr) {
+                    try {
+                        org.json.JSONObject obj = new org.json.JSONObject(body);
+                        if (obj.has("data")) algos = obj.getJSONArray("data");
+                        else if (obj.has("orders")) algos = obj.getJSONArray("orders");
+                    } catch (Throwable ignored) {}
+                }
+                if (algos != null && algos.length() > 0) {
+                    int cancelledAlgo = 0;
+                    for (int i = 0; i < algos.length(); i++) {
+                        try {
+                            org.json.JSONObject o = algos.getJSONObject(i);
+                            String sym = o.optString("symbol", "");
+                            long algoId = o.optLong("algoId", 0L);
+                            if (algoId == 0) algoId = o.optLong("orderId", 0L);
+                            if (!sym.isEmpty() && algoId > 0) {
+                                if (cancelAlgoOrder(sym, String.valueOf(algoId))) {
+                                    cancelledAlgo++;
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    LOG.info("[Executor] cancelled " + cancelledAlgo
+                            + " algo orders (SL/TP) account-wide");
+                    total += cancelledAlgo;
+                }
+            } else if (resp2.statusCode() == 404) {
+                // Endpoint may not exist on testnet — silently skip
+                LOG.fine("[Executor] /fapi/v1/algoOrders not available (testnet?), skipping algo wipe");
+            } else {
+                LOG.warning("[Executor] algoOrders list HTTP " + resp2.statusCode()
+                        + " body=" + resp2.body());
+            }
+        } catch (Throwable t) {
+            LOG.warning("[Executor] cancelAllOrdersAccountWide algo error: " + t.getMessage());
+        }
+
         return total;
     }
 

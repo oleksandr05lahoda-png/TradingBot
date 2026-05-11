@@ -1759,16 +1759,16 @@ public final class BotMain {
         try { Thread.sleep(180_000L); }
         catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
 
-        // [v82.1] Universe size — было хардкод 40, теперь env STARTUP_BT_PAIRS.
-        // Дефолт 40 = старое поведение. Подняв до 60-80 получим больше сделок
-        // в стартовом бэктесте за счёт большей выборки пар. Каждая пара = ~7сек
-        // (5с пейсинг + 1.5с между fetch'ами + сам fetch), так что 80 пар = ~10 мин
-        // только на пейсинге. Учитывайте время прогона.
-        final int btPairsLimit = Math.max(10, envInt("STARTUP_BT_PAIRS", 40));
+        // Universe size — default 50, controlled via STARTUP_BT_PAIRS env.
+        // Each pair = ~7sec (paging + fetch), so 50 pairs ≈ 6 minutes.
+        final int btPairsLimit = Math.max(10, envInt("STARTUP_BT_PAIRS", 50));
 
-        // 1. Universe — should be populated by now after first cycle.
+        // 1. Universe — wait for at least 80% target loaded (gives cachedPairs
+        // time to actually fill, not just have 1 pair). Hard timeout still 60s
+        // — if loader is slow, proceed with whatever we have.
         List<String> universe = new ArrayList<>();
-        for (int waitS = 0; waitS < 60 && universe.isEmpty(); waitS++) {
+        int targetMin = Math.max(10, (int) (btPairsLimit * 0.8));
+        for (int waitS = 0; waitS < 60 && universe.size() < targetMin; waitS++) {
             try { Thread.sleep(2_000L); }
             catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
             universe = sender.getScanUniverseSnapshot(btPairsLimit);
