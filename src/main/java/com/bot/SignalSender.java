@@ -569,6 +569,22 @@ public final class SignalSender {
 
     private static final Set<String> STABLE = Set.of("USDT","USDC","BUSD","TUSD","USDP","DAI");
 
+    // ─────────────────────────────────────────────────────────────────────
+    // [PATCH 2026-05-13] HARD_BLACKLIST — non-crypto / problematic perpetuals
+    // that the bot wastes resources on (loads WS, runs through DE, rejects
+    // with non_crypto_* or fm_funding_stale). Block at top-N selection stage.
+    //
+    // Includes: tokenized stocks (TSLA), tokenized metals (PAXG, XAUT),
+    // political/meme tokens (TRUMP, TRUTH, DOGS, PUMP, UB, LAYER).
+    //
+    // To add a pair: append to this set, no other code changes needed.
+    // ─────────────────────────────────────────────────────────────────────
+    private static final Set<String> HARD_BLACKLIST = Set.of(
+            "TSLAUSDT", "PAXGUSDT", "XAUTUSDT",
+            "TRUMPUSDT", "TRUTHUSDT",
+            "DOGSUSDT", "PUMPUSDT", "UBUSDT", "LAYERUSDT"
+    );
+
     // DYNAMIC SECTOR DETECTION — extended with AI, RWA, DePin sectors
     // and auto-detection for commodity/metal tokens
     private String detectSector(String pair) {
@@ -1694,7 +1710,7 @@ public final class SignalSender {
                 com.bot.GlobalImpulseController.GlobalContext _gc = gic.getContext();
                 if (_gc != null) _trendStrForRR = Math.abs(_gc.impulseStrength);
             } catch (Throwable ignored) {}
-            double effMinRR = (_trendStrForRR < 0.30) ? 2.20 : 2.00;
+            double effMinRR = 2.00;  // [PATCH 2026-05-13] was `(_trendStrForRR<0.30)?2.20:2.00` — synced with CS_TP2_R=2.4 + BotMain FLAT_MARKET_MIN_RR=2.00
             if (actualRR < effMinRR) {
                 // [v78.2] No ISC unregister needed — we never registered.
                 // correlationGuard.unregister still called for safety in case
@@ -3799,6 +3815,12 @@ public final class SignalSender {
     public Set<String> getTopSymbolsSet(int limit) {
         try {
             Set<String> binancePairs = getBinanceSymbolsFutures();
+
+            // [PATCH 2026-05-13] Apply HARD_BLACKLIST before any processing.
+            // Saves WS slots, REST weight, CPU. Net effect: no "non_crypto_*"
+            // reject spam, no zombie WS connections in logs.
+            binancePairs.removeIf(HARD_BLACKLIST::contains);
+
             Set<String> top = new LinkedHashSet<>();
 
             if (!volume24hUSD.isEmpty()) {

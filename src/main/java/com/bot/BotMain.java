@@ -337,12 +337,12 @@ public final class BotMain {
         // вообще, edge=0 by design. Если торгует на флэте плохо подобранными
         // сетапами — edge<0. Цель: торговать средне-качественно тогда, когда
         // высоко-качественных сетапов нет физически.
-        private static final double FLAT_MARKET_MIN_CONF      = 56.0;
+        private static final double FLAT_MARKET_MIN_CONF      = 55.0;   // [PATCH 2026-05-13] was 56.0 — match MIN_CONF env=55
         private static final int    FLAT_MARKET_MIN_CLUSTERS  = 2;
-        private static final double FLAT_MARKET_MIN_RR        = 2.20;
+        private static final double FLAT_MARKET_MIN_RR        = 2.00;   // [PATCH 2026-05-13] was 2.20 — synced with CS_TP2_R=2.4 via env
         private static final double FLAT_MARKET_MIN_SL_PCT    = 0.0085;
-        private static final int    FLAT_MARKET_MAX_PER_HOUR  = 2;
-        private static final int    FLAT_MARKET_MAX_PER_DAY   = 4;
+        private static final int    FLAT_MARKET_MAX_PER_HOUR  = 3;      // [PATCH 2026-05-13] was 2 — more samples for calibrator
+        private static final int    FLAT_MARKET_MAX_PER_DAY   = 5;      // [PATCH 2026-05-13] was 4 — more samples for calibrator
 
         private static final double WEAK_TREND_MIN_CONF       = 60.0;
         private static final int    WEAK_TREND_MIN_CLUSTERS   = 2;
