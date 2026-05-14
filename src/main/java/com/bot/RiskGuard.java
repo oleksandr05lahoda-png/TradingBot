@@ -70,7 +70,7 @@ public final class RiskGuard {
     private RiskGuard() {
         this.DAILY_LOSS_LIMIT_PCT      = envDouble("RG_DAILY_LOSS_LIMIT_PCT", 10.0);
         this.WEEKLY_LOSS_LIMIT_PCT     = envDouble("RG_WEEKLY_LOSS_LIMIT_PCT", 20.0);
-        this.DAILY_TRADE_LIMIT         = envInt("RG_DAILY_TRADE_LIMIT", 3);
+        this.DAILY_TRADE_LIMIT         = envInt("RG_DAILY_TRADE_LIMIT", 8);
         this.MAX_CONCURRENT_POSITIONS  = envInt("RG_MAX_CONCURRENT_POSITIONS", 2);
         this.BTC_CRASH_30M_PCT         = envDouble("RG_BTC_CRASH_30M_PCT", 3.0);
         this.BTC_CRASH_60M_PCT         = envDouble("RG_BTC_CRASH_60M_PCT", 5.0);
