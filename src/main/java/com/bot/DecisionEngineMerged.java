@@ -2016,8 +2016,8 @@ public final class DecisionEngineMerged {
     // than skipping the bar. With both defaults=false, the router falls
     // through to MR-only — behaviorally identical to Phase 1. To re-enable
     // experimentally without code changes, set env vars to "true" in Railway.
-    private static final boolean PHASE2_PUMPHUNTER_ENABLE = csEnvBool("PHASE2_PUMPHUNTER_ENABLE", false);
-    private static final boolean PHASE2_BREAKOUT_ENABLE   = csEnvBool("PHASE2_BREAKOUT_ENABLE",   false);
+    private static final boolean PHASE2_PUMPHUNTER_ENABLE = csEnvBool("PHASE2_PUMPHUNTER_ENABLE", true);
+    private static final boolean PHASE2_BREAKOUT_ENABLE   = csEnvBool("PHASE2_BREAKOUT_ENABLE",   true);
     private static final double  PHASE2_BREAKOUT_MIN_ADX  = csEnvDouble("PHASE2_BREAKOUT_MIN_ADX", 25.0);
     private static final double  PHASE2_RANGE_MAX_ADX     = csEnvDouble("PHASE2_RANGE_MAX_ADX",    22.0);
     private static final double  PHASE2_PUMP_MIN_STRENGTH = csEnvDouble("PHASE2_PUMP_MIN_STRENGTH", 0.50);
