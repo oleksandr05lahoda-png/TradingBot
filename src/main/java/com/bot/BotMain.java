@@ -1347,16 +1347,34 @@ public final class BotMain {
                         ? fr.robustAtrPctAtSignal * fr.entryPrice
                         : (c.size() >= 15 ? com.bot.TradingCore.atr(c, 14) : 0);
 
+                // [HOLE-1 FIX 2026-05-15] Signal side is the authoritative opinion,
+                // NOT the HTF bias snapshot. Old logic required forecastBias to contain
+                // "BULL" or "BEAR" — but HTFBias.NONE is a perfectly valid state for
+                // counter-trend / range-bound / mean-reversion setups. The signal still
+                // made a directional bet via fr.side (LONG/SHORT), and that bet either
+                // won (TP1) or lost (SL/TIME_STOP).
+                //
+                // Symptom of the old bug: forecastTimeStop=4 but forecastTotal=0 in the
+                // daily integrity report — proof that 4 records hit TIME_STOP yet none
+                // reached the calibrator because their bias was NONE.
+                //
+                // The old bullish/bearish flags are kept for the legacy bias-driven
+                // synthetic level fallback (when fr.tp1Level / fr.slLevel are missing).
                 boolean bullishBias = fr.forecastBias.contains("BULL");
                 boolean bearishBias = fr.forecastBias.contains("BEAR");
-                boolean hasOpinion = bullishBias || bearishBias;
+                // Authoritative opinion = the side the bot bet on. Period.
+                boolean hasOpinion = fr.side == com.bot.TradingCore.Side.LONG
+                        || fr.side == com.bot.TradingCore.Side.SHORT;
 
                 boolean hitTP1 = false, hitSL = false, ambiguous = false;
                 double tp1Use = fr.tp1Level;
                 double slUse  = fr.slLevel;
                 boolean haveRealLevels = tp1Use > 0 && slUse > 0;
                 if (!haveRealLevels && hasOpinion && atrAbs > 0) {
-                    boolean longSide = bullishBias;
+                    // [HOLE-1 FIX] Use signal side (not bias) to synthesize fallback levels.
+                    // For NONE-bias signals this branch is now reachable and computes
+                    // sensible ATR-based TP/SL based on what the signal actually bet on.
+                    boolean longSide = fr.side == com.bot.TradingCore.Side.LONG;
                     tp1Use = longSide ? fr.entryPrice + atrAbs * 1.0 : fr.entryPrice - atrAbs * 1.0;
                     slUse  = longSide ? fr.entryPrice - atrAbs * 0.8 : fr.entryPrice + atrAbs * 0.8;
                     haveRealLevels = true;
@@ -1985,8 +2003,41 @@ public final class BotMain {
                     + "(BTC в глубоком флэте). Это не плохо — стратегия осторожна.\n"
                     + "Калибровка пойдёт через live.";
         } else if (totalTrades < 50) {
-            verdict = "🟡 *Малая выборка* — " + totalTrades + " сделок.\n"
-                    + "Слишком мало для статистических выводов. Продолжайте paper.";
+            // [HOLE-3 FIX 2026-05-15] Small sample size still requires PnL/WR sanity check.
+            // OLD BUG: 43 trades with -39% NetPnL was labeled "малая выборка" (neutral),
+            // hiding a clear loss pattern. At 5× leverage that's a -197% margin loss =
+            // liquidation on real money. Sample-size doctrine should not override
+            // glaring negative-edge evidence.
+            //
+            // New rule: if NetPnL ≤ -10% AND/OR WR < 25% on any sample size, raise
+            // the alarm — direction is too clear to call "не хватает данных".
+            int leverage = 1;
+            try {
+                leverage = com.bot.BinanceTradeExecutor.getInstance().getLeverage();
+            } catch (Throwable ignore) {}
+            double leveragedLoss = totalNetPnL * leverage;
+            boolean clearlyNegative = (totalNetPnL <= -10.0) || (wr < 25.0);
+            if (clearlyNegative) {
+                StringBuilder vb = new StringBuilder();
+                vb.append("🔴 *Малая выборка + явный negative edge*\n");
+                vb.append(String.format("%d сделок · WR=%.1f%% · NetPnL=%+.1f%%\n",
+                        totalTrades, wr, totalNetPnL));
+                if (leverage > 1) {
+                    vb.append(String.format(
+                            "⚠️ С плечом %dx реальный убыток ≈ %+.1f%% от маржи",
+                            leverage, leveragedLoss));
+                    if (leveragedLoss <= -100.0) {
+                        vb.append(" → *ЛИКВИДАЦИЯ*");
+                    }
+                    vb.append("\n");
+                }
+                vb.append("Размер выборки мал, но направление однозначное — стратегия теряет.\n");
+                vb.append("*Real money категорически нельзя.*");
+                verdict = vb.toString();
+            } else {
+                verdict = "🟡 *Малая выборка* — " + totalTrades + " сделок.\n"
+                        + "Слишком мало для статистических выводов. Продолжайте paper.";
+            }
         } else {
             // [v81 FIX] Оценка по PnL и Expectancy, не по WR.
             // При RR 1:2 стратегия с WR=35% уже прибыльна. WR в отрыве от RR

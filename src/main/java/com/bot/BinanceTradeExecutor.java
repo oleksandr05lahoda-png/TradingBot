@@ -554,6 +554,34 @@ public final class BinanceTradeExecutor {
         boolean isLong = idea.side == com.bot.TradingCore.Side.LONG;
 
         try {
+            // ════════════════════════════════════════════════════════════════
+            // [HOLE-6 FIX 2026-05-15] PRE-CHECK SYMBOL TRADABILITY
+            // ════════════════════════════════════════════════════════════════
+            // Symptom we observed (TAOUSDT 2026-05-15 02:43):
+            //   ❌ Auto-trade FAIL TAOUSDT SHORT
+            //   "MARKET order rejected by Binance"
+            //
+            // Root cause: the symbol may be HALT / BREAK / PENDING_TRADING /
+            // delisted on this account's exchange (e.g. listed on mainnet but
+            // not on testnet). The dispatcher upstream has no knowledge of
+            // exchange status — it only sees that the symbol passes its filters.
+            //
+            // Fix: hit exchangeInfo BEFORE leverage/margin POSTs (those mutate
+            // account state on unrelated symbols if they succeed mid-flow), check
+            // status == "TRADING". A null SymbolInfo here means the symbol does
+            // not exist on this exchange at all → abort with a clear reason that
+            // the dispatcher / GARBAGE_COIN_BLOCKLIST can act on next cycle.
+            SymbolInfo preCheckInfo = loadSymbolInfo(symbol);
+            if (preCheckInfo == null) {
+                return ExecutionResult.fail("symbol not in exchangeInfo: " + symbol
+                        + " (not listed on this " + (useTestnet ? "testnet" : "real") + " endpoint)");
+            }
+            if (!preCheckInfo.isTradable()) {
+                return ExecutionResult.fail("symbol not TRADING: " + symbol
+                        + " status=" + preCheckInfo.status
+                        + " (suspended / delisted / pre-trading)");
+            }
+
             // 1. Initialize symbol settings (leverage + isolated)
             if (!initializedSymbols.contains(symbol)) {
                 if (!initSymbolMargin(symbol)) {
@@ -680,6 +708,108 @@ public final class BinanceTradeExecutor {
             }
             if (actualEntry <= 0) actualEntry = entry; // fallback на квоту
 
+            // ════════════════════════════════════════════════════════════════
+            // [HOLE-8 FIX 2026-05-15] HARD SLIPPAGE GUARD
+            // ════════════════════════════════════════════════════════════════
+            // OLD BUG: pre-trade `maxSpreadPct` check covered only the bid/ask gap
+            // at quote time, NOT the gap between idea.price (signal time, ~5-90 sec
+            // earlier) and the actual MARKET fill price. HYPEUSDT slipped 2.34%
+            // between signal and fill → SL and TP became invalid relative to the
+            // new entry, yet the trade proceeded silently.
+            //
+            // NEW POLICY: if actualEntry deviates from idea.price by more than
+            //   • 3.0%  on testnet (thin books, accepted)
+            //   • 0.5%  on real (any larger gap = stale signal, kill it)
+            // emergency-close and report. The signal probabilities, R:R, and
+            // TP/SL were computed for idea.price — a different entry breaks them.
+            double slippagePct = idea.price > 0
+                    ? Math.abs(actualEntry - idea.price) / idea.price : 0.0;
+            double maxSlippage = useTestnet ? 0.030 : 0.005;
+            if (slippagePct > maxSlippage) {
+                LOG.severe(String.format(
+                        "[Executor] %s SLIPPAGE %.2f%% > max %.2f%% "
+                                + "(idea=%.6f → fill=%.6f) — emergency close",
+                        symbol, slippagePct * 100, maxSlippage * 100,
+                        idea.price, actualEntry));
+                // Need real on-exchange qty for emergency close — it may differ
+                // from `qty` if there was a partial fill before we got here.
+                double posAmtForClose = qty;
+                try {
+                    double remoteAmt = Math.abs(fetchPositionAmount(symbol));
+                    if (remoteAmt > 0) posAmtForClose = remoteAmt;
+                } catch (Throwable ignored) {}
+                emergencyClosePosition(symbol, isLong, posAmtForClose);
+                return ExecutionResult.fail(String.format(
+                        "Slippage %.2f%% exceeded max %.2f%% (idea %.6f → fill %.6f) → emergency close",
+                        slippagePct * 100, maxSlippage * 100,
+                        idea.price, actualEntry));
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // [HOLE-2 FIX 2026-05-15] TP / SL DIRECTION SANITY VS ACTUAL ENTRY
+            // ════════════════════════════════════════════════════════════════
+            // idea.tp1, idea.tp2 and idea.stop were computed against idea.price.
+            // Even tiny slippage can flip a TP to the wrong side of actualEntry.
+            // Example from HYPEUSDT 2026-05-15:
+            //   idea.price=44.949  idea.tp1=45.844  idea.stop=44.054
+            //   actualEntry=46.000 (slippage +2.34%)
+            //   → tp1=45.844 is NOW BELOW entry for a LONG (impossible profit target).
+            //   → stop=44.054 is now -4.23% from entry vs planned -2% (risk budget blown).
+            //
+            // We do three explicit checks AFTER actualEntry, BEFORE placing any algo orders:
+            //   (a) Both TPs on wrong side of actualEntry  → abort, emergency close.
+            //   (b) SL on wrong side of actualEntry         → abort, emergency close.
+            //   (c) SL distance bloated >1.7× planned       → abort, risk budget blown.
+            //
+            // Note: rare case where only TP1 is on the wrong side (slippage moved
+            // entry past TP1 but not past TP2) is handled later in the TP block —
+            // we drop TP1 and fall back to a single TP at tp2 via closePosition=true.
+            boolean tp1WrongSide = isLong ? (idea.tp1 <= actualEntry) : (idea.tp1 >= actualEntry);
+            boolean tp2WrongSide = isLong ? (idea.tp2 <= actualEntry) : (idea.tp2 >= actualEntry);
+            boolean slWrongSide  = isLong ? (idea.stop >= actualEntry) : (idea.stop <= actualEntry);
+
+            if (slWrongSide) {
+                LOG.severe(String.format(
+                        "[Executor] %s SL on WRONG SIDE after slippage: "
+                                + "%s entry=%.6f sl=%.6f — emergency close",
+                        symbol, isLong ? "LONG" : "SHORT", actualEntry, idea.stop));
+                emergencyClosePosition(symbol, isLong, qty);
+                return ExecutionResult.fail(String.format(
+                        "SL flipped to wrong side by slippage (entry %.6f → sl %.6f for %s)",
+                        actualEntry, idea.stop, isLong ? "LONG" : "SHORT"));
+            }
+            if (tp1WrongSide && tp2WrongSide) {
+                LOG.severe(String.format(
+                        "[Executor] %s BOTH TPs on WRONG SIDE after slippage: "
+                                + "%s entry=%.6f tp1=%.6f tp2=%.6f — emergency close",
+                        symbol, isLong ? "LONG" : "SHORT",
+                        actualEntry, idea.tp1, idea.tp2));
+                emergencyClosePosition(symbol, isLong, qty);
+                return ExecutionResult.fail(String.format(
+                        "Both TPs flipped wrong-side by slippage (entry %.6f, tp1 %.6f, tp2 %.6f)",
+                        actualEntry, idea.tp1, idea.tp2));
+            }
+
+            // [HOLE-2c FIX] Risk-budget guard: SL distance after slippage must not
+            // exceed 1.7× the planned distance. If user planned -2% but slippage
+            // made it -4.5%, the risk-per-trade calculation upstream was for the
+            // smaller stop — actual loss on SL would be 2.25× the budgeted amount.
+            double plannedSlDist = Math.abs(idea.price - idea.stop);
+            double actualSlDist  = Math.abs(actualEntry - idea.stop);
+            if (plannedSlDist > 0 && actualSlDist > plannedSlDist * 1.7) {
+                double plannedPct = plannedSlDist / Math.max(1e-9, idea.price);
+                double actualPct  = actualSlDist  / Math.max(1e-9, actualEntry);
+                LOG.severe(String.format(
+                        "[Executor] %s slippage blew SL budget: planned=%.2f%% "
+                                + "actual=%.2f%% (×%.2f) — emergency close",
+                        symbol, plannedPct * 100, actualPct * 100,
+                        actualSlDist / plannedSlDist));
+                emergencyClosePosition(symbol, isLong, qty);
+                return ExecutionResult.fail(String.format(
+                        "Slippage bloated SL %.2f%%→%.2f%% (>1.7× planned) — risk budget exceeded",
+                        plannedPct * 100, actualPct * 100));
+            }
+
             // Partial-fill detection: on illiquid alts MARKET may fill < requested.
             // SL has closePosition=true (handles real qty), but TP1+TP2 split
             // could fail with "qty exceeds position". If filled < 95% of requested,
@@ -759,6 +889,22 @@ public final class BinanceTradeExecutor {
                         ? roundToTick(idea.tp1, si.tickSize, isLong) : 0;
                 double tp2Rounded = (idea.tp2 > 0)
                         ? roundToTick(idea.tp2, si.tickSize, isLong) : 0;
+
+                // [HOLE-2 FIX 2026-05-15] After tick rounding, re-check TP1 vs actualEntry.
+                // Edge case the top-level guard cannot catch: tp1 was barely on the right
+                // side before rounding (e.g., +0.05% above entry for LONG) and tick
+                // rounding pulled it across the entry line. Drop it and let the small-size
+                // fallback below place a single TP at tp2.
+                boolean tp1RoundedWrongSide = isLong
+                        ? (tp1Rounded > 0 && tp1Rounded <= actualEntry)
+                        : (tp1Rounded > 0 && tp1Rounded >= actualEntry);
+                if (tp1RoundedWrongSide) {
+                    LOG.warning("[Executor] " + symbol + " TP1 rounded across entry "
+                            + "(entry=" + actualEntry + " tp1Rounded=" + tp1Rounded
+                            + ") — dropping TP1, will use single TP2 fallback");
+                    tp1Rounded = 0; // skip TP1, partialOk below will be false
+                }
+
                 tp1Price = tp1Rounded;
                 tp2Price = tp2Rounded;
 
@@ -769,7 +915,9 @@ public final class BinanceTradeExecutor {
                 // Check minNotional for partial TPs
                 double tp1Notional = tp1Qty * actualEntry;
                 double tp2Notional = tp2Qty * actualEntry;
-                boolean partialOk = tp1Qty > 0 && tp2Qty > 0
+                // [HOLE-2 FIX] partialOk now also requires tp1Rounded > 0 — if TP1
+                // was dropped above, force the single-TP fallback path.
+                boolean partialOk = tp1Rounded > 0 && tp1Qty > 0 && tp2Qty > 0
                         && tp1Notional >= si.minNotional
                         && tp2Notional >= si.minNotional;
 
@@ -788,12 +936,14 @@ public final class BinanceTradeExecutor {
                     else LOG.warning("[Executor] TP2 failed " + symbol + ": " + r2[1]);
                 }
 
-                // Fallback: position too small for partial TPs → single TP at tp2
-                // with closePosition=true. Better one TP than none.
+                // Fallback: position too small for partial TPs (or TP1 was dropped
+                // by HOLE-2 round-across-entry guard) → single TP at tp2 with
+                // closePosition=true. Better one TP than none.
                 if (!partialOk && tp2Rounded > 0) {
-                    LOG.info("[Executor] " + symbol + " too small for partial TPs "
+                    LOG.info("[Executor] " + symbol + " single TP at tp2 fallback "
                             + "(notional=$" + String.format("%.2f", actualNotional)
-                            + " min=$" + si.minNotional + ") — single TP at tp2 fallback");
+                            + " min=$" + si.minNotional
+                            + (tp1Rounded == 0 ? " tp1Dropped" : "") + ")");
                     String[] rSingle = sendTakeProfitMarketOrderDiag(
                             symbol, !isLong, tp2Rounded, 0, true);
                     tp2OrderId = rSingle[0];
@@ -1766,16 +1916,25 @@ public final class BinanceTradeExecutor {
      *   - LOT_SIZE.stepSize       → quantity granularity (e.g., 0.001, 1, 1000)
      *   - PRICE_FILTER.tickSize   → price granularity   (e.g., 0.01, 0.0001)
      *   - MIN_NOTIONAL.notional   → smallest position $ allowed
+     *
+     * [HOLE-6 FIX 2026-05-15] Now also captures status ("TRADING" / "HALT" /
+     * "BREAK" / "PENDING_TRADING" / "PRE_DELIVERING" / "DELIVERING" / "SETTLING"
+     * / "CLOSE"). Only "TRADING" symbols are safe to open new positions on —
+     * the others either silently reject MARKET orders (the TAOUSDT case) or
+     * accept them but leave you with no exit liquidity.
      */
     private static final class SymbolInfo {
         final double stepSize;
         final double tickSize;
         final double minNotional;
-        SymbolInfo(double stepSize, double tickSize, double minNotional) {
+        final String status;          // "TRADING" | "HALT" | "BREAK" | ...
+        SymbolInfo(double stepSize, double tickSize, double minNotional, String status) {
             this.stepSize = stepSize;
             this.tickSize = tickSize;
             this.minNotional = minNotional;
+            this.status = status == null ? "UNKNOWN" : status;
         }
+        boolean isTradable() { return "TRADING".equals(status); }
     }
 
     /**
@@ -1807,6 +1966,11 @@ public final class BinanceTradeExecutor {
                 JSONObject s = symbols.getJSONObject(i);
                 String sym = s.optString("symbol", "");
                 if (sym.isEmpty()) continue;
+                // [HOLE-6 FIX 2026-05-15] Capture status. Field name on USD-M Futures is
+                // "status" (TRADING/HALT/BREAK/PENDING_TRADING/PRE_DELIVERING/...).
+                // contractStatus exists on some endpoints — fall back to it as a safety.
+                String status = s.optString("status",
+                        s.optString("contractStatus", "UNKNOWN"));
                 double stepSize = 0, tickSize = 0, minNotional = 0;
                 JSONArray filters = s.optJSONArray("filters");
                 if (filters == null) continue;
@@ -1827,7 +1991,8 @@ public final class BinanceTradeExecutor {
                 }
                 if (stepSize > 0 && tickSize > 0) {
                     if (minNotional <= 0) minNotional = 5.0; // Binance default
-                    symbolInfoCache.put(sym, new SymbolInfo(stepSize, tickSize, minNotional));
+                    symbolInfoCache.put(sym,
+                            new SymbolInfo(stepSize, tickSize, minNotional, status));
                     populated++;
                 }
             }
