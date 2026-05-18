@@ -1023,18 +1023,18 @@ public final class SignalSender {
         if (eff > RL_SAFE_WEIGHT) return Math.min(40, base);               // soft превышение
         return base;
     }
-
     private List<String> selectPairsForScan(int budget) {
         if (cachedPairs.isEmpty()) return List.of();
         List<String> sorted = new ArrayList<>(cachedPairs);
-        // [FIX] GARBAGE PAIR FILTER — remove non-ASCII AND known garbage coins.
-        // Previously only non-ASCII was filtered here. GARBAGE_COIN_BLOCKLIST coins
-        // (BASUSDT, UAIUSDT, METUSDT...) still got submitted to fetchPool → REST fetch
-        // → processPair() rejection. Each wasted fetch = 5 Binance weight = ~50 wasted/hour.
-        // Now filtered upfront: 0 REST calls, 0 fetchPool slots, 0 processPair() overhead.
         sorted.removeIf(pair -> {
             if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return true;
             if (isc.isHardBlacklisted(pair)) return true;
+            com.bot.DecisionEngineMerged.AssetType at =
+                    com.bot.DecisionEngineMerged.detectAssetType(pair);
+            if (at != com.bot.DecisionEngineMerged.AssetType.CRYPTO
+                    && at != com.bot.DecisionEngineMerged.AssetType.UNKNOWN) {
+                return true;
+            }
             for (int i = 0; i < pair.length(); i++) {
                 if (pair.charAt(i) > 127) return true;
             }

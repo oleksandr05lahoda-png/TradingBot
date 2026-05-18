@@ -1105,9 +1105,6 @@ public final class BinanceTradeExecutor {
             return 0;
         }
     }
-
-    // ─── Internal: HTTP signed calls ──────────────────────────────────
-
     private boolean initSymbolMargin(String symbol) throws Exception {
         long ts = ts();
         String qs = "symbol=" + symbol + "&marginType=ISOLATED&timestamp=" + ts + "&recvWindow=5000";
@@ -1126,6 +1123,35 @@ public final class BinanceTradeExecutor {
         String body = resp.body() == null ? "" : resp.body();
         if (code == 200) { lastInitErrorBody = ""; return true; }
         if (body.contains("-4046")) { lastInitErrorBody = ""; return true; }
+        // [PATCH 2026-05-18] -4067 on marginType: stale open/algo orders block the
+        // position-mode switch. cancelAllOrdersAccountWide() wipes regular + algo
+        // (SL/TP) orders account-wide, then single retry. On mainnet the algo-order
+        // cleanup actually succeeds (testnet returns 404 on /algoOrders, so there
+        // the retry may still fail — that path is harmless, just returns false).
+        if (body.contains("-4067") || body.contains("open orders")) {
+            LOG.warning("[Executor] marginType -4067 — cancel-all + single retry " + symbol);
+            cancelAllOrdersAccountWide();
+            long tsR = ts();
+            String qsR = "symbol=" + symbol + "&marginType=ISOLATED&timestamp=" + tsR + "&recvWindow=5000";
+            String sigR = hmacSHA256(apiSecret, qsR);
+            HttpResponse<String> respR = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/marginType"))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .header("Content-Type", "application/x-www-form-urlencoded")
+                            .POST(HttpRequest.BodyPublishers.ofString(qsR + "&signature=" + sigR))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String bodyR = respR.body() == null ? "" : respR.body();
+            if (respR.statusCode() == 200 || bodyR.contains("-4046")) {
+                lastInitErrorBody = "";
+                return true;
+            }
+            lastInitErrorBody = "HTTP " + respR.statusCode() + ": " + bodyR;
+            LOG.warning("[Executor] marginType retry failed " + symbol + " " + lastInitErrorBody);
+            return false;
+        }
         // [C5 2026-05-08] Save body so caller can surface real reason in Telegram.
         lastInitErrorBody = "HTTP " + code + ": " + body;
         LOG.warning("[Executor] marginType " + symbol + " " + lastInitErrorBody);
