@@ -1750,10 +1750,14 @@ public final class DecisionEngineMerged {
         TradeIdea idea;
 
         // Priority 1: VWAP Mean Reversion — fundament (highest historical EV)
-        idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
-        if (idea != null) {
-            csLastSignalTime.put(symbol, now);
-            return idea;
+        // [TREND-PULLBACK 2026-05-19] Gated by PHASE_MR_ENABLE. When false, MR is
+        // skipped entirely so the router falls through to Breakout (trend-pullback).
+        if (PHASE_MR_ENABLE) {
+            idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
+            if (idea != null) {
+                csLastSignalTime.put(symbol, now);
+                return idea;
+            }
         }
 
         // Priority 2: Funding Rate Momentum (Phase 5.0) — short-squeeze / long-flush hunter
@@ -1884,7 +1888,13 @@ public final class DecisionEngineMerged {
                 probability01 += 0.04;
             }
         }
-        if (pullback(c5, trendUp)) probability01 += 0.04;
+        // [TREND-PULLBACK 2026-05-19] Pullback is now a REQUIREMENT, not a bonus.
+        // Was: `if (pullback(c5, trendUp)) probability01 += 0.04;` — entry happened
+        // even at the top of the impulse. Now entry only on a pullback within the
+        // confirmed trend (the "not late" entry the strategy is designed for).
+        // Kept the +0.04 so confluence still rewards a clean pullback.
+        if (!pullback(c5, trendUp)) return reject("bo_no_pullback");
+        probability01 += 0.04;
 
         probability01 = Math.min(0.78, probability01);
         double probability = probability01 * 100.0;
@@ -1929,6 +1939,10 @@ public final class DecisionEngineMerged {
                                              List<com.bot.TradingCore.Candle> c15,
                                              CoinCategory cat,
                                              long now) {
+        // [TREND-PULLBACK 2026-05-19] Hard guard. Belt-and-suspenders on top of the
+        // router-level PHASE2_PUMPHUNTER_ENABLE check — even if the flag is misread,
+        // this branch can never emit a signal in trend-pullback mode. No code removed.
+        if (!PHASE2_PUMPHUNTER_ENABLE) return reject("ph_disabled_trend_pullback_mode");
         if (pumpHunter == null) return null;
         if (c1 == null || c1.size() < 20) return null;
         if (c15 == null || c15.size() < MIN_BARS) return null;
@@ -2016,6 +2030,10 @@ public final class DecisionEngineMerged {
     // than skipping the bar. With both defaults=false, the router falls
     // through to MR-only — behaviorally identical to Phase 1. To re-enable
     // experimentally without code changes, set env vars to "true" in Railway.
+    // [TREND-PULLBACK 2026-05-19] MR kill-switch. MR had no env flag (unlike PH/FM),
+    // so it always preempted Breakout in the router. Set PHASE_MR_ENABLE=false to
+    // run pure trend-pullback (Breakout-only) experiment. Default true = legacy behavior.
+    private static final boolean PHASE_MR_ENABLE          = csEnvBool("PHASE_MR_ENABLE",          true);
     private static final boolean PHASE2_PUMPHUNTER_ENABLE = csEnvBool("PHASE2_PUMPHUNTER_ENABLE", true);
     private static final boolean PHASE2_BREAKOUT_ENABLE   = csEnvBool("PHASE2_BREAKOUT_ENABLE",   true);
     private static final double  PHASE2_BREAKOUT_MIN_ADX  = csEnvDouble("PHASE2_BREAKOUT_MIN_ADX", 25.0);

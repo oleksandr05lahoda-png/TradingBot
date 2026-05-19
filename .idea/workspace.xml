@@ -6,8 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BinanceTradeExecutor.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BinanceTradeExecutor.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/SignalSender.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -819,7 +817,22 @@
       <workItem from="1778804410683" duration="1366000" />
       <workItem from="1778835631030" duration="639000" />
       <workItem from="1779092293378" duration="16000" />
-      <workItem from="1779099264381" duration="2132000" />
+      <workItem from="1779099264381" duration="3490000" />
+      <workItem from="1779186319439" duration="593000" />
+      <workItem from="1779187007763" duration="107000" />
+      <workItem from="1779187128008" duration="7000" />
+      <workItem from="1779187149465" duration="5000" />
+      <workItem from="1779187166558" duration="8000" />
+      <workItem from="1779187189073" duration="5000" />
+      <workItem from="1779187205203" duration="6000" />
+      <workItem from="1779187226365" duration="7000" />
+      <workItem from="1779187261939" duration="6000" />
+      <workItem from="1779187283052" duration="5000" />
+      <workItem from="1779187298888" duration="6000" />
+      <workItem from="1779187316922" duration="6000" />
+      <workItem from="1779187332478" duration="6000" />
+      <workItem from="1779187350249" duration="5000" />
+      <workItem from="1779187369114" duration="6000" />
     </task>
     <servers />
   </component>
