@@ -1888,13 +1888,13 @@ public final class DecisionEngineMerged {
                 probability01 += 0.04;
             }
         }
-        // [TREND-PULLBACK 2026-05-19] Pullback is now a REQUIREMENT, not a bonus.
-        // Was: `if (pullback(c5, trendUp)) probability01 += 0.04;` — entry happened
-        // even at the top of the impulse. Now entry only on a pullback within the
-        // confirmed trend (the "not late" entry the strategy is designed for).
-        // Kept the +0.04 so confluence still rewards a clean pullback.
-        if (!pullback(c5, trendUp)) return reject("bo_no_pullback");
-        probability01 += 0.04;
+        // [TREND-PULLBACK FIX 2026-05-19] REVERTED to bonus. Making pullback a hard
+        // requirement was a design error: detectBoS requires lastClose ABOVE a fresh
+        // swing high (price extended, broken out), while pullback() requires price
+        // back AT EMA21 with cooled RSI — mutually exclusive on the same 5m candle.
+        // Result was ~100% reject on bo_no_pullback → 0 trades in any market.
+        // Restored to original behavior: pullback is a confluence bonus, not a gate.
+        if (pullback(c5, trendUp)) probability01 += 0.04;
 
         probability01 = Math.min(0.78, probability01);
         double probability = probability01 * 100.0;
