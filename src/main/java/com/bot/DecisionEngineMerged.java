@@ -1814,11 +1814,8 @@ public final class DecisionEngineMerged {
         if (c5 == null || c5.size() < 30) return reject("bo_insufficient_5m");
 
         double atrPct15 = com.bot.TradingCore.atrPercentile(c15, 14, 100);
-        // Phase 2.1: lower bound 0.40 → 0.30. Trending pairs in early-stage
-        // breakouts often sit at moderate ATR (0.30-0.45) before volatility
-        // expands. 0.40 was filtering out the "early trend" cases we want.
-        if (atrPct15 < 0.30) return reject("bo_atr_too_low");
-        if (atrPct15 > 0.95) return reject("bo_atr_too_high");
+        if (atrPct15 < BO_MIN_ATR_PCTILE) return reject("bo_atr_too_low");
+        if (atrPct15 > BO_MAX_ATR_PCTILE) return reject("bo_atr_too_high");
 
         boolean trendUp = (regime == MarketRegime.TREND_UP);
         int htfStructure = trendUp ? 1 : -1;
@@ -1829,9 +1826,7 @@ public final class DecisionEngineMerged {
 
         double volSma20_5m = computeVolumeSma(c5, 20);
         double volCurrent_5m = last(c5).volume;
-        // Phase 2.1: 1.30x was rejecting ~70% of legitimate continuation breakouts.
-        // 1.15x is closer to "above-average volume" without requiring a spike.
-        if (volSma20_5m <= 0 || volCurrent_5m < volSma20_5m * 1.15) {
+        if (volSma20_5m <= 0 || volCurrent_5m < volSma20_5m * BO_VOL_CONFIRM_MULT) {
             return reject("bo_no_volume_confirm");
         }
 
@@ -1858,45 +1853,35 @@ public final class DecisionEngineMerged {
 
         double price = last(c5).close;
         double swingLevel = bos.swingLevel;
-        double slBuffer = 0.003;
         double stop = trendUp
-                ? swingLevel * (1.0 - slBuffer)
-                : swingLevel * (1.0 + slBuffer);
+                ? swingLevel * (1.0 - BO_SL_SWING_BUFFER)
+                : swingLevel * (1.0 + BO_SL_SWING_BUFFER);
         double riskDist = Math.abs(price - stop);
-        if (riskDist / price < 0.005) return reject("bo_sl_too_tight");
-        if (riskDist / price > 0.05)  return reject("bo_sl_too_wide");
-        double tp = trendUp ? price + riskDist * 2.0 : price - riskDist * 2.0;
+        if (riskDist / price < BO_SL_MIN_DIST_PCT) return reject("bo_sl_too_tight");
+        if (riskDist / price > BO_SL_MAX_DIST_PCT) return reject("bo_sl_too_wide");
+        double tp = trendUp ? price + riskDist * BO_TP_R_MULTIPLE : price - riskDist * BO_TP_R_MULTIPLE;
         com.bot.TradingCore.Side side = trendUp
                 ? com.bot.TradingCore.Side.LONG
-                : com.bot.TradingCore.Side.SHORT;
-
-        double probability01 = 0.58;
-        if (volCurrent_5m > volSma20_5m * 1.50) probability01 += 0.04;
-
+                : com.bot.TradingCore.Side.SHORT;        double probability01 = BO_PROB_BASE;
+        if (volCurrent_5m > volSma20_5m * BO_VOL_SPIKE_MULT) probability01 += BO_PROB_BONUS_VOL;
         HTFBias bias2h = detectBias2H(c2h != null && c2h.size() >= MIN_BARS ? c2h : c1h);
         if (bias2h != null) {
             boolean alignedHTF = (trendUp && bias2h == HTFBias.BULL) ||
                     (!trendUp && bias2h == HTFBias.BEAR);
-            if (alignedHTF) probability01 += 0.04;
+            if (alignedHTF) probability01 += BO_PROB_BONUS_HTF;
         }
         if (btc != null) {
             if (trendUp && (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP
                     || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_UP)) {
-                probability01 += 0.04;
+                probability01 += BO_PROB_BONUS_BTC;
             } else if (!trendUp && (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN
                     || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_IMPULSE_DOWN)) {
-                probability01 += 0.04;
+                probability01 += BO_PROB_BONUS_BTC;
             }
         }
-        // [TREND-PULLBACK FIX 2026-05-19] REVERTED to bonus. Making pullback a hard
-        // requirement was a design error: detectBoS requires lastClose ABOVE a fresh
-        // swing high (price extended, broken out), while pullback() requires price
-        // back AT EMA21 with cooled RSI — mutually exclusive on the same 5m candle.
-        // Result was ~100% reject on bo_no_pullback → 0 trades in any market.
-        // Restored to original behavior: pullback is a confluence bonus, not a gate.
-        if (pullback(c5, trendUp)) probability01 += 0.04;
 
-        probability01 = Math.min(0.78, probability01);
+        if (pullback(c5, trendUp)) probability01 += BO_PROB_BONUS_PULL;
+        probability01 = Math.min(BO_PROB_CAP, probability01);
         double probability = probability01 * 100.0;
 
         List<String> flags = new ArrayList<>();
@@ -1914,12 +1899,12 @@ public final class DecisionEngineMerged {
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
         TradeIdea idea = new TradeIdea(
-                symbol, side, price, stop, tp, 2.0,
+                symbol, side, price, stop, tp, BO_TP_R_MULTIPLE,
                 probability, flags,
                 frRate, frDelta, oiCh,
                 bias2h.name(), cat,
                 null,
-                1.0, 2.0, 2.0
+                CS_TP1_R, BO_TP_R_MULTIPLE, BO_TP_R_MULTIPLE
         );
         idea.setRobustAtrPct(riskDist / price);
         idea.setAgreeingClusters(1);
@@ -2015,7 +2000,7 @@ public final class DecisionEngineMerged {
                 frRate, frDelta, oiCh,
                 bias2hPH.name(), cat,
                 null,
-                1.0, tpR, tpR
+                CS_TP1_R, tpR, tpR
         );
         idea.setRobustAtrPct(atr14 / price);
         idea.setAgreeingClusters(1);
@@ -2039,19 +2024,21 @@ public final class DecisionEngineMerged {
     private static final double  PHASE2_BREAKOUT_MIN_ADX  = csEnvDouble("PHASE2_BREAKOUT_MIN_ADX", 25.0);
     private static final double  PHASE2_RANGE_MAX_ADX     = csEnvDouble("PHASE2_RANGE_MAX_ADX",    22.0);
     private static final double  PHASE2_PUMP_MIN_STRENGTH = csEnvDouble("PHASE2_PUMP_MIN_STRENGTH", 0.50);
-
-    // ─── Phase 5.0 Funding Momentum tunables ───────────────────────────────
-    // Triggers on extreme funding rates that historically predict reversion:
-    //   - funding ≤ -0.04% (-0.0004) → crowd is heavily SHORT → expect short squeeze → LONG
-    //   - funding ≥ +0.04% (+0.0004) → crowd is heavily LONG  → expect long flush   → SHORT
-    //
-    // SL wider than MR (2.0×ATR vs 1.5×ATR) — squeeze events are noisy at start.
-    // TP at 2R — squeeze moves typically extend further than mean-reversion.
-    //
-    // Variables can override:
-    //   PHASE5_FUNDING_MOMENTUM_ENABLE=false → kill switch
-    //   PHASE5_FUNDING_THRESHOLD=0.0005     → tighter (less trades, higher quality)
-    //   PHASE5_FUNDING_THRESHOLD=0.0003     → looser (more trades, more noise)
+    // ─── Breakout strategy named constants (no magic numbers) ─────────────
+    private static final double BO_MIN_ATR_PCTILE    = 0.30;
+    private static final double BO_MAX_ATR_PCTILE    = 0.95;
+    private static final double BO_VOL_CONFIRM_MULT  = 1.15;
+    private static final double BO_VOL_SPIKE_MULT    = 1.50;
+    private static final double BO_SL_SWING_BUFFER   = 0.003;
+    private static final double BO_SL_MIN_DIST_PCT   = 0.005;
+    private static final double BO_SL_MAX_DIST_PCT   = 0.05;
+    private static final double BO_TP_R_MULTIPLE     = 2.0;
+    private static final double BO_PROB_BASE         = 0.58;
+    private static final double BO_PROB_CAP          = 0.78;
+    private static final double BO_PROB_BONUS_VOL    = 0.04;
+    private static final double BO_PROB_BONUS_HTF    = 0.04;
+    private static final double BO_PROB_BONUS_BTC    = 0.04;
+    private static final double BO_PROB_BONUS_PULL   = 0.04;
     private static final boolean PHASE5_FUNDING_MOMENTUM_ENABLE = csEnvBool("PHASE5_FUNDING_MOMENTUM_ENABLE", true);
     private static final double  PHASE5_FUNDING_THRESHOLD       = csEnvDouble("PHASE5_FUNDING_THRESHOLD",      0.0004);
     private static final double  PHASE5_SL_ATR_MULT             = csEnvDouble("PHASE5_SL_ATR_MULT",            2.0);
@@ -2179,7 +2166,6 @@ public final class DecisionEngineMerged {
         if (fr.frPeakWarning)   flags.add("FR_PEAK_WARN");
         if (fr.frTroughWarning) flags.add("FR_TROUGH_WARN");
         if (htfAligned)         flags.add("HTF_ALIGN");
-
         TradeIdea idea = new TradeIdea(
                 symbol,
                 side,
@@ -2193,7 +2179,7 @@ public final class DecisionEngineMerged {
                 bias2h != null ? bias2h.name() : "NEUTRAL",
                 cat,
                 null,
-                1.0, PHASE5_TP_R, PHASE5_TP_R
+                CS_TP1_R, PHASE5_TP_R, PHASE5_TP_R
         );
         idea.setRobustAtrPct(atr14 / price);
         idea.setAgreeingClusters(1);
