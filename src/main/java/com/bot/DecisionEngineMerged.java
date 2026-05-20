@@ -1961,18 +1961,17 @@ public final class DecisionEngineMerged {
         double atr14 = com.bot.TradingCore.atr(c15, 14);
         if (atr14 <= 0) return reject("ph_invalid_atr");
 
-        // Phase 2.1: reversal-only path. SL wider (pump tops are messy),
-        // TP conservative (reversals don't run as far as continuation moves).
-        double slMult = 1.6;
-        double tpR    = 2.0;
-        double slDist = atr14 * slMult;
+        double slMult     = 1.6;
+        double tpR        = 2.0;
+        double slMaxPct   = 0.09;
+        double slDistAtr  = atr14 * slMult;
+        double slDistCap  = price * slMaxPct;
+        double slDist     = Math.min(slDistAtr, slDistCap);
+        if (slDist < atr14 * 0.5) return reject("ph_sl_capped_too_tight");
         double stop = (sig.side == com.bot.TradingCore.Side.LONG)
                 ? price - slDist : price + slDist;
         double tp = (sig.side == com.bot.TradingCore.Side.LONG)
                 ? price + slDist * tpR : price - slDist * tpR;
-
-        // pumpHunter.generateSignal returns confidence on 55-85 scale — use directly,
-        // cap at 78 to align with global MIN_CONF_CEIL.
         double probability01 = sig.confidence / 100.0;
         probability01 = Math.min(0.78, Math.max(0.55, probability01));
         double probability = probability01 * 100.0;

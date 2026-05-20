@@ -3819,13 +3819,11 @@ public final class SignalSender {
         Boolean cached = historyOkCache.get(symbol);
         if (cached != null) return cached;
 
-        // Match the TFs actually used by STARTUP-BT in BotMain.java.
-        // PRIMARY_TF env: "15m" → primary=15m, htf=1h. Default "1h" → primary=1h, htf=4h.
         boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
         String  primaryTf  = is15m ? "15m" : "1h";
         String  htfTf      = is15m ? "1h"  : "4h";
-        int     primaryMin = is15m ? 1500  : 250;   // 15m: 15.6 days, 1h: 10.4 days
-        int     htfMin     = is15m ? 250   : 200;   // 1h: 10 days, 4h: 33 days
+        int     primaryMin = is15m ? 250  : 200;   // STARTUP-BT needs ≥200/150 + warmup
+        int     htfMin     = is15m ? 200  : 150;
 
         boolean ok;
         try {

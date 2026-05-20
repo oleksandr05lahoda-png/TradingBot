@@ -962,11 +962,10 @@ public final class SimpleBacktester {
                 }
             }
 
-            // [Level 2] PROFIT LOCK — at 60% of time-window with at least +0.3R, exit at market
-            int profitLockBar = Math.max(1, (int) Math.round(timeStopBars * 0.60));
+            int profitLockBar = Math.max(1, (int) Math.round(timeStopBars * 0.85));
             if (profitLockEnabled && barsHeld >= profitLockBar && !pos.tp1Hit) {
                 double curR = isLong ? (curC.close - pos.entry) / risk : (pos.entry - curC.close) / risk;
-                if (curR >= 0.30) {
+                if (curR >= 0.80) {
                     double exitPrice = curC.close;
                     double exitPnlPct = isLong ? (exitPrice - pos.entry) / pos.entry * 100
                             : (pos.entry - exitPrice) / pos.entry * 100;
