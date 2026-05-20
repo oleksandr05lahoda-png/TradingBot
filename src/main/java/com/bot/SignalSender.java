@@ -3815,23 +3815,27 @@ public final class SignalSender {
     // Cache: avoid hitting Binance for the same pair repeatedly within a session.
     private final java.util.concurrent.ConcurrentHashMap<String, Boolean> historyOkCache
             = new java.util.concurrent.ConcurrentHashMap<>();
-
     private boolean hasEnoughHistory(String symbol) {
         Boolean cached = historyOkCache.get(symbol);
         if (cached != null) return cached;
 
-        int min15m = envInt("PAIR_FILTER_MIN_BARS_15M", 1500);
-        int min1h  = envInt("PAIR_FILTER_MIN_BARS_1H", 200);
+        // Match the TFs actually used by STARTUP-BT in BotMain.java.
+        // PRIMARY_TF env: "15m" → primary=15m, htf=1h. Default "1h" → primary=1h, htf=4h.
+        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+        String  primaryTf  = is15m ? "15m" : "1h";
+        String  htfTf      = is15m ? "1h"  : "4h";
+        int     primaryMin = is15m ? 1500  : 250;   // 15m: 15.6 days, 1h: 10.4 days
+        int     htfMin     = is15m ? 250   : 200;   // 1h: 10 days, 4h: 33 days
 
         boolean ok;
         try {
-            List<com.bot.TradingCore.Candle> probe15 = fetchKlinesDirect(symbol, "15m", min15m);
-            if (probe15 == null || probe15.size() < min15m) {
+            List<com.bot.TradingCore.Candle> probePrimary = fetchKlinesDirect(symbol, primaryTf, primaryMin);
+            if (probePrimary == null || probePrimary.size() < primaryMin) {
                 ok = false;
             } else {
                 Thread.sleep(300L);
-                List<com.bot.TradingCore.Candle> probe1h = fetchKlinesDirect(symbol, "1h", min1h);
-                ok = (probe1h != null && probe1h.size() >= min1h);
+                List<com.bot.TradingCore.Candle> probeHtf = fetchKlinesDirect(symbol, htfTf, htfMin);
+                ok = (probeHtf != null && probeHtf.size() >= htfMin);
             }
         } catch (Exception e) {
             ok = false;
@@ -3839,7 +3843,8 @@ public final class SignalSender {
 
         historyOkCache.put(symbol, ok);
         if (!ok) {
-            LOG.info("[PAIRS-FILTER] " + symbol + " skipped: not enough history (15m or 1h)");
+            LOG.info("[PAIRS-FILTER] " + symbol + " skipped: insufficient "
+                    + primaryTf + "/" + htfTf + " history for backtest");
         }
         return ok;
     }
