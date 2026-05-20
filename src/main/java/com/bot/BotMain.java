@@ -1808,6 +1808,7 @@ public final class BotMain {
 
         // 3. Aggregate counters — separate failures from low-data skips.
         int totalTrades = 0, totalWins = 0, totalLosses = 0, totalTimeStops = 0;
+        int totalBE = 0, totalProfitLock = 0, totalTrail = 0, totalStag = 0;
         double totalNetPnL = 0.0;
         int symbolsRun = 0;          // pairs that completed bt.run()
         int symbolsRateLimited = 0;  // fetchKlines returned null
@@ -1956,14 +1957,16 @@ public final class BotMain {
                     }
                 }
 
-                // 5. Aggregate.
-                totalTrades    += r.total;
-                totalWins      += r.wins;
-                totalLosses    += r.losses;
-                totalTimeStops += r.timeStops;
-                totalNetPnL    += r.netPnL;
+                totalTrades       += r.total;
+                totalWins         += r.wins;
+                totalLosses       += r.losses;
+                totalTimeStops    += r.timeStops;
+                totalBE           += r.breakEvens;
+                totalProfitLock   += r.profitLocks;
+                totalTrail        += r.trailExits;
+                totalStag         += r.stagnationExits;
+                totalNetPnL       += r.netPnL;
                 symbolsRun++;
-
                 // Existing per-symbol EV signal for ISC.
                 if (r.total >= 5) isc.setSymbolBacktestResult(sym, r.ev);
 
@@ -2105,14 +2108,16 @@ public final class BotMain {
                         + "  ✅ Wins: %d (%.1f%%)\n"
                         + "  ❌ Losses: %d\n"
                         + "  ⏳ Time-stops: %d\n"
-                        + "💰 Net PnL (sum %%): %+.2f\n"
+                        + "  🟰 BE: %d  🔒 ProfitLock: %d\n"
+                        + "  📉 Trail: %d  ⏸ Stagnation: %d\n"                        + "💰 Net PnL (sum %%): %+.2f\n"
                         + "📈 W/L ratio: %.2f\n"
                         + "🧠 Калибратор: %d outcomes\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "%s",
                 elapsedSec, symbolsRun, symbolsRateLimited, symbolsLowData,
                 symbolsErrored, totalTrades,
-                totalWins, wr, totalLosses, totalTimeStops, totalNetPnL,
+                totalWins, wr, totalLosses, totalTimeStops,
+                totalBE, totalProfitLock, totalTrail, totalStag, totalNetPnL,
                 wlRatio, newCalCount,
                 verdict);
 
