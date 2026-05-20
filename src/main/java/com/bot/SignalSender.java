@@ -3811,7 +3811,29 @@ public final class SignalSender {
             for (int i = 0; i < arr.length(); i++) { JSONObject o = arr.getJSONObject(i); double v = o.optDouble("quoteVolume", 0); if (v > 0) volume24hUSD.put(o.getString("symbol"), v); }
         } catch (Exception e) { LOG.warning("[VOL24H] Error: " + e.getMessage()); }
     }
+    // ─── Pair history probe (validate enough data for backtest) ──────────
+    // Cache: avoid hitting Binance for the same pair repeatedly.
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> historyOkCache
+            = new java.util.concurrent.ConcurrentHashMap<>();
 
+    private boolean hasEnoughHistory(String symbol) {
+        Boolean cached = historyOkCache.get(symbol);
+        if (cached != null) return cached;
+
+        int requiredBars = envInt("PAIR_FILTER_MIN_BARS_15M", 1500);
+        boolean ok;
+        try {
+            List<com.bot.TradingCore.Candle> probe = fetchKlines(symbol, "15m", requiredBars);
+            ok = (probe != null && probe.size() >= requiredBars);
+        } catch (Exception e) {
+            ok = false;
+        }
+        historyOkCache.put(symbol, ok);
+        if (!ok) {
+            LOG.info("[PAIRS-FILTER] " + symbol + " skipped: not enough 15m history");
+        }
+        return ok;
+    }
     public Set<String> getTopSymbolsSet(int limit) {
         try {
             Set<String> binancePairs = getBinanceSymbolsFutures();
@@ -3834,6 +3856,7 @@ public final class SignalSender {
                         volume24hUSD.getOrDefault(a, 0.0)));
                 for (String pair : byVolume) {
                     if (volume24hUSD.getOrDefault(pair, 0.0) <= 0.0) break;
+                    if (!hasEnoughHistory(pair)) continue;
                     top.add(pair);
                     if (top.size() >= limit) break;
                 }
@@ -3847,7 +3870,7 @@ public final class SignalSender {
                     String sym = cg.getJSONObject(i).getString("symbol").toUpperCase();
                     if (STABLE.contains(sym)) continue;
                     String pair = sym + "USDT";
-                    if (binancePairs.contains(pair)) top.add(pair);
+                    if (binancePairs.contains(pair) && hasEnoughHistory(pair)) top.add(pair);
                     if (top.size() >= limit) break;
                 }
             }
@@ -3859,6 +3882,7 @@ public final class SignalSender {
                         volume24hUSD.getOrDefault(a, 0.0)));
                 for (String p : remaining) {
                     if (top.size() >= limit) break;
+                    if (!hasEnoughHistory(p)) continue;
                     top.add(p);
                 }
             }
