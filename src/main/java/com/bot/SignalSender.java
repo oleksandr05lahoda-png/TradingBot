@@ -3812,7 +3812,7 @@ public final class SignalSender {
         } catch (Exception e) { LOG.warning("[VOL24H] Error: " + e.getMessage()); }
     }
     // ─── Pair history probe (validate enough data for backtest) ──────────
-    // Cache: avoid hitting Binance for the same pair repeatedly.
+    // Cache: avoid hitting Binance for the same pair repeatedly within a session.
     private final java.util.concurrent.ConcurrentHashMap<String, Boolean> historyOkCache
             = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -3820,27 +3820,35 @@ public final class SignalSender {
         Boolean cached = historyOkCache.get(symbol);
         if (cached != null) return cached;
 
-        int requiredBars = envInt("PAIR_FILTER_MIN_BARS_15M", 1500);
+        int min15m = envInt("PAIR_FILTER_MIN_BARS_15M", 1500);
+        int min1h  = envInt("PAIR_FILTER_MIN_BARS_1H", 200);
+
         boolean ok;
         try {
-            List<com.bot.TradingCore.Candle> probe = fetchKlines(symbol, "15m", requiredBars);
-            ok = (probe != null && probe.size() >= requiredBars);
+            List<com.bot.TradingCore.Candle> probe15 = fetchKlinesDirect(symbol, "15m", min15m);
+            if (probe15 == null || probe15.size() < min15m) {
+                ok = false;
+            } else {
+                Thread.sleep(300L);
+                List<com.bot.TradingCore.Candle> probe1h = fetchKlinesDirect(symbol, "1h", min1h);
+                ok = (probe1h != null && probe1h.size() >= min1h);
+            }
         } catch (Exception e) {
             ok = false;
         }
+
         historyOkCache.put(symbol, ok);
         if (!ok) {
-            LOG.info("[PAIRS-FILTER] " + symbol + " skipped: not enough 15m history");
+            LOG.info("[PAIRS-FILTER] " + symbol + " skipped: not enough history (15m or 1h)");
         }
         return ok;
     }
+
     public Set<String> getTopSymbolsSet(int limit) {
         try {
             Set<String> binancePairs = getBinanceSymbolsFutures();
 
-            // [PATCH 2026-05-13] Apply HARD_BLACKLIST before any processing.
-            // Saves WS slots, REST weight, CPU. Net effect: no "non_crypto_*"
-            // reject spam, no zombie WS connections in logs.
+
             binancePairs.removeIf(HARD_BLACKLIST::contains);
 
             Set<String> top = new LinkedHashSet<>();
