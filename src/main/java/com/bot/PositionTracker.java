@@ -310,10 +310,7 @@ public final class PositionTracker {
         // Window position: 0.0 = just opened, 1.0 = at time-stop.
         double agePct = (double) age / Math.max(1L, TIME_STOP_MS);
 
-        // ── PROFIT LOCK ────────────────────────────────────────────────
-        // Past 60% of time-window, currently in profit ≥0.3R, and not yet
-        // ratcheted to a meaningful trail level. Take what we have.
-        if (PROFIT_LOCK_ENABLED && !t.beActivated && agePct >= 0.60 && curR >= 0.30) {
+        if (PROFIT_LOCK_ENABLED && !t.beActivated && agePct >= 0.85 && curR >= 0.80) {
             LOG.info(String.format(
                     "[Tracker] %s PROFIT_LOCK: age=%.0f%% curR=%+.2f maxFav=%.2f → market close",
                     t.symbol, agePct * 100, curR, t.maxFavR));
