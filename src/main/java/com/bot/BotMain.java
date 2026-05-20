@@ -1833,8 +1833,7 @@ public final class BotMain {
         int legacyBars = envInt("STARTUP_BT_BARS_15M", -1);
         int primaryBarsCfg = (legacyBars > 0 && btIs15m) ? legacyBars
                 : envInt("STARTUP_BT_BARS_PRIMARY", defaultPrimaryBars);
-        final int barsPrimaryTarget = Math.min(1500, Math.max(300, primaryBarsCfg));
-
+        final int barsPrimaryTarget = Math.min(6000, Math.max(300, primaryBarsCfg));
         int legacyHtf = envInt("STARTUP_BT_BARS_1H", -1);
         int htfBarsCfg = (legacyHtf > 0 && btIs15m) ? legacyHtf
                 : envInt("STARTUP_BT_BARS_HTF", 250);

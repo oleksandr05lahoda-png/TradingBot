@@ -485,6 +485,16 @@ public final class SimpleBacktester {
             sb.append(String.format("║ Net PnL: %+.2f%% | Final: $%.2f\n", totalNetPnL, finalBalance));
             sb.append(String.format("║ Avg WR: %.1f%% | Avg EV: %+.4f | Avg PF: %.2f\n", avgWinRate * 100, avgEV, avgPF));
             sb.append(String.format("║ Portfolio Sharpe: %.2f | MaxDD: %.1f%%\n", portfolioSharpe, portfolioMaxDD));
+
+            int sumWins=0, sumLosses=0, sumBE=0, sumTS=0, sumPL=0, sumTrail=0, sumStag=0;
+            for (BacktestResult r : symbolResults) {
+                sumWins += r.wins; sumLosses += r.losses; sumBE += r.breakEvens;
+                sumTS += r.timeStops; sumPL += r.profitLocks;
+                sumTrail += r.trailExits; sumStag += r.stagnationExits;
+            }
+            sb.append(String.format("║ Exits: TP=%d SL=%d BE=%d TS=%d PL=%d Trail=%d Stag=%d\n",
+                    sumWins, sumLosses, sumBE, sumTS, sumPL, sumTrail, sumStag));
+
             sb.append("╠══════════ PER SYMBOL ══════════════════╣\n");
             symbolResults.stream()
                     .sorted(Comparator.comparingDouble((BacktestResult r) -> r.ev).reversed())
