@@ -574,13 +574,29 @@ public final class SignalSender {
     // that the bot wastes resources on (loads WS, runs through DE, rejects
     // with non_crypto_* or fm_funding_stale). Block at top-N selection stage.
     //
-    // Includes: tokenized stocks (TSLA), tokenized metals (PAXG, XAUT),
-    // political/meme tokens (TRUMP, TRUTH, DOGS, PUMP, UB, LAYER).
+    // [PATCH 2026-05-22 EXTEND] Расширен после обнаружения что в STARTUP-BT
+    // в universe попадали 4-7 non-crypto тикеров (commodities/stocks/forex),
+    // отбирая слоты у crypto-пар. Они отвергаются engine на non_crypto_* в
+    // live, но успевают сожрать слот в STARTUP-BT (показывая "0 trades on
+    // history") и помешать набрать честные 30 crypto-пар.
+    //
+    // Список ниже актуален на 2026-05-22 для Binance Futures. Если Binance
+    // добавит ещё токенизированных стоков/сырья — расширь этот set, других
+    // изменений не нужно.
     //
     // To add a pair: append to this set, no other code changes needed.
     // ─────────────────────────────────────────────────────────────────────
     private static final Set<String> HARD_BLACKLIST = Set.of(
+            // Tokenized metals / precious
             "TSLAUSDT", "PAXGUSDT", "XAUTUSDT",
+            "XAUUSDT", "XAGUSDT",       // tokenized gold / silver
+            // Tokenized commodities
+            "BZUSDT", "CLUSDT",         // Brent crude / WTI crude
+            "COCOAUSDT", "COFFEEUSDT",  // soft commodities (Binance has perpetuals)
+            // Tokenized stocks (Binance pre-IPO / equity perpetuals)
+            "NVDAUSDT", "SNDKUSDT", "MUUSDT", "CRCLUSDT",
+            "AAPLUSDT", "MSFTUSDT", "AMZNUSDT", "GOOGLUSDT",
+            // Political / meme that don't behave like crypto
             "TRUMPUSDT", "TRUTHUSDT",
             "DOGSUSDT", "PUMPUSDT", "UBUSDT", "LAYERUSDT"
     );

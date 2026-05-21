@@ -1784,39 +1784,12 @@ public final class BotMain {
         // 1. Universe — wait for at least 80% target loaded (gives cachedPairs
         // time to actually fill, not just have 1 pair). Hard timeout still 60s
         // — if loader is slow, proceed with whatever we have.
-        //
-        // [STARTUP-BT UNIVERSE-FIX 2026-05-21] Раньше использовали
-        // getScanUniverseSnapshot(btPairsLimit) который читает из cachedPairs
-        // (внутренний кэш live-сканера, ограничен TOP_N=30). При STARTUP_BT_PAIRS=45
-        // возвращалось всего 30 пар — silent cap. Теперь:
-        //   1) Сначала ждём cachedPairs (бот должен быть warmed up для live)
-        //   2) Если cachedPairs.size() < нашей цели — догружаем СВЕЖИЕ btPairsLimit
-        //      пар через getTopSymbolsSet(), который делает прямой запрос Binance
-        //      и не ограничен TOP_N. Это даёт нам полный universe = btPairsLimit пар
-        //      (например 45), что в паре с EARLY-STOP даёт ровно 30 валидных
-        //      обработанных пар.
         List<String> universe = new ArrayList<>();
         int targetMin = Math.max(10, (int) (btPairsLimit * 0.8));
-        int warmupTargetMin = Math.min(10, targetMin); // не больше TOP_N=30
-        for (int waitS = 0; waitS < 30 && universe.size() < warmupTargetMin; waitS++) {
+        for (int waitS = 0; waitS < 60 && universe.size() < targetMin; waitS++) {
             try { Thread.sleep(2_000L); }
             catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
             universe = sender.getScanUniverseSnapshot(btPairsLimit);
-        }
-        // Если cachedPairs покрывает btPairsLimit полностью — используем его.
-        // Иначе делаем прямой fetch (минует TOP_N cap).
-        if (universe.size() < btPairsLimit) {
-            LOG.info("[STARTUP-BT] cachedPairs has " + universe.size()
-                    + " pairs (limited by TOP_N) — fetching fresh top-" + btPairsLimit);
-            try {
-                Set<String> fresh = sender.getTopSymbolsSet(btPairsLimit);
-                if (fresh != null && !fresh.isEmpty()) {
-                    universe = new ArrayList<>(fresh);
-                }
-            } catch (Exception e) {
-                LOG.warning("[STARTUP-BT] getTopSymbolsSet failed: " + e.getMessage()
-                        + " — falling back to cachedPairs (size=" + universe.size() + ")");
-            }
         }
         if (universe.isEmpty()) {
             LOG.warning("[STARTUP-BT] universe empty — aborted");
@@ -1931,12 +1904,51 @@ public final class BotMain {
                     break;
                 }
 
+                // [PATCH B 2026-05-22] Fetch 5m candles for Breakout strategy.
+                // Раньше передавался empty list → Breakout/PumpHunter мгновенно
+                // отвергались на bo_insufficient_5m / silent null. Теперь Breakout
+                // тестируется впервые. PumpHunter всё ещё нужно 1m — оставлен на
+                // следующую итерацию (требует +7 мин к startup).
+                //
+                // Объём: 30 дней × 288 5m-баров/день = 8640 баров. Binance отдаёт
+                // макс 1500/запрос → ~6 запросов на пару. Pacing 1.5s → +9 sec/pair.
+                Thread.sleep(1_500L);
+                List<com.bot.TradingCore.Candle> m5 = fetchKlinesPaged(sender, sym, "5m", 8640);
+                if (m5 == null) m5 = new ArrayList<>();   // безопасный fallback
+                // Не блочим прогон если 5m не загрузились — Breakout просто не сработает
+                // на этой паре, остальные стратегии продолжат работать.
+                LOG.info("[STARTUP-BT] " + sym + " 5m bars=" + m5.size());
+
                 List<com.bot.TradingCore.Candle> empty = new ArrayList<>();
                 com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
 
-                // Pass real h1 — was the entire bug. m1/m5 stay empty (optional).
+                // [PATCH C 2026-05-22] Inject historical funding rates so that
+                // FundingMomentum strategy can evaluate against the rate active at
+                // each historical decision bar. Раньше fundingHistory оставался
+                // пустым → fundingAt() возвращал 0.0 → setSimulatedFunding не
+                // вызывался → fundingCache.get(symbol)=null → fm_no_funding_data.
+                //
+                // Окно: from primary candles' time range. Стоимость: 1 запрос
+                // на пару (~300 funding events за 30 дней умещаются в один
+                // /fapi/v1/fundingRate ответ с limit=1000).
+                try {
+                    long fhStart = m15.get(0).openTime;
+                    long fhEnd   = m15.get(m15.size() - 1).openTime;
+                    java.util.TreeMap<Long, Double> fundingHist =
+                            com.bot.SimpleBacktester.fetchFundingHistory(sym, fhStart, fhEnd);
+                    bt.setFundingHistory(fundingHist);
+                    LOG.info("[STARTUP-BT] " + sym + " funding events="
+                            + (fundingHist != null ? fundingHist.size() : 0));
+                } catch (Exception fe) {
+                    LOG.warning("[STARTUP-BT] " + sym + " funding history failed: "
+                            + fe.getMessage() + " — FM disabled for this pair");
+                    bt.setFundingHistory(new java.util.TreeMap<>()); // reset to empty
+                }
+
+                // [PATCH B] Pass real m5 — Breakout впервые получает данные.
+                // c1 (1m) пока оставлен empty — PumpHunter не сработает в backtest.
                 com.bot.SimpleBacktester.BacktestResult r =
-                        bt.run(sym, empty, empty, m15, h1, cat);
+                        bt.run(sym, empty, m5, m15, h1, cat);
                 if (r == null || r.trades == null || r.trades.isEmpty()) {
                     symbolsRun++;
                     LOG.info("[STARTUP-BT] " + sym + " — 0 trades on history (filters too tight)");
@@ -2201,6 +2213,75 @@ public final class BotMain {
             Set<String> autoBlocked = isc.getAutoBlacklist();
             for (String sym : autoBlocked) sender.addToGarbageBlocklist(sym);
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * [PATCH B 2026-05-22] Fetch klines with backwards pagination.
+     *
+     * Binance Futures /fapi/v1/klines max limit = 1500 per request.
+     * For backtest we may need 8640 5m bars (30 days) or 43200 1m bars.
+     * This helper fetches in 1500-bar chunks, walking backwards using endTime.
+     *
+     * Returns oldest-first list, may be shorter than requested if pair is young.
+     *
+     * Pacing: 600ms between requests (well under Binance rate-limit).
+     * Total time at 8640 bars = 6 requests × 600ms = ~3.6s per pair.
+     */
+    private static List<com.bot.TradingCore.Candle> fetchKlinesPaged(
+            com.bot.SignalSender sender, String symbol, String interval, int totalBars) {
+        java.util.TreeMap<Long, com.bot.TradingCore.Candle> byTime = new java.util.TreeMap<>();
+        long endTime = System.currentTimeMillis();
+        int remaining = totalBars;
+        int maxRequests = (totalBars / 1500) + 2;   // safety guard
+
+        for (int req = 0; req < maxRequests && remaining > 0; req++) {
+            int batchLimit = Math.min(1500, remaining);
+            try {
+                String url = String.format(
+                        "https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&endTime=%d&limit=%d",
+                        symbol, interval, endTime, batchLimit);
+                java.net.http.HttpClient http = java.net.http.HttpClient.newBuilder()
+                        .connectTimeout(java.time.Duration.ofSeconds(10)).build();
+                java.net.http.HttpResponse<String> resp = http.send(
+                        java.net.http.HttpRequest.newBuilder()
+                                .uri(java.net.URI.create(url))
+                                .timeout(java.time.Duration.ofSeconds(15))
+                                .GET().build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() != 200) {
+                    LOG.warning("[fetchKlinesPaged] " + symbol + " " + interval
+                            + " HTTP " + resp.statusCode() + " — stopping pagination");
+                    break;
+                }
+                org.json.JSONArray arr = new org.json.JSONArray(resp.body());
+                if (arr.length() == 0) break;
+                long minOpenT = Long.MAX_VALUE;
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONArray k = arr.getJSONArray(i);
+                    long openT = k.getLong(0);
+                    minOpenT = Math.min(minOpenT, openT);
+                    double o = Double.parseDouble(k.getString(1));
+                    double h = Double.parseDouble(k.getString(2));
+                    double l = Double.parseDouble(k.getString(3));
+                    double c = Double.parseDouble(k.getString(4));
+                    double v = Double.parseDouble(k.getString(5));
+                    long closeT = k.getLong(6);
+                    double qv = Double.parseDouble(k.getString(7));
+                    byTime.putIfAbsent(openT,
+                            new com.bot.TradingCore.Candle(openT, o, h, l, c, v, qv, closeT));
+                }
+                remaining -= arr.length();
+                // Walk further back: next endTime = oldest bar's openTime - 1
+                endTime = minOpenT - 1;
+                if (arr.length() < batchLimit) break;   // pair history exhausted
+                Thread.sleep(600L);
+            } catch (Exception e) {
+                LOG.warning("[fetchKlinesPaged] " + symbol + " " + interval
+                        + " error: " + e.getMessage());
+                break;
+            }
+        }
+        return new ArrayList<>(byTime.values());   // sorted by openTime asc
     }
 
     private static void updateBtcContext(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
