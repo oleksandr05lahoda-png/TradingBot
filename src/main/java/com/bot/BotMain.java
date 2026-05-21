@@ -1784,12 +1784,39 @@ public final class BotMain {
         // 1. Universe — wait for at least 80% target loaded (gives cachedPairs
         // time to actually fill, not just have 1 pair). Hard timeout still 60s
         // — if loader is slow, proceed with whatever we have.
+        //
+        // [STARTUP-BT UNIVERSE-FIX 2026-05-21] Раньше использовали
+        // getScanUniverseSnapshot(btPairsLimit) который читает из cachedPairs
+        // (внутренний кэш live-сканера, ограничен TOP_N=30). При STARTUP_BT_PAIRS=45
+        // возвращалось всего 30 пар — silent cap. Теперь:
+        //   1) Сначала ждём cachedPairs (бот должен быть warmed up для live)
+        //   2) Если cachedPairs.size() < нашей цели — догружаем СВЕЖИЕ btPairsLimit
+        //      пар через getTopSymbolsSet(), который делает прямой запрос Binance
+        //      и не ограничен TOP_N. Это даёт нам полный universe = btPairsLimit пар
+        //      (например 45), что в паре с EARLY-STOP даёт ровно 30 валидных
+        //      обработанных пар.
         List<String> universe = new ArrayList<>();
         int targetMin = Math.max(10, (int) (btPairsLimit * 0.8));
-        for (int waitS = 0; waitS < 60 && universe.size() < targetMin; waitS++) {
+        int warmupTargetMin = Math.min(10, targetMin); // не больше TOP_N=30
+        for (int waitS = 0; waitS < 30 && universe.size() < warmupTargetMin; waitS++) {
             try { Thread.sleep(2_000L); }
             catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
             universe = sender.getScanUniverseSnapshot(btPairsLimit);
+        }
+        // Если cachedPairs покрывает btPairsLimit полностью — используем его.
+        // Иначе делаем прямой fetch (минует TOP_N cap).
+        if (universe.size() < btPairsLimit) {
+            LOG.info("[STARTUP-BT] cachedPairs has " + universe.size()
+                    + " pairs (limited by TOP_N) — fetching fresh top-" + btPairsLimit);
+            try {
+                Set<String> fresh = sender.getTopSymbolsSet(btPairsLimit);
+                if (fresh != null && !fresh.isEmpty()) {
+                    universe = new ArrayList<>(fresh);
+                }
+            } catch (Exception e) {
+                LOG.warning("[STARTUP-BT] getTopSymbolsSet failed: " + e.getMessage()
+                        + " — falling back to cachedPairs (size=" + universe.size() + ")");
+            }
         }
         if (universe.isEmpty()) {
             LOG.warning("[STARTUP-BT] universe empty — aborted");
