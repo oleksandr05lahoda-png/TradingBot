@@ -1844,6 +1844,15 @@ public final class BotMain {
         // Min bars guard for primary TF: 200 on 15m, 150 on 1h.
         final int primaryMinBars = btIs15m ? 200 : 150;
 
+        // [STARTUP-BT EARLY-STOP 2026-05-20] Останавливаемся когда набрали ровно
+        // STARTUP_BT_TARGET_VALID_PAIRS пар с достаточной историей. Раньше шли
+        // по всему universe (50 пар) и считали "Мало данных" как сводный счётчик.
+        // Теперь Universe = overfetch buffer (45), цель = 30 валидных. Эффект:
+        // "Мало данных" в сводке падает в 0, потому что мы прекращаем перебор
+        // ДО того как доберёмся до молодых пар без истории.
+        final int targetValidPairs = Math.max(5, envInt("STARTUP_BT_TARGET_VALID_PAIRS", 30));
+        int validPairs = 0;
+
         for (String sym : universe) {
             // Cooperative cancellation if JVM is shutting down.
             if (Thread.currentThread().isInterrupted()) {
@@ -1884,6 +1893,15 @@ public final class BotMain {
                     LOG.info("[STARTUP-BT] " + sym + " — only " + h1.size()
                             + " " + btHtfTf + " bars, need ≥150 (engine MIN_BARS guard)");
                     continue;
+                }
+
+                // [STARTUP-BT EARLY-STOP] Пара прошла обе проверки данных
+                // (primary≥minBars, HTF≥150). Это валидная пара для backtest.
+                validPairs++;
+                if (validPairs > targetValidPairs) {
+                    LOG.info("[STARTUP-BT] Reached " + targetValidPairs
+                            + " valid pairs — stopping early");
+                    break;
                 }
 
                 List<com.bot.TradingCore.Candle> empty = new ArrayList<>();
