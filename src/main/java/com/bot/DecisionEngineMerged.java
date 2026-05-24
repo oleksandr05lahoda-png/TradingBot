@@ -1735,65 +1735,221 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ─── REGIME DETECTION ───
-        MarketRegime regime = detectMarketRegime(c1h);
-
-        // ─── ROUTER: try strategies by priority (Phase 2.2 ordering) ───
-        // RATIONALE: Phase 2.1 had PumpHunter first → it preempted MR setups
-        // on the same bar (same 22 trades but lower PnL: +4.92% vs Phase 1
-        // +7.57%). PH "stole" slots from more profitable MR trades because
-        // cs_cooldown blocked MR for 120 min after PH fired.
-        //
-        // Phase 2.2: MR runs first (productivity floor — proven +7.57%).
-        // Breakout and PumpHunter run AFTER MR rejects, as additive paths
-        // for setups MR doesn't see (trends + reversals on pump tops).
-        TradeIdea idea;
-
-        // Priority 1: VWAP Mean Reversion — fundament (highest historical EV)
-        // [TREND-PULLBACK 2026-05-19] Gated by PHASE_MR_ENABLE. When false, MR is
-        // skipped entirely so the router falls through to Breakout (trend-pullback).
-        if (PHASE_MR_ENABLE) {
-            idea = generateMR(symbol, c1, c5, c15, c1h, c2h, cat, now);
-            if (idea != null) {
-                csLastSignalTime.put(symbol, now);
-                return idea;
-            }
-        }
-
-        // Priority 2: Funding Rate Momentum (Phase 5.0) — short-squeeze / long-flush hunter
-        // Different signal type from MR (positioning-based, not price-based).
-        // Triggers ONLY on extreme funding rates that historically predict reversion
-        // (short squeezes when crowd is short, long flushes when crowd is long).
-        // No conflict with MR (MR Phase 2.4 funding filter blocks MR on these same
-        // extremes, so Funding Momentum gets a clean slot).
-        idea = generateFromFundingMomentum(symbol, c1, c5, c15, c1h, c2h, cat, now);
+        // ═══ SINGLE STRATEGY: TREND PULLBACK [2026-05-25] ═══
+        TradeIdea idea = generateTrendPullback(symbol, c15, c1h, c2h, cat, now);
         if (idea != null) {
             csLastSignalTime.put(symbol, now);
             return idea;
         }
-
-        // Priority 3: Breakout for trending markets (only if MR/FM found nothing)
-        if (PHASE2_BREAKOUT_ENABLE &&
-                (regime == MarketRegime.TREND_UP || regime == MarketRegime.TREND_DOWN)) {
-            idea = generateBreakout(symbol, c5, c15, c1h, c2h, cat, regime, now);
-            if (idea != null) {
-                csLastSignalTime.put(symbol, now);
-                return idea;
-            }
-        }
-
-        // Priority 4: PumpHunter exhaustion (reversal at pump top / dump bottom)
-        if (PHASE2_PUMPHUNTER_ENABLE) {
-            idea = generateFromPumpHunter(symbol, c1, c5, c15, cat, now);
-            if (idea != null) {
-                csLastSignalTime.put(symbol, now);
-                return idea;
-            }
-        }
-
-        return reject("regime_" + regime.name().toLowerCase() + "_no_setup");
+        return reject("tp_no_setup");
     }
 
+    private TradeIdea generateTrendPullback(String symbol,
+                                            List<com.bot.TradingCore.Candle> c15,
+                                            List<com.bot.TradingCore.Candle> c1h,
+                                            List<com.bot.TradingCore.Candle> c2h,
+                                            CoinCategory cat,
+                                            long now) {
+
+        if (cat == CoinCategory.MEME) return reject("tp_skip_meme");
+        if (c15.size() < 50 || c1h.size() < 50) return reject("tp_insufficient_bars");
+
+        int hourUtc = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).getHour();
+        if (hourUtc < 6 || hourUtc >= 22) return reject("tp_low_liq_session");
+
+        com.bot.TradingCore.Candle last15 = c15.get(c15.size() - 1);
+        double price = last15.close;
+        if (price <= 0) return reject("tp_invalid_price");
+
+        int trend = tpDetectTrendDirection(c1h, c2h);
+        if (trend == 0) return reject("tp_no_clear_trend");
+        boolean wantLong = trend > 0;
+
+        com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
+        if (adx1h.adx < 22) return reject("tp_adx_weak");
+        if (wantLong && adx1h.minusDI > adx1h.plusDI) return reject("tp_di_against_long");
+        if (!wantLong && adx1h.plusDI > adx1h.minusDI) return reject("tp_di_against_short");
+
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC) return reject("tp_btc_panic");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CHOPPY) return reject("tp_btc_choppy");
+            if (wantLong) {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN
+                        || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
+                    return reject("tp_btc_blocks_long");
+                if (btc.onlyShort) return reject("tp_only_short");
+            } else {
+                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
+                    return reject("tp_btc_blocks_short");
+                if (btc.onlyLong) return reject("tp_only_long");
+            }
+        }
+
+        if (!tpDetectPullback(c15, wantLong)) return reject("tp_no_pullback");
+        if (!tpCheckEntryBar(c15, wantLong)) return reject("tp_no_entry_bar");
+
+        double volSma20 = tpComputeVolSma(c15, 20);
+        if (volSma20 <= 0) return reject("tp_no_vol_data");
+        double volRatio = last15.volume / volSma20;
+        if (volRatio < 1.3) return reject("tp_volume_too_low");
+
+        if (tpIsExtendedMove(c15, wantLong)) return reject("tp_move_extended");
+
+        FundingOIData fr = fundingCache.get(symbol);
+        if (fr != null && fr.isValid()) {
+            if (wantLong && fr.fundingRate > 0.0008) return reject("tp_funding_long_crowded");
+            if (!wantLong && fr.fundingRate < -0.0008) return reject("tp_funding_short_crowded");
+        }
+
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return reject("tp_invalid_atr");
+        double atrPct = atr14 / price;
+        if (atrPct < 0.003) return reject("tp_atr_too_low");
+        if (atrPct > 0.04) return reject("tp_atr_too_high");
+
+        double sl = tpComputeStop(c15, wantLong, price, atr14);
+        double slDist = Math.abs(price - sl);
+        double slPct = slDist / price;
+        if (slPct < 0.005) return reject("tp_sl_too_tight");
+        if (slPct > 0.025) return reject("tp_sl_too_wide");
+
+        double tp2 = wantLong ? price + slDist * 3.0 : price - slDist * 3.0;
+
+        double prob01 = 0.60;
+        if (adx1h.adx > 30) prob01 += 0.05;
+        if (volRatio > 2.0) prob01 += 0.04;
+        if (btc != null && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.03;
+        if (btc != null) {
+            boolean btcAligned = (wantLong && btc.btcTrend > 0.3) || (!wantLong && btc.btcTrend < -0.3);
+            if (btcAligned) prob01 += 0.05;
+        }
+        if (fr != null && fr.isValid()) {
+            boolean frContra = (wantLong && fr.fundingRate < -0.0001) || (!wantLong && fr.fundingRate > 0.0001);
+            if (frContra) prob01 += 0.05;
+        }
+        prob01 = Math.min(0.85, prob01);
+        double probability = prob01 * 100.0;
+
+        List<String> flags = new ArrayList<>();
+        flags.add("TREND_PULLBACK");
+        flags.add(wantLong ? "CLUSTER_HTF_BULL" : "CLUSTER_HTF_BEAR");
+        flags.add("CLUSTER_STR_PULLBACK");
+        flags.add("CLUSTER_VOL");
+        flags.add(String.format("ADX=%.0f", adx1h.adx));
+        flags.add(String.format("ATR=%.2f%%", atrPct * 100));
+        flags.add(String.format("VOL=%.1fx", volRatio));
+        if (btc != null) flags.add("BTC_" + btc.regime.name());
+
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+        HTFBias bias = detectBias2H(c2h != null && c2h.size() >= 30 ? c2h : c1h);
+        double frRate  = (fr != null && fr.isValid()) ? fr.fundingRate  : 0.0;
+        double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
+        double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
+
+        TradeIdea idea = new TradeIdea(
+                symbol, side, price, sl, tp2, 3.0,
+                probability, flags, frRate, frDelta, oiCh,
+                bias.name(), cat, null, 1.5, 3.0, 3.0);
+        idea.setRobustAtrPct(atrPct);
+        idea.setAgreeingClusters(3);
+        return idea;
+    }
+
+    private int tpDetectTrendDirection(List<com.bot.TradingCore.Candle> c1h,
+                                       List<com.bot.TradingCore.Candle> c2h) {
+        if (c1h == null || c1h.size() < 50) return 0;
+        double ema9 = ema(c1h, 9), ema21 = ema(c1h, 21), ema50 = ema(c1h, 50);
+        double price1h = last(c1h).close;
+        boolean bull = price1h > ema21 && ema9 > ema21 && ema21 > ema50 * 0.998;
+        boolean bear = price1h < ema21 && ema9 < ema21 && ema21 < ema50 * 1.002;
+        if (!bull && !bear) return 0;
+        if (c2h != null && c2h.size() >= 30) {
+            double e21_2h = ema(c2h, 21);
+            double p2h = last(c2h).close;
+            if (bull && p2h < e21_2h) return 0;
+            if (bear && p2h > e21_2h) return 0;
+        }
+        return bull ? 1 : -1;
+    }
+
+    private boolean tpDetectPullback(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
+        int n = c15.size();
+        if (n < 25) return false;
+        double ema21 = ema(c15, 21);
+        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
+        boolean touched = false, cooled = false;
+        for (int i = Math.max(0, n - 5); i < n; i++) {
+            com.bot.TradingCore.Candle b = c15.get(i);
+            if (wantLong && b.low <= ema21 * 1.002) touched = true;
+            if (!wantLong && b.high >= ema21 * 0.998) touched = true;
+            if (i < rsi.length) {
+                double r = rsi[i];
+                if (wantLong && r >= 35 && r <= 55) cooled = true;
+                if (!wantLong && r >= 45 && r <= 65) cooled = true;
+            }
+        }
+        return touched && cooled;
+    }
+
+    private boolean tpCheckEntryBar(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
+        int n = c15.size();
+        if (n < 3) return false;
+        com.bot.TradingCore.Candle cur = c15.get(n - 1), prev = c15.get(n - 2);
+        double range = cur.high - cur.low;
+        if (range <= 0) return false;
+        double body = Math.abs(cur.close - cur.open);
+        double br = body / range;
+        if (wantLong) {
+            boolean sb = cur.close > cur.open && br > 0.5;
+            boolean en = cur.close > cur.open && prev.close < prev.open && cur.close > prev.open && cur.open < prev.close;
+            double lw = Math.min(cur.open, cur.close) - cur.low;
+            boolean ha = lw > body * 1.5 && cur.close > cur.open;
+            return sb || en || ha;
+        } else {
+            boolean sb = cur.close < cur.open && br > 0.5;
+            boolean en = cur.close < cur.open && prev.close > prev.open && cur.close < prev.open && cur.open > prev.close;
+            double uw = cur.high - Math.max(cur.open, cur.close);
+            boolean ss = uw > body * 1.5 && cur.close < cur.open;
+            return sb || en || ss;
+        }
+    }
+
+    private boolean tpIsExtendedMove(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
+        int n = c15.size();
+        if (n < 7) return false;
+        int same = 0;
+        for (int i = n - 6; i < n; i++) {
+            boolean bull = c15.get(i).close > c15.get(i).open;
+            if (wantLong && bull) same++;
+            if (!wantLong && !bull) same++;
+        }
+        return same >= 5;
+    }
+
+    private double tpComputeVolSma(List<com.bot.TradingCore.Candle> c, int period) {
+        int n = c.size();
+        if (n < period) return 0;
+        double sum = 0;
+        for (int i = n - period; i < n; i++) sum += c.get(i).volume;
+        return sum / period;
+    }
+
+    private double tpComputeStop(List<com.bot.TradingCore.Candle> c15, boolean wantLong, double price, double atr14) {
+        int n = c15.size();
+        int lb = Math.min(5, n - 1);
+        if (wantLong) {
+            double sl = Double.POSITIVE_INFINITY;
+            for (int i = n - lb; i < n; i++) sl = Math.min(sl, c15.get(i).low);
+            return Math.min(sl - atr14 * 0.1, price - atr14 * 1.5);
+        } else {
+            double sh = Double.NEGATIVE_INFINITY;
+            for (int i = n - lb; i < n; i++) sh = Math.max(sh, c15.get(i).high);
+            return Math.max(sh + atr14 * 0.1, price + atr14 * 1.5);
+        }
+    }
     // ─────────────────────────────────────────────────────────────────────
     // STRATEGY: BREAKOUT — for TREND regime (1h ADX > 25, +DI/-DI directional)
     // ─────────────────────────────────────────────────────────────────────

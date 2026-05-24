@@ -1434,25 +1434,8 @@ public final class SignalSender {
                 blockedCorr.incrementAndGet(); return null;
             }
 
-            // [v18.0 REFACTOR] PumpHunter: flag only, no arbitrary confidence scaling
-            // Pass category for category-aware thresholds
-            // Use liveM1Buffer directly — it contains the currently forming bar
-            // from WS aggTrade stream. This gives PumpHunter 1-minute-fresh data instead
-            // of REST-cached closed bars. Critical for new detectExhaustion / detectPrePump
-            // which need the live forming candle to catch tops/bottoms in time.
-            List<com.bot.TradingCore.Candle> m1Live = liveM1Buffer.getOrDefault(pair, m1);
-            if (m1Live == null || m1Live.size() < 20) m1Live = m1;
-            com.bot.PumpHunter.PumpEvent pump = pumpHunter.detectPump(pair, m1Live, m5, m15, cat);
-            if (pump != null && pump.strength > 0.40) {
-                boolean aligned = (idea.side == com.bot.TradingCore.Side.LONG && pump.isBullish()) ||
-                        (idea.side == com.bot.TradingCore.Side.SHORT && pump.isBearish());
-                if (aligned) {
-                    List<String> nf = new ArrayList<>(idea.flags);
-                    nf.add("PH_" + pump.type.name());
-                    idea = rebuildIdea(idea, idea.probability, nf);
-                }
-            }
-
+            // PumpHunter удалён — TrendPullback стратегия не использует его теги.
+            // SignalOptimizer.μ оставлен (мягкий ±10pt micro-momentum, может помочь).
             idea = optimizer.withAdjustedConfidence(idea);
             // [v75] Removed duplicate MIN_CONF check here. Was: probability < MIN_CONF → reject.
             // The same check happens at line ~1570 (finalMinConf) which is the authoritative

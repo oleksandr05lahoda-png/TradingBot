@@ -302,8 +302,9 @@ public final class BotMain {
 
         private static final int    COLD_START_MIN_OUTCOMES = 20;
         private static final double MIN_RR          = 2.00;
-        // [v80] SL min 0.30% → 0.70%. Backtest: при SL<0.7% доля time-stop = 88.5%.
-        private static final double MIN_SL_PCT      = 0.0070;
+        // [2026-05-25] SL min 0.70% → 0.50%. TrendPullback использует swing-based стопы
+        // от 0.5%, старый порог резал тонкие но валидные сетапы.
+        private static final double MIN_SL_PCT      = 0.0050;
         // [v80] Dedup 6 мин → 4 часа. Защита от повторных входов в ту же пару.
         private static final long   SYMBOL_DEDUP_MS = 4 * 60 * 60_000L;
         // [v80] Часовая квота 20 → 6. Цель: 1-3 качественных сигнала в день, не 20 средненьких.
@@ -340,7 +341,7 @@ public final class BotMain {
         private static final double FLAT_MARKET_MIN_CONF      = 55.0;   // [PATCH 2026-05-13] was 56.0 — match MIN_CONF env=55
         private static final int    FLAT_MARKET_MIN_CLUSTERS  = 2;
         private static final double FLAT_MARKET_MIN_RR        = 2.00;   // [PATCH 2026-05-13] was 2.20 — synced with CS_TP2_R=2.4 via env
-        private static final double FLAT_MARKET_MIN_SL_PCT    = 0.0085;
+        private static final double FLAT_MARKET_MIN_SL_PCT    = 0.0060;  // [2026-05-25] 0.85% → 0.60% sync с TrendPullback
         private static final int    FLAT_MARKET_MAX_PER_HOUR  = 3;      // [PATCH 2026-05-13] was 2 — more samples for calibrator
         private static final int    FLAT_MARKET_MAX_PER_DAY   = 5;      // [PATCH 2026-05-13] was 4 — more samples for calibrator
 
@@ -1862,9 +1863,10 @@ public final class BotMain {
             try {
                 Thread.sleep(pacingMs);
 
-                // Primary TF candles (PRIMARY_TF env, default 1h).
-                List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, btPrimaryTf, barsPrimaryTarget);
-                if (m15 == null) {
+                // Primary TF candles — пагинация снимает кэп Бинанса в 1500 баров.
+                // На 15m это даёт 30+ дней истории вместо 15.6 дней.
+                List<com.bot.TradingCore.Candle> m15 = fetchKlinesPaged(sender, sym, btPrimaryTf, barsPrimaryTarget);
+                if (m15 == null || m15.isEmpty()) {
                     symbolsRateLimited++;
                     LOG.warning("[STARTUP-BT] " + sym + " — primary " + btPrimaryTf
                             + " fetch returned null (rate limit?)");
@@ -1878,10 +1880,10 @@ public final class BotMain {
                     continue;
                 }
 
-                // HTF candles (HTF_FAST env, default 4h on 1h primary, 1h on 15m primary).
+                // HTF candles — тоже через пагинацию для consistency.
                 Thread.sleep(1_500L);
-                List<com.bot.TradingCore.Candle> h1 = sender.fetchKlines(sym, btHtfTf, barsHtfTarget);
-                if (h1 == null) {
+                List<com.bot.TradingCore.Candle> h1 = fetchKlinesPaged(sender, sym, btHtfTf, barsHtfTarget);
+                if (h1 == null || h1.isEmpty()) {
                     symbolsRateLimited++;
                     LOG.warning("[STARTUP-BT] " + sym + " — HTF " + btHtfTf
                             + " fetch returned null (rate limit?)");
