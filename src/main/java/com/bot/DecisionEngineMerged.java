@@ -1890,13 +1890,28 @@ public final class DecisionEngineMerged {
         boolean wantLong = breakUp;
 
         // ═══════════════════════════════════════════════════════════════
-        // 3. VOLUME CONFIRMATION (institutional engaged)
+        // 3. VOLUME CONFIRMATION + ACCELERATION (institutional engaged)
+        // [v8.1 ACCELERATION] Volume на entry баре должен быть ВЫШЕ avg
+        // последних 3 баров — это значит momentum УСКОРЯЕТСЯ, не утихает.
+        // Real institutional engagement = volume burst НА текущем баре,
+        // не carry-over volume от предыдущего движения.
         // ═══════════════════════════════════════════════════════════════
         double volSma = tpComputeVolSma(c15, 20);
         if (volSma <= 0) return reject("vcb_no_vol_data");
         double volRatio = last15.volume / volSma;
-        // [v7.1] Volume 1.5× → 1.7× для более явной institutional engagement
         if (volRatio < 1.7) return reject("vcb_no_volume");
+
+        // Volume acceleration check
+        double prev3VolAvg = 0;
+        int prev3Count = 0;
+        for (int i = Math.max(0, n - 4); i < n - 1; i++) {
+            prev3VolAvg += c15.get(i).volume;
+            prev3Count++;
+        }
+        if (prev3Count > 0) {
+            prev3VolAvg /= prev3Count;
+            if (last15.volume < prev3VolAvg * 1.20) return reject("vcb_no_vol_acceleration");
+        }
 
         // ═══════════════════════════════════════════════════════════════
         // 4. CANDLE STRENGTH (real momentum, не doji breakout)
@@ -2002,9 +2017,8 @@ public final class DecisionEngineMerged {
         if (slPct < 0.0050) return reject("vcb_sl_too_tight");
         if (slPct > 0.0250) return reject("vcb_sl_too_wide");
 
-        // [v7.4] TP2 откат 2.5R → 2.2R. v7.3 показал что 2.5R редко достигается,
-        // больше trail-closes на меньших %. 2.2R = optimum для текущего entry.
-        double tp2 = wantLong ? price + slDist * 2.2 : price - slDist * 2.2;
+        // [v8.1] TP2 вычисляется ниже AFTER probability — adaptive по quality.
+        // Skeleton: TP2 init = 2.2R, потом upgrade до 3.0R если prob ≥ 0.75.
 
         // ═══════════════════════════════════════════════════════════════
         // PROBABILITY SCORING (база 0.62, cap 0.85)
@@ -2058,11 +2072,18 @@ public final class DecisionEngineMerged {
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
+        // [v8.1 ADAPTIVE TP] High-probability setups (prob ≥ 0.75) получают
+        // расширенный TP2 = 3.0R вместо 2.2R. Логика: high-prob setups
+        // статистически имеют дольше momentum follow-through. Trail после TP1
+        // защищает остаток, поэтому risk не растёт, но upside +36% per winner.
+        double tp2Mult = prob01 >= 0.75 ? 3.0 : 2.2;
+        double tp2 = wantLong ? price + slDist * tp2Mult : price - slDist * tp2Mult;
+
         // ═══════════════════════════════════════════════════════════════
         // BUILD IDEA
         // ═══════════════════════════════════════════════════════════════
         List<String> flags = new ArrayList<>();
-        flags.add("VCB_v7");
+        flags.add("VCB_v8");
         flags.add(wantLong ? "CLUSTER_STR_BREAKOUT_UP" : "CLUSTER_STR_BREAKOUT_DOWN");
         flags.add("CLUSTER_SQUEEZE_RELEASE");
         flags.add("CLUSTER_VOL");
@@ -2083,11 +2104,12 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
-        // [v7.4] TP1=1.0R partial, TP2=2.2R, R:R 1:2.2
+        // [v8.1] Adaptive TP1=1.0R partial, TP2=2.2R или 3.0R (по prob).
+        // Финальный R:R передаётся в Tracker для proper exit framework.
         TradeIdea idea = new TradeIdea(
-                symbol, side, price, sl, tp2, 2.2,
+                symbol, side, price, sl, tp2, tp2Mult,
                 probability, flags, frRate, frDelta, oiCh,
-                bias.name(), cat, null, 1.0, 2.2, 2.2);
+                bias.name(), cat, null, 1.0, tp2Mult, tp2Mult);
         idea.setRobustAtrPct(atrPct);
         idea.setAgreeingClusters(5);
         return idea;
