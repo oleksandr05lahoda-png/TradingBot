@@ -1855,8 +1855,11 @@ public final class DecisionEngineMerged {
         double atr14 = com.bot.TradingCore.atr(c15, 14);
         if (atr14 <= 0) return reject("vcb_invalid_atr");
         double atrPct = atr14 / price;
-        if (atrPct < 0.0040) return reject("vcb_atr_too_low");
-        if (atrPct > 0.0350) return reject("vcb_atr_too_high");
+        // [v8.3] ATR расширен 0.40-3.50% → 0.35-4.00%. Захватывает quiet-hour
+        // setups (ATR 0.35-0.40%) и high-vol breakouts (3.5-4%) которые VCB
+        // умеет торговать с trail-защитой. Минимальный риск качества.
+        if (atrPct < 0.0035) return reject("vcb_atr_too_low");
+        if (atrPct > 0.0400) return reject("vcb_atr_too_high");
 
         // ═══════════════════════════════════════════════════════════════
         // 1. SQUEEZE CONTEXT (volatility compression в окне 8 баров)
