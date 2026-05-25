@@ -1766,7 +1766,9 @@ public final class DecisionEngineMerged {
         boolean wantLong = trend > 0;
 
         com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
-        if (adx1h.adx < 22) return reject("tp_adx_weak");
+        // [2026-05-25] ADX 22→18: в флэтовом BTC даже сильные альты редко дают ADX>22.
+        // 18 = всё ещё реальный тренд (random = ~15), но фильтр пропускает в 2-3× больше.
+        if (adx1h.adx < 18) return reject("tp_adx_weak");
         if (wantLong && adx1h.minusDI > adx1h.plusDI) return reject("tp_di_against_long");
         if (!wantLong && adx1h.plusDI > adx1h.minusDI) return reject("tp_di_against_short");
 
@@ -1793,7 +1795,8 @@ public final class DecisionEngineMerged {
         double volSma20 = tpComputeVolSma(c15, 20);
         if (volSma20 <= 0) return reject("tp_no_vol_data");
         double volRatio = last15.volume / volSma20;
-        if (volRatio < 1.3) return reject("tp_volume_too_low");
+        // [2026-05-25] 1.30→1.15: достаточно просто volume выше среднего, не нужен спайк.
+        if (volRatio < 1.15) return reject("tp_volume_too_low");
 
         if (tpIsExtendedMove(c15, wantLong)) return reject("tp_move_extended");
 
@@ -1876,22 +1879,26 @@ public final class DecisionEngineMerged {
     }
 
     private boolean tpDetectPullback(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
+        // [2026-05-25] AND → OR: достаточно одного из двух признаков отката.
+        // Раньше требовалось ОБА (touched EMA21 И RSI cooled) одновременно в 5 барах —
+        // редкая комбинация в флэтовом рынке. Теперь либо касание EMA, либо охлаждение RSI.
         int n = c15.size();
         if (n < 25) return false;
         double ema21 = ema(c15, 21);
         double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
         boolean touched = false, cooled = false;
-        for (int i = Math.max(0, n - 5); i < n; i++) {
+        // Расширил окно с 5 до 7 баров — захватывает чуть больше recent pullbacks
+        for (int i = Math.max(0, n - 7); i < n; i++) {
             com.bot.TradingCore.Candle b = c15.get(i);
-            if (wantLong && b.low <= ema21 * 1.002) touched = true;
-            if (!wantLong && b.high >= ema21 * 0.998) touched = true;
+            if (wantLong && b.low <= ema21 * 1.003) touched = true;
+            if (!wantLong && b.high >= ema21 * 0.997) touched = true;
             if (i < rsi.length) {
                 double r = rsi[i];
-                if (wantLong && r >= 35 && r <= 55) cooled = true;
-                if (!wantLong && r >= 45 && r <= 65) cooled = true;
+                if (wantLong && r >= 32 && r <= 58) cooled = true;
+                if (!wantLong && r >= 42 && r <= 68) cooled = true;
             }
         }
-        return touched && cooled;
+        return touched || cooled;
     }
 
     private boolean tpCheckEntryBar(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
