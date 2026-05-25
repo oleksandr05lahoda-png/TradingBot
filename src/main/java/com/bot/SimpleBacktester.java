@@ -33,7 +33,10 @@ public final class SimpleBacktester {
 
     // ── Configuration ────────────────────────────────────────────
     private double initialBalance   = 100.0;
-    private double takerFee         = 0.0004;     // 0.04% per side
+    // [v7.5] 0.04% → 0.035%. Binance Futures с BNB pay = 10% discount от taker.
+    // VIP-0 taker 0.05% × 0.9 (BNB) × 0.78 (тут есть referral bonus 22%) ≈ 0.035%.
+    // Реалистично если bot настроен на BNB-pay enabled.
+    private double takerFee         = 0.00035;    // 0.035% per side
     private double fundingPer15m    = 0.0001 / 32; // ~0.01%/8h → per 15m
     private int    maxConcurrent    = 6;
     // [v82] 4 → 12 bars (60min → 180min).

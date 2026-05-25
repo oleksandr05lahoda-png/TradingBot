@@ -1857,10 +1857,11 @@ public final class DecisionEngineMerged {
                 com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
         if (bb.upper <= 0 || bb.lower <= 0) return reject("vcb_no_bb");
 
-        // [v7.1] Squeeze threshold 0.20 → 0.15 для жёстче compression detection.
-        // Окно 8 → 6 баров (более свежий squeeze = более reliable breakout).
+        // [v7.5] Окно squeeze 6 → 3 баров. Свежий squeeze release (≤3 бара)
+        // даёт сильнее initial momentum чем stale (5-6 баров после).
+        // Stale squeeze часто = false breakout (price уже отыграл reaction).
         boolean recentSqueeze = false;
-        for (int i = Math.max(0, n - 6); i < n; i++) {
+        for (int i = Math.max(0, n - 3); i < n; i++) {
             com.bot.TradingCore.BollingerSqueeze bbi =
                     com.bot.TradingCore.bollingerSqueeze(c15.subList(0, i + 1), 20, 2.0, 96);
             if (bbi.bandwidthPctile <= 0.15) {
@@ -1937,15 +1938,17 @@ public final class DecisionEngineMerged {
         if (wantLong && rsiNow > 75) return reject("vcb_rsi_overbought");
         if (!wantLong && rsiNow < 25) return reject("vcb_rsi_oversold");
 
-        // [v7.4] УБРАЛ ADX и LTF EMA жёсткие блоки. Анализ v7.3 (45 trade) показал:
-        //  - ADX > 20 блокирует EARLY TRENDS где ADX ещё не успел вырасти
-        //  - LTF EMA20>50 дублирует HTF EMA50 alignment (избыточный фильтр)
-        // Обе работают теперь как probability bonus (см. PROBABILITY SCORING ниже).
+        // [v7.5] КОМПРОМИСС: ADX hard block ВОЗВРАЩЁН (18 вместо 20).
+        // Анализ v7.4 (78 trade, -6.32%) vs v7.2 (44 trade, -2.36%):
+        //   ADX как bonus добавил 34 шумных trade с худшим WR = -4% NetPnL.
+        //   ADX > 18 = тренд начался (не топ-30 но 20 был слишком жёсткий).
+        // DI direction тоже hard block — без него рандомные входы в обратную сторону.
         double ema20_15m = ema(c15, 20);
         double ema50_15m = ema(c15, 50);
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
-        // Hard block только если ADX совсем низкий (полный флэт)
-        if (adxR.adx < 12) return reject("vcb_adx_dead_flat");
+        if (adxR.adx < 18) return reject("vcb_adx_flat");
+        if (wantLong && !adxR.bullish()) return reject("vcb_adx_bearish_di");
+        if (!wantLong && !adxR.bearish()) return reject("vcb_adx_bullish_di");
 
         // ═══════════════════════════════════════════════════════════════
         // 7. NOT EXTENDED (анти-FOMO chase)
