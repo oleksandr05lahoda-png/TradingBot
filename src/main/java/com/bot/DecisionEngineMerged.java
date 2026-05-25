@@ -1744,6 +1744,27 @@ public final class DecisionEngineMerged {
         return reject("tp_no_setup");
     }
 
+    /**
+     * LIQUIDITY SWEEP + RECLAIM v2 [2026-05-25]
+     *
+     * Полностью переписан с predict (TrendPullback) на REACT (Sweep+Reclaim).
+     *
+     * Гипотеза: HFT-боты охотятся на стопы за очевидными swing levels.
+     * После sweep + reclaim — institutionals выкупают/продают, мы заходим
+     * на их стороне с тонким SL за wick'ом.
+     *
+     * Setup (LONG; SHORT — зеркально):
+     *   1. Recent swing low в окне [n-23, n-3]
+     *   2. Last bar low ПРОБИЛ swing low (low < swingLow * 0.999)
+     *   3. Last bar close ВЕРНУЛСЯ выше swing low (close > swingLow * 1.0008)
+     *   4. Lower wick > 45% диапазона (V-shape reversal)
+     *   5. Volume > 1.4× SMA20 (institutional signature)
+     *   6. BTC не PANIC/CRASH
+     *   7. Funding не overcrowded
+     *
+     * Exits: SL за sweep wick + 0.15ATR, TP1=1.5R, TP2=3R, time stop 8 баров.
+     * Натуральное R:R 1:3-1:5 за счёт тонкого SL.
+     */
     private TradeIdea generateTrendPullback(String symbol,
                                             List<com.bot.TradingCore.Candle> c15,
                                             List<com.bot.TradingCore.Candle> c1h,
@@ -1751,98 +1772,122 @@ public final class DecisionEngineMerged {
                                             CoinCategory cat,
                                             long now) {
 
-        if (cat == CoinCategory.MEME) return reject("tp_skip_meme");
-        if (c15.size() < 50 || c1h.size() < 50) return reject("tp_insufficient_bars");
-
-        int hourUtc = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).getHour();
-        if (hourUtc < 6 || hourUtc >= 22) return reject("tp_low_liq_session");
+        if (cat == CoinCategory.MEME) return reject("ls_skip_meme");
+        if (c15.size() < 30) return reject("ls_insufficient_bars");
 
         com.bot.TradingCore.Candle last15 = c15.get(c15.size() - 1);
         double price = last15.close;
-        if (price <= 0) return reject("tp_invalid_price");
+        if (price <= 0) return reject("ls_invalid_price");
 
-        int trend = tpDetectTrendDirection(c1h, c2h);
-        if (trend == 0) return reject("tp_no_clear_trend");
-        boolean wantLong = trend > 0;
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return reject("ls_invalid_atr");
+        double atrPct = atr14 / price;
+        if (atrPct < 0.003) return reject("ls_atr_too_low");
+        if (atrPct > 0.05) return reject("ls_atr_too_high");
 
-        com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
-        // [2026-05-25] ADX 22→18: в флэтовом BTC даже сильные альты редко дают ADX>22.
-        // 18 = всё ещё реальный тренд (random = ~15), но фильтр пропускает в 2-3× больше.
-        if (adx1h.adx < 18) return reject("tp_adx_weak");
-        if (wantLong && adx1h.minusDI > adx1h.plusDI) return reject("tp_di_against_long");
-        if (!wantLong && adx1h.plusDI > adx1h.minusDI) return reject("tp_di_against_short");
+        // Find recent swing high/low [n-23, n-3]
+        int n = c15.size();
+        int from = Math.max(0, n - 23);
+        int to = n - 3;
+        if (to <= from) return reject("ls_no_swing_window");
+        double swingHigh = Double.NEGATIVE_INFINITY;
+        double swingLow = Double.POSITIVE_INFINITY;
+        for (int i = from; i < to; i++) {
+            swingHigh = Math.max(swingHigh, c15.get(i).high);
+            swingLow = Math.min(swingLow, c15.get(i).low);
+        }
+        if (swingHigh <= 0 || swingLow <= 0) return reject("ls_no_swing");
 
+        // Sweep + Reclaim
+        boolean sweptLow = last15.low < swingLow * 0.9990
+                && last15.close > swingLow * 1.0008;
+        boolean sweptHigh = last15.high > swingHigh * 1.0010
+                && last15.close < swingHigh * 0.9992;
+        if (!sweptLow && !sweptHigh) return reject("ls_no_sweep");
+        if (sweptLow && sweptHigh) return reject("ls_ambiguous_sweep");
+
+        boolean wantLong = sweptLow;
+
+        // V-shape wick analysis
+        double range = last15.high - last15.low;
+        if (range <= 0) return reject("ls_zero_range");
+        double wickPct;
+        if (wantLong) {
+            double lowerWick = Math.min(last15.open, last15.close) - last15.low;
+            wickPct = lowerWick / range;
+            if (wickPct < 0.45) return reject("ls_no_v_reversal");
+        } else {
+            double upperWick = last15.high - Math.max(last15.open, last15.close);
+            wickPct = upperWick / range;
+            if (wickPct < 0.45) return reject("ls_no_inv_reversal");
+        }
+
+        // Volume confirmation
+        double volSma20 = tpComputeVolSma(c15, 20);
+        if (volSma20 <= 0) return reject("ls_no_vol_data");
+        double volRatio = last15.volume / volSma20;
+        if (volRatio < 1.4) return reject("ls_low_volume");
+
+        // BTC regime gate
         com.bot.GlobalImpulseController.GlobalContext btc =
                 (gicRef != null) ? gicRef.getContext() : null;
         if (btc != null) {
-            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC) return reject("tp_btc_panic");
-            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CHOPPY) return reject("tp_btc_choppy");
-            if (wantLong) {
-                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN
-                        || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
-                    return reject("tp_btc_blocks_long");
-                if (btc.onlyShort) return reject("tp_only_short");
-            } else {
-                if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
-                    return reject("tp_btc_blocks_short");
-                if (btc.onlyLong) return reject("tp_only_long");
-            }
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC) return reject("ls_btc_panic");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH) return reject("ls_btc_crash");
+            if (wantLong && btc.onlyShort) return reject("ls_only_short");
+            if (!wantLong && btc.onlyLong) return reject("ls_only_long");
         }
 
-        if (!tpDetectPullback(c15, wantLong)) return reject("tp_no_pullback");
-        if (!tpCheckEntryBar(c15, wantLong)) return reject("tp_no_entry_bar");
+        // HTF context (soft) — блокирует только если СИЛЬНО против И мало volume
+        int htfTrend = tpDetectTrendDirection(c1h, c2h);
+        if (wantLong && htfTrend < 0 && volRatio < 2.0) return reject("ls_long_vs_bear_htf");
+        if (!wantLong && htfTrend > 0 && volRatio < 2.0) return reject("ls_short_vs_bull_htf");
 
-        double volSma20 = tpComputeVolSma(c15, 20);
-        if (volSma20 <= 0) return reject("tp_no_vol_data");
-        double volRatio = last15.volume / volSma20;
-        // [2026-05-25] 1.30→1.15: достаточно просто volume выше среднего, не нужен спайк.
-        if (volRatio < 1.15) return reject("tp_volume_too_low");
-
-        if (tpIsExtendedMove(c15, wantLong)) return reject("tp_move_extended");
-
+        // Funding sanity
         FundingOIData fr = fundingCache.get(symbol);
         if (fr != null && fr.isValid()) {
-            if (wantLong && fr.fundingRate > 0.0008) return reject("tp_funding_long_crowded");
-            if (!wantLong && fr.fundingRate < -0.0008) return reject("tp_funding_short_crowded");
+            if (wantLong && fr.fundingRate > 0.0010) return reject("ls_funding_long_crowded");
+            if (!wantLong && fr.fundingRate < -0.0010) return reject("ls_funding_short_crowded");
         }
 
-        double atr14 = com.bot.TradingCore.atr(c15, 14);
-        if (atr14 <= 0) return reject("tp_invalid_atr");
-        double atrPct = atr14 / price;
-        if (atrPct < 0.003) return reject("tp_atr_too_low");
-        if (atrPct > 0.04) return reject("tp_atr_too_high");
-
-        double sl = tpComputeStop(c15, wantLong, price, atr14);
+        // SL placement: за sweep wick + 0.15ATR buffer
+        double sl;
+        if (wantLong) {
+            sl = last15.low - atr14 * 0.15;
+        } else {
+            sl = last15.high + atr14 * 0.15;
+        }
         double slDist = Math.abs(price - sl);
         double slPct = slDist / price;
-        if (slPct < 0.005) return reject("tp_sl_too_tight");
-        if (slPct > 0.025) return reject("tp_sl_too_wide");
+        if (slPct < 0.003) return reject("ls_sl_too_tight");
+        if (slPct > 0.020) return reject("ls_sl_too_wide");
 
         double tp2 = wantLong ? price + slDist * 3.0 : price - slDist * 3.0;
 
-        double prob01 = 0.60;
-        if (adx1h.adx > 30) prob01 += 0.05;
-        if (volRatio > 2.0) prob01 += 0.04;
+        // Probability scoring
+        double prob01 = 0.62;
+        if (volRatio > 2.5) prob01 += 0.06;
+        if (volRatio > 4.0) prob01 += 0.04;
+        if (htfTrend == 0) prob01 += 0.03;
+        if ((wantLong && htfTrend > 0) || (!wantLong && htfTrend < 0)) prob01 += 0.05;
+        if (tpIsMajorCoin(symbol)) prob01 += 0.05;
         if (btc != null && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.03;
-        if (btc != null) {
-            boolean btcAligned = (wantLong && btc.btcTrend > 0.3) || (!wantLong && btc.btcTrend < -0.3);
-            if (btcAligned) prob01 += 0.05;
-        }
         if (fr != null && fr.isValid()) {
             boolean frContra = (wantLong && fr.fundingRate < -0.0001) || (!wantLong && fr.fundingRate > 0.0001);
-            if (frContra) prob01 += 0.05;
+            if (frContra) prob01 += 0.04;
         }
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
         List<String> flags = new ArrayList<>();
-        flags.add("TREND_PULLBACK");
-        flags.add(wantLong ? "CLUSTER_HTF_BULL" : "CLUSTER_HTF_BEAR");
-        flags.add("CLUSTER_STR_PULLBACK");
+        flags.add("SWEEP_RECLAIM");
+        flags.add(wantLong ? "CLUSTER_STR_SWEEP_LOW" : "CLUSTER_STR_SWEEP_HIGH");
         flags.add("CLUSTER_VOL");
-        flags.add(String.format("ADX=%.0f", adx1h.adx));
-        flags.add(String.format("ATR=%.2f%%", atrPct * 100));
+        flags.add("CLUSTER_HTF_" + (htfTrend > 0 ? "BULL" : htfTrend < 0 ? "BEAR" : "NEUTRAL"));
+        flags.add(String.format("SWEEP=%.6f", wantLong ? swingLow : swingHigh));
+        flags.add(String.format("WICK=%.0f%%", wickPct * 100));
         flags.add(String.format("VOL=%.1fx", volRatio));
+        flags.add(String.format("ATR=%.2f%%", atrPct * 100));
         if (btc != null) flags.add("BTC_" + btc.regime.name());
 
         com.bot.TradingCore.Side side = wantLong
@@ -1861,19 +1906,55 @@ public final class DecisionEngineMerged {
         return idea;
     }
 
+    /** Major coins имеют больше institutional liquidity для защиты levels. */
+    private boolean tpIsMajorCoin(String symbol) {
+        if (symbol == null) return false;
+        String s = symbol.toUpperCase();
+        return s.startsWith("BTC") || s.startsWith("ETH") || s.startsWith("SOL")
+                || s.startsWith("BNB") || s.startsWith("XRP") || s.startsWith("ADA")
+                || s.startsWith("AVAX") || s.startsWith("LINK") || s.startsWith("DOGE")
+                || s.startsWith("TON") || s.startsWith("DOT") || s.startsWith("MATIC");
+    }
+
     private int tpDetectTrendDirection(List<com.bot.TradingCore.Candle> c1h,
                                        List<com.bot.TradingCore.Candle> c2h) {
+        // [2026-05-25] HTF detection переделан: было 3-of-3 (price>EMA21 AND EMA9>EMA21
+        // AND EMA21>EMA50) — почти невыполнимо в флэте. Стало weighted score из 4 факторов,
+        // нужно ≥2 голосов в одну сторону. Гораздо больше setup'ов проходит, но всё равно
+        // требуется реальный тренд, не шум.
         if (c1h == null || c1h.size() < 50) return 0;
         double ema9 = ema(c1h, 9), ema21 = ema(c1h, 21), ema50 = ema(c1h, 50);
         double price1h = last(c1h).close;
-        boolean bull = price1h > ema21 && ema9 > ema21 && ema21 > ema50 * 0.998;
-        boolean bear = price1h < ema21 && ema9 < ema21 && ema21 < ema50 * 1.002;
+
+        int bullVotes = 0, bearVotes = 0;
+        // Vote 1: price vs EMA21 (instant trend)
+        if (price1h > ema21 * 1.001) bullVotes++;
+        else if (price1h < ema21 * 0.999) bearVotes++;
+        // Vote 2: EMA9 vs EMA21 (fast cross)
+        if (ema9 > ema21) bullVotes++;
+        else if (ema9 < ema21) bearVotes++;
+        // Vote 3: EMA21 vs EMA50 (slow trend)
+        if (ema21 > ema50 * 1.001) bullVotes++;
+        else if (ema21 < ema50 * 0.999) bearVotes++;
+        // Vote 4: price slope over 10 bars (momentum)
+        int n = c1h.size();
+        if (n >= 11) {
+            double change = (price1h - c1h.get(n - 11).close) / c1h.get(n - 11).close;
+            if (change > 0.008) bullVotes++;
+            else if (change < -0.008) bearVotes++;
+        }
+
+        // Нужно ≥2 голосов и однозначное превосходство
+        boolean bull = bullVotes >= 2 && bullVotes > bearVotes;
+        boolean bear = bearVotes >= 2 && bearVotes > bullVotes;
         if (!bull && !bear) return 0;
+
+        // 2h confirmation (soft) — блокирует только при явном disagreement
         if (c2h != null && c2h.size() >= 30) {
             double e21_2h = ema(c2h, 21);
             double p2h = last(c2h).close;
-            if (bull && p2h < e21_2h) return 0;
-            if (bear && p2h > e21_2h) return 0;
+            if (bull && p2h < e21_2h * 0.997) return 0;
+            if (bear && p2h > e21_2h * 1.003) return 0;
         }
         return bull ? 1 : -1;
     }
