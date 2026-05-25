@@ -1102,18 +1102,19 @@ public final class SimpleBacktester {
                 double partialPnlPct = isLong
                         ? (pos.tp1 - pos.entry) / pos.entry * 100
                         : (pos.entry - pos.tp1) / pos.entry * 100;
-                pos.accumulatedPnlPct += partialPnlPct * 0.5;  // 50% of qty closed
-                // Record costs for the partial close: 1× takerFee + 1× slippage on 50% qty.
-                pos.partialFeesCost += takerFee * 0.5;
-                pos.partialSlipCost += slippage * 0.5;
+                // [v8.5] Partial close 50% → 40%. 60% capital остаётся на full TP2 +
+                // защита через trail после TP1. Больше profit per high-prob winner.
+                pos.accumulatedPnlPct += partialPnlPct * 0.4;
+                pos.partialFeesCost += takerFee * 0.4;
+                pos.partialSlipCost += slippage * 0.4;
                 pos.tp1Hit = true;
-                pos.remainingFrac = 0.5;
+                pos.remainingFrac = 0.6;
                 pos.tp1ExitPrice = pos.tp1;
                 pos.tp1ExitBar = currentBar;
                 pos.currentSL = pos.entry * (isLong ? 1.001 : 0.999); // move SL to BE
-                return null; // position continues at 50% with BE stop
+                return null; // position continues at 60% with BE stop
             } else {
-                // TP2 hit on remaining 50%. Total PnL = accumulated (TP1 50%) + tp2 PnL on remaining 50%.
+                // TP2 hit on remaining 60%. Total PnL = accumulated (TP1 40%) + tp2 PnL on remaining 60%.
                 double exitPrice = tp;
                 double tp2PnlPct = isLong
                         ? (exitPrice - pos.entry) / pos.entry * 100
@@ -1160,11 +1161,12 @@ public final class SimpleBacktester {
                     double partialPnlPct = isLong
                             ? (pos.tp1 - pos.entry) / pos.entry * 100
                             : (pos.entry - pos.tp1) / pos.entry * 100;
-                    pos.accumulatedPnlPct += partialPnlPct * 0.5;
-                    pos.partialFeesCost  += this.takerFee * 0.5;
-                    pos.partialSlipCost  += slippage * 0.5;
+                    // [v8.5] Partial close 50% → 40% (60% остаётся)
+                    pos.accumulatedPnlPct += partialPnlPct * 0.4;
+                    pos.partialFeesCost  += this.takerFee * 0.4;
+                    pos.partialSlipCost  += slippage * 0.4;
                     pos.tp1Hit = true;
-                    pos.remainingFrac = 0.5;
+                    pos.remainingFrac = 0.6;
                     pos.tp1ExitPrice = pos.tp1;
                     pos.tp1ExitBar = currentBar;
                     pos.currentSL = pos.entry * (isLong ? 1.001 : 0.999);
@@ -1223,11 +1225,12 @@ public final class SimpleBacktester {
                 double partialPnlPct = isLong
                         ? (pos.tp1 - pos.entry) / pos.entry * 100
                         : (pos.entry - pos.tp1) / pos.entry * 100;
-                pos.accumulatedPnlPct += partialPnlPct * 0.5;
-                pos.partialFeesCost  += takerFee * 0.5;
-                pos.partialSlipCost  += slippage * 0.5;
+                // [v8.5] Partial close 50% → 40% (60% остаётся)
+                pos.accumulatedPnlPct += partialPnlPct * 0.4;
+                pos.partialFeesCost  += takerFee * 0.4;
+                pos.partialSlipCost  += slippage * 0.4;
                 pos.tp1Hit = true;
-                pos.remainingFrac = 0.5;
+                pos.remainingFrac = 0.6;
                 pos.tp1ExitPrice = pos.tp1;
                 pos.tp1ExitBar = currentBar;
                 pos.currentSL = pos.entry * (isLong ? 1.001 : 0.999);

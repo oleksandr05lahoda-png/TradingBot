@@ -2092,9 +2092,9 @@ public final class DecisionEngineMerged {
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
-        // [v8.2] Adaptive TP threshold 0.75 → 0.72. Чуть больше high-prob trades
+        // [v8.5] Adaptive TP threshold 0.72 → 0.70. Чуть больше high-prob trades
         // попадут в TP2=3.0R. Trail защищает после TP1, риск минимален.
-        double tp2Mult = prob01 >= 0.72 ? 3.0 : 2.2;
+        double tp2Mult = prob01 >= 0.70 ? 3.0 : 2.2;
         double tp2 = wantLong ? price + slDist * tp2Mult : price - slDist * tp2Mult;
 
         // ═══════════════════════════════════════════════════════════════
