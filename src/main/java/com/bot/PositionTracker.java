@@ -354,21 +354,28 @@ public final class PositionTracker {
             return;
         }
 
-        // ── TRAILING STOP ──────────────────────────────────────────────
-        // Multi-level ratchet. Each level is one-way — once we move SL to
-        // entry+0.4R, we never go back to entry+0.0R. trailLevel records
-        // the highest level reached so we don't churn the SL order book.
-        if (TRAIL_ENABLED) {
+        // ── TRAILING STOP v2 [2026-05-25] ──────────────────────────────
+        // КРИТИЧНОЕ ИЗМЕНЕНИЕ: Trail активируется ТОЛЬКО ПОСЛЕ TP1 hit
+        // (t.beActivated=true). Старая логика выбивала winners на +0.4R
+        // ДО достижения TP1=1.0R — backtest 124 trade WR 51.6% NetPnL -33%.
+        //
+        // Новая логика: до TP1 — trail отключён (работают SL/TP1).
+        // После TP1 hit (partial 50% взяли, SL уже на BE+) — trail защищает
+        // оставшиеся 50%:
+        //   - maxFavR ≥ 1.5R → SL на entry + 0.6R
+        //   - maxFavR ≥ 2.0R → SL на entry + 1.2R
+        //   - maxFavR ≥ 2.5R → SL на entry + 1.8R
+        if (TRAIL_ENABLED && t.beActivated) {
             double newTrailSl = Double.NaN;
             int newLevel = t.trailLevel;
-            if (t.maxFavR >= 2.0 && t.trailLevel < 3) {
-                newTrailSl = t.isLong ? t.entry + risk * 1.4 : t.entry - risk * 1.4;
+            if (t.maxFavR >= 2.5 && t.trailLevel < 3) {
+                newTrailSl = t.isLong ? t.entry + risk * 1.8 : t.entry - risk * 1.8;
                 newLevel = 3;
-            } else if (t.maxFavR >= 1.5 && t.trailLevel < 2) {
-                newTrailSl = t.isLong ? t.entry + risk * 0.8 : t.entry - risk * 0.8;
+            } else if (t.maxFavR >= 2.0 && t.trailLevel < 2) {
+                newTrailSl = t.isLong ? t.entry + risk * 1.2 : t.entry - risk * 1.2;
                 newLevel = 2;
-            } else if (t.maxFavR >= 1.0 && t.trailLevel < 1) {
-                newTrailSl = t.isLong ? t.entry + risk * 0.4 : t.entry - risk * 0.4;
+            } else if (t.maxFavR >= 1.5 && t.trailLevel < 1) {
+                newTrailSl = t.isLong ? t.entry + risk * 0.6 : t.entry - risk * 0.6;
                 newLevel = 1;
             }
             if (!Double.isNaN(newTrailSl)) {
@@ -386,7 +393,7 @@ public final class PositionTracker {
                         t.slPrice    = newTrailSl;
                         t.trailLevel = newLevel;
                         if (telegram != null) {
-                            double lockedR = newLevel == 3 ? 1.4 : (newLevel == 2 ? 0.8 : 0.4);
+                            double lockedR = newLevel == 3 ? 1.8 : (newLevel == 2 ? 1.2 : 0.6);
                             telegram.sendMessageAsync(String.format(
                                     "🪜 *TRAIL L%d* %s — SL подтянут\n" +
                                             "maxFav=%.2fR → SL зафиксировал +%.1fR прибыли\n" +

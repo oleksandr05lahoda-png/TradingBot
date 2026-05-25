@@ -954,22 +954,31 @@ public final class SimpleBacktester {
             if (favPeak > pos.maxFavR) pos.maxFavR = favPeak;
             if (advPeak > pos.maxAdvR) pos.maxAdvR = advPeak;
 
-            // [Level 1] TRAILING STOP — ratchet up SL based on max favorable move
-            if (trailEnabled && barsHeld >= 1) {
+            // [Level 1] TRAILING STOP v2 [2026-05-25]
+            // КРИТИЧНОЕ ИЗМЕНЕНИЕ: Trail активируется ТОЛЬКО ПОСЛЕ TP1 hit.
+            // Старый поведение (124 trade WR 51.6% NetPnL -33%): trail SL на +0.4R
+            // после maxFavR=1.0R выбивал winners ДО достижения TP1=1.0R partial.
+            // 66 из 124 trade закрылись через trail на ~+0.4R вместо TP1=1R/TP2=2.2R.
+            //
+            // Новая логика: до TP1 hit — trail отключён, работают только SL/TP1.
+            // После TP1 hit (partial 50% уже взяли) — trail защищает оставшиеся 50%:
+            //   - maxFavR ≥ 1.5R → SL на entry + 0.6R (защита 60% от TP1)
+            //   - maxFavR ≥ 2.0R → SL на entry + 1.2R (защита 120%)
+            //   - maxFavR ≥ 2.5R → SL на entry + 1.8R (защита 180%)
+            if (trailEnabled && barsHeld >= 1 && pos.tp1Hit) {
                 double newTrailSL = Double.NaN;
                 int newLevel = pos.trailLevel;
-                if (pos.maxFavR >= 2.0 && pos.trailLevel < 3) {
-                    newTrailSL = isLong ? pos.entry + risk * 1.4 : pos.entry - risk * 1.4;
+                if (pos.maxFavR >= 2.5 && pos.trailLevel < 3) {
+                    newTrailSL = isLong ? pos.entry + risk * 1.8 : pos.entry - risk * 1.8;
                     newLevel = 3;
-                } else if (pos.maxFavR >= 1.5 && pos.trailLevel < 2) {
-                    newTrailSL = isLong ? pos.entry + risk * 0.8 : pos.entry - risk * 0.8;
+                } else if (pos.maxFavR >= 2.0 && pos.trailLevel < 2) {
+                    newTrailSL = isLong ? pos.entry + risk * 1.2 : pos.entry - risk * 1.2;
                     newLevel = 2;
-                } else if (pos.maxFavR >= 1.0 && pos.trailLevel < 1) {
-                    newTrailSL = isLong ? pos.entry + risk * 0.4 : pos.entry - risk * 0.4;
+                } else if (pos.maxFavR >= 1.5 && pos.trailLevel < 1) {
+                    newTrailSL = isLong ? pos.entry + risk * 0.6 : pos.entry - risk * 0.6;
                     newLevel = 1;
                 }
                 if (!Double.isNaN(newTrailSL)) {
-                    // ratchet: only tighten, never loosen
                     if (isLong  && newTrailSL > pos.currentSL) {
                         pos.currentSL = newTrailSL; pos.trailLevel = newLevel;
                     } else if (!isLong && newTrailSL < pos.currentSL) {
