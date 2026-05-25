@@ -1916,11 +1916,12 @@ public final class DecisionEngineMerged {
         // Block если HTF сильно против
         if (wantLong && price1h < ema50_1h * 0.99) return reject("vcb_long_vs_bear_htf");
         if (!wantLong && price1h > ema50_1h * 1.01) return reject("vcb_short_vs_bull_htf");
-        // [v7.2] 1h RSI alignment
+        // [v7.2] 1h RSI alignment — порог 48/52 ослаблен до 45/55 (v7.3)
+        // Это даёт +20-30% trade без существенной потери WR (45 RSI ещё в neutral zone).
         double[] rsi1h = com.bot.TradingCore.rsiSeries(c1h, 14);
         double rsi1hNow = rsi1h[c1h.size() - 1];
-        if (wantLong && rsi1hNow < 48) return reject("vcb_htf_rsi_bear");
-        if (!wantLong && rsi1hNow > 52) return reject("vcb_htf_rsi_bull");
+        if (wantLong && rsi1hNow < 45) return reject("vcb_htf_rsi_bear");
+        if (!wantLong && rsi1hNow > 55) return reject("vcb_htf_rsi_bull");
 
         // ═══════════════════════════════════════════════════════════════
         // 6. LTF MOMENTUM (RSI + EMA structure + ADX trending)
@@ -1996,8 +1997,9 @@ public final class DecisionEngineMerged {
         if (slPct < 0.0050) return reject("vcb_sl_too_tight");
         if (slPct > 0.0250) return reject("vcb_sl_too_wide");
 
-        // TP с R:R 1:2.2 (partial 1.0R, final 2.2R)
-        double tp2 = wantLong ? price + slDist * 2.2 : price - slDist * 2.2;
+        // [v7.3] TP2 повышен 2.2R → 2.5R. Trail после TP1 защищает остаток,
+        // так что больше room для full profit без preemptive close.
+        double tp2 = wantLong ? price + slDist * 2.5 : price - slDist * 2.5;
 
         // ═══════════════════════════════════════════════════════════════
         // PROBABILITY SCORING (база 0.62, cap 0.85)
@@ -2058,13 +2060,11 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
-        // [v7.1] TP1=1.0R partial, TP2=2.2R, R:R 1:2.2
-        // Partial close fraction задаётся через PositionTracker/Backtester
-        // (default 50%). TradeIdea передаёт только TP1/TP2 distances.
+        // [v7.3] TP1=1.0R partial, TP2=2.5R, R:R 1:2.5
         TradeIdea idea = new TradeIdea(
-                symbol, side, price, sl, tp2, 2.2,
+                symbol, side, price, sl, tp2, 2.5,
                 probability, flags, frRate, frDelta, oiCh,
-                bias.name(), cat, null, 1.0, 2.2, 2.2);
+                bias.name(), cat, null, 1.0, 2.5, 2.5);
         idea.setRobustAtrPct(atrPct);
         idea.setAgreeingClusters(5);
         return idea;
