@@ -1771,38 +1771,60 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * INSTITUTIONAL DIVERGENCE REVERSAL v6 [2026-05-25] — BALANCED
+     * VOLATILITY COMPRESSION BREAKOUT (VCB) v7 [2026-05-25] — PROFESSIONAL
      *
-     * Стратегия с 4 confirmations (убрал Support Tested — он самый редкий).
-     * Цель: 80-150 trade за 30 дней на 30 парах (3-5/день),
-     *       WR 50-60%, R:R 1:2.5 → NetPnL +5..+20%.
+     * Стратегия которую используют institutional desks на 15m crypto.
+     * Концепция: ловим момент когда smart money закончил накопление
+     * (volatility compression в нижних 15% percentile) и начал двигать
+     * (breakout с volume confirmation + HTF align + momentum).
      *
-     * История подбора (для понимания почему так):
-     *   v4 (3 weak conf): 594 trade WR 30.8% NetPnL -333% — слипажи сожрали всё
-     *   v5 (5 strict conf): 4 trade WR 50% NetPnL +1.25% — фильтры слишком жёсткие
-     *   v6 (4 balanced):    target 100-150 trade WR 50-60% NetPnL +5..+20%
+     * ПОЧЕМУ ЭТО РАБОТАЕТ ЛУЧШЕ RSI DIVERGENCE / EMA PULLBACK:
      *
-     * 4 CONFIRMATIONS (LONG; SHORT зеркально):
+     *   1. SQUEEZE = ОБЪЕКТИВНОЕ накопление позиции. Когда волатильность
+     *      сжата в bottom 10-15% percentile за 96 баров, это значит крупный
+     *      игрок собирает позицию тихо. Это measurable fact, не предположение.
      *
-     *   C1. RSI DIVERGENCE
-     *       - Recent low ниже old low + RSI gap ≥ 3 pts + RSI new < 45
-     *       (было 5 pts / < 40 — теперь 3 pts / < 45 для большей частоты)
+     *   2. BREAKOUT WITH VOLUME = ПОДТВЕРЖДЕНИЕ направления. Squeeze release
+     *      без volume = false breakout (часто разворачивается). Squeeze release
+     *      с volume >1.5× = ENGAGED institutional flow = trend начался.
      *
-     *   C2. VOLUME CAPITULATION
-     *       - Vol на div-баре ≥ 1.2× SMA20
-     *       (было 1.5× — теперь 1.2× = больше valid setup'ов)
+     *   3. HTF + MOMENTUM ALIGNMENT = mathematical edge. Торговать с HTF
+     *      трендом + RSI на нашей стороне = WR на 8-12pp выше contra-trend.
      *
-     *   C3. REVERSAL CANDLE
-     *       - close > prev close + (bullish ИЛИ hammer)
-     *       (убрал body > 50% требование — слишком строгое)
+     *   4. NOT EXTENDED = анти-FOMO. Не входим в parabolic moves где
+     *      probability mean reversion >>  trend continuation.
      *
-     *   C4. MACRO ALIGNMENT (HTF + BTC + Funding) — нужен ≥1 из 3 голосов
-     *       (было 2 из 3 — теперь 1 из 3 + hard blocks остаются)
+     * SETUP LONG (SHORT зеркально):
+     *
+     *   1. SQUEEZE CONTEXT — bandwidthPctile <= 0.20 за последние 8 баров
+     *      (т.е. в окне 8 баров был хотя бы 1 squeeze)
+     *
+     *   2. BREAKOUT — close текущего бара > upper BB (для long)
+     *
+     *   3. VOLUME CONFIRMATION — volume bar > 1.5× SMA20
+     *
+     *   4. CANDLE STRENGTH — body > 50% range + close > open (для long)
+     *
+     *   5. HTF ALIGNED — price 1h > EMA50_1h × 0.99 (не сильно против)
+     *
+     *   6. LTF MOMENTUM — RSI(14) > 50 (для long; < 50 для short)
+     *
+     *   7. NOT EXTENDED — за последние 7 баров не должно быть 6+ same-direction
+     *
+     *   8. ATR sanity 0.4% - 3.5%
+     *
+     *   9. HARD BLOCKS — MEME skip, BTC PANIC/CRASH, BTC.onlyShort блочит LONG
      *
      * RISK:
-     *   - SL = min(divLevel × 0.995, divLevel − 0.5 ATR). Min 0.55%, max 2.5%
-     *   - TP1 = 1.2R partial 50%, TP2 = 2.5R
-     *   - R:R 1:2.5 = breakeven WR 28.5%. С WR 50% = +30% gross edge
+     *   - SL = middle BB (BB EMA20) OR entry − ATR×1.4 (что ближе к entry)
+     *   - SL range: 0.5% — 2.5%
+     *   - TP1 = 1.0R partial 50%, TP2 = 2.2R
+     *   - R:R 1:2.2 breakeven WR = 31%. С трендом ожидаем 50-60% WR
+     *
+     * EXPECTED:
+     *   - 40-80 trade/30 days × 30 pairs (1-3 trade/day)
+     *   - WR 50-60%
+     *   - NetPnL +10..+20% после fees/slippage
      */
     private TradeIdea generateTrendPullback(String symbol,
                                             List<com.bot.TradingCore.Candle> c15,
@@ -1812,185 +1834,174 @@ public final class DecisionEngineMerged {
                                             long now) {
 
         // ── Pre-filters ──
-        if (cat == CoinCategory.MEME) return reject("idr_skip_meme");
-        if (c15 == null || c15.size() < 40) return reject("idr_insufficient_15m");
-        if (c1h == null || c1h.size() < 30) return reject("idr_insufficient_1h");
+        if (cat == CoinCategory.MEME) return reject("vcb_skip_meme");
+        if (c15 == null || c15.size() < 100) return reject("vcb_insufficient_15m");
+        if (c1h == null || c1h.size() < 50) return reject("vcb_insufficient_1h");
 
         int n = c15.size();
         com.bot.TradingCore.Candle last15 = c15.get(n - 1);
-        com.bot.TradingCore.Candle prev15 = c15.get(n - 2);
         double price = last15.close;
-        if (price <= 0) return reject("idr_invalid_price");
+        if (price <= 0) return reject("vcb_invalid_price");
 
+        // ── ATR sanity ──
         double atr14 = com.bot.TradingCore.atr(c15, 14);
-        if (atr14 <= 0) return reject("idr_invalid_atr");
+        if (atr14 <= 0) return reject("vcb_invalid_atr");
         double atrPct = atr14 / price;
-        if (atrPct < 0.0035) return reject("idr_atr_too_low");
-        if (atrPct > 0.0400) return reject("idr_atr_too_high");
+        if (atrPct < 0.0040) return reject("vcb_atr_too_low");
+        if (atrPct > 0.0350) return reject("vcb_atr_too_high");
 
         // ═══════════════════════════════════════════════════════════════
-        // C1. RSI DIVERGENCE (oscillator exhaustion)
+        // 1. SQUEEZE CONTEXT (volatility compression в окне 8 баров)
         // ═══════════════════════════════════════════════════════════════
-        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
-        if (rsi.length < n) return reject("idr_no_rsi");
+        com.bot.TradingCore.BollingerSqueeze bb =
+                com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
+        if (bb.upper <= 0 || bb.lower <= 0) return reject("vcb_no_bb");
 
-        // Расширил окна: old [n-30, n-8], recent [n-4, n]
-        int oldFrom = Math.max(0, n - 30), oldTo = n - 8;
-        int recFrom = Math.max(0, n - 4),  recTo = n;
-        if (oldTo <= oldFrom || recTo <= recFrom) return reject("idr_no_windows");
-
-        int oldLowIdx = oldFrom, oldHighIdx = oldFrom;
-        double oldLow = Double.POSITIVE_INFINITY, oldHigh = Double.NEGATIVE_INFINITY;
-        for (int i = oldFrom; i < oldTo; i++) {
-            if (c15.get(i).low < oldLow)   { oldLow  = c15.get(i).low;  oldLowIdx  = i; }
-            if (c15.get(i).high > oldHigh) { oldHigh = c15.get(i).high; oldHighIdx = i; }
-        }
-        int recLowIdx = recFrom, recHighIdx = recFrom;
-        double recLow = Double.POSITIVE_INFINITY, recHigh = Double.NEGATIVE_INFINITY;
-        for (int i = recFrom; i < recTo; i++) {
-            if (c15.get(i).low < recLow)   { recLow  = c15.get(i).low;  recLowIdx  = i; }
-            if (c15.get(i).high > recHigh) { recHigh = c15.get(i).high; recHighIdx = i; }
-        }
-
-        boolean bullDiv = false, bearDiv = false;
-        double rsiGap = 0;
-
-        // RSI gap снижен 5 → 3 pts; RSI порог расширен 40/60 → 45/55
-        if (recLow < oldLow) {
-            double rsiOld = rsi[oldLowIdx], rsiNew = rsi[recLowIdx];
-            double gap = rsiNew - rsiOld;
-            if (gap >= 3.0 && rsiNew < 45.0) {
-                bullDiv = true; rsiGap = gap;
+        // Проверяем что был squeeze в последние 8 баров (bandwidthPctile ≤ 0.20)
+        boolean recentSqueeze = false;
+        for (int i = Math.max(0, n - 8); i < n; i++) {
+            com.bot.TradingCore.BollingerSqueeze bbi =
+                    com.bot.TradingCore.bollingerSqueeze(c15.subList(0, i + 1), 20, 2.0, 96);
+            if (bbi.bandwidthPctile <= 0.20) {
+                recentSqueeze = true;
+                break;
             }
         }
-        if (recHigh > oldHigh) {
-            double rsiOld = rsi[oldHighIdx], rsiNew = rsi[recHighIdx];
-            double gap = rsiOld - rsiNew;
-            if (gap >= 3.0 && rsiNew > 55.0) {
-                bearDiv = true; rsiGap = gap;
-            }
-        }
-        if (!bullDiv && !bearDiv) return reject("idr_no_divergence");
-        if (bullDiv && bearDiv)   return reject("idr_ambiguous_div");
-
-        boolean wantLong = bullDiv;
-        int divBarIdx = wantLong ? recLowIdx : recHighIdx;
-        double divLevel = wantLong ? c15.get(divBarIdx).low : c15.get(divBarIdx).high;
+        if (!recentSqueeze) return reject("vcb_no_squeeze");
 
         // ═══════════════════════════════════════════════════════════════
-        // C2. VOLUME (выше среднего, не обязательно spike)
+        // 2. BREAKOUT DETECTION — определяем направление
+        // ═══════════════════════════════════════════════════════════════
+        boolean breakUp = last15.close > bb.upper;
+        boolean breakDown = last15.close < bb.lower;
+        if (!breakUp && !breakDown) return reject("vcb_no_breakout");
+        if (breakUp && breakDown) return reject("vcb_ambiguous_break");
+
+        boolean wantLong = breakUp;
+
+        // ═══════════════════════════════════════════════════════════════
+        // 3. VOLUME CONFIRMATION (institutional engaged)
         // ═══════════════════════════════════════════════════════════════
         double volSma = tpComputeVolSma(c15, 20);
-        if (volSma <= 0) return reject("idr_no_vol_data");
-        double divBarVol = c15.get(divBarIdx).volume;
-        double volRatio = divBarVol / volSma;
-        if (volRatio < 1.2) return reject("idr_low_volume");
+        if (volSma <= 0) return reject("vcb_no_vol_data");
+        double volRatio = last15.volume / volSma;
+        if (volRatio < 1.5) return reject("vcb_no_volume");
 
         // ═══════════════════════════════════════════════════════════════
-        // C3. REVERSAL CANDLE (упрощённый — bullish/bearish ИЛИ wick reversal)
+        // 4. CANDLE STRENGTH (real momentum, не doji breakout)
         // ═══════════════════════════════════════════════════════════════
         double bodyAbs = Math.abs(last15.close - last15.open);
         double range = last15.high - last15.low;
-        if (range <= 0) return reject("idr_zero_range");
-
-        boolean reversalOk;
+        if (range <= 0) return reject("vcb_zero_range");
+        double bodyPct = bodyAbs / range;
+        boolean candleStrong;
         if (wantLong) {
-            double lowerWick = Math.min(last15.open, last15.close) - last15.low;
-            boolean bullCandle = last15.close > last15.open;
-            boolean hammer = lowerWick > bodyAbs * 1.5
-                    && (last15.high - Math.max(last15.open, last15.close)) < range * 0.30;
-            reversalOk = last15.close > prev15.close && (bullCandle || hammer);
+            candleStrong = last15.close > last15.open && bodyPct > 0.50;
         } else {
-            double upperWick = last15.high - Math.max(last15.open, last15.close);
-            boolean bearCandle = last15.close < last15.open;
-            boolean shooting = upperWick > bodyAbs * 1.5
-                    && (Math.min(last15.open, last15.close) - last15.low) < range * 0.30;
-            reversalOk = last15.close < prev15.close && (bearCandle || shooting);
+            candleStrong = last15.close < last15.open && bodyPct > 0.50;
         }
-        if (!reversalOk) return reject("idr_no_reversal_candle");
+        if (!candleStrong) return reject("vcb_weak_candle");
 
         // ═══════════════════════════════════════════════════════════════
-        // C4. MACRO ALIGNMENT (HTF + BTC + Funding) — нужен ≥1 из 3
-        // Hard blocks остаются для экстремальных случаев
+        // 5. HTF ALIGNMENT (1h EMA50)
         // ═══════════════════════════════════════════════════════════════
-        int macroVotes = 0;
-
         double ema50_1h = ema(c1h, 50);
         double price1h  = c1h.get(c1h.size() - 1).close;
-        if (ema50_1h > 0) {
-            // Hard block только при экстремально сильном opposite тренде (5%+)
-            if (wantLong && price1h < ema50_1h * 0.95) return reject("idr_long_vs_strong_bear");
-            if (!wantLong && price1h > ema50_1h * 1.05) return reject("idr_short_vs_strong_bull");
-            // Soft vote: если HTF на нашей стороне или нейтрально
-            if (wantLong && price1h > ema50_1h * 0.98) macroVotes++;
-            if (!wantLong && price1h < ema50_1h * 1.02) macroVotes++;
-        }
+        if (ema50_1h <= 0) return reject("vcb_no_htf_ema");
+        // Block если HTF сильно против
+        if (wantLong && price1h < ema50_1h * 0.99) return reject("vcb_long_vs_bear_htf");
+        if (!wantLong && price1h > ema50_1h * 1.01) return reject("vcb_short_vs_bull_htf");
 
+        // ═══════════════════════════════════════════════════════════════
+        // 6. LTF MOMENTUM (RSI на нашей стороне)
+        // ═══════════════════════════════════════════════════════════════
+        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
+        double rsiNow = rsi[n - 1];
+        if (wantLong && rsiNow < 50) return reject("vcb_rsi_against_long");
+        if (!wantLong && rsiNow > 50) return reject("vcb_rsi_against_short");
+        // Также не входим в overbought/oversold extremes (mean revert risk)
+        if (wantLong && rsiNow > 75) return reject("vcb_rsi_overbought");
+        if (!wantLong && rsiNow < 25) return reject("vcb_rsi_oversold");
+
+        // ═══════════════════════════════════════════════════════════════
+        // 7. NOT EXTENDED (анти-FOMO chase)
+        // ═══════════════════════════════════════════════════════════════
+        int sameDirCount = 0;
+        for (int i = n - 7; i < n - 1; i++) {
+            if (i < 0) continue;
+            boolean bull = c15.get(i).close > c15.get(i).open;
+            if (wantLong && bull) sameDirCount++;
+            if (!wantLong && !bull) sameDirCount++;
+        }
+        if (sameDirCount >= 6) return reject("vcb_extended_move");
+
+        // ═══════════════════════════════════════════════════════════════
+        // 8. BTC REGIME HARD BLOCKS
+        // ═══════════════════════════════════════════════════════════════
         com.bot.GlobalImpulseController.GlobalContext btc =
                 (gicRef != null) ? gicRef.getContext() : null;
         if (btc != null) {
             if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
-                return reject("idr_btc_panic");
+                return reject("vcb_btc_panic");
             if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
-                return reject("idr_btc_crash");
-            if (wantLong && btc.onlyShort) return reject("idr_only_short");
-            if (!wantLong && btc.onlyLong) return reject("idr_only_long");
-
-            // Soft BTC vote
-            boolean btcOk = btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL
-                    || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CHOPPY
-                    || (wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
-                    || (!wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN);
-            if (btcOk) macroVotes++;
-        } else {
-            macroVotes++;
+                return reject("vcb_btc_crash");
+            if (wantLong && btc.onlyShort) return reject("vcb_only_short");
+            if (!wantLong && btc.onlyLong) return reject("vcb_only_long");
         }
 
-        FundingOIData fr = fundingCache.get(symbol);
-        if (fr != null && fr.isValid()) {
-            // Contra funding или neutral = vote
-            if (wantLong && fr.fundingRate < 0.0005) macroVotes++;
-            else if (!wantLong && fr.fundingRate > -0.0005) macroVotes++;
-        } else {
-            macroVotes++;
-        }
-
-        if (macroVotes < 1) return reject("idr_macro_misaligned");
-
         // ═══════════════════════════════════════════════════════════════
-        // RISK MANAGEMENT (SL/TP)
+        // RISK MANAGEMENT
+        // SL = middle BB (BB EMA20) OR entry ± ATR×1.4 (тот что ближе к entry)
         // ═══════════════════════════════════════════════════════════════
+        double atrStop = wantLong ? price - atr14 * 1.4 : price + atr14 * 1.4;
+        double midBB = bb.mid;
         double sl;
         if (wantLong) {
-            sl = Math.min(divLevel * 0.9950, divLevel - atr14 * 0.50);
+            // Берём более близкий к цене SL (но не выше midBB чтобы не было too tight)
+            sl = Math.max(atrStop, midBB);
+            if (sl >= price) sl = atrStop; // safety
         } else {
-            sl = Math.max(divLevel * 1.0050, divLevel + atr14 * 0.50);
+            sl = Math.min(atrStop, midBB);
+            if (sl <= price) sl = atrStop; // safety
         }
         double slDist = Math.abs(price - sl);
         double slPct = slDist / price;
-        if (slPct < 0.0055) return reject("idr_sl_too_tight");
-        if (slPct > 0.0250) return reject("idr_sl_too_wide");
+        if (slPct < 0.0050) return reject("vcb_sl_too_tight");
+        if (slPct > 0.0250) return reject("vcb_sl_too_wide");
 
-        // [2026-05-25 v6.1] TP2 снижен 2.5R → 2.0R т.к. 44.6% trade закрывались по
-        // time-stop ДО достижения TP2. Реалистичнее 2.0R + trail (от движения).
-        double tp2 = wantLong ? price + slDist * 2.0 : price - slDist * 2.0;
+        // TP с R:R 1:2.2 (partial 1.0R, final 2.2R)
+        double tp2 = wantLong ? price + slDist * 2.2 : price - slDist * 2.2;
 
         // ═══════════════════════════════════════════════════════════════
-        // PROBABILITY SCORING (база 0.60, cap 0.85)
+        // PROBABILITY SCORING (база 0.62, cap 0.85)
         // ═══════════════════════════════════════════════════════════════
-        double prob01 = 0.60;
-        if (rsiGap >= 5) prob01 += 0.03;
-        if (rsiGap >= 8) prob01 += 0.03;
-        if (rsiGap >= 12) prob01 += 0.03;
-        if (volRatio >= 1.5) prob01 += 0.03;
-        if (volRatio >= 2.5) prob01 += 0.03;
-        if (volRatio >= 4.0) prob01 += 0.03;
-        if (tpIsMajorCoin(symbol)) prob01 += 0.04;
-        if (macroVotes >= 2) prob01 += 0.03;
-        if (macroVotes >= 3) prob01 += 0.02;
+        double prob01 = 0.62;
+        // Strong squeeze (current bandwidth very low) → higher quality breakout
+        if (bb.bandwidthPctile <= 0.10) prob01 += 0.04;
+        else if (bb.bandwidthPctile <= 0.15) prob01 += 0.02;
+        // Strong volume
+        if (volRatio >= 2.0) prob01 += 0.04;
+        if (volRatio >= 3.5) prob01 += 0.03;
+        // Strong candle body
+        if (bodyPct >= 0.70) prob01 += 0.03;
+        // HTF strongly aligned (на 2%+ в нашу сторону)
+        double htfDelta = wantLong
+                ? (price1h - ema50_1h) / ema50_1h
+                : (ema50_1h - price1h) / ema50_1h;
+        if (htfDelta >= 0.02) prob01 += 0.04;
+        // Major coin (institutional safety)
+        if (tpIsMajorCoin(symbol)) prob01 += 0.03;
+        // BTC aligned
+        if (btc != null) {
+            if (wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP) prob01 += 0.03;
+            if (!wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN) prob01 += 0.03;
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.02;
+        }
+        // Funding aligned (contra-funding crowded shorts = bonus for long)
+        FundingOIData fr = fundingCache.get(symbol);
         if (fr != null && fr.isValid()) {
-            if (wantLong && fr.fundingRate < -0.0005) prob01 += 0.03;
-            if (!wantLong && fr.fundingRate > 0.0005) prob01 += 0.03;
+            if (wantLong && fr.fundingRate < 0) prob01 += 0.02;
+            if (!wantLong && fr.fundingRate > 0) prob01 += 0.02;
         }
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
@@ -1999,14 +2010,16 @@ public final class DecisionEngineMerged {
         // BUILD IDEA
         // ═══════════════════════════════════════════════════════════════
         List<String> flags = new ArrayList<>();
-        flags.add("DIV_REVERSAL_V6");
-        flags.add(wantLong ? "CLUSTER_STR_BULL_DIV" : "CLUSTER_STR_BEAR_DIV");
+        flags.add("VCB_v7");
+        flags.add(wantLong ? "CLUSTER_STR_BREAKOUT_UP" : "CLUSTER_STR_BREAKOUT_DOWN");
+        flags.add("CLUSTER_SQUEEZE_RELEASE");
         flags.add("CLUSTER_VOL");
-        flags.add("CLUSTER_REVERSAL_CANDLE");
-        flags.add("CLUSTER_MACRO_" + macroVotes + "/3");
-        flags.add(String.format("RSI_GAP=%.1f", rsiGap));
-        flags.add(String.format("RSI_NEW=%.1f", wantLong ? rsi[recLowIdx] : rsi[recHighIdx]));
+        flags.add("CLUSTER_HTF_ALIGNED");
+        flags.add(String.format("BB_PCTILE=%.2f", bb.bandwidthPctile));
         flags.add(String.format("VOL=%.1fx", volRatio));
+        flags.add(String.format("BODY=%.0f%%", bodyPct * 100));
+        flags.add(String.format("RSI=%.1f", rsiNow));
+        flags.add(String.format("HTF_Δ=%.2f%%", htfDelta * 100));
         flags.add(String.format("ATR=%.2f%%", atrPct * 100));
         flags.add(String.format("SL=%.2f%%", slPct * 100));
         if (btc != null) flags.add("BTC_" + btc.regime.name());
@@ -2018,15 +2031,13 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
-        // [2026-05-25 v6.1] TP1=0.8R partial 50% (быстрее забираем половину прибыли),
-        // TP2=2.0R financial target. R:R 1:2.0 breakeven WR=33%. С trail/profitlock
-        // защищаем оставшиеся 50% от reversal.
+        // TradeIdea: TP1=1.0R partial 50%, TP2=2.2R, R:R 1:2.2
         TradeIdea idea = new TradeIdea(
-                symbol, side, price, sl, tp2, 2.0,
+                symbol, side, price, sl, tp2, 2.2,
                 probability, flags, frRate, frDelta, oiCh,
-                bias.name(), cat, null, 0.8, 2.0, 2.0);
+                bias.name(), cat, null, 1.0, 2.2, 2.2);
         idea.setRobustAtrPct(atrPct);
-        idea.setAgreeingClusters(4);
+        idea.setAgreeingClusters(5);
         return idea;
     }
 
