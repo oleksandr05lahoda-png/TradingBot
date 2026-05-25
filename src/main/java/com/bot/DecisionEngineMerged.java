@@ -1868,16 +1868,16 @@ public final class DecisionEngineMerged {
                 com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
         if (bb.upper <= 0 || bb.lower <= 0) return reject("vcb_no_bb");
 
-        // [v8.0] ОТКАТ окна squeeze 3 → 6 баров (как было в v7.2).
-        // v7.5 с 3-bar window дал WR 35.6% (хуже всех), т.к. ловил
-        // первые часто-fake breakouts. 6 баров даёт более settled context.
+        // [v8.0/v9.0] Squeeze window 6 баров. Также считаем DURATION (consecutive bars
+        // в squeeze) для probability bonus — long squeeze = stronger accumulation.
         boolean recentSqueeze = false;
+        int squeezeDuration = 0;
         for (int i = Math.max(0, n - 6); i < n; i++) {
             com.bot.TradingCore.BollingerSqueeze bbi =
                     com.bot.TradingCore.bollingerSqueeze(c15.subList(0, i + 1), 20, 2.0, 96);
             if (bbi.bandwidthPctile <= 0.15) {
                 recentSqueeze = true;
-                break;
+                squeezeDuration++;
             }
         }
         if (!recentSqueeze) return reject("vcb_no_squeeze");
@@ -1951,12 +1951,13 @@ public final class DecisionEngineMerged {
         double rsi1hNow = rsi1h[rsi1hN - 1];
         if (wantLong && rsi1hNow < 48) return reject("vcb_htf_rsi_bear");
         if (!wantLong && rsi1hNow > 52) return reject("vcb_htf_rsi_bull");
-        // [v8.4] RSI slope check (last 3 bars)
+        // [v9.0] RSI slope усилен -2.0 → -3.0 / +2.0 → +3.0 pts.
+        // Жёстче фильтр momentum exhaustion на HTF.
         if (rsi1hN >= 4) {
             double rsi1hPrev3 = rsi1h[rsi1hN - 4];
             double rsiSlope = rsi1hNow - rsi1hPrev3;
-            if (wantLong && rsiSlope < -2.0) return reject("vcb_htf_rsi_falling");
-            if (!wantLong && rsiSlope > 2.0) return reject("vcb_htf_rsi_rising");
+            if (wantLong && rsiSlope < -3.0) return reject("vcb_htf_rsi_falling");
+            if (!wantLong && rsiSlope > 3.0) return reject("vcb_htf_rsi_rising");
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -2047,6 +2048,9 @@ public final class DecisionEngineMerged {
         // Strong squeeze (current bandwidth very low) → higher quality breakout
         if (bb.bandwidthPctile <= 0.10) prob01 += 0.04;
         else if (bb.bandwidthPctile <= 0.15) prob01 += 0.02;
+        // [v9.0] Squeeze DURATION bonus — long compression = stronger accumulation
+        if (squeezeDuration >= 4) prob01 += 0.03;
+        else if (squeezeDuration >= 2) prob01 += 0.02;
         // Strong volume
         if (volRatio >= 2.0) prob01 += 0.04;
         if (volRatio >= 3.5) prob01 += 0.03;
@@ -2088,6 +2092,12 @@ public final class DecisionEngineMerged {
             if (!wantLong && fr.fundingRate > 0.0003) prob01 += 0.04;   // longs crowded
             if (wantLong && fr.fundingRate < -0.0008) prob01 += 0.03;   // very crowded
             if (!wantLong && fr.fundingRate > 0.0008) prob01 += 0.03;
+            // [v9.0] Open Interest trend bonus — OI растёт в нашу сторону = real flow.
+            // oiChange1h в процентах. +1% OI на нашей стороне за час = institutional accumulation.
+            if (wantLong && fr.oiChange1h > 0.01) prob01 += 0.02;
+            if (wantLong && fr.oiChange1h > 0.025) prob01 += 0.02;
+            if (!wantLong && fr.oiChange1h < -0.01) prob01 += 0.02;
+            if (!wantLong && fr.oiChange1h < -0.025) prob01 += 0.02;
         }
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
@@ -2107,6 +2117,7 @@ public final class DecisionEngineMerged {
         flags.add("CLUSTER_VOL");
         flags.add("CLUSTER_HTF_ALIGNED");
         flags.add(String.format("BB_PCTILE=%.2f", bb.bandwidthPctile));
+        flags.add(String.format("SQZ_DUR=%d", squeezeDuration));
         flags.add(String.format("VOL=%.1fx", volRatio));
         flags.add(String.format("BODY=%.0f%%", bodyPct * 100));
         flags.add(String.format("RSI=%.1f", rsiNow));
