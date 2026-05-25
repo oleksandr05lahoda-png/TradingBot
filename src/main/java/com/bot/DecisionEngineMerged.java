@@ -1785,48 +1785,88 @@ public final class DecisionEngineMerged {
         if (atrPct < 0.003) return reject("ls_atr_too_low");
         if (atrPct > 0.05) return reject("ls_atr_too_high");
 
-        // Find recent swing high/low [n-23, n-3]
+        // [2026-05-25 RELAX v2] Two swing windows проверяются НЕЗАВИСИМО.
+        // Любой из 4 sweep-паттернов триггерит вход (sweep wide OR short, single OR two-bar).
         int n = c15.size();
-        int from = Math.max(0, n - 23);
-        int to = n - 3;
-        if (to <= from) return reject("ls_no_swing_window");
-        double swingHigh = Double.NEGATIVE_INFINITY;
-        double swingLow = Double.POSITIVE_INFINITY;
-        for (int i = from; i < to; i++) {
-            swingHigh = Math.max(swingHigh, c15.get(i).high);
-            swingLow = Math.min(swingLow, c15.get(i).low);
-        }
-        if (swingHigh <= 0 || swingLow <= 0) return reject("ls_no_swing");
+        int fromWide = Math.max(0, n - 23), toWide = n - 3;
+        int fromShort = Math.max(0, n - 10), toShort = n - 2;
+        if (toWide <= fromWide || toShort <= fromShort) return reject("ls_no_swing_window");
 
-        // Sweep + Reclaim
-        boolean sweptLow = last15.low < swingLow * 0.9990
-                && last15.close > swingLow * 1.0008;
-        boolean sweptHigh = last15.high > swingHigh * 1.0010
-                && last15.close < swingHigh * 0.9992;
+        double swingHighWide = Double.NEGATIVE_INFINITY, swingLowWide = Double.POSITIVE_INFINITY;
+        for (int i = fromWide; i < toWide; i++) {
+            swingHighWide = Math.max(swingHighWide, c15.get(i).high);
+            swingLowWide = Math.min(swingLowWide, c15.get(i).low);
+        }
+        double swingHighShort = Double.NEGATIVE_INFINITY, swingLowShort = Double.POSITIVE_INFINITY;
+        for (int i = fromShort; i < toShort; i++) {
+            swingHighShort = Math.max(swingHighShort, c15.get(i).high);
+            swingLowShort = Math.min(swingLowShort, c15.get(i).low);
+        }
+        if (swingHighWide <= 0 || swingLowWide <= 0) return reject("ls_no_swing");
+
+        com.bot.TradingCore.Candle prev15 = n >= 2 ? c15.get(n - 2) : last15;
+
+        // Helper lambda для проверки sweep уровня X в режиме single/two-bar
+        // sweepLow(X): low пробил X И close выше X
+        // 4 паттерна на каждую сторону: {wide,short} × {single-bar, two-bar}
+
+        boolean swLowWideSingle = last15.low < swingLowWide * 0.9990
+                && last15.close > swingLowWide * 1.0002;
+        boolean swLowWideTwoBar = prev15.low < swingLowWide * 0.9990
+                && prev15.close < swingLowWide * 1.0000
+                && last15.close > swingLowWide * 1.0002;
+        boolean swLowShortSingle = last15.low < swingLowShort * 0.9990
+                && last15.close > swingLowShort * 1.0002;
+        boolean swLowShortTwoBar = prev15.low < swingLowShort * 0.9990
+                && prev15.close < swingLowShort * 1.0000
+                && last15.close > swingLowShort * 1.0002;
+
+        boolean swHighWideSingle = last15.high > swingHighWide * 1.0010
+                && last15.close < swingHighWide * 0.9998;
+        boolean swHighWideTwoBar = prev15.high > swingHighWide * 1.0010
+                && prev15.close > swingHighWide * 1.0000
+                && last15.close < swingHighWide * 0.9998;
+        boolean swHighShortSingle = last15.high > swingHighShort * 1.0010
+                && last15.close < swingHighShort * 0.9998;
+        boolean swHighShortTwoBar = prev15.high > swingHighShort * 1.0010
+                && prev15.close > swingHighShort * 1.0000
+                && last15.close < swingHighShort * 0.9998;
+
+        boolean sweptLow = swLowWideSingle || swLowWideTwoBar
+                || swLowShortSingle || swLowShortTwoBar;
+        boolean sweptHigh = swHighWideSingle || swHighWideTwoBar
+                || swHighShortSingle || swHighShortTwoBar;
+
         if (!sweptLow && !sweptHigh) return reject("ls_no_sweep");
         if (sweptLow && sweptHigh) return reject("ls_ambiguous_sweep");
 
         boolean wantLong = sweptLow;
+        // Track WHICH swing was swept (для SL и flag)
+        double sweptLevel = wantLong
+                ? (swLowWideSingle || swLowWideTwoBar ? swingLowWide : swingLowShort)
+                : (swHighWideSingle || swHighWideTwoBar ? swingHighWide : swingHighShort);
 
-        // V-shape wick analysis
+        // [2026-05-25 RELAX] V-shape wick 45% → 35%. На последнем sweep-баре.
+        // 45% = только идеальные hammer candles. 35% = реалистичный диапазон.
         double range = last15.high - last15.low;
         if (range <= 0) return reject("ls_zero_range");
         double wickPct;
         if (wantLong) {
             double lowerWick = Math.min(last15.open, last15.close) - last15.low;
             wickPct = lowerWick / range;
-            if (wickPct < 0.45) return reject("ls_no_v_reversal");
+            if (wickPct < 0.35) return reject("ls_no_v_reversal");
         } else {
             double upperWick = last15.high - Math.max(last15.open, last15.close);
             wickPct = upperWick / range;
-            if (wickPct < 0.45) return reject("ls_no_inv_reversal");
+            if (wickPct < 0.35) return reject("ls_no_inv_reversal");
         }
 
-        // Volume confirmation
+        // [2026-05-25 RELAX] Volume 1.4× → 1.2×. Sweep часто идёт постепенно,
+        // не нужен явный спайк — достаточно volume выше среднего.
         double volSma20 = tpComputeVolSma(c15, 20);
         if (volSma20 <= 0) return reject("ls_no_vol_data");
         double volRatio = last15.volume / volSma20;
-        if (volRatio < 1.4) return reject("ls_low_volume");
+        if (volRatio < 1.2) return reject("ls_low_volume");
 
         // BTC regime gate
         com.bot.GlobalImpulseController.GlobalContext btc =
@@ -1850,12 +1890,14 @@ public final class DecisionEngineMerged {
             if (!wantLong && fr.fundingRate < -0.0010) return reject("ls_funding_short_crowded");
         }
 
-        // SL placement: за sweep wick + 0.15ATR buffer
+        // SL placement: за наименьшим low обоих баров (для two-bar pattern) + 0.15ATR
         double sl;
         if (wantLong) {
-            sl = last15.low - atr14 * 0.15;
+            double wickLow = Math.min(last15.low, prev15.low);
+            sl = wickLow - atr14 * 0.15;
         } else {
-            sl = last15.high + atr14 * 0.15;
+            double wickHigh = Math.max(last15.high, prev15.high);
+            sl = wickHigh + atr14 * 0.15;
         }
         double slDist = Math.abs(price - sl);
         double slPct = slDist / price;
@@ -1886,7 +1928,7 @@ public final class DecisionEngineMerged {
         flags.add(wantLong ? "CLUSTER_STR_SWEEP_LOW" : "CLUSTER_STR_SWEEP_HIGH");
         flags.add("CLUSTER_VOL");
         flags.add("CLUSTER_HTF_" + (htfTrend > 0 ? "BULL" : htfTrend < 0 ? "BEAR" : "NEUTRAL"));
-        flags.add(String.format("SWEEP=%.6f", wantLong ? swingLow : swingHigh));
+        flags.add(String.format("SWEEP=%.6f", sweptLevel));
         flags.add(String.format("WICK=%.0f%%", wickPct * 100));
         flags.add(String.format("VOL=%.1fx", volRatio));
         flags.add(String.format("ATR=%.2f%%", atrPct * 100));
