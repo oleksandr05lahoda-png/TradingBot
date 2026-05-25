@@ -1838,6 +1838,14 @@ public final class DecisionEngineMerged {
         if (c15 == null || c15.size() < 100) return reject("vcb_insufficient_15m");
         if (c1h == null || c1h.size() < 50) return reject("vcb_insufficient_1h");
 
+        // [v8.0 STRUCTURAL] MAJOR COINS ONLY — отсеиваем manipulation-prone
+        // small/mid alts которые в крипте 2026 дают худший WR из-за HFT
+        // ликвидности hunting и pump/dump групп.
+        // Major: BTC/ETH/SOL/BNB/XRP/ADA/AVAX/LINK/DOGE/TON/DOT/MATIC + TOP cat.
+        if (cat != CoinCategory.TOP && !tpIsMajorCoin(symbol)) {
+            return reject("vcb_not_major_coin");
+        }
+
         int n = c15.size();
         com.bot.TradingCore.Candle last15 = c15.get(n - 1);
         double price = last15.close;
@@ -1857,11 +1865,11 @@ public final class DecisionEngineMerged {
                 com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
         if (bb.upper <= 0 || bb.lower <= 0) return reject("vcb_no_bb");
 
-        // [v7.5] Окно squeeze 6 → 3 баров. Свежий squeeze release (≤3 бара)
-        // даёт сильнее initial momentum чем stale (5-6 баров после).
-        // Stale squeeze часто = false breakout (price уже отыграл reaction).
+        // [v8.0] ОТКАТ окна squeeze 3 → 6 баров (как было в v7.2).
+        // v7.5 с 3-bar window дал WR 35.6% (хуже всех), т.к. ловил
+        // первые часто-fake breakouts. 6 баров даёт более settled context.
         boolean recentSqueeze = false;
-        for (int i = Math.max(0, n - 3); i < n; i++) {
+        for (int i = Math.max(0, n - 6); i < n; i++) {
             com.bot.TradingCore.BollingerSqueeze bbi =
                     com.bot.TradingCore.bollingerSqueeze(c15.subList(0, i + 1), 20, 2.0, 96);
             if (bbi.bandwidthPctile <= 0.15) {
@@ -1938,15 +1946,13 @@ public final class DecisionEngineMerged {
         if (wantLong && rsiNow > 75) return reject("vcb_rsi_overbought");
         if (!wantLong && rsiNow < 25) return reject("vcb_rsi_oversold");
 
-        // [v7.5] КОМПРОМИСС: ADX hard block ВОЗВРАЩЁН (18 вместо 20).
-        // Анализ v7.4 (78 trade, -6.32%) vs v7.2 (44 trade, -2.36%):
-        //   ADX как bonus добавил 34 шумных trade с худшим WR = -4% NetPnL.
-        //   ADX > 18 = тренд начался (не топ-30 но 20 был слишком жёсткий).
-        // DI direction тоже hard block — без него рандомные входы в обратную сторону.
+        // [v8.0] ОТКАТ к v7.2 base config (best NetPnL -2.36%) + добавлены
+        // СТРУКТУРНЫЕ фильтры (major coins, funding extreme).
+        // ADX 20 + DI direction (как было в v7.2).
         double ema20_15m = ema(c15, 20);
         double ema50_15m = ema(c15, 50);
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
-        if (adxR.adx < 18) return reject("vcb_adx_flat");
+        if (adxR.adx < 20) return reject("vcb_adx_flat");
         if (wantLong && !adxR.bullish()) return reject("vcb_adx_bearish_di");
         if (!wantLong && !adxR.bearish()) return reject("vcb_adx_bullish_di");
 
@@ -2036,10 +2042,18 @@ public final class DecisionEngineMerged {
             if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.02;
         }
         // Funding aligned (contra-funding crowded shorts = bonus for long)
+        // [v8.0 STRUCTURAL] EXTREME funding = strong squeeze potential.
+        // Это РЕАЛЬНЫЙ edge на crypto — overcrowded одной стороны = forced unwind.
         FundingOIData fr = fundingCache.get(symbol);
         if (fr != null && fr.isValid()) {
+            // Soft contra funding
             if (wantLong && fr.fundingRate < 0) prob01 += 0.02;
             if (!wantLong && fr.fundingRate > 0) prob01 += 0.02;
+            // EXTREME funding bonus (overcrowded → squeeze)
+            if (wantLong && fr.fundingRate < -0.0003) prob01 += 0.04;   // shorts crowded
+            if (!wantLong && fr.fundingRate > 0.0003) prob01 += 0.04;   // longs crowded
+            if (wantLong && fr.fundingRate < -0.0008) prob01 += 0.03;   // very crowded
+            if (!wantLong && fr.fundingRate > 0.0008) prob01 += 0.03;
         }
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
