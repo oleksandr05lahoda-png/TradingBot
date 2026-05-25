@@ -104,11 +104,13 @@ public final class PositionTracker {
         this.BE_ENABLED        = "1".equals(System.getenv().getOrDefault("PT_BE_ENABLED", "1"));
         this.BE_TRIGGER_FRAC   = envDouble("PT_BE_TRIGGER_FRAC", 0.55);
         this.REAL_PNL_ENABLED  = "1".equals(System.getenv().getOrDefault("PT_REAL_PNL_ENABLED", "1"));
-        // [2026-05-25] HARDCODED — sync с SimpleBacktester. Trail/ProfitLock
-        // резали winners до 0.4-0.8R в backtest, в live было бы то же самое.
-        // Stagnation оставлен — защищает от dead trades.
-        this.TRAIL_ENABLED       = false;
-        this.PROFIT_LOCK_ENABLED = false;
+        // [2026-05-25 v6] HARDCODED — sync с SimpleBacktester для live/backtest consistency.
+        // ПЕРЕВКЛЮЧЕНО false→true для Institutional Divergence Reversal v6 (R:R 1:2.0):
+        // - 44.6% trade закрываются по time-stop без защиты прибыли = winners теряют edge
+        // - Trail держит позицию когда движение продолжается → захватывает full TP
+        // - ProfitLock закрывает если после +0.5R пошёл откат на 50% → защищает от reversal
+        this.TRAIL_ENABLED       = true;
+        this.PROFIT_LOCK_ENABLED = true;
         this.STAGNATION_ENABLED  = true;
 
         LOG.info(String.format("[Tracker] init v2.0+v86: poll=%dms timeStop=%dmin "

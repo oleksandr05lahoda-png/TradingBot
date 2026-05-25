@@ -1971,7 +1971,9 @@ public final class DecisionEngineMerged {
         if (slPct < 0.0055) return reject("idr_sl_too_tight");
         if (slPct > 0.0250) return reject("idr_sl_too_wide");
 
-        double tp2 = wantLong ? price + slDist * 2.5 : price - slDist * 2.5;
+        // [2026-05-25 v6.1] TP2 снижен 2.5R → 2.0R т.к. 44.6% trade закрывались по
+        // time-stop ДО достижения TP2. Реалистичнее 2.0R + trail (от движения).
+        double tp2 = wantLong ? price + slDist * 2.0 : price - slDist * 2.0;
 
         // ═══════════════════════════════════════════════════════════════
         // PROBABILITY SCORING (база 0.60, cap 0.85)
@@ -2016,10 +2018,13 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
+        // [2026-05-25 v6.1] TP1=0.8R partial 50% (быстрее забираем половину прибыли),
+        // TP2=2.0R financial target. R:R 1:2.0 breakeven WR=33%. С trail/profitlock
+        // защищаем оставшиеся 50% от reversal.
         TradeIdea idea = new TradeIdea(
-                symbol, side, price, sl, tp2, 2.5,
+                symbol, side, price, sl, tp2, 2.0,
                 probability, flags, frRate, frDelta, oiCh,
-                bias.name(), cat, null, 1.2, 2.5, 2.5);
+                bias.name(), cat, null, 0.8, 2.0, 2.0);
         idea.setRobustAtrPct(atrPct);
         idea.setAgreeingClusters(4);
         return idea;

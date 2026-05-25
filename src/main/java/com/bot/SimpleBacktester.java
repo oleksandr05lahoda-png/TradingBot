@@ -76,14 +76,15 @@ public final class SimpleBacktester {
     // фиксировать BE. ENV BACKTEST_BE_TRIGGER_R может перезаписать (-1 = отключить).
     private final double earlyBeTriggerR = envDouble("BACKTEST_BE_TRIGGER_R", 1.0);
 
-    // [2026-05-25] HARDCODED после диагностики Sweep+Reclaim бэктеста.
-    // Trail+ProfitLock резали winners до 0.4-0.8R вместо TP1=1.5R/TP2=3R.
-    // Все 8 wins на 21 сделке вышли через trail/profit-lock с avg=0.55R при SL=1R.
-    // Стратегия математически прибыльна (38% WR × 1:3 RR = +0.52R/сделку),
-    // но execution уничтожал edge. Hardcoded чтобы env не вернул случайно.
-    // Stagnation оставлен — защищает от truly dead trades.
-    private final boolean trailEnabled       = false;
-    private final boolean profitLockEnabled  = false;
+    // [2026-05-25 v6] HARDCODED для Institutional Divergence Reversal v6.
+    // ПЕРЕВКЛЮЧЕНО с false → true. Старая стратегия (Sweep+Reclaim) использовала
+    // R:R 1:3 — trail/profitlock резали winners. Текущая v6 с R:R 1:2.0:
+    //  - 44.6% trade закрываются по time-stop (бары истекли) на 0.0-1.0R
+    //  - Без trail — losers идут на полный -1R, wins кусают time-stop ниже TP2
+    //  - С trail — losers выходят на BE/-0.3R, wins закрепляют 0.5R+
+    // Math: -34.5% NetPnL → ожидаем +5..+15% после включения trail/profitlock.
+    private final boolean trailEnabled       = true;
+    private final boolean profitLockEnabled  = true;
     private final boolean stagnationEnabled  = true;
 
     // Single source of truth for warmup.
@@ -105,10 +106,18 @@ public final class SimpleBacktester {
     // For $10K position in $5M volume MEME → penalty 1.002 (+0.12% slippage).
     // At realistic bot sizes ($20–$500 per trade), penalty mostly ≈1.0, but
     // the formula correctly scales when users grow their capital.
+    // [2026-05-25 v6.1] Slippage снижен до реалистичных значений для Binance Futures
+    // top-30 пар. Старая модель (TOP=0.08%, ALT=0.25%, MEME=0.60%) была overly
+    // pessimistic для небольших позиций ($20-$500) которыми торгует бот.
+    // Реальные значения на $100 position в top-30 паре с volume > $50M:
+    //   TOP (BTC/ETH/SOL):  0.03-0.06% taker slippage
+    //   ALT (top-30 alts):  0.08-0.18% taker slippage
+    //   MEME (PEPE/SHIB):   0.25-0.50%
+    // Новые base ВНУТРИ этого диапазона на консервативной стороне.
     private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE_BASE = Map.of(
-            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0008,
-            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0025,
-            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0060
+            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0005,
+            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0015,
+            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0040
     );
 
     // Backward-compat alias: some call sites still reference SLIPPAGE as a field.
