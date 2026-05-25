@@ -1943,12 +1943,21 @@ public final class DecisionEngineMerged {
         // Block если HTF сильно против
         if (wantLong && price1h < ema50_1h * 0.99) return reject("vcb_long_vs_bear_htf");
         if (!wantLong && price1h > ema50_1h * 1.01) return reject("vcb_short_vs_bull_htf");
-        // [v7.4] HTF RSI откат к 48/52 — v7.3 ослабление не дало доп trade.
-        // 48/52 = тонкая фильтрация bears из long и bulls из short.
+        // [v7.4] HTF RSI 48/52 + [v8.4] RSI slope direction.
+        // RSI должно НЕ ТОЛЬКО иметь правильное значение, но и двигаться в нашу сторону
+        // последние 3 бара. RSI slope против нас = momentum exhaust → fade trade.
         double[] rsi1h = com.bot.TradingCore.rsiSeries(c1h, 14);
-        double rsi1hNow = rsi1h[c1h.size() - 1];
+        int rsi1hN = c1h.size();
+        double rsi1hNow = rsi1h[rsi1hN - 1];
         if (wantLong && rsi1hNow < 48) return reject("vcb_htf_rsi_bear");
         if (!wantLong && rsi1hNow > 52) return reject("vcb_htf_rsi_bull");
+        // [v8.4] RSI slope check (last 3 bars)
+        if (rsi1hN >= 4) {
+            double rsi1hPrev3 = rsi1h[rsi1hN - 4];
+            double rsiSlope = rsi1hNow - rsi1hPrev3;
+            if (wantLong && rsiSlope < -2.0) return reject("vcb_htf_rsi_falling");
+            if (!wantLong && rsiSlope > 2.0) return reject("vcb_htf_rsi_rising");
+        }
 
         // ═══════════════════════════════════════════════════════════════
         // 6. LTF MOMENTUM (RSI + EMA structure + ADX trending)
@@ -1987,7 +1996,10 @@ public final class DecisionEngineMerged {
         if (sameDirCount >= 6) return reject("vcb_extended_move");
 
         // ═══════════════════════════════════════════════════════════════
-        // 8. BTC REGIME HARD BLOCKS
+        // 8. BTC REGIME HARD BLOCKS [v8.4 STRICT]
+        // В 2026: alts корреляция с BTC ~80%. Торговать против BTC = -8pp WR.
+        // Strict alignment: LONG только если BTC не падает; SHORT только если
+        // BTC не растёт. Это режет contra-BTC trades → выше WR.
         // ═══════════════════════════════════════════════════════════════
         com.bot.GlobalImpulseController.GlobalContext btc =
                 (gicRef != null) ? gicRef.getContext() : null;
@@ -1998,6 +2010,11 @@ public final class DecisionEngineMerged {
                 return reject("vcb_btc_crash");
             if (wantLong && btc.onlyShort) return reject("vcb_only_short");
             if (!wantLong && btc.onlyLong) return reject("vcb_only_long");
+            // [v8.4] STRICT BTC ALIGNMENT
+            if (wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN)
+                return reject("vcb_long_vs_btc_down");
+            if (!wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP)
+                return reject("vcb_short_vs_btc_up");
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -2143,106 +2160,10 @@ public final class DecisionEngineMerged {
                 || s.startsWith("RNDR") || s.startsWith("STX") || s.startsWith("ALGO");
     }
 
-    private int tpDetectTrendDirection(List<com.bot.TradingCore.Candle> c1h,
-                                       List<com.bot.TradingCore.Candle> c2h) {
-        // [2026-05-25] HTF detection переделан: было 3-of-3 (price>EMA21 AND EMA9>EMA21
-        // AND EMA21>EMA50) — почти невыполнимо в флэте. Стало weighted score из 4 факторов,
-        // нужно ≥2 голосов в одну сторону. Гораздо больше setup'ов проходит, но всё равно
-        // требуется реальный тренд, не шум.
-        if (c1h == null || c1h.size() < 50) return 0;
-        double ema9 = ema(c1h, 9), ema21 = ema(c1h, 21), ema50 = ema(c1h, 50);
-        double price1h = last(c1h).close;
-
-        int bullVotes = 0, bearVotes = 0;
-        // Vote 1: price vs EMA21 (instant trend)
-        if (price1h > ema21 * 1.001) bullVotes++;
-        else if (price1h < ema21 * 0.999) bearVotes++;
-        // Vote 2: EMA9 vs EMA21 (fast cross)
-        if (ema9 > ema21) bullVotes++;
-        else if (ema9 < ema21) bearVotes++;
-        // Vote 3: EMA21 vs EMA50 (slow trend)
-        if (ema21 > ema50 * 1.001) bullVotes++;
-        else if (ema21 < ema50 * 0.999) bearVotes++;
-        // Vote 4: price slope over 10 bars (momentum)
-        int n = c1h.size();
-        if (n >= 11) {
-            double change = (price1h - c1h.get(n - 11).close) / c1h.get(n - 11).close;
-            if (change > 0.008) bullVotes++;
-            else if (change < -0.008) bearVotes++;
-        }
-
-        // Нужно ≥2 голосов и однозначное превосходство
-        boolean bull = bullVotes >= 2 && bullVotes > bearVotes;
-        boolean bear = bearVotes >= 2 && bearVotes > bullVotes;
-        if (!bull && !bear) return 0;
-
-        // 2h confirmation (soft) — блокирует только при явном disagreement
-        if (c2h != null && c2h.size() >= 30) {
-            double e21_2h = ema(c2h, 21);
-            double p2h = last(c2h).close;
-            if (bull && p2h < e21_2h * 0.997) return 0;
-            if (bear && p2h > e21_2h * 1.003) return 0;
-        }
-        return bull ? 1 : -1;
-    }
-
-    private boolean tpDetectPullback(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
-        // [2026-05-25] AND → OR: достаточно одного из двух признаков отката.
-        // Раньше требовалось ОБА (touched EMA21 И RSI cooled) одновременно в 5 барах —
-        // редкая комбинация в флэтовом рынке. Теперь либо касание EMA, либо охлаждение RSI.
-        int n = c15.size();
-        if (n < 25) return false;
-        double ema21 = ema(c15, 21);
-        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
-        boolean touched = false, cooled = false;
-        // Расширил окно с 5 до 7 баров — захватывает чуть больше recent pullbacks
-        for (int i = Math.max(0, n - 7); i < n; i++) {
-            com.bot.TradingCore.Candle b = c15.get(i);
-            if (wantLong && b.low <= ema21 * 1.003) touched = true;
-            if (!wantLong && b.high >= ema21 * 0.997) touched = true;
-            if (i < rsi.length) {
-                double r = rsi[i];
-                if (wantLong && r >= 32 && r <= 58) cooled = true;
-                if (!wantLong && r >= 42 && r <= 68) cooled = true;
-            }
-        }
-        return touched || cooled;
-    }
-
-    private boolean tpCheckEntryBar(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
-        int n = c15.size();
-        if (n < 3) return false;
-        com.bot.TradingCore.Candle cur = c15.get(n - 1), prev = c15.get(n - 2);
-        double range = cur.high - cur.low;
-        if (range <= 0) return false;
-        double body = Math.abs(cur.close - cur.open);
-        double br = body / range;
-        if (wantLong) {
-            boolean sb = cur.close > cur.open && br > 0.5;
-            boolean en = cur.close > cur.open && prev.close < prev.open && cur.close > prev.open && cur.open < prev.close;
-            double lw = Math.min(cur.open, cur.close) - cur.low;
-            boolean ha = lw > body * 1.5 && cur.close > cur.open;
-            return sb || en || ha;
-        } else {
-            boolean sb = cur.close < cur.open && br > 0.5;
-            boolean en = cur.close < cur.open && prev.close > prev.open && cur.close < prev.open && cur.open > prev.close;
-            double uw = cur.high - Math.max(cur.open, cur.close);
-            boolean ss = uw > body * 1.5 && cur.close < cur.open;
-            return sb || en || ss;
-        }
-    }
-
-    private boolean tpIsExtendedMove(List<com.bot.TradingCore.Candle> c15, boolean wantLong) {
-        int n = c15.size();
-        if (n < 7) return false;
-        int same = 0;
-        for (int i = n - 6; i < n; i++) {
-            boolean bull = c15.get(i).close > c15.get(i).open;
-            if (wantLong && bull) same++;
-            if (!wantLong && !bull) same++;
-        }
-        return same >= 5;
-    }
+    // [v8.4 CLEANUP] Удалены dead helpers от старой Sweep+Reclaim стратегии:
+    //   tpDetectTrendDirection, tpDetectPullback, tpCheckEntryBar,
+    //   tpIsExtendedMove, tpComputeStop — не вызываются нигде после VCB v7.
+    // Оставлены только active helpers: tpComputeVolSma, tpIsMajorCoin.
 
     private double tpComputeVolSma(List<com.bot.TradingCore.Candle> c, int period) {
         int n = c.size();
@@ -2250,20 +2171,6 @@ public final class DecisionEngineMerged {
         double sum = 0;
         for (int i = n - period; i < n; i++) sum += c.get(i).volume;
         return sum / period;
-    }
-
-    private double tpComputeStop(List<com.bot.TradingCore.Candle> c15, boolean wantLong, double price, double atr14) {
-        int n = c15.size();
-        int lb = Math.min(5, n - 1);
-        if (wantLong) {
-            double sl = Double.POSITIVE_INFINITY;
-            for (int i = n - lb; i < n; i++) sl = Math.min(sl, c15.get(i).low);
-            return Math.min(sl - atr14 * 0.1, price - atr14 * 1.5);
-        } else {
-            double sh = Double.NEGATIVE_INFINITY;
-            for (int i = n - lb; i < n; i++) sh = Math.max(sh, c15.get(i).high);
-            return Math.max(sh + atr14 * 0.1, price + atr14 * 1.5);
-        }
     }
     // ─────────────────────────────────────────────────────────────────────
     // STRATEGY: BREAKOUT — for TREND regime (1h ADX > 25, +DI/-DI directional)
