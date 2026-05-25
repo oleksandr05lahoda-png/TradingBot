@@ -2072,11 +2072,9 @@ public final class DecisionEngineMerged {
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
-        // [v8.1 ADAPTIVE TP] High-probability setups (prob ≥ 0.75) получают
-        // расширенный TP2 = 3.0R вместо 2.2R. Логика: high-prob setups
-        // статистически имеют дольше momentum follow-through. Trail после TP1
-        // защищает остаток, поэтому risk не растёт, но upside +36% per winner.
-        double tp2Mult = prob01 >= 0.75 ? 3.0 : 2.2;
+        // [v8.2] Adaptive TP threshold 0.75 → 0.72. Чуть больше high-prob trades
+        // попадут в TP2=3.0R. Trail защищает после TP1, риск минимален.
+        double tp2Mult = prob01 >= 0.72 ? 3.0 : 2.2;
         double tp2 = wantLong ? price + slDist * tp2Mult : price - slDist * tp2Mult;
 
         // ═══════════════════════════════════════════════════════════════
@@ -2116,13 +2114,30 @@ public final class DecisionEngineMerged {
     }
 
     /** Major coins имеют больше institutional liquidity для защиты levels. */
+    /**
+     * Major coins имеют больше institutional liquidity для защиты levels.
+     * [v8.2] Расширен список до top-30 ликвидных по volume24h на Binance Futures.
+     * Все эти coins имеют: volume > $50M/day, spread < 0.05%, deep orderbook,
+     * active institutional trading. Исключены: мемы, новые/спекулятивные тикеры.
+     */
     private boolean tpIsMajorCoin(String symbol) {
         if (symbol == null) return false;
         String s = symbol.toUpperCase();
-        return s.startsWith("BTC") || s.startsWith("ETH") || s.startsWith("SOL")
+        // Tier 1 — top 10 by market cap (BTC, ETH ecosystem)
+        if (s.startsWith("BTC") || s.startsWith("ETH") || s.startsWith("SOL")
                 || s.startsWith("BNB") || s.startsWith("XRP") || s.startsWith("ADA")
                 || s.startsWith("AVAX") || s.startsWith("LINK") || s.startsWith("DOGE")
-                || s.startsWith("TON") || s.startsWith("DOT") || s.startsWith("MATIC");
+                || s.startsWith("TON") || s.startsWith("DOT") || s.startsWith("MATIC")) {
+            return true;
+        }
+        // Tier 2 — top 30 by Binance Futures volume (added v8.2)
+        return s.startsWith("LTC") || s.startsWith("BCH") || s.startsWith("TRX")
+                || s.startsWith("ATOM") || s.startsWith("UNI") || s.startsWith("AAVE")
+                || s.startsWith("NEAR") || s.startsWith("APT") || s.startsWith("SUI")
+                || s.startsWith("OP") || s.startsWith("ARB") || s.startsWith("INJ")
+                || s.startsWith("FIL") || s.startsWith("HBAR") || s.startsWith("XLM")
+                || s.startsWith("ETC") || s.startsWith("ICP") || s.startsWith("FET")
+                || s.startsWith("RNDR") || s.startsWith("STX") || s.startsWith("ALGO");
     }
 
     private int tpDetectTrendDirection(List<com.bot.TradingCore.Candle> c1h,
