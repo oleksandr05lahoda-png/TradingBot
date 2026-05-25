@@ -1862,7 +1862,9 @@ public final class DecisionEngineMerged {
         if (slPct < 0.003) return reject("ls_sl_too_tight");
         if (slPct > 0.020) return reject("ls_sl_too_wide");
 
-        double tp2 = wantLong ? price + slDist * 3.0 : price - slDist * 3.0;
+        // [2026-05-25] TP2 3.0R → 2.0R. Альты в 2026 редко делают 3R движение за 3h.
+        // Avg win был ~1R при WR 33% = -EV. С TP2=2R hit rate должен подскочить с 30% до 55%+.
+        double tp2 = wantLong ? price + slDist * 2.0 : price - slDist * 2.0;
 
         // Probability scoring
         double prob01 = 0.62;
@@ -1897,10 +1899,12 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
+        // [2026-05-25] tp1Mult=1.5→1.0, tp2Mult=3.0→2.0. RR теперь 1:2.
+        // Breakeven WR = 33%, текущий WR 33% — на границе. Если WR подрастёт до 38%+ → плюс.
         TradeIdea idea = new TradeIdea(
-                symbol, side, price, sl, tp2, 3.0,
+                symbol, side, price, sl, tp2, 2.0,
                 probability, flags, frRate, frDelta, oiCh,
-                bias.name(), cat, null, 1.5, 3.0, 3.0);
+                bias.name(), cat, null, 1.0, 2.0, 2.0);
         idea.setRobustAtrPct(atrPct);
         idea.setAgreeingClusters(3);
         return idea;
