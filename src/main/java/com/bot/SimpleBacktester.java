@@ -76,14 +76,15 @@ public final class SimpleBacktester {
     // фиксировать BE. ENV BACKTEST_BE_TRIGGER_R может перезаписать (-1 = отключить).
     private final double earlyBeTriggerR = envDouble("BACKTEST_BE_TRIGGER_R", 1.0);
 
-    // [v86 EXIT-FIX] Active exit management toggles. All ON by default.
-    // Set =0 in env to disable individual layers for A/B comparison.
-    private final boolean trailEnabled       =
-            !"0".equals(System.getenv().getOrDefault("BACKTEST_TRAIL_ENABLED",       "1"));
-    private final boolean profitLockEnabled  =
-            !"0".equals(System.getenv().getOrDefault("BACKTEST_PROFIT_LOCK_ENABLED", "1"));
-    private final boolean stagnationEnabled  =
-            !"0".equals(System.getenv().getOrDefault("BACKTEST_STAGNATION_ENABLED",  "1"));
+    // [2026-05-25] HARDCODED после диагностики Sweep+Reclaim бэктеста.
+    // Trail+ProfitLock резали winners до 0.4-0.8R вместо TP1=1.5R/TP2=3R.
+    // Все 8 wins на 21 сделке вышли через trail/profit-lock с avg=0.55R при SL=1R.
+    // Стратегия математически прибыльна (38% WR × 1:3 RR = +0.52R/сделку),
+    // но execution уничтожал edge. Hardcoded чтобы env не вернул случайно.
+    // Stagnation оставлен — защищает от truly dead trades.
+    private final boolean trailEnabled       = false;
+    private final boolean profitLockEnabled  = false;
+    private final boolean stagnationEnabled  = true;
 
     // Single source of truth for warmup.
     // Matches DecisionEngineMerged.MIN_BARS (100) — the gate engine.analyze()

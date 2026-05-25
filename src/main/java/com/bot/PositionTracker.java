@@ -104,12 +104,12 @@ public final class PositionTracker {
         this.BE_ENABLED        = "1".equals(System.getenv().getOrDefault("PT_BE_ENABLED", "1"));
         this.BE_TRIGGER_FRAC   = envDouble("PT_BE_TRIGGER_FRAC", 0.55);
         this.REAL_PNL_ENABLED  = "1".equals(System.getenv().getOrDefault("PT_REAL_PNL_ENABLED", "1"));
-        this.TRAIL_ENABLED       =
-                !"0".equals(System.getenv().getOrDefault("PT_TRAIL_ENABLED",       "1"));
-        this.PROFIT_LOCK_ENABLED =
-                !"0".equals(System.getenv().getOrDefault("PT_PROFIT_LOCK_ENABLED", "1"));
-        this.STAGNATION_ENABLED  =
-                !"0".equals(System.getenv().getOrDefault("PT_STAGNATION_ENABLED",  "1"));
+        // [2026-05-25] HARDCODED — sync с SimpleBacktester. Trail/ProfitLock
+        // резали winners до 0.4-0.8R в backtest, в live было бы то же самое.
+        // Stagnation оставлен — защищает от dead trades.
+        this.TRAIL_ENABLED       = false;
+        this.PROFIT_LOCK_ENABLED = false;
+        this.STAGNATION_ENABLED  = true;
 
         LOG.info(String.format("[Tracker] init v2.0+v86: poll=%dms timeStop=%dmin "
                         + "BE=%s offset=%.2f%% trigger=%.2f realPnL=%s "
