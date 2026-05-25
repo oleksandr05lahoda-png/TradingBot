@@ -1857,12 +1857,13 @@ public final class DecisionEngineMerged {
                 com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
         if (bb.upper <= 0 || bb.lower <= 0) return reject("vcb_no_bb");
 
-        // Проверяем что был squeeze в последние 8 баров (bandwidthPctile ≤ 0.20)
+        // [v7.1] Squeeze threshold 0.20 → 0.15 для жёстче compression detection.
+        // Окно 8 → 6 баров (более свежий squeeze = более reliable breakout).
         boolean recentSqueeze = false;
-        for (int i = Math.max(0, n - 8); i < n; i++) {
+        for (int i = Math.max(0, n - 6); i < n; i++) {
             com.bot.TradingCore.BollingerSqueeze bbi =
                     com.bot.TradingCore.bollingerSqueeze(c15.subList(0, i + 1), 20, 2.0, 96);
-            if (bbi.bandwidthPctile <= 0.20) {
+            if (bbi.bandwidthPctile <= 0.15) {
                 recentSqueeze = true;
                 break;
             }
@@ -1885,7 +1886,8 @@ public final class DecisionEngineMerged {
         double volSma = tpComputeVolSma(c15, 20);
         if (volSma <= 0) return reject("vcb_no_vol_data");
         double volRatio = last15.volume / volSma;
-        if (volRatio < 1.5) return reject("vcb_no_volume");
+        // [v7.1] Volume 1.5× → 1.7× для более явной institutional engagement
+        if (volRatio < 1.7) return reject("vcb_no_volume");
 
         // ═══════════════════════════════════════════════════════════════
         // 4. CANDLE STRENGTH (real momentum, не doji breakout)
@@ -1894,11 +1896,12 @@ public final class DecisionEngineMerged {
         double range = last15.high - last15.low;
         if (range <= 0) return reject("vcb_zero_range");
         double bodyPct = bodyAbs / range;
+        // [v7.1] Body 50% → 55%. Сильное тело = реальный momentum
         boolean candleStrong;
         if (wantLong) {
-            candleStrong = last15.close > last15.open && bodyPct > 0.50;
+            candleStrong = last15.close > last15.open && bodyPct > 0.55;
         } else {
-            candleStrong = last15.close < last15.open && bodyPct > 0.50;
+            candleStrong = last15.close < last15.open && bodyPct > 0.55;
         }
         if (!candleStrong) return reject("vcb_weak_candle");
 
@@ -2031,7 +2034,9 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
-        // TradeIdea: TP1=1.0R partial 50%, TP2=2.2R, R:R 1:2.2
+        // [v7.1] TP1=1.0R partial, TP2=2.2R, R:R 1:2.2
+        // Partial close fraction задаётся через PositionTracker/Backtester
+        // (default 50%). TradeIdea передаёт только TP1/TP2 distances.
         TradeIdea idea = new TradeIdea(
                 symbol, side, price, sl, tp2, 2.2,
                 probability, flags, frRate, frDelta, oiCh,

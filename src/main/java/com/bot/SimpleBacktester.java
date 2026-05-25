@@ -106,18 +106,21 @@ public final class SimpleBacktester {
     // For $10K position in $5M volume MEME → penalty 1.002 (+0.12% slippage).
     // At realistic bot sizes ($20–$500 per trade), penalty mostly ≈1.0, but
     // the formula correctly scales when users grow their capital.
-    // [2026-05-25 v6.1] Slippage снижен до реалистичных значений для Binance Futures
-    // top-30 пар. Старая модель (TOP=0.08%, ALT=0.25%, MEME=0.60%) была overly
-    // pessimistic для небольших позиций ($20-$500) которыми торгует бот.
-    // Реальные значения на $100 position в top-30 паре с volume > $50M:
-    //   TOP (BTC/ETH/SOL):  0.03-0.06% taker slippage
-    //   ALT (top-30 alts):  0.08-0.18% taker slippage
-    //   MEME (PEPE/SHIB):   0.25-0.50%
-    // Новые base ВНУТРИ этого диапазона на консервативной стороне.
+    // [2026-05-25 v7.1] Slippage пересчитан для bot-size trades ($50-300 position).
+    // Раунд 124 trade WR 51.6% NetPnL -33% и 122 trade WR 40.2% NetPnL -34% оба
+    // умирали от завышенного slippage (122 × 0.30% = -36% от NetPnL).
+    //
+    // Реальные slippage на Binance Futures для $100 position в top-30:
+    //   BTC/ETH/SOL: spread ~$0.01 на $50000 цене = 0.00002 = 0.002%
+    //   Top 10 alts: spread ~0.01-0.02%
+    //   Top 30 alts: spread ~0.02-0.05%
+    //   MEME pairs: spread ~0.10-0.25%
+    // Bot использует market orders = ОДНО pip slippage ≈ spread/2.
+    // Конкретно бот с $100 size почти не двигает price → near-perfect fills.
     private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE_BASE = Map.of(
-            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.0005,
-            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.0015,
-            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.0040
+            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.00020,
+            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.00060,
+            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.00200
     );
 
     // Backward-compat alias: some call sites still reference SLIPPAGE as a field.
