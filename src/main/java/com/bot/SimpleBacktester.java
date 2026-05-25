@@ -118,9 +118,9 @@ public final class SimpleBacktester {
     // Bot использует market orders = ОДНО pip slippage ≈ spread/2.
     // Конкретно бот с $100 size почти не двигает price → near-perfect fills.
     private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE_BASE = Map.of(
-            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.00020,
-            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.00060,
-            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.00200
+            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.00010,
+            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.00040,
+            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.00150
     );
 
     // Backward-compat alias: some call sites still reference SLIPPAGE as a field.

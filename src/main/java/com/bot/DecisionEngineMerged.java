@@ -1916,12 +1916,12 @@ public final class DecisionEngineMerged {
         // Block если HTF сильно против
         if (wantLong && price1h < ema50_1h * 0.99) return reject("vcb_long_vs_bear_htf");
         if (!wantLong && price1h > ema50_1h * 1.01) return reject("vcb_short_vs_bull_htf");
-        // [v7.2] 1h RSI alignment — порог 48/52 ослаблен до 45/55 (v7.3)
-        // Это даёт +20-30% trade без существенной потери WR (45 RSI ещё в neutral zone).
+        // [v7.4] HTF RSI откат к 48/52 — v7.3 ослабление не дало доп trade.
+        // 48/52 = тонкая фильтрация bears из long и bulls из short.
         double[] rsi1h = com.bot.TradingCore.rsiSeries(c1h, 14);
         double rsi1hNow = rsi1h[c1h.size() - 1];
-        if (wantLong && rsi1hNow < 45) return reject("vcb_htf_rsi_bear");
-        if (!wantLong && rsi1hNow > 55) return reject("vcb_htf_rsi_bull");
+        if (wantLong && rsi1hNow < 48) return reject("vcb_htf_rsi_bear");
+        if (!wantLong && rsi1hNow > 52) return reject("vcb_htf_rsi_bull");
 
         // ═══════════════════════════════════════════════════════════════
         // 6. LTF MOMENTUM (RSI + EMA structure + ADX trending)
@@ -1937,19 +1937,15 @@ public final class DecisionEngineMerged {
         if (wantLong && rsiNow > 75) return reject("vcb_rsi_overbought");
         if (!wantLong && rsiNow < 25) return reject("vcb_rsi_oversold");
 
-        // [v7.2] 15m EMA structure alignment
+        // [v7.4] УБРАЛ ADX и LTF EMA жёсткие блоки. Анализ v7.3 (45 trade) показал:
+        //  - ADX > 20 блокирует EARLY TRENDS где ADX ещё не успел вырасти
+        //  - LTF EMA20>50 дублирует HTF EMA50 alignment (избыточный фильтр)
+        // Обе работают теперь как probability bonus (см. PROBABILITY SCORING ниже).
         double ema20_15m = ema(c15, 20);
         double ema50_15m = ema(c15, 50);
-        if (ema20_15m > 0 && ema50_15m > 0) {
-            if (wantLong && ema20_15m < ema50_15m) return reject("vcb_ltf_ema_bear");
-            if (!wantLong && ema20_15m > ema50_15m) return reject("vcb_ltf_ema_bull");
-        }
-
-        // [v7.2] ADX trending filter — не торгуем в флэте
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
-        if (adxR.adx < 20) return reject("vcb_adx_flat");
-        if (wantLong && !adxR.bullish()) return reject("vcb_adx_bearish_di");
-        if (!wantLong && !adxR.bearish()) return reject("vcb_adx_bullish_di");
+        // Hard block только если ADX совсем низкий (полный флэт)
+        if (adxR.adx < 12) return reject("vcb_adx_dead_flat");
 
         // ═══════════════════════════════════════════════════════════════
         // 7. NOT EXTENDED (анти-FOMO chase)
@@ -1997,9 +1993,9 @@ public final class DecisionEngineMerged {
         if (slPct < 0.0050) return reject("vcb_sl_too_tight");
         if (slPct > 0.0250) return reject("vcb_sl_too_wide");
 
-        // [v7.3] TP2 повышен 2.2R → 2.5R. Trail после TP1 защищает остаток,
-        // так что больше room для full profit без preemptive close.
-        double tp2 = wantLong ? price + slDist * 2.5 : price - slDist * 2.5;
+        // [v7.4] TP2 откат 2.5R → 2.2R. v7.3 показал что 2.5R редко достигается,
+        // больше trail-closes на меньших %. 2.2R = optimum для текущего entry.
+        double tp2 = wantLong ? price + slDist * 2.2 : price - slDist * 2.2;
 
         // ═══════════════════════════════════════════════════════════════
         // PROBABILITY SCORING (база 0.62, cap 0.85)
@@ -2018,6 +2014,16 @@ public final class DecisionEngineMerged {
                 ? (price1h - ema50_1h) / ema50_1h
                 : (ema50_1h - price1h) / ema50_1h;
         if (htfDelta >= 0.02) prob01 += 0.04;
+        // [v7.4] ADX trending bonus (вместо hard filter)
+        if (adxR.adx >= 25) prob01 += 0.03;
+        else if (adxR.adx >= 20) prob01 += 0.02;
+        if ((wantLong && adxR.bullish()) || (!wantLong && adxR.bearish())) prob01 += 0.02;
+        // [v7.4] LTF EMA structure bonus
+        if (ema20_15m > 0 && ema50_15m > 0) {
+            if ((wantLong && ema20_15m > ema50_15m) || (!wantLong && ema20_15m < ema50_15m)) {
+                prob01 += 0.02;
+            }
+        }
         // Major coin (institutional safety)
         if (tpIsMajorCoin(symbol)) prob01 += 0.03;
         // BTC aligned
@@ -2060,11 +2066,11 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
-        // [v7.3] TP1=1.0R partial, TP2=2.5R, R:R 1:2.5
+        // [v7.4] TP1=1.0R partial, TP2=2.2R, R:R 1:2.2
         TradeIdea idea = new TradeIdea(
-                symbol, side, price, sl, tp2, 2.5,
+                symbol, side, price, sl, tp2, 2.2,
                 probability, flags, frRate, frDelta, oiCh,
-                bias.name(), cat, null, 1.0, 2.5, 2.5);
+                bias.name(), cat, null, 1.0, 2.2, 2.2);
         idea.setRobustAtrPct(atrPct);
         idea.setAgreeingClusters(5);
         return idea;
