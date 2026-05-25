@@ -649,8 +649,14 @@ public final class SimpleBacktester {
                     engine.setSimulatedFunding(symbol, currentFr, prevFr);
                 }
 
+                // [BUG-FIX 2026-05-25] Передаём decisionTime как `now` в DE.analyze.
+                // Старый overload без `now` хардкодил System.currentTimeMillis() — это
+                // ломало все time-keyed guards (csLastSignalTime cooldown 60 мин,
+                // blacklist, daily-loss). Backtest на ~12 мин wall-clock против 60 мин
+                // cooldown = максимум 1 сигнал на пару → объяснение почему 30 пар
+                // выдавали ровно 21 трейд независимо от стратегии.
                 com.bot.DecisionEngineMerged.TradeIdea idea = engine.analyze(
-                        symbol, sliceM1, sliceM5, slice15, sliceH1, category);
+                        symbol, sliceM1, sliceM5, slice15, sliceH1, category, decisionTime);
 
                 // [v82] BACKTEST_MIN_CONF gate. Раньше backtest принимал любую идею
                 // с prob ≥ DE.MIN_CONF_FLOOR=50, в то время как live SignalSender гейтит

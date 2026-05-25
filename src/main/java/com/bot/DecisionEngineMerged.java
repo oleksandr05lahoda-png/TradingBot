@@ -1529,6 +1529,32 @@ public final class DecisionEngineMerged {
         return generate(symbol, c1, c5, c15, c1h, null, cat, System.currentTimeMillis());
     }
 
+    // BACKTEST-AWARE OVERLOADS: pass historical bar time as `now` so that
+    // cooldowns/blacklist/daily-loss guards keyed on `now` work in simulated time
+    // instead of wall-clock. Without this, the 60-min csLastSignalTime cooldown
+    // never expires during a backtest run (which finishes in ~12 min real time),
+    // capping signals to ~1 per pair regardless of strategy quality.
+    public TradeIdea analyze(String symbol,
+                             List<com.bot.TradingCore.Candle> c1,
+                             List<com.bot.TradingCore.Candle> c5,
+                             List<com.bot.TradingCore.Candle> c15,
+                             List<com.bot.TradingCore.Candle> c1h,
+                             List<com.bot.TradingCore.Candle> c2h,
+                             CoinCategory cat,
+                             long now) {
+        return generate(symbol, c1, c5, c15, c1h, c2h, cat, now);
+    }
+
+    public TradeIdea analyze(String symbol,
+                             List<com.bot.TradingCore.Candle> c1,
+                             List<com.bot.TradingCore.Candle> c5,
+                             List<com.bot.TradingCore.Candle> c15,
+                             List<com.bot.TradingCore.Candle> c1h,
+                             CoinCategory cat,
+                             long now) {
+        return generate(symbol, c1, c5, c15, c1h, null, cat, now);
+    }
+
     //  5m BREAK OF STRUCTURE / CHANGE OF CHARACTER
     //  Primary entry trigger: fires 1-3 bars BEFORE 15m structure confirms.
     //  BoS  = breakout WITH the HTF trend  → strong signal (score 0.62)
@@ -1745,25 +1771,30 @@ public final class DecisionEngineMerged {
     }
 
     /**
-     * LIQUIDITY SWEEP + RECLAIM v2 [2026-05-25]
+     * EMA20 PULLBACK CONTINUATION v3 [2026-05-25]
      *
-     * Полностью переписан с predict (TrendPullback) на REACT (Sweep+Reclaim).
+     * Классическая трендовая стратегия. РЕАКТИВНАЯ:
+     *   1. Определяем тренд по HTF (1h EMA50 slope + price vs EMA50)
+     *   2. Ждём pullback цены к EMA20 на 15m
+     *   3. ВХОДИМ только после подтверждения разворота (close обратно над/под EMA20
+     *      + bullish/bearish candle close)
      *
-     * Гипотеза: HFT-боты охотятся на стопы за очевидными swing levels.
-     * После sweep + reclaim — institutionals выкупают/продают, мы заходим
-     * на их стороне с тонким SL за wick'ом.
+     * Почему лучше Sweep+Reclaim:
+     *   - Sweep+Reclaim требует редкие V-wick паттерны (3-5/мес на пару → 24 трейда/30 пар/мес)
+     *   - EMA pullback бывает каждые 4-12 баров в тренде (15-30/мес на пару → 200-400 трейдов/30 пар/мес)
+     *   - WR EMA pullback в тренде ≈ 45-55% при R:R 1:2 = чистый положительный edge
      *
      * Setup (LONG; SHORT — зеркально):
-     *   1. Recent swing low в окне [n-23, n-3]
-     *   2. Last bar low ПРОБИЛ swing low (low < swingLow * 0.999)
-     *   3. Last bar close ВЕРНУЛСЯ выше swing low (close > swingLow * 1.0008)
-     *   4. Lower wick > 45% диапазона (V-shape reversal)
-     *   5. Volume > 1.4× SMA20 (institutional signature)
-     *   6. BTC не PANIC/CRASH
-     *   7. Funding не overcrowded
+     *   1. HTF тренд: price_1h > EMA50_1h И EMA20_1h > EMA50_1h (явный бычий)
+     *   2. 15m pullback: за последние 6 баров был bar где low ≤ EMA20_15m * 1.002
+     *   3. Подтверждение реверса: текущий бар — bullish (close > open) И close > EMA20_15m
+     *   4. Не extended: предыдущие 6 баров не должны быть все bullish (иначе chase)
+     *   5. ATR sanity: 0.3% ≤ atrPct ≤ 5%
+     *   6. Volume на entry баре ≥ 0.7× SMA20 (не мертвый рынок)
+     *   7. BTC не PANIC/CRASH, funding не extreme
      *
-     * Exits: SL за sweep wick + 0.15ATR, TP1=1.5R, TP2=3R, time stop 8 баров.
-     * Натуральное R:R 1:3-1:5 за счёт тонкого SL.
+     * Exits: SL = min(last_3_lows) - 0.3 ATR, TP1=1R (50%), TP2=2R.
+     * R:R 1:2 base, partial exit на TP1 защищает PnL.
      */
     private TradeIdea generateTrendPullback(String symbol,
                                             List<com.bot.TradingCore.Candle> c15,
@@ -1772,164 +1803,167 @@ public final class DecisionEngineMerged {
                                             CoinCategory cat,
                                             long now) {
 
-        if (cat == CoinCategory.MEME) return reject("ls_skip_meme");
-        if (c15.size() < 30) return reject("ls_insufficient_bars");
+        if (cat == CoinCategory.MEME) return reject("ep_skip_meme");
+        if (c15 == null || c15.size() < 30) return reject("ep_insufficient_15m");
+        if (c1h == null || c1h.size() < 55) return reject("ep_insufficient_1h");
 
         com.bot.TradingCore.Candle last15 = c15.get(c15.size() - 1);
         double price = last15.close;
-        if (price <= 0) return reject("ls_invalid_price");
+        if (price <= 0) return reject("ep_invalid_price");
 
         double atr14 = com.bot.TradingCore.atr(c15, 14);
-        if (atr14 <= 0) return reject("ls_invalid_atr");
+        if (atr14 <= 0) return reject("ep_invalid_atr");
         double atrPct = atr14 / price;
-        if (atrPct < 0.003) return reject("ls_atr_too_low");
-        if (atrPct > 0.05) return reject("ls_atr_too_high");
+        if (atrPct < 0.003) return reject("ep_atr_too_low");
+        if (atrPct > 0.050) return reject("ep_atr_too_high");
 
-        // [2026-05-25 RELAX v2] Two swing windows проверяются НЕЗАВИСИМО.
-        // Любой из 4 sweep-паттернов триггерит вход (sweep wide OR short, single OR two-bar).
+        // ─── 1. HTF TREND DETECTION (1h) ───
+        // Используем 3-vote scoring чтобы поймать тренд даже в slightly-trending рынке.
+        // Старый strict gate (price И ema20 ОБА выше ema50 на 0.1%) терял много trade-ablе
+        // setup'ов в крипте 2026 где тренды менее чёткие чем в 2021.
+        double ema20_1h = ema(c1h, 20);
+        double ema50_1h = ema(c1h, 50);
+        double price1h  = c1h.get(c1h.size() - 1).close;
+        if (ema20_1h <= 0 || ema50_1h <= 0) return reject("ep_no_htf_emas");
+
+        int bullVotes = 0, bearVotes = 0;
+        // Vote 1: price vs EMA50 (главный долгосрочный фильтр)
+        if (price1h > ema50_1h * 1.0010) bullVotes++;
+        else if (price1h < ema50_1h * 0.9990) bearVotes++;
+        // Vote 2: EMA20 vs EMA50 (структурный наклон)
+        if (ema20_1h > ema50_1h) bullVotes++;
+        else if (ema20_1h < ema50_1h) bearVotes++;
+        // Vote 3: 10-bar slope EMA20 (momentum)
+        if (c1h.size() >= 11) {
+            double e20_old = ema(c1h.subList(0, c1h.size() - 10), 20);
+            if (e20_old > 0) {
+                double slope = (ema20_1h - e20_old) / e20_old;
+                if (slope > 0.003) bullVotes++;
+                else if (slope < -0.003) bearVotes++;
+            }
+        }
+        boolean htfBull = bullVotes >= 2 && bullVotes > bearVotes;
+        boolean htfBear = bearVotes >= 2 && bearVotes > bullVotes;
+        if (!htfBull && !htfBear) return reject("ep_htf_flat");
+
+        // ─── 2. PULLBACK DETECTION (15m, EMA20) ───
+        double ema20_15m = ema(c15, 20);
+        if (ema20_15m <= 0) return reject("ep_no_ltf_ema");
+
         int n = c15.size();
-        int fromWide = Math.max(0, n - 23), toWide = n - 3;
-        int fromShort = Math.max(0, n - 10), toShort = n - 2;
-        if (toWide <= fromWide || toShort <= fromShort) return reject("ls_no_swing_window");
-
-        double swingHighWide = Double.NEGATIVE_INFINITY, swingLowWide = Double.POSITIVE_INFINITY;
-        for (int i = fromWide; i < toWide; i++) {
-            swingHighWide = Math.max(swingHighWide, c15.get(i).high);
-            swingLowWide = Math.min(swingLowWide, c15.get(i).low);
+        int lookback = Math.min(6, n - 1);
+        boolean touchedEma = false;
+        for (int i = n - lookback; i < n - 1; i++) {  // не включаем текущий бар
+            com.bot.TradingCore.Candle b = c15.get(i);
+            if (htfBull && b.low <= ema20_15m * 1.0025) { touchedEma = true; break; }
+            if (htfBear && b.high >= ema20_15m * 0.9975) { touchedEma = true; break; }
         }
-        double swingHighShort = Double.NEGATIVE_INFINITY, swingLowShort = Double.POSITIVE_INFINITY;
-        for (int i = fromShort; i < toShort; i++) {
-            swingHighShort = Math.max(swingHighShort, c15.get(i).high);
-            swingLowShort = Math.min(swingLowShort, c15.get(i).low);
-        }
-        if (swingHighWide <= 0 || swingLowWide <= 0) return reject("ls_no_swing");
+        if (!touchedEma) return reject("ep_no_pullback_touch");
 
-        com.bot.TradingCore.Candle prev15 = n >= 2 ? c15.get(n - 2) : last15;
-
-        // Helper lambda для проверки sweep уровня X в режиме single/two-bar
-        // sweepLow(X): low пробил X И close выше X
-        // 4 паттерна на каждую сторону: {wide,short} × {single-bar, two-bar}
-
-        boolean swLowWideSingle = last15.low < swingLowWide * 0.9990
-                && last15.close > swingLowWide * 1.0002;
-        boolean swLowWideTwoBar = prev15.low < swingLowWide * 0.9990
-                && prev15.close < swingLowWide * 1.0000
-                && last15.close > swingLowWide * 1.0002;
-        boolean swLowShortSingle = last15.low < swingLowShort * 0.9990
-                && last15.close > swingLowShort * 1.0002;
-        boolean swLowShortTwoBar = prev15.low < swingLowShort * 0.9990
-                && prev15.close < swingLowShort * 1.0000
-                && last15.close > swingLowShort * 1.0002;
-
-        boolean swHighWideSingle = last15.high > swingHighWide * 1.0010
-                && last15.close < swingHighWide * 0.9998;
-        boolean swHighWideTwoBar = prev15.high > swingHighWide * 1.0010
-                && prev15.close > swingHighWide * 1.0000
-                && last15.close < swingHighWide * 0.9998;
-        boolean swHighShortSingle = last15.high > swingHighShort * 1.0010
-                && last15.close < swingHighShort * 0.9998;
-        boolean swHighShortTwoBar = prev15.high > swingHighShort * 1.0010
-                && prev15.close > swingHighShort * 1.0000
-                && last15.close < swingHighShort * 0.9998;
-
-        boolean sweptLow = swLowWideSingle || swLowWideTwoBar
-                || swLowShortSingle || swLowShortTwoBar;
-        boolean sweptHigh = swHighWideSingle || swHighWideTwoBar
-                || swHighShortSingle || swHighShortTwoBar;
-
-        if (!sweptLow && !sweptHigh) return reject("ls_no_sweep");
-        if (sweptLow && sweptHigh) return reject("ls_ambiguous_sweep");
-
-        boolean wantLong = sweptLow;
-        // Track WHICH swing was swept (для SL и flag)
-        double sweptLevel = wantLong
-                ? (swLowWideSingle || swLowWideTwoBar ? swingLowWide : swingLowShort)
-                : (swHighWideSingle || swHighWideTwoBar ? swingHighWide : swingHighShort);
-
-        // [2026-05-25 RELAX] V-shape wick 45% → 35%. На последнем sweep-баре.
-        // 45% = только идеальные hammer candles. 35% = реалистичный диапазон.
-        double range = last15.high - last15.low;
-        if (range <= 0) return reject("ls_zero_range");
-        double wickPct;
+        // ─── 3. ENTRY BAR CONFIRMATION ───
+        boolean wantLong = htfBull;
+        boolean entryBarOk;
         if (wantLong) {
-            double lowerWick = Math.min(last15.open, last15.close) - last15.low;
-            wickPct = lowerWick / range;
-            if (wickPct < 0.35) return reject("ls_no_v_reversal");
+            entryBarOk = last15.close > last15.open                    // bullish candle
+                    && last15.close > ema20_15m                         // back above EMA20
+                    && last15.close > c15.get(n - 2).close;             // higher close
         } else {
-            double upperWick = last15.high - Math.max(last15.open, last15.close);
-            wickPct = upperWick / range;
-            if (wickPct < 0.35) return reject("ls_no_inv_reversal");
+            entryBarOk = last15.close < last15.open                    // bearish candle
+                    && last15.close < ema20_15m                         // back below EMA20
+                    && last15.close < c15.get(n - 2).close;             // lower close
         }
+        if (!entryBarOk) return reject("ep_no_entry_confirm");
 
-        // [2026-05-25 RELAX] Volume 1.4× → 1.2×. Sweep часто идёт постепенно,
-        // не нужен явный спайк — достаточно volume выше среднего.
-        double volSma20 = tpComputeVolSma(c15, 20);
-        if (volSma20 <= 0) return reject("ls_no_vol_data");
-        double volRatio = last15.volume / volSma20;
-        if (volRatio < 1.2) return reject("ls_low_volume");
+        // ─── 4. NOT EXTENDED (избегаем chase после длинного движения) ───
+        int sameDirCount = 0;
+        for (int i = n - 7; i < n - 1; i++) {
+            if (i < 0) continue;
+            boolean bull = c15.get(i).close > c15.get(i).open;
+            if (wantLong && bull) sameDirCount++;
+            if (!wantLong && !bull) sameDirCount++;
+        }
+        if (sameDirCount >= 5) return reject("ep_extended_move");
 
-        // BTC regime gate
+        // ─── 5. VOLUME SANITY (не мертвый рынок) ───
+        double volSma = tpComputeVolSma(c15, 20);
+        if (volSma <= 0) return reject("ep_no_vol_data");
+        double volRatio = last15.volume / volSma;
+        if (volRatio < 0.7) return reject("ep_low_volume");
+
+        // ─── 6. BTC GLOBAL REGIME GATE ───
         com.bot.GlobalImpulseController.GlobalContext btc =
                 (gicRef != null) ? gicRef.getContext() : null;
         if (btc != null) {
-            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC) return reject("ls_btc_panic");
-            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH) return reject("ls_btc_crash");
-            if (wantLong && btc.onlyShort) return reject("ls_only_short");
-            if (!wantLong && btc.onlyLong) return reject("ls_only_long");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC)
+                return reject("ep_btc_panic");
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH)
+                return reject("ep_btc_crash");
+            if (wantLong && btc.onlyShort) return reject("ep_only_short");
+            if (!wantLong && btc.onlyLong) return reject("ep_only_long");
         }
 
-        // HTF context (soft) — блокирует только если СИЛЬНО против И мало volume
-        int htfTrend = tpDetectTrendDirection(c1h, c2h);
-        if (wantLong && htfTrend < 0 && volRatio < 2.0) return reject("ls_long_vs_bear_htf");
-        if (!wantLong && htfTrend > 0 && volRatio < 2.0) return reject("ls_short_vs_bull_htf");
-
-        // Funding sanity
+        // ─── 7. FUNDING SANITY (extreme funding часто == reversal) ───
         FundingOIData fr = fundingCache.get(symbol);
         if (fr != null && fr.isValid()) {
-            if (wantLong && fr.fundingRate > 0.0010) return reject("ls_funding_long_crowded");
-            if (!wantLong && fr.fundingRate < -0.0010) return reject("ls_funding_short_crowded");
+            if (wantLong && fr.fundingRate > 0.0015) return reject("ep_funding_long_crowded");
+            if (!wantLong && fr.fundingRate < -0.0015) return reject("ep_funding_short_crowded");
         }
 
-        // SL placement: за наименьшим low обоих баров (для two-bar pattern) + 0.15ATR
+        // ─── 8. STOP LOSS = swing low/high последних 3 баров ± 0.3 ATR ───
         double sl;
         if (wantLong) {
-            double wickLow = Math.min(last15.low, prev15.low);
-            sl = wickLow - atr14 * 0.15;
+            double swLo = Double.POSITIVE_INFINITY;
+            for (int i = Math.max(0, n - 4); i < n; i++) swLo = Math.min(swLo, c15.get(i).low);
+            sl = swLo - atr14 * 0.3;
         } else {
-            double wickHigh = Math.max(last15.high, prev15.high);
-            sl = wickHigh + atr14 * 0.15;
+            double swHi = Double.NEGATIVE_INFINITY;
+            for (int i = Math.max(0, n - 4); i < n; i++) swHi = Math.max(swHi, c15.get(i).high);
+            sl = swHi + atr14 * 0.3;
         }
         double slDist = Math.abs(price - sl);
         double slPct = slDist / price;
-        if (slPct < 0.003) return reject("ls_sl_too_tight");
-        if (slPct > 0.020) return reject("ls_sl_too_wide");
+        if (slPct < 0.0030) return reject("ep_sl_too_tight");
+        if (slPct > 0.0250) return reject("ep_sl_too_wide");
 
-        // [2026-05-25] TP2 3.0R → 2.0R. Альты в 2026 редко делают 3R движение за 3h.
-        // Avg win был ~1R при WR 33% = -EV. С TP2=2R hit rate должен подскочить с 30% до 55%+.
+        // ─── 9. TP TARGETS (1R partial / 2R final) ───
+        double tp1 = wantLong ? price + slDist * 1.0 : price - slDist * 1.0;
         double tp2 = wantLong ? price + slDist * 2.0 : price - slDist * 2.0;
 
-        // Probability scoring
-        double prob01 = 0.62;
-        if (volRatio > 2.5) prob01 += 0.06;
-        if (volRatio > 4.0) prob01 += 0.04;
-        if (htfTrend == 0) prob01 += 0.03;
-        if ((wantLong && htfTrend > 0) || (!wantLong && htfTrend < 0)) prob01 += 0.05;
-        if (tpIsMajorCoin(symbol)) prob01 += 0.05;
-        if (btc != null && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.03;
+        // ─── 10. PROBABILITY SCORING ───
+        double prob01 = 0.60;
+        // Сильный HTF тренд (price выше EMA50 на 1%+) → +
+        double htfStrength = Math.abs(price1h - ema50_1h) / ema50_1h;
+        if (htfStrength > 0.015) prob01 += 0.05;
+        if (htfStrength > 0.030) prob01 += 0.04;
+        // Volume bonus
+        if (volRatio > 1.2) prob01 += 0.04;
+        if (volRatio > 2.0) prob01 += 0.03;
+        // Major coin (более ликвидные = надёжнее)
+        if (tpIsMajorCoin(symbol)) prob01 += 0.04;
+        // BTC aligned
+        if (btc != null) {
+            if (wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_UP) prob01 += 0.04;
+            if (!wantLong && btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_STRONG_DOWN) prob01 += 0.04;
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.02;
+        }
+        // Contra-funding (часто signals smart money positioning)
         if (fr != null && fr.isValid()) {
-            boolean frContra = (wantLong && fr.fundingRate < -0.0001) || (!wantLong && fr.fundingRate > 0.0001);
-            if (frContra) prob01 += 0.04;
+            boolean frContra = (wantLong && fr.fundingRate < 0)
+                    || (!wantLong && fr.fundingRate > 0);
+            if (frContra) prob01 += 0.03;
         }
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
+        // ─── 11. BUILD IDEA ───
         List<String> flags = new ArrayList<>();
-        flags.add("SWEEP_RECLAIM");
-        flags.add(wantLong ? "CLUSTER_STR_SWEEP_LOW" : "CLUSTER_STR_SWEEP_HIGH");
-        flags.add("CLUSTER_VOL");
-        flags.add("CLUSTER_HTF_" + (htfTrend > 0 ? "BULL" : htfTrend < 0 ? "BEAR" : "NEUTRAL"));
-        flags.add(String.format("SWEEP=%.6f", sweptLevel));
-        flags.add(String.format("WICK=%.0f%%", wickPct * 100));
+        flags.add("EMA_PULLBACK");
+        flags.add(wantLong ? "CLUSTER_STR_BULL_TREND" : "CLUSTER_STR_BEAR_TREND");
+        flags.add("CLUSTER_HTF_" + (htfBull ? "BULL" : "BEAR"));
+        flags.add("CLUSTER_LTF_REVERSAL");
+        flags.add(String.format("EMA20_15=%.6f", ema20_15m));
+        flags.add(String.format("EMA50_1h=%.6f", ema50_1h));
+        flags.add(String.format("HTF_STR=%.2f%%", htfStrength * 100));
         flags.add(String.format("VOL=%.1fx", volRatio));
         flags.add(String.format("ATR=%.2f%%", atrPct * 100));
         if (btc != null) flags.add("BTC_" + btc.regime.name());
@@ -1941,8 +1975,6 @@ public final class DecisionEngineMerged {
         double frDelta = (fr != null && fr.isValid()) ? fr.fundingDelta : 0.0;
         double oiCh    = (fr != null && fr.isValid()) ? fr.oiChange1h   : 0.0;
 
-        // [2026-05-25] tp1Mult=1.5→1.0, tp2Mult=3.0→2.0. RR теперь 1:2.
-        // Breakeven WR = 33%, текущий WR 33% — на границе. Если WR подрастёт до 38%+ → плюс.
         TradeIdea idea = new TradeIdea(
                 symbol, side, price, sl, tp2, 2.0,
                 probability, flags, frRate, frDelta, oiCh,
