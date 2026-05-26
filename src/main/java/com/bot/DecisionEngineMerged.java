@@ -2094,41 +2094,9 @@ public final class DecisionEngineMerged {
             // [v8.4] OI bonus убран (v9.0 регрессия)
         }
 
-        // [v9.1 GLOBAL] VOLUME PROFILE BONUS — institutional level confluence.
-        // Если breakout произошёл рядом с VPOC/VAH/VAL = institutional acceptance.
-        // Это РЕАЛЬНЫЙ edge — smart money защищает свои levels.
-        // НЕ hard filter — только probability bonus чтобы не сломать v8.4.
-        try {
-            int vpBars = Math.min(c15.size(), 96);  // last 24h на 15m
-            com.bot.TradingCore.VolumeProfileResult vp =
-                    com.bot.TradingCore.volumeProfile(c15.subList(c15.size() - vpBars, c15.size()), 30);
-            if (vp.vpoc > 0 && vp.vah > 0 && vp.val > 0) {
-                if (wantLong) {
-                    // LONG bonus: break above VAH = acceptance up (institutional confirmation)
-                    if (price > vp.vah * 1.001) prob01 += 0.03;
-                    // Bonus: price near VPOC (within 0.3%) = strong magnet support
-                    if (Math.abs(price - vp.vpoc) / vp.vpoc < 0.003) prob01 += 0.02;
-                    // Bonus: VAL was held as support recently (price was above VAL last 10 bars)
-                    boolean valHeld = true;
-                    for (int i = Math.max(0, n - 10); i < n; i++) {
-                        if (c15.get(i).low < vp.val * 0.998) { valHeld = false; break; }
-                    }
-                    if (valHeld) prob01 += 0.02;
-                } else {
-                    // SHORT bonus: break below VAL = acceptance down
-                    if (price < vp.val * 0.999) prob01 += 0.03;
-                    if (Math.abs(price - vp.vpoc) / vp.vpoc < 0.003) prob01 += 0.02;
-                    // VAH was held as resistance recently
-                    boolean vahHeld = true;
-                    for (int i = Math.max(0, n - 10); i < n; i++) {
-                        if (c15.get(i).high > vp.vah * 1.002) { vahHeld = false; break; }
-                    }
-                    if (vahHeld) prob01 += 0.02;
-                }
-            }
-        } catch (Throwable ignore) {
-            // Volume Profile computation failed — silently skip bonus (safe fallback)
-        }
+        // [v9.2] VP bonus убран — v9.1 регрессия (-1.33% vs +5.23% baseline).
+        // VP пушил probability в adaptive TP=3R корзину, но trades не доходили = trail
+        // закрывал на меньших R. Возврат к чистому v8.4 baseline.
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
@@ -2190,14 +2158,14 @@ public final class DecisionEngineMerged {
                 || s.startsWith("TON") || s.startsWith("DOT") || s.startsWith("MATIC")) {
             return true;
         }
-        // Tier 2 — top 30 by Binance Futures volume (added v8.2)
+        // Tier 2 — proven liquid coins (v9.2: убраны ICP/FET/RNDR/STX/ALGO как
+        // наиболее волатильные/манипулируемые — давали worst WR в backtest)
         return s.startsWith("LTC") || s.startsWith("BCH") || s.startsWith("TRX")
                 || s.startsWith("ATOM") || s.startsWith("UNI") || s.startsWith("AAVE")
                 || s.startsWith("NEAR") || s.startsWith("APT") || s.startsWith("SUI")
                 || s.startsWith("OP") || s.startsWith("ARB") || s.startsWith("INJ")
                 || s.startsWith("FIL") || s.startsWith("HBAR") || s.startsWith("XLM")
-                || s.startsWith("ETC") || s.startsWith("ICP") || s.startsWith("FET")
-                || s.startsWith("RNDR") || s.startsWith("STX") || s.startsWith("ALGO");
+                || s.startsWith("ETC");
     }
 
     // [v8.4 CLEANUP] Удалены dead helpers от старой Sweep+Reclaim стратегии:
