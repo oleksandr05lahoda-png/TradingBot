@@ -1902,9 +1902,8 @@ public final class DecisionEngineMerged {
         double volSma = tpComputeVolSma(c15, 20);
         if (volSma <= 0) return reject("vcb_no_vol_data");
         double volRatio = last15.volume / volSma;
-        // [v8.6] Volume 1.7× → 1.8× SMA20. Чуть строже = более явный
-        // institutional engagement, стабилизирует WR floor на ~50%.
-        if (volRatio < 1.8) return reject("vcb_no_volume");
+        // [v9.1] ОТКАТ Volume 1.8 → 1.7 (v8.6 ухудшил). Это baseline v8.4.
+        if (volRatio < 1.7) return reject("vcb_no_volume");
 
         // Volume acceleration check
         double prev3VolAvg = 0;
@@ -2093,6 +2092,42 @@ public final class DecisionEngineMerged {
             if (wantLong && fr.fundingRate < -0.0008) prob01 += 0.03;   // very crowded
             if (!wantLong && fr.fundingRate > 0.0008) prob01 += 0.03;
             // [v8.4] OI bonus убран (v9.0 регрессия)
+        }
+
+        // [v9.1 GLOBAL] VOLUME PROFILE BONUS — institutional level confluence.
+        // Если breakout произошёл рядом с VPOC/VAH/VAL = institutional acceptance.
+        // Это РЕАЛЬНЫЙ edge — smart money защищает свои levels.
+        // НЕ hard filter — только probability bonus чтобы не сломать v8.4.
+        try {
+            int vpBars = Math.min(c15.size(), 96);  // last 24h на 15m
+            com.bot.TradingCore.VolumeProfileResult vp =
+                    com.bot.TradingCore.volumeProfile(c15.subList(c15.size() - vpBars, c15.size()), 30);
+            if (vp.vpoc > 0 && vp.vah > 0 && vp.val > 0) {
+                if (wantLong) {
+                    // LONG bonus: break above VAH = acceptance up (institutional confirmation)
+                    if (price > vp.vah * 1.001) prob01 += 0.03;
+                    // Bonus: price near VPOC (within 0.3%) = strong magnet support
+                    if (Math.abs(price - vp.vpoc) / vp.vpoc < 0.003) prob01 += 0.02;
+                    // Bonus: VAL was held as support recently (price was above VAL last 10 bars)
+                    boolean valHeld = true;
+                    for (int i = Math.max(0, n - 10); i < n; i++) {
+                        if (c15.get(i).low < vp.val * 0.998) { valHeld = false; break; }
+                    }
+                    if (valHeld) prob01 += 0.02;
+                } else {
+                    // SHORT bonus: break below VAL = acceptance down
+                    if (price < vp.val * 0.999) prob01 += 0.03;
+                    if (Math.abs(price - vp.vpoc) / vp.vpoc < 0.003) prob01 += 0.02;
+                    // VAH was held as resistance recently
+                    boolean vahHeld = true;
+                    for (int i = Math.max(0, n - 10); i < n; i++) {
+                        if (c15.get(i).high > vp.vah * 1.002) { vahHeld = false; break; }
+                    }
+                    if (vahHeld) prob01 += 0.02;
+                }
+            }
+        } catch (Throwable ignore) {
+            // Volume Profile computation failed — silently skip bonus (safe fallback)
         }
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
