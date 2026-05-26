@@ -1951,13 +1951,12 @@ public final class DecisionEngineMerged {
         double rsi1hNow = rsi1h[rsi1hN - 1];
         if (wantLong && rsi1hNow < 48) return reject("vcb_htf_rsi_bear");
         if (!wantLong && rsi1hNow > 52) return reject("vcb_htf_rsi_bull");
-        // [v9.0] RSI slope усилен -2.0 → -3.0 / +2.0 → +3.0 pts.
-        // Жёстче фильтр momentum exhaustion на HTF.
+        // [v8.4] RSI slope -2.0/+2.0 (v9.0 -3 был хуже)
         if (rsi1hN >= 4) {
             double rsi1hPrev3 = rsi1h[rsi1hN - 4];
             double rsiSlope = rsi1hNow - rsi1hPrev3;
-            if (wantLong && rsiSlope < -3.0) return reject("vcb_htf_rsi_falling");
-            if (!wantLong && rsiSlope > 3.0) return reject("vcb_htf_rsi_rising");
+            if (wantLong && rsiSlope < -2.0) return reject("vcb_htf_rsi_falling");
+            if (!wantLong && rsiSlope > 2.0) return reject("vcb_htf_rsi_rising");
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -2048,9 +2047,8 @@ public final class DecisionEngineMerged {
         // Strong squeeze (current bandwidth very low) → higher quality breakout
         if (bb.bandwidthPctile <= 0.10) prob01 += 0.04;
         else if (bb.bandwidthPctile <= 0.15) prob01 += 0.02;
-        // [v9.0] Squeeze DURATION bonus — long compression = stronger accumulation
-        if (squeezeDuration >= 4) prob01 += 0.03;
-        else if (squeezeDuration >= 2) prob01 += 0.02;
+        // [v8.4] Squeeze duration tracked for telegram flag debug (см. flag SQZ_DUR),
+        // bonus убран т.к. v9.0 (с bonus) дал хуже чем v8.4 без.
         // Strong volume
         if (volRatio >= 2.0) prob01 += 0.04;
         if (volRatio >= 3.5) prob01 += 0.03;
@@ -2092,19 +2090,13 @@ public final class DecisionEngineMerged {
             if (!wantLong && fr.fundingRate > 0.0003) prob01 += 0.04;   // longs crowded
             if (wantLong && fr.fundingRate < -0.0008) prob01 += 0.03;   // very crowded
             if (!wantLong && fr.fundingRate > 0.0008) prob01 += 0.03;
-            // [v9.0] Open Interest trend bonus — OI растёт в нашу сторону = real flow.
-            // oiChange1h в процентах. +1% OI на нашей стороне за час = institutional accumulation.
-            if (wantLong && fr.oiChange1h > 0.01) prob01 += 0.02;
-            if (wantLong && fr.oiChange1h > 0.025) prob01 += 0.02;
-            if (!wantLong && fr.oiChange1h < -0.01) prob01 += 0.02;
-            if (!wantLong && fr.oiChange1h < -0.025) prob01 += 0.02;
+            // [v8.4] OI bonus убран (v9.0 регрессия)
         }
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
-        // [v8.5] Adaptive TP threshold 0.72 → 0.70. Чуть больше high-prob trades
-        // попадут в TP2=3.0R. Trail защищает после TP1, риск минимален.
-        double tp2Mult = prob01 >= 0.70 ? 3.0 : 2.2;
+        // [v8.4] Adaptive TP threshold 0.72 (v8.5 0.70 был хуже).
+        double tp2Mult = prob01 >= 0.72 ? 3.0 : 2.2;
         double tp2 = wantLong ? price + slDist * tp2Mult : price - slDist * tp2Mult;
 
         // ═══════════════════════════════════════════════════════════════
