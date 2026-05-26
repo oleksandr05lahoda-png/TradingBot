@@ -1902,7 +1902,9 @@ public final class DecisionEngineMerged {
         double volSma = tpComputeVolSma(c15, 20);
         if (volSma <= 0) return reject("vcb_no_vol_data");
         double volRatio = last15.volume / volSma;
-        if (volRatio < 1.7) return reject("vcb_no_volume");
+        // [v8.6] Volume 1.7× → 1.8× SMA20. Чуть строже = более явный
+        // institutional engagement, стабилизирует WR floor на ~50%.
+        if (volRatio < 1.8) return reject("vcb_no_volume");
 
         // Volume acceleration check
         double prev3VolAvg = 0;
