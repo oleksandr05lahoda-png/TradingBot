@@ -484,6 +484,36 @@ public final class BotMain {
                     effMinClusters = MIN_CLUSTERS_AFTER_WARMUP;
                     regimeLabel = "trend";
                 }
+
+                // [v9.8 2026-05-28] AUTO-THROTTLE на drawdown — foundation для big-capital safety.
+                // Когда live WR за всю историю (≥30 trades) падает ниже healthy levels, бот
+                // автоматически становится консервативнее: поднимает effMinConf, пропускает
+                // только high-confidence setups. Это safety net для real money: если edge
+                // исчезает (regime shift / strategy degradation), bot самозащищается без
+                // user intervention. Когда WR восстанавливается — gate auto-resets.
+                //
+                // Thresholds calibrated:
+                //   WR < 35% (catastrophic): +6pp gate. Только perfect setups.
+                //   WR 35-40% (degraded):    +3pp gate. Conservative mode.
+                //   WR ≥ 45% (healthy):      no throttle.
+                //   WR 40-45%:               soft +1pp (border zone).
+                int liveTradeCount = isc.getTotalTradeCount();
+                if (liveTradeCount >= 30) {
+                    double liveWr = isc.getOverallWinRate();
+                    double throttleBoost = 0;
+                    if (liveWr < 0.35) {
+                        throttleBoost = 6.0;
+                        regimeLabel += "/THROTTLE_HARD";
+                    } else if (liveWr < 0.40) {
+                        throttleBoost = 3.0;
+                        regimeLabel += "/THROTTLE_MILD";
+                    } else if (liveWr < 0.45) {
+                        throttleBoost = 1.0;
+                        regimeLabel += "/THROTTLE_SOFT";
+                    }
+                    effMinConf += throttleBoost;
+                }
+
                 if (idea.probability < effMinConf || _clusters < effMinClusters) {
                     blockedByGate.incrementAndGet();
                     blockedQuality.incrementAndGet();
