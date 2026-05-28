@@ -140,7 +140,8 @@ public final class BotMain {
     private static volatile long lastSignalMs       = 0;
     private static volatile long lastCycleSuccessMs = 0;
     private static volatile long lastStatsSuccessMs = 0;
-    private static final long SIGNAL_DROUGHT_MS = 3 * 60 * 60_000L;
+    // [v9.9 2026-05-29] SIGNAL_DROUGHT 3h → 12h — reduce spam, тихий рынок не новость
+    private static final long SIGNAL_DROUGHT_MS = 12 * 60 * 60_000L;
     private static final AtomicBoolean droughtAnnounced = new AtomicBoolean(false);
     private static volatile long lastInfraAlertMs = 0;
     private static final long INFRA_ALERT_COOLDOWN_MS = 60 * 60_000L;
@@ -1504,6 +1505,42 @@ public final class BotMain {
                         fr.symbol, fr.forecastBias, outcome, calWeight, correct ? "✅" : "❌",
                         acc, correct2, total,
                         forecastAmbiguous.get(), forecastTimeStop.get()));
+
+                // [v9.9 2026-05-29] TRADE OUTCOME NOTIFICATION — user-facing.
+                // Раньше user видел signal в Telegram, потом ничего пока не
+                // приходил Daily Integrity Report. Теперь сразу как verifier
+                // resolved outcome — short Telegram с результатом, движением
+                // цены, cumulative WR. Это replaces spam heartbeats (которые
+                // теперь только каждые 6h).
+                try {
+                    boolean isLong = fr.side == com.bot.TradingCore.Side.LONG;
+                    double pnlPct = isLong
+                            ? (currentPrice - fr.entryPrice) / fr.entryPrice * 100.0
+                            : (fr.entryPrice - currentPrice) / fr.entryPrice * 100.0;
+                    String emoji;
+                    String outcomeLabel;
+                    switch (outcome) {
+                        case "TP1":       emoji = "✅"; outcomeLabel = "TP1 HIT";        break;
+                        case "SL":        emoji = "❌"; outcomeLabel = "SL HIT";         break;
+                        case "AMBIGUOUS": emoji = "🟡"; outcomeLabel = "AMBIGUOUS (½)"; break;
+                        case "TIME_STOP": emoji = "⏳"; outcomeLabel = "TIME-STOP";      break;
+                        default:          emoji = "⚪"; outcomeLabel = outcome;
+                    }
+                    String durationMin = String.valueOf(fr.ageMs() / 60_000L);
+                    String tradeNotif = String.format(
+                            "%s *%s* — %s %s\n"
+                                    + "Entry: `%.6f` → Exit: `%.6f`\n"
+                                    + "Movement: `%+.2f%%` · Held: %s мин\n"
+                                    + "━━━━━━━━━━━━━━━━━━━\n"
+                                    + "📊 Live WR: *%d/%d (%.0f%%)* · Cal n=%d",
+                            emoji, outcomeLabel, fr.symbol, isLong ? "LONG" : "SHORT",
+                            fr.entryPrice, currentPrice, pnlPct, durationMin,
+                            correct2, total, acc,
+                            com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount());
+                    telegram.sendMessageAsync(tradeNotif);
+                } catch (Throwable notifEx) {
+                    LOG.fine("[FC] notification failed: " + notifEx.getMessage());
+                }
             } catch (Exception ex) {
                 LOG.fine("[FC] Fetch fail: " + fr.symbol + " " + ex.getMessage());
             }
@@ -1687,8 +1724,12 @@ public final class BotMain {
     static volatile String lastBtcRegimeForAlert = null;
 
     private static volatile long lastHeartbeatMs = 0;
-    private static final long HEARTBEAT_INTERVAL_MS = 90 * 60_000L;
-    private static final long HEARTBEAT_QUIET_MS    = 90 * 60_000L;
+    // [v9.9 2026-05-29] HEARTBEAT 90 min → 6h. Раньше каждые 90мин в тихом
+    // рынке шло "💓 Heartbeat" = spam без actionable info. Теперь только
+    // каждые 6h, и только если 6h без signals. Реальная информация о трейдах
+    // приходит через notifyTradeOutcome() при resolution каждого signal.
+    private static final long HEARTBEAT_INTERVAL_MS = 6 * 60 * 60_000L;
+    private static final long HEARTBEAT_QUIET_MS    = 6 * 60 * 60_000L;
 
     private static void maybeSendHeartbeat(com.bot.TelegramBotSender telegram,
                                            com.bot.SignalSender sender,

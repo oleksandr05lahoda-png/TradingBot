@@ -1761,12 +1761,32 @@ public final class DecisionEngineMerged {
             }
         }
 
-        // ═══ SINGLE STRATEGY: TREND PULLBACK [2026-05-25] ═══
+        // ═══ STRATEGY ROUTER ═══
+        // Phase 1 (default): VCB only — proven baseline +3.5%/мес
+        // Phase 4 (opt-in): + Mean Reversion via env MEAN_REV_ENABLED=1
+        // Math к +10%/мес: VCB +3.5% + MR +2-3% + FundingArb +1.5% + ML +2-3% = +9-12%
+
+        // Primary: VCB Squeeze Breakout (validated baseline)
         TradeIdea idea = generateTrendPullback(symbol, c15, c1h, c2h, cat, now);
         if (idea != null) {
             csLastSignalTime.put(symbol, now);
             return idea;
         }
+
+        // [v9.9 2026-05-29] PHASE 4 SKELETON — Mean Reversion для RANGE markets.
+        // ВКЛЮЧАЕТСЯ ТОЛЬКО через env MEAN_REV_ENABLED=1.
+        // Default OFF → 0 impact на baseline.
+        // Включи когда: paper data 50+ VCB signals подтвердил baseline →
+        // backtest показал MR profitable → 2 недели paper test MR alone.
+        // См. roadmap к +10%/мес в memory: project_v92_baseline.md
+        if ("1".equals(System.getenv().getOrDefault("MEAN_REV_ENABLED", "0"))) {
+            TradeIdea mrIdea = generateMeanReversion(symbol, c15, c1h, cat, now);
+            if (mrIdea != null) {
+                csLastSignalTime.put(symbol, now);
+                return mrIdea;
+            }
+        }
+
         return reject("tp_no_setup");
     }
 
@@ -2148,6 +2168,165 @@ public final class DecisionEngineMerged {
                 bias.name(), cat, null, 1.0, tp2Mult, tp2Mult);
         idea.setRobustAtrPct(atrPct);
         idea.setAgreeingClusters(5);
+        return idea;
+    }
+
+    /**
+     * [v9.9 2026-05-29] MEAN REVERSION v1 — RANGE-bound markets strategy.
+     *
+     * DISABLED by default. Enable via env MEAN_REV_ENABLED=1.
+     *
+     * Концепция: VCB работает в trending markets, но crypto часто в RANGE
+     * (ADX<22, BB wide). В range market VCB генерирует мало signals → bot idle.
+     * Mean Reversion ловит BB extreme touches в этих режимах = complementary
+     * strategy without competing с VCB.
+     *
+     * SETUP LONG (mirror для SHORT):
+     *   1. Market RANGE: ADX_15m < 22 AND ADX_1h < 25
+     *   2. NOT in squeeze: bandwidthPctile > 0.30 (squeeze = VCB territory)
+     *   3. BB lower touch: percentB < 0.05 (price near/below lower BB)
+     *   4. RSI extreme: RSI(14) < 35 (oversold)
+     *   5. Normal volume: volRatio 0.5-1.5 (not breakout volume)
+     *   6. ATR sanity: 0.5% - 5%
+     *   7. BTC regime: not PANIC/CRASH, not onlyShort blocks
+     *
+     * RISK:
+     *   - SL = lower_BB - ATR×0.5 (beyond extreme + buffer)
+     *   - TP = mid_BB (revert to mean)
+     *   - R:R typically 1.3-1.8 (lower than VCB)
+     *   - Position size 50% от VCB (untested)
+     *
+     * EXPECTED (math):
+     *   - 30-50 signals/мес в range periods
+     *   - WR target 50-55%
+     *   - R:R 1:1.5 avg → expectancy +0.25R/trade
+     *   - Monthly contribution: +2-3%/мес NetPnL
+     *
+     * SAFETY:
+     *   - Returns null если все filters не passed (no signal)
+     *   - Lower prob cap 0.78 (vs VCB 0.85) пока не validated
+     *   - Cross-strategy cooldown shared (csLastSignalTime)
+     */
+    private TradeIdea generateMeanReversion(String symbol,
+                                            List<com.bot.TradingCore.Candle> c15,
+                                            List<com.bot.TradingCore.Candle> c1h,
+                                            CoinCategory cat,
+                                            long now) {
+        // Pre-filters (same conservative gating как VCB)
+        if (cat == CoinCategory.MEME) return null;
+        if (c15 == null || c15.size() < 100) return null;
+        if (c1h == null || c1h.size() < 50) return null;
+        if (!tpIsMajorCoin(symbol) && cat != CoinCategory.TOP) return null;
+
+        int n = c15.size();
+        com.bot.TradingCore.Candle last15 = c15.get(n - 1);
+        double price = last15.close;
+        if (price <= 0) return null;
+
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return null;
+        double atrPct = atr14 / price;
+        if (atrPct < 0.005 || atrPct > 0.05) return null;
+
+        // ── 1. RANGE REGIME (ADX low on both 15m and 1h)
+        com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
+        if (adxR.adx > 22) return null;
+        com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
+        if (adx1h.adx > 25) return null;
+
+        // ── 2. NOT in squeeze (squeeze = VCB territory)
+        com.bot.TradingCore.BollingerSqueeze bb =
+                com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
+        if (bb.upper <= 0 || bb.lower <= 0) return null;
+        if (bb.bandwidthPctile < 0.30) return null;
+
+        // ── 3. BB EXTREME TOUCH
+        double pctB = (price - bb.lower) / Math.max(1e-9, bb.upper - bb.lower);
+        boolean upperTouch = pctB > 0.95;
+        boolean lowerTouch = pctB < 0.05;
+        if (!upperTouch && !lowerTouch) return null;
+        boolean wantLong = lowerTouch;
+
+        // ── 4. RSI EXTREME confirmation
+        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
+        double rsiNow = rsi[n - 1];
+        if (wantLong && rsiNow > 35) return null;
+        if (!wantLong && rsiNow < 65) return null;
+
+        // ── 5. NORMAL volume (not breakout — that's VCB)
+        double volSma = tpComputeVolSma(c15, 20);
+        if (volSma <= 0) return null;
+        double volRatio = last15.volume / volSma;
+        if (volRatio > 1.5) return null;
+        if (volRatio < 0.4) return null; // dead market, no liquidity
+
+        // ── 6. BTC REGIME guard
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC) return null;
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH) return null;
+            if (wantLong && btc.onlyShort) return null;
+            if (!wantLong && btc.onlyLong) return null;
+        }
+
+        // ── RISK
+        // SL beyond BB extreme + ATR×0.5 buffer
+        // TP back to midBB
+        double sl;
+        double tp;
+        if (wantLong) {
+            sl = bb.lower - atr14 * 0.5;
+            tp = bb.mid;
+        } else {
+            sl = bb.upper + atr14 * 0.5;
+            tp = bb.mid;
+        }
+        double slDist = Math.abs(price - sl);
+        double tpDist = Math.abs(tp - price);
+        if (slDist < 1e-9 || tpDist < 1e-9) return null;
+        double slPct = slDist / price;
+        if (slPct < 0.005 || slPct > 0.03) return null;
+
+        double rr = tpDist / slDist;
+        if (rr < 1.3) return null;
+
+        // ── PROBABILITY scoring (база 0.55, cap 0.78 — lower чем VCB)
+        double prob01 = 0.55;
+        if (Math.abs(rsiNow - 50) > 30) prob01 += 0.05;
+        if (bb.bandwidthPctile > 0.70) prob01 += 0.03;
+        if (adxR.adx < 18) prob01 += 0.03;
+        if (volRatio < 0.7) prob01 += 0.04;
+        if (tpIsMajorCoin(symbol)) prob01 += 0.03;
+        if (btc != null && btc.regime ==
+                com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.03;
+
+        prob01 = Math.min(0.78, prob01);
+        double probability = prob01 * 100.0;
+
+        // ── BUILD IDEA
+        List<String> flags = new ArrayList<>();
+        flags.add("MEAN_REV_v1");
+        flags.add(wantLong ? "CLUSTER_STR_REVERSAL_UP" : "CLUSTER_STR_REVERSAL_DOWN");
+        flags.add("CLUSTER_HTF_RANGE");
+        flags.add("CLUSTER_MOM_OVERSOLD");
+        flags.add(String.format("BB_PCTB=%.2f", pctB));
+        flags.add(String.format("RSI=%.1f", rsiNow));
+        flags.add(String.format("ADX=%.0f", adxR.adx));
+        flags.add(String.format("VOL=%.1fx", volRatio));
+        flags.add(String.format("ATR=%.2f%%", atrPct * 100));
+        flags.add(String.format("SL=%.2f%%", slPct * 100));
+
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+        double tp2Mult = rr;
+
+        TradeIdea idea = new TradeIdea(
+                symbol, side, price, sl, tp, tp2Mult,
+                probability, flags, 0.0, 0.0, 0.0,
+                "NONE", cat, null, 1.0, tp2Mult, tp2Mult);
+        idea.setRobustAtrPct(atrPct);
+        idea.setAgreeingClusters(4);
         return idea;
     }
 
