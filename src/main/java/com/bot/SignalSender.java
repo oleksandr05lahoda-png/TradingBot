@@ -1521,7 +1521,28 @@ public final class SignalSender {
                 }
             }
 
-            idea = adjustStopForClusters(idea, m15);
+            // [v9.3 2026-05-28] SKIP adjustStopForClusters FOR VCB SIGNALS.
+            // ROOT CAUSE найден: VCB strategy выставляет structural SL (midBB или
+            // ATR×1.4, clamped 0.5-2.5%) от которого TradeIdea ctor рассчитывает
+            // TP1/TP2 пропорционально. adjustStopForClusters расширял SL до swing
+            // low/high (cap ATR×2.2 = до 5.5%), и TradeIdea ctor пересчитывал TP
+            // от нового risk → TP отъезжал на 12-25% дальше plan.
+            //
+            // Эффект в live (6 сигналов, 26-28 мая 2026):
+            //   - SL_ADJ→3.12% при VCB max=2.5% (NEAR), 3.00% (RENDER), 2.81% (FIL)
+            //   - TP2 cap 6-9% вместо backtest 5-6%
+            //   - Time-stops 2/6 = 33% vs backtest 2/48 = 4% (8× регрессия)
+            //   - Live WR 33% vs backtest 52% (на малой выборке)
+            //
+            // ВАЖНО: backtest НЕ применяет adjustStopForClusters (вызывает
+            // engine.analyze напрямую, не через processPair). То есть backtest
+            // +3.54% NetPnL не отражает real live performance — гарантия
+            // вранья. Skip для VCB восстанавливает live↔backtest consistency.
+            //
+            // Откат: убрать !idea.flags.contains("VCB_v8") condition.
+            if (!idea.flags.contains("VCB_v8")) {
+                idea = adjustStopForClusters(idea, m15);
+            }
             idea = applyVpocBarrierGuard(idea, m15);
             if (idea == null) { blockedVpoc.incrementAndGet(); return null; }
 
@@ -2597,6 +2618,14 @@ public final class SignalSender {
 
     private boolean hasLeadBreakout(com.bot.DecisionEngineMerged.TradeIdea idea) {
         if (idea == null || idea.flags == null || idea.flags.isEmpty()) return false;
+        // [v9.7 2026-05-28] VCB_v8 → lead-breakout: VCB сигнал ВСЕГДА является
+        // structural breakout setup (BB squeeze release + volume + HTF align).
+        // Раньше hasLeadBreakout не знал про VCB → VPOC barrier guard мог
+        // блочить VCB-сигналы если они проходили рядом с VPOC. Сейчас VCB
+        // передаёт forecast=null → applyVpocBarrierGuard делает early return,
+        // НО если в будущем добавится forecast — block ловушка активируется.
+        // Defensive fix.
+        if (idea.flags.contains("VCB_v8")) return true;
         if (idea.side == com.bot.TradingCore.Side.LONG) {
             return idea.flags.contains("EARLY_SOLO")
                     || idea.flags.contains("BOS_UP_5M")

@@ -993,6 +993,8 @@ public final class SimpleBacktester {
                 }
             }
 
+            // [v9.6 ОТКАТ 2026-05-28] profitLockBar 0.70→0.85 (sync с PositionTracker).
+            // См. PositionTracker.java комментарий v9.6 ОТКАТ — fix был спекулятивным.
             int profitLockBar = Math.max(1, (int) Math.round(timeStopBars * 0.85));
             if (profitLockEnabled && barsHeld >= profitLockBar && !pos.tp1Hit) {
                 double curR = isLong ? (curC.close - pos.entry) / risk : (pos.entry - curC.close) / risk;

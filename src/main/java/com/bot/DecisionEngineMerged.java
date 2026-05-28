@@ -1941,9 +1941,14 @@ public final class DecisionEngineMerged {
         double ema50_1h = ema(c1h, 50);
         double price1h  = c1h.get(c1h.size() - 1).close;
         if (ema50_1h <= 0) return reject("vcb_no_htf_ema");
-        // Block если HTF сильно против
-        if (wantLong && price1h < ema50_1h * 0.99) return reject("vcb_long_vs_bear_htf");
-        if (!wantLong && price1h > ema50_1h * 1.01) return reject("vcb_short_vs_bull_htf");
+        // [v9.5 2026-05-28] HTF buffer 0.99/1.01 → 0.985/1.015.
+        // ROOT CAUSE: live 5/6 signals были SHORTs в NEUTRAL BTC. HTF filter
+        // 0.99 (1% buffer) асимметрично блокировал LONGs т.к. ALT 1h часто
+        // болтаются на ±0.5-1% от EMA50. 0.985 (1.5% buffer) пропускает
+        // LONG/SHORT setups равномерно в NEUTRAL.
+        // Откат: вернуть 0.99/1.01.
+        if (wantLong && price1h < ema50_1h * 0.985) return reject("vcb_long_vs_bear_htf");
+        if (!wantLong && price1h > ema50_1h * 1.015) return reject("vcb_short_vs_bull_htf");
         // [v7.4] HTF RSI 48/52 + [v8.4] RSI slope direction.
         // RSI должно НЕ ТОЛЬКО иметь правильное значение, но и двигаться в нашу сторону
         // последние 3 бара. RSI slope против нас = momentum exhaust → fade trade.
@@ -2100,8 +2105,14 @@ public final class DecisionEngineMerged {
         prob01 = Math.min(0.85, prob01);
         double probability = prob01 * 100.0;
 
-        // [v8.4] Adaptive TP threshold 0.72 (v8.5 0.70 был хуже).
-        double tp2Mult = prob01 >= 0.72 ? 3.0 : 2.2;
+        // [v9.4 2026-05-28] Adaptive TP threshold 0.72 → 0.78.
+        // ROOT CAUSE: live 4/6 signals дотянулись до prob01≥0.72 (через
+        // SignalOptimizer μ+5..+9 bonus) и попали в TP2=3R корзину.
+        // НИ ОДИН из них не достиг 3R за 180 мин → time-stops.
+        // 0.78 = жёстче gate, только real high-quality setups идут в 3R.
+        // Остальные получают 2.2R что реалистичнее достижимо.
+        // Откат: вернуть 0.72.
+        double tp2Mult = prob01 >= 0.78 ? 3.0 : 2.2;
         double tp2 = wantLong ? price + slDist * tp2Mult : price - slDist * tp2Mult;
 
         // ═══════════════════════════════════════════════════════════════

@@ -312,6 +312,12 @@ public final class PositionTracker {
         // Window position: 0.0 = just opened, 1.0 = at time-stop.
         double agePct = (double) age / Math.max(1L, TIME_STOP_MS);
 
+        // [v9.6 ОТКАТ 2026-05-28] PROFIT_LOCK 0.70→0.85 (вернул к baseline).
+        // Self-review: v9.6 был СПЕКУЛЯТИВНЫМ. Backtest v9.2 показывал profitLock=1/48
+        // (хорошо работает). Понижение порога рисковало закрывать trades, которые
+        // в backtest становились trail-exits с +1.5R+ после TP1. Plus реальные
+        // time-stops в live (curR<0.5) не лечатся PROFIT_LOCK (требует curR≥0.80).
+        // Корневая проблема time-stops закрыта v9.3 (skip adjustStopForClusters).
         if (PROFIT_LOCK_ENABLED && !t.beActivated && agePct >= 0.85 && curR >= 0.80) {
             LOG.info(String.format(
                     "[Tracker] %s PROFIT_LOCK: age=%.0f%% curR=%+.2f maxFav=%.2f → market close",
