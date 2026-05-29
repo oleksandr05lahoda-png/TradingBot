@@ -2227,7 +2227,7 @@ public final class BotMain {
         }
 
         String summary = String.format(
-                "✅ *Стартовый backtest завершён*\n"
+                "✅ *Стартовый backtest завершён* `v80.0-RESTORED+5%%`\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "⏱ Время: %d сек\n"
                         + "📊 Пар обработано: %d\n"
