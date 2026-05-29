@@ -1075,7 +1075,7 @@ public final class BotMain {
             telegram.flushAndShutdown(8000);
         }, "ShutdownHook"));
 
-        LOG.info("═══ TradingBot v79.0 INTEGRITY started " + nowLocalStr()
+        LOG.info("═══ TradingBot v80.0 RESTORED+5% started " + nowLocalStr()
                 + " (first cycle in 90s, OBSERVATION_MODE="
                 + (OBSERVATION_MODE ? "ON/PAPER" : "OFF/LIVE")
                 + ", X-EXCHANGE_CHECK=" + (CROSS_EXCHANGE_VALIDATION ? "ON" : "OFF") + ") ═══");
