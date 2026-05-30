@@ -2005,7 +2005,9 @@ public final class DecisionEngineMerged {
         double ema20_15m = ema(c15, 20);
         double ema50_15m = ema(c15, 50);
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
-        if (adxR.adx < 20) return reject("vcb_adx_flat");
+        // [v80.1 2026-05-29] ADX 20 → 25. VCB needs real trend; ADX=20 пускал fake breakouts
+        // в choppy market (current). ADX=25 = только trending setups. Откат: вернуть 20.
+        if (adxR.adx < 25) return reject("vcb_adx_flat");
         if (wantLong && !adxR.bullish()) return reject("vcb_adx_bearish_di");
         if (!wantLong && !adxR.bearish()) return reject("vcb_adx_bullish_di");
 
