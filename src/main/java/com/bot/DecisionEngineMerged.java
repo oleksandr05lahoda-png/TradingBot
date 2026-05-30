@@ -1923,7 +1923,9 @@ public final class DecisionEngineMerged {
         if (volSma <= 0) return reject("vcb_no_vol_data");
         double volRatio = last15.volume / volSma;
         // [v9.1] ОТКАТ Volume 1.8 → 1.7 (v8.6 ухудшил). Это baseline v8.4.
-        if (volRatio < 1.7) return reject("vcb_no_volume");
+        // [v80.1 2026-05-29] Volume 1.7x → 1.9x. Сильнее volume confirmation = реальный
+        // institutional engagement. В choppy market 1.7x пускал weak breakouts. Откат: 1.7.
+        if (volRatio < 1.9) return reject("vcb_no_volume");
 
         // Volume acceleration check
         double prev3VolAvg = 0;
@@ -1947,9 +1949,9 @@ public final class DecisionEngineMerged {
         // [v7.1] Body 50% → 55%. Сильное тело = реальный momentum
         boolean candleStrong;
         if (wantLong) {
-            candleStrong = last15.close > last15.open && bodyPct > 0.55;
+            candleStrong = last15.close > last15.open && bodyPct > 0.60;
         } else {
-            candleStrong = last15.close < last15.open && bodyPct > 0.55;
+            candleStrong = last15.close < last15.open && bodyPct > 0.60;
         }
         if (!candleStrong) return reject("vcb_weak_candle");
 
