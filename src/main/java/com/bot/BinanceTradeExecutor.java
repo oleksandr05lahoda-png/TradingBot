@@ -1152,6 +1152,17 @@ public final class BinanceTradeExecutor {
             LOG.warning("[Executor] marginType retry failed " + symbol + " " + lastInitErrorBody);
             return false;
         }
+        // [v82.1 2026-06-01] FIX -1109 "Invalid account" на marginType.
+        // ROOT: demo/PM/Multi-Assets аккаунт не даёт менять маржу per-symbol через
+        // классический /fapi/v1/marginType. Баланс при этом читается (ключи валидны).
+        // Раньше -1109 → abort трейда. Теперь: НЕ фатально — торгуем в текущем
+        // режиме маржи аккаунта (как делают prod-боты, не форсящие ISOLATED).
+        if (body.contains("-1109")) {
+            LOG.warning("[Executor] marginType -1109 для " + symbol
+                    + " — НЕ фатально, торгую в текущем режиме маржи аккаунта");
+            lastInitErrorBody = "";
+            return true;
+        }
         // [C5 2026-05-08] Save body so caller can surface real reason in Telegram.
         lastInitErrorBody = "HTTP " + code + ": " + body;
         LOG.warning("[Executor] marginType " + symbol + " " + lastInitErrorBody);
@@ -1174,6 +1185,14 @@ public final class BinanceTradeExecutor {
         if (resp.statusCode() == 200) { lastInitErrorBody = ""; return true; }
         // [C5 2026-05-08] Save body so caller can surface real reason in Telegram.
         String body = resp.body() == null ? "" : resp.body();
+        // [v82.1 2026-06-01] -1109 на leverage тоже НЕ фатально (см. marginType).
+        // Аккаунт в режиме где per-symbol leverage не ставится → торгуем с текущим.
+        if (body.contains("-1109")) {
+            LOG.warning("[Executor] leverage -1109 для " + symbol
+                    + " — НЕ фатально, торгую с текущим плечом аккаунта");
+            lastInitErrorBody = "";
+            return true;
+        }
         lastInitErrorBody = "HTTP " + resp.statusCode() + ": " + body;
         LOG.warning("[Executor] leverage " + symbol + " " + lastInitErrorBody);
         return false;
