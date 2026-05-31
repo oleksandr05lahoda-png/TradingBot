@@ -1906,7 +1906,13 @@ public final class BotMain {
         int legacyBars = envInt("STARTUP_BT_BARS_15M", -1);
         int primaryBarsCfg = (legacyBars > 0 && btIs15m) ? legacyBars
                 : envInt("STARTUP_BT_BARS_PRIMARY", defaultPrimaryBars);
-        final int barsPrimaryTarget = Math.min(6000, Math.max(300, primaryBarsCfg));
+        // [v80.3 2026-05-31] Принудительный floor 2880 баров (30 дней на 15m) для
+        // статистической надёжности. ROOT: 1500 баров = 49 trades = малая выборка →
+        // дикий разброс backtest (−8%..+4.88% на ИДЕНТИЧНОМ коде). 2880 баров =
+        // ~100 trades = стабильное число, отражает РЕАЛЬНЫЙ edge, не lucky window.
+        // Это улучшает ИЗМЕРЕНИЕ, не стратегию. Решает "как понять edge не ждать месяц".
+        int statFloor = btIs15m ? 2880 : 720;
+        final int barsPrimaryTarget = Math.min(6000, Math.max(statFloor, primaryBarsCfg));
         int legacyHtf = envInt("STARTUP_BT_BARS_1H", -1);
         int htfBarsCfg = (legacyHtf > 0 && btIs15m) ? legacyHtf
                 : envInt("STARTUP_BT_BARS_HTF", 250);
