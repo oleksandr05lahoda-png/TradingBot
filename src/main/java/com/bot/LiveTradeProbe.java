@@ -183,7 +183,7 @@ public final class LiveTradeProbe {
             // STEP 4: Build a synthetic TradeIdea and call openPositionWithSl —
             //         this is the EXACT SAME path used for real signals.
             //         If this works, real signals will work too.
-            DecisionEngineMerged.TradeIdea idea = buildProbeIdea(currentPrice,
+            DecisionEngineMerged.TradeIdea idea = buildProbeIdea(symbol, currentPrice,
                     slPrice, tp1Price, tp2Price);
 
             sendTg(tg, "⚙️ Шаг 3: вызываю `openPositionWithSl()` — тот же метод что и для реальных сигналов...");
@@ -320,7 +320,8 @@ public final class LiveTradeProbe {
      *   Net result: probe no longer depends on a removal-marked API; it compiles
      *   cleanly without --add-opens or --enable-native-access flags on JDK 21.
      */
-    private static DecisionEngineMerged.TradeIdea buildProbeIdea(double entry,
+    private static DecisionEngineMerged.TradeIdea buildProbeIdea(String probeSymbol,
+                                                                 double entry,
                                                                  double sl,
                                                                  double tp1,
                                                                  double tp2) throws Exception {
@@ -339,7 +340,7 @@ public final class LiveTradeProbe {
         flags.add("PROBE");
 
         DecisionEngineMerged.TradeIdea idea = new DecisionEngineMerged.TradeIdea(
-                "BTCUSDT",
+                probeSymbol,
                 (com.bot.TradingCore.Side) longSide,
                 entry,         // price
                 sl,            // stop
