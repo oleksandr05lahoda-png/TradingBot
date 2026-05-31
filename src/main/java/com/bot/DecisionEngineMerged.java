@@ -1923,9 +1923,8 @@ public final class DecisionEngineMerged {
         if (volSma <= 0) return reject("vcb_no_vol_data");
         double volRatio = last15.volume / volSma;
         // [v9.1] ОТКАТ Volume 1.8 → 1.7 (v8.6 ухудшил). Это baseline v8.4.
-        // [v80.1 2026-05-29] Volume 1.7x → 1.9x. Сильнее volume confirmation = реальный
-        // institutional engagement. В choppy market 1.7x пускал weak breakouts. Откат: 1.7.
-        if (volRatio < 1.9) return reject("vcb_no_volume");
+        // [v80.2 ОТКАТ] Volume 1.9→1.7 (baseline). v80.1 регрессия -8%.
+        if (volRatio < 1.7) return reject("vcb_no_volume");
 
         // Volume acceleration check
         double prev3VolAvg = 0;
@@ -1949,9 +1948,9 @@ public final class DecisionEngineMerged {
         // [v7.1] Body 50% → 55%. Сильное тело = реальный momentum
         boolean candleStrong;
         if (wantLong) {
-            candleStrong = last15.close > last15.open && bodyPct > 0.60;
+            candleStrong = last15.close > last15.open && bodyPct > 0.55;
         } else {
-            candleStrong = last15.close < last15.open && bodyPct > 0.60;
+            candleStrong = last15.close < last15.open && bodyPct > 0.55;
         }
         if (!candleStrong) return reject("vcb_weak_candle");
 
@@ -2007,9 +2006,8 @@ public final class DecisionEngineMerged {
         double ema20_15m = ema(c15, 20);
         double ema50_15m = ema(c15, 50);
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
-        // [v80.1 2026-05-29] ADX 20 → 25. VCB needs real trend; ADX=20 пускал fake breakouts
-        // в choppy market (current). ADX=25 = только trending setups. Откат: вернуть 20.
-        if (adxR.adx < 25) return reject("vcb_adx_flat");
+        // [v80.2 ОТКАТ] ADX 25→20. v80.1 дал backtest -8% (27 trades WR 33%). Baseline 20.
+        if (adxR.adx < 20) return reject("vcb_adx_flat");
         if (wantLong && !adxR.bullish()) return reject("vcb_adx_bearish_di");
         if (!wantLong && !adxR.bearish()) return reject("vcb_adx_bullish_di");
 
