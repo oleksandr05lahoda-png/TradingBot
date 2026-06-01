@@ -6,6 +6,8 @@
   <component name="ChangeListManager">
     <list default="true" id="6018f699-4b63-479f-aaf8-153524ca5fe9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/BinanceTradeExecutor.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/BinanceTradeExecutor.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/bot/LiveTradeProbe.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/bot/LiveTradeProbe.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -864,7 +866,8 @@
       <workItem from="1780005453676" duration="1233000" />
       <workItem from="1780053694760" duration="1310000" />
       <workItem from="1780099229561" duration="2885000" />
-      <workItem from="1780221430909" duration="476000" />
+      <workItem from="1780221430909" duration="2856000" />
+      <workItem from="1780263940215" duration="8243000" />
     </task>
     <servers />
   </component>

@@ -163,8 +163,15 @@ public final class BinanceTradeExecutor {
         if (useTestnet) {
             this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
             this.apiSecret = pick("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET", "");
-            // Testnet API endpoint (UI is on demo.binance.com, REST on demo-fapi).
-            this.baseUrl   = "https://demo-fapi.binance.com";
+            // [v82.3 2026-06-01] REVERTED demo-fapi → testnet.binancefuture.com.
+            // ROOT CAUSE of -1109 "Invalid account" on EVERY write (marginType/
+            // leverage/order) while reads worked: demo-fapi (= demo.binance.com
+            // "Demo Trading") is a MANUAL-ONLY UI environment with NO API order
+            // placement. The classic Binance Futures testnet DOES support
+            // /fapi/v1/order for bots. Keys must be generated at
+            // testnet.binancefuture.com (separate from demo/live keys).
+            // Откат: вернуть "https://demo-fapi.binance.com" если Binance вернёт API на demo.
+            this.baseUrl   = "https://testnet.binancefuture.com";
         } else {
             this.apiKey    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
             this.apiSecret = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
