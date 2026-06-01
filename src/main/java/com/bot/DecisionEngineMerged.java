@@ -1913,6 +1913,37 @@ public final class DecisionEngineMerged {
         boolean wantLong = breakUp;
 
         // ═══════════════════════════════════════════════════════════════
+        // [v83.0 2026-06-01] ANTI-FALSE-BREAKOUT FILTER
+        // ═══════════════════════════════════════════════════════════════
+        // ДИАГНОЗ (backtest 506 сделок): WR=38.7% — ХУЖЕ монетки. Корень: вход
+        // на САМОМ баре пробоя BB часто = пик импульса, после которого откат
+        // (false breakout). Это тянет WR < 50%.
+        //
+        // FIX (2 проверки, обе дёшевы, отсекают ~половину false breakouts):
+        //   (1) CLOSE-IN-RANGE: close должен быть в дальней трети бара по
+        //       направлению пробоя. Если close далеко от экстремума бара —
+        //       значит был откат внутри бара = слабый пробой = пропускаем.
+        //   (2) NOT-OVEREXTENDED: close не оторван от BB более чем на 1.0 ATR.
+        //       Если цену уже унесло >1 ATR за полосу — мы догоняем уехавший
+        //       поезд, mean-reversion риск высок = пропускаем.
+        //
+        // Env-флаг VCB_BREAKOUT_CONFIRM (default 1=ON). Откат: =0.
+        // Ожидание: меньше сделок, но WR 38%→45-50%, W/L вырастет (входим в
+        // пробои с запасом хода, а не на пике).
+        if (!"0".equals(System.getenv().getOrDefault("VCB_BREAKOUT_CONFIRM", "1"))) {
+            double barRange = last15.high - last15.low;
+            if (barRange > 1e-12) {
+                // (1) close в дальней трети бара по направлению пробоя
+                double closePos = (last15.close - last15.low) / barRange; // 0=low,1=high
+                if (wantLong && closePos < 0.66) return reject("vcb_weak_breakout_close");
+                if (!wantLong && closePos > 0.34) return reject("vcb_weak_breakout_close");
+            }
+            // (2) не оторван от полосы более чем на 1.0 ATR
+            double bandDist = wantLong ? (last15.close - bb.upper) : (bb.lower - last15.close);
+            if (bandDist > atr14 * 1.0) return reject("vcb_breakout_overextended");
+        }
+
+        // ═══════════════════════════════════════════════════════════════
         // 3. VOLUME CONFIRMATION + ACCELERATION (institutional engaged)
         // [v8.1 ACCELERATION] Volume на entry баре должен быть ВЫШЕ avg
         // последних 3 баров — это значит momentum УСКОРЯЕТСЯ, не утихает.
