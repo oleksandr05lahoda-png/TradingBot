@@ -86,9 +86,16 @@ public final class SimpleBacktester {
     //  - Без trail — losers идут на полный -1R, wins кусают time-stop ниже TP2
     //  - С trail — losers выходят на BE/-0.3R, wins закрепляют 0.5R+
     // Math: -34.5% NetPnL → ожидаем +5..+15% после включения trail/profitlock.
-    private final boolean trailEnabled       = true;
-    private final boolean profitLockEnabled  = true;
-    private final boolean stagnationEnabled  = true;
+    // [v83.1 2026-06-01] Сделаны env-управляемыми для A/B-теста гипотезы
+    // "trail/BE душат winners". ДИАГНОЗ: WR 39% + W/L 0.80 = минус, НО Trail 84
+    // + BE 50 из 164 winners выходят рано (+0.6R) вместо TP2=2.2R. Математика:
+    // при WR 39% и winners→2.2R expectancy = 0.39×2.2 − 0.61×1.0 = +0.25R (ПЛЮС).
+    // Тест: BACKTEST_TRAIL_ENABLED=0 (+PROFITLOCK=0) → дать winners течь до TP2.
+    // ДЕФОЛТ true = текущее поведение (sync с PositionTracker сохранён до явного
+    // переключения env в ОБОИХ местах). Откат: не задавать env.
+    private final boolean trailEnabled       = !"0".equals(System.getenv().getOrDefault("BACKTEST_TRAIL_ENABLED", "1"));
+    private final boolean profitLockEnabled  = !"0".equals(System.getenv().getOrDefault("BACKTEST_PROFITLOCK_ENABLED", "1"));
+    private final boolean stagnationEnabled  = !"0".equals(System.getenv().getOrDefault("BACKTEST_STAGNATION_ENABLED", "1"));
 
     // Single source of truth for warmup.
     // Matches DecisionEngineMerged.MIN_BARS (100) — the gate engine.analyze()

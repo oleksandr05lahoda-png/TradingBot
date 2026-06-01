@@ -1927,10 +1927,13 @@ public final class DecisionEngineMerged {
         //       Если цену уже унесло >1 ATR за полосу — мы догоняем уехавший
         //       поезд, mean-reversion риск высок = пропускаем.
         //
-        // Env-флаг VCB_BREAKOUT_CONFIRM (default 1=ON). Откат: =0.
-        // Ожидание: меньше сделок, но WR 38%→45-50%, W/L вырастет (входим в
-        // пробои с запасом хода, а не на пике).
-        if (!"0".equals(System.getenv().getOrDefault("VCB_BREAKOUT_CONFIRM", "1"))) {
+        // [v83.1 ОТКАТ] Default 1→0. Гипотеза A ПРОВАЛЕНА: backtest 420 сделок
+        // дал WR 39.0% (было 38.7%) = +0.3pp шум, отрезал 86 сделок впустую.
+        // ВЫВОД: false breakouts НЕ корень — пробои в принципе не предсказывают
+        // направление на этих парах (WR стабильно ~39% независимо от формы бара).
+        // Фильтр оставлен в коде (env VCB_BREAKOUT_CONFIRM=1 включит), но по
+        // умолчанию OFF. Корень ищем в выходах (trail душит winners), не во входе.
+        if ("1".equals(System.getenv().getOrDefault("VCB_BREAKOUT_CONFIRM", "0"))) {
             double barRange = last15.high - last15.low;
             if (barRange > 1e-12) {
                 // (1) close в дальней трети бара по направлению пробоя
