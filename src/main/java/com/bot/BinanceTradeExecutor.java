@@ -715,13 +715,24 @@ public final class BinanceTradeExecutor {
             // RISK_PCT, что безопаснее. На реале это критичная защита от слива.
             //
             // 5 позиций × 20% = 100% депо в нотционале макс (×5 плечо = 20% маржи).
+            // [v82.12 2026-06-01] FIX: кап НЕ должен опускать ниже minNotional.
+            // БАГ v82.9: при малом балансе (проба $20) кап 20% = $4, что ниже
+            // минимума биржи ($5 BTC) → qty округлялся в НОЛЬ → "qty rounded to
+            // zero". Теперь потолок = max(20%-баланса, minNotional×1.1): если
+            // 20% меньше минимума — берём минимально-торгуемый размер, не режем
+            // в ноль. На реале с нормальным балансом 20%-кап всегда > minNotional,
+            // поведение не меняется. Защита от over-size сохранена.
             double maxNotionalPct = envDouble("EXEC_MAX_NOTIONAL_PCT", 20.0);
             double maxNotional = balanceUsd * (maxNotionalPct / 100.0);
+            double minTradable = si.minNotional * 1.10; // +10% буфер на округление qty вниз
+            if (maxNotional < minTradable) {
+                maxNotional = minTradable; // не капать ниже минимума биржи
+            }
             if (notional > maxNotional && entry > 0) {
                 double cappedQty = maxNotional / entry;
                 LOG.info(String.format(
-                        "[Executor] %s notional cap: $%.2f → $%.2f (%.0f%% of bal) qty %.6f → %.6f",
-                        symbol, notional, maxNotional, maxNotionalPct, qty, cappedQty));
+                        "[Executor] %s notional cap: $%.2f → $%.2f (%.0f%% bal, min $%.2f) qty %.6f → %.6f",
+                        symbol, notional, maxNotional, maxNotionalPct, si.minNotional, qty, cappedQty));
                 qty = cappedQty;
                 notional = qty * entry;
             }
