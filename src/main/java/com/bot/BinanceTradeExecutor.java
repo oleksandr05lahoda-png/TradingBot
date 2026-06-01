@@ -413,6 +413,11 @@ public final class BinanceTradeExecutor {
         diagGet("/fapi/v1/multiAssetsMargin", "multiAssetsMargin");
         diagGet("/fapi/v1/positionSide/dual", "positionSide(hedge?)");
         diagGet("/fapi/v2/account", "account(flags)");
+        // [v82.6] PORTFOLIO MARGIN probe. If demo silently switched to PM, the
+        // classic /fapi/* write endpoints return -1109 while reads still work —
+        // exact match for our symptom. /papi/v1/balance HTTP 200 = account IS in
+        // Portfolio Margin → fix = turn PM OFF in demo settings (NOT a code bug).
+        diagGetHost("https://papi.binance.com", "/papi/v1/balance", "PortfolioMargin?(papi)");
         diagOrderTest();
         LOG.info("[DIAG] ═══ END ACCOUNT DIAG ═══");
     }
@@ -433,6 +438,30 @@ public final class BinanceTradeExecutor {
             String b = resp.body() == null ? "" : resp.body();
             if (b.length() > 500) b = b.substring(0, 500) + "…";
             LOG.info("[DIAG] " + label + " → HTTP " + resp.statusCode() + " " + b);
+        } catch (Exception e) {
+            LOG.warning("[DIAG] " + label + " error: " + e.getMessage());
+        }
+    }
+
+    /** Signed GET against an arbitrary host (for /papi PM probe). */
+    private void diagGetHost(String host, String path, String label) {
+        try {
+            long ts = ts();
+            String qs = "timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(host + path + "?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String b = resp.body() == null ? "" : resp.body();
+            if (b.length() > 300) b = b.substring(0, 300) + "…";
+            String verdict = resp.statusCode() == 200
+                    ? " ⚠️ PM ON → classic /fapi blocked, THIS is the -1109 cause"
+                    : " (not PM)";
+            LOG.info("[DIAG] " + label + " → HTTP " + resp.statusCode() + verdict + " " + b);
         } catch (Exception e) {
             LOG.warning("[DIAG] " + label + " error: " + e.getMessage());
         }
