@@ -2167,7 +2167,14 @@ public final class DecisionEngineMerged {
         // best result (+5.23%). Перевод в 2.2R убил большие winners.
         // Реальный live time-stop fix = v9.3 (skip adjustStopForClusters),
         // а не сужение TP bucket. См. backtest data 2026-05-28.
-        double tp2Mult = prob01 >= 0.72 ? 3.0 : 2.2;
+        // [v83.3 2026-06-01] ГИПОТЕЗА C — приблизить TP. ДИАГНОЗ: winners не
+        // доходят до 2.2-3.0R (trail-off тест: Net не изменился = цена физически
+        // не идёт так далеко). Решение: TP ближе → выше hit-rate TP → выше WR.
+        // При WR 39% TP 2.2R = −0.31R/сделку. Ближний TP должен поднять и WR, и
+        // expectancy. env VCB_TP_MULT (default 1.3). Откат: VCB_TP_MULT=2.2.
+        // tp1Mult тоже приближаем пропорц. (в TradeIdea ctor TP1 = 1.0R по умолч.,
+        // оставляем — partial на 1.0R, остаток на VCB_TP_MULT).
+        double tp2Mult = csEnvDouble("VCB_TP_MULT", 1.3);
         double tp2 = wantLong ? price + slDist * tp2Mult : price - slDist * tp2Mult;
 
         // ═══════════════════════════════════════════════════════════════

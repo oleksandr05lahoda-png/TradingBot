@@ -93,15 +93,12 @@ public final class SimpleBacktester {
     // Тест: BACKTEST_TRAIL_ENABLED=0 (+PROFITLOCK=0) → дать winners течь до TP2.
     // ДЕФОЛТ true = текущее поведение (sync с PositionTracker сохранён до явного
     // переключения env в ОБОИХ местах). Откат: не задавать env.
-    // [v83.2 2026-06-01] ТЕСТ ГИПОТЕЗЫ B — trail/profitlock ВЫКЛЮЧЕНЫ ХАРДКОДОМ
-    // (без env, чтобы не зависеть от Railway). Цель: дать winners течь до TP2=2.2R
-    // вместо раннего trail-выхода (+0.6R). Если Net прыгнет вверх → trail душил
-    // прибыль. Stagnation оставлен ON (он режет мёртвые сделки, не winners).
-    // ⚠️ ВРЕМЕННО только для бэктеста. PositionTracker НЕ трогаю — sync восстановлю
-    // ПОСЛЕ того как тест покажет результат. Откат: вернуть true.
-    // В сводке должно стать Trail=0 — это индикатор что тест реально применился.
-    private final boolean trailEnabled       = false;  // [v83.2] TEST: was true
-    private final boolean profitLockEnabled  = false;  // [v83.2] TEST: was true
+    // [v83.3 2026-06-01] Trail/profitlock ВОЗВРАЩЕНЫ в true (sync с PositionTracker).
+    // Тест B (v83.2, trail=off) показал: Net −92% vs −96% baseline = trail НЕ
+    // виноват, winners просто не доходят до 2.2R. Откатили. Теперь чиним через
+    // приближение TP (гипотеза C, VCB_TP_MULT=1.3 в DecisionEngineMerged).
+    private final boolean trailEnabled       = true;
+    private final boolean profitLockEnabled  = true;
     private final boolean stagnationEnabled  = true;
 
     // Single source of truth for warmup.
