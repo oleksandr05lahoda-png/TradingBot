@@ -72,7 +72,7 @@ public final class BotMain {
     // and HTF derivation. Default "1h" (was hardcoded "15m" pre-v90). To revert
     // set env PRIMARY_TF=15m. Must match SignalSender.PRIMARY_TF.
     public static final String PRIMARY_TF =
-            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim();
     public static final String HTF_FAST =
             System.getenv().getOrDefault("HTF_FAST",
                     "1h".equals(PRIMARY_TF) ? "4h" : "1h").trim();
@@ -1897,7 +1897,7 @@ public final class BotMain {
         //  STARTUP_BT_BARS_HTF     — кол-во HTF свечей (default 250). Минимум 150
         //                            = MIN_BARS движка.
         //  STARTUP_BT_PACING_MS    — задержка между парами (default 5000ms).
-        final boolean btIs15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+        final boolean btIs15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
         final String btPrimaryTf = btIs15m ? "15m" : "1h";
         final String btHtfTf     = btIs15m ? "1h"  : "4h";
         final int defaultPrimaryBars = btIs15m ? 1000 : 720; // 1h: 30 days
@@ -2053,8 +2053,16 @@ public final class BotMain {
                 // calibrator from backtest), explicitly set env SKIP_STARTUP_CALIBRATION=0.
                 // Only do that AFTER you've validated the strategy has positive edge on
                 // history (otherwise you're feeding the calibrator a loser distribution).
-                boolean skipCalRecord = !"0".equals(System.getenv()
-                        .getOrDefault("SKIP_STARTUP_CALIBRATION", "1"));
+                // [v82.9 2026-06-01] CATCH-22 FIX: default flipped "1"→"0" = FEED calibrator.
+                // ПРОБЛЕМА: с default skip=ON стартовый backtest НЕ кормил калибратор,
+                // live-сделок 0 → калибратор навсегда застревал на n=0 (Cal:DISABLED
+                // passthrough). Бот месяцами слал НЕкалиброванные (сырые) вероятности.
+                // БЕЗОПАСНОСТЬ: BIAS-GUARD ниже всё равно блокирует запись если backtest
+                // показывает negative edge (Net<0 ИЛИ WR<40%) — отравить PAV нельзя.
+                // Текущий backtest +13% WR 54% → edge положительный → калибратор стартует
+                // с ~80 outcomes вместо 0. Откат: SKIP_STARTUP_CALIBRATION=1 в env.
+                boolean skipCalRecord = "1".equals(System.getenv()
+                        .getOrDefault("SKIP_STARTUP_CALIBRATION", "0"));
 
                 // [v87 BIAS-GUARD 2026-05-09] Even with skipCalRecord=false, refuse to
                 // record outcomes if the backtest itself shows the strategy is losing
@@ -2245,7 +2253,12 @@ public final class BotMain {
                         + "  ❌ Losses: %d\n"
                         + "  ⏳ Time-stops: %d\n"
                         + "  🟰 BE: %d  🔒 ProfitLock: %d\n"
-                        + "  📉 Trail: %d  ⏸ Stagnation: %d\n"                        + "💰 Net PnL (sum %%): %+.2f\n"
+                        + "  📉 Trail: %d  ⏸ Stagnation: %d\n"
+                        + "💰 Net PnL (сумма %% по парам): %+.2f\n"
+                        + "  ⚠️ _это НЕ доход депозита: суммирует %% всех пар как\n"
+                        + "  отдельные счета. Реальный портфель (1 депо, maxConcurrent=5,\n"
+                        + "  корреляция) даёт МЕНЬШЕ. Цифра — для сравнения версий, не profit._\n"
+                        + "  Avg/сделку: %+.3f%% (вот это ближе к реальности на сделку)\n"
                         + "📈 W/L ratio: %.2f\n"
                         + "🧠 Калибратор: %d outcomes\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2254,6 +2267,7 @@ public final class BotMain {
                 symbolsErrored, totalTrades,
                 totalWins, wr, totalLosses, totalTimeStops,
                 totalBE, totalProfitLock, totalTrail, totalStag, totalNetPnL,
+                (totalTrades > 0 ? totalNetPnL / totalTrades : 0.0),  // [v82.11] avg/trade
                 wlRatio, newCalCount,
                 verdict);
 

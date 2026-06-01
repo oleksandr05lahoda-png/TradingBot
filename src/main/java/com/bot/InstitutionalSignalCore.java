@@ -38,7 +38,7 @@ public final class InstitutionalSignalCore {
     // Must match BACKTEST_TIME_STOP_BARS in SimpleBacktester for walk-forward
     // consistency.
     private static final boolean ISC_IS_15M = "15m".equals(
-            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
     private static final long ISC_BAR_MS = ISC_IS_15M ? 15 * 60_000L : 60 * 60_000L;
     private static final int  TIME_STOP_BARS  = envInt("ISC_TIME_STOP_BARS",
             ISC_IS_15M ? 12 : 8);
@@ -494,7 +494,9 @@ public final class InstitutionalSignalCore {
     // Direction cap: crypto correlations during BTC moves are ~1.0, so 8 same-
     // side positions = 8× leverage on a single bet. 4 captures a sector wave
     // without portfolio concentration risk.
-    private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 4);
+    // [v82.8 2026-06-01] 4→5: иначе при maxConcurrent=5 пятую сделку в одну
+    // сторону резал этот потолок. Синхронизировано с RG_MAX_CONCURRENT_POSITIONS=5.
+    private static final int MAX_SAME_DIRECTION = envInt("ISC_MAX_SAME_DIRECTION", 5);
 
     // Rate-limit BIPOLAR BLOCK logs: one log per symbol per 60s to avoid Railway log flood.
     private final Map<String, Long> bipolarLogThrottle = new ConcurrentHashMap<>();

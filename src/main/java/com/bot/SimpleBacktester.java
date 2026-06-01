@@ -61,7 +61,7 @@ public final class SimpleBacktester {
     // ENV BACKTEST_TIME_STOP_BARS overrides; must match ISC_TIME_STOP_BARS in
     // live ISC for walk-forward consistency.
     private int    timeStopBars     = envInt("BACKTEST_TIME_STOP_BARS",
-            "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 12 : 8);
+            "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim()) ? 12 : 8);
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
@@ -533,7 +533,7 @@ public final class SimpleBacktester {
         // [v90] Min bars: 200 on 15m primary (50 hours), 150 on 1h primary
         // (6.25 days). The lower floor on 1h is offset by each bar carrying
         // 4× more information; 150 bars = stable VWAP/sigma calc.
-        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
         int minBars = is15m ? 200 : 150;
         if (m15 == null || m15.size() < minBars) return result;
 
@@ -1351,7 +1351,7 @@ public final class SimpleBacktester {
             // pulled enough bars for 13 days of 15m but only ~3 days of 1h, yet
             // the engine was configured for 1h primary — root cause of the
             // "13 days, 5 trades" anomaly.
-            String primaryTfBT = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+            String primaryTfBT = System.getenv().getOrDefault("PRIMARY_TF", "15m").trim();
             int barsPerDayPrimary = "1h".equals(primaryTfBT) ? 24
                     : "30m".equals(primaryTfBT) ? 48 : 96;
             int barsNeeded = daysOfHistory * barsPerDayPrimary + 250; // warmup + window
@@ -1474,10 +1474,33 @@ public final class SimpleBacktester {
             double sigPerDayPerPair = signals / (double) Math.max(1, days * pairsWithSignals);
             double tsShare = signals > 0 ? 100.0 * timeStops / signals : 0.0;
 
-            String verdict =
-                    (winRate >= 55 && avgPF > 1.50 && netPnL > 0) ? "✅ GO — viable edge"
-                            : (winRate >= 48 && avgPF > 1.10 && netPnL > 0) ? "⚠️ MARGINAL — edge thin"
-                              : "❌ NO-GO — no edge / negative expectancy";
+            // [v82.11 2026-06-01] SAMPLE-SIZE GUARD на verdict. РАНЬШЕ "✅ GO"
+            // выдавался при winRate≥55 && PF>1.5 БЕЗ учёта числа сделок — поэтому
+            // 16 сделок с PF=749 (чистый шум на малой выборке) показывали "GO —
+            // viable edge", создавая ложную уверенность для real money.
+            // FIX: edge не подтверждён статистически пока сделок < 30 (binomial
+            // доверие); 30-99 = LOW-SAMPLE; полноценный verdict только при ≥100.
+            // Также PF капается в отображении абсурдных значений (749 = деление
+            // почти без losses на малой выборке, НЕ реальный edge).
+            String verdict;
+            if (signals < 30) {
+                verdict = String.format(
+                        "🔴 LOW-SAMPLE (%d сделок) — edge НЕ подтверждён.\n"
+                        + "WR=%.1f%% PF=%.1f выглядят хорошо, но на <30 сделках это ШУМ,\n"
+                        + "не статистика. Real money КАТЕГОРИЧЕСКИ нельзя. Нужно ≥100.",
+                        signals, winRate, Math.min(avgPF, 99.9));
+            } else if (signals < 100) {
+                String dir = (winRate >= 50 && netPnL > 0) ? "🟡 склоняется к edge" : "🟠 склоняется к no-edge";
+                verdict = String.format(
+                        "%s, но выборка мала (%d/100).\n"
+                        + "WR=%.1f%% PF=%.1f NetPnL=%+.1f%%. Продолжай paper до 100+.",
+                        dir, signals, winRate, Math.min(avgPF, 99.9), netPnL);
+            } else {
+                verdict =
+                        (winRate >= 55 && avgPF > 1.50 && netPnL > 0) ? "✅ GO — viable edge (n≥100)"
+                                : (winRate >= 48 && avgPF > 1.10 && netPnL > 0) ? "⚠️ MARGINAL — edge thin"
+                                  : "❌ NO-GO — no edge / negative expectancy";
+            }
 
             // [v82] Time-stop dominance diagnostic. Если >60% — структурная проблема:
             // вход без edge на горизонте удержания ИЛИ TP слишком далеко для time-stop.

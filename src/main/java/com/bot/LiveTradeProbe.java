@@ -188,7 +188,24 @@ public final class LiveTradeProbe {
 
             sendTg(tg, "⚙️ Шаг 3: вызываю `openPositionWithSl()` — тот же метод что и для реальных сигналов...");
 
-            BinanceTradeExecutor.ExecutionResult result = ex.openPositionWithSl(idea, balance);
+            // [v82.10 2026-06-01] PROBE SIZE FIX. Раньше проба звала
+            // openPositionWithSl(idea, balance) → executor считал размер = весь
+            // баланс × risk% / SL% = почти весь депозит ($5005 на $5000),
+            // хотя в Telegram писалось "~$20". Это вводило в заблуждение.
+            // FIX: подменяем balance на synthetic значение так, чтобы получился
+            // ровно targetNotional. Executor: notional = (bal×risk%)/SL%.
+            // → bal = targetNotional × SL% / risk%. SL пробы = 2%, risk берём из
+            // executor.getRiskPct(). Итог: проба открывает РОВНО ~targetNotional$.
+            double slPctProbe = 0.02; // соответствует slPrice = price×0.98
+            double riskPctProbe = Math.max(0.05, ex.getRiskPct()) / 100.0;
+            double syntheticBalance = targetNotional * slPctProbe / riskPctProbe;
+            // Не больше реального баланса (на всякий) и не меньше минимума.
+            syntheticBalance = Math.min(syntheticBalance, balance);
+            LOG.info(String.format("[PROBE] size: target=$%.2f → syntheticBalance=$%.2f "
+                    + "(realBal=$%.2f risk=%.2f%% sl=%.1f%%)",
+                    targetNotional, syntheticBalance, balance, riskPctProbe * 100, slPctProbe * 100));
+
+            BinanceTradeExecutor.ExecutionResult result = ex.openPositionWithSl(idea, syntheticBalance);
 
             if (!result.success) {
                 LOG.severe("[PROBE] step 4 FAIL: " + result.reason);

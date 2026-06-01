@@ -79,7 +79,7 @@ public final class SignalSender {
     // higher timeframe filters (default 4h / 1d when PRIMARY_TF=1h).
     // ════════════════════════════════════════════════════════════════════
     private static final String PRIMARY_TF =
-            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim();
     private static final long PRIMARY_TF_MS = primaryTfMs(PRIMARY_TF);
     private static final int PRIMARY_TF_MIN = (int) (PRIMARY_TF_MS / 60_000L);
     // HTF (higher timeframe) used for bias filters. For 1h primary, default 4h.
@@ -3847,7 +3847,7 @@ public final class SignalSender {
         Boolean cached = historyOkCache.get(symbol);
         if (cached != null) return cached;
 
-        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
         String  primaryTf  = is15m ? "15m" : "1h";
         String  htfTf      = is15m ? "1h"  : "4h";
         int     primaryMin = is15m ? 250  : 200;   // STARTUP-BT needs ≥200/150 + warmup
@@ -4274,6 +4274,16 @@ public final class SignalSender {
     }
     public List<String> getScanUniverseSnapshot(int limit) {
         List<String> sorted = new ArrayList<>(cachedPairs);
+        // [v82.9 2026-06-01] CLEAN UNIVERSE — фильтруем мусор ДО backtest/scan.
+        // ROOT: cachedPairs содержал ETHUSDC/BTCUSDC (USDC-пары, дублируют USDT но
+        // с тонкой ликвидностью → HARD FAIL HTTP 400 каждый цикл) и токенизир.
+        // commodities/stocks (XAU/XAG/CL/MU — есть в HARD_BLACKLIST, но snapshot
+        // их НЕ применял). Это засоряло лог HARD FAIL и отбирало слоты у crypto
+        // в STARTUP-BT. Фильтр здесь = единая точка для live-scan и startup-BT.
+        sorted.removeIf(p -> p == null
+                || !p.endsWith("USDT")              // только *USDT (отсекает USDC/BUSD-пары)
+                || HARD_BLACKLIST.contains(p)       // токенизир. металлы/сырьё/стоки
+                || isBlocklisted(p));               // garbage-coin рантайм-блок
         sorted.sort((a, b) -> Double.compare(
                 volume24hUSD.getOrDefault(b, 0.0),
                 volume24hUSD.getOrDefault(a, 0.0)));

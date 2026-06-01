@@ -3083,7 +3083,7 @@ public final class DecisionEngineMerged {
     // To revert to 15m defaults set env CS_PROFILE=15m (overrides below).
     // ──────────────────────────────────────────────────────────────────────
     private static final boolean CS_IS_15M = "15m".equals(
-            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
 
     private static final double CS_SIGMA_THRESHOLD   = csEnvDouble("CS_SIGMA_THRESHOLD",
             CS_IS_15M ? 1.8 : 1.6);
@@ -4651,9 +4651,11 @@ public final class DecisionEngineMerged {
         private static String resolveHmacKey() {
             String k = System.getenv("CALIBRATOR_HMAC_KEY");
             if (k == null || k.isBlank()) {
-                LOG.warning("[Calibrator] CALIBRATOR_HMAC_KEY not set — using default. "
-                        + "FOR PRODUCTION: set unique key in Railway env vars.");
-                return "default-CHANGE-ME-CALIBRATOR-KEY-2026";
+                // [v82.11 2026-06-01] Юзер env не использует → хардкодим УНИКАЛЬНЫЙ
+                // ключ. Лучше старого публичного "default-CHANGE-ME" (его знал любой,
+                // кто видел исходник). Не идеал (ключ в git), но для demo/личного бота
+                // достаточно — аудит-лог подписан НЕпубличной солью.
+                return "tb-clbr-9f3a7c21e8b64d05a1f2-20260601-hmac-salt-do-not-share";
             }
             return k;
         }

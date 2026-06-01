@@ -231,10 +231,6 @@ public final class BinanceTradeExecutor {
                 LOG.info("[Executor] testnet/demo — skip ensureOneWayMode "
                         + "(account mode is set manually in demo UI; avoids -1109 corruption)");
             }
-            // [v82.5 DIAG] One-shot account diagnostics to root-cause -1109.
-            try { logAccountDiagnostics(); } catch (Throwable t) {
-                LOG.warning("[Executor] account diagnostics failed: " + t.getMessage());
-            }
         }
     }
 
@@ -407,103 +403,9 @@ public final class BinanceTradeExecutor {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // [v82.5 DIAG 2026-06-01] ACCOUNT DIAGNOSTICS — root-cause the -1109.
-    //
-    // Pure reads + a DRY-RUN order (/fapi/v1/order/test validates an order
-    // exactly like a real one but does NOT place it). Prints the account mode
-    // (Multi-Assets / Hedge / canTrade) and the EXACT Binance reply on the
-    // order path — instead of the opaque "MARKET order rejected".
-    //
-    // Reading these [DIAG] lines from the boot log tells us definitively WHY
-    // every write returns -1109 while reads work.
-    // ═══════════════════════════════════════════════════════════════════
-    public void logAccountDiagnostics() {
-        if (!isReady()) { LOG.warning("[DIAG] skipped — keys missing"); return; }
-        LOG.info("[DIAG] ═══ ACCOUNT DIAG base=" + baseUrl + " keyHead="
-                + (apiKey.length() >= 6 ? apiKey.substring(0, 6) : apiKey) + "… ═══");
-        diagGet("/fapi/v1/multiAssetsMargin", "multiAssetsMargin");
-        diagGet("/fapi/v1/positionSide/dual", "positionSide(hedge?)");
-        diagGet("/fapi/v2/account", "account(flags)");
-        // [v82.6] PORTFOLIO MARGIN probe. If demo silently switched to PM, the
-        // classic /fapi/* write endpoints return -1109 while reads still work —
-        // exact match for our symptom. /papi/v1/balance HTTP 200 = account IS in
-        // Portfolio Margin → fix = turn PM OFF in demo settings (NOT a code bug).
-        diagGetHost("https://papi.binance.com", "/papi/v1/balance", "PortfolioMargin?(papi)");
-        diagOrderTest();
-        LOG.info("[DIAG] ═══ END ACCOUNT DIAG ═══");
-    }
-
-    /** Signed GET helper for diagnostics — logs status + (truncated) body. */
-    private void diagGet(String path, String label) {
-        try {
-            long ts = ts();
-            String qs = "timestamp=" + ts + "&recvWindow=5000";
-            String sig = hmacSHA256(apiSecret, qs);
-            HttpResponse<String> resp = http.send(
-                    HttpRequest.newBuilder()
-                            .uri(URI.create(baseUrl + path + "?" + qs + "&signature=" + sig))
-                            .timeout(Duration.ofSeconds(8))
-                            .header("X-MBX-APIKEY", apiKey)
-                            .GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            String b = resp.body() == null ? "" : resp.body();
-            if (b.length() > 500) b = b.substring(0, 500) + "…";
-            LOG.info("[DIAG] " + label + " → HTTP " + resp.statusCode() + " " + b);
-        } catch (Exception e) {
-            LOG.warning("[DIAG] " + label + " error: " + e.getMessage());
-        }
-    }
-
-    /** Signed GET against an arbitrary host (for /papi PM probe). */
-    private void diagGetHost(String host, String path, String label) {
-        try {
-            long ts = ts();
-            String qs = "timestamp=" + ts + "&recvWindow=5000";
-            String sig = hmacSHA256(apiSecret, qs);
-            HttpResponse<String> resp = http.send(
-                    HttpRequest.newBuilder()
-                            .uri(URI.create(host + path + "?" + qs + "&signature=" + sig))
-                            .timeout(Duration.ofSeconds(8))
-                            .header("X-MBX-APIKEY", apiKey)
-                            .GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            String b = resp.body() == null ? "" : resp.body();
-            if (b.length() > 300) b = b.substring(0, 300) + "…";
-            String verdict = resp.statusCode() == 200
-                    ? " ⚠️ PM ON → classic /fapi blocked, THIS is the -1109 cause"
-                    : " (not PM)";
-            LOG.info("[DIAG] " + label + " → HTTP " + resp.statusCode() + verdict + " " + b);
-        } catch (Exception e) {
-            LOG.warning("[DIAG] " + label + " error: " + e.getMessage());
-        }
-    }
-
-    /** Dry-run order: same validation as a real MARKET order but NOT placed.
-     *  HTTP 200 + empty body {} = order path WORKS. Any -code = the real reason. */
-    private void diagOrderTest() {
-        try {
-            long ts = ts();
-            String body = "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.002"
-                    + "&newOrderRespType=RESULT&timestamp=" + ts + "&recvWindow=5000";
-            String sig = hmacSHA256(apiSecret, body);
-            HttpResponse<String> resp = http.send(
-                    HttpRequest.newBuilder()
-                            .uri(URI.create(baseUrl + "/fapi/v1/order/test"))
-                            .timeout(Duration.ofSeconds(8))
-                            .header("X-MBX-APIKEY", apiKey)
-                            .header("Content-Type", "application/x-www-form-urlencoded")
-                            .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
-                            .build(),
-                    HttpResponse.BodyHandlers.ofString());
-            String b = resp.body() == null ? "" : resp.body();
-            LOG.info("[DIAG] order/test BTCUSDT MARKET qty0.002 → HTTP " + resp.statusCode()
-                    + " body=" + (b.isEmpty() || "{}".equals(b.trim())
-                        ? "{} (✅ order path WORKS — -1109 is elsewhere)" : b));
-        } catch (Exception e) {
-            LOG.warning("[DIAG] order/test error: " + e.getMessage());
-        }
-    }
+    // [v82.10 2026-06-01] DIAG-блок ([v82.5]/[v82.6]) удалён — отработал свою
+    // задачу (root-cause -1109: ключ был привязан к битому demo-аккаунту, не код).
+    // Восстановить из git history если снова понадобится диагностика аккаунта.
 
     /** True if exchange credentials are configured and we can call API. */
     public boolean isReady() {
@@ -797,6 +699,33 @@ public final class BinanceTradeExecutor {
             }
 
             double notional = qty * entry;
+
+            // ════════════════════════════════════════════════════════════════
+            // [v82.9 2026-06-01] NOTIONAL CAP — защита размера позиции.
+            // ════════════════════════════════════════════════════════════════
+            // ПРОБЛЕМА: размер = riskUsd / slDistance. При узком SL (0.5%) нотионал
+            // взрывается до 2-4× баланса (проба дала $5005 на $5000). Старый guard
+            // (margin ≤ 50% баланса) при 5x плече допускал нотионал до 250% депо —
+            // т.е. почти не ограничивал. С maxConcurrent=5 это 5 раздутых позиций.
+            //
+            // FIX: жёсткий потолок нотионала = MAX_NOTIONAL_PCT% от баланса (env
+            // EXEC_MAX_NOTIONAL_PCT, default 20). Если расчётный нотионал больше —
+            // СРЕЗАЕМ qty до потолка (НЕ reject — лучше меньший корректный размер,
+            // чем пропуск сделки). Риск на сделку при этом просто < заданного
+            // RISK_PCT, что безопаснее. На реале это критичная защита от слива.
+            //
+            // 5 позиций × 20% = 100% депо в нотционале макс (×5 плечо = 20% маржи).
+            double maxNotionalPct = envDouble("EXEC_MAX_NOTIONAL_PCT", 20.0);
+            double maxNotional = balanceUsd * (maxNotionalPct / 100.0);
+            if (notional > maxNotional && entry > 0) {
+                double cappedQty = maxNotional / entry;
+                LOG.info(String.format(
+                        "[Executor] %s notional cap: $%.2f → $%.2f (%.0f%% of bal) qty %.6f → %.6f",
+                        symbol, notional, maxNotional, maxNotionalPct, qty, cappedQty));
+                qty = cappedQty;
+                notional = qty * entry;
+            }
+
             double marginUsed = notional / leverage;
 
             if (marginUsed > balanceUsd * 0.5) {
