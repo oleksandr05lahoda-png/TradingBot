@@ -215,11 +215,23 @@ public final class BinanceTradeExecutor {
         // Normalize position mode to ONE_WAY at boot. HEDGE-mode accounts
         // reject MARKET orders without positionSide=LONG/SHORT (-4061).
         // Idempotent: if already ONE_WAY, Binance returns -4059 (ignored).
+        //
+        // [v82.7 2026-06-01] DEMO FIX: skip ensureOneWayMode on testnet/demo.
+        // Корень -1109: demo-fapi отбивает попытку сменить positionSide/dual
+        // (-4067/-1109), и это переводит demo-сессию в "Invalid account" на КАЖДУЮ
+        // последующую запись (order/leverage/marginType). Юзер уже выставил режим
+        // (One-Way + Isolated) РУКАМИ в demo UI — боту НЕ нужно его трогать.
+        // На реале (useTestnet=false) поведение прежнее: бот сам нормализует режим.
         if (!apiKey.isBlank() && !apiSecret.isBlank()) {
-            try { ensureOneWayMode(); } catch (Exception e) {
-                LOG.warning("[Executor] ensureOneWayMode failed (non-fatal): " + e.getMessage());
+            if (!useTestnet) {
+                try { ensureOneWayMode(); } catch (Exception e) {
+                    LOG.warning("[Executor] ensureOneWayMode failed (non-fatal): " + e.getMessage());
+                }
+            } else {
+                LOG.info("[Executor] testnet/demo — skip ensureOneWayMode "
+                        + "(account mode is set manually in demo UI; avoids -1109 corruption)");
             }
-            // [v82.5 DIAG 2026-06-01] One-shot account diagnostics to root-cause -1109.
+            // [v82.5 DIAG] One-shot account diagnostics to root-cause -1109.
             try { logAccountDiagnostics(); } catch (Throwable t) {
                 LOG.warning("[Executor] account diagnostics failed: " + t.getMessage());
             }
@@ -691,6 +703,16 @@ public final class BinanceTradeExecutor {
             }
 
             // 1. Initialize symbol settings (leverage + isolated)
+            // [v82.7 2026-06-01] DEMO FIX: on testnet/demo, SKIP per-symbol
+            // marginType/leverage POSTs entirely. demo-fapi returns -1109 on them
+            // and that poisons the session so the следующий MARKET order also
+            // gets -1109. User sets Isolated + leverage MANUALLY in demo UI, so
+            // these calls are redundant on demo. On REAL they run as before.
+            if (useTestnet) {
+                LOG.info("[Executor] testnet/demo — skip initSymbolMargin/Leverage for "
+                        + symbol + " (set manually in UI; avoids -1109)");
+                initializedSymbols.add(symbol);
+            }
             if (!initializedSymbols.contains(symbol)) {
                 if (!initSymbolMargin(symbol)) {
                     // [C5 2026-05-08] Include real Binance error body so user can act on it
