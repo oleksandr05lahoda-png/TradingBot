@@ -1911,12 +1911,21 @@ public final class BotMain {
         // дикий разброс backtest (−8%..+4.88% на ИДЕНТИЧНОМ коде). 2880 баров =
         // ~100 trades = стабильное число, отражает РЕАЛЬНЫЙ edge, не lucky window.
         // Это улучшает ИЗМЕРЕНИЕ, не стратегию. Решает "как понять edge не ждать месяц".
-        int statFloor = btIs15m ? 2880 : 720;
-        final int barsPrimaryTarget = Math.min(6000, Math.max(statFloor, primaryBarsCfg));
+        // [v82.14 2026-06-01] 15m statFloor 2880→5760 (30→60 дней). ПРИЧИНА:
+        // сравнивали "1h +13% на 62 днях" vs "15m +0.05% на 15 днях" — РАЗНЫЕ
+        // периоды = невалидное сравнение (юзер верно заметил нестыковку). VCB
+        // параметрически заточен под 15m (squeeze 96 баров=24ч), значит мерить
+        // надо на 15m, но на ТОЙ ЖЕ длине истории что 1h (60 дней) = честно.
+        // 60 дней × 96 баров/день = 5760. Кап поднят 6000→8000. Улучшает
+        // ИЗМЕРЕНИЕ edge, не стратегию. Прогон дольше (~12-18 мин), но честный.
+        int statFloor = btIs15m ? 5760 : 1440; // 15m: 60дн, 1h: 60дн
+        final int barsPrimaryTarget = Math.min(8000, Math.max(statFloor, primaryBarsCfg));
         int legacyHtf = envInt("STARTUP_BT_BARS_1H", -1);
         int htfBarsCfg = (legacyHtf > 0 && btIs15m) ? legacyHtf
                 : envInt("STARTUP_BT_BARS_HTF", 250);
-        final int barsHtfTarget = Math.min(1500, Math.max(150, htfBarsCfg));
+        // [v82.14] HTF floor 150→1440: на 15m primary HTF=1h, 60 дней = 1440 баров.
+        // Иначе HTF-история короче primary → часть свечей бэктеста без HTF-bias.
+        final int barsHtfTarget = Math.min(2000, Math.max(1440, htfBarsCfg));
         final long pacingMs     = Math.max(3000L, envInt("STARTUP_BT_PACING_MS", 5000));
 
         // Min bars guard for primary TF: 200 on 15m, 150 on 1h.

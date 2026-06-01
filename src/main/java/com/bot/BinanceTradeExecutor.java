@@ -768,6 +768,19 @@ public final class BinanceTradeExecutor {
             // Round SL price to tick size (Binance rejects unaligned prices).
             double slPriceRounded = roundToTick(idea.stop, si.tickSize, isLong);
 
+            // [v82.14 2026-06-01] -4130 FIX: чистим висячие SL/TP по символу ПЕРЕД
+            // открытием. БАГ: остаточный TP-ордер с closePosition=true от прошлой
+            // сделки (напр. наложение проб, или недочищенный orphan) → Binance
+            // отбивает новый SL с -4130 "open stop/TP with closePosition existing"
+            // → emergency close. Чистка перед entry гарантирует пустой символ.
+            // Идемпотентно: если ордеров нет — no-op. Дёшево (1 DELETE-запрос).
+            try {
+                cancelAllOpenOrders(symbol);
+            } catch (Throwable preClean) {
+                LOG.warning("[Executor] pre-entry order cleanup " + symbol
+                        + " failed (non-fatal): " + preClean.getMessage());
+            }
+
             // 4. Send MARKET order
             String entryOrderId = sendMarketOrder(symbol, isLong, qty);
             if (entryOrderId == null) {
