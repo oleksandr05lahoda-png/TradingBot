@@ -93,9 +93,16 @@ public final class SimpleBacktester {
     // Тест: BACKTEST_TRAIL_ENABLED=0 (+PROFITLOCK=0) → дать winners течь до TP2.
     // ДЕФОЛТ true = текущее поведение (sync с PositionTracker сохранён до явного
     // переключения env в ОБОИХ местах). Откат: не задавать env.
-    private final boolean trailEnabled       = !"0".equals(System.getenv().getOrDefault("BACKTEST_TRAIL_ENABLED", "1"));
-    private final boolean profitLockEnabled  = !"0".equals(System.getenv().getOrDefault("BACKTEST_PROFITLOCK_ENABLED", "1"));
-    private final boolean stagnationEnabled  = !"0".equals(System.getenv().getOrDefault("BACKTEST_STAGNATION_ENABLED", "1"));
+    // [v83.2 2026-06-01] ТЕСТ ГИПОТЕЗЫ B — trail/profitlock ВЫКЛЮЧЕНЫ ХАРДКОДОМ
+    // (без env, чтобы не зависеть от Railway). Цель: дать winners течь до TP2=2.2R
+    // вместо раннего trail-выхода (+0.6R). Если Net прыгнет вверх → trail душил
+    // прибыль. Stagnation оставлен ON (он режет мёртвые сделки, не winners).
+    // ⚠️ ВРЕМЕННО только для бэктеста. PositionTracker НЕ трогаю — sync восстановлю
+    // ПОСЛЕ того как тест покажет результат. Откат: вернуть true.
+    // В сводке должно стать Trail=0 — это индикатор что тест реально применился.
+    private final boolean trailEnabled       = false;  // [v83.2] TEST: was true
+    private final boolean profitLockEnabled  = false;  // [v83.2] TEST: was true
+    private final boolean stagnationEnabled  = true;
 
     // Single source of truth for warmup.
     // Matches DecisionEngineMerged.MIN_BARS (100) — the gate engine.analyze()
