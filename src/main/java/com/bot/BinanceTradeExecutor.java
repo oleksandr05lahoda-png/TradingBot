@@ -219,6 +219,10 @@ public final class BinanceTradeExecutor {
             try { ensureOneWayMode(); } catch (Exception e) {
                 LOG.warning("[Executor] ensureOneWayMode failed (non-fatal): " + e.getMessage());
             }
+            // [v82.5 DIAG 2026-06-01] One-shot account diagnostics to root-cause -1109.
+            try { logAccountDiagnostics(); } catch (Throwable t) {
+                LOG.warning("[Executor] account diagnostics failed: " + t.getMessage());
+            }
         }
     }
 
@@ -388,6 +392,75 @@ public final class BinanceTradeExecutor {
             ensureOneWayMode();
         } catch (Exception e) {
             LOG.warning("[Executor] post-reconcile ensureOneWayMode failed: " + e.getMessage());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // [v82.5 DIAG 2026-06-01] ACCOUNT DIAGNOSTICS — root-cause the -1109.
+    //
+    // Pure reads + a DRY-RUN order (/fapi/v1/order/test validates an order
+    // exactly like a real one but does NOT place it). Prints the account mode
+    // (Multi-Assets / Hedge / canTrade) and the EXACT Binance reply on the
+    // order path — instead of the opaque "MARKET order rejected".
+    //
+    // Reading these [DIAG] lines from the boot log tells us definitively WHY
+    // every write returns -1109 while reads work.
+    // ═══════════════════════════════════════════════════════════════════
+    public void logAccountDiagnostics() {
+        if (!isReady()) { LOG.warning("[DIAG] skipped — keys missing"); return; }
+        LOG.info("[DIAG] ═══ ACCOUNT DIAG base=" + baseUrl + " keyHead="
+                + (apiKey.length() >= 6 ? apiKey.substring(0, 6) : apiKey) + "… ═══");
+        diagGet("/fapi/v1/multiAssetsMargin", "multiAssetsMargin");
+        diagGet("/fapi/v1/positionSide/dual", "positionSide(hedge?)");
+        diagGet("/fapi/v2/account", "account(flags)");
+        diagOrderTest();
+        LOG.info("[DIAG] ═══ END ACCOUNT DIAG ═══");
+    }
+
+    /** Signed GET helper for diagnostics — logs status + (truncated) body. */
+    private void diagGet(String path, String label) {
+        try {
+            long ts = ts();
+            String qs = "timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + path + "?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String b = resp.body() == null ? "" : resp.body();
+            if (b.length() > 500) b = b.substring(0, 500) + "…";
+            LOG.info("[DIAG] " + label + " → HTTP " + resp.statusCode() + " " + b);
+        } catch (Exception e) {
+            LOG.warning("[DIAG] " + label + " error: " + e.getMessage());
+        }
+    }
+
+    /** Dry-run order: same validation as a real MARKET order but NOT placed.
+     *  HTTP 200 + empty body {} = order path WORKS. Any -code = the real reason. */
+    private void diagOrderTest() {
+        try {
+            long ts = ts();
+            String body = "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.002"
+                    + "&newOrderRespType=RESULT&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, body);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v1/order/test"))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .header("Content-Type", "application/x-www-form-urlencoded")
+                            .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String b = resp.body() == null ? "" : resp.body();
+            LOG.info("[DIAG] order/test BTCUSDT MARKET qty0.002 → HTTP " + resp.statusCode()
+                    + " body=" + (b.isEmpty() || "{}".equals(b.trim())
+                        ? "{} (✅ order path WORKS — -1109 is elsewhere)" : b));
+        } catch (Exception e) {
+            LOG.warning("[DIAG] order/test error: " + e.getMessage());
         }
     }
 
