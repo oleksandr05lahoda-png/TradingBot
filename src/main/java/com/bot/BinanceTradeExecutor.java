@@ -722,17 +722,24 @@ public final class BinanceTradeExecutor {
             // 20% меньше минимума — берём минимально-торгуемый размер, не режем
             // в ноль. На реале с нормальным балансом 20%-кап всегда > minNotional,
             // поведение не меняется. Защита от over-size сохранена.
+            // [v82.13 2026-06-01] FIX округления у минимума. БАГ v82.12: minTradable
+            // = minNotional×1.10 ($55), но roundDownToStep(qty) ниже съедал больше
+            // 10% (BTC step 0.001 = ~$71/шаг) → $55→$49.92 < min$50 → reject.
+            // Теперь нижний потолок капа = minNotional + 2 шага qty (в $), что
+            // ГАРАНТИРУЕТ: после округления qty вниз нотионал останется > minNotional.
+            // Защита от over-size (20%-кап) на нормальном балансе не меняется.
             double maxNotionalPct = envDouble("EXEC_MAX_NOTIONAL_PCT", 20.0);
             double maxNotional = balanceUsd * (maxNotionalPct / 100.0);
-            double minTradable = si.minNotional * 1.10; // +10% буфер на округление qty вниз
+            double stepNotional = si.stepSize * entry; // стоимость одного шага qty в $
+            double minTradable = si.minNotional + 2.0 * stepNotional; // min + 2 шага запаса
             if (maxNotional < minTradable) {
-                maxNotional = minTradable; // не капать ниже минимума биржи
+                maxNotional = minTradable; // не капать ниже реально-исполнимого минимума
             }
             if (notional > maxNotional && entry > 0) {
                 double cappedQty = maxNotional / entry;
                 LOG.info(String.format(
-                        "[Executor] %s notional cap: $%.2f → $%.2f (%.0f%% bal, min $%.2f) qty %.6f → %.6f",
-                        symbol, notional, maxNotional, maxNotionalPct, si.minNotional, qty, cappedQty));
+                        "[Executor] %s notional cap: $%.2f → $%.2f (%.0f%% bal, min $%.2f step $%.2f) qty %.6f → %.6f",
+                        symbol, notional, maxNotional, maxNotionalPct, si.minNotional, stepNotional, qty, cappedQty));
                 qty = cappedQty;
                 notional = qty * entry;
             }
