@@ -1900,11 +1900,13 @@ public final class BotMain {
         int[]    tierN   = new int[CONF_TIERS];
         int[]    tierWin = new int[CONF_TIERS];
         double[] tierPnL = new double[CONF_TIERS];
-        // [v83.9] Раскол по времени: 1-я vs 2-я половина окна. Если весь плюс
-        // в одной половине → везение окна, не edge. [0]=1-я половина, [1]=2-я.
-        int[]    halfN   = new int[2];
-        int[]    halfWin = new int[2];
-        double[] halfPnL = new double[2];
+        // [v84.3] Раскол 30-дн окна на 4 ПЕРИОДА (≈7.5 дн каждый) = walk-forward
+        // ВНУТРИ 30 дней (юзер: только 30д, не 90, ради Railway). Edge = плюс на
+        // ВСЕХ 4 периодах. Плюс в 1-2 из 4 → везение окна, не edge.
+        final int WF_PERIODS = 4;
+        int[]    halfN   = new int[WF_PERIODS];
+        int[]    halfWin = new int[WF_PERIODS];
+        double[] halfPnL = new double[WF_PERIODS];
         int symbolsRun = 0;          // pairs that completed bt.run()
         int symbolsRateLimited = 0;  // fetchKlines returned null
         int symbolsLowData = 0;      // fetched but <200 bars
@@ -2147,7 +2149,7 @@ public final class BotMain {
                         if (t.entryTime < tMin) tMin = t.entryTime;
                         if (t.entryTime > tMax) tMax = t.entryTime;
                     }
-                    long tMid = (tMin + tMax) / 2L;
+                    long tSpan = Math.max(1L, tMax - tMin);
                     for (com.bot.SimpleBacktester.TradeRecord t : r.trades) {
                         int bi = (int) ((t.confidence - 50.0) / 5.0);
                         if (bi < 0) bi = 0;
@@ -2156,7 +2158,9 @@ public final class BotMain {
                         if (t.pnlPct > 0.05) tierWin[bi]++;
                         tierPnL[bi] += t.pnlPct;
 
-                        int hi = (t.entryTime <= tMid) ? 0 : 1;
+                        int hi = (int) (WF_PERIODS * (t.entryTime - tMin) / tSpan);
+                        if (hi < 0) hi = 0;
+                        if (hi >= WF_PERIODS) hi = WF_PERIODS - 1;
                         halfN[hi]++;
                         if (t.pnlPct > 0.05) halfWin[hi]++;
                         halfPnL[hi] += t.pnlPct;
@@ -2203,19 +2207,21 @@ public final class BotMain {
         }
         String tierBreakdown = tb.toString();
 
-        // [v83.9] Раскол по времени — детектор "везения одного окна".
-        StringBuilder hb = new StringBuilder("⏳ *Стабильность (время):*\n");
-        String[] halfLbl = {"1-я пол.", "2-я пол."};
-        for (int k = 0; k < 2; k++) {
+        // [v84.3] Walk-forward ВНУТРИ 30д: 4 периода. Edge = плюс на ВСЕХ 4.
+        StringBuilder hb = new StringBuilder("🔭 *Walk-forward (4 периода × ~7.5д):*\n");
+        String[] halfLbl = {"П1 (старый)", "П2", "П3", "П4 (свежий)"};
+        int wfGreens = 0;
+        for (int k = 0; k < WF_PERIODS; k++) {
             if (halfN[k] == 0) { hb.append("  ").append(halfLbl[k]).append(": нет сделок\n"); continue; }
             double hWr  = 100.0 * halfWin[k] / halfN[k];
             double hAvg = halfPnL[k] / halfN[k];
-            String mark = halfPnL[k] > 0 ? "🟢" : "🔴";
+            boolean g = halfPnL[k] > 0 && halfN[k] >= 10;
+            if (g) wfGreens++;
             hb.append(String.format(
-                    "  %s %s: %d сд · WR %.0f%% · PnL %+.1f%% · avg %+.3f%%\n",
-                    mark, halfLbl[k], halfN[k], hWr, halfPnL[k], hAvg));
+                    "  %s %s: %d сд · WR %.0f%% · %+.1f%% · avg %+.3f%%\n",
+                    g ? "🟢" : "🔴", halfLbl[k], halfN[k], hWr, halfPnL[k], hAvg));
         }
-        hb.append("  _(обе 🟢 = edge; одна несёт всё = везение окна)_\n");
+        hb.append(String.format("  _%d/4 периодов в плюс — все 4 = edge; меньше = везение окна_\n", wfGreens));
         String halfBreakdown = hb.toString();
 
         // [FIX-1] Differentiate technical failure vs strategy verdict.
