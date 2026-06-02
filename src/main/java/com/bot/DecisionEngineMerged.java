@@ -2306,36 +2306,43 @@ public final class DecisionEngineMerged {
         double atrPct = atr14 / price;
         if (atrPct < 0.005 || atrPct > 0.05) return null;
 
-        // ── 1. RANGE REGIME (ADX low on both 15m and 1h)
-        com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
-        if (adxR.adx > 22) return null;
-        com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
-        if (adx1h.adx > 25) return null;
+        // [v83.6 2026-06-01] ОСЛАБЛЕНИЕ MR-фильтров. ПРИЧИНА: с жёсткими порогами
+        // backtest дал лишь 2 сделки за 60 дней (нет статистики). Расширяем каждый
+        // фильтр до разумного, сохраняя суть mean-reversion, цель ~100 сделок.
+        // Все пороги env-управляемы для дальнейшего тюнинга без передеплоя кода.
 
-        // ── 2. NOT in squeeze (squeeze = VCB territory)
+        // ── 1. RANGE REGIME — ADX мягче (22→32 / 25→35): рейндж не обязан быть штилем
+        com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
+        if (adxR.adx > csEnvDouble("MR_ADX_MAX", 32)) return null;
+        com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
+        if (adx1h.adx > csEnvDouble("MR_ADX1H_MAX", 35)) return null;
+
+        // ── 2. NOT in squeeze — bandwidth 0.30→0.20 (шире рынков подходит)
         com.bot.TradingCore.BollingerSqueeze bb =
                 com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
         if (bb.upper <= 0 || bb.lower <= 0) return null;
-        if (bb.bandwidthPctile < 0.30) return null;
+        if (bb.bandwidthPctile < csEnvDouble("MR_BW_MIN", 0.20)) return null;
 
-        // ── 3. BB EXTREME TOUCH
+        // ── 3. BB EXTREME TOUCH — pctB 0.05/0.95 → 0.12/0.88 (отбой от ЗОНЫ границы)
         double pctB = (price - bb.lower) / Math.max(1e-9, bb.upper - bb.lower);
-        boolean upperTouch = pctB > 0.95;
-        boolean lowerTouch = pctB < 0.05;
+        double pctBedge = csEnvDouble("MR_PCTB_EDGE", 0.12);
+        boolean upperTouch = pctB > (1.0 - pctBedge);
+        boolean lowerTouch = pctB < pctBedge;
         if (!upperTouch && !lowerTouch) return null;
         boolean wantLong = lowerTouch;
 
-        // ── 4. RSI EXTREME confirmation
+        // ── 4. RSI EXTREME — 35/65 → 42/58 (вход чуть раньше сверх-экстрима)
         double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
         double rsiNow = rsi[n - 1];
-        if (wantLong && rsiNow > 35) return null;
-        if (!wantLong && rsiNow < 65) return null;
+        double rsiLong = csEnvDouble("MR_RSI_LONG", 42);
+        if (wantLong && rsiNow > rsiLong) return null;
+        if (!wantLong && rsiNow < (100.0 - rsiLong)) return null;
 
-        // ── 5. NORMAL volume (not breakout — that's VCB)
+        // ── 5. NORMAL volume — верх 1.5→2.0 (терпим чуть больше объёма)
         double volSma = tpComputeVolSma(c15, 20);
         if (volSma <= 0) return null;
         double volRatio = last15.volume / volSma;
-        if (volRatio > 1.5) return null;
+        if (volRatio > csEnvDouble("MR_VOL_MAX", 2.0)) return null;
         if (volRatio < 0.4) return null; // dead market, no liquidity
 
         // ── 6. BTC REGIME guard
@@ -2366,8 +2373,10 @@ public final class DecisionEngineMerged {
         double slPct = slDist / price;
         if (slPct < 0.005 || slPct > 0.03) return null;
 
+        // [v83.6] rr-гейт 1.3→1.1 (env): MR живёт на высоком WR, не на R:R.
+        // TP=midBB бывает близко → строгий 1.3 резал валидные отбои.
         double rr = tpDist / slDist;
-        if (rr < 1.3) return null;
+        if (rr < csEnvDouble("MR_MIN_RR", 1.1)) return null;
 
         // ── PROBABILITY scoring (база 0.55, cap 0.78 — lower чем VCB)
         double prob01 = 0.55;
