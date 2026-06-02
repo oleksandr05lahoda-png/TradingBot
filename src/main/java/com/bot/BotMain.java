@@ -1882,6 +1882,13 @@ public final class BotMain {
         int totalTrades = 0, totalWins = 0, totalLosses = 0, totalTimeStops = 0;
         int totalBE = 0, totalProfitLock = 0, totalTrail = 0, totalStag = 0;
         double totalNetPnL = 0.0;
+        // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
+        // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
+        // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
+        final int CONF_TIERS = 6;
+        int[]    tierN   = new int[CONF_TIERS];
+        int[]    tierWin = new int[CONF_TIERS];
+        double[] tierPnL = new double[CONF_TIERS];
         int symbolsRun = 0;          // pairs that completed bt.run()
         int symbolsRateLimited = 0;  // fetchKlines returned null
         int symbolsLowData = 0;      // fetched but <200 bars
@@ -2116,6 +2123,17 @@ public final class BotMain {
                 totalTrail        += r.trailExits;
                 totalStag         += r.stagnationExits;
                 totalNetPnL       += r.netPnL;
+                // [v83.7] bucket каждую сделку по тиру уверенности (score).
+                if (r.trades != null) {
+                    for (com.bot.SimpleBacktester.TradeRecord t : r.trades) {
+                        int bi = (int) ((t.confidence - 50.0) / 5.0);
+                        if (bi < 0) bi = 0;
+                        if (bi >= CONF_TIERS) bi = CONF_TIERS - 1;
+                        tierN[bi]++;
+                        if (t.pnlPct > 0.05) tierWin[bi]++;
+                        tierPnL[bi] += t.pnlPct;
+                    }
+                }
                 symbolsRun++;
                 // Existing per-symbol EV signal for ISC.
                 if (r.total >= 5) isc.setSymbolBacktestResult(sym, r.ev);
@@ -2140,6 +2158,22 @@ public final class BotMain {
         double wr = totalTrades > 0 ? 100.0 * totalWins / totalTrades : 0.0;
         double wlRatio = totalLosses > 0 ? (double) totalWins / totalLosses : 0.0;
         int newCalCount = cal.totalOutcomeCount();
+
+        // [v83.7] Сводка по тирам уверенности — показывает, какой score-тир в плюсе.
+        // Решает, какой порог BACKTEST_MIN_CONF / MIN_CONF оставить, чтобы торговать
+        // только "уверенные" сигналы (цель ~100-200 сделок/мес на лучшем тире).
+        StringBuilder tb = new StringBuilder("🎚 *По уверенности (score):*\n");
+        String[] tierLbl = {"50-55", "55-60", "60-65", "65-70", "70-75", "75+"};
+        for (int k = 0; k < CONF_TIERS; k++) {
+            if (tierN[k] == 0) continue;
+            double tWr  = 100.0 * tierWin[k] / tierN[k];
+            double tAvg = tierPnL[k] / tierN[k];
+            String mark = tierPnL[k] > 0 ? "🟢" : "🔴";
+            tb.append(String.format(
+                    "  %s %s: %d сд · WR %.0f%% · PnL %+.1f%% · avg %+.3f%%\n",
+                    mark, tierLbl[k], tierN[k], tWr, tierPnL[k], tAvg));
+        }
+        String tierBreakdown = tb.toString();
 
         // [FIX-1] Differentiate technical failure vs strategy verdict.
         String verdict;
@@ -2267,6 +2301,7 @@ public final class BotMain {
                         + "  Avg/сделку: %+.3f%% (вот это ближе к реальности на сделку)\n"
                         + "📈 W/L ratio: %.2f\n"
                         + "🧠 Калибратор: %d outcomes\n"
+                        + "%s"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "%s",
                 elapsedSec, symbolsRun, symbolsRateLimited, symbolsLowData,
@@ -2274,7 +2309,7 @@ public final class BotMain {
                 totalWins, wr, totalLosses, totalTimeStops,
                 totalBE, totalProfitLock, totalTrail, totalStag, totalNetPnL,
                 (totalTrades > 0 ? totalNetPnL / totalTrades : 0.0),  // [v82.11] avg/trade
-                wlRatio, newCalCount,
+                wlRatio, newCalCount, tierBreakdown,
                 verdict);
 
         try { telegram.sendMessageAsync(summary); } catch (Throwable ignored) {}
