@@ -2776,15 +2776,15 @@ public final class DecisionEngineMerged {
             return reject(String.format("fm_funding_not_extreme=%.4f%%", rate * 100));
         }
 
-        // [v83.10] REGIME GATE — funding-fade живёт в РЕЙНДЖЕ; в тренде его выносит
-        // (толпа права, фандинг остаётся экстремальным, цена не откатывает —
-        // учебниковый провал funding-fade). Гипотеза из half-split v83.9: 1-я
-        // половина окна была flat (avg +0.007%/сделку) = вероятно трендовый режим.
-        // Торгуем funding ТОЛЬКО в RANGE/UNCLEAR. Откат: env FUNDING_REGIME_GATE=0.
+        // [v84.1] TREND-STRENGTH GATE (tunable). v83.10 скипал ЛЮБОЙ тренд (ADX>25)
+        // → срезал до 34 сделок. Смягчено: скипаем funding только в СИЛЬНОМ тренде
+        // (1h ADX > FUNDING_TREND_ADX_MAX, default 35) — где fade особенно опасен.
+        // Это возвращает объём к ~100-200 (запрос юзера) и оставляет half-split
+        // детектор судьёй edge'а. Откат: env FUNDING_REGIME_GATE=0.
         if (!"0".equals(System.getenv().getOrDefault("FUNDING_REGIME_GATE", "1"))) {
-            MarketRegime fmReg = detectMarketRegime(c1h);
-            if (fmReg == MarketRegime.TREND_UP || fmReg == MarketRegime.TREND_DOWN) {
-                return reject("fm_trend_regime");
+            double adx1hVal = com.bot.TradingCore.adx(c1h, 14).adx;
+            if (adx1hVal > csEnvDouble("FUNDING_TREND_ADX_MAX", 35.0)) {
+                return reject("fm_strong_trend");
             }
         }
 
