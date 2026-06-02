@@ -1201,6 +1201,17 @@ public final class BotMain {
         } catch (Throwable t) {
             LOG.warning("[STARTUP-BT] init failed: " + t.getMessage());
         }
+
+        // [v84.0] PAIRS STAT-ARB diagnostic — market-neutral edge test, runs
+        // alongside startup-BT and reports its own Telegram summary. PAIRS_BACKTEST=0 to skip.
+        try {
+            if (!"0".equals(System.getenv().getOrDefault("PAIRS_BACKTEST", "1"))) {
+                heavySched.submit(safe("PairsBacktest",
+                        () -> runPairsBacktest(sender, telegram)));
+            }
+        } catch (Throwable t) {
+            LOG.warning("[PAIRS-BT] init failed: " + t.getMessage());
+        }
     }
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
@@ -2394,6 +2405,111 @@ public final class BotMain {
      * Pacing: 600ms between requests (well under Binance rate-limit).
      * Total time at 8640 bars = 6 requests × 600ms = ~3.6s per pair.
      */
+    // [v84.0] PAIRS STAT-ARB diagnostic backtest. Market-neutral z-score reversion
+    // on the log-spread of correlated pairs. Self-contained (PairsBacktester),
+    // reports its own Telegram summary with |z|-tier + time-half breakdown so we
+    // can judge honestly: is there edge, and is it temporally stable (not window luck).
+    private static void runPairsBacktest(com.bot.SignalSender sender,
+                                         com.bot.TelegramBotSender telegram) {
+        try { Thread.sleep(200_000L); }   // start after the main startup-BT settles
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+
+        // Correlated / same-sector pairs — spread tends toward stationarity.
+        String[][] pairs = {
+                {"ETHUSDT", "BTCUSDT"},  {"SOLUSDT", "ETHUSDT"},  {"SOLUSDT", "AVAXUSDT"},
+                {"AVAXUSDT", "ETHUSDT"}, {"BNBUSDT", "ETHUSDT"},  {"LINKUSDT", "ETHUSDT"},
+                {"AVAXUSDT", "BNBUSDT"}, {"LINKUSDT", "SOLUSDT"}
+        };
+
+        int    lookback = envInt("PAIRS_LOOKBACK", 96);        // 1 day on 15m
+        double entryZ   = envDbl("PAIRS_ENTRY_Z", 2.0);
+        double exitZ    = envDbl("PAIRS_EXIT_Z", 0.5);
+        double stopZ    = envDbl("PAIRS_STOP_Z", 3.5);
+        int    timeStop = envInt("PAIRS_TIMESTOP_BARS", 96);
+        double cost     = envDbl("PAIRS_COST_PCT", 0.35);      // 2-leg round trip
+        int    bars     = envInt("PAIRS_BARS", 2880);          // 30 days 15m
+
+        LOG.info("[PAIRS-BT] ▶ starting, " + pairs.length + " pairs");
+        int totTrades = 0, totWins = 0, pairsRun = 0;
+        double totPnL = 0.0;
+        int[]    tierN = new int[4], tierWin = new int[4];     // |z|: 2-2.5, 2.5-3, 3-3.5, 3.5+
+        double[] tierPnL = new double[4];
+        int[]    halfN = new int[2], halfWin = new int[2];
+        double[] halfPnL = new double[2];
+        StringBuilder perPair = new StringBuilder();
+
+        for (String[] p : pairs) {
+            try {
+                List<com.bot.TradingCore.Candle> a = fetchKlinesPaged(sender, p[0], "15m", bars);
+                Thread.sleep(1500L);
+                List<com.bot.TradingCore.Candle> b = fetchKlinesPaged(sender, p[1], "15m", bars);
+                Thread.sleep(1500L);
+                if (a == null || b == null || a.size() < lookback + 50 || b.size() < lookback + 50) continue;
+
+                com.bot.PairsBacktester.Result res = com.bot.PairsBacktester.run(
+                        p[0] + "/" + p[1], a, b, lookback, entryZ, exitZ, stopZ, timeStop, cost);
+                if (res.trades.isEmpty()) continue;
+
+                pairsRun++;
+                totTrades += res.trades.size();
+                totWins   += res.wins;
+                totPnL    += res.netPnLPct;
+                perPair.append(String.format("  %s %s: %d сд · %+.1f%%\n",
+                        res.netPnLPct > 0 ? "🟢" : "🔴", res.name, res.trades.size(), res.netPnLPct));
+
+                long tMin = Long.MAX_VALUE, tMax = Long.MIN_VALUE;
+                for (com.bot.PairsBacktester.Trade t : res.trades) {
+                    if (t.entryTime < tMin) tMin = t.entryTime;
+                    if (t.entryTime > tMax) tMax = t.entryTime;
+                }
+                long tMid = (tMin + tMax) / 2L;
+                for (com.bot.PairsBacktester.Trade t : res.trades) {
+                    int zi = (int) ((t.entryZ - 2.0) / 0.5);
+                    if (zi < 0) zi = 0; if (zi > 3) zi = 3;
+                    tierN[zi]++; if (t.netPnlPct > 0.05) tierWin[zi]++; tierPnL[zi] += t.netPnlPct;
+                    int hi = (t.entryTime <= tMid) ? 0 : 1;
+                    halfN[hi]++; if (t.netPnlPct > 0.05) halfWin[hi]++; halfPnL[hi] += t.netPnlPct;
+                }
+            } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+            catch (Exception e) { LOG.warning("[PAIRS-BT] " + p[0] + "/" + p[1] + " err: " + e.getMessage()); }
+        }
+
+        double wr  = totTrades > 0 ? 100.0 * totWins / totTrades : 0.0;
+        double avg = totTrades > 0 ? totPnL / totTrades : 0.0;
+
+        String[] zlbl = {"2.0-2.5", "2.5-3.0", "3.0-3.5", "3.5+"};
+        StringBuilder tb = new StringBuilder("🎚 *По |z| входа:*\n");
+        for (int k = 0; k < 4; k++) {
+            if (tierN[k] == 0) continue;
+            tb.append(String.format("  %s %s: %d сд · WR %.0f%% · %+.1f%%\n",
+                    tierPnL[k] > 0 ? "🟢" : "🔴", zlbl[k], tierN[k], 100.0 * tierWin[k] / tierN[k], tierPnL[k]));
+        }
+        String[] hl = {"1-я пол.", "2-я пол."};
+        StringBuilder hb = new StringBuilder("⏳ *Стабильность (время):*\n");
+        for (int k = 0; k < 2; k++) {
+            if (halfN[k] == 0) { hb.append("  ").append(hl[k]).append(": нет сделок\n"); continue; }
+            hb.append(String.format("  %s %s: %d сд · WR %.0f%% · %+.1f%% · avg %+.3f%%\n",
+                    halfPnL[k] > 0 ? "🟢" : "🔴", hl[k], halfN[k],
+                    100.0 * halfWin[k] / halfN[k], halfPnL[k], halfPnL[k] / halfN[k]));
+        }
+
+        String verdict = (avg > 0 && halfPnL[0] > 0 && halfPnL[1] > 0)
+                ? "🟢 Есть сигнал edge И обе половины в плюсе — нужна валидация на 3-5 окнах + walk-forward, потом микро-реал."
+                : (avg > 0
+                    ? "🟡 Суммарно плюс, но НЕ обе половины зелёные — возможно везение окна. Гонять ещё."
+                    : "🔴 Edge нет (или косты 2 ног съедают). Pairs тоже мимо.");
+
+        String msg = "🔬 *PAIRS STAT-ARB backtest* (30д/15m, market-neutral)\n"
+                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                + String.format("Пар: %d · Сделок: %d\n", pairsRun, totTrades)
+                + String.format("WR: %.1f%% · Net: %+.1f%% (сумма по парам)\n", wr, totPnL)
+                + String.format("Avg/сделку: %+.3f%% (косты 2 ног учтены, funding нет)\n", avg)
+                + perPair + tb + hb
+                + "━━━━━━━━━━━━━━━━━━━━━\n" + verdict;
+        try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
+        LOG.info(String.format("[PAIRS-BT] ✓ done trades=%d wr=%.1f pnl=%.1f", totTrades, wr, totPnL));
+    }
+
     private static List<com.bot.TradingCore.Candle> fetchKlinesPaged(
             com.bot.SignalSender sender, String symbol, String interval, int totalBars) {
         java.util.TreeMap<Long, com.bot.TradingCore.Candle> byTime = new java.util.TreeMap<>();
@@ -2547,6 +2663,11 @@ public final class BotMain {
 
     private static int envInt(String k, int d) {
         try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); }
+        catch (Exception e) { return d; }
+    }
+
+    private static double envDbl(String k, double d) {
+        try { return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(d))); }
         catch (Exception e) { return d; }
     }
 
