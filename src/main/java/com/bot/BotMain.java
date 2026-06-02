@@ -1212,6 +1212,17 @@ public final class BotMain {
         } catch (Throwable t) {
             LOG.warning("[PAIRS-BT] init failed: " + t.getMessage());
         }
+
+        // [v84.2] FUNDING WALK-FORWARD — deciding test for real-money trust.
+        // Runs once; set FUNDING_WALKFORWARD=0 after to avoid re-fetching 90d each restart.
+        try {
+            if (!"0".equals(System.getenv().getOrDefault("FUNDING_WALKFORWARD", "1"))) {
+                heavySched.submit(safe("FundingWalkForward",
+                        () -> runFundingWalkForward(sender, telegram)));
+            }
+        } catch (Throwable t) {
+            LOG.warning("[WF] init failed: " + t.getMessage());
+        }
     }
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
@@ -2405,6 +2416,84 @@ public final class BotMain {
      * Pacing: 600ms between requests (well under Binance rate-limit).
      * Total time at 8640 bars = 6 requests × 600ms = ~3.6s per pair.
      */
+    // [v84.2] FUNDING WALK-FORWARD — the deciding test for "can I trust real money".
+    // Runs the funding strategy on N INDEPENDENT, non-overlapping 30-day windows
+    // (fetch 90d, split into 3) per symbol. A real edge is positive on ALL windows;
+    // window-luck shows up as some windows red. This is un-gameable: each window is
+    // a different month the strategy never "saw". FUNDING_WALKFORWARD=0 to skip.
+    private static void runFundingWalkForward(com.bot.SignalSender sender,
+                                              com.bot.TelegramBotSender telegram) {
+        try { Thread.sleep(260_000L); }   // after startup-BT + pairs-BT settle
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+
+        int nWin     = Math.max(2, envInt("WF_WINDOWS", 3));
+        int winBars  = envInt("WF_WINDOW_BARS", 2880);     // 30d on 15m
+        int winBarsH = winBars / 4;                         // 720 on 1h
+        int totBars  = nWin * winBars;
+        int totBarsH = nWin * winBarsH;
+        List<String> universe = sender.getScanUniverseSnapshot(envInt("WF_PAIRS", 20));
+        if (universe == null || universe.isEmpty()) { LOG.warning("[WF] universe empty"); return; }
+
+        LOG.info("[WF] ▶ funding walk-forward, " + nWin + " windows, " + universe.size() + " pairs");
+        com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
+        int[] wTrades = new int[nWin], wWins = new int[nWin];
+        double[] wPnL = new double[nWin];
+        int symbolsRun = 0;
+        List<com.bot.TradingCore.Candle> empty = new ArrayList<>();
+
+        for (String sym : universe) {
+            try {
+                Thread.sleep(4000L);
+                List<com.bot.TradingCore.Candle> m15 = fetchKlinesPaged(sender, sym, "15m", totBars);
+                Thread.sleep(1500L);
+                List<com.bot.TradingCore.Candle> h1  = fetchKlinesPaged(sender, sym, "1h", totBarsH);
+                if (m15 == null || h1 == null || m15.size() < totBars - 300 || h1.size() < totBarsH - 100) continue;
+                com.bot.DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(sym);
+                if (cat == null) cat = com.bot.DecisionEngineMerged.CoinCategory.ALT;
+                try {
+                    java.util.TreeMap<Long, Double> fh = com.bot.SimpleBacktester.fetchFundingHistory(
+                            sym, m15.get(0).openTime, m15.get(m15.size() - 1).openTime);
+                    bt.setFundingHistory(fh);
+                } catch (Exception fe) { bt.setFundingHistory(new java.util.TreeMap<>()); }
+                symbolsRun++;
+                for (int w = 0; w < nWin; w++) {
+                    int mf = w * winBars, mt = Math.min(m15.size(), (w + 1) * winBars);
+                    int hf = w * winBarsH, ht = Math.min(h1.size(), (w + 1) * winBarsH);
+                    if (mt - mf < 800 || ht - hf < 150) continue;
+                    com.bot.SimpleBacktester.BacktestResult r = bt.run(sym, empty, empty,
+                            new ArrayList<>(m15.subList(mf, mt)), new ArrayList<>(h1.subList(hf, ht)), cat);
+                    if (r == null) continue;
+                    wTrades[w] += r.total; wWins[w] += r.wins; wPnL[w] += r.netPnL;
+                }
+            } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+            catch (Exception e) { LOG.warning("[WF] " + sym + " err: " + e.getMessage()); }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("🔭 *FUNDING WALK-FORWARD* (").append(nWin).append("×30д, НЕЗАВИСИМЫЕ окна)\n");
+        sb.append("━━━━━━━━━━━━━━━━━━━━━\n");
+        sb.append("Это решающий тест: edge должен быть в плюс на КАЖДОМ окне.\n\n");
+        int greens = 0;
+        for (int w = 0; w < nWin; w++) {
+            double wr  = wTrades[w] > 0 ? 100.0 * wWins[w] / wTrades[w] : 0.0;
+            double avg = wTrades[w] > 0 ? wPnL[w] / wTrades[w] : 0.0;
+            boolean green = wPnL[w] > 0 && wTrades[w] >= 20;
+            if (green) greens++;
+            sb.append(String.format("  %s Окно %d (%d дн назад): %d сд · WR %.0f%% · %+.1f%% · avg %+.3f%%\n",
+                    green ? "🟢" : "🔴", w + 1, (nWin - w) * 30, wTrades[w], wr, wPnL[w], avg));
+        }
+        sb.append("━━━━━━━━━━━━━━━━━━━━━\n");
+        if (greens == nWin) {
+            sb.append(String.format("🟢 ВСЕ %d окна в плюс — edge ДЕРЖИТСЯ out-of-sample.\n", nWin));
+            sb.append("Это уровень, на котором можно начинать МИКРО-реал (×0.1 размер, daily-stop).");
+        } else {
+            sb.append(String.format("🔴 Только %d/%d окон в плюс — edge НЕ стабилен на разных периодах.\n", greens, nWin));
+            sb.append("Это везение окна, не edge. Реальные деньги — нельзя.");
+        }
+        try { telegram.sendMessageAsync(sb.toString()); } catch (Throwable ignored) {}
+        LOG.info("[WF] ✓ done greens=" + greens + "/" + nWin + " symbolsRun=" + symbolsRun);
+    }
+
     // [v84.0] PAIRS STAT-ARB diagnostic backtest. Market-neutral z-score reversion
     // on the log-spread of correlated pairs. Self-contained (PairsBacktester),
     // reports its own Telegram summary with |z|-tier + time-half breakdown so we
