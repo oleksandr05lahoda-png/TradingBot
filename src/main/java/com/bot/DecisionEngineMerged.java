@@ -1766,20 +1766,39 @@ public final class DecisionEngineMerged {
         // Phase 4 (opt-in): + Mean Reversion via env MEAN_REV_ENABLED=1
         // Math к +10%/мес: VCB +3.5% + MR +2-3% + FundingArb +1.5% + ML +2-3% = +9-12%
 
-        // Primary: VCB Squeeze Breakout (validated baseline)
+        // [v83.5 2026-06-01] STRATEGY ROUTER — переключатель движка.
+        // ДИАГНОЗ: VCB breakout доказанно убыточен (6 прогонов, WR ~39%, Net −96%,
+        // даже инверсия не помогла = directional-вход на пробое = шум на крипте
+        // 2026). Переключаемся на MEAN-REVERSION (другой класс: не угадываем
+        // направление, а торгуем возврат к среднему в рейндже — там у ретейла
+        // бывает реальный edge, как у Binance Grid-ботов).
+        //
+        // env STRATEGY_MODE: "MR" (только mean-reversion, DEFAULT),
+        //                    "VCB" (только breakout — старое поведение),
+        //                    "BOTH" (VCB primary, MR fallback).
+        // Откат к VCB: STRATEGY_MODE=VCB.
+        String stratMode = System.getenv().getOrDefault("STRATEGY_MODE", "MR").trim().toUpperCase();
+
+        if (stratMode.equals("MR")) {
+            // Чистая mean-reversion — тестируем её edge без примеси VCB.
+            TradeIdea mrIdea = generateMeanReversion(symbol, c15, c1h, cat, now);
+            if (mrIdea != null) {
+                csLastSignalTime.put(symbol, now);
+                return mrIdea;
+            }
+            return reject("mr_no_setup");
+        }
+
+        // VCB primary (STRATEGY_MODE=VCB или BOTH)
         TradeIdea idea = generateTrendPullback(symbol, c15, c1h, c2h, cat, now);
         if (idea != null) {
             csLastSignalTime.put(symbol, now);
             return idea;
         }
 
-        // [v9.9 2026-05-29] PHASE 4 SKELETON — Mean Reversion для RANGE markets.
-        // ВКЛЮЧАЕТСЯ ТОЛЬКО через env MEAN_REV_ENABLED=1.
-        // Default OFF → 0 impact на baseline.
-        // Включи когда: paper data 50+ VCB signals подтвердил baseline →
-        // backtest показал MR profitable → 2 недели paper test MR alone.
-        // См. roadmap к +10%/мес в memory: project_v92_baseline.md
-        if ("1".equals(System.getenv().getOrDefault("MEAN_REV_ENABLED", "0"))) {
+        // BOTH: MR как fallback когда VCB не дал сетап
+        if (stratMode.equals("BOTH")
+                || "1".equals(System.getenv().getOrDefault("MEAN_REV_ENABLED", "0"))) {
             TradeIdea mrIdea = generateMeanReversion(symbol, c15, c1h, cat, now);
             if (mrIdea != null) {
                 csLastSignalTime.put(symbol, now);
@@ -2088,9 +2107,10 @@ public final class DecisionEngineMerged {
         // candle/HTF/RSI/ADX, которые отработали по естественному breakout), чтобы
         // фильтры остались валидными, а флипнулись только side/SL/TP. Иначе
         // candleStrong зарезал бы все сделки.
-        // env VCB_INVERT=1 (default ON для теста). WR→55%+ = mean-reversion edge.
-        // WR останется 39% = сигнал шум → VCB на удаление. Откат: VCB_INVERT=0.
-        if (!"0".equals(System.getenv().getOrDefault("VCB_INVERT", "1"))) {
+        // [v83.5 ОТКАТ] Инверсия (тест D) ПРОВАЛЕНА: WR 40.6%, Net −137% (хуже).
+        // Подтвердило: VCB-сигнал = шум (не работает ни прямо, ни обратно).
+        // Default OFF. VCB целиком вытеснен mean-reversion (STRATEGY_MODE=MR).
+        if ("1".equals(System.getenv().getOrDefault("VCB_INVERT", "0"))) {
             wantLong = !wantLong;
         }
 
