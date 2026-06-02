@@ -1889,6 +1889,11 @@ public final class BotMain {
         int[]    tierN   = new int[CONF_TIERS];
         int[]    tierWin = new int[CONF_TIERS];
         double[] tierPnL = new double[CONF_TIERS];
+        // [v83.9] Раскол по времени: 1-я vs 2-я половина окна. Если весь плюс
+        // в одной половине → везение окна, не edge. [0]=1-я половина, [1]=2-я.
+        int[]    halfN   = new int[2];
+        int[]    halfWin = new int[2];
+        double[] halfPnL = new double[2];
         int symbolsRun = 0;          // pairs that completed bt.run()
         int symbolsRateLimited = 0;  // fetchKlines returned null
         int symbolsLowData = 0;      // fetched but <200 bars
@@ -2123,8 +2128,15 @@ public final class BotMain {
                 totalTrail        += r.trailExits;
                 totalStag         += r.stagnationExits;
                 totalNetPnL       += r.netPnL;
-                // [v83.7] bucket каждую сделку по тиру уверенности (score).
-                if (r.trades != null) {
+                // [v83.7] bucket по тиру уверенности (score).
+                // [v83.9] + раскол по времени (1-я/2-я половина окна пары).
+                if (r.trades != null && !r.trades.isEmpty()) {
+                    long tMin = Long.MAX_VALUE, tMax = Long.MIN_VALUE;
+                    for (com.bot.SimpleBacktester.TradeRecord t : r.trades) {
+                        if (t.entryTime < tMin) tMin = t.entryTime;
+                        if (t.entryTime > tMax) tMax = t.entryTime;
+                    }
+                    long tMid = (tMin + tMax) / 2L;
                     for (com.bot.SimpleBacktester.TradeRecord t : r.trades) {
                         int bi = (int) ((t.confidence - 50.0) / 5.0);
                         if (bi < 0) bi = 0;
@@ -2132,6 +2144,11 @@ public final class BotMain {
                         tierN[bi]++;
                         if (t.pnlPct > 0.05) tierWin[bi]++;
                         tierPnL[bi] += t.pnlPct;
+
+                        int hi = (t.entryTime <= tMid) ? 0 : 1;
+                        halfN[hi]++;
+                        if (t.pnlPct > 0.05) halfWin[hi]++;
+                        halfPnL[hi] += t.pnlPct;
                     }
                 }
                 symbolsRun++;
@@ -2174,6 +2191,21 @@ public final class BotMain {
                     mark, tierLbl[k], tierN[k], tWr, tierPnL[k], tAvg));
         }
         String tierBreakdown = tb.toString();
+
+        // [v83.9] Раскол по времени — детектор "везения одного окна".
+        StringBuilder hb = new StringBuilder("⏳ *Стабильность (время):*\n");
+        String[] halfLbl = {"1-я пол.", "2-я пол."};
+        for (int k = 0; k < 2; k++) {
+            if (halfN[k] == 0) { hb.append("  ").append(halfLbl[k]).append(": нет сделок\n"); continue; }
+            double hWr  = 100.0 * halfWin[k] / halfN[k];
+            double hAvg = halfPnL[k] / halfN[k];
+            String mark = halfPnL[k] > 0 ? "🟢" : "🔴";
+            hb.append(String.format(
+                    "  %s %s: %d сд · WR %.0f%% · PnL %+.1f%% · avg %+.3f%%\n",
+                    mark, halfLbl[k], halfN[k], hWr, halfPnL[k], hAvg));
+        }
+        hb.append("  _(обе 🟢 = edge; одна несёт всё = везение окна)_\n");
+        String halfBreakdown = hb.toString();
 
         // [FIX-1] Differentiate technical failure vs strategy verdict.
         String verdict;
@@ -2302,6 +2334,7 @@ public final class BotMain {
                         + "📈 W/L ratio: %.2f\n"
                         + "🧠 Калибратор: %d outcomes\n"
                         + "%s"
+                        + "%s"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "%s",
                 elapsedSec, symbolsRun, symbolsRateLimited, symbolsLowData,
@@ -2309,7 +2342,7 @@ public final class BotMain {
                 totalWins, wr, totalLosses, totalTimeStops,
                 totalBE, totalProfitLock, totalTrail, totalStag, totalNetPnL,
                 (totalTrades > 0 ? totalNetPnL / totalTrades : 0.0),  // [v82.11] avg/trade
-                wlRatio, newCalCount, tierBreakdown,
+                wlRatio, newCalCount, tierBreakdown, halfBreakdown,
                 verdict);
 
         try { telegram.sendMessageAsync(summary); } catch (Throwable ignored) {}
