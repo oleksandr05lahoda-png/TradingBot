@@ -1773,11 +1773,32 @@ public final class DecisionEngineMerged {
         // направление, а торгуем возврат к среднему в рейндже — там у ретейла
         // бывает реальный edge, как у Binance Grid-ботов).
         //
-        // env STRATEGY_MODE: "MR" (только mean-reversion, DEFAULT),
-        //                    "VCB" (только breakout — старое поведение),
-        //                    "BOTH" (VCB primary, MR fallback).
-        // Откат к VCB: STRATEGY_MODE=VCB.
-        String stratMode = System.getenv().getOrDefault("STRATEGY_MODE", "MR").trim().toUpperCase();
+        // [v83.8] env STRATEGY_MODE:
+        //   "ENSEMBLE" (DEFAULT) — режим-роутер СТРУКТУРНЫХ edge, НЕ конфликтует
+        //                          (1 стратегия на условие). Сейчас: funding-harvest
+        //                          на экстриме фандинга, иначе — стоим в стороне.
+        //                          Pairs/Grid добавятся после доработки движка бэктеста.
+        //   "FUNDING"            — только funding-harvest (изолированный тест edge).
+        //   "MR"/"VCB"/"BOTH"    — старые directional-движки. ДОКАЗАННО убыточны
+        //                          (v83.7: все score-тиры в минус). Оставлены для сравнения.
+        String stratMode = System.getenv().getOrDefault("STRATEGY_MODE", "ENSEMBLE").trim().toUpperCase();
+
+        // ── FUNDING: изолированный тест funding-edge ──
+        if (stratMode.equals("FUNDING")) {
+            TradeIdea f = generateFromFundingMomentum(symbol, c1, c5, c15, c1h, c2h, cat, now);
+            if (f != null) { csLastSignalTime.put(symbol, now); return f; }
+            return reject("funding_no_setup");
+        }
+
+        // ── ENSEMBLE: структурный funding-edge первым приоритетом ──
+        // Экстрим фандинга = толпа перекошена → fade + получаем фандинг (структурный,
+        // не directional edge). Нет сетапа → стоим в стороне (VCB/MR исключены как
+        // убыточные). Так "всё только помогает", и стратегии не конфликтуют.
+        if (stratMode.equals("ENSEMBLE")) {
+            TradeIdea f = generateFromFundingMomentum(symbol, c1, c5, c15, c1h, c2h, cat, now);
+            if (f != null) { csLastSignalTime.put(symbol, now); return f; }
+            return reject("ensemble_stand_aside");
+        }
 
         if (stratMode.equals("MR")) {
             // Чистая mean-reversion — тестируем её edge без примеси VCB.
