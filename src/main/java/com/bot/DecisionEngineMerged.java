@@ -2776,6 +2776,18 @@ public final class DecisionEngineMerged {
             return reject(String.format("fm_funding_not_extreme=%.4f%%", rate * 100));
         }
 
+        // [v83.10] REGIME GATE — funding-fade живёт в РЕЙНДЖЕ; в тренде его выносит
+        // (толпа права, фандинг остаётся экстремальным, цена не откатывает —
+        // учебниковый провал funding-fade). Гипотеза из half-split v83.9: 1-я
+        // половина окна была flat (avg +0.007%/сделку) = вероятно трендовый режим.
+        // Торгуем funding ТОЛЬКО в RANGE/UNCLEAR. Откат: env FUNDING_REGIME_GATE=0.
+        if (!"0".equals(System.getenv().getOrDefault("FUNDING_REGIME_GATE", "1"))) {
+            MarketRegime fmReg = detectMarketRegime(c1h);
+            if (fmReg == MarketRegime.TREND_UP || fmReg == MarketRegime.TREND_DOWN) {
+                return reject("fm_trend_regime");
+            }
+        }
+
         // ── Direction: contrarian to crowd ──
         // Negative funding = crowd is short → LONG to ride squeeze
         // Positive funding = crowd is long  → SHORT to ride flush
