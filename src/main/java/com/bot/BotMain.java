@@ -1878,7 +1878,7 @@ public final class BotMain {
 
         // Universe size — default 50, controlled via STARTUP_BT_PAIRS env.
         // Each pair = ~7sec (paging + fetch), so 50 pairs ≈ 6 minutes.
-        final int btPairsLimit = Math.max(10, envInt("STARTUP_BT_PAIRS", 50));
+        final int btPairsLimit = Math.max(10, envInt("STARTUP_BT_PAIRS", 25));  // [v85.3] 50→25: легче для Binance rate-limit
 
         // 1. Universe — wait for at least 80% target loaded (gives cachedPairs
         // time to actually fill, not just have 1 pair). Hard timeout still 60s
@@ -1964,7 +1964,7 @@ public final class BotMain {
         // [v83.6] HTF floor 1440→720: на 15m primary HTF=1h, 30 дней = 720 баров.
         // Синхронно с откатом окна 60→30 дней (экономия Railway).
         final int barsHtfTarget = Math.min(2000, Math.max(720, htfBarsCfg));
-        final long pacingMs     = Math.max(3000L, envInt("STARTUP_BT_PACING_MS", 5000));
+        final long pacingMs     = Math.max(3000L, envInt("STARTUP_BT_PACING_MS", 8000));  // [v85.3] 5000→8000: мягче темп запросов
 
         // Min bars guard for primary TF: 200 on 15m, 150 on 1h.
         final int primaryMinBars = btIs15m ? 200 : 150;
@@ -1975,7 +1975,7 @@ public final class BotMain {
         // Теперь Universe = overfetch buffer (45), цель = 30 валидных. Эффект:
         // "Мало данных" в сводке падает в 0, потому что мы прекращаем перебор
         // ДО того как доберёмся до молодых пар без истории.
-        final int targetValidPairs = Math.max(5, envInt("STARTUP_BT_TARGET_VALID_PAIRS", 30));
+        final int targetValidPairs = Math.max(5, envInt("STARTUP_BT_TARGET_VALID_PAIRS", 15));  // [v85.3] 30→15: вдвое меньше пар = вдвое меньше запросов
         int validPairs = 0;
 
         for (String sym : universe) {
