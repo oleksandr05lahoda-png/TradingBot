@@ -1179,10 +1179,11 @@ public final class BotMain {
         // Disable explicitly with STARTUP_BACKTEST=0 in Railway env.
         // ═══════════════════════════════════════════════════════════════════
         try {
-            // [v85.1] DEFAULT OFF: directional/funding бэктест признан мёртвым (walk-forward 2/4),
-            // а тяжёлый фетч 30 пар на каждом рестарте долбит Binance → 418 IP ban. Включить: STARTUP_BACKTEST=1.
+            // [v85.2] Вернул DEFAULT ON (юзер хочет обычный бэктест). На нормальной каденции
+            // (без частых рестартов) startup-BT грузит ОК — 418 был от ~10 рестартов подряд
+            // + тяжёлого pairs-BT. pairs-BT остаётся OFF. Откл: STARTUP_BACKTEST=0.
             boolean startupBacktestEnabled =
-                    "1".equals(System.getenv().getOrDefault("STARTUP_BACKTEST", "0"));
+                    !"0".equals(System.getenv().getOrDefault("STARTUP_BACKTEST", "1"));
             int existingOutcomes =
                     com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
             int minSamplesNeeded = Integer.parseInt(System.getenv()
