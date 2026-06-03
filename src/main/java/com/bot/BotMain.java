@@ -1179,8 +1179,10 @@ public final class BotMain {
         // Disable explicitly with STARTUP_BACKTEST=0 in Railway env.
         // ═══════════════════════════════════════════════════════════════════
         try {
+            // [v85.1] DEFAULT OFF: directional/funding бэктест признан мёртвым (walk-forward 2/4),
+            // а тяжёлый фетч 30 пар на каждом рестарте долбит Binance → 418 IP ban. Включить: STARTUP_BACKTEST=1.
             boolean startupBacktestEnabled =
-                    !"0".equals(System.getenv().getOrDefault("STARTUP_BACKTEST", "1"));
+                    "1".equals(System.getenv().getOrDefault("STARTUP_BACKTEST", "0"));
             int existingOutcomes =
                     com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
             int minSamplesNeeded = Integer.parseInt(System.getenv()
@@ -1205,7 +1207,9 @@ public final class BotMain {
         // [v84.0] PAIRS STAT-ARB diagnostic — market-neutral edge test, runs
         // alongside startup-BT and reports its own Telegram summary. PAIRS_BACKTEST=0 to skip.
         try {
-            if (!"0".equals(System.getenv().getOrDefault("PAIRS_BACKTEST", "1"))) {
+            // [v85.1] DEFAULT OFF: pairs доказанно мёртв (−177%), нет смысла фетчить 16 серий
+            // каждый запуск и долбить Binance. Включить: PAIRS_BACKTEST=1.
+            if ("1".equals(System.getenv().getOrDefault("PAIRS_BACKTEST", "0"))) {
                 heavySched.submit(safe("PairsBacktest",
                         () -> runPairsBacktest(sender, telegram)));
             }
