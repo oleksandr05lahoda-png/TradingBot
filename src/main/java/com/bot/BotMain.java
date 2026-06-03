@@ -1212,6 +1212,17 @@ public final class BotMain {
         } catch (Throwable t) {
             LOG.warning("[PAIRS-BT] init failed: " + t.getMessage());
         }
+
+        // [v85.0] CARRY (funding harvest) diagnostic — the one structurally-real,
+        // market-neutral edge. Cheap (funding data only). CARRY_BACKTEST=0 to skip.
+        try {
+            if (!"0".equals(System.getenv().getOrDefault("CARRY_BACKTEST", "1"))) {
+                heavySched.submit(safe("CarryBacktest",
+                        () -> runCarryBacktest(sender, telegram)));
+            }
+        } catch (Throwable t) {
+            LOG.warning("[CARRY] init failed: " + t.getMessage());
+        }
     }
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
@@ -2411,6 +2422,69 @@ public final class BotMain {
      * Pacing: 600ms between requests (well under Binance rate-limit).
      * Total time at 8640 bars = 6 requests × 600ms = ~3.6s per pair.
      */
+    // [v85.0] CARRY (funding harvest) diagnostic — delta-neutral, market-neutral.
+    // Tests the ONE structurally-real edge (funding cash flow) using funding history
+    // ONLY (no spot needed to ESTIMATE; legs' price PnL cancels). Cheap: funding
+    // endpoint is light. CARRY_BACKTEST=0 to skip. 30d window (user rule).
+    private static void runCarryBacktest(com.bot.SignalSender sender,
+                                         com.bot.TelegramBotSender telegram) {
+        try { Thread.sleep(150_000L); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+
+        int    nPairs  = envInt("CARRY_PAIRS", 25);
+        double minRate = envDbl("CARRY_MIN_RATE", 0.00005);   // 0.005%/8h
+        double rtCost  = envDbl("CARRY_RT_COST_PCT", 0.30);   // 2 legs in+out
+        List<String> universe = sender.getScanUniverseSnapshot(nPairs);
+        if (universe == null || universe.isEmpty()) { LOG.warning("[CARRY] universe empty"); return; }
+
+        long end = System.currentTimeMillis();
+        long start = end - 30L * 86_400_000L;                 // 30 days (user rule: never >30d)
+        LOG.info("[CARRY] ▶ " + universe.size() + " coins");
+
+        List<com.bot.CarryBacktester.Result> results = new ArrayList<>();
+        double sumAnnual = 0.0; int positive = 0, ran = 0;
+        for (String sym : universe) {
+            try {
+                Thread.sleep(700L);
+                java.util.TreeMap<Long, Double> fh =
+                        com.bot.SimpleBacktester.fetchFundingHistory(sym, start, end);
+                if (fh == null || fh.size() < 20) continue;
+                com.bot.CarryBacktester.Result r = com.bot.CarryBacktester.run(sym, fh, minRate, rtCost);
+                if (r.daysCovered < 5) continue;
+                ran++;
+                sumAnnual += r.annualizedPct;
+                if (r.netPct > 0) positive++;
+                results.add(r);
+            } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+            catch (Exception e) { LOG.warning("[CARRY] " + sym + " err: " + e.getMessage()); }
+        }
+        if (ran == 0) {
+            try { telegram.sendMessageAsync("🏦 Carry backtest: нет funding-данных."); } catch (Throwable ig) {}
+            return;
+        }
+        results.sort((a, b) -> Double.compare(b.annualizedPct, a.annualizedPct));
+        StringBuilder per = new StringBuilder();
+        int show = Math.min(8, results.size());
+        for (int i = 0; i < show; i++) {
+            com.bot.CarryBacktester.Result r = results.get(i);
+            per.append(String.format("  %s %s: %+.0f%%/год (net %+.2f%% / %.0fд)\n",
+                    r.annualizedPct > 0 ? "🟢" : "🔴", r.symbol, r.annualizedPct, r.netPct, r.daysCovered));
+        }
+        double avgAnnual = sumAnnual / ran;
+        String verdict = (avgAnnual > 8.0 && positive > ran * 0.6)
+                ? "🟢 Реальный market-neutral yield. Это ЧЕСТНЫЙ edge — денежный поток, не предсказание.\nСлед. шаг: спот-нога для live + валидация. Доходность скромная, но РЕАЛЬНАЯ и низкорисковая."
+                : "🟡 Carry-yield тонкий после костов. Честно: даже структурный edge тут невелик на этих монетах.";
+        String msg = "🏦 *CARRY (funding harvest)* — delta-neutral, market-neutral (30д)\n"
+                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                + String.format("Монет: %d · в плюс: %d/%d\n", ran, positive, ran)
+                + String.format("Средний yield: %+.1f%%/год (net, косты учтены)\n", avgAnnual)
+                + "Топ:\n" + per
+                + "━━━━━━━━━━━━━━━━━━━━━\n" + verdict
+                + "\n_Оценка оптимистичная (без basis-риска и спот-комиссий) — реал ниже._";
+        try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
+        LOG.info(String.format("[CARRY] ✓ ran=%d pos=%d avg=%.1f", ran, positive, avgAnnual));
+    }
+
     // [v84.0] PAIRS STAT-ARB diagnostic backtest. Market-neutral z-score reversion
     // on the log-spread of correlated pairs. Self-contained (PairsBacktester),
     // reports its own Telegram summary with |z|-tier + time-half breakdown so we
