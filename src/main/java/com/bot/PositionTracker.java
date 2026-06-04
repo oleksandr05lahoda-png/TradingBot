@@ -98,7 +98,13 @@ public final class PositionTracker {
         this.executor  = BinanceTradeExecutor.getInstance();
         this.riskGuard = RiskGuard.getInstance();
         this.telegram  = null;
-        this.TIME_STOP_MS      = envLong("PT_TIME_STOP_MS", 180 * 60_000L);
+        // [v86.3] Time-stop масштабируется под PRIMARY_TF, чтобы СОВПАДАТЬ с backtest
+        // (SimpleBacktester: 15m=12 баров=180мин, 1h=8 баров=480мин=8ч). Раньше был фикс
+        // 180мин → на 1h live резал сделку за 3ч, а backtest держал 8ч = расхождение,
+        // меньше профита live. env PT_TIME_STOP_MS перебивает.
+        this.TIME_STOP_MS      = envLong("PT_TIME_STOP_MS",
+                "1h".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim())
+                        ? 480L * 60_000L : 180L * 60_000L);
         this.POLL_INTERVAL_MS  = envLong("PT_POLL_INTERVAL_MS", 30_000L);
         this.BE_OFFSET_PCT     = envDouble("PT_BE_OFFSET_PCT", 0.05);
         this.BE_ENABLED        = "1".equals(System.getenv().getOrDefault("PT_BE_ENABLED", "1"));
