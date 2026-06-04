@@ -1781,7 +1781,16 @@ public final class DecisionEngineMerged {
         //   "FUNDING"            — только funding-harvest (изолированный тест edge).
         //   "MR"/"VCB"/"BOTH"    — старые directional-движки. ДОКАЗАННО убыточны
         //                          (v83.7: все score-тиры в минус). Оставлены для сравнения.
-        String stratMode = System.getenv().getOrDefault("STRATEGY_MODE", "ENSEMBLE").trim().toUpperCase();
+        String stratMode = System.getenv().getOrDefault("STRATEGY_MODE", "TREND").trim().toUpperCase();
+
+        // [v86.0] TREND-ALIGNED INTRADAY — DEFAULT. HTF(4h) тренд задаёт направление,
+        // 1h откат к EMA даёт вход, холд ≤ суток. Под PRIMARY_TF=1h. Лучший честный
+        // directional-вариант под интрадей (не воюет с трендом, вне HFT-зоны).
+        if (stratMode.equals("TREND")) {
+            TradeIdea t = generateTrendAligned(symbol, c15, c1h, cat, now);
+            if (t != null) { csLastSignalTime.put(symbol, now); return t; }
+            return reject("trend_no_setup");
+        }
 
         // ── FUNDING: изолированный тест funding-edge ──
         if (stratMode.equals("FUNDING")) {
@@ -2745,6 +2754,128 @@ public final class DecisionEngineMerged {
     //   - SimpleBacktester now loads historical funding rates per symbol
     //   - DE.setSimulatedFunding() injects per-bar funding into fundingCache
     //   - Live: fundingCache populated by SignalSender.refreshAllFundingRates()
+    // ─────────────────────────────────────────────────────────────────────
+    // [v86.0] TREND-ALIGNED INTRADAY (designed for PRIMARY_TF=1h)
+    // ─────────────────────────────────────────────────────────────────────
+    // Thesis: pure intraday prediction is noise (proven). The ONE directional
+    // premium that survives is TREND — but it lives on higher timeframes. So:
+    //   • DIRECTION comes from the HTF (c1h = 4h when primary is 1h): EMA20>EMA50,
+    //     rising, price above EMA50 → only trade WITH the bigger trend.
+    //   • TIMING comes from the primary (c15 = 1h): a pullback to EMA20 that
+    //     RESUMES in the trend direction (don't chase, buy the dip in an uptrend).
+    //   • EXIT is same-day: ATR-based SL/TP (R:R≈1.8) + the engine's time-stop.
+    // This captures a slice of the trend premium while closing within a day, and
+    // avoids the HFT zone (no millisecond games). Honest: edge here is thin and
+    // MUST be confirmed by walk-forward — this is the best version, not a promise.
+    // All thresholds are env-tunable (TA_*) for tuning без передеплоя.
+    private TradeIdea generateTrendAligned(String symbol,
+                                           List<com.bot.TradingCore.Candle> c15,  // PRIMARY (1h)
+                                           List<com.bot.TradingCore.Candle> c1h,  // HTF (4h)
+                                           CoinCategory cat, long now) {
+        if (!valid(c15) || !valid(c1h)) return reject("ta_invalid_candles");
+        if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("ta_skip_meme");
+
+        Long lastSig = csLastSignalTime.get(symbol);
+        if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) return reject("ta_cooldown");
+
+        int n = c15.size();
+        com.bot.TradingCore.Candle last = c15.get(n - 1);
+        com.bot.TradingCore.Candle prev = c15.get(n - 2);
+        double price = last.close;
+        if (price <= 0) return reject("ta_bad_price");
+
+        double atr = com.bot.TradingCore.atr(c15, 14);
+        if (atr <= 0) return reject("ta_bad_atr");
+        double atrPct = atr / price;
+        if (atrPct < csEnvDouble("TA_ATR_MIN", 0.004) || atrPct > csEnvDouble("TA_ATR_MAX", 0.06))
+            return reject("ta_atr_oob");
+
+        // ── HTF TREND (direction) — EMA20/50 on c1h (4h), with slope + price filter ──
+        double[] hFast = com.bot.TradingCore.emaSeries(c1h, 20);
+        double[] hSlow = com.bot.TradingCore.emaSeries(c1h, 50);
+        if (hFast.length < 3 || hSlow.length < 3) return reject("ta_htf_short");
+        double hFastNow = hFast[hFast.length - 1], hFastPrev = hFast[hFast.length - 3];
+        double hSlowNow = hSlow[hSlow.length - 1];
+        double hPrice = c1h.get(c1h.size() - 1).close;
+        boolean htfUp   = hFastNow > hSlowNow && hFastNow > hFastPrev && hPrice > hSlowNow;
+        boolean htfDown = hFastNow < hSlowNow && hFastNow < hFastPrev && hPrice < hSlowNow;
+        if (!htfUp && !htfDown) return reject("ta_no_htf_trend");
+        boolean wantLong = htfUp;
+
+        // ── PRIMARY (1h) PULLBACK + RESUMPTION to EMA20 ──
+        double[] ema20 = com.bot.TradingCore.emaSeries(c15, 20);
+        if (ema20.length < 1) return reject("ta_ema_short");
+        double emaNow = ema20[ema20.length - 1];
+        boolean resumeUp   = last.close > last.open && last.close > emaNow && prev.low  <= emaNow * 1.005;
+        boolean resumeDown = last.close < last.open && last.close < emaNow && prev.high >= emaNow * 0.995;
+        if (wantLong ? !resumeUp : !resumeDown) return reject("ta_no_pullback");
+
+        // body strength of the resumption bar
+        double range = last.high - last.low;
+        if (range <= 0 || Math.abs(last.close - last.open) / range < csEnvDouble("TA_BODY_MIN", 0.45))
+            return reject("ta_weak_body");
+
+        // ── RSI: not over-extended against the entry ──
+        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
+        double rsiNow = rsi[rsi.length - 1];
+        if (wantLong && rsiNow > csEnvDouble("TA_RSI_MAX", 72)) return reject("ta_rsi_hot");
+        if (!wantLong && rsiNow < csEnvDouble("TA_RSI_MIN", 28)) return reject("ta_rsi_cold");
+
+        // ── ADX: primary trend strength ──
+        com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
+        if (adxR.adx < csEnvDouble("TA_ADX_MIN", 18)) return reject("ta_adx_weak");
+
+        // ── volume confirmation ──
+        double volSma = tpComputeVolSma(c15, 20);
+        double volR = volSma > 0 ? last.volume / volSma : 1.0;
+        if (volR < csEnvDouble("TA_VOL_MIN", 1.0)) return reject("ta_low_vol");
+
+        // ── BTC regime gate ──
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC
+             || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH) return reject("ta_btc_bad");
+            if (wantLong && btc.onlyShort) return reject("ta_btc_only_short");
+            if (!wantLong && btc.onlyLong) return reject("ta_btc_only_long");
+        }
+
+        // ── SL/TP (intraday, ATR-based) ──
+        double slDist = atr * csEnvDouble("TA_SL_ATR", 1.5);
+        double slPct = slDist / price;
+        if (slPct < 0.004 || slPct > 0.04) return reject("ta_sl_oob");
+        double tpR = csEnvDouble("TA_TP_R", 1.8);
+        double stop = wantLong ? price - slDist : price + slDist;
+        double tp2  = wantLong ? price + slDist * tpR : price - slDist * tpR;
+
+        // ── probability score ──
+        double prob = 58.0;
+        if (adxR.adx > 25) prob += 4;
+        if (adxR.adx > 35) prob += 3;
+        HTFBias bias = detectBias2H(c1h);
+        boolean aligned = bias != null &&
+                ((wantLong && bias == HTFBias.BULL) || (!wantLong && bias == HTFBias.BEAR));
+        if (aligned)   prob += 4;
+        if (volR > 1.5) prob += 2;
+        prob = Math.min(75.0, prob);
+
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+        List<String> flags = new ArrayList<>();
+        flags.add("TREND_ALIGNED_1H");
+        flags.add(htfUp ? "HTF_UP" : "HTF_DOWN");
+        flags.add(String.format("ADX=%.0f", adxR.adx));
+        if (aligned) flags.add("HTF_BIAS_ALIGN");
+
+        TradeIdea idea = new TradeIdea(
+                symbol, side, price, stop, tp2, tpR, prob, flags,
+                0.0, 0.0, 0.0, bias != null ? bias.name() : "NEUTRAL", cat, null,
+                CS_TP1_R, tpR, tpR);
+        idea.setRobustAtrPct(atrPct);
+        idea.setAgreeingClusters(1);
+        return idea;
+    }
+
     private TradeIdea generateFromFundingMomentum(String symbol,
                                                   List<com.bot.TradingCore.Candle> c1,
                                                   List<com.bot.TradingCore.Candle> c5,
