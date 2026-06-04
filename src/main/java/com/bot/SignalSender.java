@@ -1540,7 +1540,11 @@ public final class SignalSender {
             // вранья. Skip для VCB восстанавливает live↔backtest consistency.
             //
             // Откат: убрать !idea.flags.contains("VCB_v8") condition.
-            if (!idea.flags.contains("VCB_v8")) {
+            // [v86.2] TREND_ALIGNED_1H тоже ставит структурный ATR-SL — adjustStopForClusters
+            // расширял бы его (как ломал VCB: live time-stops 8×, WR 52→33%). Скип = live ставит
+            // ТОТ ЖЕ SL/TP, что симулирует backtest → backtest↔live консистентность. Без этого
+            // backtest +40% не отражал бы лайв (юзер верно заподозрил расхождение).
+            if (!idea.flags.contains("VCB_v8") && !idea.flags.contains("TREND_ALIGNED_1H")) {
                 idea = adjustStopForClusters(idea, m15);
             }
             idea = applyVpocBarrierGuard(idea, m15);
