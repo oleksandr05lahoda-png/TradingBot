@@ -2802,6 +2802,14 @@ public final class DecisionEngineMerged {
         if (!htfUp && !htfDown) return reject("ta_no_htf_trend");
         boolean wantLong = htfUp;
 
+        // [v86.1 Pass 2] CHOP FILTER — главная правка по данным: П1/П2 (красные) были
+        // боковиком, где трендследование пилит. Торгуем только ПОДТВЕРЖДЁННЫЙ сильный
+        // тренд: (1) EMA20/50 на HTF разнесены (в пиле они слиплись), (2) HTF ADX высок.
+        double htfSep = Math.abs(hFastNow - hSlowNow) / Math.max(1e-9, hPrice);
+        if (htfSep < csEnvDouble("TA_HTF_SEP_MIN", 0.004)) return reject("ta_htf_tangled");  // EMA слиплись = боковик
+        double htfAdx = com.bot.TradingCore.adx(c1h, 14).adx;
+        if (htfAdx < csEnvDouble("TA_HTF_ADX_MIN", 20.0)) return reject("ta_htf_weak");      // HTF не трендит
+
         // ── PRIMARY (1h) PULLBACK + RESUMPTION to EMA20 ──
         double[] ema20 = com.bot.TradingCore.emaSeries(c15, 20);
         if (ema20.length < 1) return reject("ta_ema_short");
@@ -2823,7 +2831,7 @@ public final class DecisionEngineMerged {
 
         // ── ADX: primary trend strength ──
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
-        if (adxR.adx < csEnvDouble("TA_ADX_MIN", 18)) return reject("ta_adx_weak");
+        if (adxR.adx < csEnvDouble("TA_ADX_MIN", 22)) return reject("ta_adx_weak");  // [v86.1] 18→22: сильнее тренд, меньше пилы
 
         // ── volume confirmation ──
         double volSma = tpComputeVolSma(c15, 20);
