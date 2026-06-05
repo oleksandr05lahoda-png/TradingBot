@@ -112,9 +112,15 @@ public final class BotMain {
     private static final int MAX_SIGNALS_PER_CYCLE = envInt("MAX_SIGNALS_PER_CYCLE", 5);
 
     // Time-stop window for the verifier — single source of truth across bot.
-    // 90 min stop + 30 min grace = 120 min total. Grace covers the case where
-    // price hits TP1/SL exactly at bar 6 close.
-    private static final long VERIFIER_TIME_STOP_MS = 90 * 60_000L;
+    // [v86.5] Scales with PRIMARY_TF to MIRROR the real hold. Was hardcoded
+    // 90 min (6×15m). On 1h the real position (PositionTracker PT_TIME_STOP_MS,
+    // v86.3) and the backtest both hold up to 480 min (8h); the old 90 min judged
+    // every 1h signal after ~2h → false TIME_STOP losses → corrupted "Live WR"
+    // AND fed premature losses to the calibrator (which can suppress future live
+    // signals via the calibration gate). Now a 1h signal gets the same 480 min
+    // the bot/backtest actually give it. Grace 30 min covers exact-close hits.
+    private static final long VERIFIER_TIME_STOP_MS =
+            "1h".equals(PRIMARY_TF) ? 480L * 60_000L : 90L * 60_000L;
     private static final long VERIFIER_GRACE_MS     = 30 * 60_000L;
     private static final long VERIFIER_MAX_AGE_MS   = VERIFIER_TIME_STOP_MS + VERIFIER_GRACE_MS;
 
