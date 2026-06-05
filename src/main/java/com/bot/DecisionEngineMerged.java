@@ -2871,6 +2871,18 @@ public final class DecisionEngineMerged {
         if (volR > 1.5) prob += 2;
         prob = Math.min(75.0, prob);
 
+        // [v86.6] TREND confidence floor — DATA-DRIVEN (startup-BT tier breakdown,
+        // 202 trades): conf 60-65 band = 79 trades, WR 46%, NetPnL -2.8% (LOSING);
+        // conf 65-70 = 121 trades, WR 54%, NetPnL +26.7% (the ENTIRE edge). The
+        // discriminator is the +4 HTF-bias-alignment bonus: prob<65 = non-aligned
+        // (trade direction disagrees with the 2h HTF bias = whipsaw); prob>=65 =
+        // aligned or very-strong-trend. Trading only >=65 lifts avg/trade
+        // ~0.13%->~0.22% and WR 51%->~54%, dropping the net-negative tier. The
+        // PRINCIPLE (multi-timeframe confluence) is regime-robust; the exact 65 is
+        // window-informed, so it stays env-tunable. Applies in BOTH backtest and
+        // live (same generate() path) => backtest<->live stay synced.
+        if (prob < csEnvDouble("TA_MIN_CONF", 65.0)) return reject("ta_low_conf");
+
         com.bot.TradingCore.Side side = wantLong
                 ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
         List<String> flags = new ArrayList<>();
