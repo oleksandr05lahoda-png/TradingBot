@@ -2852,7 +2852,11 @@ public final class DecisionEngineMerged {
         double slDist = atr * csEnvDouble("TA_SL_ATR", 1.5);
         double slPct = slDist / price;
         if (slPct < 0.004 || slPct > 0.04) return reject("ta_sl_oob");
-        double tpR = csEnvDouble("TA_TP_R", 1.8);
+        // [v86.4] 1.8 → 2.05: ЖИВОЙ R:R-гейт требует ≥2.0 (лог: "actualRR=1.80 < 2.00 BLOCKED").
+        // При R:R 1.8 КАЖДЫЙ TREND-сигнал блокировался в live (бэктест гейт не применяет →
+        // считал их → отсюда "200 в бэктесте, 0 в live"). 2.05 = запас над гейтом. Это
+        // восстанавливает backtest↔live: live теперь реально может открывать сделки.
+        double tpR = csEnvDouble("TA_TP_R", 2.05);
         double stop = wantLong ? price - slDist : price + slDist;
         double tp2  = wantLong ? price + slDist * tpR : price - slDist * tpR;
 
