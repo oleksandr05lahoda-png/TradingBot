@@ -396,6 +396,20 @@ public final class BinanceTradeExecutor {
      */
     public void ensureCleanAccountAndOneWayMode() {
         if (!isReady()) return;
+        // [v86.7] CRITICAL: skip on testnet/demo — SAME reason as the init path
+        // (see ~line 226). demo-fapi rejects the positionSide/dual switch (-4067),
+        // and that flips the demo session into -1109 "Invalid account" on EVERY
+        // subsequent write (order / SL / leverage). The INIT call was already gated
+        // behind !useTestnet, but THIS post-reconcile re-entry was NOT — so on every
+        // restart PositionTracker re-corrupted the account, blocking all live order
+        // placement (observed: 3/3 live signals failed with "-1109 SL not placed").
+        // User sets One-Way + Isolated manually in the demo UI; the bot must never
+        // touch position mode on demo.
+        if (useTestnet) {
+            LOG.info("[Executor] testnet/demo — skip post-reconcile ensureOneWayMode "
+                    + "(avoids -1109 account corruption)");
+            return;
+        }
         try {
             ensureOneWayMode();
         } catch (Exception e) {
