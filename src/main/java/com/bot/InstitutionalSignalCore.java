@@ -38,7 +38,7 @@ public final class InstitutionalSignalCore {
     // Must match BACKTEST_TIME_STOP_BARS in SimpleBacktester for walk-forward
     // consistency.
     private static final boolean ISC_IS_15M = "15m".equals(
-            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
     private static final long ISC_BAR_MS = ISC_IS_15M ? 15 * 60_000L : 60 * 60_000L;
     private static final int  TIME_STOP_BARS  = envInt("ISC_TIME_STOP_BARS",
             ISC_IS_15M ? 12 : 8);

@@ -72,7 +72,7 @@ public final class BotMain {
     // and HTF derivation. Default "1h" (was hardcoded "15m" pre-v90). To revert
     // set env PRIMARY_TF=15m. Must match SignalSender.PRIMARY_TF.
     public static final String PRIMARY_TF =
-            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim();
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
     public static final String HTF_FAST =
             System.getenv().getOrDefault("HTF_FAST",
                     "1h".equals(PRIMARY_TF) ? "4h" : "1h").trim();
@@ -1235,12 +1235,13 @@ public final class BotMain {
             LOG.warning("[CARRY] init failed: " + t.getMessage());
         }
 
-        // [v86.9] CROSS-SECTIONAL MOMENTUM diagnostic — relative-strength, market-neutral.
+        // [v86.11] CROSS-SECTIONAL MOMENTUM diagnostic — relative-strength, market-neutral.
         // Trades the winner/loser SPREAD, so it produces signals even in the low-energy
-        // chop where the directional TREND strategy sits flat. Default OFF (extra fetch
-        // load); set XSM_BACKTEST=1 to run the experiment once and see if the edge exists.
+        // chop where the directional TREND strategy sits flat. DEFAULT ON (baked in code so
+        // the user need not touch Railway Variables): runs the validation each boot until we
+        // have a verdict, then it gets turned back OFF in code. Set XSM_BACKTEST=0 to force off.
         try {
-            if ("1".equals(System.getenv().getOrDefault("XSM_BACKTEST", "0"))) {
+            if (!"0".equals(System.getenv().getOrDefault("XSM_BACKTEST", "1"))) {
                 heavySched.submit(safe("XSectMomentumBacktest",
                         () -> runCrossSectionalBacktest(sender, telegram)));
             }
@@ -1957,7 +1958,7 @@ public final class BotMain {
         //  STARTUP_BT_BARS_HTF     — кол-во HTF свечей (default 250). Минимум 150
         //                            = MIN_BARS движка.
         //  STARTUP_BT_PACING_MS    — задержка между парами (default 5000ms).
-        final boolean btIs15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
+        final boolean btIs15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
         final String btPrimaryTf = btIs15m ? "15m" : "1h";
         final String btHtfTf     = btIs15m ? "1h"  : "4h";
         final int defaultPrimaryBars = btIs15m ? 1000 : 720; // 1h: 30 days

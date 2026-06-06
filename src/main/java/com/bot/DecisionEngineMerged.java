@@ -3356,7 +3356,7 @@ public final class DecisionEngineMerged {
     // To revert to 15m defaults set env CS_PROFILE=15m (overrides below).
     // ──────────────────────────────────────────────────────────────────────
     private static final boolean CS_IS_15M = "15m".equals(
-            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
 
     private static final double CS_SIGMA_THRESHOLD   = csEnvDouble("CS_SIGMA_THRESHOLD",
             CS_IS_15M ? 1.8 : 1.6);

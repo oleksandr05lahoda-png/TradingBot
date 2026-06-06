@@ -79,7 +79,7 @@ public final class SignalSender {
     // higher timeframe filters (default 4h / 1d when PRIMARY_TF=1h).
     // ════════════════════════════════════════════════════════════════════
     private static final String PRIMARY_TF =
-            System.getenv().getOrDefault("PRIMARY_TF", "15m").trim();
+            System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
     private static final long PRIMARY_TF_MS = primaryTfMs(PRIMARY_TF);
     private static final int PRIMARY_TF_MIN = (int) (PRIMARY_TF_MS / 60_000L);
     // HTF (higher timeframe) used for bias filters. For 1h primary, default 4h.
@@ -677,7 +677,7 @@ public final class SignalSender {
 
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
         this.API_SECRET = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
-        this.TOP_N            = envInt("TOP_N", 30);
+        this.TOP_N            = envInt("TOP_N", 60);   // [v86.11] baked 60 default (was 30) — no env needed
         this.MIN_CONF         = envDouble("MIN_CONF", 50.0);  // sync с DE.MIN_CONF_FLOOR
         // MIN_CONF=50 == DE.MIN_CONF_FLOOR — no extra quality margin here.
         // Effective range in processPair: [MIN_CONF-1, MIN_CONF+4].
@@ -703,7 +703,7 @@ public final class SignalSender {
         // сканил только 25 пар из 40, остальные 15 жрали WS-коннекты вхолостую.
         // Теперь дефолт = 40, синхронизирован с пользовательским TOP_N.
         // Если рейт-лимит давит — computePairBudget() сам срежет до 35/30/20.
-        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 40);
+        this.MAX_SCAN_PAIRS_PER_CYCLE = envInt("MAX_SCAN_PAIRS_PER_CYCLE", 60);   // [v86.11] baked 60 (was 40) to match TOP_N
         this.DEPTH_SNAPSHOT_TOP_N     = envInt("DEPTH_SNAPSHOT_TOP_N", 10);
         this.FUNDING_OI_TOP_N         = envInt("FUNDING_OI_TOP_N", 25);
 
@@ -3851,7 +3851,7 @@ public final class SignalSender {
         Boolean cached = historyOkCache.get(symbol);
         if (cached != null) return cached;
 
-        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
+        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
         String  primaryTf  = is15m ? "15m" : "1h";
         String  htfTf      = is15m ? "1h"  : "4h";
         int     primaryMin = is15m ? 250  : 200;   // STARTUP-BT needs ≥200/150 + warmup

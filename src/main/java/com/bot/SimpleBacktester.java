@@ -61,7 +61,7 @@ public final class SimpleBacktester {
     // ENV BACKTEST_TIME_STOP_BARS overrides; must match ISC_TIME_STOP_BARS in
     // live ISC for walk-forward consistency.
     private int    timeStopBars     = envInt("BACKTEST_TIME_STOP_BARS",
-            "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim()) ? 12 : 8);
+            "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 12 : 8);
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
@@ -544,7 +544,7 @@ public final class SimpleBacktester {
         // [v90] Min bars: 200 on 15m primary (50 hours), 150 on 1h primary
         // (6.25 days). The lower floor on 1h is offset by each bar carrying
         // 4× more information; 150 bars = stable VWAP/sigma calc.
-        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim());
+        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
         int minBars = is15m ? 200 : 150;
         if (m15 == null || m15.size() < minBars) return result;
 
@@ -1362,7 +1362,7 @@ public final class SimpleBacktester {
             // pulled enough bars for 13 days of 15m but only ~3 days of 1h, yet
             // the engine was configured for 1h primary — root cause of the
             // "13 days, 5 trades" anomaly.
-            String primaryTfBT = System.getenv().getOrDefault("PRIMARY_TF", "15m").trim();
+            String primaryTfBT = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
             int barsPerDayPrimary = "1h".equals(primaryTfBT) ? 24
                     : "30m".equals(primaryTfBT) ? 48 : 96;
             int barsNeeded = daysOfHistory * barsPerDayPrimary + 250; // warmup + window

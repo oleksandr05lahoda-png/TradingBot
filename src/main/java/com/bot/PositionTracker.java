@@ -103,7 +103,7 @@ public final class PositionTracker {
         // 180мин → на 1h live резал сделку за 3ч, а backtest держал 8ч = расхождение,
         // меньше профита live. env PT_TIME_STOP_MS перебивает.
         this.TIME_STOP_MS      = envLong("PT_TIME_STOP_MS",
-                "1h".equals(System.getenv().getOrDefault("PRIMARY_TF", "15m").trim())
+                "1h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim())
                         ? 480L * 60_000L : 180L * 60_000L);
         this.POLL_INTERVAL_MS  = envLong("PT_POLL_INTERVAL_MS", 30_000L);
         this.BE_OFFSET_PCT     = envDouble("PT_BE_OFFSET_PCT", 0.05);
