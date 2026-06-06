@@ -1234,6 +1234,19 @@ public final class BotMain {
         } catch (Throwable t) {
             LOG.warning("[CARRY] init failed: " + t.getMessage());
         }
+
+        // [v86.9] CROSS-SECTIONAL MOMENTUM diagnostic — relative-strength, market-neutral.
+        // Trades the winner/loser SPREAD, so it produces signals even in the low-energy
+        // chop where the directional TREND strategy sits flat. Default OFF (extra fetch
+        // load); set XSM_BACKTEST=1 to run the experiment once and see if the edge exists.
+        try {
+            if ("1".equals(System.getenv().getOrDefault("XSM_BACKTEST", "0"))) {
+                heavySched.submit(safe("XSectMomentumBacktest",
+                        () -> runCrossSectionalBacktest(sender, telegram)));
+            }
+        } catch (Throwable t) {
+            LOG.warning("[XSM] init failed: " + t.getMessage());
+        }
     }
 
     private static void runCycle(com.bot.TelegramBotSender telegram,
@@ -2494,6 +2507,73 @@ public final class BotMain {
                 + "\n_Оценка оптимистичная (без basis-риска и спот-комиссий) — реал ниже._";
         try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
         LOG.info(String.format("[CARRY] ✓ ran=%d pos=%d avg=%.1f", ran, positive, avgAnnual));
+    }
+
+    // [v86.9] CROSS-SECTIONAL MOMENTUM diagnostic. Rank the universe by recent return,
+    // LONG top-K strongest / SHORT bottom-K weakest, rebalance periodically. Market-
+    // neutral spread → produces signals in chop where the directional trend is flat.
+    // Default OFF (XSM_BACKTEST=1 to run). Estimate is OPTIMISTIC (ignores short-leg
+    // funding/borrow), so a thin/negative result here = not worth building live.
+    private static void runCrossSectionalBacktest(com.bot.SignalSender sender,
+                                                  com.bot.TelegramBotSender telegram) {
+        try { Thread.sleep(230_000L); }    // start after startup-BT + carry settle
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+
+        int    nPairs      = envInt("XSM_PAIRS", 40);
+        int    lookbackHrs = envInt("XSM_LOOKBACK_HRS", 168);   // 7 days
+        int    rebalHrs    = envInt("XSM_REBALANCE_HRS", 24);   // daily
+        int    topK        = envInt("XSM_TOP_K", 3);
+        double cost        = envDbl("XSM_COST_PCT", 0.20);      // round-trip turnover / rebalance
+        int    bars        = envInt("XSM_BARS", 720);           // 30 days of 1h
+
+        List<String> universe = sender.getScanUniverseSnapshot(nPairs);
+        if (universe == null || universe.isEmpty()) { LOG.warning("[XSM] universe empty"); return; }
+        LOG.info("[XSM] ▶ " + universe.size() + " coins, fetching 1h history…");
+
+        java.util.Map<String, List<com.bot.TradingCore.Candle>> series = new java.util.HashMap<>();
+        int minBars = lookbackHrs + rebalHrs + 5;
+        for (String sym : universe) {
+            try {
+                List<com.bot.TradingCore.Candle> c = fetchKlinesPaged(sender, sym, "1h", bars);
+                if (c != null && c.size() >= minBars) series.put(sym, c);
+                Thread.sleep(800L);
+            } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+            catch (Exception e) { LOG.warning("[XSM] " + sym + " err: " + e.getMessage()); }
+        }
+        if (series.size() < 2 * topK) {
+            try { telegram.sendMessageAsync("📊 Cross-sectional momentum: мало данных (" + series.size() + " монет)."); } catch (Throwable ig) {}
+            return;
+        }
+
+        com.bot.CrossSectionalMomentumBacktester.Result r =
+                com.bot.CrossSectionalMomentumBacktester.run(series, lookbackHrs, rebalHrs, topK, cost);
+        if (r.rebalances == 0) {
+            try { telegram.sendMessageAsync("📊 Cross-sectional momentum: 0 ребалансов (мало истории)."); } catch (Throwable ig) {}
+            return;
+        }
+
+        double wr = 100.0 * r.wins / r.rebalances;
+        boolean stable = r.firstHalfPct > 0 && r.secondHalfPct > 0;
+        String verdict = (r.netPct > 0 && r.avgPerRebalance > 0 && stable)
+                ? "🟢 Есть market-neutral spread И обе половины в плюсе. Это РАБОТАЕТ в чопе, где трендовая молчит. След.: валидация на 3-5 окнах → live paper."
+                : (r.netPct > 0
+                    ? "🟡 Суммарно плюс, но НЕ обе половины зелёные — возможно везение окна. Гонять ещё."
+                    : "🔴 Edge нет (косты/шорт-фандинг съедают). Cross-sectional тоже мимо — live не строим.");
+
+        String msg = "📊 *CROSS-SECTIONAL MOMENTUM* (относит. сила, market-neutral, 30д/1h)\n"
+                + "━━━━━━━━━━━━━━━━━━━━━\n"
+                + String.format("Монет: %d · ребалансов: %d (каждые %dч, lookback %dд)\n",
+                        r.symbolsUsed, r.rebalances, rebalHrs, lookbackHrs / 24)
+                + String.format("Лонг топ-%d / шорт боттом-%d\n", topK, topK)
+                + String.format("WR ребалансов: %.0f%% (%d/%d в плюс)\n", wr, r.wins, r.rebalances)
+                + String.format("Net: %+.1f%% · avg/ребаланс: %+.3f%%\n", r.netPct, r.avgPerRebalance)
+                + String.format("Лонг-нога: %+.1f%% · шорт-нога: %+.1f%%\n", r.longLegPct, r.shortLegPct)
+                + String.format("Стабильность: 1-я пол %+.1f%% · 2-я пол %+.1f%%\n", r.firstHalfPct, r.secondHalfPct)
+                + "━━━━━━━━━━━━━━━━━━━━━\n" + verdict
+                + "\n_Оценка ОПТИМИСТИЧНА (без фандинга на шорт-ногах и борроу) — реал ниже._";
+        try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
+        LOG.info(String.format("[XSM] ✓ rebalances=%d wr=%.1f net=%.1f avg=%.3f",
+                r.rebalances, wr, r.netPct, r.avgPerRebalance));
     }
 
     // [v84.0] PAIRS STAT-ARB diagnostic backtest. Market-neutral z-score reversion
