@@ -322,7 +322,8 @@ public final class BinanceTradeExecutor {
                     LOG.info("[Executor] cancelled regular orders on " + symbols.size() + " symbols");
                 }
             } else {
-                LOG.warning("[Executor] cancelAllOrdersAccountWide regular HTTP " + resp.statusCode());
+                LOG.warning("[Executor] cancelAllOrdersAccountWide regular HTTP " + resp.statusCode()
+                        + " body=" + (resp.body() == null ? "" : resp.body()));  // [v86.8] log body to reveal -1109 vs benign
             }
         } catch (Throwable t) {
             LOG.warning("[Executor] cancelAllOrdersAccountWide regular error: " + t.getMessage());
