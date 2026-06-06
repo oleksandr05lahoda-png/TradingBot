@@ -1235,13 +1235,13 @@ public final class BotMain {
             LOG.warning("[CARRY] init failed: " + t.getMessage());
         }
 
-        // [v86.11] CROSS-SECTIONAL MOMENTUM diagnostic — relative-strength, market-neutral.
-        // Trades the winner/loser SPREAD, so it produces signals even in the low-energy
-        // chop where the directional TREND strategy sits flat. DEFAULT ON (baked in code so
-        // the user need not touch Railway Variables): runs the validation each boot until we
-        // have a verdict, then it gets turned back OFF in code. Set XSM_BACKTEST=0 to force off.
+        // [v86.12] CROSS-SECTIONAL MOMENTUM — VERDICT: DEAD on 2026 crypto. Backtest
+        // (40 coins, 22 daily rebalances, 30d): Net -37.9%, killed by the SHORT leg
+        // (-34.8% — the weakest coins BOUNCE / mean-revert instead of continuing down;
+        // long leg was only +1.3%). Joins VCB/MR/pairs/carry in the graveyard. Turned
+        // back OFF (default "0") now we have the verdict. XSM_BACKTEST=1 to re-run by hand.
         try {
-            if (!"0".equals(System.getenv().getOrDefault("XSM_BACKTEST", "1"))) {
+            if ("1".equals(System.getenv().getOrDefault("XSM_BACKTEST", "0"))) {
                 heavySched.submit(safe("XSectMomentumBacktest",
                         () -> runCrossSectionalBacktest(sender, telegram)));
             }
