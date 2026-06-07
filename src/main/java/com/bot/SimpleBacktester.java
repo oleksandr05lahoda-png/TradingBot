@@ -1394,7 +1394,14 @@ public final class SimpleBacktester {
                     // Variable name kept as `m15` for diff size; semantically it's
                     // the primary-TF series (1h on 1h-primary, 15m on 15m-primary).
                     m15 = sender.fetchKlines(pair, primaryTfBT, barsNeeded);
-                    h1  = sender.fetchKlines(pair, "1h",        h1Limit);
+                    // [v86.14] FIX: HTF was hardcoded "1h" — WRONG on 1h-primary, where live
+                    // uses HTF_FAST=4h. The self-validator was measuring the strategy on a
+                    // LOOSER 1h-HTF config than live actually runs (4h), inflating its signal
+                    // count and making live look broken/"lying" by comparison. Now mirrors
+                    // live exactly: 4h HTF on 1h-primary, 1h HTF on 15m-primary.
+                    String htfTfBT = "1h".equals(primaryTfBT) ? "4h" : "1h";
+                    int htfLimitBT = "1h".equals(primaryTfBT) ? Math.max(150, barsNeeded / 4 + 60) : h1Limit;
+                    h1  = sender.fetchKlines(pair, htfTfBT, htfLimitBT);
                 } catch (Throwable e) {
                     continue;
                 }
