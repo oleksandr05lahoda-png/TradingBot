@@ -798,6 +798,16 @@ public final class BinanceTradeExecutor {
 
             // 4. Send MARKET order
             String entryOrderId = sendMarketOrder(symbol, isLong, qty);
+            // [v86.21] On rejection (e.g. intermittent -1109) retry ONCE — but only after
+            // confirming no position actually opened, to avoid a double-fill.
+            if (entryOrderId == null) {
+                boolean noPos = true;
+                try { noPos = Math.abs(fetchPositionAmount(symbol)) < 1e-9; } catch (Throwable ignored) {}
+                if (noPos) {
+                    try { Thread.sleep(500L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    entryOrderId = sendMarketOrder(symbol, isLong, qty);
+                }
+            }
             if (entryOrderId == null) {
                 return ExecutionResult.fail("MARKET order rejected by Binance "
                         + "(see [Executor] log for code+msg)");
@@ -811,7 +821,20 @@ public final class BinanceTradeExecutor {
                 if (actualEntry > 0) break;
                 Thread.sleep(50);
             }
-            if (actualEntry <= 0) actualEntry = entry; // fallback на квоту
+            // [v86.21] Cross-check the reported fill vs the LIVE mark price. On testnet the
+            // order avgPrice read is often stale or 0, which mis-anchors the SL to an OLD
+            // price → the SL lands on the wrong side of the real market → instant stop-out +
+            // phantom PnL (the LTC/XLM "SLHIT за 0 мин" losses). Trust the fresh mark when
+            // avgPrice is missing or deviates >1%. This also lets the slippage guard below see
+            // the REAL move and abort a trade whose price already ran away from the signal.
+            double _markNow = fetchMarkPrice(symbol);
+            if (actualEntry <= 0) {
+                actualEntry = (_markNow > 0 ? _markNow : entry);
+            } else if (_markNow > 0 && Math.abs(actualEntry - _markNow) / _markNow > 0.01) {
+                LOG.warning(String.format("[Executor] %s fill %.6f stale vs mark %.6f — using mark",
+                        symbol, actualEntry, _markNow));
+                actualEntry = _markNow;
+            }
 
             // ════════════════════════════════════════════════════════════════
             // [HOLE-8 FIX 2026-05-15] HARD SLIPPAGE GUARD
