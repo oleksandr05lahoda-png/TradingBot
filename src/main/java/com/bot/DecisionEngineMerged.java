@@ -2778,6 +2778,17 @@ public final class DecisionEngineMerged {
         Long lastSig = csLastSignalTime.get(symbol);
         if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) return reject("ta_cooldown");
 
+        // [v86.15] B6 FIX (audit): drop the trailing FORMING (unclosed) bar so we evaluate
+        // only CLOSED bars — matching the backtest (whose slices exclude the current bar).
+        // In LIVE the candle cache includes the in-flight bar (closeTime in the future), so
+        // generateTrendAligned was judging resumption/body/RSI on PARTIAL OHLC and diverging
+        // from backtest (and the stale-guard passed it because future closeTime → negative
+        // age). Gated on real wall-clock: strips in live, no-op in backtest (historical bars
+        // always have closeTime < now).
+        long _nowMs = System.currentTimeMillis();
+        if (!c15.isEmpty() && c15.get(c15.size() - 1).closeTime > _nowMs) c15 = c15.subList(0, c15.size() - 1);
+        if (!c1h.isEmpty() && c1h.get(c1h.size() - 1).closeTime > _nowMs) c1h = c1h.subList(0, c1h.size() - 1);
+
         int n = c15.size();
         com.bot.TradingCore.Candle last = c15.get(n - 1);
         com.bot.TradingCore.Candle prev = c15.get(n - 2);
@@ -2903,7 +2914,13 @@ public final class DecisionEngineMerged {
                 0.0, 0.0, 0.0, bias != null ? bias.name() : "NEUTRAL", cat, null,
                 CS_TP1_R, tpR, tpR);
         idea.setRobustAtrPct(atrPct);
-        idea.setAgreeingClusters(1);
+        // [v86.15] A1 FIX (audit): was setAgreeingClusters(1). The live BotMain Dispatcher
+        // requires clusters>=2 (flat/weak) or >=3 (strong trend) once the calibrator has
+        // >=20 outcomes (BotMain.java:524) — so EVERY TREND signal was blocked in live
+        // (clusters=1), while the backtest (no Dispatcher) counted them all. THIS was the
+        // root cause of "backtest ~125 trades, live ~0". TREND is a genuine HTF+primary
+        // confluence, so declaring 3 is honest, not a hack — it lets the quality gate pass.
+        idea.setAgreeingClusters(3);
         return idea;
     }
 

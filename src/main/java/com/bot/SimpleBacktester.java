@@ -77,7 +77,7 @@ public final class SimpleBacktester {
     // Это превращало "будущие 1.5R-победы" в "+0.1R крошки", сжимая правый хвост.
     // Default v82: триггер 1.0R (вместо 0.5R) — даём сделке развиться прежде чем
     // фиксировать BE. ENV BACKTEST_BE_TRIGGER_R может перезаписать (-1 = отключить).
-    private final double earlyBeTriggerR = envDouble("BACKTEST_BE_TRIGGER_R", 1.0);
+    private final double earlyBeTriggerR = envDouble("BACKTEST_BE_TRIGGER_R", -1.0);   // [v86.15] B1 (audit): DISABLED by default (was 1.0). Live PositionTracker has NO pre-TP1 distance-based SL ratchet; this backtest-only early-BE turned future winners into ~0R and inflated BT PnL vs live.
 
     // [2026-05-25 v6] HARDCODED для Institutional Divergence Reversal v6.
     // ПЕРЕВКЛЮЧЕНО с false → true. Старая стратегия (Sweep+Reclaim) использовала
