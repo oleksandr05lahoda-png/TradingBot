@@ -706,10 +706,20 @@ public final class BotMain {
                 }
 
                 // 1. Fetch live balance (this also feeds RiskGuard's day baseline)
+                // [v86.18] The demo backend's -1109 ("Invalid account") is INTERMITTENT — a
+                // single call can fail then succeed seconds later (proven: emergencyClose
+                // attempt-1 -1109 -> attempt-2 OK; probe + LTC opened while DOT's balance
+                // fetch -1109'd in the same minute). So RETRY before giving up, otherwise a
+                // transient -1109 silently kills an otherwise-valid signal.
                 double balance = ex.fetchAvailableBalance();
+                for (int _bRetry = 0; balance <= 0 && _bRetry < 4; _bRetry++) {
+                    try { Thread.sleep(400L); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    balance = ex.fetchAvailableBalance();
+                }
                 if (balance <= 0) {
                     tg.sendMessageAsync("⚠️ Auto-trade " + idea.symbol
-                            + ": не удалось получить баланс с биржи.");
+                            + ": не удалось получить баланс (−1109 после 5 попыток).");
                     return;
                 }
 
