@@ -60,10 +60,14 @@ public final class LiveTradeProbe {
      * @return true если проба запустилась (даже с ошибкой), false если пропущена
      */
     public static boolean runIfRequested(TelegramBotSender telegram) {
-        String symbol = System.getenv().getOrDefault("PROBE_RUN", "").trim().toUpperCase();
+        // [v86.16] Baked ON in code (no Railway Variables needed) as a STANDING execution
+        // check: fires one quick demo trade each boot. It will fail with -1109 while the
+        // demo account is invalid for writes, and SUCCEED the instant the account is valid —
+        // so it auto-confirms execution the moment -1109 clears. Disabled in code once seen OK.
+        String symbol = System.getenv().getOrDefault("PROBE_RUN", "BTCUSDT").trim().toUpperCase();
         if (symbol.isEmpty()) return false;
 
-        long holdSeconds = envLong("PROBE_HOLD_SECONDS", 300L);
+        long holdSeconds = envLong("PROBE_HOLD_SECONDS", 60L);   // [v86.16] fast 60s test
         // [v82.12] 20→200. $20 нотионал на BTC ($71k) = 0.00028 BTC, что ниже
         // minNotional многих пар → "qty rounded to zero". $200 надёжно проходит
         // минимум на любой паре и всё равно мелочь (vs весь баланс $5000).
