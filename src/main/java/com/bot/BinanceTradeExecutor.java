@@ -851,6 +851,21 @@ public final class BinanceTradeExecutor {
             }
 
             // ════════════════════════════════════════════════════════════════
+            // [v86.19 B5 FIX] ANCHOR SL/TP TO THE ACTUAL FILL (not the stale signal price).
+            // idea.stop/tp1/tp2 were computed off idea.price (the closed-bar reference).
+            // By fill time the market has moved (e.g. LTC: signal 41.83 → fill 42.04), which
+            // COMPRESSED the SL relative to the real entry (42.77 was only 1.74% from 42.04 vs
+            // the planned 2.24%) → instant stop-outs that the backtest never sees (it shifts
+            // levels to the entry). Shift all three by (actualEntry - idea.price) to preserve
+            // the planned distances from the REAL entry. The sanity guards below now run on
+            // these effective levels, so a bad shift still aborts safely.
+            double _lvlShift = (idea.price > 0) ? (actualEntry - idea.price) : 0.0;
+            double effStop = idea.stop + _lvlShift;
+            double effTp1  = idea.tp1 > 0 ? idea.tp1 + _lvlShift : 0.0;
+            double effTp2  = idea.tp2 > 0 ? idea.tp2 + _lvlShift : 0.0;
+            slPriceRounded = roundToTick(effStop, si.tickSize, isLong);
+
+            // ════════════════════════════════════════════════════════════════
             // [HOLE-2 FIX 2026-05-15] TP / SL DIRECTION SANITY VS ACTUAL ENTRY
             // ════════════════════════════════════════════════════════════════
             // idea.tp1, idea.tp2 and idea.stop were computed against idea.price.
@@ -869,9 +884,9 @@ public final class BinanceTradeExecutor {
             // Note: rare case where only TP1 is on the wrong side (slippage moved
             // entry past TP1 but not past TP2) is handled later in the TP block —
             // we drop TP1 and fall back to a single TP at tp2 via closePosition=true.
-            boolean tp1WrongSide = isLong ? (idea.tp1 <= actualEntry) : (idea.tp1 >= actualEntry);
-            boolean tp2WrongSide = isLong ? (idea.tp2 <= actualEntry) : (idea.tp2 >= actualEntry);
-            boolean slWrongSide  = isLong ? (idea.stop >= actualEntry) : (idea.stop <= actualEntry);
+            boolean tp1WrongSide = isLong ? (effTp1 <= actualEntry) : (effTp1 >= actualEntry);
+            boolean tp2WrongSide = isLong ? (effTp2 <= actualEntry) : (effTp2 >= actualEntry);
+            boolean slWrongSide  = isLong ? (effStop >= actualEntry) : (effStop <= actualEntry);
 
             if (slWrongSide) {
                 LOG.severe(String.format(
@@ -900,7 +915,7 @@ public final class BinanceTradeExecutor {
             // made it -4.5%, the risk-per-trade calculation upstream was for the
             // smaller stop — actual loss on SL would be 2.25× the budgeted amount.
             double plannedSlDist = Math.abs(idea.price - idea.stop);
-            double actualSlDist  = Math.abs(actualEntry - idea.stop);
+            double actualSlDist  = Math.abs(actualEntry - effStop);   // [v86.19] eff = anchored to fill (≈ planned by design)
             if (plannedSlDist > 0 && actualSlDist > plannedSlDist * 1.7) {
                 double plannedPct = plannedSlDist / Math.max(1e-9, idea.price);
                 double actualPct  = actualSlDist  / Math.max(1e-9, actualEntry);
@@ -984,16 +999,16 @@ public final class BinanceTradeExecutor {
             String tp1OrderId = null;
             String tp2OrderId = null;
             int tpsPlaced = 0;
-            double tp1Price = idea.tp1;
-            double tp2Price = idea.tp2;
+            double tp1Price = effTp1;
+            double tp2Price = effTp2;
 
             try {
                 // Round TP prices to tick size (same direction as SL: rounds toward
                 // entry → conservative, locks profit slightly earlier).
-                double tp1Rounded = (idea.tp1 > 0)
-                        ? roundToTick(idea.tp1, si.tickSize, isLong) : 0;
-                double tp2Rounded = (idea.tp2 > 0)
-                        ? roundToTick(idea.tp2, si.tickSize, isLong) : 0;
+                double tp1Rounded = (effTp1 > 0)
+                        ? roundToTick(effTp1, si.tickSize, isLong) : 0;
+                double tp2Rounded = (effTp2 > 0)
+                        ? roundToTick(effTp2, si.tickSize, isLong) : 0;
 
                 // [HOLE-2 FIX 2026-05-15] After tick rounding, re-check TP1 vs actualEntry.
                 // Edge case the top-level guard cannot catch: tp1 was barely on the right
@@ -1015,7 +1030,9 @@ public final class BinanceTradeExecutor {
 
                 // Split qty 50/50, ensuring sum doesn't exceed total.
                 double tp1Qty = roundDownToStep(qty * 0.5, si.stepSize);
-                double tp2Qty = qty - tp1Qty; // remainder, already a step multiple
+                // [v86.19] FIX -1111 "Precision over maximum": `qty - tp1Qty` produced a
+                // float artifact (e.g. 11.90699999) that Binance rejected. Round to step.
+                double tp2Qty = roundDownToStep(qty - tp1Qty, si.stepSize);
 
                 // Check minNotional for partial TPs
                 double tp1Notional = tp1Qty * actualEntry;
