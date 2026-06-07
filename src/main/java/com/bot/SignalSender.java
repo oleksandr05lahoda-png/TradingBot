@@ -808,7 +808,14 @@ public final class SignalSender {
                 !API_KEY.isBlank() ? "ON" : "MANUAL");
 
         // [Hole 13 FIX] Make default $1000 balance loudly transparent
-        if (API_KEY.isBlank()) {
+        // [v86.20 CLEANUP] Don't cry "API not connected" when the executor's testnet key is
+        // set. SignalSender's own API_KEY reads BINANCE_API_KEY; on demo the user sets
+        // BINANCE_TESTNET_API_KEY (which the Executor uses to actually trade). So a blank
+        // BINANCE_API_KEY on testnet is EXPECTED, not "disconnected" — the misleading
+        // virtual-$1000 warning only confused. Warn only when NO key of either kind exists.
+        boolean anyKeyConfigured = !API_KEY.isBlank()
+                || !System.getenv().getOrDefault("BINANCE_TESTNET_API_KEY", "").isBlank();
+        if (!anyKeyConfigured) {
             LOG.info("⚠️ Внимание: API не подключен, использую виртуальный фикс. баланс $1000");
         }
     }

@@ -1342,7 +1342,11 @@ public final class DecisionEngineMerged {
             // 90 — пользователь видел одно, бот делал другое. Сейчас default ISC = 12 баров
             // = 180 мин. Если меняешь ISC_TIME_STOP_BARS env, обнови соответствующее число
             // здесь. (Не делаем cross-class import чтобы не плодить зависимости.)
-            sb.append(String.format("%n⏳ Time-stop: 180 мин"));
+            // [v86.20 CLEANUP] Was hardcoded "180 мин" (stale 15m value) — misleading on 1h,
+        // where the real position time-stop (PositionTracker PT_TIME_STOP_MS) is 480 мин.
+        // Show the value that actually applies for the current PRIMARY_TF.
+        int _tsMin = "1h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 480 : 180;
+        sb.append(String.format("%n⏳ Time-stop: %d мин", _tsMin));
 
             sb.append("\n⏱ ").append(timeStr).append(" · ").append(city);
 
