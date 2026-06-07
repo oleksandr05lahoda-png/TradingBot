@@ -60,14 +60,15 @@ public final class LiveTradeProbe {
      * @return true если проба запустилась (даже с ошибкой), false если пропущена
      */
     public static boolean runIfRequested(TelegramBotSender telegram) {
-        // [v86.16] Baked ON in code (no Railway Variables needed) as a STANDING execution
-        // check: fires one quick demo trade each boot. It will fail with -1109 while the
-        // demo account is invalid for writes, and SUCCEED the instant the account is valid —
-        // so it auto-confirms execution the moment -1109 clears. Disabled in code once seen OK.
-        String symbol = System.getenv().getOrDefault("PROBE_RUN", "BTCUSDT").trim().toUpperCase();
+        // [v86.17] DISABLED again (default ""). The v86.16 baked-on probe DID its job —
+        // 2026-06-07 14:10 it opened a confirmed demo BTCUSDT position (entry+SL placed,
+        // exchange confirmed) → execution is PROVEN working. Leaving it on per-boot caused
+        // an orphan naked position (TP hit intermittent -1109) + a 418 IP ban (probe +
+        // restarts + retries hammered Binance). Re-enable in code only for a one-off retest.
+        String symbol = System.getenv().getOrDefault("PROBE_RUN", "").trim().toUpperCase();
         if (symbol.isEmpty()) return false;
 
-        long holdSeconds = envLong("PROBE_HOLD_SECONDS", 60L);   // [v86.16] fast 60s test
+        long holdSeconds = envLong("PROBE_HOLD_SECONDS", 60L);
         // [v82.12] 20→200. $20 нотионал на BTC ($71k) = 0.00028 BTC, что ниже
         // minNotional многих пар → "qty rounded to zero". $200 надёжно проходит
         // минимум на любой паре и всё равно мелочь (vs весь баланс $5000).
