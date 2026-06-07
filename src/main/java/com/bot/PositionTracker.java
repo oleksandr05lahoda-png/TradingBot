@@ -238,7 +238,17 @@ public final class PositionTracker {
         if (t == null) return;
 
         long now = System.currentTimeMillis();
-        double exchangeQty = executor.fetchPositionAmount(symbol);
+        // [v86.23] Use the checked variant: NaN = positionRisk read FAILED (-1109 / non-200 /
+        // network), which is NOT a real close. Previously fetchPositionAmount returned 0 on
+        // those errors and we read 0 as "closed" → false SLHIT report + ORPHANED a still-open
+        // naked position (exactly the bug: TG said "закрыто SLHIT" while Binance still showed
+        // the position open). On a failed read, skip this poll and keep tracking; the position
+        // stays protected by its exchange-side SL/TP until the read recovers.
+        double exchangeQty = executor.fetchPositionAmountChecked(symbol);
+        if (Double.isNaN(exchangeQty)) {
+            LOG.warning("[Tracker] " + symbol + " positionRisk read failed — skip poll, keep tracking (NOT closing)");
+            return;
+        }
         double absQty = Math.abs(exchangeQty);
         boolean stillOpen = absQty > 1e-9;
 

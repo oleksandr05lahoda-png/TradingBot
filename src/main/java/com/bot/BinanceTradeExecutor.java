@@ -1188,6 +1188,42 @@ public final class BinanceTradeExecutor {
     }
 
     /**
+     * [v86.23] Like {@link #fetchPositionAmount} but returns {@link Double#NaN} on a FAILED
+     * read (not-ready / non-200 / -1109 / exception) instead of 0, so the caller can tell a
+     * genuinely FLAT position (a real 0 from a 200 response) apart from a transient read
+     * failure. PositionTracker uses this so a momentary positionRisk error is NOT misread as
+     * "position closed" — which previously orphaned a still-open naked position (Telegram
+     * reported SLHIT while Binance still showed the position open).
+     */
+    public double fetchPositionAmountChecked(String symbol) {
+        if (!isReady()) return Double.NaN;
+        try {
+            long ts = ts();
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String sig = hmacSHA256(apiSecret, qs);
+            HttpResponse<String> resp = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(baseUrl + "/fapi/v2/positionRisk?" + qs + "&signature=" + sig))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("X-MBX-APIKEY", apiKey)
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) return Double.NaN;
+            JSONArray arr = new JSONArray(resp.body());
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                if (symbol.equals(o.optString("symbol"))) {
+                    return o.optDouble("positionAmt", 0);
+                }
+            }
+            return 0; // 200 OK and symbol simply flat
+        } catch (Exception e) {
+            LOG.warning("[Executor] fetchPositionChecked error: " + e.getMessage());
+            return Double.NaN;
+        }
+    }
+
+    /**
      * Get unrealized PnL for an open position.
      * @return PnL in USDT, or 0 if no position.
      */
