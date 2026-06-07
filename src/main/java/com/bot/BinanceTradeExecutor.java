@@ -1452,7 +1452,12 @@ public final class BinanceTradeExecutor {
                 + "&type=STOP_MARKET"
                 + "&triggerPrice=" + formatPrice(stopPrice)
                 + "&closePosition=true"
-                + "&workingType=MARK_PRICE"
+                // [v86.22] testnet mark-price feed is ERRATIC — it momentarily spikes and
+                // trips MARK_PRICE stops even when BTC didn't actually move (the "SLHIT за
+                // 0 мин" on BTC at +1.29%, physically impossible in seconds). Use
+                // CONTRACT_PRICE (last traded price) on demo: the stop only fires if a REAL
+                // trade prints at that level. Real account keeps MARK_PRICE (correct there).
+                + "&workingType=" + (useTestnet ? "CONTRACT_PRICE" : "MARK_PRICE")
                 + "&timestamp=" + ts + "&recvWindow=60000";
         String sig = hmacSHA256(apiSecret, body);
         HttpResponse<String> resp;
@@ -1521,7 +1526,8 @@ public final class BinanceTradeExecutor {
                 .append("&side=").append(buy ? "BUY" : "SELL")
                 .append("&type=TAKE_PROFIT_MARKET")
                 .append("&triggerPrice=").append(formatPrice(triggerPrice))
-                .append("&workingType=MARK_PRICE");
+                // [v86.22] CONTRACT_PRICE on testnet (erratic demo mark trips early); MARK_PRICE on real.
+                .append("&workingType=").append(useTestnet ? "CONTRACT_PRICE" : "MARK_PRICE");
         if (useClosePosition) {
             body.append("&closePosition=true");
         } else {
