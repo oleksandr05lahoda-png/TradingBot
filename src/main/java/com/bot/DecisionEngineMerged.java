@@ -2814,8 +2814,15 @@ public final class DecisionEngineMerged {
         double[] ema20 = com.bot.TradingCore.emaSeries(c15, 20);
         if (ema20.length < 1) return reject("ta_ema_short");
         double emaNow = ema20[ema20.length - 1];
-        boolean resumeUp   = last.close > last.open && last.close > emaNow && prev.low  <= emaNow * 1.005;
-        boolean resumeDown = last.close < last.open && last.close < emaNow && prev.high >= emaNow * 0.995;
+        // [v86.13] pullback-to-EMA tolerance is env-tunable. Was hardcoded 0.5% (very
+        // tight) — in low-vol chop price rarely comes that close to EMA, so the DOMINANT
+        // live reject was ta_no_pullback and almost nothing qualified. 1.2% default lets
+        // shallower pullbacks count → more setups. Applies in BOTH live and backtest (same
+        // generate() path), so the next startup-BT validates honestly whether the extra
+        // trades keep PnL (compare trade count + avg/trade vs the 0.5% baseline ~121/+0.23%).
+        double pbTol = csEnvDouble("TA_PULLBACK_TOL", 0.012);
+        boolean resumeUp   = last.close > last.open && last.close > emaNow && prev.low  <= emaNow * (1.0 + pbTol);
+        boolean resumeDown = last.close < last.open && last.close < emaNow && prev.high >= emaNow * (1.0 - pbTol);
         if (wantLong ? !resumeUp : !resumeDown) return reject("ta_no_pullback");
 
         // body strength of the resumption bar
