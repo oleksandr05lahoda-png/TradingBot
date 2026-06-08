@@ -1735,6 +1735,24 @@ public final class BotMain {
         if (sender.isRlBanned()) return;
         if (now - startTimeMs < 10 * 60_000L) return;
 
+        // [v86.30] SELF-HEAL a genuinely HUNG main cycle. runCycle is scheduleAtFixedRate on a
+        // single thread — if one execution blocks (e.g. a no-timeout HTTP call), every later cycle
+        // is blocked forever and this watchdog otherwise only ALERTS, so the bot silently stops
+        // trading (this is exactly what happened: cycles froze after #4). If the cycle has been
+        // silent >15 min (3 missed 5-min cycles = real hang, not a pause), exit for a CLEAN Railway
+        // auto-restart. Safe: fires ONLY on a real hang (stale lastCycleSuccessMs — if logs were
+        // merely delayed but the bot cycled, this won't fire); clean restart = no double-trades;
+        // the 10-min startup grace above covers the boot backtest.
+        if (now - lastCycleSuccessMs > 15 * 60_000L) {
+            LOG.severe("[Watchdog] MainCycle HUNG " + ((now - lastCycleSuccessMs) / 60_000L)
+                    + "min — System.exit(1) for clean Railway auto-restart");
+            try {
+                if (telegram != null) telegram.sendMessageAsync("💀 Главный цикл завис >15 мин — перезапускаю бота (auto-recovery)");
+                Thread.sleep(2000);
+            } catch (Throwable ignored) {}
+            System.exit(1);
+        }
+
         List<String> infraIssues = new ArrayList<>();
         if (now - lastCycleSuccessMs > 3 * 60_000L)
             infraIssues.add("💀 MainCycle silent " + (now - lastCycleSuccessMs) / 1000 + "s");
