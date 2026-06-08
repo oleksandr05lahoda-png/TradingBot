@@ -767,8 +767,17 @@ public final class SignalSender {
 
         // User Data Stream
         if (!API_KEY.isBlank()) {
-            udsExecutor.schedule(this::initUserDataStream, 5, TimeUnit.SECONDS);
-            udsExecutor.scheduleAtFixedRate(this::renewListenKey, 28, 28, TimeUnit.MINUTES);
+            // [v86.29] UDS (account-event WebSocket) is now OPT-IN (default OFF). On real it
+            // fork-bombed reconnects ("[UDS] ✅ Connected" every ~2s) — this path ran for the
+            // FIRST time against a real account (testnet had a blank BINANCE_API_KEY → UDS off),
+            // and the overlapping retry chains hammer Binance → rate-limit/418 risk. Core trading
+            // does NOT need it: PositionTracker polls positionRisk via REST every 30s for
+            // close/PnL/management. Re-enable for testing with UDS_ENABLE=1 (after the reconnect
+            // loop is properly fixed). refreshAccountBalance (REST, no loop) stays on.
+            if ("1".equals(System.getenv().getOrDefault("UDS_ENABLE", "0"))) {
+                udsExecutor.schedule(this::initUserDataStream, 5, TimeUnit.SECONDS);
+                udsExecutor.scheduleAtFixedRate(this::renewListenKey, 28, 28, TimeUnit.MINUTES);
+            }
             wsWatcher.scheduleAtFixedRate(this::refreshAccountBalance, 10, 120, TimeUnit.SECONDS);
             // PATCH #3: Set leverage + margin mode on startup.
             // OLD: leverage defaulted to exchange setting (often 20x) — SIZE=20$ at 20x = $400 position.
@@ -809,7 +818,7 @@ public final class SignalSender {
 
         System.out.printf("[SignalSender v7.0] TOP_N=%d SCAN=%d OI=%d DEPTH=%d POOL=%d LIVE_CANDLE=ON WS_AUTO=ON UDS=%s BALANCE_TRACK=%s%n",
                 TOP_N, MAX_SCAN_PAIRS_PER_CYCLE, FUNDING_OI_TOP_N, DEPTH_SNAPSHOT_TOP_N, poolSize,
-                !API_KEY.isBlank() ? "ON" : "OFF",
+                (!API_KEY.isBlank() && "1".equals(System.getenv().getOrDefault("UDS_ENABLE","0"))) ? "ON" : "OFF",
                 !API_KEY.isBlank() ? "ON" : "MANUAL");
 
         // [Hole 13 FIX] Make default $1000 balance loudly transparent
