@@ -665,6 +665,8 @@ public final class PositionTracker {
      * Поведение можно отключить через env AUTO_CLOSE_ORPHANS=0 (по умолчанию 1).
      * При =0 возвращается старое поведение (только warn).
      */
+    /** [v86.24b] consecutive cycles where positionRisk was unreadable (-1109), for alert throttle. */
+    private int reconcileUnreadableStreak = 0;
     private void reconcileAtStartup() {
         if (!executor.isReady()) return;
         boolean autoClose = !"0".equals(System.getenv().getOrDefault("AUTO_CLOSE_ORPHANS", "1"));
@@ -680,9 +682,20 @@ public final class PositionTracker {
                 try { Thread.sleep(1500L * attempt); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
             }
             if (positions == null) {
-                LOG.severe("[Tracker] reconcile: positionRisk read failed 4x (likely -1109) — orphans NOT verified this cycle");
-                if (telegram != null) telegram.sendMessageAsync("⚠️ Reconcile skipped: positionRisk unreadable (-1109?) 4x — orphans NOT verified");
+                reconcileUnreadableStreak++;
+                LOG.severe("[Tracker] reconcile: positionRisk read failed 4x (likely -1109) — orphans NOT verified (streak=" + reconcileUnreadableStreak + ")");
+                // [v86.24b] Throttle the Telegram alert: notify on the FIRST failure and then only
+                // every ~3h (every 12th 15-min cycle) — persistent -1109 is account-side, spamming
+                // every 15 min adds nothing.
+                if ((reconcileUnreadableStreak == 1 || reconcileUnreadableStreak % 12 == 0) && telegram != null) {
+                    telegram.sendMessageAsync("⚠️ Reconcile: positionRisk unreadable (-1109?) — orphans NOT verified. Likely demo account/key issue (account-side). Streak=" + reconcileUnreadableStreak + " cycles. Fix: Close All on demo UI + regenerate testnet API key.");
+                }
                 return;
+            }
+            if (reconcileUnreadableStreak > 0) {
+                LOG.info("[Tracker] reconcile: positionRisk readable again after " + reconcileUnreadableStreak + " failed cycles");
+                if (telegram != null) telegram.sendMessageAsync("✅ Reconcile recovered: positionRisk readable again (was unreadable " + reconcileUnreadableStreak + " cycles)");
+                reconcileUnreadableStreak = 0;
             }
             int orphanWithSl = 0;
             int orphanNakedClosed = 0;
