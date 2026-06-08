@@ -85,8 +85,12 @@ public final class LiveTradeProbe {
         // On real/live it must NOT run. Skip SILENTLY — do NOT send a Telegram message, and
         // especially do NOT advise switching to testnet (that would send the user back to the
         // broken demo). On real the proof-of-life is the balance read + first real signal.
-        if (!ex.isTestnet()) {
-            LOG.info("[PROBE] skipped on real/live (probe is testnet-only by design)");
+        // [v86.31] On real the probe stays OFF by default, BUT allow an explicit ONE-SHOT real
+        // test trade for peace-of-mind verification when PROBE_ALLOW_REAL=1. Safe now: size is
+        // capped to EXEC_MAX_NOTIONAL_USD (~$6) and the close is hardened (v86.24/27). Use a CHEAP
+        // coin in PROBE_RUN (e.g. DOGEUSDT, $5 min notional) — BTC's $100 min would be rejected.
+        if (!ex.isTestnet() && !"1".equals(System.getenv().getOrDefault("PROBE_ALLOW_REAL", "0"))) {
+            LOG.info("[PROBE] skipped on real/live (set PROBE_ALLOW_REAL=1 + PROBE_RUN=<cheap coin> for a one-shot real test trade)");
             return false;
         }
 
