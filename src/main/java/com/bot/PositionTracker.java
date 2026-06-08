@@ -491,16 +491,23 @@ public final class PositionTracker {
      */
     private double computeRealExitPrice(Tracked t) {
         if (!REAL_PNL_ENABLED) return t.slPrice;
-        try {
-            double real = executor.fetchRealizedClosingPrice(
-                    t.symbol, t.isLong, t.openedAtMs);
-            if (real > 0) return real;
-            LOG.fine("[Tracker] real exit price returned 0 for " + t.symbol
-                    + " — falling back to slPrice");
-        } catch (Throwable ex) {
-            LOG.warning("[Tracker] real exit price fetch failed for " + t.symbol
-                    + ": " + ex.getMessage() + " — falling back to slPrice");
+        // [v86.24] Closing fills often lag the positionRisk-going-flat signal; a single read
+        // returning 0 (or a -1109 on userTrades) silently fell back to slPrice → fabricated PnL
+        // for PROFIT_LOCK / STAGNATION / TIME_STOP closes (which almost never exit at slPrice),
+        // poisoning both the Telegram report AND riskGuard's daily-loss accounting. Retry a few
+        // times to resolve the real VWAP before falling back.
+        for (int r = 0; r < 4; r++) {
+            try {
+                double real = executor.fetchRealizedClosingPrice(t.symbol, t.isLong, t.openedAtMs);
+                if (real > 0) return real;
+            } catch (Throwable ex) {
+                LOG.warning("[Tracker] real exit price fetch failed for " + t.symbol
+                        + ": " + ex.getMessage());
+            }
+            if (r < 3) { try { Thread.sleep(700L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; } }
         }
+        LOG.warning("[Tracker] real exit price unresolved for " + t.symbol
+                + " — falling back to slPrice (PnL may be approximate)");
         return t.slPrice;
     }
 
@@ -662,9 +669,19 @@ public final class PositionTracker {
         if (!executor.isReady()) return;
         boolean autoClose = !"0".equals(System.getenv().getOrDefault("AUTO_CLOSE_ORPHANS", "1"));
         try {
-            JSONArray positions = executor.fetchAllOpenPositionsRaw();
+            // [v86.24] A single null = transient -1109 read failure, NOT "account is clean".
+            // This is the only guaranteed orphan scan — abandoning it on one transient error can
+            // leave a pre-existing naked orphan running to liquidation. Retry, then escalate.
+            JSONArray positions = null;
+            for (int attempt = 1; attempt <= 4; attempt++) {
+                positions = executor.fetchAllOpenPositionsRaw();
+                if (positions != null) break;
+                LOG.warning("[Tracker] reconcile: positionRisk read failed (attempt " + attempt + "/4) — retrying");
+                try { Thread.sleep(1500L * attempt); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
             if (positions == null) {
-                LOG.info("[Tracker] startup reconcile: positionRisk fetch returned null (skipped)");
+                LOG.severe("[Tracker] reconcile: positionRisk read failed 4x (likely -1109) — orphans NOT verified this cycle");
+                if (telegram != null) telegram.sendMessageAsync("⚠️ Reconcile skipped: positionRisk unreadable (-1109?) 4x — orphans NOT verified");
                 return;
             }
             int orphanWithSl = 0;

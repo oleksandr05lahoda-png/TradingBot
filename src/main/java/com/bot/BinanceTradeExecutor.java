@@ -249,7 +249,7 @@ public final class BinanceTradeExecutor {
 
     private void ensureOneWayMode(boolean afterCancel) throws Exception {
         long ts = ts();
-        String body = "dualSidePosition=false&timestamp=" + ts + "&recvWindow=5000";
+        String body = "dualSidePosition=false&timestamp=" + ts + "&recvWindow=60000";
         String sig = hmacSHA256(apiSecret, body);
         HttpResponse<String> resp = http.send(
                 HttpRequest.newBuilder()
@@ -296,7 +296,7 @@ public final class BinanceTradeExecutor {
         // Cancel regular orders (LIMIT, MARKET) via /fapi/v1/openOrders
         try {
             long ts = ts();
-            String qs = "timestamp=" + ts + "&recvWindow=5000";
+            String qs = "timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -334,7 +334,7 @@ public final class BinanceTradeExecutor {
         // and previously kept blocking position-mode changes with -4067.
         try {
             long ts2 = ts();
-            String qs2 = "timestamp=" + ts2 + "&recvWindow=5000";
+            String qs2 = "timestamp=" + ts2 + "&recvWindow=60000";
             String sig2 = hmacSHA256(apiSecret, qs2);
             HttpResponse<String> resp2 = http.send(
                     HttpRequest.newBuilder()
@@ -451,10 +451,15 @@ public final class BinanceTradeExecutor {
         try {
             emergencyClosePosition(symbol, wasLong, qty);
             // Verify close succeeded by re-checking positionAmt within ~1.5s.
+            // [v86.24] A null snapshot = read FAILED (-1109), NOT "still open". Retry the read;
+            // only declare still-open on a SUCCESSFUL read that shows the position. If every read
+            // failed, report UNKNOWN — not a false "still open — MANUAL".
+            boolean readOk = false;
             for (int i = 0; i < 3; i++) {
                 Thread.sleep(500);
                 JSONArray ps = fetchAllOpenPositionsRaw();
-                if (ps == null) break;
+                if (ps == null) continue;
+                readOk = true;
                 boolean stillOpen = false;
                 for (int k = 0; k < ps.length(); k++) {
                     JSONObject p = ps.getJSONObject(k);
@@ -467,6 +472,11 @@ public final class BinanceTradeExecutor {
                     cancelAllOpenOrders(symbol);
                     return true;
                 }
+            }
+            if (!readOk) {
+                LOG.severe("[Executor] closeOrphanPosition: " + symbol
+                        + " verify UNREADABLE (-1109?) — state UNKNOWN, MANUAL CHECK");
+                return false;
             }
             // Position still showing as open after emergency close — log and bail.
             LOG.severe("[Executor] closeOrphanPosition: " + symbol
@@ -542,7 +552,7 @@ public final class BinanceTradeExecutor {
         if (!isReady()) return -1;
         try {
             long ts = ts();
-            String qs = "timestamp=" + ts + "&recvWindow=5000";
+            String qs = "timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "/fapi/v2/balance?" + qs + "&signature=" + sig))
@@ -801,11 +811,16 @@ public final class BinanceTradeExecutor {
             // [v86.21] On rejection (e.g. intermittent -1109) retry ONCE — but only after
             // confirming no position actually opened, to avoid a double-fill.
             if (entryOrderId == null) {
-                boolean noPos = true;
-                try { noPos = Math.abs(fetchPositionAmount(symbol)) < 1e-9; } catch (Throwable ignored) {}
-                if (noPos) {
+                // [v86.24] Only retry if the position is CONFIRMED flat (a 200 read returning ~0).
+                // A -1109 read now returns NaN → unknown → do NOT resend, else we double-fill when
+                // the first order actually filled but its response/verify -1109'd.
+                double _chk = fetchPositionAmountChecked(symbol);
+                boolean confirmedFlat = !Double.isNaN(_chk) && Math.abs(_chk) < 1e-9;
+                if (confirmedFlat) {
                     try { Thread.sleep(500L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                     entryOrderId = sendMarketOrder(symbol, isLong, qty);
+                } else if (Double.isNaN(_chk)) {
+                    LOG.warning("[Executor] " + symbol + " entry rejected AND position-read failed (-1109?) — NOT retrying to avoid double-fill; treat as possibly-open");
                 }
             }
             if (entryOrderId == null) {
@@ -985,9 +1000,13 @@ public final class BinanceTradeExecutor {
             // 4 attempts × ~250ms each fits within slPlacementTimeoutMs (2s default).
             String slOrderId = null;
             String slLastError = "no attempts";
-            long slDeadline = System.currentTimeMillis() + slPlacementTimeoutMs;
+            // [v86.24] attempt-count governs retries (per-call .timeout caps each); the old 2s
+            // wall-clock deadline could collapse "4 attempts" to ~1 on a slow call → premature
+            // emergency close of a protectable position. Also handle error codes: retry transient
+            // -4509 (fill not yet registered) / -1109 with a real wait; abort permanent param
+            // rejects; and bail early if the position is confirmed flat (the fill itself failed).
             int attempts = 0;
-            while (System.currentTimeMillis() < slDeadline && attempts < 4) {
+            while (attempts < 4) {
                 attempts++;
                 String[] slResult = sendStopMarketOrderDiag(symbol, !isLong, slPriceRounded);
                 slOrderId = slResult[0];
@@ -995,7 +1014,21 @@ public final class BinanceTradeExecutor {
                 if (slOrderId != null) break;
                 LOG.warning("[Executor] SL attempt " + attempts + "/4 failed for "
                         + symbol + ": " + slLastError);
-                Thread.sleep(200);
+                String _e = slLastError == null ? "" : slLastError;
+                boolean permanentParam = _e.contains("-1111") || _e.contains("-4014") || _e.contains("-4013") || _e.contains("-2021");
+                if (permanentParam) {
+                    LOG.severe("[Executor] SL permanent reject " + symbol + " (" + _e + ") — not retrying");
+                    break;
+                }
+                boolean isTransient = _e.contains("-4509") || _e.contains("-1109") || _e.contains("open position") || _e.contains("Invalid account");
+                if (isTransient && attempts >= 2) {
+                    double posChk = fetchPositionAmountChecked(symbol);
+                    if (!Double.isNaN(posChk) && Math.abs(posChk) < 1e-9) {
+                        LOG.severe("[Executor] SL " + symbol + ": confirmed flat after " + attempts + " tries — fill failed, abort");
+                        break;
+                    }
+                }
+                Thread.sleep(isTransient ? 500 : 300);
             }
 
             // 6. SL FAILED — emergency close
@@ -1003,8 +1036,24 @@ public final class BinanceTradeExecutor {
                 LOG.severe("[Executor] CRITICAL: SL placement failed after " + attempts
                         + " attempts on " + symbol + " (lastError=" + slLastError
                         + ") — emergency closing position");
-                emergencyClosePosition(symbol, isLong, qty);
-                return ExecutionResult.fail("SL not placed (" + slLastError + ") → emergency close");
+                // [v86.24] Do NOT fire-and-forget. Capture the close result, re-fetch real qty,
+                // verify-retry, and escalate if it stays open — never return a plain fail while a
+                // NAKED position may still be live (the ASTERUSDT -4509 orphan path).
+                double closeQty = qty;
+                try { double remoteAmt = Math.abs(fetchPositionAmount(symbol)); if (remoteAmt > 0) closeQty = remoteAmt; } catch (Throwable ignored) {}
+                boolean closed = emergencyClosePositionWithVerify(symbol, isLong, closeQty);
+                for (int rc = 0; rc < 3 && !closed; rc++) {
+                    try { Thread.sleep(700L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    double remNow = fetchPositionAmountChecked(symbol);
+                    if (!Double.isNaN(remNow) && Math.abs(remNow) < 1e-9) { closed = true; break; }
+                    double q2 = Double.isNaN(remNow) ? closeQty : Math.abs(remNow);
+                    closed = emergencyClosePositionWithVerify(symbol, isLong, q2 > 0 ? q2 : closeQty);
+                }
+                if (!closed) {
+                    LOG.severe("[Executor] NAKED POSITION " + symbol + " — SL failed AND close failed; MANUAL INTERVENTION");
+                    emergencyAlert(symbol, isLong, qty, "SL fail + close fail: " + slLastError);
+                }
+                return ExecutionResult.fail("SL not placed (" + slLastError + ") → close " + (closed ? "OK" : "FAILED-NAKED"));
             }
 
             // 7. Place TP1 + TP2 — partial profit-taking via TAKE_PROFIT_MARKET algo orders.
@@ -1128,8 +1177,16 @@ public final class BinanceTradeExecutor {
     public boolean closePosition(String symbol, String reason) {
         if (!isReady()) return false;
         try {
-            // 1. Find position
-            double posQty = fetchPositionAmount(symbol);
+            // 1. Find position. [v86.24] Checked read: NaN = read FAILED (-1109/non-200) —
+            // NOT a real flat. Previously a failed read returned 0 → "no position", we cancelled
+            // the SL/TP and reported closed while the position was still OPEN on Binance
+            // (phantom close + naked + orphan). Fail CLOSED: return false, keep the SL, let the
+            // caller keep tracking until the read recovers.
+            double posQty = fetchPositionAmountChecked(symbol);
+            if (Double.isNaN(posQty)) {
+                LOG.severe("[Executor] closePosition " + symbol + ": positionRisk read FAILED (-1109?) — NOT cancelling orders, NOT reporting flat");
+                return false;
+            }
             if (Math.abs(posQty) < 1e-12) {
                 LOG.info("[Executor] closePosition " + symbol + ": no position to close");
                 cancelAllOpenOrders(symbol); // still cancel orphan SL/TP
@@ -1163,7 +1220,7 @@ public final class BinanceTradeExecutor {
         if (!isReady()) return 0;
         try {
             long ts = ts();
-            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -1199,7 +1256,7 @@ public final class BinanceTradeExecutor {
         if (!isReady()) return Double.NaN;
         try {
             long ts = ts();
-            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -1231,7 +1288,7 @@ public final class BinanceTradeExecutor {
         if (!isReady()) return 0;
         try {
             long ts = ts();
-            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -1264,7 +1321,7 @@ public final class BinanceTradeExecutor {
         if (!isReady()) return 0;
         try {
             long ts = ts();
-            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -1288,7 +1345,7 @@ public final class BinanceTradeExecutor {
     }
     private boolean initSymbolMargin(String symbol) throws Exception {
         long ts = ts();
-        String qs = "symbol=" + symbol + "&marginType=ISOLATED&timestamp=" + ts + "&recvWindow=5000";
+        String qs = "symbol=" + symbol + "&marginType=ISOLATED&timestamp=" + ts + "&recvWindow=60000";
         String sig = hmacSHA256(apiSecret, qs);
         HttpResponse<String> resp = http.send(
                 HttpRequest.newBuilder()
@@ -1313,7 +1370,7 @@ public final class BinanceTradeExecutor {
             LOG.warning("[Executor] marginType -4067 — cancel-all + single retry " + symbol);
             cancelAllOrdersAccountWide();
             long tsR = ts();
-            String qsR = "symbol=" + symbol + "&marginType=ISOLATED&timestamp=" + tsR + "&recvWindow=5000";
+            String qsR = "symbol=" + symbol + "&marginType=ISOLATED&timestamp=" + tsR + "&recvWindow=60000";
             String sigR = hmacSHA256(apiSecret, qsR);
             HttpResponse<String> respR = http.send(
                     HttpRequest.newBuilder()
@@ -1352,7 +1409,7 @@ public final class BinanceTradeExecutor {
 
     private boolean initSymbolLeverage(String symbol) throws Exception {
         long ts = ts();
-        String qs = "symbol=" + symbol + "&leverage=" + leverage + "&timestamp=" + ts + "&recvWindow=5000";
+        String qs = "symbol=" + symbol + "&leverage=" + leverage + "&timestamp=" + ts + "&recvWindow=60000";
         String sig = hmacSHA256(apiSecret, qs);
         HttpResponse<String> resp = http.send(
                 HttpRequest.newBuilder()
@@ -1401,7 +1458,7 @@ public final class BinanceTradeExecutor {
                 + "&type=MARKET"
                 + "&quantity=" + formatQty(qty)
                 + "&newOrderRespType=RESULT"
-                + "&timestamp=" + ts + "&recvWindow=5000";
+                + "&timestamp=" + ts + "&recvWindow=60000";
         String sig = hmacSHA256(apiSecret, body);
         HttpResponse<String> resp = http.send(
                 HttpRequest.newBuilder()
@@ -1426,7 +1483,7 @@ public final class BinanceTradeExecutor {
                         + "&type=MARKET"
                         + "&quantity=" + formatQty(qty)
                         + "&newOrderRespType=RESULT"
-                        + "&timestamp=" + ts2 + "&recvWindow=5000";
+                        + "&timestamp=" + ts2 + "&recvWindow=60000";
                 String sig2 = hmacSHA256(apiSecret, body2);
                 HttpResponse<String> resp2 = http.send(
                         HttpRequest.newBuilder()
@@ -1661,7 +1718,7 @@ public final class BinanceTradeExecutor {
         try {
             long ts = ts();
             String qs = "symbol=" + symbol + "&algoId=" + algoId
-                    + "&timestamp=" + ts + "&recvWindow=5000";
+                    + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -1780,7 +1837,7 @@ public final class BinanceTradeExecutor {
             // limit=500 is the max for userTrades. For a single trade this is
             // way more than enough (TP1 + SL = 2 fills, plus the entry = 3).
             String qs = "symbol=" + symbol + "&startTime=" + sinceMs
-                    + "&limit=500&timestamp=" + ts + "&recvWindow=5000";
+                    + "&limit=500&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -1837,7 +1894,7 @@ public final class BinanceTradeExecutor {
         if (!isReady()) return null;
         try {
             long ts = ts();
-            String qs = "timestamp=" + ts + "&recvWindow=5000";
+            String qs = "timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
@@ -1862,7 +1919,7 @@ public final class BinanceTradeExecutor {
         // 1) Обычные ордера
         try {
             long ts = ts();
-            String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, body);
             http.send(
                     HttpRequest.newBuilder()
@@ -1878,7 +1935,7 @@ public final class BinanceTradeExecutor {
         // 2) Алго-ордера (SL/TP/трейлинги — теперь отдельная очередь)
         try {
             long ts = ts();
-            String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String body = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, body);
             http.send(
                     HttpRequest.newBuilder()
@@ -1909,7 +1966,7 @@ public final class BinanceTradeExecutor {
         // 1. Check plain open orders queue
         try {
             long ts = ts();
-            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> r = http.send(
                     HttpRequest.newBuilder()
@@ -1933,7 +1990,7 @@ public final class BinanceTradeExecutor {
         // 2. Check algo open orders queue
         try {
             long ts = ts();
-            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=5000";
+            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> r = http.send(
                     HttpRequest.newBuilder()
@@ -1998,7 +2055,7 @@ public final class BinanceTradeExecutor {
                         + "&type=MARKET"
                         + "&quantity=" + formatQty(qty)
                         + "&reduceOnly=true"
-                        + "&timestamp=" + ts + "&recvWindow=5000";
+                        + "&timestamp=" + ts + "&recvWindow=60000";
                 String sig = hmacSHA256(apiSecret, body);
                 HttpResponse<String> resp = http.send(
                         HttpRequest.newBuilder()
@@ -2018,7 +2075,8 @@ public final class BinanceTradeExecutor {
                         try { Thread.sleep(500); } catch (InterruptedException ie) {
                             Thread.currentThread().interrupt(); break;
                         }
-                        double remaining = fetchPositionAmount(symbol);
+                        double remaining = fetchPositionAmountChecked(symbol);
+                        if (Double.isNaN(remaining)) continue; // [v86.24] read failed — do NOT treat as flat
                         if (Math.abs(remaining) < 1e-9) { verified = true; break; }
                     }
                     if (verified) {
@@ -2036,7 +2094,7 @@ public final class BinanceTradeExecutor {
                             + "&positionSide=" + (wasLong ? "LONG" : "SHORT")
                             + "&type=MARKET"
                             + "&quantity=" + formatQty(qty)
-                            + "&timestamp=" + ts2 + "&recvWindow=5000";
+                            + "&timestamp=" + ts2 + "&recvWindow=60000";
                     String sig2 = hmacSHA256(apiSecret, body2);
                     HttpResponse<String> resp2 = http.send(
                             HttpRequest.newBuilder()
@@ -2055,7 +2113,8 @@ public final class BinanceTradeExecutor {
                             try { Thread.sleep(500); } catch (InterruptedException ie) {
                                 Thread.currentThread().interrupt(); break;
                             }
-                            double remaining = fetchPositionAmount(symbol);
+                            double remaining = fetchPositionAmountChecked(symbol);
+                            if (Double.isNaN(remaining)) continue; // [v86.24] read failed — do NOT treat as flat
                             if (Math.abs(remaining) < 1e-9) {
                                 LOG.info("[Executor] emergencyClose " + symbol
                                         + " OK via HEDGE retry");
@@ -2121,7 +2180,7 @@ public final class BinanceTradeExecutor {
         try {
             long ts = ts();
             String qs = "symbol=" + symbol + "&orderId=" + orderId
-                    + "&timestamp=" + ts + "&recvWindow=5000";
+                    + "&timestamp=" + ts + "&recvWindow=60000";
             String sig = hmacSHA256(apiSecret, qs);
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()

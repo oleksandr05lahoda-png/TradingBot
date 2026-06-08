@@ -2838,7 +2838,20 @@ public final class DecisionEngineMerged {
         double pbTol = csEnvDouble("TA_PULLBACK_TOL", 0.012);
         boolean resumeUp   = last.close > last.open && last.close > emaNow && prev.low  <= emaNow * (1.0 + pbTol);
         boolean resumeDown = last.close < last.open && last.close < emaNow && prev.high >= emaNow * (1.0 - pbTol);
-        if (wantLong ? !resumeUp : !resumeDown) return reject("ta_no_pullback");
+        // [v86.24] CONTINUATION branch: in a STRONG steep trend (already HTF-validated above)
+        // price rides far from EMA20 and never pulls back, so resumeUp/Down stay false and the
+        // dominant live reject was ta_no_pullback — the bot stood flat through exactly the regime
+        // it wants. Add a trend-aligned breakout-continuation trigger that fires ONLY when price
+        // is on the correct side of EMA20 AND breaks the prior bar's extreme in the trend
+        // direction (never a counter-trend dip → not a reversal entry). All downstream floors
+        // (body≥0.45, RSI cap, ADX≥22, vol, conf≥65, R:R≥2.05) still apply. Same generate() path
+        // runs in backtest, so the next startup-BT validates the edge honestly.
+        double contTol = csEnvDouble("TA_CONT_BREAK", 0.0005);
+        boolean contUp   = last.close > last.open && last.close > emaNow && last.high > prev.high * (1.0 + contTol) && last.low > emaNow;
+        boolean contDown = last.close < last.open && last.close < emaNow && last.low  < prev.low  * (1.0 - contTol) && last.high < emaNow;
+        boolean setupUp   = resumeUp   || contUp;
+        boolean setupDown = resumeDown || contDown;
+        if (wantLong ? !setupUp : !setupDown) return reject("ta_no_pullback");
 
         // body strength of the resumption bar
         double range = last.high - last.low;
@@ -2848,8 +2861,14 @@ public final class DecisionEngineMerged {
         // ── RSI: not over-extended against the entry ──
         double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
         double rsiNow = rsi[rsi.length - 1];
-        if (wantLong && rsiNow > csEnvDouble("TA_RSI_MAX", 72)) return reject("ta_rsi_hot");
-        if (!wantLong && rsiNow < csEnvDouble("TA_RSI_MIN", 28)) return reject("ta_rsi_cold");
+        // [v86.24] regime-aware cap: a strong sustained trend keeps RSI 70-80 for hours, so the
+        // 72 cap (anti-FOMO for pullback entries) would reject the very continuation setups we
+        // just added. Relax ONLY for the continuation path (up to ~82); keep the strict 72 cap on
+        // pullback entries so anti-FOMO is intact.
+        double rsiMaxL = contUp   ? csEnvDouble("TA_RSI_MAX_CONT", 82) : csEnvDouble("TA_RSI_MAX", 72);
+        double rsiMinS = contDown ? csEnvDouble("TA_RSI_MIN_CONT", 18) : csEnvDouble("TA_RSI_MIN", 28);
+        if (wantLong && rsiNow > rsiMaxL) return reject("ta_rsi_hot");
+        if (!wantLong && rsiNow < rsiMinS) return reject("ta_rsi_cold");
 
         // ── ADX: primary trend strength ──
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
