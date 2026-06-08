@@ -81,14 +81,13 @@ public final class LiveTradeProbe {
 
         BinanceTradeExecutor ex = BinanceTradeExecutor.getInstance();
 
-        // SAFETY GATE 1: must be on testnet
+        // SAFETY GATE 1: the probe is a TESTNET-ONLY health-check (it opens a test position).
+        // On real/live it must NOT run. Skip SILENTLY — do NOT send a Telegram message, and
+        // especially do NOT advise switching to testnet (that would send the user back to the
+        // broken demo). On real the proof-of-life is the balance read + first real signal.
         if (!ex.isTestnet()) {
-            String err = "[PROBE] REFUSED: BINANCE_USE_TESTNET != 1. "
-                    + "Probe ALWAYS refuses to run on live to protect real money.";
-            LOG.severe(err);
-            sendTg(telegram, "🚫 *Проба отказана*\n\n" + err
-                    + "\n\nПоставь BINANCE_USE_TESTNET=1 в Railway, перезапусти.");
-            return true;
+            LOG.info("[PROBE] skipped on real/live (probe is testnet-only by design)");
+            return false;
         }
 
         // SAFETY GATE 2: API keys present
