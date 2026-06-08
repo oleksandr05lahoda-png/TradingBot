@@ -163,14 +163,15 @@ public final class BinanceTradeExecutor {
         if (useTestnet) {
             this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
             this.apiSecret = pick("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET", "");
-            // [v82.4 2026-06-01] Host = demo-fapi.binance.com. Binance МИГРИРОВАЛ
-            // старый testnet.binancefuture.com В "Demo Trading": testnet-сайт теперь
-            // 301-редиректит на demo.binance.com, а demo-fapi — его API-хост.
-            // ПРИЧИНА -1109 "Invalid account" на записи (чтение работает): API-ключ
-            // создан НЕ внутри Demo Trading. Demo Trading = ОТДЕЛЬНЫЙ namespace
-            // аккаунта — ключи из обычного account API Management читают, но не
-            // торгуют. FIX: создать ключ в demo.binance.com → Demo Trading → API Management.
-            this.baseUrl   = "https://demo-fapi.binance.com";
+            // [v86.25 2026-06-08] Default host switched to testnet.binancefuture.com (classic
+            // Binance Futures Testnet). The previous demo-fapi.binance.com ("Demo Trading") host
+            // kept returning -1109 "Invalid account" because keys there must be created INSIDE the
+            // Demo Trading namespace (very easy to get wrong — confirmed: a freshly-made key still
+            // -1109'd on demo-fapi AND testnet). The classic testnet is the stable, documented
+            // path: log in at https://testnet.binancefuture.com (GitHub login), copy the API
+            // Key+Secret shown at the BOTTOM of the page — that key owns a real futures demo
+            // account (auto-funded USDT) → no -1109. Override via TESTNET_BASE_URL if ever needed.
+            this.baseUrl   = System.getenv().getOrDefault("TESTNET_BASE_URL", "https://testnet.binancefuture.com").trim();
         } else {
             this.apiKey    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
             this.apiSecret = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
