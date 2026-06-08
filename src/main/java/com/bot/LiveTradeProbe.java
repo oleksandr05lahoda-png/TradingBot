@@ -412,8 +412,8 @@ public final class LiveTradeProbe {
             HttpClient http = HttpClient.newBuilder()
                     .connectTimeout(Duration.ofSeconds(10)).build();
             String base = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "1"))
-                    ? System.getenv().getOrDefault("TESTNET_BASE_URL", "https://testnet.binancefuture.com").trim()
-                    : "https://fapi.binance.com"; // [v86.25] classic Futures Testnet host by default
+                    ? System.getenv().getOrDefault("TESTNET_BASE_URL", "https://demo-fapi.binance.com").trim()
+                    : "https://fapi.binance.com"; // [v86.26] official Demo Trading API host by default
             HttpResponse<String> resp = http.send(
                     HttpRequest.newBuilder()
                             .uri(URI.create(base + "/fapi/v1/premiumIndex?symbol=" + symbol))

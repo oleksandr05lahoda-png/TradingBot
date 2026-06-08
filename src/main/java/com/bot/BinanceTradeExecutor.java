@@ -163,15 +163,15 @@ public final class BinanceTradeExecutor {
         if (useTestnet) {
             this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
             this.apiSecret = pick("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET", "");
-            // [v86.25 2026-06-08] Default host switched to testnet.binancefuture.com (classic
-            // Binance Futures Testnet). The previous demo-fapi.binance.com ("Demo Trading") host
-            // kept returning -1109 "Invalid account" because keys there must be created INSIDE the
-            // Demo Trading namespace (very easy to get wrong — confirmed: a freshly-made key still
-            // -1109'd on demo-fapi AND testnet). The classic testnet is the stable, documented
-            // path: log in at https://testnet.binancefuture.com (GitHub login), copy the API
-            // Key+Secret shown at the BOTTOM of the page — that key owns a real futures demo
-            // account (auto-funded USDT) → no -1109. Override via TESTNET_BASE_URL if ever needed.
-            this.baseUrl   = System.getenv().getOrDefault("TESTNET_BASE_URL", "https://testnet.binancefuture.com").trim();
+            // [v86.26 2026-06-08] Host = demo-fapi.binance.com (official Demo Trading API host).
+            // VERIFIED: testnet.binancefuture.com now 301-redirects to demo.binance.com (Binance
+            // retired the standalone Futures Testnet site); the documented API base is
+            // demo-fapi.binance.com. The -1109 "Invalid account" is NOT the host (a fresh key
+            // -1109'd identically on both) — it is the KEY NAMESPACE: a Demo Trading API key MUST
+            // be created from demo.binance.com itself (Account icon -> API Management -> Create API),
+            // NOT the regular binance.com API Management. A real-account key authenticates but has
+            // no demo futures account behind it -> -1109. Overridable via TESTNET_BASE_URL.
+            this.baseUrl   = System.getenv().getOrDefault("TESTNET_BASE_URL", "https://demo-fapi.binance.com").trim();
         } else {
             this.apiKey    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
             this.apiSecret = System.getenv().getOrDefault("BINANCE_API_SECRET", "");
