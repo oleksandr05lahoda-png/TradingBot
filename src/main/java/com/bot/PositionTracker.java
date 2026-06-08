@@ -680,7 +680,12 @@ public final class PositionTracker {
     private int reconcileUnreadableStreak = 0;
     private void reconcileAtStartup() {
         if (!executor.isReady()) return;
-        boolean autoClose = !"0".equals(System.getenv().getOrDefault("AUTO_CLOSE_ORPHANS", "1"));
+        // [v86.27] Auto-closing UNTRACKED ("orphan") positions is destructive on a REAL account —
+        // it would market-close the user's own manual positions. On real it's OPT-IN only
+        // (AUTO_CLOSE_ORPHANS=1, dedicated account); on testnet it stays ON by default (demo funds).
+        boolean autoClose = executor.isTestnet()
+                ? !"0".equals(System.getenv().getOrDefault("AUTO_CLOSE_ORPHANS", "1"))
+                : "1".equals(System.getenv().getOrDefault("AUTO_CLOSE_ORPHANS", "0"));
         try {
             // [v86.24] A single null = transient -1109 read failure, NOT "account is clean".
             // This is the only guaranteed orphan scan — abandoning it on one transient error can
@@ -786,12 +791,16 @@ public final class PositionTracker {
             // silently if orders were hanging. Now positions are dealt with,
             // sweep any lingering orders and retry the position-mode switch.
             try {
-                int cancelled = executor.cancelAllOrdersAccountWide();
-                if (cancelled > 0) {
-                    LOG.info("[Tracker] post-reconcile: cancelled "
-                            + cancelled + " orphan orders account-wide");
+                // [v86.27] Account-wide order cancel + mode-flip is DESTRUCTIVE on a real account
+                // (wipes the user's manual/protective orders). Testnet only.
+                if (executor.isTestnet()) {
+                    int cancelled = executor.cancelAllOrdersAccountWide();
+                    if (cancelled > 0) {
+                        LOG.info("[Tracker] post-reconcile: cancelled "
+                                + cancelled + " orphan orders account-wide");
+                    }
+                    executor.ensureCleanAccountAndOneWayMode();
                 }
-                executor.ensureCleanAccountAndOneWayMode();
             } catch (Throwable t) {
                 LOG.warning("[Tracker] post-reconcile cleanup failed: " + t.getMessage());
             }

@@ -74,8 +74,8 @@ public final class RiskGuard {
         // статистики/калибровки. dailyTrades 8→30, maxConcurrent 2→5.
         // ⚠️ RISK: concurrent×risk% = одновременный риск. 5×2%=10% депо разом,
         // при dailyLoss -10% один плохой блок = стоп на день. На реале вернуть 2-3.
-        this.DAILY_TRADE_LIMIT         = envInt("RG_DAILY_TRADE_LIMIT", 30);
-        this.MAX_CONCURRENT_POSITIONS  = envInt("RG_MAX_CONCURRENT_POSITIONS", 5);
+        this.DAILY_TRADE_LIMIT         = envInt("RG_DAILY_TRADE_LIMIT", 8);   // [v86.27] real default (was 30 for demo stat-gathering)
+        this.MAX_CONCURRENT_POSITIONS  = envInt("RG_MAX_CONCURRENT_POSITIONS", 1);  // [v86.27] real default (was 5 demo); 1 position at a time for a tiny account
         this.BTC_CRASH_30M_PCT         = envDouble("RG_BTC_CRASH_30M_PCT", 3.0);
         this.BTC_CRASH_60M_PCT         = envDouble("RG_BTC_CRASH_60M_PCT", 5.0);
         this.BTC_CRASH_BLOCK_MS        = envLong  ("RG_BTC_CRASH_BLOCK_MS",   2 * 60 * 60_000L);

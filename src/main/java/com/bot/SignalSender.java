@@ -776,7 +776,12 @@ public final class SignalSender {
             // NEW: ISOLATED margin at 5x leverage. SIZE=20$ at 5x = $100 position.
             //      SL -1.36% = -$1.36 loss on $20 margin = -6.8% per trade. Correct Kelly sizing.
             // Scheduled 10s after UDS init to ensure account is ready.
-            udsExecutor.schedule(this::initLeverageAndMarginMode, 10, TimeUnit.SECONDS);
+            // [v86.27] On REAL skip the boot-time bulk leverage/margin rewrite of ~60 symbols
+            // (mutates real-account state + 60 API calls). The executor sets leverage/margin
+            // lazily per-symbol at trade time (and ABORTS on real if it can't). Testnet only.
+            if ("1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "1"))) {
+                udsExecutor.schedule(this::initLeverageAndMarginMode, 10, TimeUnit.SECONDS);
+            }
         }
 
         // [ДЫРА №2] Liquidation WebSocket — глобальный поток, без API ключа

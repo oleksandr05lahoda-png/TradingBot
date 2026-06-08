@@ -273,10 +273,10 @@ public final class BinanceTradeExecutor {
             // orders" — cancel ALL open orders across all symbols, then retry.
             // Only retry once (afterCancel guard) to avoid infinite loop.
             else if ((b.contains("-4067") || b.contains("open orders")) && !afterCancel) {
-                LOG.warning("[Executor] -4067 detected — cancelling all open orders before retry");
-                int cancelled = cancelAllOrdersAccountWide();
-                LOG.info("[Executor] cancelled " + cancelled + " open orders, retrying ensureOneWayMode");
-                ensureOneWayMode(true); // single retry
+                // [v86.27] Do NOT cancel all account orders to force a mode flip — on a real
+                // account that wipes the user's manual/protective orders. Warn only; the per-symbol
+                // -4061 retry with positionSide already handles hedge-mode placement at trade time.
+                LOG.warning("[Executor] -4067: open orders present — leaving account mode unchanged, NOT cancelling orders. Set ONE_WAY manually if needed.");
             } else {
                 LOG.warning("[Executor] positionSide/dual HTTP " + resp.statusCode() + ": " + b);
             }
@@ -767,6 +767,16 @@ public final class BinanceTradeExecutor {
                         "[Executor] %s notional cap: $%.2f → $%.2f (%.0f%% bal, min $%.2f step $%.2f) qty %.6f → %.6f",
                         symbol, notional, maxNotional, maxNotionalPct, si.minNotional, stepNotional, qty, cappedQty));
                 qty = cappedQty;
+                notional = qty * entry;
+            }
+
+            // [v86.27] Absolute per-trade notional cap for tiny accounts: the 20% cap above is
+            // defeated by minNotional on a small balance, so add a hard USD ceiling. Default $6
+            // (just above the $5 alt minNotional) → exactly one small position fits; high-min
+            // symbols (ETH $20 / BTC $100) then correctly fail the minNotional check below.
+            double absCapUsd = envDouble("EXEC_MAX_NOTIONAL_USD", 6.0);
+            if (absCapUsd > 0 && notional > absCapUsd && entry > 0) {
+                qty = absCapUsd / entry;
                 notional = qty * entry;
             }
 
@@ -1397,6 +1407,13 @@ public final class BinanceTradeExecutor {
         // Раньше -1109 → abort трейда. Теперь: НЕ фатально — торгуем в текущем
         // режиме маржи аккаунта (как делают prod-боты, не форсящие ISOLATED).
         if (body.contains("-1109")) {
+            if (!useTestnet) {
+                // [v86.27] On REAL do NOT swallow -1109: trading at an unconfirmed margin mode
+                // (account-default CROSS) while risk math assumes ISOLATED is unsafe → abort.
+                lastInitErrorBody = "HTTP " + code + ": " + body + " (real: marginType not confirmed — abort)";
+                LOG.severe("[Executor] marginType -1109 on REAL " + symbol + " — ABORT trade (cannot confirm ISOLATED)");
+                return false;
+            }
             LOG.warning("[Executor] marginType -1109 для " + symbol
                     + " — НЕ фатально, торгую в текущем режиме маржи аккаунта");
             lastInitErrorBody = "";
@@ -1427,6 +1444,13 @@ public final class BinanceTradeExecutor {
         // [v82.1 2026-06-01] -1109 на leverage тоже НЕ фатально (см. marginType).
         // Аккаунт в режиме где per-symbol leverage не ставится → торгуем с текущим.
         if (body.contains("-1109")) {
+            if (!useTestnet) {
+                // [v86.27] On REAL do NOT swallow -1109: trading at the account-default leverage
+                // (often 20x) while risk math assumes 5x is a liquidation risk → abort.
+                lastInitErrorBody = "HTTP " + resp.statusCode() + ": " + body + " (real: leverage not confirmed — abort)";
+                LOG.severe("[Executor] leverage -1109 on REAL " + symbol + " — ABORT trade (cannot confirm 5x)");
+                return false;
+            }
             LOG.warning("[Executor] leverage -1109 для " + symbol
                     + " — НЕ фатально, торгую с текущим плечом аккаунта");
             lastInitErrorBody = "";
