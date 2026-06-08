@@ -74,10 +74,11 @@ public final class LiveTradeProbe {
         if (symbol.isEmpty()) return false;
 
         long holdSeconds = envLong("PROBE_HOLD_SECONDS", 60L);
-        // [v82.12] 20→200. $20 нотионал на BTC ($71k) = 0.00028 BTC, что ниже
-        // minNotional многих пар → "qty rounded to zero". $200 надёжно проходит
-        // минимум на любой паре и всё равно мелочь (vs весь баланс $5000).
-        double targetNotional = envDouble("PROBE_NOTIONAL_USD", 200.0);
+        // [v86.32] Default 200→6 for the tiny real account ($17): $200 needed balance ≥ $40 and
+        // failed the pre-check. $6 fits $17 (check needs ≥ $1.2), clears the $5 alt minNotional,
+        // and matches the executor's EXEC_MAX_NOTIONAL_USD cap. Use a CHEAP coin in PROBE_RUN
+        // (DOGEUSDT) — BTC/ETH ($100/$20 min) are rejected at this size. Override via env if needed.
+        double targetNotional = envDouble("PROBE_NOTIONAL_USD", 6.0);
 
         BinanceTradeExecutor ex = BinanceTradeExecutor.getInstance();
 
