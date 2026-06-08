@@ -311,6 +311,8 @@ public final class PositionTracker {
      * actually a generic SL-replace) for (3). All three are guarded by env
      * flags for surgical A/B testing.
      */
+    /** [v86.24c] true on demo/testnet — gates spike-rejection clamps we don't want on a real venue. */
+    private static final boolean PT_TESTNET = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "1"));
     private void applyActiveManagement(Tracked t, long age) {
         double mark = executor.fetchMarkPrice(t.symbol);
         if (mark <= 0) return; // API hiccup — try again next poll
@@ -322,7 +324,12 @@ public final class PositionTracker {
         double curR = t.isLong ? (mark - t.entry) / risk : (t.entry - mark) / risk;
         // Update HWM. We only have point-in-time mark, so peaks are approximate
         // (better than nothing — backtester uses bar high/low which is more accurate).
-        if (curR > 0 && curR > t.maxFavR) t.maxFavR = curR;
+        // [v86.24c] On testnet reject an implausible single-poll HWM jump (>+1.0R in one 30s poll)
+        // — a spurious demo mark spike must not permanently corrupt maxFavR (drives trail levels +
+        // defeats STAGNATION). Real venue keeps the raw update.
+        if (curR > 0 && curR > t.maxFavR) {
+            if (!PT_TESTNET || curR <= t.maxFavR + 1.0) t.maxFavR = curR;
+        }
         if (curR < 0 && -curR > t.maxAdvR) t.maxAdvR = -curR;
 
         // Window position: 0.0 = just opened, 1.0 = at time-stop.
@@ -334,7 +341,9 @@ public final class PositionTracker {
         // в backtest становились trail-exits с +1.5R+ после TP1. Plus реальные
         // time-stops в live (curR<0.5) не лечатся PROFIT_LOCK (требует curR≥0.80).
         // Корневая проблема time-stops закрыта v9.3 (skip adjustStopForClusters).
-        if (PROFIT_LOCK_ENABLED && !t.beActivated && agePct >= 0.85 && curR >= 0.80) {
+        boolean _plCond = PROFIT_LOCK_ENABLED && !t.beActivated && agePct >= 0.85 && curR >= 0.80;
+        if (!_plCond) t.profitLockTicks = 0;
+        if (_plCond && ++t.profitLockTicks >= 2) {  // [v86.24c] require 2 consecutive polls — one erratic demo tick must not close
             LOG.info(String.format(
                     "[Tracker] %s PROFIT_LOCK: age=%.0f%% curR=%+.2f maxFav=%.2f → market close",
                     t.symbol, agePct * 100, curR, t.maxFavR));
@@ -356,9 +365,11 @@ public final class PositionTracker {
         // Past 35% of window, neither favorable nor adverse exceeded 0.3R —
         // trade is dead, release capital for next setup. Skip if BE already moved
         // (we have a partial fill in profit; let TP2 / trail handle).
-        if (STAGNATION_ENABLED && !t.beActivated
+        boolean _stCond = STAGNATION_ENABLED && !t.beActivated
                 && agePct >= 0.35
-                && t.maxFavR < 0.30 && t.maxAdvR < 0.30) {
+                && t.maxFavR < 0.30 && t.maxAdvR < 0.30;
+        if (!_stCond) t.stagnationTicks = 0;
+        if (_stCond && ++t.stagnationTicks >= 2) {  // [v86.24c] require 2 consecutive polls
             LOG.info(String.format(
                     "[Tracker] %s STAGNATION: age=%.0f%% maxFav=%.2f maxAdv=%.2f → market close",
                     t.symbol, agePct * 100, t.maxFavR, t.maxAdvR));
@@ -739,6 +750,24 @@ public final class PositionTracker {
                             sym, amt, upnl));
                 }
             }
+            // [v86.24c] Zombie recovery: finalize any TRACKED position ABSENT/flat in this
+            // (successful) snapshot — its per-symbol poll may be stuck on -1109 while it actually
+            // closed. The bulk endpoint is a guaranteed ~15-min recovery path. Skip positions
+            // younger than 2 min to avoid the open->registration race.
+            java.util.Set<String> openOnExchange = new java.util.HashSet<>();
+            for (int i = 0; i < positions.length(); i++) {
+                JSONObject p = positions.getJSONObject(i);
+                if (Math.abs(p.optDouble("positionAmt", 0)) > 1e-9) openOnExchange.add(p.optString("symbol", ""));
+            }
+            for (String trackedSym : new java.util.ArrayList<>(tracked.keySet())) {
+                Tracked zt = tracked.get(trackedSym);
+                if (zt == null) continue;
+                if (System.currentTimeMillis() - zt.openedAtMs < 120_000L) continue; // skip fresh (registration race)
+                if (!openOnExchange.contains(trackedSym)) {
+                    LOG.warning("[Tracker] reconcile: tracked " + trackedSym + " absent on exchange — finalizing (zombie recovery)");
+                    handlePositionClosed(zt, System.currentTimeMillis());
+                }
+            }
             int total = orphanWithSl + orphanNakedClosed + orphanNakedFailed;
             if (total > 0) {
                 String msg = String.format(
@@ -814,6 +843,8 @@ public final class PositionTracker {
         double maxFavR     = 0.0;    // peak favorable movement in R-units (HWM)
         double maxAdvR     = 0.0;    // peak adverse movement in R-units (for stagnation detection)
         int    trailLevel  = 0;      // 0=none, 1=locked@0.4R, 2=locked@0.8R, 3=locked@1.4R
+        int    profitLockTicks = 0;  // [v86.24c] consecutive polls meeting PROFIT_LOCK cond (anti-spike)
+        int    stagnationTicks = 0;  // [v86.24c] consecutive polls meeting STAGNATION cond (anti-spike)
     }
 
     // ─── Env helpers ──────────────────────────────────────────────────

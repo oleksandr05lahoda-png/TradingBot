@@ -65,7 +65,12 @@ public final class LiveTradeProbe {
         // exchange confirmed) → execution is PROVEN working. Leaving it on per-boot caused
         // an orphan naked position (TP hit intermittent -1109) + a 418 IP ban (probe +
         // restarts + retries hammered Binance). Re-enable in code only for a one-off retest.
-        String symbol = System.getenv().getOrDefault("PROBE_RUN", "").trim().toUpperCase();
+        // [v86.24c] Re-enabled as a STARTUP HEALTH-CHECK (user request): opens one tiny demo
+        // trade at every boot so you immediately see ✅ (execution alive) or ❌ -1109 (account
+        // broken) instead of waiting hours. Cleanup hardened via v86.24 closePosition (verify +
+        // fail-closed). Disable with PROBE_HEALTHCHECK=0. Avoid rapid restarts (418 risk).
+        if ("0".equals(System.getenv().getOrDefault("PROBE_HEALTHCHECK", "1"))) return false;
+        String symbol = System.getenv().getOrDefault("PROBE_RUN", "BTCUSDT").trim().toUpperCase();
         if (symbol.isEmpty()) return false;
 
         long holdSeconds = envLong("PROBE_HOLD_SECONDS", 60L);
@@ -284,14 +289,12 @@ public final class LiveTradeProbe {
             LOG.info("[PROBE] step 6: closing position + canceling orphan orders");
             sendTg(tg, "🧹 Закрываю пробу + чищу orphan-ордера...");
 
-            double remainingQty = ex.fetchPositionAmount(symbol);
-            if (Math.abs(remainingQty) > 1e-9) {
-                boolean closed = ex.closePosition(symbol, "probe-finished");
-                LOG.info("[PROBE] closePosition returned " + closed);
-            } else {
-                // Position already closed by SL/TP — just kill any orphan orders
-                ex.cancelAllOrdersOnSymbol(symbol);
-            }
+            // [v86.24c] Always route through the hardened closePosition (verifies the close and
+            // fails-closed on -1109) instead of gating on a 0-returning read that could skip-close
+            // into an orphan. closePosition cancels orphan orders on a confirmed-flat read.
+            boolean closed = ex.closePosition(symbol, "probe-finished");
+            LOG.info("[PROBE] closePosition returned " + closed);
+            ex.cancelAllOrdersOnSymbol(symbol);
 
             sendTg(tg, "✅ *Проба завершена УСПЕШНО*\n\n"
                     + "Что это значит:\n"
@@ -300,7 +303,8 @@ public final class LiveTradeProbe {
                     + "• Корректно ставит SL+TP1+TP2 на бирже\n"
                     + "• Корректно закрывает и чистит ордера\n\n"
                     + "Когда придёт реальный сигнал — пройдёт тем же путём.\n\n"
-                    + "👉 *УБЕРИ* `PROBE_RUN` из Railway env, иначе будет повторяться.");
+                    + "Это стартовый health-check — гоняется при каждом запуске.\n"
+                    + "Отключить: `PROBE_HEALTHCHECK=0` в Railway.");
         }
 
         /** Best-effort cleanup on any exception path. */
@@ -308,10 +312,7 @@ public final class LiveTradeProbe {
             if (!positionOpened) return;
             try {
                 LOG.warning("[PROBE] emergency cleanup running");
-                double q = ex.fetchPositionAmount(symbol);
-                if (Math.abs(q) > 1e-9) {
-                    ex.closePosition(symbol, "probe-emergency");
-                }
+                ex.closePosition(symbol, "probe-emergency"); // [v86.24c] hardened: verifies + fail-closed
                 ex.cancelAllOrdersOnSymbol(symbol);
                 sendTg(tg, "🧹 Аварийная чистка завершена. Проверь Binance UI вручную.");
             } catch (Throwable t) {
