@@ -96,6 +96,13 @@ public final class BotMain {
     public static final boolean AUTO_TRADE_ENABLED =
             "1".equals(System.getenv().getOrDefault("BOT_AUTO_TRADE", "0"));
 
+    // [v86.35] HARD live-trading kill switch — default OFF (DISARMED). While we validate the edge
+    // (honest backtest + live verifier), the bot analyzes, sends signals, and the verifier
+    // accumulates Live WR — but NO real trades are executed. Sits ON TOP of BOT_AUTO_TRADE /
+    // OBSERVATION_MODE. Arm only AFTER results are proven: set LIVE_TRADING_ARMED=1 in Railway.
+    public static final boolean LIVE_TRADING_ARMED =
+            "1".equals(System.getenv().getOrDefault("LIVE_TRADING_ARMED", "0"));
+
     // [v79 I5] Cross-exchange price validation. Compares Binance kline last close
     // with Bybit/OKX. If discrepancy >0.5% → log warning + dispatch blocked.
     // Default OFF — Binance is generally trustworthy, but available for paranoid setups.
@@ -650,9 +657,11 @@ public final class BotMain {
                 // trade limits all enforced here. Failure → message in Telegram,
                 // bot continues normally. Success → position opened on exchange,
                 // SL placed, tracker watching.
-                if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE) {
+                if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && LIVE_TRADING_ARMED) {
                     autoTradeHook(idea, tg);
                 }
+                // [v86.35] When DISARMED (LIVE_TRADING_ARMED=0) the signal is still dispatched +
+                // tracked by the verifier (Live WR), but NO real trade is opened — experiment mode.
 
                 isc.setSignalCooldown(idea.symbol, 3 * 60_000L);
                 LOG.info(String.format("[DISPATCH/%s%s] %s %s prob=%.0f conf=%.2f rr=%.2f sl=%.2f%% n=%d",
@@ -1122,7 +1131,19 @@ public final class BotMain {
             });
             // Only start polling if auto-trade is enabled — otherwise tracker
             // would just spin uselessly.
-            if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady()) {
+            if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady() && !LIVE_TRADING_ARMED) {
+                // [v86.35] Auto-trade configured but DISARMED — experiment/validation mode.
+                // Tracker still runs (manages any leftover position safely), signals + verifier
+                // keep working, but NO real trades open.
+                tracker.start();
+                LOG.warning("[BOOT] LIVE TRADING DISARMED (LIVE_TRADING_ARMED=0) — experiment mode: "
+                        + "signals + verifier run, NO real trades. Arm with LIVE_TRADING_ARMED=1 when proven.");
+                telegram.sendMessageAsync(
+                        "🛡 *Живая торговля ВЫКЛЮЧЕНА* (режим эксперимента)\n" +
+                                "Бот анализирует рынок, шлёт сигналы и копит Live WR в верификаторе — "
+                                + "но РЕАЛЬНЫХ сделок НЕ открывает. Деньги не рискуют.\n" +
+                                "_Включим, когда докажем edge: `LIVE_TRADING_ARMED=1`._");
+            } else if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady()) {
                 tracker.start();
                 LOG.info("[BOOT] Auto-trade ENABLED. Mode: "
                         + (ex.isTestnet() ? "TESTNET" : "REAL/LIVE")
@@ -1234,10 +1255,10 @@ public final class BotMain {
             LOG.warning("[PAIRS-BT] init failed: " + t.getMessage());
         }
 
-        // [v85.0] CARRY (funding harvest) diagnostic — the one structurally-real,
-        // market-neutral edge. Cheap (funding data only). CARRY_BACKTEST=0 to skip.
+        // [v86.35] CARRY (funding harvest) is a DEAD strategy (~ -36%/yr net) that only spammed
+        // Telegram every cycle — default OFF now. Re-enable as a diagnostic with CARRY_BACKTEST=1.
         try {
-            if (!"0".equals(System.getenv().getOrDefault("CARRY_BACKTEST", "1"))) {
+            if ("1".equals(System.getenv().getOrDefault("CARRY_BACKTEST", "0"))) {
                 heavySched.submit(safe("CarryBacktest",
                         () -> runCarryBacktest(sender, telegram)));
             }
