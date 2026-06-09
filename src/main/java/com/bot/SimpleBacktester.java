@@ -728,6 +728,54 @@ public final class SimpleBacktester {
                     currentPos = new ActivePosition(
                             idea.side, entryPrice, adjustedSL, adjustedTP1, adjustedTP2,
                             idea.probability, entryBar.openTime, i);
+
+                    // [v86.38] SAME-BAR ENTRY STOP-OUT (honesty fix, audit-verified 3/3).
+                    // resolvePosition first runs at bar i+1 (barsHeld=1), so the entry bar i's
+                    // own intrabar range is never tested -> a position that gaps to its SL within
+                    // its entry bar was silently carried as a survivor (optimistic bias). Test
+                    // SL ONLY (same-bar TP would be look-ahead-flavored: intrabar order unknown).
+                    // Mirrors resolvePosition SL branch (price/slippage) and the main-loop cost
+                    // block EXACTLY, so a same-bar SL costs identically to a normal SL. Live SL is
+                    // a real STOP_MARKET that can trigger intrabar -> this is MORE faithful, not a
+                    // divergence. Toggle off: BACKTEST_SAME_BAR_SL=0.
+                    if ("1".equals(System.getenv().getOrDefault("BACKTEST_SAME_BAR_SL", "1"))) {
+                        boolean isLongSb = idea.side == com.bot.TradingCore.Side.LONG;
+                        boolean slHitSb  = isLongSb ? (entryBar.low <= adjustedSL)
+                                                    : (entryBar.high >= adjustedSL);
+                        if (slHitSb) {
+                            double exitPx = adjustedSL;
+                            if (isLongSb) exitPx -= exitPx * slippage;
+                            else          exitPx += exitPx * slippage;
+                            double grossSb = isLongSb
+                                    ? (exitPx - entryPrice) / entryPrice * 100.0
+                                    : (entryPrice - exitPx) / entryPrice * 100.0;
+                            double feesSb = takerFee * 1.0
+                                    + takerFee * currentPos.remainingFrac
+                                    + currentPos.partialFeesCost;
+                            double slipSb = slippage * 1.0
+                                    + slippage * currentPos.remainingFrac
+                                    + currentPos.partialSlipCost;
+                            double fundSb = 0.0;                 // barsHeld = 0
+                            double costsSb = feesSb + slipSb + fundSb;
+                            double netSb   = grossSb - costsSb * 100;
+                            result.trades.add(new TradeRecord(
+                                    symbol, idea.side, entryPrice, exitPx,
+                                    adjustedSL, adjustedTP1, netSb, idea.probability,
+                                    0, "SL", entryBar.openTime, feesSb, slipSb, fundSb));
+                            result.total++;
+                            result.grossPnL += grossSb;
+                            result.netPnL   += netSb;
+                            result.totalFees += feesSb;
+                            result.totalSlippage += slipSb;
+                            result.totalFunding += fundSb;
+                            if (netSb > 0.05)       result.wins++;
+                            else if (netSb < -0.05) result.losses++;
+                            else                    result.breakEvens++;
+                            dailyPnL.merge(barDay, netSb, Double::sum);
+                            if (compound) balance += balance * netSb / 100.0;
+                            currentPos = null;
+                        }
+                    }
                 }
             }
 
