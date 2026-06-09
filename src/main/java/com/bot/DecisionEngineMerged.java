@@ -2860,6 +2860,26 @@ public final class DecisionEngineMerged {
         com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
         if (adxR.adx < csEnvDouble("TA_ADX_MIN", 22)) return reject("ta_adx_weak");  // [v86.1] 18→22: сильнее тренд, меньше пилы
 
+        // ── [v86.37] ADX DIRECTIONAL confirmation (edge lever, audit-verified) ──
+        // Magnitude-only ADX (above) let trades fire while the coin's OWN 1h +DI/−DI
+        // opposed the intended side. VCB already requires DI agreement (lines 2098-2099);
+        // mirror it here. Per-coin (no BTC dependence), principled (not a window-fit
+        // threshold), env-toggleable. Targets transitional/whipsaw losers in P1/P2.
+        if ("1".equals(System.getenv().getOrDefault("TA_DI_CONFIRM", "1"))) {
+            if (wantLong  && !adxR.bullish()) return reject("ta_di_bearish");
+            if (!wantLong && !adxR.bearish()) return reject("ta_di_bullish");
+        }
+
+        // ── [v86.37] CHOPPINESS gate (edge lever, audit-verified) ──
+        // The code's own P1/P2 post-mortem: those losing windows were боковик where
+        // trend-following пилит. TradingCore.choppinessIndex (was dead code) measures
+        // exactly that on the coin's OWN 1h bars. CI>61.8 = choppy/range → skip. 61.8
+        // is the published fractal default (1/φ²), NOT tuned to green the windows;
+        // env-tunable (set TA_CHOP_MAX=999 to disable). No look-ahead (closed bars
+        // only), no cost change. Runs in the shared generate() path → backtest==live.
+        double taChop = com.bot.TradingCore.choppinessIndex(c15, 14);
+        if (taChop > csEnvDouble("TA_CHOP_MAX", 61.8)) return reject("ta_choppy");
+
         // ── volume confirmation ──
         double volSma = tpComputeVolSma(c15, 20);
         double volR = volSma > 0 ? last.volume / volSma : 1.0;
