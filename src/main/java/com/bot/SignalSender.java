@@ -1066,6 +1066,7 @@ public final class SignalSender {
         sorted.removeIf(pair -> {
             if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return true;
             if (isc.isHardBlacklisted(pair)) return true;
+            if (!passesTradeTier(pair)) return true;   // [v86.36] liquidity-tier filter
             com.bot.DecisionEngineMerged.AssetType at =
                     com.bot.DecisionEngineMerged.detectAssetType(pair);
             if (at != com.bot.DecisionEngineMerged.AssetType.CRYPTO
@@ -4029,6 +4030,28 @@ public final class SignalSender {
         return com.bot.DecisionEngineMerged.CoinCategory.ALT;
     }
 
+    // [v86.36] LIQUIDITY-TIER FILTER — edge lever #1 (cost-cut experiment).
+    // Honest backtest (v86.34) showed the strategy's GROSS edge (~+0.35%/trade) is real,
+    // but ~70% of it is eaten by slippage on illiquid coins (per-side TOP 0.025% /
+    // ALT 0.075% / MEME 0.20%). Restricting scan+backtest to liquid coins recovers that
+    // cost drag. This is a PER-COIN liquidity gate (each market judged on its own trend) —
+    // NOT a BTC-regime filter; the bot does not become BTC-dependent.
+    //   TRADE_TIER=TOP    → only top-tier liquid (cheapest slippage; default for the test)
+    //   TRADE_TIER=TOPALT → top + alt (drop only the worst-slippage meme tier)
+    //   TRADE_TIER=ALL    → legacy (everything) — set this to restore old behavior
+    // Single source of truth: used by live scan (selectPairsForScan), startup backtest
+    // (getScanUniverseSnapshot) and self-validator (getTopPairsForForecast) so the
+    // backtested universe == the live-traded universe.
+    private static final String TRADE_TIER =
+            System.getenv().getOrDefault("TRADE_TIER", "TOP").trim().toUpperCase();
+    private boolean passesTradeTier(String pair) {
+        if ("ALL".equals(TRADE_TIER)) return true;
+        com.bot.DecisionEngineMerged.CoinCategory c = categorizePair(pair);
+        if ("TOPALT".equals(TRADE_TIER))
+            return c != com.bot.DecisionEngineMerged.CoinCategory.MEME;
+        return c == com.bot.DecisionEngineMerged.CoinCategory.TOP;   // default TOP
+    }
+
     private com.bot.DecisionEngineMerged.TradeIdea rebuildIdea(com.bot.DecisionEngineMerged.TradeIdea src, double p, List<String> f) {
         // Передаём адаптивные TP-множители из оригинала — они не должны теряться при перестройке
         com.bot.DecisionEngineMerged.TradeIdea ni = new com.bot.DecisionEngineMerged.TradeIdea(
@@ -4262,6 +4285,7 @@ public final class SignalSender {
                 .filter(e -> e.getValue() >= MIN_VOL_ALT_USD)
                 .filter(e -> !isBlocklisted(e.getKey()))
                 .filter(e -> !isc.isHardBlacklisted(e.getKey()))
+                .filter(e -> passesTradeTier(e.getKey()))   // [v86.36] liquidity-tier filter
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .limit(n)
                 .map(Map.Entry::getKey)
@@ -4308,7 +4332,8 @@ public final class SignalSender {
         sorted.removeIf(p -> p == null
                 || !p.endsWith("USDT")              // только *USDT (отсекает USDC/BUSD-пары)
                 || HARD_BLACKLIST.contains(p)       // токенизир. металлы/сырьё/стоки
-                || isBlocklisted(p));               // garbage-coin рантайм-блок
+                || isBlocklisted(p)                 // garbage-coin рантайм-блок
+                || !passesTradeTier(p));            // [v86.36] liquidity-tier filter (TRADE_TIER)
         sorted.sort((a, b) -> Double.compare(
                 volume24hUSD.getOrDefault(b, 0.0),
                 volume24hUSD.getOrDefault(a, 0.0)));
