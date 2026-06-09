@@ -2485,6 +2485,18 @@ public final class DecisionEngineMerged {
         if (atrPct < csEnvDouble("TA_ATR_MIN", 0.004) || atrPct > csEnvDouble("TA_ATR_MAX", 0.06))
             return reject("ta_atr_oob");
 
+        // ── [v86.40] per-coin VOL-EXPANSION ceiling (4/4-hunt, audit-verified test-it) ──
+        // Reject pullback entries when the coin's OWN 1h ATR has spiked into the top of its
+        // recent range — the volatility-expansion regime where pullback-to-EMA stops resuming
+        // cleanly (the structural failure suspected behind P2). atrPercentile ranks the current
+        // ATR vs the coin's own last-100-bar ATR distribution (strictly per-coin, NO BTC). Reuses
+        // the exact primitive already used by generateFromFundingMomentum. Default 0.90 = reject
+        // only the top decile of the coin's own vol; TA_ATR_PCTILE_MAX=1.0 disables. Closed bars
+        // only (c15 trimmed @2473) → no look-ahead; shared generate() path → backtest==live.
+        // OOS rule: keep ONLY if P1/P3/P4 stay green AND P2 improves AND trade count holds.
+        double taAtrPctile = com.bot.TradingCore.atrPercentile(c15, 14, 100);
+        if (taAtrPctile > csEnvDouble("TA_ATR_PCTILE_MAX", 0.90)) return reject("ta_vol_expanding");
+
         // ── HTF TREND (direction) — EMA20/50 on c1h (4h), with slope + price filter ──
         double[] hFast = com.bot.TradingCore.emaSeries(c1h, 20);
         double[] hSlow = com.bot.TradingCore.emaSeries(c1h, 50);
@@ -2529,6 +2541,17 @@ public final class DecisionEngineMerged {
         double range = last.high - last.low;
         if (range <= 0 || Math.abs(last.close - last.open) / range < csEnvDouble("TA_BODY_MIN", 0.45))
             return reject("ta_weak_body");
+
+        // ── [v86.40] RECLAIM-PREV gate (4/4-hunt, audit-verified test-it; default OFF) ──
+        // A genuine resumption should close back beyond the pullback bar's extreme (reclaim the
+        // prior bar's range = 1-bar engulf-of-pullback). A fine-bodied green bar that closes BELOW
+        // prev.high is still trapped under prior supply and tends to fade (the P2 false-continuation).
+        // ZERO tunable parameter (strict inequality) → cannot be curve-fit. Per-coin (own last/prev),
+        // closed bars only → no look-ahead. Default OFF; set TA_RECLAIM_PREV=1 to test next.
+        if ("1".equals(System.getenv().getOrDefault("TA_RECLAIM_PREV", "0"))) {
+            if (wantLong  && last.close <= prev.high) return reject("ta_no_reclaim");
+            if (!wantLong && last.close >= prev.low)  return reject("ta_no_reclaim");
+        }
 
         // ── RSI: not over-extended against the entry ──
         double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
