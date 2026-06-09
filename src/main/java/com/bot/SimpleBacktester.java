@@ -36,7 +36,7 @@ public final class SimpleBacktester {
     // [v7.5] 0.04% → 0.035%. Binance Futures с BNB pay = 10% discount от taker.
     // VIP-0 taker 0.05% × 0.9 (BNB) × 0.78 (тут есть referral bonus 22%) ≈ 0.035%.
     // Реалистично если bot настроен на BNB-pay enabled.
-    private double takerFee         = 0.00035;    // 0.035% per side
+    private double takerFee         = 0.0005;     // [v86.34] 0.05% per side — real VIP-0 taker (old 0.035% assumed BNB-pay + referral, unrealistic for a fresh small account)
     private double fundingPer15m    = 0.0001 / 32; // ~0.01%/8h → per 15m
     private int    maxConcurrent    = 6;
     // [v82] 4 → 12 bars (60min → 180min).
@@ -131,10 +131,14 @@ public final class SimpleBacktester {
     //   MEME pairs: spread ~0.10-0.25%
     // Bot использует market orders = ОДНО pip slippage ≈ spread/2.
     // Конкретно бот с $100 size почти не двигает price → near-perfect fills.
+    // [v86.34] Raised to match the bot's OWN live cost model (SignalSender.checkMinProfit):
+    // per-side TOP 0.025% / ALT 0.075% / MEME 0.20%. The old values charged ~HALF the slippage
+    // the live guard already budgets — which inflated a thin edge. Measurement honesty, NOT a
+    // strategy change. The bot trades mostly ALTs, where this gap alone was ~1/3 of the edge.
     private static final Map<com.bot.DecisionEngineMerged.CoinCategory, Double> SLIPPAGE_BASE = Map.of(
-            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.00010,
-            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.00040,
-            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.00150
+            com.bot.DecisionEngineMerged.CoinCategory.TOP,  0.00025,
+            com.bot.DecisionEngineMerged.CoinCategory.ALT,  0.00075,
+            com.bot.DecisionEngineMerged.CoinCategory.MEME, 0.00200
     );
 
     // Backward-compat alias: some call sites still reference SLIPPAGE as a field.
