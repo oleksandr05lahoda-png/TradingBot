@@ -1950,7 +1950,7 @@ public final class BotMain {
 
         // Universe size — default 50, controlled via STARTUP_BT_PAIRS env.
         // Each pair = ~7sec (paging + fetch), so 50 pairs ≈ 6 minutes.
-        final int btPairsLimit = Math.max(10, envInt("STARTUP_BT_PAIRS", 25));  // [v85.3] 50→25: легче для Binance rate-limit
+        final int btPairsLimit = Math.max(10, envInt("STARTUP_BT_PAIRS", 35));  // [v86.39] 25→35: больше пар = больше сделок/период для честного walk-forward (env-override есть)
 
         // 1. Universe — wait for at least 80% target loaded (gives cachedPairs
         // time to actually fill, not just have 1 pair). Hard timeout still 60s
@@ -2028,7 +2028,7 @@ public final class BotMain {
         // экономия Railway (меньше данных = короче прогон = дешевле) + 30 дней
         // (≈2880 баров 15m ≈ 100+ сделок) достаточно для оценки edge. 60 дней
         // были нужны для разовой сверки VCB vs 1h — больше не нужны.
-        int statFloor = btIs15m ? 2880 : 720; // 15m: 30дн, 1h: 30дн
+        int statFloor = btIs15m ? 2880 : 1440; // [v86.39] 1h: 30дн→60дн — вдвое больше истории = статистически значимые walk-forward периоды (env STARTUP_BT_BARS_PRIMARY override; cap 6000)
         final int barsPrimaryTarget = Math.min(6000, Math.max(statFloor, primaryBarsCfg));
         int legacyHtf = envInt("STARTUP_BT_BARS_1H", -1);
         int htfBarsCfg = (legacyHtf > 0 && btIs15m) ? legacyHtf
@@ -2047,7 +2047,7 @@ public final class BotMain {
         // Теперь Universe = overfetch buffer (45), цель = 30 валидных. Эффект:
         // "Мало данных" в сводке падает в 0, потому что мы прекращаем перебор
         // ДО того как доберёмся до молодых пар без истории.
-        final int targetValidPairs = Math.max(5, envInt("STARTUP_BT_TARGET_VALID_PAIRS", 15));  // [v85.3] 30→15: вдвое меньше пар = вдвое меньше запросов
+        final int targetValidPairs = Math.max(5, envInt("STARTUP_BT_TARGET_VALID_PAIRS", 24));  // [v86.39] 15→24: больше независимых рынков = значимая выборка на период (честный 4/4, не подгонка)
         int validPairs = 0;
 
         for (String sym : universe) {

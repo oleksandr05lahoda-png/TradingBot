@@ -815,16 +815,24 @@ public final class PositionTracker {
         if (telegram == null) return;
         try {
             String emoji = pnl > 0 ? "✅" : pnl < 0 ? "❌" : "⚪";
-            String beTag = t.beActivated ? " [BE-armed]" : "";
+            // [v86.39] Compact professional close report (3 lines, no spam). The $ is the real
+            // money result; movePct = entry->real-exit price move (direction-aware) — how the
+            // trade reads for a trader. Duration humanized (Xч Yм / Yм).
+            double movePct = t.entry > 0
+                    ? (t.isLong ? (exitPrice - t.entry) : (t.entry - exitPrice)) / t.entry * 100.0
+                    : 0.0;
+            long mins = (System.currentTimeMillis() - t.openedAtMs) / 60_000L;
+            String dur = mins >= 60
+                    ? String.format("%dч %02dм", mins / 60, mins % 60)
+                    : String.format("%dм", mins);
+            String beTag = t.beActivated ? " · BE" : "";
             String msg = String.format(
-                    "%s *Позиция закрыта*%s\n" +
-                            "%s %s | qty=%.6f\n" +
-                            "Entry: %.6f → Exit (real): %.6f\n" +
-                            "PnL: $%+.4f | Reason: %s\n" +
-                            "Длительность: %d мин",
-                    emoji, beTag, t.symbol, t.isLong ? "LONG" : "SHORT", t.initialQty,
-                    t.entry, exitPrice, pnl, reason,
-                    (System.currentTimeMillis() - t.openedAtMs) / 60_000L);
+                    "%s *%s %s закрыта · %s*%s\n" +
+                            "PnL: $%+.4f (%+.2f%%) · держалась %s\n" +
+                            "вход %.6f → выход %.6f",
+                    emoji, t.symbol, t.isLong ? "LONG" : "SHORT", reason, beTag,
+                    pnl, movePct, dur,
+                    t.entry, exitPrice);
             telegram.sendMessageAsync(msg);
         } catch (Throwable ignored) {}
     }
