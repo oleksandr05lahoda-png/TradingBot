@@ -656,6 +656,18 @@ public final class SimpleBacktester {
                 long h1Start = h1.isEmpty() ? 0L : h1.get(0).openTime;
                 List<com.bot.TradingCore.Candle> sliceH1 = getTimeframeSlice(
                         h1, h1Start, decisionTime);
+                // [v86.33 LOOK-AHEAD FIX] getTimeframeSlice keeps the 4h bar that OPENED before
+                // decisionTime but is still FORMING (closeTime > decisionTime) — and that bar holds
+                // its fully-resolved FUTURE OHLC. So the 4h-trend filter (htfUp/htfDown/sep/adx) was
+                // reading ~4h of look-ahead price and passed far more often than live ever can.
+                // Live strips this bar (DecisionEngineMerged forming-bar strip), but in backtest
+                // closeTime < System.currentTimeMillis() makes that strip a no-op. Trim trailing
+                // still-forming 4h bars here so the sim evaluates the HTF trend on the last CLOSED
+                // 4h bar — identical to live. This makes backtest WR/PnL/signal-rate HONEST
+                // (they were inflated by this peek into the future).
+                while (!sliceH1.isEmpty()
+                        && sliceH1.get(sliceH1.size() - 1).closeTime > decisionTime)
+                    sliceH1 = sliceH1.subList(0, sliceH1.size() - 1);
 
                 List<com.bot.TradingCore.Candle> sliceM1 = null, sliceM5 = null;
                 if (m1 != null && !m1.isEmpty())
