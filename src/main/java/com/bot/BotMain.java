@@ -1637,6 +1637,14 @@ public final class BotMain {
                     new java.io.BufferedWriter(new java.io.FileWriter(f)))) {
                 pw.println("# forecast_records v1");
                 pw.println("# format: sym;side;entry;bias;score;prob;atrPct;tp1;sl;regime;createdAt;resolved;outcome;counted");
+                // [v86.45] Persist the RESOLVED-outcome counters too. The Daily Integrity
+                // Report's "Verifier X/Y wins" is the Gate-2 GO/NO-GO evidence (need 30-50
+                // signals WR>=55% before arming real money) — but the counters were in-memory
+                // only and reset to 0/0 on every restart (deploy or watchdog self-heal), while
+                // pending records survived. Losing the tally mid-phase = losing the forward
+                // proof. Parsed by loadForecastRecords BEFORE the generic '#' comment skip.
+                pw.println("#COUNTERS|" + forecastTotal.get() + "|" + forecastCorrect.get()
+                        + "|" + forecastAmbiguous.get() + "|" + forecastTimeStop.get());
                 long now = System.currentTimeMillis();
                 for (Map.Entry<String, ForecastRecord> e : forecastRecords.entrySet()) {
                     ForecastRecord fr = e.getValue();
@@ -1657,6 +1665,19 @@ public final class BotMain {
             try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
                 String line;
                 while ((line = br.readLine()) != null) {
+                    // [v86.45] Restore resolved-outcome counters (must run before the '#' skip).
+                    if (line.startsWith("#COUNTERS|")) {
+                        try {
+                            String[] p = line.split("\\|");
+                            forecastTotal.set(Integer.parseInt(p[1]));
+                            forecastCorrect.set(Integer.parseInt(p[2]));
+                            forecastAmbiguous.set(Integer.parseInt(p[3]));
+                            forecastTimeStop.set(Integer.parseInt(p[4]));
+                            LOG.info("[ForecastLoad] counters restored: " + p[1] + "/" + p[2]
+                                    + " amb=" + p[3] + " ts=" + p[4]);
+                        } catch (Throwable ignored) {}
+                        continue;
+                    }
                     if (line.startsWith("#") || line.isBlank()) continue;
                     int barIdx = line.indexOf('|');
                     if (barIdx < 0) continue;

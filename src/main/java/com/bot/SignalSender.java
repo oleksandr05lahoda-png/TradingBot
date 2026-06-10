@@ -4483,38 +4483,6 @@ public final class SignalSender {
         public boolean isFresh() { return System.currentTimeMillis() - timestamp < 30_000; }
     }
 
-    /**
-     * Find liquidity wall direction relative to entry price.
-     * Returns price level where the wall sits, or -1 if no significant wall detected.
-     *
-     * Logic: with only L1/L5 aggregated depth available, we use OBI imbalance
-     * as proxy. If LONG and ask depth >> bid depth → wall above price (sellers stacking).
-     * That wall blocks TP. We estimate wall distance proportional to imbalance strength.
-     *
-     * For a real implementation with full L2 data, this would scan price levels.
-     * With aggregated data, we approximate: strong imbalance → wall close to price.
-     */
-    private double findLiquidityWall(OrderbookSnapshot obs, com.bot.TradingCore.Side side, double entry) {
-        if (obs == null || !obs.isFresh()) return -1;
-        double bid = obs.bidDepth5 > obs.bidVolume ? obs.bidDepth5 : obs.bidVolume;
-        double ask = obs.askDepth5 > obs.askVolume ? obs.askDepth5 : obs.askVolume;
-        if (bid + ask < 1e-9) return -1;
-        double imbalance = (bid - ask) / (bid + ask);
-
-        // For LONG: wall = sellers above. ask >> bid means strong wall.
-        // For SHORT: wall = buyers below. bid >> ask means strong wall.
-        if (side == com.bot.TradingCore.Side.LONG) {
-            if (imbalance > -0.30) return -1; // no significant ask wall
-            // Wall strength: -0.30 → 1.5% above, -0.60 → 0.8% above, -0.90 → 0.4% above
-            double wallDistPct = Math.max(0.004, 0.018 + imbalance * 0.020);
-            return entry * (1.0 + wallDistPct);
-        } else {
-            if (imbalance < 0.30) return -1; // no significant bid wall
-            double wallDistPct = Math.max(0.004, 0.018 - imbalance * 0.020);
-            return entry * (1.0 - wallDistPct);
-        }
-    }
-
     public static final class MicroCandleBuilder {
         private final int intervalMs;
         private long bucketStart=-1;
