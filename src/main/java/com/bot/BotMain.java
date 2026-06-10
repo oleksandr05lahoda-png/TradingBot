@@ -1934,7 +1934,7 @@ public final class BotMain {
                     "🔄 *Стартовый backtest запущен*\n"
                             + "━━━━━━━━━━━━━━━━━━━━━\n"
                             + "Фильтр ликвидности: TRADE_TIER="
-                            + System.getenv().getOrDefault("TRADE_TIER", "TOP")
+                            + sender.getTradeTier()   // [v86.44] single source of truth (banner used to show its own default "TOP" while the filter ran TOPALT)
                             + " (TOP=только ликвид · TOPALT=без меме · ALL=всё)\n"
                             + "Бот собирает историю по парам и обучает\n"
                             + "калибратор на симулированных сделках.\n"

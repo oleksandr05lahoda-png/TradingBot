@@ -4044,6 +4044,10 @@ public final class SignalSender {
     // backtested universe == the live-traded universe.
     private static final String TRADE_TIER =
             System.getenv().getOrDefault("TRADE_TIER", "TOPALT").trim().toUpperCase();  // [v86.43] TOP→TOPALT: widen universe (add ALT, drop only MEME) for more signal flow + bigger/diversified walk-forward sample. Signals were ~0/day on 15 TOP coins. Revert: TRADE_TIER=TOP.
+    /** [v86.44] Single source of truth for the active tier — used by the startup-BT banner
+     *  (BotMain had its own getOrDefault default "TOP", which displayed the WRONG tier after
+     *  the v86.43 default flip to TOPALT while the actual filter ran TOPALT). */
+    public String getTradeTier() { return TRADE_TIER; }
     private boolean passesTradeTier(String pair) {
         if ("ALL".equals(TRADE_TIER)) return true;
         com.bot.DecisionEngineMerged.CoinCategory c = categorizePair(pair);
