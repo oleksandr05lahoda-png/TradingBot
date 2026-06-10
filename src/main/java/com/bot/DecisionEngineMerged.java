@@ -1246,8 +1246,13 @@ public final class DecisionEngineMerged {
             sb.append("▫️ Вход:    `").append(String.format(fmt, price)).append("`\n");
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");
             // [v75] TP precision 2 → 1: читается быстрее, десятые роли не играют
-            if (tp1 > 0) sb.append(String.format("🎯 TP1:    `" + fmt + "`  (%+.1f%%)%n", tp1, tp1Pct));
-            if (tp2 > 0) sb.append(String.format("🎯 TP2:    `" + fmt + "`  (%+.1f%%)%n", tp2, tp2Pct));
+            // [v86.46] + R-множитель: TP1 стоит на 1.0R (= дистанция SL, частичный выход 50%),
+            // поэтому |TP1%| == |SL%| — это дизайн, а не «TP на стоп-лоссе».
+            double riskAbsPct = Math.abs(slPct);
+            if (tp1 > 0) sb.append(String.format("🎯 TP1:    `" + fmt + "`  (%+.1f%% · %.1fR)%n", tp1, tp1Pct,
+                    riskAbsPct > 1e-9 ? Math.abs(tp1Pct) / riskAbsPct : 0));
+            if (tp2 > 0) sb.append(String.format("🎯 TP2:    `" + fmt + "`  (%+.1f%% · %.1fR)%n", tp2, tp2Pct,
+                    riskAbsPct > 1e-9 ? Math.abs(tp2Pct) / riskAbsPct : 0));
             // [v80] TP3 убран из вывода — пользователь практически не доходит до него.
             // Внутренняя логика TP3 (для расчётов trailing-stop) остаётся.
             sb.append("━━━━━━━━━━━━━━━━━━━━━━━\n");

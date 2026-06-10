@@ -1695,6 +1695,16 @@ public final class SignalSender {
                     double newTp1 = Math.max(0.60, idea.tp1Mult * 0.70);
                     double newTp2 = Math.max(1.00, idea.tp2Mult * 0.75);
                     double newTp3 = Math.max(1.50, idea.tp3Mult * 0.85);
+                    // [v86.46 compress-then-block FIX] Жёсткий RR-GATE ниже требует tp2Mult >= 2.00:
+                    // при TA_TP_R=2.05 компрессия ×0.75 даёт 1.5375 → сигнал гарантированно умирал
+                    // на гейте с вводящим в заблуждение логом [RR-GATE]. Если стенка прижимает TP2
+                    // ниже флора — профит-путь заблокирован, скипаем сразу и с честной причиной.
+                    if (newTp2 < 2.00) {  // sync: effMinRR ниже
+                        correlationGuard.unregister(pair);
+                        System.out.printf("[OB-WALL] %s %s SKIPPED: wall %.1fx blocks TP path (tp2Mult %.2f→%.2f < RR floor 2.00)%n",
+                                pair, idea.side, obstacleDepth / supportDepth, idea.tp2Mult, newTp2);
+                        return null;
+                    }
                     List<String> wf = new ArrayList<>(idea.flags);
                     wf.add(String.format("OB_WALL%.1fx", obstacleDepth / supportDepth));
                     // [HOLE-1 REGRESSION FIX 2026-05-08] Preserve executorSizeMultiplier
@@ -1718,6 +1728,16 @@ public final class SignalSender {
                 double newTp1 = Math.max(0.60, idea.tp1Mult * scale);
                 double newTp2 = Math.max(1.00, idea.tp2Mult * scale);
                 double newTp3 = Math.max(1.50, idea.tp3Mult * scale);
+                // [v86.46 compress-then-block FIX] то же, что у OB_WALL: scale<0.70 даёт
+                // tp2Mult<1.44 — гарантированная смерть на RR-GATE ниже. Реализованный RR
+                // символа не дотягивает до целей при флоре 2.00 → честный скип вместо
+                // ложного [RR-GATE] лога.
+                if (newTp2 < 2.00) {  // sync: effMinRR ниже
+                    correlationGuard.unregister(pair);
+                    System.out.printf("[TP-CAL] %s %s SKIPPED: realized RR %.2f too weak for targets (tp2Mult %.2f→%.2f < RR floor 2.00)%n",
+                            pair, idea.side, realRR, idea.tp2Mult, newTp2);
+                    return null;
+                }
                 List<String> tf = new ArrayList<>(idea.flags);
                 tf.add(String.format("TP_CAL×%.1f", scale));
                 // [HOLE-1 REGRESSION FIX 2026-05-08] Preserve executorSizeMultiplier
