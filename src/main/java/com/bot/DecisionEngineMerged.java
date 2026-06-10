@@ -2552,7 +2552,7 @@ public final class DecisionEngineMerged {
         // prev.high is still trapped under prior supply and tends to fade (the P2 false-continuation).
         // ZERO tunable parameter (strict inequality) → cannot be curve-fit. Per-coin (own last/prev),
         // closed bars only → no look-ahead. Default OFF; set TA_RECLAIM_PREV=1 to test next.
-        if ("1".equals(System.getenv().getOrDefault("TA_RECLAIM_PREV", "1"))) {  // [v86.41] ENABLED for clean test (zero-param, cannot be curve-fit)
+        if ("1".equals(System.getenv().getOrDefault("TA_RECLAIM_PREV", "0"))) {  // [v86.42] back to OFF: test showed INERT (165→163tr, P2 unchanged -0.838→-0.794) — existing filters already imply it; did not fix P2
             if (wantLong  && last.close <= prev.high) return reject("ta_no_reclaim");
             if (!wantLong && last.close >= prev.low)  return reject("ta_no_reclaim");
         }
