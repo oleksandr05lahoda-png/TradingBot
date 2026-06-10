@@ -4043,7 +4043,7 @@ public final class SignalSender {
     // (getScanUniverseSnapshot) and self-validator (getTopPairsForForecast) so the
     // backtested universe == the live-traded universe.
     private static final String TRADE_TIER =
-            System.getenv().getOrDefault("TRADE_TIER", "TOP").trim().toUpperCase();
+            System.getenv().getOrDefault("TRADE_TIER", "TOPALT").trim().toUpperCase();  // [v86.43] TOP→TOPALT: widen universe (add ALT, drop only MEME) for more signal flow + bigger/diversified walk-forward sample. Signals were ~0/day on 15 TOP coins. Revert: TRADE_TIER=TOP.
     private boolean passesTradeTier(String pair) {
         if ("ALL".equals(TRADE_TIER)) return true;
         com.bot.DecisionEngineMerged.CoinCategory c = categorizePair(pair);
