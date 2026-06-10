@@ -1292,7 +1292,17 @@ public final class DecisionEngineMerged {
             // Grade B = ОК сигнал, торговать ×0.7
             // Grade C = в paper / ×0.3 на live
             // Grade D = только paper
-            int _clusterCount = countAgreeingClusters();
+            // [v86.48] CLUSTER/GRADE DISPLAY FIX. countAgreeingClusters() re-derives
+            // the count from flag substrings and only recognises OLD VCB-style flags
+            // (CLUSTER_x/RSI/VOL_…); a TREND signal carries HTF_UP/ADX/HTF_BIAS_ALIGN,
+            // of which only "HTF" matches → it returned 1 for EVERY trend signal, so a
+            // genuine 3-cluster 75% signal printed "Кластеров: 1 · Grade D" (looked like
+            // trash). The strategy already stores the authoritative count via
+            // setAgreeingClusters (TREND=3, VCB=5/4, funding=1) — the SAME value the
+            // BotMain quality gate enforces (getAgreeingClusters). Use it; fall back to
+            // the flag re-count only when unset (-1). Display-only, no behaviour change.
+            int _clusterCount = getAgreeingClusters() >= 0
+                    ? getAgreeingClusters() : countAgreeingClusters();
             String grade = computeSignalGrade(_prob, _clusterCount, _calSamples);
             sb.append(String.format("🏷️ Grade: *%s*  ·  Кластеров: %d  ·  Cal: %d%n",
                     grade, _clusterCount, _calSamples));
