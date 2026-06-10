@@ -2495,7 +2495,11 @@ public final class DecisionEngineMerged {
         // only (c15 trimmed @2473) → no look-ahead; shared generate() path → backtest==live.
         // OOS rule: keep ONLY if P1/P3/P4 stay green AND P2 improves AND trade count holds.
         double taAtrPctile = com.bot.TradingCore.atrPercentile(c15, 14, 100);
-        if (taAtrPctile > csEnvDouble("TA_ATR_PCTILE_MAX", 0.90)) return reject("ta_vol_expanding");
+        // [v86.41] DISABLED (0.90→1.0=off): failed the OOS rule — at 0.90 it improved P2
+        // (-0.838%→-0.284%) but BROKE P1 (green +0.316%→red -0.041%), WF 3/4→2/4. Helping the
+        // bad period by cutting good trends in good periods = not a clean win. Lever kept for the
+        // record; re-test a non-default ONLY via the loser-vs-winner vol distribution, never to fit P1.
+        if (taAtrPctile > csEnvDouble("TA_ATR_PCTILE_MAX", 1.0)) return reject("ta_vol_expanding");
 
         // ── HTF TREND (direction) — EMA20/50 on c1h (4h), with slope + price filter ──
         double[] hFast = com.bot.TradingCore.emaSeries(c1h, 20);
@@ -2548,7 +2552,7 @@ public final class DecisionEngineMerged {
         // prev.high is still trapped under prior supply and tends to fade (the P2 false-continuation).
         // ZERO tunable parameter (strict inequality) → cannot be curve-fit. Per-coin (own last/prev),
         // closed bars only → no look-ahead. Default OFF; set TA_RECLAIM_PREV=1 to test next.
-        if ("1".equals(System.getenv().getOrDefault("TA_RECLAIM_PREV", "0"))) {
+        if ("1".equals(System.getenv().getOrDefault("TA_RECLAIM_PREV", "1"))) {  // [v86.41] ENABLED for clean test (zero-param, cannot be curve-fit)
             if (wantLong  && last.close <= prev.high) return reject("ta_no_reclaim");
             if (!wantLong && last.close >= prev.low)  return reject("ta_no_reclaim");
         }
