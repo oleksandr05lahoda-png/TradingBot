@@ -1223,10 +1223,16 @@ public final class DecisionEngineMerged {
             // [v75] Честный расчет дистанций в процентах. Точность снижена 2 → 1
             // знак после запятой: трейдер быстрее читает "+2.5%" чем "+2.53%",
             // и десятые в SL/TP визуальный шум, не информация.
-            double slPct  = (stop - price) / price * 100;
-            double tp1Pct = tp1 > 0 ? (tp1 - price) / price * 100 : 0;
-            double tp2Pct = tp2 > 0 ? (tp2 - price) / price * 100 : 0;
-            double tp3Pct = tp3 > 0 ? (tp3 - price) / price * 100 : 0;
+            // [v86.47] PnL-ЗНАК, не ценовая дельта: знак отражает ПРИБЫЛЬ/УБЫТОК.
+            // Для SHORT TP теперь "+" (профит при движении вниз), SL "−" (убыток
+            // при движении вверх) — как и для LONG. Раньше показывались сырые
+            // (price-entry)/entry, из-за чего у шорта TP выглядел минусом, а SL
+            // плюсом («плюсы наоборот»). dir переворачивает знак для шорта.
+            double dir = isLong ? 1.0 : -1.0;
+            double slPct  = dir * (stop - price) / price * 100;
+            double tp1Pct = tp1 > 0 ? dir * (tp1 - price) / price * 100 : 0;
+            double tp2Pct = tp2 > 0 ? dir * (tp2 - price) / price * 100 : 0;
+            double tp3Pct = tp3 > 0 ? dir * (tp3 - price) / price * 100 : 0;
 
             // Локализация времени
             java.time.ZonedDateTime now = java.time.ZonedDateTime.now(DecisionEngineMerged.USER_ZONE);
