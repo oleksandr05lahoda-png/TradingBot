@@ -2562,18 +2562,13 @@ public final class DecisionEngineMerged {
         // trusted; it is NOT worth degrading the validated edge.
         if (wantLong ? !resumeUp : !resumeDown) return reject("ta_no_pullback");
 
-        // [v86.50] ANTI-CHASE: resumption bar must CLOSE near the EMA, not far extended.
-        // resumeUp/Down only required close past emaNow with NO upper bound (line 2556-2557)
-        // — a bar closing 2-3% beyond EMA20 still qualified, but SL=1.5*ATR then sits far
-        // from structure and TP2=2.05R becomes unreachable → the trade is a structural
-        // scratch-or-stop. Capping entry distance enforces this strategy's own thesis
-        // ("buy the dip, don't chase") and mirrors VCB's overextended guard. Regime-
-        // independent R-geometry (entering far from an ATR-anchored SL degrades R in ANY
-        // regime), NOT a window-fit threshold; shared generate() path → backtest==live.
-        // env-tunable (TA_MAX_EMA_DIST=99 disables). May be partly inert — inert is free:
-        // it only removes bad-R entries, never adds a trade.
-        double emaDist = Math.abs(last.close - emaNow) / emaNow;
-        if (emaDist > csEnvDouble("TA_MAX_EMA_DIST", 0.012)) return reject("ta_chase");
+        // [v86.51] REVERTED v86.50 anti-chase EMA cap. Hypothesis was "inert / removes only
+        // bad-R far-from-EMA scratches" — the startup-BT proved it WRONG: with default 1.2%
+        // it cut trades 165→54 (−67%), WR 48%→41%, walk-forward 2/4→0/4, NetPnL +7→−13.5%.
+        // Far-from-EMA resumption bars are disproportionately the WINNERS (strong impulse
+        // that keeps running), not scratches — capping them removed the edge and left the
+        // weak near-EMA chop. Lesson: entry-filter tweaks degrade the proven baseline; the
+        // real lever is exit payoff-skew, not more entry filters. Baseline restored.
 
         // body strength of the resumption bar
         double range = last.high - last.low;
