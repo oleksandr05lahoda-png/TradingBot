@@ -2002,6 +2002,10 @@ public final class BotMain {
         int totalTrades = 0, totalWins = 0, totalLosses = 0, totalTimeStops = 0;
         int totalBE = 0, totalProfitLock = 0, totalTrail = 0, totalStag = 0;
         double totalNetPnL = 0.0;
+        // [v86.53 EXIT-SHADOW] суммы по 5 вариантам геометрии выхода (см. SimpleBacktester)
+        int shadowN = 0;
+        double[] shadowNet = new double[5];
+        int[] shadowWins = new int[5];
         // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
         // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
         // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
@@ -2250,6 +2254,12 @@ public final class BotMain {
                 totalTrail        += r.trailExits;
                 totalStag         += r.stagnationExits;
                 totalNetPnL       += r.netPnL;
+                // [v86.53 EXIT-SHADOW] aggregate shadow exit-variant results
+                shadowN += r.shadowN;
+                for (int sv = 0; sv < 5; sv++) {
+                    shadowNet[sv]  += r.shadowNet[sv];
+                    shadowWins[sv] += r.shadowWins[sv];
+                }
                 // [v83.7] bucket по тиру уверенности (score).
                 // [v83.9] + раскол по времени (1-я/2-я половина окна пары).
                 if (r.trades != null && !r.trades.isEmpty()) {
@@ -2438,6 +2448,30 @@ public final class BotMain {
             }
         }
 
+        // [v86.53 EXIT-SHADOW] таблица сравнения геометрий выхода на тех же входах.
+        // Сравнивать строго МЕЖДУ СОБОЙ: C = контроль (текущая геометрия) в том же
+        // упрощённом теневом движке (чистые брекеты, пессимистичный двойной-тач),
+        // поэтому C ≠ основным цифрам сводки. Решение о смене выхода — только если
+        // вариант стабильно бьёт C несколько прогонов подряд.
+        String shadowBlock = "";
+        if (shadowN > 0) {
+            String[] svName = {
+                    "C 50%@TP1+BE (текущий)",
+                    "A 33%@TP1+BE",
+                    "B 50%@min(1.5R,TP2)+BE",
+                    "D 100%→TP2, BE@1R",
+                    "E 100%→TP2, без BE"};
+            StringBuilder sb2 = new StringBuilder(
+                    "🧪 EXIT-SHADOW (" + shadowN + " входов, чистые брекеты):\n");
+            for (int sv = 0; sv < 5; sv++) {
+                sb2.append(String.format("  %s: WR %.0f%% · %+.1f%% · %+.3f%%/сд\n",
+                        svName[sv], 100.0 * shadowWins[sv] / shadowN,
+                        shadowNet[sv], shadowNet[sv] / shadowN));
+            }
+            sb2.append("  _сравнивать варианты между собой; C=контроль, движок упрощён_\n");
+            shadowBlock = sb2.toString();
+        }
+
         String summary = String.format(
                 "✅ *Стартовый backtest завершён* `v80.0-RESTORED+5%%`\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2461,6 +2495,7 @@ public final class BotMain {
                         + "🧠 Калибратор: %d outcomes\n"
                         + "%s"
                         + "%s"
+                        + "%s"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "%s",
                 elapsedSec, symbolsRun, symbolsRateLimited, symbolsLowData,
@@ -2469,6 +2504,7 @@ public final class BotMain {
                 totalBE, totalProfitLock, totalTrail, totalStag, totalNetPnL,
                 (totalTrades > 0 ? totalNetPnL / totalTrades : 0.0),  // [v82.11] avg/trade
                 wlRatio, newCalCount, tierBreakdown, halfBreakdown,
+                shadowBlock,  // [v86.53 EXIT-SHADOW]
                 verdict);
 
         try { telegram.sendMessageAsync(summary); } catch (Throwable ignored) {}

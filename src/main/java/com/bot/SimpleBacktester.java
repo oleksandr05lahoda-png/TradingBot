@@ -287,6 +287,15 @@ public final class SimpleBacktester {
         // Daily returns for Sharpe calculation
         public final List<Double> dailyReturns = new ArrayList<>();
 
+        // [v86.53 EXIT-SHADOW] Aggregates of the shadow exit-variant walk: the SAME
+        // entries re-simulated under 5 alternative exit geometries (see
+        // shadowExitVariants). Pure instrumentation — does not affect trade
+        // accounting. Index: 0=C control(50%@TP1+BE) 1=A(33%@TP1+BE)
+        // 2=B(50%@1.5R+BE) 3=D(no partial, BE@1R) 4=E(pure SL/TP2 bracket).
+        public int shadowN = 0;
+        public final double[] shadowNet  = new double[5];
+        public final int[]    shadowWins = new int[5];
+
         public BacktestResult(String symbol) { this.symbol = symbol; }
 
         public void compute(double initialBal) {
@@ -729,6 +738,12 @@ public final class SimpleBacktester {
                             idea.side, entryPrice, adjustedSL, adjustedTP1, adjustedTP2,
                             idea.probability, entryBar.openTime, i);
 
+                    // [v86.53 EXIT-SHADOW] Re-simulate this SAME entry under 5 exit
+                    // geometries (pure brackets) and accumulate per-variant PnL.
+                    // Instrumentation only: no effect on the real position/accounting.
+                    shadowExitVariants(result, m15, i, idea.side, entryPrice,
+                            adjustedSL, adjustedTP1, adjustedTP2, slippage);
+
                     // [v86.38] SAME-BAR ENTRY STOP-OUT (honesty fix, audit-verified 3/3).
                     // resolvePosition first runs at bar i+1 (barsHeld=1), so the entry bar i's
                     // own intrabar range is never tested -> a position that gaps to its SL within
@@ -936,6 +951,125 @@ public final class SimpleBacktester {
         Arrays.sort(maxDrawdowns);
         int idx = (int) (confidence * simulations);
         return maxDrawdowns[Math.min(idx, simulations - 1)];
+    }
+
+    //  [v86.53] EXIT-SHADOW — measure exit-geometry variants on the SAME entries
+    //
+    //  МОТИВАЦИЯ: payoff skew. Текущий выход (TP1=1R закрывает 50% + BE) даёт
+    //  модальный выигрыш +0.5R против модального проигрыша −1R; при WR~49% это
+    //  near-zero EV by construction. Прежде чем МЕНЯТЬ выход (урок v86.50: менять
+    //  вслепую = ломать), ИЗМЕРЯЕМ: каждый вход бектеста дополнительно прогоняется
+    //  через 5 упрощённых геометрий выхода, сводка печатает сравнение.
+    //
+    //  Упрощения теневого движка (одинаковы для всех вариантов → сравнение честное):
+    //   - чистые брекеты SL/BE/TP: БЕЗ trail/profitLock/stagnation;
+    //   - конфликт SL+TP в одном баре решается ПЕССИМИСТИЧНО как SL (без m1);
+    //   - same-bar SL на баре входа — как v86.38 (SL-only).
+    //  Поэтому цифры варианта C (контроль = текущая геометрия) НЕ совпадут с
+    //  основной сводкой — сравнивать варианты строго МЕЖДУ СОБОЙ.
+    //  Косты — та же модель: fee+slip по ногам (вход 1.0, частичная f, выход rem),
+    //  funding по barsHeld.
+    private void shadowExitVariants(BacktestResult res,
+                                    List<com.bot.TradingCore.Candle> m15, int entryBar,
+                                    com.bot.TradingCore.Side side, double entry,
+                                    double sl, double tp1, double tp2, double slippage) {
+        boolean isLong = side == com.bot.TradingCore.Side.LONG;
+        double risk = Math.abs(entry - sl);
+        if (risk <= 1e-12 || entry <= 0) return;
+        double tp1R = Math.abs(tp1 - entry) / risk;
+        double tp2R = Math.abs(tp2 - entry) / risk;
+        if (tp2R <= 0.1 || tp1R <= 0.05) return;
+        // Вариант B: частичный на 1.5R, но не дальше TP2 (VCB несёт tp2R≈1.3)
+        double bAt = Math.min(1.5, tp2R * 0.99);
+        // {partialFrac, partialAtR, beTriggerR (NaN = BE нет)}
+        double[][] V = {
+                {0.50, tp1R, tp1R},          // C контроль = текущая геометрия
+                {0.33, tp1R, tp1R},          // A меньше гарант-нога, больше раннер
+                {0.50, bAt,  bAt },          // B гарант-нога платит на 1.5R
+                {0.00, 0.0,  1.0 },          // D без частичного, BE после +1.0R
+                {0.00, 0.0,  Double.NaN}     // E чистый брекет SL/TP2
+        };
+        res.shadowN++;
+        for (int v = 0; v < V.length; v++) {
+            double net = shadowOneVariant(m15, entryBar, isLong, entry, risk, tp2,
+                    V[v][0], V[v][1], V[v][2], slippage);
+            res.shadowNet[v] += net;
+            if (net > 0.05) res.shadowWins[v]++;
+        }
+    }
+
+    /** Один теневой прогон: упрощённый брекет от entryBar до timeStop. Возвращает net PnL%. */
+    private double shadowOneVariant(List<com.bot.TradingCore.Candle> m15, int entryBar,
+                                    boolean isLong, double entry, double risk, double tp2Price,
+                                    double partialFrac, double partialAtR, double beTriggerR,
+                                    double slippage) {
+        double dir = isLong ? 1.0 : -1.0;
+        double curSL = entry - dir * risk;
+        double partialPrice = partialFrac > 0 ? entry + dir * risk * partialAtR : 0.0;
+        double bePrice = isLong ? entry * 1.001 : entry * 0.999;  // зеркало BE основного движка
+        boolean partialDone = partialFrac <= 0;
+        boolean beArmed = false;
+        double accumulated = 0.0;   // зафиксированный PnL% (цена-% × доля)
+        double remFrac = 1.0;
+        double partialFees = 0.0, partialSlip = 0.0;
+
+        // Бар входа: только SL (зеркало v86.38 same-bar honesty fix)
+        com.bot.TradingCore.Candle eb = m15.get(entryBar);
+        if (isLong ? eb.low <= curSL : eb.high >= curSL) {
+            double px = curSL - dir * curSL * slippage;
+            double gross = dir * (px - entry) / entry * 100.0;
+            return gross - (takerFee * 2.0 + slippage * 2.0) * 100.0;
+        }
+
+        int lastBar = Math.min(entryBar + timeStopBars, m15.size() - 1);
+        for (int b = entryBar + 1; b <= lastBar; b++) {
+            com.bot.TradingCore.Candle bar = m15.get(b);
+            int barsHeld = b - entryBar;
+            boolean slHit = isLong ? bar.low <= curSL : bar.high >= curSL;
+            double target = partialDone ? tp2Price : partialPrice;
+            boolean tpHit = isLong ? bar.high >= target : bar.low <= target;
+            if (slHit) {  // пессимистично: при двойном касании бар считаем SL-first
+                double px = curSL - dir * curSL * slippage;
+                double pnl = dir * (px - entry) / entry * 100.0;
+                double total = accumulated + pnl * remFrac;
+                double fees = takerFee * (1.0 + remFrac) + partialFees;
+                double slip = slippage * (1.0 + remFrac) + partialSlip;
+                return total - (fees + slip + fundingPer15m * barsHeld) * 100.0;
+            }
+            if (tpHit) {
+                if (!partialDone) {
+                    double pnl = dir * (partialPrice - entry) / entry * 100.0;
+                    accumulated += pnl * partialFrac;
+                    partialFees += takerFee * partialFrac;
+                    partialSlip += slippage * partialFrac;
+                    remFrac = 1.0 - partialFrac;
+                    partialDone = true;
+                    if (isLong ? bePrice > curSL : bePrice < curSL) curSL = bePrice;
+                    beArmed = true;  // BE вместе с частичным (варианты C/A/B)
+                } else {
+                    double pnl = dir * (tp2Price - entry) / entry * 100.0;
+                    double total = accumulated + pnl * remFrac;
+                    double fees = takerFee * (1.0 + remFrac) + partialFees;
+                    double slip = slippage * (1.0 + remFrac) + partialSlip;
+                    return total - (fees + slip + fundingPer15m * barsHeld) * 100.0;
+                }
+            }
+            // Независимый BE-триггер (вариант D: без частичного, BE после +beTriggerR)
+            if (!beArmed && !Double.isNaN(beTriggerR)) {
+                double favR = (isLong ? bar.high - entry : entry - bar.low) / risk;
+                if (favR >= beTriggerR) {
+                    if (isLong ? bePrice > curSL : bePrice < curSL) curSL = bePrice;
+                    beArmed = true;
+                }
+            }
+        }
+        // Time-stop: выход по close последнего бара остатком
+        double px = m15.get(lastBar).close;
+        double pnl = dir * (px - entry) / entry * 100.0;
+        double total = accumulated + pnl * remFrac;
+        double fees = takerFee * (1.0 + remFrac) + partialFees;
+        double slip = slippage * (1.0 + remFrac) + partialSlip;
+        return total - (fees + slip + fundingPer15m * (lastBar - entryBar)) * 100.0;
     }
 
     //  INTERNAL: POSITION RESOLUTION
