@@ -57,6 +57,15 @@ public final class RiskGuard {
     private static final RiskGuard INSTANCE = new RiskGuard();
     public  static RiskGuard getInstance() { return INSTANCE; }
 
+    // [v86.49] Persist daily/weekly loss + trade-count across restarts. Was IN-MEMORY
+    // only → every container restart (Railway redeploy or ExitOnOutOfMemoryError crash)
+    // reset dailyPnl/dailyTrades/weekly to 0, so on LIVE the daily-loss cap could be
+    // cleared by a restart mid-drawdown (blowup risk). Same ./data mechanism as the
+    // calibrator/forecast records. openPositions + btcCrashBlock stay transient
+    // (reconciled live by PositionTracker / re-detected from BTC price).
+    private static final String STATE_FILE =
+            System.getenv().getOrDefault("RISKGUARD_STATE_FILE", "./data/riskguard.csv");
+
     // ─── Configuration (env-overridable) ──────────────────────────────
     private final double DAILY_LOSS_LIMIT_PCT;
     private final double WEEKLY_LOSS_LIMIT_PCT;
@@ -89,6 +98,12 @@ public final class RiskGuard {
                 DAILY_LOSS_LIMIT_PCT, WEEKLY_LOSS_LIMIT_PCT, DAILY_TRADE_LIMIT,
                 MAX_CONCURRENT_POSITIONS, BTC_CRASH_30M_PCT, BTC_CRASH_60M_PCT,
                 COLD_START_MS / 3_600_000L));
+
+        // [v86.49] Restore persisted daily/weekly state so a restart does NOT clear
+        // the loss caps. The existing rolloverIfNewDay() on the first canTrade() will
+        // archive+reset cleanly if the persisted day is no longer today (caps reset at
+        // the real UTC boundary, not on restart).
+        loadState();
     }
 
     // ─── Public config getters (for status messages / Telegram boot banner) ───
@@ -192,6 +207,7 @@ public final class RiskGuard {
                 manualLock = true;
                 manualLockReason = String.format("weekly DD %.1f%% — manual resume required",
                         weekDrawdownPct);
+                saveState();  // [v86.49] persist the lock so a restart can't clear it
                 return Decision.block("weekly loss limit", manualLockReason);
             }
         }
@@ -240,6 +256,7 @@ public final class RiskGuard {
                         + "todayCount=%d/%d concurrent=%d/%d",
                 symbol, notionalUsd, dailyTradesOpened.get(), DAILY_TRADE_LIMIT,
                 openPositions.size(), MAX_CONCURRENT_POSITIONS));
+        saveState();  // [v86.49] persist the incremented daily trade count
     }
 
     /**
@@ -251,6 +268,7 @@ public final class RiskGuard {
         dailyPnlUsd += pnlUsd;
         LOG.info(String.format("[RiskGuard] trade closed: %s pnl=$%+.2f dayPnL=$%+.2f",
                 symbol, pnlUsd, dailyPnlUsd));
+        saveState();  // [v86.49] persist realized daily PnL → daily-loss cap survives restart
     }
 
     /**
@@ -316,6 +334,7 @@ public final class RiskGuard {
         manualLock = false;
         manualLockReason = "";
         LOG.info("[RiskGuard] manual resume — locks cleared");
+        saveState();  // [v86.49] persist cleared lock
     }
 
     /** Manually halt trading. Use as emergency stop. */
@@ -323,6 +342,7 @@ public final class RiskGuard {
         manualLock = true;
         manualLockReason = "manual halt: " + reason;
         LOG.warning("[RiskGuard] MANUAL HALT: " + reason);
+        saveState();  // [v86.49] persist manual halt so a restart can't clear it
     }
 
     /** True if the bot is in cold-start period (first 24h). Used by
@@ -438,6 +458,7 @@ public final class RiskGuard {
                     weekStartBalance = currentBalanceUsd;
                 }
             }
+            saveState();  // [v86.49] persist the day-rollover (archived weekly history + reset daily)
         } else if (dayStartBalance <= 0 && currentBalanceUsd > 0) {
             // First call of the day with valid balance — initialize.
             dayStartBalance = currentBalanceUsd;
@@ -449,6 +470,75 @@ public final class RiskGuard {
         double sum = dailyPnlUsd;
         for (DayPnl d : weeklyPnlHistory) sum += d.pnlUsd;
         return sum;
+    }
+
+    // ─── [v86.49] State persistence (survive Railway restarts) ─────────
+    // Money-critical: the daily/weekly loss caps + daily trade count are useless
+    // if a restart resets them to 0. We persist ONLY that accounting state +
+    // manual lock. openPositions and btcCrashBlockUntil are deliberately NOT
+    // persisted (positions are reconciled live by PositionTracker on startup; the
+    // BTC-crash block re-detects from the live price feed within a minute).
+    private synchronized void saveState() {
+        try {
+            java.io.File f = new java.io.File(STATE_FILE);
+            java.io.File parent = f.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            try (java.io.PrintWriter pw = new java.io.PrintWriter(
+                    new java.io.BufferedWriter(new java.io.FileWriter(f)))) {
+                pw.println("# riskguard_state v1");
+                pw.println("DAY|" + currentDayUtc + "|" + dailyPnlUsd + "|"
+                        + dailyTradesOpened.get() + "|" + dayStartBalance + "|"
+                        + weekStartBalance + "|" + manualLock + "|"
+                        + (manualLockReason == null ? ""
+                                : manualLockReason.replace('|', '/').replace('\n', ' ')));
+                for (DayPnl d : weeklyPnlHistory) {
+                    pw.println("WEEK|" + d.date + "|" + d.startBalance + "|" + d.pnlUsd);
+                }
+            }
+        } catch (Throwable t) { LOG.warning("[RiskGuard] saveState: " + t.getMessage()); }
+    }
+
+    private synchronized void loadState() {
+        try {
+            java.io.File f = new java.io.File(STATE_FILE);
+            if (!f.exists()) return;
+            try (java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.FileReader(f))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    if (line.startsWith("#") || line.isBlank()) continue;
+                    String[] p = line.split("\\|", -1);
+                    if (p[0].equals("DAY") && p.length >= 8) {
+                        // [v86.49] parse ALL fields into locals FIRST; commit to instance
+                        // fields only once the whole line parsed — a corrupt field then
+                        // restores NOTHING (not a dangerous half-state) for this
+                        // money-critical record.
+                        LocalDate day = LocalDate.parse(p[1]);
+                        double dPnl   = Double.parseDouble(p[2]);
+                        long   dTr    = Long.parseLong(p[3]);
+                        double dStart = Double.parseDouble(p[4]);
+                        double wStart = Double.parseDouble(p[5]);
+                        boolean lock  = Boolean.parseBoolean(p[6]);
+                        currentDayUtc    = day;
+                        dailyPnlUsd      = dPnl;
+                        dailyTradesOpened.set(dTr);
+                        dayStartBalance  = dStart;
+                        weekStartBalance = wStart;
+                        manualLock       = lock;
+                        manualLockReason = p[7];
+                    } else if (p[0].equals("WEEK") && p.length >= 4) {
+                        DayPnl d = new DayPnl(LocalDate.parse(p[1]), Double.parseDouble(p[2]));
+                        d.pnlUsd = Double.parseDouble(p[3]);
+                        weeklyPnlHistory.addLast(d);
+                    }
+                }
+            }
+            LOG.info(String.format("[RiskGuard] state restored: day=%s dayPnL=$%+.2f "
+                            + "trades=%d weekHist=%d%s",
+                    currentDayUtc, dailyPnlUsd, dailyTradesOpened.get(),
+                    weeklyPnlHistory.size(),
+                    manualLock ? " LOCKED(" + manualLockReason + ")" : ""));
+        } catch (Throwable t) { LOG.warning("[RiskGuard] loadState: " + t.getMessage()); }
     }
 
     // ─── Env helpers ──────────────────────────────────────────────────
