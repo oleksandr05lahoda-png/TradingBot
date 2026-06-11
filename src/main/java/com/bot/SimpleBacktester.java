@@ -295,6 +295,10 @@ public final class SimpleBacktester {
         public int shadowN = 0;
         public final double[] shadowNet  = new double[5];
         public final int[]    shadowWins = new int[5];
+        // [v86.54] per-entry shadow rows {entryTimeMs, netC, netA, netB, netD, netE}
+        // — для walk-forward разбивки теневых вариантов по периодам (выживает ли
+        // вариант D в чопе П2/П4 — решающий вопрос перед сменой реального выхода).
+        public final List<double[]> shadowTradeRows = new ArrayList<>();
 
         public BacktestResult(String symbol) { this.symbol = symbol; }
 
@@ -990,12 +994,16 @@ public final class SimpleBacktester {
                 {0.00, 0.0,  Double.NaN}     // E чистый брекет SL/TP2
         };
         res.shadowN++;
+        double[] row = new double[6];
+        row[0] = m15.get(entryBar).openTime;
         for (int v = 0; v < V.length; v++) {
             double net = shadowOneVariant(m15, entryBar, isLong, entry, risk, tp2,
                     V[v][0], V[v][1], V[v][2], slippage);
             res.shadowNet[v] += net;
             if (net > 0.05) res.shadowWins[v]++;
+            row[v + 1] = net;
         }
+        res.shadowTradeRows.add(row);  // [v86.54] для WF-разбивки по периодам
     }
 
     /** Один теневой прогон: упрощённый брекет от entryBar до timeStop. Возвращает net PnL%. */

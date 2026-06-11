@@ -2006,6 +2006,9 @@ public final class BotMain {
         int shadowN = 0;
         double[] shadowNet = new double[5];
         int[] shadowWins = new int[5];
+        // [v86.54] теневые суммы по WF-периодам: [период][вариант] — отвечает на
+        // решающий вопрос «выживает ли D/B в чопе П2/П4».
+        double[][] shadowHalfPnL = new double[4][5];
         // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
         // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
         // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
@@ -2284,6 +2287,13 @@ public final class BotMain {
                         if (t.pnlPct > 0.05) halfWin[hi]++;
                         halfPnL[hi] += t.pnlPct;
                     }
+                    // [v86.54] теневые варианты — в те же WF-периоды (тот же tMin/tSpan)
+                    for (double[] srow : r.shadowTradeRows) {
+                        int shi = (int) (WF_PERIODS * ((long) srow[0] - tMin) / tSpan);
+                        if (shi < 0) shi = 0;
+                        if (shi >= WF_PERIODS) shi = WF_PERIODS - 1;
+                        for (int sv = 0; sv < 5; sv++) shadowHalfPnL[shi][sv] += srow[sv + 1];
+                    }
                 }
                 symbolsRun++;
                 // Existing per-symbol EV signal for ISC.
@@ -2341,6 +2351,18 @@ public final class BotMain {
                     g ? "🟢" : "🔴", halfLbl[k], halfN[k], hWr, halfPnL[k], hAvg));
         }
         hb.append(String.format("  _%d/4 периодов в плюс — все 4 = edge; меньше = везение окна_\n", wfGreens));
+        // [v86.54] shadow-варианты по периодам: C(текущий)/B(1.5R)/D(100%→TP2).
+        // Решающий тест: если D/B бьют C и в красных периодах (П2/П4-чоп), смена
+        // выхода робастна; если выигрывают только в трендовых П1/П3 — это window-fit.
+        if (shadowN > 0) {
+            hb.append("  🧪 _shadow C/B/D:_ ");
+            for (int k = 0; k < WF_PERIODS; k++) {
+                hb.append(String.format("П%d %+.0f/%+.0f/%+.0f", k + 1,
+                        shadowHalfPnL[k][0], shadowHalfPnL[k][2], shadowHalfPnL[k][3]));
+                if (k < WF_PERIODS - 1) hb.append(" · ");
+            }
+            hb.append("\n");
+        }
         String halfBreakdown = hb.toString();
 
         // [FIX-1] Differentiate technical failure vs strategy verdict.
