@@ -2562,6 +2562,19 @@ public final class DecisionEngineMerged {
         // trusted; it is NOT worth degrading the validated edge.
         if (wantLong ? !resumeUp : !resumeDown) return reject("ta_no_pullback");
 
+        // [v86.50] ANTI-CHASE: resumption bar must CLOSE near the EMA, not far extended.
+        // resumeUp/Down only required close past emaNow with NO upper bound (line 2556-2557)
+        // — a bar closing 2-3% beyond EMA20 still qualified, but SL=1.5*ATR then sits far
+        // from structure and TP2=2.05R becomes unreachable → the trade is a structural
+        // scratch-or-stop. Capping entry distance enforces this strategy's own thesis
+        // ("buy the dip, don't chase") and mirrors VCB's overextended guard. Regime-
+        // independent R-geometry (entering far from an ATR-anchored SL degrades R in ANY
+        // regime), NOT a window-fit threshold; shared generate() path → backtest==live.
+        // env-tunable (TA_MAX_EMA_DIST=99 disables). May be partly inert — inert is free:
+        // it only removes bad-R entries, never adds a trade.
+        double emaDist = Math.abs(last.close - emaNow) / emaNow;
+        if (emaDist > csEnvDouble("TA_MAX_EMA_DIST", 0.012)) return reject("ta_chase");
+
         // body strength of the resumption bar
         double range = last.high - last.low;
         if (range <= 0 || Math.abs(last.close - last.open) / range < csEnvDouble("TA_BODY_MIN", 0.45))
