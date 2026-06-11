@@ -538,7 +538,13 @@ public final class RiskGuard {
                     currentDayUtc, dailyPnlUsd, dailyTradesOpened.get(),
                     weeklyPnlHistory.size(),
                     manualLock ? " LOCKED(" + manualLockReason + ")" : ""));
-        } catch (Throwable t) { LOG.warning("[RiskGuard] loadState: " + t.getMessage()); }
+        } catch (Throwable t) {
+            // [v86.52] log the exception CLASS, not just getMessage() (which was null →
+            // useless "loadState: null"). Diagnostic only; load already fail-safes to fresh
+            // in-memory state (caps active from 0). Helps pin the cause next boot.
+            LOG.warning("[RiskGuard] loadState skipped (" + t.getClass().getSimpleName()
+                    + ": " + t.getMessage() + ") — starting from fresh state");
+        }
     }
 
     // ─── Env helpers ──────────────────────────────────────────────────
