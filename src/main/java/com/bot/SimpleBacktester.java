@@ -990,15 +990,17 @@ public final class SimpleBacktester {
         double tp1R = Math.abs(tp1 - entry) / risk;
         double tp2R = Math.abs(tp2 - entry) / risk;
         if (tp2R <= 0.1 || tp1R <= 0.05) return;
-        // Вариант B: частичный на 1.5R, но не дальше TP2 (VCB несёт tp2R≈1.3)
-        double bAt = Math.min(1.5, tp2R * 0.99);
+        // [v86.58] Слот B перепрофилирован: после шипа v86.57 (TP1=1.5R) контроль C
+        // сам стал «50%@1.5R», и B(min(1.5R,TP2)) задублировал его. Теперь B = СТАРАЯ
+        // геометрия (50%@1.0R+BE) — каждый прогон сравнивает старое-vs-новое живьём.
+        double oldAt = Math.min(1.0, tp2R * 0.99);
         // {partialFrac, partialAtR, beTriggerR (NaN = BE нет)}
         double[][] V = {
-                {0.50, tp1R, tp1R},          // C контроль = текущая геометрия
-                {0.33, tp1R, tp1R},          // A меньше гарант-нога, больше раннер
-                {0.50, bAt,  bAt },          // B гарант-нога платит на 1.5R
-                {0.00, 0.0,  1.0 },          // D без частичного, BE после +1.0R
-                {0.00, 0.0,  Double.NaN}     // E чистый брекет SL/TP2
+                {0.50, tp1R,  tp1R },        // C контроль = текущая геометрия (актуальный tp1R)
+                {0.33, tp1R,  tp1R },        // A меньше гарант-нога, больше раннер
+                {0.50, oldAt, oldAt},        // B = СТАРАЯ геометрия 50%@1.0R+BE (референс)
+                {0.00, 0.0,   1.0  },        // D без частичного, BE после +1.0R
+                {0.00, 0.0,   Double.NaN}    // E чистый брекет SL/TP2
         };
         res.shadowN++;
         double[] row = new double[6];

@@ -2524,7 +2524,7 @@ public final class BotMain {
             String[] svName = {
                     "C 50%@TP1+BE (текущий)",
                     "A 33%@TP1+BE",
-                    "B 50%@min(1.5R,TP2)+BE",
+                    "B 50%@1.0R+BE (старая)",
                     "D 100%→TP2, BE@1R",
                     "E 100%→TP2, без BE"};
             StringBuilder sb2 = new StringBuilder(
