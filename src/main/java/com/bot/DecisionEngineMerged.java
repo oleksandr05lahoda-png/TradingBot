@@ -2927,7 +2927,15 @@ public final class DecisionEngineMerged {
     private static final double CS_MAX_ATR_PCTILE    = csEnvDouble("CS_MAX_ATR_PCTILE",    0.85);
     private static final double CS_SL_ATR_MULT       = csEnvDouble("CS_SL_ATR_MULT",
             CS_IS_15M ? 1.2 : 1.5);
-    private static final double CS_TP1_R             = csEnvDouble("CS_TP1_R",             1.0);
+    // [v86.57 EXIT-GEOMETRY B] 1.0 → 1.5: данные EXIT-SHADOW (3 прогона подряд,
+    // v86.53/54) — вариант B (частичный 50% на 1.5R вместо 1.0R) бил контроль во
+    // ВСЕХ прогонах (+0.174/+0.190/+0.138 vs +0.112/+0.127/+0.092 %/сд) И во всех
+    // красных WF-периодах (П2/П4 не хуже контроля). Лечит payoff skew: гарант-нога
+    // платит 1.5R вместо 1.0R (модальный выигрыш +0.75R vs −1R прежних +0.5R).
+    // Вход НЕ меняется — те же сделки, другой выход (риск класса v86.50 исключён).
+    // ОТКАТ БЕЗ ДЕПЛОЯ: env CS_TP1_R=1.0 на Railway. Вариант D (без частичного,
+    // +0.20%/сд) — кандидат №2, требует кода в трекере; после валидации B живьём.
+    private static final double CS_TP1_R             = csEnvDouble("CS_TP1_R",             1.5);
     private static final double CS_TP2_R             = csEnvDouble("CS_TP2_R",
             CS_IS_15M ? 1.5 : 1.8);
     private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",
