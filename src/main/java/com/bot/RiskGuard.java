@@ -54,17 +54,21 @@ import java.util.logging.Logger;
 public final class RiskGuard {
 
     private static final Logger LOG = Logger.getLogger("RiskGuard");
-    private static final RiskGuard INSTANCE = new RiskGuard();
-    public  static RiskGuard getInstance() { return INSTANCE; }
-
     // [v86.49] Persist daily/weekly loss + trade-count across restarts. Was IN-MEMORY
     // only → every container restart (Railway redeploy or ExitOnOutOfMemoryError crash)
     // reset dailyPnl/dailyTrades/weekly to 0, so on LIVE the daily-loss cap could be
     // cleared by a restart mid-drawdown (blowup risk). Same ./data mechanism as the
     // calibrator/forecast records. openPositions + btcCrashBlock stay transient
     // (reconciled live by PositionTracker / re-detected from BTC price).
+    // [v86.55 FIX] MUST be declared BEFORE INSTANCE: static initializers run in
+    // declaration order, and the INSTANCE constructor calls loadState() which reads
+    // STATE_FILE — declared after, it was still null at that moment → new File(null)
+    // = NullPointerException → state NEVER loaded on boot (caught by v86.52 diag).
     private static final String STATE_FILE =
             System.getenv().getOrDefault("RISKGUARD_STATE_FILE", "./data/riskguard.csv");
+
+    private static final RiskGuard INSTANCE = new RiskGuard();
+    public  static RiskGuard getInstance() { return INSTANCE; }
 
     // ─── Configuration (env-overridable) ──────────────────────────────
     private final double DAILY_LOSS_LIMIT_PCT;

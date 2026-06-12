@@ -1228,15 +1228,22 @@ public final class BotMain {
 
             if (!startupBacktestEnabled) {
                 LOG.info("[STARTUP-BT] Disabled via STARTUP_BACKTEST=0");
-            } else if (existingOutcomes >= minSamplesNeeded) {
-                LOG.info("[STARTUP-BT] Skipped: calibrator already has "
-                        + existingOutcomes + " outcomes (≥" + minSamplesNeeded + ")");
             } else {
-                LOG.info("[STARTUP-BT] Scheduled — calibrator has only "
-                        + existingOutcomes + " outcomes, need ≥" + minSamplesNeeded);
+                // [v86.55] Бектест теперь запускается ВСЕГДА: с v86.53 он — измерительный
+                // стенд (EXIT-SHADOW, walk-forward, сводка для сравнения версий). Выше
+                // порога калибратора он идёт в MEASURE-ONLY: сим-исходы НЕ пишутся в
+                // калибратор (порог защищает живые данные от затопления симуляцией),
+                // но сводка и shadow-таблица приходят при каждом рестарте.
+                final boolean measureOnly = existingOutcomes >= minSamplesNeeded;
+                LOG.info(measureOnly
+                        ? "[STARTUP-BT] Scheduled MEASURE-ONLY (calibrator full: "
+                          + existingOutcomes + "≥" + minSamplesNeeded
+                          + ") — сводка+EXIT-SHADOW, калибратор не трогаем"
+                        : "[STARTUP-BT] Scheduled — calibrator has only "
+                          + existingOutcomes + " outcomes, need ≥" + minSamplesNeeded);
                 final String _calibFile = calibratorFile;
                 heavySched.submit(safe("StartupBacktest",
-                        () -> runStartupBacktest(sender, isc, telegram, _calibFile)));
+                        () -> runStartupBacktest(sender, isc, telegram, _calibFile, measureOnly)));
             }
         } catch (Throwable t) {
             LOG.warning("[STARTUP-BT] init failed: " + t.getMessage());
@@ -1947,7 +1954,8 @@ public final class BotMain {
     private static void runStartupBacktest(com.bot.SignalSender sender,
                                            com.bot.InstitutionalSignalCore isc,
                                            com.bot.TelegramBotSender telegram,
-                                           String calibratorFilePath) {
+                                           String calibratorFilePath,
+                                           boolean measureOnly) {
         long t0 = System.currentTimeMillis();
         LOG.info("[STARTUP-BT] ▶ Starting full backtest pre-training…");
         try {
@@ -2208,7 +2216,7 @@ public final class BotMain {
                 // показывает negative edge (Net<0 ИЛИ WR<40%) — отравить PAV нельзя.
                 // Текущий backtest +13% WR 54% → edge положительный → калибратор стартует
                 // с ~80 outcomes вместо 0. Откат: SKIP_STARTUP_CALIBRATION=1 в env.
-                boolean skipCalRecord = "1".equals(System.getenv()
+                boolean skipCalRecord = measureOnly || "1".equals(System.getenv()
                         .getOrDefault("SKIP_STARTUP_CALIBRATION", "0"));
 
                 // [v87 BIAS-GUARD 2026-05-09] Even with skipCalRecord=false, refuse to
