@@ -2643,21 +2643,26 @@ public final class BotMain {
         // поэтому C ≠ основным цифрам сводки. Решение о смене выхода — только если
         // вариант стабильно бьёт C несколько прогонов подряд.
         String shadowBlock = "";
-        if (shadowN > 0) {
+        // [v86.61] было if(shadowN>0) вокруг ВСЕГО блока — при пустом основном прогоне
+        // (0 TREND-сделок) строки MR/TE-SHADOW копились, но не печатались (минор из
+        // ревью v86.60). Теперь печатаем всё, что есть; EXIT-таблица — только при shadowN>0.
+        if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0) {
             String[] svName = {
                     "C 50%@TP1+BE (текущий)",
                     "A 33%@TP1+BE",
                     "B 50%@1.0R+BE (старая)",
                     "D 100%→TP2, BE@1R",
                     "E 100%→TP2, без BE"};
-            StringBuilder sb2 = new StringBuilder(
-                    "🧪 EXIT-SHADOW (" + shadowN + " входов, чистые брекеты):\n");
-            for (int sv = 0; sv < 5; sv++) {
-                sb2.append(String.format("  %s: WR %.0f%% · %+.1f%% · %+.3f%%/сд\n",
-                        svName[sv], 100.0 * shadowWins[sv] / shadowN,
-                        shadowNet[sv], shadowNet[sv] / shadowN));
+            StringBuilder sb2 = new StringBuilder();
+            if (shadowN > 0) {
+                sb2.append("🧪 EXIT-SHADOW (").append(shadowN).append(" входов, чистые брекеты):\n");
+                for (int sv = 0; sv < 5; sv++) {
+                    sb2.append(String.format("  %s: WR %.0f%% · %+.1f%% · %+.3f%%/сд\n",
+                            svName[sv], 100.0 * shadowWins[sv] / shadowN,
+                            shadowNet[sv], shadowNet[sv] / shadowN));
+                }
+                sb2.append("  _сравнивать варианты между собой; C=контроль, движок упрощён_\n");
             }
-            sb2.append("  _сравнивать варианты между собой; C=контроль, движок упрощён_\n");
             // [v86.56 MR-SHADOW] строка про спящую mean-rev: дополняет ли она тренд в чопе.
             if (mrTrades > 0) {
                 sb2.append(String.format(
