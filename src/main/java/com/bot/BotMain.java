@@ -244,6 +244,13 @@ public final class BotMain {
 
     private static final AtomicInteger forecastTotal     = new AtomicInteger(0);
     private static final AtomicInteger forecastCorrect   = new AtomicInteger(0);
+    // [v86.59] Live-исходы в разрезе «режим BTC · сторона» (например NEUTRAL·S).
+    // Отвечает на вопрос юзера «не сливают ли опять шорты»: все 5 первых live-лузов
+    // были шортами в мёртвом флэте BTC — этот разрез покажет паттерн данными, а не
+    // ощущением, и станет основой для решений (например флэт-вето), которые бектест
+    // проверить НЕ может (он не воспроизводит исторический режим BTC).
+    // key → int[2]{total, wins}; персистится в forecast-файле (#REGIME| строки).
+    private static final Map<String, int[]> regimeOutcomes = new ConcurrentHashMap<>();
     // [v79 I1] AMBIGUOUS counted separately — visible in stats so user can
     // see "out of 100 signals: 60 wins, 30 losses, 10 ambiguous half-credit".
     private static final AtomicInteger forecastAmbiguous = new AtomicInteger(0);
@@ -1565,6 +1572,12 @@ public final class BotMain {
                     if (fr.counted.compareAndSet(false, true)) {
                         forecastTotal.incrementAndGet();
                         if (correct) forecastCorrect.incrementAndGet();
+                        // [v86.59] разрез «режим BTC · сторона» — где именно бот сливает
+                        String rKey = fr.btcRegimeAtSignal + "·"
+                                + (fr.side == com.bot.TradingCore.Side.LONG ? "L" : "S");
+                        int[] rs = regimeOutcomes.computeIfAbsent(rKey, k -> new int[2]);
+                        rs[0]++;
+                        if (correct) rs[1]++;
                     }
                     try {
                         double sigProb01 = Math.max(0.01, Math.min(0.99, fr.signalProbability / 100.0));
@@ -1652,6 +1665,11 @@ public final class BotMain {
                 // proof. Parsed by loadForecastRecords BEFORE the generic '#' comment skip.
                 pw.println("#COUNTERS|" + forecastTotal.get() + "|" + forecastCorrect.get()
                         + "|" + forecastAmbiguous.get() + "|" + forecastTimeStop.get());
+                // [v86.59] per-regime·side live tally — survives restarts like #COUNTERS
+                for (Map.Entry<String, int[]> re : regimeOutcomes.entrySet()) {
+                    pw.println("#REGIME|" + re.getKey() + "|"
+                            + re.getValue()[0] + "|" + re.getValue()[1]);
+                }
                 long now = System.currentTimeMillis();
                 for (Map.Entry<String, ForecastRecord> e : forecastRecords.entrySet()) {
                     ForecastRecord fr = e.getValue();
@@ -1672,6 +1690,15 @@ public final class BotMain {
             try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
                 String line;
                 while ((line = br.readLine()) != null) {
+                    // [v86.59] Restore per-regime·side tally (before the generic '#' skip).
+                    if (line.startsWith("#REGIME|")) {
+                        try {
+                            String[] p = line.split("\\|");
+                            regimeOutcomes.put(p[1],
+                                    new int[]{Integer.parseInt(p[2]), Integer.parseInt(p[3])});
+                        } catch (Throwable ignored) {}
+                        continue;
+                    }
                     // [v86.45] Restore resolved-outcome counters (must run before the '#' skip).
                     if (line.startsWith("#COUNTERS|")) {
                         try {
@@ -1744,11 +1771,25 @@ public final class BotMain {
             String regime = lastBtcRegimeForAlert == null ? "?" : lastBtcRegimeForAlert;
             String paperFlag = OBSERVATION_MODE ? "🧪 PAPER" : "🔴 LIVE";
 
+            // [v86.59] разрез live-исходов «режим BTC · сторона» — видно, ГДЕ бот
+            // сливает (например NEUTRAL·S 0/4 = шорты в флэте сквизит). База для
+            // будущих решений (флэт-вето), которые бектест проверить не может.
+            StringBuilder regimeLines = new StringBuilder();
+            if (!regimeOutcomes.isEmpty()) {
+                regimeLines.append("По режимам (режим·сторона W/N):\n");
+                regimeOutcomes.entrySet().stream()
+                        .sorted((a, b) -> b.getValue()[0] - a.getValue()[0])
+                        .limit(8)
+                        .forEach(e -> regimeLines.append(String.format("  %s: %d/%d\n",
+                                e.getKey(), e.getValue()[1], e.getValue()[0])));
+            }
+
             telegram.sendMessageAsync(String.format(
                     "📊 *Daily Integrity Report*\n"
                             + "━━━━━━━━━━━━━━━━━━━━━\n"
                             + "Verifier: *%d/%d wins* (%.0f%%)\n"
                             + "Ambiguous: %d (½ credit) · Time-stop: %d (loss)\n"
+                            + "%s"
                             + "Calibrator: n=%d outcomes\n"
                             + "Audit log: %s\n"
                             + "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1756,7 +1797,7 @@ public final class BotMain {
                             + "_Числа выше — независимо проверяемые:_\n"
                             + "_calibrator.csv + audit.log с HMAC-SHA256_",
                     verifierWins, verifierTotal, verifierAcc,
-                    verifierAmb, verifierTS, calN, calIntegrity,
+                    verifierAmb, verifierTS, regimeLines.toString(), calN, calIntegrity,
                     regime, paperFlag));
         } catch (Throwable t) {
             LOG.warning("[IntegrityReport] " + t.getMessage());
