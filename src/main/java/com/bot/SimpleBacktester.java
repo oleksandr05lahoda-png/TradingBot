@@ -468,6 +468,9 @@ public final class SimpleBacktester {
         public final String exitReason; // SL, TP1, TP2, TIME_STOP, BE
         public final long entryTime;
         public final double fees, slippage, funding;
+        // [v86.60 PHASE-0] возраст 4h-тренда на входе (баров с пересечения EMA20/50);
+        // -1 = не размечен. Mutable, ставится после конструктора (не ломаем сигнатуру).
+        public int trendAge = -1;
 
         public TradeRecord(String sym, com.bot.TradingCore.Side side, double entry, double exit,
                            double sl, double tp, double pnlPct, double conf, int bars,
@@ -621,11 +624,13 @@ public final class SimpleBacktester {
                     double grossPnl = outcome.pnlPct;
                     double netPnl   = grossPnl - totalCosts * 100;
 
-                    result.trades.add(new TradeRecord(
+                    TradeRecord _tr = new TradeRecord(
                             symbol, currentPos.side, currentPos.entry, outcome.exitPrice,
                             currentPos.sl, currentPos.tp1, netPnl, currentPos.confidence,
                             outcome.barsHeld, outcome.reason, currentPos.entryTime,
-                            feesCost, slipCost, fundingCost));
+                            feesCost, slipCost, fundingCost);
+                    _tr.trendAge = currentPos.trendAge;  // [v86.60 PHASE-0]
+                    result.trades.add(_tr);
 
                     result.total++;
                     result.grossPnL += grossPnl;
@@ -748,6 +753,7 @@ public final class SimpleBacktester {
                     currentPos = new ActivePosition(
                             idea.side, entryPrice, adjustedSL, adjustedTP1, adjustedTP2,
                             idea.probability, entryBar.openTime, i);
+                    currentPos.trendAge = idea.getTrendAge4h();  // [v86.60 PHASE-0]
 
                     // [v86.53 EXIT-SHADOW] Re-simulate this SAME entry under 5 exit
                     // geometries (pure brackets) and accumulate per-variant PnL.
@@ -784,10 +790,12 @@ public final class SimpleBacktester {
                             double fundSb = 0.0;                 // barsHeld = 0
                             double costsSb = feesSb + slipSb + fundSb;
                             double netSb   = grossSb - costsSb * 100;
-                            result.trades.add(new TradeRecord(
+                            TradeRecord _trSb = new TradeRecord(
                                     symbol, idea.side, entryPrice, exitPx,
                                     adjustedSL, adjustedTP1, netSb, idea.probability,
-                                    0, "SL", entryBar.openTime, feesSb, slipSb, fundSb));
+                                    0, "SL", entryBar.openTime, feesSb, slipSb, fundSb);
+                            _trSb.trendAge = idea.getTrendAge4h();  // [v86.60 PHASE-0]
+                            result.trades.add(_trSb);
                             result.total++;
                             result.grossPnL += grossSb;
                             result.netPnL   += netSb;
@@ -1102,6 +1110,9 @@ public final class SimpleBacktester {
         double maxFavR     = 0.0;  // peak favorable movement in R-units
         double maxAdvR     = 0.0;  // peak adverse movement in R-units (for stagnation detection)
         int    trailLevel  = 0;    // 0=none, 1=locked@0.4R, 2=locked@0.8R, 3=locked@1.4R
+
+        // [v86.60 PHASE-0] возраст 4h-тренда на входе; -1 = не размечен
+        int trendAge = -1;
 
         // [v87 PARTIAL-CLOSE 2026-05-09] Partial-close state — sync with live BinanceTradeExecutor.
         // Live executor places 2 separate TP orders on 50%/50% qty (BinanceTradeExecutor.java:654-655).

@@ -924,6 +924,13 @@ public final class DecisionEngineMerged {
             if (v > 0 && v <= 0.5) this.robustAtrPctOverride = v;
         }
 
+        // [v86.60 PHASE-0] Возраст 4h-тренда на момент сигнала: закрытых 4h-баров с
+        // последнего пересечения EMA20/50. -1 = не размечен (не-TREND стратегии).
+        // Чистая разметка для отчёта «PnL по возрасту тренда» — поведение не меняет.
+        private volatile int trendAge4h = -1;
+        public int getTrendAge4h() { return trendAge4h; }
+        public void setTrendAge4h(int v) { this.trendAge4h = v; }
+
         public final double robustAtrPct;
         // Signal age tracking — enables decay-based filtering in
         // earlyTickBuffer and anywhere else ideas sit in a queue. Stale signals
@@ -1734,6 +1741,21 @@ public final class DecisionEngineMerged {
             return reject("trend_no_setup");
         }
 
+        // [v86.60] TREND_EARLY — ранний вход в СВЕЖИЙ тренд (см. generateTrendEarly).
+        // Пока только measure-only тень в startup-BT (TE-SHADOW); NSC = арм без
+        // подтверждения свинг-структуры (абляция — лагающий pivot-конфирм может
+        // душить ровно те ранние входы, ради которых режим существует).
+        if (stratMode.equals("TREND_EARLY")) {
+            TradeIdea te = generateTrendEarly(symbol, c15, c1h, cat, now, true);
+            if (te != null) { csLastSignalTime.put(symbol, now); return te; }
+            return reject("trend_early_no_setup");
+        }
+        if (stratMode.equals("TREND_EARLY_NSC")) {
+            TradeIdea te = generateTrendEarly(symbol, c15, c1h, cat, now, false);
+            if (te != null) { csLastSignalTime.put(symbol, now); return te; }
+            return reject("trend_early_nsc_no_setup");
+        }
+
         // ── FUNDING: изолированный тест funding-edge ──
         if (stratMode.equals("FUNDING")) {
             TradeIdea f = generateFromFundingMomentum(symbol, c1, c5, c15, c1h, c2h, cat, now);
@@ -2541,6 +2563,12 @@ public final class DecisionEngineMerged {
         if (!htfUp && !htfDown) return reject("ta_no_htf_trend");
         boolean wantLong = htfUp;
 
+        // [v86.60 PHASE-0] Возраст тренда: закрытых 4h-баров с последнего пересечения
+        // EMA20/50 (обратный скан смены знака). Насыщение = длина окна (попадёт в
+        // бакет 25+). Чистая разметка: отчёт «PnL по возрасту» решит ДАННЫМИ, где
+        // живёт edge — в молодых трендах (ранний вход) или зрелых.
+        int age4h = computeTrendAge4h(hFast, hSlow);
+
         // [v86.1 Pass 2] CHOP FILTER — главная правка по данным: П1/П2 (красные) были
         // боковиком, где трендследование пилит. Торгуем только ПОДТВЕРЖДЁННЫЙ сильный
         // тренд: (1) EMA20/50 на HTF разнесены (в пиле они слиплись), (2) HTF ADX высок.
@@ -2680,18 +2708,200 @@ public final class DecisionEngineMerged {
         flags.add(htfUp ? "HTF_UP" : "HTF_DOWN");
         flags.add(String.format("ADX=%.0f", adxR.adx));
         if (aligned) flags.add("HTF_BIAS_ALIGN");
+        flags.add("AGE4H=" + age4h);  // [v86.60 PHASE-0]
 
         TradeIdea idea = new TradeIdea(
                 symbol, side, price, stop, tp2, tpR, prob, flags,
                 0.0, 0.0, 0.0, bias != null ? bias.name() : "NEUTRAL", cat, null,
                 CS_TP1_R, tpR, tpR);
         idea.setRobustAtrPct(atrPct);
+        idea.setTrendAge4h(age4h);  // [v86.60 PHASE-0]
         // [v86.15] A1 FIX (audit): was setAgreeingClusters(1). The live BotMain Dispatcher
         // requires clusters>=2 (flat/weak) or >=3 (strong trend) once the calibrator has
         // >=20 outcomes (BotMain.java:524) — so EVERY TREND signal was blocked in live
         // (clusters=1), while the backtest (no Dispatcher) counted them all. THIS was the
         // root cause of "backtest ~125 trades, live ~0". TREND is a genuine HTF+primary
         // confluence, so declaring 3 is honest, not a hack — it lets the quality gate pass.
+        idea.setAgreeingClusters(3);
+        return idea;
+    }
+
+    // [v86.60 PHASE-0] Закрытых 4h-баров с последнего пересечения EMA20/50.
+    // Обратный скан смены знака (hFast-hSlow); насыщение = длина окна.
+    private static int computeTrendAge4h(double[] hFast, double[] hSlow) {
+        int len = Math.min(hFast.length, hSlow.length);
+        if (len < 2) return len;
+        double curSign = Math.signum(hFast[len - 1] - hSlow[len - 1]);
+        for (int i = len - 2; i >= 0; i--) {
+            if (Math.signum(hFast[i] - hSlow[i]) != curSign) return (len - 1) - i;
+        }
+        return len;  // флипа в окне нет → старый тренд (бакет 25+)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // [v86.60] TREND_EARLY — ранний вход: первый 1h-откат после СВЕЖЕГО
+    // пересечения 4h EMA20/50 (возраст ≤ 12 закрытых 4h-баров = 48ч).
+    // ─────────────────────────────────────────────────────────────────────
+    // Тезис: текущий TREND по построению поздний (требует зрелый тренд через
+    // htfSep≥0.4%). TREND_EARLY торгует ту же механику отката/возобновления, но
+    // в МОЛОДОМ тренде — самая длинная дорога до TP2 (спроектировано 8-агентным
+    // анализом 12.06.2026; единственная непробованная ось: все прошлые
+    // эксперименты меняли 1h-триггер, эта меняет ЗРЕЛОСТЬ HTF-тренда).
+    // СТРУКТУРНАЯ НЕПЕРЕСЕКАЕМОСТЬ с TREND: требует htfSep < 0.4% — точное
+    // дополнение гейта TREND (sep≥0.4%) → на одном баре сработать могут только
+    // ВМЕСТО друг друга, никогда вместе (иммунитет к разбавлению эджа v86.24).
+    // Компенсаторы вместо chop-гейта (мы сознательно инвертируем его — честный
+    // риск, ~половина свежих пересечений = пила): (1) возраст ≤ 12; (2) 4h ADX
+    // ≥ 15 И растёт vs 3 бара назад; (3) опц. structConfirm: свинг-структура 1h
+    // согласна (BOS-bias). Весь 1h-кор (откат/тело/RSI/ADX+DI/чоп/объём/BTC) —
+    // ДОСЛОВНО как у TREND. SL/TP/скоринг — те же. Floor TE_MIN_CONF=50 на время
+    // тени (порог заморозим по СОБСТВЕННЫМ тирам режима при промоушене).
+    // ПУТЬ: только measure-only тень в startup-BT (TE-SHADOW). KILL-линии
+    // предзарегистрированы: median slPct < ~1.0% (кост >0.25R) = смерть;
+    // объём-вместо-эджа = смерть; красный в чопе = смерть.
+    private TradeIdea generateTrendEarly(String symbol,
+                                         List<com.bot.TradingCore.Candle> c15,  // PRIMARY (1h)
+                                         List<com.bot.TradingCore.Candle> c1h,  // HTF (4h)
+                                         CoinCategory cat, long now, boolean structConfirm) {
+        if (!valid(c15) || !valid(c1h)) return reject("te_invalid_candles");
+        if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("te_skip_meme");
+
+        Long lastSig = csLastSignalTime.get(symbol);
+        if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) return reject("te_cooldown");
+
+        // closed-bars only (зеркало v86.15 B6)
+        long _nowMs = System.currentTimeMillis();
+        if (!c15.isEmpty() && c15.get(c15.size() - 1).closeTime > _nowMs) c15 = c15.subList(0, c15.size() - 1);
+        if (!c1h.isEmpty() && c1h.get(c1h.size() - 1).closeTime > _nowMs) c1h = c1h.subList(0, c1h.size() - 1);
+
+        int n = c15.size();
+        com.bot.TradingCore.Candle last = c15.get(n - 1);
+        com.bot.TradingCore.Candle prev = c15.get(n - 2);
+        double price = last.close;
+        if (price <= 0) return reject("te_bad_price");
+
+        double atr = com.bot.TradingCore.atr(c15, 14);
+        if (atr <= 0) return reject("te_bad_atr");
+        double atrPct = atr / price;
+        if (atrPct < csEnvDouble("TA_ATR_MIN", 0.004) || atrPct > csEnvDouble("TA_ATR_MAX", 0.06))
+            return reject("te_atr_oob");
+
+        // ── HTF направление — как у TREND ──
+        double[] hFast = com.bot.TradingCore.emaSeries(c1h, 20);
+        double[] hSlow = com.bot.TradingCore.emaSeries(c1h, 50);
+        if (hFast.length < 3 || hSlow.length < 3) return reject("te_htf_short");
+        double hFastNow = hFast[hFast.length - 1], hFastPrev = hFast[hFast.length - 3];
+        double hSlowNow = hSlow[hSlow.length - 1];
+        double hPrice = c1h.get(c1h.size() - 1).close;
+        boolean htfUp   = hFastNow > hSlowNow && hFastNow > hFastPrev && hPrice > hSlowNow;
+        boolean htfDown = hFastNow < hSlowNow && hFastNow < hFastPrev && hPrice < hSlowNow;
+        if (!htfUp && !htfDown) return reject("te_no_htf_trend");
+        boolean wantLong = htfUp;
+
+        // ── ЗАМЕНА chop-гейта TREND: гейты СВЕЖЕСТИ тренда ──
+        // (b) тренд молодой: ≤ TE_MAX_AGE_4H закрытых 4h-баров с пересечения
+        int age4h = computeTrendAge4h(hFast, hSlow);
+        if (age4h > csEnvDouble("TE_MAX_AGE_4H", 12)) return reject("te_htf_stale");
+        // (c) EMA ещё НЕ разнесены — точное дополнение гейта TREND (непересекаемость)
+        double htfSep = Math.abs(hFastNow - hSlowNow) / Math.max(1e-9, hPrice);
+        if (htfSep >= csEnvDouble("TA_HTF_SEP_MIN", 0.004)) return reject("te_htf_sep_wide");
+        // (d) 4h ADX жив и растёт (рождение тренда, не пила). Замечание из дизайна:
+        // adx() — средний DX по окну → «растёт» это демпфированный знак-тест; следим
+        // за счётчиком te_htf_adx_falling — если ~0 за прогоны, гейт инертен, убрать.
+        double htfAdxNow = com.bot.TradingCore.adx(c1h, 14).adx;
+        if (htfAdxNow < csEnvDouble("TE_HTF_ADX_MIN", 15.0)) return reject("te_htf_adx_low");
+        if (c1h.size() > 20) {
+            double htfAdxPrev = com.bot.TradingCore.adx(c1h.subList(0, c1h.size() - 3), 14).adx;
+            if (htfAdxNow <= htfAdxPrev) return reject("te_htf_adx_falling");
+        }
+        // (e) опц. подтверждение 1h свинг-структуры (BOS-bias согласен с направлением)
+        if (structConfirm) {
+            com.bot.TradingCore.SwingStructureResult ss =
+                    com.bot.TradingCore.analyzeSwingStructure(c15, 3);
+            boolean agree = wantLong
+                    ? ss.bias == com.bot.TradingCore.StructureBias.BULLISH
+                    : ss.bias == com.bot.TradingCore.StructureBias.BEARISH;
+            if (!agree) return reject("te_structure_disagree");
+        }
+
+        // ── 1h-кор: ДОСЛОВНО как у TREND (откат/тело/RSI/ADX+DI/чоп/объём/BTC) ──
+        double[] ema20 = com.bot.TradingCore.emaSeries(c15, 20);
+        if (ema20.length < 1) return reject("te_ema_short");
+        double emaNow = ema20[ema20.length - 1];
+        double pbTol = csEnvDouble("TA_PULLBACK_TOL", 0.012);
+        boolean resumeUp   = last.close > last.open && last.close > emaNow && prev.low  <= emaNow * (1.0 + pbTol);
+        boolean resumeDown = last.close < last.open && last.close < emaNow && prev.high >= emaNow * (1.0 - pbTol);
+        if (wantLong ? !resumeUp : !resumeDown) return reject("te_no_pullback");
+
+        double range = last.high - last.low;
+        if (range <= 0 || Math.abs(last.close - last.open) / range < csEnvDouble("TA_BODY_MIN", 0.45))
+            return reject("te_weak_body");
+
+        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
+        double rsiNow = rsi[rsi.length - 1];
+        if (wantLong && rsiNow > csEnvDouble("TA_RSI_MAX", 72)) return reject("te_rsi_hot");
+        if (!wantLong && rsiNow < csEnvDouble("TA_RSI_MIN", 28)) return reject("te_rsi_cold");
+
+        com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
+        if (adxR.adx < csEnvDouble("TA_ADX_MIN", 22)) return reject("te_adx_weak");
+        if ("1".equals(System.getenv().getOrDefault("TA_DI_CONFIRM", "1"))) {
+            if (wantLong  && !adxR.bullish()) return reject("te_di_bearish");
+            if (!wantLong && !adxR.bearish()) return reject("te_di_bullish");
+        }
+
+        double taChop = com.bot.TradingCore.choppinessIndex(c15, 14);
+        if (taChop > csEnvDouble("TA_CHOP_MAX", 61.8)) return reject("te_choppy");
+
+        double volSma = tpComputeVolSma(c15, 20);
+        double volR = volSma > 0 ? last.volume / volSma : 1.0;
+        if (volR < csEnvDouble("TA_VOL_MIN", 1.0)) return reject("te_low_vol");
+
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC
+             || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH) return reject("te_btc_bad");
+            if (wantLong && btc.onlyShort) return reject("te_btc_only_short");
+            if (!wantLong && btc.onlyLong) return reject("te_btc_only_long");
+        }
+
+        // ── SL/TP и скоринг — как у TREND ──
+        double slDist = atr * csEnvDouble("TA_SL_ATR", 1.5);
+        double slPct = slDist / price;
+        if (slPct < 0.004 || slPct > 0.04) return reject("te_sl_oob");
+        double tpR = csEnvDouble("TA_TP_R", 2.05);
+        double stop = wantLong ? price - slDist : price + slDist;
+        double tp2  = wantLong ? price + slDist * tpR : price - slDist * tpR;
+
+        double prob = 58.0;
+        if (adxR.adx > 25) prob += 4;
+        if (adxR.adx > 35) prob += 3;
+        HTFBias bias = detectBias2H(c1h);
+        boolean aligned = bias != null &&
+                ((wantLong && bias == HTFBias.BULL) || (!wantLong && bias == HTFBias.BEAR));
+        if (aligned)   prob += 4;
+        if (volR > 1.5) prob += 2;
+        prob = Math.min(75.0, prob);
+        // Floor 50 НА ВРЕМЯ ТЕНИ (не слепые 65 от TREND): у молодых трендов 2h-bias
+        // часто ещё не развернулся → +4 alignment редок; собственный тир-разрез
+        // <65/≥65 в TE-SHADOW решит честный порог при промоушене.
+        if (prob < csEnvDouble("TE_MIN_CONF", 50.0)) return reject("te_low_conf");
+
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+        List<String> flags = new ArrayList<>();
+        flags.add("TREND_EARLY_1H");
+        flags.add(htfUp ? "HTF_UP" : "HTF_DOWN");
+        flags.add(String.format("ADX=%.0f", adxR.adx));
+        if (aligned) flags.add("HTF_BIAS_ALIGN");
+        flags.add("AGE4H=" + age4h);
+
+        TradeIdea idea = new TradeIdea(
+                symbol, side, price, stop, tp2, tpR, prob, flags,
+                0.0, 0.0, 0.0, bias != null ? bias.name() : "NEUTRAL", cat, null,
+                CS_TP1_R, tpR, tpR);
+        idea.setRobustAtrPct(atrPct);
+        idea.setTrendAge4h(age4h);
         idea.setAgreeingClusters(3);
         return idea;
     }

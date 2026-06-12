@@ -2064,6 +2064,22 @@ public final class BotMain {
         int mrTrades = 0, mrWins = 0;
         double mrNet = 0.0;
         double[] mrHalfPnL = new double[4];
+        // [v86.60 PHASE-0] PnL по возрасту 4h-тренда (TREND-сделки): бакеты
+        // {0-2,3-5,6-12,13-24,25+} + решающая свёртка young(≤12)/old(>12) × WF.
+        // Отвечает данными: живёт ли edge в МОЛОДЫХ трендах (тезис TREND_EARLY)?
+        int[] ageN = new int[5];
+        double[] agePnL = new double[5];
+        int[] ageYoN = new int[2];
+        double[][] ageYoHalf = new double[2][4];
+        // [v86.60 TE-SHADOW] TREND_EARLY: 2 арма (struct ON / NSC) measure-only
+        final String[] TE_TOKENS = {"TREND_EARLY", "TREND_EARLY_NSC"};
+        int[] teTrades = new int[2], teWins = new int[2];
+        double[] teNet = new double[2];
+        double[][] teHalf = new double[2][4];
+        int[] teLongN = new int[2], teShortN = new int[2], teLoN = new int[2];
+        double[] teLongNet = new double[2], teShortNet = new double[2], teLoNet = new double[2];
+        java.util.List<java.util.List<Double>> teSlPcts =
+                java.util.List.of(new ArrayList<>(), new ArrayList<>());
         // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
         // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
         // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
@@ -2341,6 +2357,16 @@ public final class BotMain {
                         halfN[hi]++;
                         if (t.pnlPct > 0.05) halfWin[hi]++;
                         halfPnL[hi] += t.pnlPct;
+                        // [v86.60 PHASE-0] PnL по возрасту тренда
+                        if (t.trendAge >= 0) {
+                            int ab = t.trendAge <= 2 ? 0 : t.trendAge <= 5 ? 1
+                                    : t.trendAge <= 12 ? 2 : t.trendAge <= 24 ? 3 : 4;
+                            ageN[ab]++;
+                            agePnL[ab] += t.pnlPct;
+                            int yo = t.trendAge <= 12 ? 0 : 1;
+                            ageYoN[yo]++;
+                            ageYoHalf[yo][hi] += t.pnlPct;
+                        }
                     }
                     // [v86.54] теневые варианты — в те же WF-периоды (тот же tMin/tSpan)
                     for (double[] srow : r.shadowTradeRows) {
@@ -2384,6 +2410,45 @@ public final class BotMain {
                     bt.setStrategyModeOverride(null);
                 }
 
+                // [v86.60 TE-SHADOW] TREND_EARLY: 2 measure-only прохода (struct/nsc)
+                // на ТЕХ ЖЕ свечах. Никогда не кормит калибратор/ISC.
+                for (int ti = 0; ti < TE_TOKENS.length; ti++) {
+                    try {
+                        bt.setStrategyModeOverride(TE_TOKENS[ti]);
+                        com.bot.SimpleBacktester.BacktestResult r3 =
+                                bt.run(sym, empty, m5, m15, h1, cat);
+                        if (r3 != null && r3.trades != null && !r3.trades.isEmpty()) {
+                            long tMin3 = Long.MAX_VALUE, tMax3 = Long.MIN_VALUE;
+                            for (com.bot.SimpleBacktester.TradeRecord t : r3.trades) {
+                                if (t.entryTime < tMin3) tMin3 = t.entryTime;
+                                if (t.entryTime > tMax3) tMax3 = t.entryTime;
+                            }
+                            long tSpan3 = Math.max(1L, tMax3 - tMin3);
+                            for (com.bot.SimpleBacktester.TradeRecord t : r3.trades) {
+                                teTrades[ti]++;
+                                teNet[ti] += t.pnlPct;
+                                if (t.pnlPct > 0.05) teWins[ti]++;
+                                int hi3 = (int) (WF_PERIODS * (t.entryTime - tMin3) / tSpan3);
+                                if (hi3 < 0) hi3 = 0;
+                                if (hi3 >= WF_PERIODS) hi3 = WF_PERIODS - 1;
+                                teHalf[ti][hi3] += t.pnlPct;
+                                if (t.side == com.bot.TradingCore.Side.LONG) {
+                                    teLongN[ti]++; teLongNet[ti] += t.pnlPct;
+                                } else {
+                                    teShortN[ti]++; teShortNet[ti] += t.pnlPct;
+                                }
+                                if (t.confidence < 65) { teLoN[ti]++; teLoNet[ti] += t.pnlPct; }
+                                if (t.entry > 0) teSlPcts.get(ti)
+                                        .add(Math.abs(t.entry - t.sl) / t.entry * 100.0);
+                            }
+                        }
+                    } catch (Throwable teEx) {
+                        LOG.fine("[STARTUP-BT] TE-shadow " + sym + " failed: " + teEx.getMessage());
+                    } finally {
+                        bt.setStrategyModeOverride(null);
+                    }
+                }
+
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt(); break;
             } catch (Exception e) {
@@ -2418,6 +2483,23 @@ public final class BotMain {
             tb.append(String.format(
                     "  %s %s: %d сд · WR %.0f%% · PnL %+.1f%% · avg %+.3f%%\n",
                     mark, tierLbl[k], tierN[k], tWr, tierPnL[k], tAvg));
+        }
+        // [v86.60 PHASE-0] PnL по возрасту 4h-тренда — решает ДАННЫМИ, где живёт
+        // edge: в молодых трендах (тезис TREND_EARLY) или зрелых. Selection-bias
+        // оговорка печатается: гистограмма обусловлена прошедшими гейты сделками.
+        int ageTot = ageN[0] + ageN[1] + ageN[2] + ageN[3] + ageN[4];
+        if (ageTot > 0) {
+            tb.append("📅 PnL по возрасту 4h-тренда (баров с пересечения EMA):\n");
+            String[] ageLbl = {"0-2", "3-5", "6-12", "13-24", "25+"};
+            for (int k = 0; k < 5; k++) {
+                if (ageN[k] == 0) continue;
+                tb.append(String.format("  %s: %d сд · %+.1f%% · %+.3f%%/сд\n",
+                        ageLbl[k], ageN[k], agePnL[k], agePnL[k] / ageN[k]));
+            }
+            tb.append(String.format(
+                    "  young≤12: %d сд П1..П4 %+.0f/%+.0f/%+.0f/%+.0f · old>12: %d сд %+.0f/%+.0f/%+.0f/%+.0f\n",
+                    ageYoN[0], ageYoHalf[0][0], ageYoHalf[0][1], ageYoHalf[0][2], ageYoHalf[0][3],
+                    ageYoN[1], ageYoHalf[1][0], ageYoHalf[1][1], ageYoHalf[1][2], ageYoHalf[1][3]));
         }
         String tierBreakdown = tb.toString();
 
@@ -2586,6 +2668,27 @@ public final class BotMain {
             } else {
                 sb2.append("🧪 MR-SHADOW: 0 сделок (mean-rev сетапов на истории нет)\n");
             }
+            // [v86.60 TE-SHADOW] TREND_EARLY (ранний вход в свежий тренд): 2 арма.
+            String[] teName = {"struct", "nsc"};
+            for (int ti = 0; ti < 2; ti++) {
+                if (teTrades[ti] == 0) {
+                    sb2.append("🧪 TE-SHADOW(").append(teName[ti])
+                       .append("): 0 сделок (свежих трендов с сетапом на окне нет)\n");
+                    continue;
+                }
+                java.util.List<Double> sls = new ArrayList<>(teSlPcts.get(ti));
+                java.util.Collections.sort(sls);
+                double medSl = sls.isEmpty() ? 0 : sls.get(sls.size() / 2);
+                sb2.append(String.format(
+                        "🧪 TE-SHADOW(%s) ранний вход: %d сд · WR %.0f%% · %+.1f%% · %+.3f%%/сд\n"
+                        + "  П1..П4 %+.0f/%+.0f/%+.0f/%+.0f · L %d/%+.1f%% S %d/%+.1f%% · <65конф %d/%+.1f%% · medSL %.2f%%\n",
+                        teName[ti], teTrades[ti], 100.0 * teWins[ti] / teTrades[ti],
+                        teNet[ti], teNet[ti] / teTrades[ti],
+                        teHalf[ti][0], teHalf[ti][1], teHalf[ti][2], teHalf[ti][3],
+                        teLongN[ti], teLongNet[ti], teShortN[ti], teShortNet[ti],
+                        teLoN[ti], teLoNet[ti], medSl));
+            }
+            sb2.append("  _TE: KILL если medSL<1.0% (кост>0.25R) или объём-без-эджа или красный чоп; решение ≥3 прогонов_\n");
             shadowBlock = sb2.toString();
         }
 

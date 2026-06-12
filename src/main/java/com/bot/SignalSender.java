@@ -4104,6 +4104,11 @@ public final class SignalSender {
         if (srcClusters >= 0) {
             ni.setAgreeingClusters(srcClusters);
         }
+        // [v86.60 PHASE-0] возраст тренда — иначе 12+ rebuild-точек молча затирали бы тег
+        int srcAge = src.getTrendAge4h();
+        if (srcAge >= 0) {
+            ni.setTrendAge4h(srcAge);
+        }
         return ni;
     }
 
