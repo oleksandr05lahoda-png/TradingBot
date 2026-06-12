@@ -159,6 +159,11 @@ public final class SimpleBacktester {
 
     // ── Setters ──────────────────────────────────────────────────
     public void setInitialBalance(double v)  { this.initialBalance = v; }
+    // [v86.56 MR-SHADOW] strategy override for measure-only comparison passes;
+    // null = normal env-driven mode. Set/reset by BotMain around the second pass.
+    private volatile String strategyModeOverride = null;
+    public void setStrategyModeOverride(String m) { this.strategyModeOverride = m; }
+
     public void setTakerFee(double v)        { this.takerFee = v; }
     public void setMaxConcurrent(int v)      { this.maxConcurrent = v; }
     public void setTimeStopBars(int v)       { this.timeStopBars = v; }
@@ -568,6 +573,8 @@ public final class SimpleBacktester {
         com.bot.DecisionEngineMerged engine = new com.bot.DecisionEngineMerged();
         com.bot.GlobalImpulseController btGic = new com.bot.GlobalImpulseController();
         engine.setGIC(btGic);
+        // [v86.56 MR-SHADOW] measure-only strategy override for comparison passes
+        if (strategyModeOverride != null) engine.setStrategyModeOverride(strategyModeOverride);
 
         // Effective slippage = base × (1 + position/volume) capped at 3× base.
         // When setVolume24hUSD() not called (default = 0), falls back to base rate

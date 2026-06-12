@@ -2017,6 +2017,12 @@ public final class BotMain {
         // [v86.54] теневые суммы по WF-периодам: [период][вариант] — отвечает на
         // решающий вопрос «выживает ли D/B в чопе П2/П4».
         double[][] shadowHalfPnL = new double[4][5];
+        // [v86.56 MR-SHADOW] спящая mean-rev (STRATEGY_MODE=MR) measure-only на тех же
+        // данных. Вопрос портфеля: зелёная ли MR в чопе П2/П4, где TREND красный?
+        // Если да — взаимодополнение = легальный путь к 4/4. Калибратор НЕ кормится.
+        int mrTrades = 0, mrWins = 0;
+        double mrNet = 0.0;
+        double[] mrHalfPnL = new double[4];
         // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
         // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
         // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
@@ -2307,6 +2313,36 @@ public final class BotMain {
                 // Existing per-symbol EV signal for ISC.
                 if (r.total >= 5) isc.setSymbolBacktestResult(sym, r.ev);
 
+                // [v86.56 MR-SHADOW] второй measure-only прогон: спящая mean-rev на ТЕХ ЖЕ
+                // свечах (данные уже скачаны — это секунды CPU). Никогда не кормит
+                // калибратор/ISC; только аккумулирует для строки сравнения в сводке.
+                try {
+                    bt.setStrategyModeOverride("MR");
+                    com.bot.SimpleBacktester.BacktestResult r2 =
+                            bt.run(sym, empty, m5, m15, h1, cat);
+                    if (r2 != null && r2.trades != null && !r2.trades.isEmpty()) {
+                        mrTrades += r2.total;
+                        mrWins   += r2.wins;
+                        mrNet    += r2.netPnL;
+                        long tMin2 = Long.MAX_VALUE, tMax2 = Long.MIN_VALUE;
+                        for (com.bot.SimpleBacktester.TradeRecord t : r2.trades) {
+                            if (t.entryTime < tMin2) tMin2 = t.entryTime;
+                            if (t.entryTime > tMax2) tMax2 = t.entryTime;
+                        }
+                        long tSpan2 = Math.max(1L, tMax2 - tMin2);
+                        for (com.bot.SimpleBacktester.TradeRecord t : r2.trades) {
+                            int hi2 = (int) (WF_PERIODS * (t.entryTime - tMin2) / tSpan2);
+                            if (hi2 < 0) hi2 = 0;
+                            if (hi2 >= WF_PERIODS) hi2 = WF_PERIODS - 1;
+                            mrHalfPnL[hi2] += t.pnlPct;
+                        }
+                    }
+                } catch (Throwable mrEx) {
+                    LOG.fine("[STARTUP-BT] MR-shadow " + sym + " failed: " + mrEx.getMessage());
+                } finally {
+                    bt.setStrategyModeOverride(null);
+                }
+
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt(); break;
             } catch (Exception e) {
@@ -2499,6 +2535,16 @@ public final class BotMain {
                         shadowNet[sv], shadowNet[sv] / shadowN));
             }
             sb2.append("  _сравнивать варианты между собой; C=контроль, движок упрощён_\n");
+            // [v86.56 MR-SHADOW] строка про спящую mean-rev: дополняет ли она тренд в чопе.
+            if (mrTrades > 0) {
+                sb2.append(String.format(
+                        "🧪 MR-SHADOW (спящий mean-rev, measure-only): %d сд · WR %.0f%% · %+.1f%%\n"
+                        + "  _по периодам: П1 %+.0f · П2 %+.0f · П3 %+.0f · П4 %+.0f — ценно, если зелёный в П2/П4 (чоп), где TREND красный_\n",
+                        mrTrades, 100.0 * mrWins / mrTrades, mrNet,
+                        mrHalfPnL[0], mrHalfPnL[1], mrHalfPnL[2], mrHalfPnL[3]));
+            } else {
+                sb2.append("🧪 MR-SHADOW: 0 сделок (mean-rev сетапов на истории нет)\n");
+            }
             shadowBlock = sb2.toString();
         }
 

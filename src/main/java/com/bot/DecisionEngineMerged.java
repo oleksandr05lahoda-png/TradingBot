@@ -440,6 +440,12 @@ public final class DecisionEngineMerged {
     public void setGIC(com.bot.GlobalImpulseController gic) { this.gicRef = gic; }
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
 
+    // [v86.56 MR-SHADOW] Backtest-only override of STRATEGY_MODE for measure-only
+    // comparison passes (e.g. does the dormant mean-rev earn in chop where TREND
+    // bleeds?). Live path never sets this — stays null → env/default as before.
+    private volatile String strategyModeOverride = null;
+    public void setStrategyModeOverride(String m) { this.strategyModeOverride = m; }
+
     // Category-aware directional score thresholds for EARLY_TICK gate.
     //
     // Old: single 0.25 threshold for all categories.
@@ -1716,7 +1722,8 @@ public final class DecisionEngineMerged {
         //   "FUNDING"            — только funding-harvest (изолированный тест edge).
         //   "MR"/"VCB"/"BOTH"    — старые directional-движки. ДОКАЗАННО убыточны
         //                          (v83.7: все score-тиры в минус). Оставлены для сравнения.
-        String stratMode = System.getenv().getOrDefault("STRATEGY_MODE", "TREND").trim().toUpperCase();
+        String stratMode = (strategyModeOverride != null ? strategyModeOverride
+                : System.getenv().getOrDefault("STRATEGY_MODE", "TREND")).trim().toUpperCase();
 
         // [v86.0] TREND-ALIGNED INTRADAY — DEFAULT. HTF(4h) тренд задаёт направление,
         // 1h откат к EMA даёт вход, холд ≤ суток. Под PRIMARY_TF=1h. Лучший честный
