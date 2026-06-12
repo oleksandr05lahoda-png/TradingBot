@@ -168,6 +168,12 @@ public final class BotMain {
     private static final String FORECAST_PERSIST_FILE = System.getenv()
             .getOrDefault("FORECAST_RECORDS_FILE", "./data/forecast_records.csv");
 
+    // [v86.62] Версия бота для баннеров. Годами лгала как "v80.0-RESTORED+5%" в
+    // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
+    // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
+    // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
+    private static final String BOT_VERSION = "v86.62";
+
     static final class ForecastRecord {
         final String symbol;
         final com.bot.TradingCore.Side side;
@@ -1107,7 +1113,7 @@ public final class BotMain {
             telegram.flushAndShutdown(8000);
         }, "ShutdownHook"));
 
-        LOG.info("═══ TradingBot v80.0 RESTORED+5% started " + nowLocalStr()
+        LOG.info("═══ TradingBot " + BOT_VERSION + " started " + nowLocalStr()
                 + " (first cycle in 90s, OBSERVATION_MODE="
                 + (OBSERVATION_MODE ? "ON/PAPER" : "OFF/LIVE")
                 + ", X-EXCHANGE_CHECK=" + (CROSS_EXCHANGE_VALIDATION ? "ON" : "OFF") + ") ═══");
@@ -2698,7 +2704,7 @@ public final class BotMain {
         }
 
         String summary = String.format(
-                "✅ *Стартовый backtest завершён* `v80.0-RESTORED+5%%`\n"
+                "✅ *Стартовый backtest завершён* `" + BOT_VERSION + "`\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
                         + "⏱ Время: %d сек\n"
                         + "📊 Пар обработано: %d\n"
