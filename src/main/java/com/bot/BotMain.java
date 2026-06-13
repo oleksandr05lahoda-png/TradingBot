@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.62";
+    private static final String BOT_VERSION = "v86.63";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2074,6 +2074,7 @@ public final class BotMain {
         // {0-2,3-5,6-12,13-24,25+} + решающая свёртка young(≤12)/old(>12) × WF.
         // Отвечает данными: живёт ли edge в МОЛОДЫХ трендах (тезис TREND_EARLY)?
         int[] ageN = new int[5];
+        int[] ageWins = new int[5];  // [v86.63] WR по возрастным бакетам
         double[] agePnL = new double[5];
         int[] ageYoN = new int[2];
         double[][] ageYoHalf = new double[2][4];
@@ -2368,6 +2369,7 @@ public final class BotMain {
                             int ab = t.trendAge <= 2 ? 0 : t.trendAge <= 5 ? 1
                                     : t.trendAge <= 12 ? 2 : t.trendAge <= 24 ? 3 : 4;
                             ageN[ab]++;
+                            if (t.pnlPct > 0.05) ageWins[ab]++;  // [v86.63]
                             agePnL[ab] += t.pnlPct;
                             int yo = t.trendAge <= 12 ? 0 : 1;
                             ageYoN[yo]++;
@@ -2499,8 +2501,9 @@ public final class BotMain {
             String[] ageLbl = {"0-2", "3-5", "6-12", "13-24", "25+"};
             for (int k = 0; k < 5; k++) {
                 if (ageN[k] == 0) continue;
-                tb.append(String.format("  %s: %d сд · %+.1f%% · %+.3f%%/сд\n",
-                        ageLbl[k], ageN[k], agePnL[k], agePnL[k] / ageN[k]));
+                tb.append(String.format("  %s: %d сд · WR %.0f%% · %+.1f%% · %+.3f%%/сд\n",
+                        ageLbl[k], ageN[k], 100.0 * ageWins[k] / ageN[k],
+                        agePnL[k], agePnL[k] / ageN[k]));
             }
             tb.append(String.format(
                     "  young≤12: %d сд П1..П4 %+.0f/%+.0f/%+.0f/%+.0f · old>12: %d сд %+.0f/%+.0f/%+.0f/%+.0f\n",
