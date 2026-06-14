@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.70";
+    private static final String BOT_VERSION = "v86.71";
 
     static final class ForecastRecord {
         final String symbol;
@@ -3192,7 +3192,16 @@ public final class BotMain {
     private static List<com.bot.TradingCore.Candle> fetchKlinesPaged(
             com.bot.SignalSender sender, String symbol, String interval, int totalBars) {
         java.util.TreeMap<Long, com.bot.TradingCore.Candle> byTime = new java.util.TreeMap<>();
-        long endTime = System.currentTimeMillis();
+        // [v86.71] ВОСПРОИЗВОДИМОСТЬ: раньше endTime = now каждый бут → 30-дн окно скользило
+        // → ±9× прыжки PnL (правка казалась улучшением/регрессией по ЧИСТОЙ удаче, см. v86.70:
+        // −2.5→−22 на measure-only коде). Якорим к последней закрытой UTC-границе суток: все
+        // буты одного дня = ИДЕНТИЧНАЯ история → правка = СИГНАЛ, не монетка. Сдвиг раз в сутки
+        // → не протухает. Env BT_END_TIME (мс) — явный фикс-окно для строгих A/B. Откат: =0.
+        long btEndEnv = 0L;
+        try { btEndEnv = Long.parseLong(System.getenv().getOrDefault("BT_END_TIME", "0").trim()); }
+        catch (NumberFormatException ignore) {}
+        final long DAY_MS = 24L * 60L * 60L * 1000L;
+        long endTime = btEndEnv > 0 ? btEndEnv : (System.currentTimeMillis() / DAY_MS) * DAY_MS;
         int remaining = totalBars;
         int maxRequests = (totalBars / 1500) + 2;   // safety guard
 
