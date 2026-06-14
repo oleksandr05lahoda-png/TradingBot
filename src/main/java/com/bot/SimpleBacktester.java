@@ -1002,20 +1002,28 @@ public final class SimpleBacktester {
         // сам стал «50%@1.5R», и B(min(1.5R,TP2)) задублировал его. Теперь B = СТАРАЯ
         // геометрия (50%@1.0R+BE) — каждый прогон сравнивает старое-vs-новое живьём.
         double oldAt = Math.min(1.0, tp2R * 0.99);
-        // {partialFrac, partialAtR, beTriggerR (NaN = BE нет)}
+        // [v86.66] Слот A(33%) ПЕРЕПРОФИЛИРОВАН в F = D + ЖИВОЙ актив-менеджмент.
+        // Зачем: чистая тень (C/A/B/D/E) НЕ моделирует live-стек выходов (trail/
+        // profit-lock/stagnation). У D нет частичного → tp1Hit=false → trail НЕ
+        // включается, НО profit-lock(85%окна,≥0.8R) и stagnation(35%окна,без хода)
+        // ВКЛЮЧАЮТСЯ (они требуют !tp1Hit) и режут раннер на ~0.8R до TP2. F меряет
+        // ИМЕННО это: переживёт ли преимущество D (vs C) реальный стек, или +0.085
+        // в тени — артефакт его отсутствия. F бьёт C → D достоин портирования; F≈C
+        // или хуже → шип D = ловушка (тень врёт). 4-я колонка = флаг актив-стека.
+        // {partialFrac, partialAtR, beTriggerR (NaN = BE нет), activeMgmt}
         double[][] V = {
-                {0.50, tp1R,  tp1R },        // C контроль = текущая геометрия (актуальный tp1R)
-                {0.33, tp1R,  tp1R },        // A меньше гарант-нога, больше раннер
-                {0.50, oldAt, oldAt},        // B = СТАРАЯ геометрия 50%@1.0R+BE (референс)
-                {0.00, 0.0,   1.0  },        // D без частичного, BE после +1.0R
-                {0.00, 0.0,   Double.NaN}    // E чистый брекет SL/TP2
+                {0.50, tp1R,  tp1R,        0},  // C контроль = текущая геометрия (актуальный tp1R)
+                {0.00, 0.0,   1.0,         1},  // F = D + актив-менеджмент (profit-lock+stagnation, как live)
+                {0.50, oldAt, oldAt,       0},  // B = СТАРАЯ геометрия 50%@1.0R+BE (референс)
+                {0.00, 0.0,   1.0,         0},  // D без частичного, BE после +1.0R (чистый брекет)
+                {0.00, 0.0,   Double.NaN,  0}   // E чистый брекет SL/TP2
         };
         res.shadowN++;
         double[] row = new double[6];
         row[0] = m15.get(entryBar).openTime;
         for (int v = 0; v < V.length; v++) {
             double net = shadowOneVariant(m15, entryBar, isLong, entry, risk, tp2,
-                    V[v][0], V[v][1], V[v][2], slippage);
+                    V[v][0], V[v][1], V[v][2], V[v][3] > 0.5, slippage);
             res.shadowNet[v] += net;
             if (net > 0.05) res.shadowWins[v]++;
             row[v + 1] = net;
@@ -1027,7 +1035,7 @@ public final class SimpleBacktester {
     private double shadowOneVariant(List<com.bot.TradingCore.Candle> m15, int entryBar,
                                     boolean isLong, double entry, double risk, double tp2Price,
                                     double partialFrac, double partialAtR, double beTriggerR,
-                                    double slippage) {
+                                    boolean activeManagement, double slippage) {
         double dir = isLong ? 1.0 : -1.0;
         double curSL = entry - dir * risk;
         double partialPrice = partialFrac > 0 ? entry + dir * risk * partialAtR : 0.0;
@@ -1037,6 +1045,7 @@ public final class SimpleBacktester {
         double accumulated = 0.0;   // зафиксированный PnL% (цена-% × доля)
         double remFrac = 1.0;
         double partialFees = 0.0, partialSlip = 0.0;
+        double maxFavR = 0.0, maxAdvR = 0.0;  // [v86.66] HWM для F (profit-lock/stagnation)
 
         // Бар входа: только SL (зеркало v86.38 same-bar honesty fix)
         com.bot.TradingCore.Candle eb = m15.get(entryBar);
@@ -1050,6 +1059,28 @@ public final class SimpleBacktester {
         for (int b = entryBar + 1; b <= lastBar; b++) {
             com.bot.TradingCore.Candle bar = m15.get(b);
             int barsHeld = b - entryBar;
+            // [v86.66] АКТИВНЫЙ СТЕК ВЫХОДА (только F) — зеркало resolvePosition.
+            // Проверяется ДО SL/TP (как в основном движке). Для no-partial позиции
+            // trail НЕ работает (требует tp1Hit), а profit-lock и stagnation — да.
+            // Это и есть гэп «тень vs live», который режет раннер D.
+            if (activeManagement) {
+                double favR = (isLong ? bar.high - entry : entry - bar.low) / risk;
+                double advR = (isLong ? entry - bar.low : bar.high - entry) / risk;
+                if (favR > maxFavR) maxFavR = favR;
+                if (advR > maxAdvR) maxAdvR = advR;
+                int stagBar = Math.max(3, (int) Math.round(timeStopBars * 0.35));
+                int plBar   = Math.max(1, (int) Math.round(timeStopBars * 0.85));
+                double curR = dir * (bar.close - entry) / risk;
+                boolean stag = barsHeld >= stagBar && maxFavR < 0.30 && maxAdvR < 0.30;
+                boolean plock = barsHeld >= plBar && curR >= 0.80;
+                if (stag || plock) {  // рыночный выход по close
+                    double pnl = dir * (bar.close - entry) / entry * 100.0;
+                    double total = accumulated + pnl * remFrac;
+                    double fees = takerFee * (1.0 + remFrac) + partialFees;
+                    double slip = slippage * (1.0 + remFrac) + partialSlip;
+                    return total - (fees + slip + fundingPer15m * barsHeld) * 100.0;
+                }
+            }
             boolean slHit = isLong ? bar.low <= curSL : bar.high >= curSL;
             double target = partialDone ? tp2Price : partialPrice;
             boolean tpHit = isLong ? bar.high >= target : bar.low <= target;

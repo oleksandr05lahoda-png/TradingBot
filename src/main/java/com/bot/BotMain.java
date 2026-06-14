@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.65";
+    private static final String BOT_VERSION = "v86.66";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2658,9 +2658,9 @@ public final class BotMain {
         if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0) {
             String[] svName = {
                     "C 50%@TP1+BE (текущий)",
-                    "A 33%@TP1+BE",
+                    "F D+актив (PL+stag, ~live)",
                     "B 50%@1.0R+BE (старая)",
-                    "D 100%→TP2, BE@1R",
+                    "D 100%→TP2, BE@1R (тень)",
                     "E 100%→TP2, без BE"};
             StringBuilder sb2 = new StringBuilder();
             if (shadowN > 0) {
