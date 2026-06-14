@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.71";
+    private static final String BOT_VERSION = "v86.72";
 
     static final class ForecastRecord {
         final String symbol;
@@ -3266,7 +3266,14 @@ public final class BotMain {
     private static void updateBtcContext(com.bot.SignalSender sender, com.bot.GlobalImpulseController gic) {
         try {
             List<com.bot.TradingCore.Candle> btc = sender.fetchKlines("BTCUSDT", PRIMARY_TF, KLINES);
-            if (btc != null && btc.size() > 30) gic.update(btc);
+            if (btc != null && btc.size() > 30) {
+                gic.update(btc);
+                // [v86.72] FIX (audit): RiskGuard.updateBtcPrice НИКОГДА не вызывался →
+                // btcCrashBlockUntil=0 → лимит «BTC-crash» (защита от каскада, где все альты
+                // падают разом) был МЁРТВ. Кормим ценой BTC каждый цикл → детектор −3%/30мин /
+                // −5%/60мин теперь живой и заблокирует новые входы во время обвала (когда armed).
+                com.bot.RiskGuard.getInstance().updateBtcPrice(btc.get(btc.size() - 1).close);
+            }
         } catch (Exception e) { LOG.warning("[BTC ctx] " + e.getMessage()); }
     }
 
