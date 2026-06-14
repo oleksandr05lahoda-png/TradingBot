@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.66";
+    private static final String BOT_VERSION = "v86.67";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2057,6 +2057,7 @@ public final class BotMain {
         int totalTrades = 0, totalWins = 0, totalLosses = 0, totalTimeStops = 0;
         int totalBE = 0, totalProfitLock = 0, totalTrail = 0, totalStag = 0;
         double totalNetPnL = 0.0;
+        double totalGrossPnL = 0.0, totalFeesAgg = 0.0, totalSlipAgg = 0.0, totalFundAgg = 0.0;  // [v86.67] cost-decomp
         // [v86.53 EXIT-SHADOW] суммы по 5 вариантам геометрии выхода (см. SimpleBacktester)
         int shadowN = 0;
         double[] shadowNet = new double[5];
@@ -2335,6 +2336,10 @@ public final class BotMain {
                 totalTrail        += r.trailExits;
                 totalStag         += r.stagnationExits;
                 totalNetPnL       += r.netPnL;
+                totalGrossPnL     += r.grossPnL;       // [v86.67] cost-decomp
+                totalFeesAgg      += r.totalFees;
+                totalSlipAgg      += r.totalSlippage;
+                totalFundAgg      += r.totalFunding;
                 // [v86.53 EXIT-SHADOW] aggregate shadow exit-variant results
                 shadowN += r.shadowN;
                 for (int sv = 0; sv < 5; sv++) {
@@ -2706,6 +2711,28 @@ public final class BotMain {
             shadowBlock = sb2.toString();
         }
 
+        // [v86.67] COST-DECOMPOSITION — где живёт минус: в сигнале или в костах?
+        // net = gross − fee − slip − funding. Если gross ПОЛОЖИТЕЛЕН, а net ~0 —
+        // сигнал есть, его съедают косты → главный рычаг = maker-исполнение (limit-
+        // вход: fee~0 + 0 slip на вход-ноге). Если gross ≤ 0 — сигнал мёртв, никакое
+        // execution не спасёт. Maker-прикидка ОПТИМИСТИЧНА (без adverse-selection и
+        // риска непрофилла лимитника). Решает, куда вообще копать после exit-тупика.
+        String costBlock = "";
+        if (totalTrades > 0) {
+            double gAvg    = totalGrossPnL / totalTrades;
+            double feeAvg  = totalFeesAgg  * 100.0 / totalTrades;
+            double slipAvg = totalSlipAgg  * 100.0 / totalTrades;
+            double fundAvg = totalFundAgg  * 100.0 / totalTrades;
+            double netAvg  = gAvg - feeAvg - slipAvg - fundAvg;
+            double makerAvg = gAvg - feeAvg * 0.5 - slipAvg * 0.5 - fundAvg; // экономит вход-ногу
+            costBlock = String.format(
+                    "💸 *Косты/сделку:* gross %+.3f%% − fee %.3f − slip %.3f − fund %.3f = net %+.3f%%\n"
+                  + "  maker-вход (оптимистич., без adverse-sel): ~%+.3f%%/сд %s\n",
+                    gAvg, feeAvg, slipAvg, fundAvg, netAvg, makerAvg,
+                    gAvg > 0 ? (makerAvg > 0 ? "🟢 gross+ → косты-рычаг ЖИВ" : "🟡 gross+ но maker мало")
+                             : "🔴 gross≤0 → сигнал мёртв, execution не спасёт");
+        }
+
         String summary = String.format(
                 "✅ *Стартовый backtest завершён* `" + BOT_VERSION + "`\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2725,6 +2752,7 @@ public final class BotMain {
                         + "  отдельные счета. Реальный портфель (1 депо, maxConcurrent=5,\n"
                         + "  корреляция) даёт МЕНЬШЕ. Цифра — для сравнения версий, не profit._\n"
                         + "  Avg/сделку: %+.3f%% (вот это ближе к реальности на сделку)\n"
+                        + "%s"
                         + "📈 W/L ratio: %.2f\n"
                         + "🧠 Калибратор: %d outcomes\n"
                         + "%s"
@@ -2737,6 +2765,7 @@ public final class BotMain {
                 totalWins, wr, totalLosses, totalTimeStops,
                 totalBE, totalProfitLock, totalTrail, totalStag, totalNetPnL,
                 (totalTrades > 0 ? totalNetPnL / totalTrades : 0.0),  // [v82.11] avg/trade
+                costBlock,  // [v86.67] cost-decomposition
                 wlRatio, newCalCount, tierBreakdown, halfBreakdown,
                 shadowBlock,  // [v86.53 EXIT-SHADOW]
                 verdict);
