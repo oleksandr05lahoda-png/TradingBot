@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.69";
+    private static final String BOT_VERSION = "v86.70";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2058,6 +2058,7 @@ public final class BotMain {
         int totalBE = 0, totalProfitLock = 0, totalTrail = 0, totalStag = 0;
         double totalNetPnL = 0.0;
         double totalGrossPnL = 0.0, totalFeesAgg = 0.0, totalSlipAgg = 0.0, totalFundAgg = 0.0;  // [v86.67] cost-decomp
+        java.util.List<Double> allPnls = new ArrayList<>();  // [v86.70] bootstrap-CI значимости edge + Monte-Carlo
         // [v86.53 EXIT-SHADOW] суммы по 5 вариантам геометрии выхода (см. SimpleBacktester)
         int shadowN = 0;
         double[] shadowNet = new double[5];
@@ -2292,8 +2293,11 @@ public final class BotMain {
                 // показывает negative edge (Net<0 ИЛИ WR<40%) — отравить PAV нельзя.
                 // Текущий backtest +13% WR 54% → edge положительный → калибратор стартует
                 // с ~80 outcomes вместо 0. Откат: SKIP_STARTUP_CALIBRATION=1 в env.
+                // [v86.70] default 0→1: бэктест БОЛЬШЕ НЕ кормит live-калибратор (in-sample +
+                // survivorship-исходы заражали live-гейт). Калибратор теперь учится ТОЛЬКО на
+                // живых/paper-исходах верификатора. Откат к старому: SKIP_STARTUP_CALIBRATION=0.
                 boolean skipCalRecord = measureOnly || "1".equals(System.getenv()
-                        .getOrDefault("SKIP_STARTUP_CALIBRATION", "0"));
+                        .getOrDefault("SKIP_STARTUP_CALIBRATION", "1"));
 
                 // [v87 BIAS-GUARD 2026-05-09] Even with skipCalRecord=false, refuse to
                 // record outcomes if the backtest itself shows the strategy is losing
@@ -2367,6 +2371,7 @@ public final class BotMain {
                         tierN[bi]++;
                         if (t.pnlPct > 0.05) tierWin[bi]++;
                         tierPnL[bi] += t.pnlPct;
+                        allPnls.add(t.pnlPct);  // [v86.70] для bootstrap-CI / Monte-Carlo
 
                         int hi = (int) (WF_PERIODS * (t.entryTime - tMin) / tSpan);
                         if (hi < 0) hi = 0;
@@ -2784,6 +2789,33 @@ public final class BotMain {
                              : "🔴 gross≤0 → сигнал мёртв, execution не спасёт");
         }
 
+        // [v86.70] ЗНАЧИМОСТЬ edge — bootstrap CI (честный тест «edge или шум»). Заменяет
+        // фикс-пороги: edge РЕАЛЕН только если нижняя граница CI95 на avg/сделку > 0 ПОСЛЕ
+        // косто́в. + Monte-Carlo maxDD(95%) на перетасовке сделок — калибровка риск-лимитов
+        // (раньше monteCarloDrawdown был мёртвым кодом). Seed фиксирован → CI воспроизводим.
+        String sigBlock = "";
+        if (allPnls.size() >= 20) {
+            int B = 1000, m = allPnls.size();
+            double[] means = new double[B];
+            java.util.Random sigRng = new java.util.Random(20260614L);  // seeded → воспроизводимо
+            for (int b = 0; b < B; b++) {
+                double s = 0.0;
+                for (int i = 0; i < m; i++) s += allPnls.get(sigRng.nextInt(m));
+                means[b] = s / m;
+            }
+            java.util.Arrays.sort(means);
+            double ciLo = means[(int) (0.025 * B)];
+            double ciHi = means[(int) (0.975 * B)];
+            double mean = 0.0; for (double p : allPnls) mean += p; mean /= m;
+            double mc95 = com.bot.SimpleBacktester.monteCarloDrawdown(allPnls, 2000, 0.95);
+            String sMark = ciLo > 0 ? "🟢 edge ОТЛИЧИМ от нуля"
+                                    : "🔴 НЕотличим от нуля (= шум/кост, реальные деньги нельзя)";
+            sigBlock = String.format(
+                    "📊 *Значимость* (bootstrap %d сд): avg %+.3f%%/сд · CI95 [%+.3f, %+.3f] %s\n"
+                  + "  MonteCarlo maxDD(95%%): %.1f%% (калибровка риск-лимитов)\n",
+                    m, mean, ciLo, ciHi, sMark, mc95);
+        }
+
         String summary = String.format(
                 "✅ *Стартовый backtest завершён* `" + BOT_VERSION + "`\n"
                         + "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2804,6 +2836,7 @@ public final class BotMain {
                         + "  корреляция) даёт МЕНЬШЕ. Цифра — для сравнения версий, не profit._\n"
                         + "  Avg/сделку: %+.3f%% (вот это ближе к реальности на сделку)\n"
                         + "%s"
+                        + "%s"
                         + "📈 W/L ratio: %.2f\n"
                         + "🧠 Калибратор: %d outcomes\n"
                         + "%s"
@@ -2817,6 +2850,7 @@ public final class BotMain {
                 totalBE, totalProfitLock, totalTrail, totalStag, totalNetPnL,
                 (totalTrades > 0 ? totalNetPnL / totalTrades : 0.0),  // [v82.11] avg/trade
                 costBlock,  // [v86.67] cost-decomposition
+                sigBlock,   // [v86.70] edge significance (bootstrap CI + Monte-Carlo)
                 wlRatio, newCalCount, tierBreakdown, halfBreakdown,
                 shadowBlock,  // [v86.53 EXIT-SHADOW]
                 verdict);
