@@ -163,6 +163,10 @@ public final class SimpleBacktester {
     // null = normal env-driven mode. Set/reset by BotMain around the second pass.
     private volatile String strategyModeOverride = null;
     public void setStrategyModeOverride(String m) { this.strategyModeOverride = m; }
+    // [v86.73] BTC-контекст для btGic в бэктесте (раньше заморожен NEUTRAL → BTC-режим-гейт
+    // no-op в BT, живой в проде). Кормится per-bar барами, закрытыми ≤ decisionTime.
+    private volatile java.util.List<com.bot.TradingCore.Candle> btcCandles = null;
+    public void setBtcCandles(java.util.List<com.bot.TradingCore.Candle> c) { this.btcCandles = c; }
 
     public void setTakerFee(double v)        { this.takerFee = v; }
     public void setMaxConcurrent(int v)      { this.maxConcurrent = v; }
@@ -596,6 +600,7 @@ public final class SimpleBacktester {
 
         // Active position tracking
         ActivePosition currentPos = null;
+        int btcHi = 0;  // [v86.73] указатель в btcCandles (только вперёд → без look-ahead)
 
         while (i < m15.size()) {
             com.bot.TradingCore.Candle bar = m15.get(i);
@@ -714,6 +719,14 @@ public final class SimpleBacktester {
                 double prevFr = fundingAt(decisionTime - 28_800_000L);
                 if (currentFr != 0.0 || prevFr != 0.0) {
                     engine.setSimulatedFunding(symbol, currentFr, prevFr);
+                }
+
+                // [v86.73] Кормим btGic BTC-барами, ЗАКРЫТЫМИ к decisionTime (без look-ahead) →
+                // BTC-режим-гейт (PANIC/CRASH/onlyLong/onlyShort) теперь живой в BT, как в проде.
+                // Указатель btcHi только вперёд; трейлинг-окно 120 баров (хватает EMA20/50+склон).
+                if (btcCandles != null && btcCandles.size() > 30) {
+                    while (btcHi < btcCandles.size() && btcCandles.get(btcHi).closeTime <= decisionTime) btcHi++;
+                    if (btcHi > 30) btGic.update(btcCandles.subList(Math.max(0, btcHi - 120), btcHi));
                 }
 
                 // [BUG-FIX 2026-05-25] Передаём decisionTime как `now` в DE.analyze.

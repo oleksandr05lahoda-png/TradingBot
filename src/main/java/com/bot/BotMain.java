@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.72";
+    private static final String BOT_VERSION = "v86.73";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2162,6 +2162,18 @@ public final class BotMain {
         // ДО того как доберёмся до молодых пар без истории.
         final int targetValidPairs = Math.max(5, envInt("STARTUP_BT_TARGET_VALID_PAIRS", 24));  // [v86.39] 15→24: больше независимых рынков = значимая выборка на период (честный 4/4, не подгонка)
         int validPairs = 0;
+
+        // [v86.73] FIX: btGic в бэктесте был ЗАМОРОЖЕН NEUTRAL (никогда не кормился BTC) →
+        // BTC-режим-гейт no-op в BT, но ЖИВОЙ в проде → BT оптимистичен в BTC-панику + BTC-aware
+        // чоп-стратегии невалидируемы. Грузим BTC 1h ОДИН раз (то же якорное окно, v86.71);
+        // SimpleBacktester per-bar обновляет btGic барами, закрытыми ≤ decisionTime (без look-ahead).
+        try {
+            List<com.bot.TradingCore.Candle> btcBt = fetchKlinesPaged(sender, "BTCUSDT", btPrimaryTf, barsPrimaryTarget);
+            bt.setBtcCandles(btcBt);
+            LOG.info("[STARTUP-BT] BTC-context candles=" + (btcBt != null ? btcBt.size() : 0));
+        } catch (Exception be) {
+            LOG.warning("[STARTUP-BT] BTC-context load failed: " + be.getMessage());
+        }
 
         for (String sym : universe) {
             // Cooperative cancellation if JVM is shutting down.
