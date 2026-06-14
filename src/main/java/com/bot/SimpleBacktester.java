@@ -623,7 +623,21 @@ public final class SimpleBacktester {
                     double slipCost = slippage * 1.0
                             + slippage * currentPos.remainingFrac
                             + currentPos.partialSlipCost;
-                    double fundingCost = fundingPer15m * outcome.barsHeld;
+                    // [v86.75] FUNDING: реальный ЗНАКОВЫЙ интеграл вместо плоской константы.
+                    // Лонг ПЛАТИТ funding при rate>0 (кост), ШОРТ ПОЛУЧАЕТ (benefit → отриц. кост).
+                    // Раньше flat fundingPer15m игнорировал и знак, и величину — на тонком edge
+                    // (gross ~кост) это материально (audit). Суммируем ставки funding-таймстампов
+                    // в окне удержания (entry, exit]; знак по стороне. Fallback на flat без истории.
+                    double fundingCost;
+                    java.util.NavigableMap<Long, Double> heldFunding = fundingHistory.isEmpty() ? null
+                            : fundingHistory.subMap(currentPos.entryTime, false, bar.closeTime, true);
+                    if (heldFunding != null && !heldFunding.isEmpty()) {
+                        double rateSum = 0.0;
+                        for (double r : heldFunding.values()) rateSum += r;
+                        fundingCost = (currentPos.side == com.bot.TradingCore.Side.LONG ? 1.0 : -1.0) * rateSum;
+                    } else {
+                        fundingCost = fundingPer15m * outcome.barsHeld;  // нет funding-истории → старое прибл.
+                    }
                     double totalCosts = feesCost + slipCost + fundingCost;
 
                     double grossPnl = outcome.pnlPct;
