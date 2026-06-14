@@ -704,6 +704,32 @@ public final class BinanceTradeExecutor {
                         "SHORT SL=%.6f <= entry=%.6f (wrong direction)", idea.stop, entry));
             }
 
+            // ════════════════════════════════════════════════════════════════
+            // [v86.65] LIQUIDATION-DISTANCE GUARD — жёсткий инвариант риск-каркаса.
+            // ════════════════════════════════════════════════════════════════
+            // Правило crypto-futures: "если стоп ЗА ценой ликвидации — сделку НЕ
+            // открывать" (позиция ликвидируется раньше стопа → риск неуправляем).
+            // Раньше это было только ЭМЕРДЖЕНТНО (SL≤10% + плечо 5x → стоп всегда
+            // внутри ликвидации ~18%), без ЯВНОЙ проверки — единственная такая
+            // логика мёртвая (TradingCore.buildSignal не вызывается на live-пути).
+            // Делаем инвариант явным. При 5x/SL≤4% гейт НИКОГДА не срабатывает
+            // (нулевое изменение поведения сейчас, проба и реальные сигналы проходят)
+            // — он ловит ОПАСНЫЙ дрейф плеча: при 10x liqDist≈8% < широкий SL → слив
+            // ДО стопа. maintMargin консервативный (env LIQ_MAINT_MARGIN, def 0.02 —
+            // выше реала мейджоров → liqDist недооценена → гейт скорее перестрахуется).
+            double liqMaint    = envDouble("LIQ_MAINT_MARGIN", 0.02);
+            double liqDistFrac = (1.0 / leverage) - liqMaint;     // доля от entry до ликвидации
+            double liqBuffer   = envDouble("LIQ_SL_BUFFER", 0.90); // стоп внутри liqDist с запасом
+            LOG.info(String.format(
+                    "[Executor] %s liq-check: lev=%dx liqDist=%.2f%% vs SL=%.2f%% (need SL < %.2f%%)",
+                    symbol, leverage, liqDistFrac * 100, slDistancePct * 100, liqDistFrac * liqBuffer * 100));
+            if (liqDistFrac <= 0 || slDistancePct >= liqDistFrac * liqBuffer) {
+                return ExecutionResult.fail(String.format(
+                        "SL beyond liquidation: SL %.2f%% >= safe liqDist %.2f%% (lev=%dx) — "
+                                + "would liquidate before stop, risk uncontrolled. Lower LEVERAGE or tighten SL.",
+                        slDistancePct * 100, liqDistFrac * liqBuffer * 100, leverage));
+            }
+
             // Load real exchange filters: stepSize (qty), tickSize (price),
             // minNotional (smallest position) — all per-symbol from exchangeInfo.
             SymbolInfo si = loadSymbolInfo(symbol);
