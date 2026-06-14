@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.68";
+    private static final String BOT_VERSION = "v86.69";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2088,6 +2088,11 @@ public final class BotMain {
         double[] teLongNet = new double[2], teShortNet = new double[2], teLoNet = new double[2];
         java.util.List<java.util.List<Double>> teSlPcts =
                 java.util.List.of(new ArrayList<>(), new ArrayList<>());
+        // [v86.69 FLOW-SHADOW] flow-gated чоп-стратегия (value-area break + taker-flow), measure-only
+        int fbTrades = 0, fbWins = 0, fbLongN = 0, fbShortN = 0;
+        double fbNet = 0.0, fbLongNet = 0.0, fbShortNet = 0.0;
+        double[] fbHalf = new double[4];
+        java.util.List<Double> fbSlPcts = new ArrayList<>();
         // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
         // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
         // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
@@ -2462,6 +2467,37 @@ public final class BotMain {
                     }
                 }
 
+                // [v86.69 FLOW-SHADOW] FLOW_BREAK: чоп-стратегия measure-only на ТЕХ ЖЕ свечах.
+                try {
+                    bt.setStrategyModeOverride("FLOW_BREAK");
+                    com.bot.SimpleBacktester.BacktestResult r4 =
+                            bt.run(sym, empty, m5, m15, h1, cat);
+                    if (r4 != null && r4.trades != null && !r4.trades.isEmpty()) {
+                        long tMin4 = Long.MAX_VALUE, tMax4 = Long.MIN_VALUE;
+                        for (com.bot.SimpleBacktester.TradeRecord t : r4.trades) {
+                            if (t.entryTime < tMin4) tMin4 = t.entryTime;
+                            if (t.entryTime > tMax4) tMax4 = t.entryTime;
+                        }
+                        long tSpan4 = Math.max(1L, tMax4 - tMin4);
+                        for (com.bot.SimpleBacktester.TradeRecord t : r4.trades) {
+                            fbTrades++;
+                            fbNet += t.pnlPct;
+                            if (t.pnlPct > 0.05) fbWins++;
+                            int hi4 = (int) (WF_PERIODS * (t.entryTime - tMin4) / tSpan4);
+                            if (hi4 < 0) hi4 = 0;
+                            if (hi4 >= WF_PERIODS) hi4 = WF_PERIODS - 1;
+                            fbHalf[hi4] += t.pnlPct;
+                            if (t.side == com.bot.TradingCore.Side.LONG) { fbLongN++; fbLongNet += t.pnlPct; }
+                            else { fbShortN++; fbShortNet += t.pnlPct; }
+                            if (t.entry > 0) fbSlPcts.add(Math.abs(t.entry - t.sl) / t.entry * 100.0);
+                        }
+                    }
+                } catch (Throwable fbEx) {
+                    LOG.fine("[STARTUP-BT] FLOW-shadow " + sym + " failed: " + fbEx.getMessage());
+                } finally {
+                    bt.setStrategyModeOverride(null);
+                }
+
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt(); break;
             } catch (Exception e) {
@@ -2660,7 +2696,7 @@ public final class BotMain {
         // [v86.61] было if(shadowN>0) вокруг ВСЕГО блока — при пустом основном прогоне
         // (0 TREND-сделок) строки MR/TE-SHADOW копились, но не печатались (минор из
         // ревью v86.60). Теперь печатаем всё, что есть; EXIT-таблица — только при shadowN>0.
-        if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0) {
+        if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0 || fbTrades > 0) {
             String[] svName = {
                     "C 50%@TP1+BE (текущий)",
                     "F D+актив (PL+stag, ~live)",
@@ -2708,6 +2744,21 @@ public final class BotMain {
                         teLoN[ti], teLoNet[ti], medSl));
             }
             sb2.append("  _TE: KILL если medSL<1.0% (кост>0.25R) или объём-без-эджа или красный чоп; решение ≥3 прогонов_\n");
+            // [v86.69 FLOW-SHADOW] чоп-комплемент к TREND: value-area break + taker-flow.
+            // ЦЕЛЬ: зелёный в П2/П4 (где TREND красный) = кандидат в чоп-ногу к 4/4.
+            if (fbTrades == 0) {
+                sb2.append("🧪 FLOW-SHADOW: 0 сделок (value-area break+flow сетапов на окне нет)\n");
+            } else {
+                java.util.List<Double> fsls = new ArrayList<>(fbSlPcts);
+                java.util.Collections.sort(fsls);
+                double fbMedSl = fsls.isEmpty() ? 0 : fsls.get(fsls.size() / 2);
+                sb2.append(String.format(
+                        "🧪 FLOW-SHADOW (чоп: value-area break+flow): %d сд · WR %.0f%% · %+.1f%% · %+.3f%%/сд\n"
+                        + "  П1..П4 %+.0f/%+.0f/%+.0f/%+.0f · L %d/%+.1f%% S %d/%+.1f%% · medSL %.2f%% (зелёный П2/П4 = чоп-нога!)\n",
+                        fbTrades, 100.0 * fbWins / fbTrades, fbNet, fbNet / fbTrades,
+                        fbHalf[0], fbHalf[1], fbHalf[2], fbHalf[3],
+                        fbLongN, fbLongNet, fbShortN, fbShortNet, fbMedSl));
+            }
             shadowBlock = sb2.toString();
         }
 
