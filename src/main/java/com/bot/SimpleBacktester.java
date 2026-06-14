@@ -721,10 +721,14 @@ public final class SimpleBacktester {
                     engine.setSimulatedFunding(symbol, currentFr, prevFr);
                 }
 
-                // [v86.73] Кормим btGic BTC-барами, ЗАКРЫТЫМИ к decisionTime (без look-ahead) →
-                // BTC-режим-гейт (PANIC/CRASH/onlyLong/onlyShort) теперь живой в BT, как в проде.
-                // Указатель btcHi только вперёд; трейлинг-окно 120 баров (хватает EMA20/50+склон).
-                if (btcCandles != null && btcCandles.size() > 30) {
+                // [v86.74] btGic-feed ГЕЙЧЕН OFF по умолчанию (BT_FEED_BTC_GIC=1 включает).
+                // v86.73 кормил btGic BTC-барами → BTC-режим-гейт зарезал 165→29 сделок (82%):
+                // мой 120-бар trailing-feed переклассифицирует режим ЖЁСТЧЕ live (live при
+                // str=0.30 почти не вето'ит) → выборка 29 = бесполезна для статистики. РЕГРЕСС.
+                // Идея верная (BT не должен врать в панику), но реализация должна ТОЧНО совпасть
+                // с live (окно KLINES, пороги PANIC/onlyShort) — отдельный R&D. Пока — off.
+                if ("1".equals(System.getenv().getOrDefault("BT_FEED_BTC_GIC", "0"))
+                        && btcCandles != null && btcCandles.size() > 30) {
                     while (btcHi < btcCandles.size() && btcCandles.get(btcHi).closeTime <= decisionTime) btcHi++;
                     if (btcHi > 30) btGic.update(btcCandles.subList(Math.max(0, btcHi - 120), btcHi));
                 }
