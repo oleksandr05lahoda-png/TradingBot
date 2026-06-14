@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.67";
+    private static final String BOT_VERSION = "v86.68";
 
     static final class ForecastRecord {
         final String symbol;
@@ -3144,8 +3144,16 @@ public final class BotMain {
                     double v = Double.parseDouble(k.getString(5));
                     long closeT = k.getLong(6);
                     double qv = Double.parseDouble(k.getString(7));
+                    // [v86.68] DATA-PIPELINE: парсим taker-buy объём (klines idx 8/9/10) в бэктест.
+                    // Раньше зануляли через 8-арг конструктор → CVD/aggressor-flow = 0 в shadow →
+                    // ЛЮБАЯ order-flow чоп-стратегия (для портфеля к 4/4) была НЕпроверяема. Данные
+                    // уже приходят в klines, просто выбрасывались. TREND их не читает → его BT-edge
+                    // не меняется (проверено: generateTrendAligned/DEM не ссылаются на takerBuy).
+                    int    nTr     = k.length() > 8  ? k.getInt(8)                       : 0;
+                    double tbBase  = k.length() > 9  ? Double.parseDouble(k.getString(9))  : 0.0;
+                    double tbQuote = k.length() > 10 ? Double.parseDouble(k.getString(10)) : 0.0;
                     byTime.putIfAbsent(openT,
-                            new com.bot.TradingCore.Candle(openT, o, h, l, c, v, qv, closeT));
+                            new com.bot.TradingCore.Candle(openT, o, h, l, c, v, qv, closeT, nTr, tbBase, tbQuote));
                 }
                 remaining -= arr.length();
                 // Walk further back: next endTime = oldest bar's openTime - 1

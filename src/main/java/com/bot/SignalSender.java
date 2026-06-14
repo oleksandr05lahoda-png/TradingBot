@@ -2937,12 +2937,18 @@ public final class SignalSender {
                     double v = Double.parseDouble(k.getString(5));
                     double qv = k.length() > 7 ? Double.parseDouble(k.getString(7)) : 0.0;
                     long closeT = k.getLong(6);
+                    // [v86.68] DATA-PIPELINE: taker-buy объём (idx 8/9/10) — раньше зануляли
+                    // через 8-арг конструктор. Нужен для CVD/aggressor order-flow (REST-fallback
+                    // паритет с WS, где он уже приходит). См. BotMain BT-загрузчик.
+                    int    nTr     = k.length() > 8  ? k.getInt(8)                       : 0;
+                    double tbBase  = k.length() > 9  ? Double.parseDouble(k.getString(9))  : 0.0;
+                    double tbQuote = k.length() > 10 ? Double.parseDouble(k.getString(10)) : 0.0;
 
                     // Sanity check — skip malformed candles
                     if (h < l || o <= 0 || c <= 0 || Double.isNaN(o) || Double.isNaN(c)) {
                         continue;
                     }
-                    list.add(new com.bot.TradingCore.Candle(openT, o, h, l, c, v, qv, closeT));
+                    list.add(new com.bot.TradingCore.Candle(openT, o, h, l, c, v, qv, closeT, nTr, tbBase, tbQuote));
                 }
                 return list; // success — may be empty if Binance really returned []
 
