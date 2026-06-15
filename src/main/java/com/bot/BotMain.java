@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.81";
+    private static final String BOT_VERSION = "v86.82";
 
     static final class ForecastRecord {
         final String symbol;
@@ -3132,14 +3132,17 @@ public final class BotMain {
             java.util.List<Double> oosPnls = new ArrayList<>();  // [v86.80] real purged-OOS per-trade net
             for (String sym : symbols) {
                 try {
-                    // [v90] Walk-forward bars scale with TF.
-                    //   15m: 2880 bars = 30 days; window 1344 = 14 days, step 288 = 3 days
-                    //   1h:   720 bars = 30 days; window  336 = 14 days, step  72 = 3 days
+                    // [v90] Walk-forward bars scale with TF. [v86.82] train shrunk / test grown:
+                    // the train window is vestigial here (TREND is rule-based, NOT fit per-window),
+                    // so a smaller train + bigger test extracts ~1.7x more held-out OOS trades from
+                    // the SAME fetched data (old 336/72 gave only ~16 OOS trades across 30 coins).
+                    //   15m: 2880 bars; train 672 (~7d), test 480 (~5d)
+                    //   1h:   720 bars; train 168 (~7d), test 120 (~5d)
                     int wfTotalBars = PRIMARY_IS_15M ? 2880 : 720;
                     int wfHtfBars   = PRIMARY_IS_15M ? 720 : 180;
                     int wfMinBars   = PRIMARY_IS_15M ? 1500 : 400;
-                    int wfWindow    = PRIMARY_IS_15M ? 1344 : 336;
-                    int wfStep      = PRIMARY_IS_15M ? 288  : 72;
+                    int wfWindow    = PRIMARY_IS_15M ? 672 : 168;   // train bars (~7d)
+                    int wfStep      = PRIMARY_IS_15M ? 480 : 120;   // test bars (~5d)
                     List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, PRIMARY_TF, wfTotalBars);
                     List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, HTF_FAST,  wfHtfBars);
                     if (m15 == null || m15.size() < wfMinBars) continue;
@@ -3186,7 +3189,7 @@ public final class BotMain {
                 String msg = String.format(
                         "🔭 *НАСТОЯЩИЙ OOS — purged walk-forward (embargo)*\n"
                       + "━━━━━━━━━━━━━━━━━━━━━\n"
-                      + "%d OOS-сделок · %d окон · %d монет (SECTOR_LEADERS)\n"
+                      + "%d OOS-сделок · %d окон · %d монет (scan-вселенная)\n"
                       + "Net %+.1f%% · avg %+.3f%%/сд · CI95 [%+.3f, %+.3f]\n"
                       + "%s\n"
                       + "_Out-of-sample: train→gap→test→embargo. In-sample «X/4» в стартовой сводке — НЕ это._",
@@ -3195,7 +3198,18 @@ public final class BotMain {
                 LOG.info(String.format("[WalkForward] OOS %d trades net=%.1f avg=%.3f CI[%.3f,%.3f]",
                         m, net, avg, ciLo, ciHi));
             } else {
-                LOG.info("[WalkForward] OOS sample too small (" + oosPnls.size() + " < 20) — no verdict");
+                // [v86.82] Still send an HONEST message (don't go silent): a thin held-out
+                // sample is itself informative — 30d of a selective strategy yields few OOS
+                // trades. Report the count; the judge stays the in-sample CI + ≥100 live.
+                String msg = String.format(
+                        "🔭 *OOS walk-forward (purged) — выборка тонкая*\n"
+                      + "━━━━━━━━━━━━━━━━━━━━━\n"
+                      + "Только %d held-out сделок (%d окон · %d монет) — мало для CI-вердикта.\n"
+                      + "30д истории + селективный TREND дают мало OOS-сделок. Судья остаётся:\n"
+                      + "in-sample bootstrap-CI (в сводке) + ≥100 живых исходов.",
+                        oosPnls.size(), totalWindows, symbols.size());
+                try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
+                LOG.info("[WalkForward] OOS thin sample (" + oosPnls.size() + " < 20) — informational msg sent");
             }
             if (alerts > 0) {
                 LOG.info(String.format(
