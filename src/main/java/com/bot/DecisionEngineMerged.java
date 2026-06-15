@@ -2941,13 +2941,14 @@ public final class DecisionEngineMerged {
         return idea;
     }
 
-    // [v86.69] FLOW_BREAK — чоп-стратегия (комплемент TREND, путь к 4/4 walk-forward).
-    // Тезис: в боковике (нет 4h-тренда) граница value-area (VAH/VAL) держится резервной
-    // лимит-ликвидностью; её ПРОБОЙ на реальном агрессор-флоу = маркет-мейкеры из абсорбции
-    // переходят в погоню → продолжение. НЕ mean-rev: ПОКУПАЕМ пробой VAH (MR бы его фейдил),
-    // инвалидация = возврат в зону (тезис MR — механически инверсны). Флоу-гейт (taker-buy
-    // ratio) — НОВЫЙ дискриминатор, разблокированный v86.68 (без него = голый VCB, мёртв).
-    // Структурно НЕ пересекается с TREND (htfSep<0.4% = точное дополнение sep≥0.4%).
+    // [v86.77] MOMENTUM — «ЛОВЛЯ ВЗРЫВА»: ловим СТАРТ большого движения (AVAX/TAO памп),
+    // который trend пропускает (входит поздно, у вершины). Прямой ответ на жалобу юзера
+    // «теряю большие свечи». Тезис: взрывная свеча (range ≥ 2.5×ATR + объём ≥ 2.5×SMA) с
+    // сильным ОДНОСТОРОННИМ агрессор-флоу (taker-buy, v86.68) = реальный катализатор, не
+    // фейк-спайк. Входим С движением; ТУГОЙ стоп (1.2×ATR, режем быстро) + БОЛЬШАЯ цель
+    // (3.5R) → профиль НИЗКИЙ WR / крупные winner'ы (моментум, не тренд). Честный риск:
+    // голый пробой мёртв (VCB −96%); flow+объём — новый фильтр реальности vs фейк. Только
+    // measure-only тень. (Перепрофилирован из v86.69 FLOW_BREAK value-area — был красный.)
     private TradeIdea generateFlowBreak(String symbol,
                                         List<com.bot.TradingCore.Candle> c15,  // PRIMARY (1h)
                                         List<com.bot.TradingCore.Candle> c1h,  // HTF (4h)
@@ -2974,33 +2975,23 @@ public final class DecisionEngineMerged {
         if (atrPct < csEnvDouble("TA_ATR_MIN", 0.004) || atrPct > csEnvDouble("TA_ATR_MAX", 0.06))
             return reject("fb_atr_oob");
 
-        // ── ЧОП-ГЕЙТ: точное дополнение TREND (нет разнесённого 4h-тренда) ──
-        double[] hFast = com.bot.TradingCore.emaSeries(c1h, 20);
-        double[] hSlow = com.bot.TradingCore.emaSeries(c1h, 50);
-        if (hFast.length < 3 || hSlow.length < 3) return reject("fb_htf_short");
-        double hPrice = c1h.get(c1h.size() - 1).close;
-        double htfSep = Math.abs(hFast[hFast.length - 1] - hSlow[hSlow.length - 1]) / Math.max(1e-9, hPrice);
-        if (htfSep >= csEnvDouble("TA_HTF_SEP_MIN", 0.004)) return reject("fb_htf_trending");
+        // ── ВЗРЫВ: explosive свеча = старт катализатора (range ≥ 2.5×ATR + объём ≥ 2.5×SMA) ──
+        double volSma = tpComputeVolSma(c15, 20);
+        double volR = volSma > 0 ? last.volume / volSma : 0.0;
+        double rangeAtr = atr > 0 ? last.range / atr : 0.0;
+        if (rangeAtr < csEnvDouble("FB_EXPL_ATR", 2.5)) return reject("fb_no_explosion");
+        if (volR < csEnvDouble("FB_EXPL_VOL", 2.5))     return reject("fb_low_vol_burst");
+        // направление = сторона взрывной свечи (входим С движением, не против)
+        boolean wantLong = last.close > last.open;
 
-        // ── VALUE AREA по 48 закрытым барам ДО пробойного (без look-ahead его объёма) ──
-        com.bot.TradingCore.VolumeProfileResult vp =
-                com.bot.TradingCore.volumeProfile(c15.subList(n - 49, n - 1), 24);
-        if (vp.vah <= 0 || vp.val <= 0 || vp.valueAreaWidth <= 0) return reject("fb_no_profile");
-
-        // ── ПРОБОЙ границы + направление из пробоя (не из тренда) ──
-        boolean breakUp   = last.close > vp.vah;
-        boolean breakDown = last.close < vp.val;
-        if (!breakUp && !breakDown) return reject("fb_no_break");
-        boolean wantLong = breakUp;
-
-        // ── ТЕЛО: импульс, не фитиль ──
+        // ── ТЕЛО: импульс, не фитиль-вынос ──
         if (last.range <= 0 || last.body / last.range < csEnvDouble("FB_BODY_MIN", 0.5))
             return reject("fb_weak_body");
 
-        // ── FLOW CONFIRM (новый edge v86.68): агрессор согласен с направлением пробоя ──
+        // ── FLOW CONFIRM (v86.68): агрессор согласен с движением = реальный катализатор, не фейк ──
         if (last.volume <= 0) return reject("fb_no_vol");
         double flow = last.takerBuySellRatio();   // taker-buy base / volume ∈ [0..1]
-        double flowMin = csEnvDouble("FB_FLOW_MIN", 0.55);
+        double flowMin = csEnvDouble("FB_FLOW_MIN", 0.60);
         if (wantLong  && flow < flowMin)         return reject("fb_no_buy_flow");
         if (!wantLong && flow > (1.0 - flowMin)) return reject("fb_no_sell_flow");
 
@@ -3014,28 +3005,28 @@ public final class DecisionEngineMerged {
             if (!wantLong && btc.onlyLong) return reject("fb_btc_only_long");
         }
 
-        // ── SL/TP (структурно: стоп = ATR-ширина; цель 2R, кост << R) ──
-        double slDist = atr * csEnvDouble("FB_SL_ATR", 1.5);
+        // ── SL/TP: стоп ТУГОЙ (режем лоссы быстро), цель БОЛЬШАЯ (низкий WR, крупные winner'ы) ──
+        double slDist = atr * csEnvDouble("FB_SL_ATR", 1.2);
         double slPct = slDist / price;
-        if (slPct < 0.004 || slPct > 0.04) return reject("fb_sl_oob");
-        double tpR = csEnvDouble("FB_TP_R", 2.0);
+        if (slPct < 0.004 || slPct > 0.05) return reject("fb_sl_oob");
+        double tpR = csEnvDouble("FB_TP_R", 3.5);
         double stop = wantLong ? price - slDist : price + slDist;
         double tp2  = wantLong ? price + slDist * tpR : price - slDist * tpR;
 
-        // ── score: сила флоу = уверенность ──
+        // ── score: сила флоу + величина взрыва = уверенность ──
         double flowEdge = wantLong ? (flow - 0.5) : (0.5 - flow);   // ∈ [0..0.5]
         double prob = 58.0;
         if (flowEdge > 0.10) prob += 4;
         if (flowEdge > 0.20) prob += 3;
-        if (vp.valueAreaWidth > 0.01) prob += 2;
+        if (rangeAtr > 3.5)  prob += 2;
         prob = Math.min(75.0, prob);
         if (prob < csEnvDouble("FB_MIN_CONF", 50.0)) return reject("fb_low_conf");
 
         com.bot.TradingCore.Side side = wantLong
                 ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
         List<String> flags = new ArrayList<>();
-        flags.add("FLOW_BREAK_1H");
-        flags.add(breakUp ? "VAH_BREAK" : "VAL_BREAK");
+        flags.add("MOMENTUM_1H");
+        flags.add(wantLong ? "EXPL_UP" : "EXPL_DOWN");
         flags.add(String.format("FLOW=%.2f", flow));
         HTFBias bias = detectBias2H(c1h);
 

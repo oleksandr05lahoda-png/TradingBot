@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.76";
+    private static final String BOT_VERSION = "v86.77";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2764,14 +2764,14 @@ public final class BotMain {
             // [v86.69 FLOW-SHADOW] чоп-комплемент к TREND: value-area break + taker-flow.
             // ЦЕЛЬ: зелёный в П2/П4 (где TREND красный) = кандидат в чоп-ногу к 4/4.
             if (fbTrades == 0) {
-                sb2.append("🧪 FLOW-SHADOW: 0 сделок (value-area break+flow сетапов на окне нет)\n");
+                sb2.append("🧪 MOMENTUM-SHADOW: 0 сделок (взрывных свечей с flow на окне нет)\n");
             } else {
                 java.util.List<Double> fsls = new ArrayList<>(fbSlPcts);
                 java.util.Collections.sort(fsls);
                 double fbMedSl = fsls.isEmpty() ? 0 : fsls.get(fsls.size() / 2);
                 sb2.append(String.format(
-                        "🧪 FLOW-SHADOW (чоп: value-area break+flow): %d сд · WR %.0f%% · %+.1f%% · %+.3f%%/сд\n"
-                        + "  П1..П4 %+.0f/%+.0f/%+.0f/%+.0f · L %d/%+.1f%% S %d/%+.1f%% · medSL %.2f%% (зелёный П2/П4 = чоп-нога!)\n",
+                        "🧪 MOMENTUM-SHADOW (ловля взрыва: range+vol+flow, цель 3.5R): %d сд · WR %.0f%% · %+.1f%% · %+.3f%%/сд\n"
+                        + "  П1..П4 %+.0f/%+.0f/%+.0f/%+.0f · L %d/%+.1f%% S %d/%+.1f%% · medSL %.2f%% (низкий WR норма; зелёный net = ловит большие движения!)\n",
                         fbTrades, 100.0 * fbWins / fbTrades, fbNet, fbNet / fbTrades,
                         fbHalf[0], fbHalf[1], fbHalf[2], fbHalf[3],
                         fbLongN, fbLongNet, fbShortN, fbShortNet, fbMedSl));
