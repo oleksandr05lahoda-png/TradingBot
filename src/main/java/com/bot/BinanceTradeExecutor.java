@@ -1317,36 +1317,6 @@ public final class BinanceTradeExecutor {
         }
     }
 
-    /**
-     * Get unrealized PnL for an open position.
-     * @return PnL in USDT, or 0 if no position.
-     */
-    public double fetchUnrealizedPnl(String symbol) {
-        if (!isReady()) return 0;
-        try {
-            long ts = ts();
-            String qs = "symbol=" + symbol + "&timestamp=" + ts + "&recvWindow=60000";
-            String sig = hmacSHA256(apiSecret, qs);
-            HttpResponse<String> resp = http.send(
-                    HttpRequest.newBuilder()
-                            .uri(URI.create(baseUrl + "/fapi/v2/positionRisk?" + qs + "&signature=" + sig))
-                            .timeout(Duration.ofSeconds(8))
-                            .header("X-MBX-APIKEY", apiKey)
-                            .GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) return 0;
-            JSONArray arr = new JSONArray(resp.body());
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject o = arr.getJSONObject(i);
-                if (symbol.equals(o.optString("symbol"))) {
-                    return o.optDouble("unRealizedProfit", 0);
-                }
-            }
-            return 0;
-        } catch (Exception e) {
-            return 0;
-        }
-    }
 
     /**
      * [v86 EXIT-FIX] Get current mark price for a symbol via positionRisk endpoint.

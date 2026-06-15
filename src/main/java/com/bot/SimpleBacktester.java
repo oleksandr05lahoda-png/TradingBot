@@ -486,80 +486,6 @@ public final class SimpleBacktester {
         }
     }
 
-    /** Portfolio-level result aggregating multiple symbols */
-    public static final class PortfolioResult {
-        public final List<BacktestResult> symbolResults = new ArrayList<>();
-        public final List<String> warnings = new ArrayList<>();   // [PATCH #3]
-        public double totalNetPnL, portfolioSharpe, portfolioMaxDD;
-        public double avgWinRate, avgEV, avgPF;
-        public int totalTrades;
-        public double finalBalance;
-
-        public void compute(double initialBal) {
-            totalTrades = symbolResults.stream().mapToInt(r -> r.total).sum();
-            totalNetPnL = symbolResults.stream().mapToDouble(r -> r.netPnL).sum();
-            avgWinRate  = symbolResults.stream().filter(r -> r.total > 0).mapToDouble(r -> r.winRate).average().orElse(0);
-            avgEV       = symbolResults.stream().filter(r -> r.total > 0).mapToDouble(r -> r.ev).average().orElse(0);
-            avgPF       = symbolResults.stream().filter(r -> r.total > 0).mapToDouble(r -> r.profitFactor).average().orElse(0);
-
-            // Portfolio max DD from all trades sorted by time
-            List<TradeRecord> allTrades = new ArrayList<>();
-            symbolResults.forEach(r -> allTrades.addAll(r.trades));
-            allTrades.sort(Comparator.comparingLong(t -> t.entryTime));
-
-            double equity = initialBal;
-            double peak = initialBal;
-            double maxDD = 0;
-            for (TradeRecord t : allTrades) {
-                equity += equity * t.pnlPct / 100.0;
-                peak = Math.max(peak, equity);
-                maxDD = Math.max(maxDD, (peak - equity) / peak);
-            }
-            portfolioMaxDD = maxDD * 100;
-            finalBalance = equity;
-
-            // Portfolio daily returns
-            Map<Long, Double> dailyPnL = new TreeMap<>();
-            for (TradeRecord t : allTrades) {
-                long day = t.entryTime / 86400_000L;
-                dailyPnL.merge(day, t.pnlPct, Double::sum);
-            }
-            if (dailyPnL.size() >= 5) {
-                double[] dailyArr = dailyPnL.values().stream().mapToDouble(Double::doubleValue).toArray();
-                double mean = Arrays.stream(dailyArr).average().orElse(0);
-                double var  = Arrays.stream(dailyArr).map(r -> Math.pow(r - mean, 2)).average().orElse(0);
-                double std  = Math.sqrt(var);
-                portfolioSharpe = std > 0 ? (mean / std) * Math.sqrt(365) : 0;
-            }
-        }
-
-        @Override
-        public String toString() {
-            StringBuilder sb = new StringBuilder();
-            sb.append("╔══════════ PORTFOLIO BACKTEST ══════════╗\n");
-            sb.append(String.format("║ Symbols: %d | Trades: %d\n", symbolResults.size(), totalTrades));
-            sb.append(String.format("║ Net PnL: %+.2f%% | Final: $%.2f\n", totalNetPnL, finalBalance));
-            sb.append(String.format("║ Avg WR: %.1f%% | Avg EV: %+.4f | Avg PF: %.2f\n", avgWinRate * 100, avgEV, avgPF));
-            sb.append(String.format("║ Portfolio Sharpe: %.2f | MaxDD: %.1f%%\n", portfolioSharpe, portfolioMaxDD));
-
-            int sumWins=0, sumLosses=0, sumBE=0, sumTS=0, sumPL=0, sumTrail=0, sumStag=0;
-            for (BacktestResult r : symbolResults) {
-                sumWins += r.wins; sumLosses += r.losses; sumBE += r.breakEvens;
-                sumTS += r.timeStops; sumPL += r.profitLocks;
-                sumTrail += r.trailExits; sumStag += r.stagnationExits;
-            }
-            sb.append(String.format("║ Exits: TP=%d SL=%d BE=%d TS=%d PL=%d Trail=%d Stag=%d\n",
-                    sumWins, sumLosses, sumBE, sumTS, sumPL, sumTrail, sumStag));
-
-            sb.append("╠══════════ PER SYMBOL ══════════════════╣\n");
-            symbolResults.stream()
-                    .sorted(Comparator.comparingDouble((BacktestResult r) -> r.ev).reversed())
-                    .forEach(r -> sb.append(String.format("║ %-10s TR:%3d WR:%.0f%% EV:%+.3f PF:%.1f DD:%.0f%%\n",
-                            r.symbol, r.total, r.winRate * 100, r.ev, r.profitFactor, r.maxDrawdownPct)));
-            sb.append("╚════════════════════════════════════════╝");
-            return sb.toString();
-        }
-    }
 
     //  SINGLE SYMBOL BACKTEST
 
@@ -855,47 +781,6 @@ public final class SimpleBacktester {
         return result;
     }
 
-    //  PORTFOLIO BACKTEST (multiple symbols simultaneously)
-
-    /**
-     * Portfolio backtest — per-symbol isolated, NO cross-symbol concurrency.
-     *
-     * WARNING: this is NOT a true portfolio simulation. Each symbol runs independently,
-     * which means the total may show 50 concurrent positions even though live CorrelationGuard
-     * limits to 5-6. Per-symbol metrics are trustworthy; aggregate P&L is NOT a live-realistic
-     * number (it ignores maxConcurrent and cross-symbol correlation).
-     *
-     * For a proper portfolio simulation you need to merge all symbols into a single timeline
-     * with shared equity and max-concurrent cap. That's a separate refactor.
-     */
-    public PortfolioResult runPortfolio(Map<String, SymbolData> allData) {
-        PortfolioResult portfolio = new PortfolioResult();
-        portfolio.warnings.add("[WARN] runPortfolio() is per-symbol isolated. Aggregate P&L "
-                + "ignores maxConcurrent and cross-symbol correlation. Use per-symbol results only.");
-
-        for (Map.Entry<String, SymbolData> entry : allData.entrySet()) {
-            SymbolData data = entry.getValue();
-            BacktestResult result = run(entry.getKey(), data.m1, data.m5, data.m15, data.h1, data.category);
-            if (result.total >= 3) {
-                portfolio.symbolResults.add(result);
-            }
-        }
-
-        portfolio.compute(initialBalance);
-        return portfolio;
-    }
-
-    /** Data container for all timeframes of a symbol */
-    public static final class SymbolData {
-        public final List<com.bot.TradingCore.Candle> m1, m5, m15, h1;
-        public final com.bot.DecisionEngineMerged.CoinCategory category;
-
-        public SymbolData(List<com.bot.TradingCore.Candle> m1, List<com.bot.TradingCore.Candle> m5,
-                          List<com.bot.TradingCore.Candle> m15, List<com.bot.TradingCore.Candle> h1,
-                          com.bot.DecisionEngineMerged.CoinCategory category) {
-            this.m1 = m1; this.m5 = m5; this.m15 = m15; this.h1 = h1; this.category = category;
-        }
-    }
 
     //  WALK-FORWARD VALIDATION
 

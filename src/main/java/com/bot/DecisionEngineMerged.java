@@ -193,24 +193,6 @@ public final class DecisionEngineMerged {
     // от чисто шумовых ассоциаций (random < 0.15).
     private static final double MIN_CLUSTER_SCORE        = 0.22;
 
-    // [HOLE-LONG FIX 2026-05-08] Env-параметризация LONG-suppression слоёв.
-    // Дефолты сохраняют старое поведение. Чтобы разморозить LONG в bear-market:
-    //   HTF_OPPOSE_PENALTY=0           — убирает -5 баллов за HTF mismatch
-    //   GIC_LONG_HARD_VETO=0           — конвертирует hard-reject в soft penalty
-    //   DUAL_HTF_PENALTY_MULT=0.85     — мягче чем 0.65 (default)
-    private static final double HTF_OPPOSE_PENALTY = envDoubleStatic("HTF_OPPOSE_PENALTY", 5.0);
-    private static final boolean GIC_LONG_HARD_VETO = !"0".equals(
-            System.getenv().getOrDefault("GIC_LONG_HARD_VETO", "1"));
-    private static final double DUAL_HTF_PENALTY_MULT = envDoubleStatic("DUAL_HTF_PENALTY_MULT", 0.65);
-    private static final double SINGLE_HTF_PENALTY_MULT = envDoubleStatic("SINGLE_HTF_PENALTY_MULT", 0.85);
-
-    private static double envDoubleStatic(String key, double def) {
-        try {
-            String v = System.getenv(key);
-            if (v == null || v.isBlank()) return def;
-            return Double.parseDouble(v.trim());
-        } catch (Throwable t) { return def; }
-    }
 
     /** [HOLE-4] Required agreeing clusters for the given market state. */
     private static int clustersRequired(MarketState ms) {

@@ -2008,11 +2008,6 @@ public final class SignalSender {
         return Collections.unmodifiableList(seed);
     }
 
-    /** @deprecated Заменён на getM1FromWs(). Оставлен для совместимости с TradeResolver. */
-    @Deprecated
-    private void updateLiveM1Buffer(String pair, List<com.bot.TradingCore.Candle> m1) {
-        // no-op: liveM1Buffer теперь заполняется исключительно из processAggTrade()
-    }
 
     //  РАЗМЕР ПОЗИЦИИ — Kelly-inspired компаундинг
 
@@ -2062,17 +2057,7 @@ public final class SignalSender {
         else if (balance < 150.0)  sizeMult *= 0.75;
 
         // Flag-based modifiers (синхрон с DE.java tags)
-        if (idea.flags.contains("PRE_BREAK_UP") || idea.flags.contains("PRE_BREAK_DN"))
-            sizeMult *= 1.15;
         if (idea.flags.contains("EARLY_TICK"))             sizeMult *= 0.85;
-        if (idea.flags.contains("EXHAUSTION_REVERSAL_BOOST")) sizeMult *= 0.80;
-        if (idea.flags.contains("LATE_ENTRY_SIZE_CUT"))    sizeMult *= 0.80;
-        if (idea.flags.contains("ELITE_REV_LONG"))         sizeMult *= 0.75;
-        else if (idea.flags.contains("STRONG_REV_LONG"))   sizeMult *= 0.55;
-        else if (idea.flags.contains("COUNTER_TREND_LONG")) sizeMult *= 0.40;
-        else if (idea.flags.contains("WEAK_REV_LONG"))     sizeMult *= 0.25;
-        // [HOLE-LONG FIX] GIC panic soft-veto — реальный size cut
-        if (idea.flags.contains("GIC_PANIC_SIZE_CUT"))     sizeMult *= 0.40;
 
         // ISC institutional risk multiplier (depends on signal strength)
         sizeMult *= isc.getRiskSizeMultiplier();
