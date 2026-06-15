@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.83";
+    private static final String BOT_VERSION = "v86.84";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2073,6 +2073,11 @@ public final class BotMain {
         double fbNet = 0.0, fbLongNet = 0.0, fbShortNet = 0.0;
         double[] fbHalf = new double[4];
         java.util.List<Double> fbSlPcts = new ArrayList<>();
+        // [v86.84 FLOW_FADE-SHADOW] фейд границы рейнджа + flow-истощение, measure-only. Чоп-нога
+        // (htfSep<TA_HTF_SEP_MIN = дополнение TREND), где TREND молчит. Никогда не кормит калибратор/ISC.
+        int ffTrades = 0, ffWins = 0;
+        double ffNet = 0.0;
+        double[] ffHalfPnL = new double[4];
         // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
         // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
         // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
@@ -2513,6 +2518,35 @@ public final class BotMain {
                     bt.setStrategyModeOverride(null);
                 }
 
+                // [v86.84 FLOW_FADE-SHADOW] фейд границы рейнджа + flow-истощение measure-only на
+                // ТЕХ ЖЕ свечах. Никогда не кормит калибратор/ISC; только строка сравнения в сводке.
+                try {
+                    bt.setStrategyModeOverride("FLOW_FADE");
+                    com.bot.SimpleBacktester.BacktestResult r5 =
+                            bt.run(sym, empty, m5, m15, h1, cat);
+                    if (r5 != null && r5.trades != null && !r5.trades.isEmpty()) {
+                        ffTrades += r5.total;
+                        ffWins   += r5.wins;
+                        ffNet    += r5.netPnL;
+                        long tMin5 = Long.MAX_VALUE, tMax5 = Long.MIN_VALUE;
+                        for (com.bot.SimpleBacktester.TradeRecord t : r5.trades) {
+                            if (t.entryTime < tMin5) tMin5 = t.entryTime;
+                            if (t.entryTime > tMax5) tMax5 = t.entryTime;
+                        }
+                        long tSpan5 = Math.max(1L, tMax5 - tMin5);
+                        for (com.bot.SimpleBacktester.TradeRecord t : r5.trades) {
+                            int hi5 = (int) (WF_PERIODS * (t.entryTime - tMin5) / tSpan5);
+                            if (hi5 < 0) hi5 = 0;
+                            if (hi5 >= WF_PERIODS) hi5 = WF_PERIODS - 1;
+                            ffHalfPnL[hi5] += t.pnlPct;
+                        }
+                    }
+                } catch (Throwable ffEx) {
+                    LOG.fine("[STARTUP-BT] FLOW_FADE-shadow " + sym + " failed: " + ffEx.getMessage());
+                } finally {
+                    bt.setStrategyModeOverride(null);
+                }
+
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt(); break;
             } catch (Exception e) {
@@ -2736,7 +2770,7 @@ public final class BotMain {
         // [v86.61] было if(shadowN>0) вокруг ВСЕГО блока — при пустом основном прогоне
         // (0 TREND-сделок) строки MR/TE-SHADOW копились, но не печатались (минор из
         // ревью v86.60). Теперь печатаем всё, что есть; EXIT-таблица — только при shadowN>0.
-        if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0 || fbTrades > 0) {
+        if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0 || fbTrades > 0 || ffTrades > 0) {
             String[] svName = {
                     "C 50%@TP1+BE (текущий)",
                     "F D+актив (PL+stag, ~live)",
@@ -2805,6 +2839,15 @@ public final class BotMain {
                         fbTrades, 100.0 * fbWins / fbTrades, fbNet, fbNet / fbTrades,
                         fbHalf[0], fbHalf[1], fbHalf[2], fbHalf[3],
                         fbLongN, fbLongNet, fbShortN, fbShortNet, fbMedSl));
+            }
+            // [v86.84 FLOW_FADE-SHADOW] фейд границы рейнджа + flow-истощение, measure-only.
+            // ЦЕЛЬ: зелёный в П2/П4 (чоп), где TREND молчит = кандидат в чоп-ногу к 4/4.
+            if (ffTrades > 0) {
+                sb2.append(String.format(
+                        "🧪 FLOW_FADE-SHADOW (фейд границы + flow-истощение, measure-only): %d сд · WR %.0f%% · %+.1f%%\n"
+                        + "  _по периодам: П1 %+.0f · П2 %+.0f · П3 %+.0f · П4 %+.0f — нужен зелёный в П2/П4 (чоп), где TREND молчит_\n",
+                        ffTrades, 100.0 * ffWins / ffTrades, ffNet,
+                        ffHalfPnL[0], ffHalfPnL[1], ffHalfPnL[2], ffHalfPnL[3]));
             }
             shadowBlock = sb2.toString();
         }

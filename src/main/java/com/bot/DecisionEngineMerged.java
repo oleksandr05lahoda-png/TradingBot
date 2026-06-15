@@ -1748,6 +1748,16 @@ public final class DecisionEngineMerged {
             return reject("flow_break_no_setup");
         }
 
+        // [v86.84] FLOW_FADE — mean-rev range-edge fade GATED to chop (htfSep<TA_HTF_SEP_MIN, the
+        // exact complement of TREND) + adverse aggressor-flow EXHAUSTING at the edge. Leak-free
+        // (flow from CLOSED pre-entry bars only). Measure-only shadow (FLOW_FADE-SHADOW); promotion
+        // to live = зелёный в П2/П4 ≥3 прогона. Mirror of the FLOW_BREAK dispatch shape.
+        if (stratMode.equals("FLOW_FADE")) {
+            TradeIdea ff = generateFlowFade(symbol, c15, c1h, cat, now);
+            if (ff != null) { csLastSignalTime.put(symbol, now); return ff; }
+            return reject("flow_fade_no_setup");
+        }
+
         // ── FUNDING: изолированный тест funding-edge ──
         if (stratMode.equals("FUNDING")) {
             TradeIdea f = generateFromFundingMomentum(symbol, c1, c5, c15, c1h, c2h, cat, now);
@@ -2389,6 +2399,189 @@ public final class DecisionEngineMerged {
         flags.add(String.format("VOL=%.1fx", volRatio));
         flags.add(String.format("ATR=%.2f%%", atrPct * 100));
         flags.add(String.format("SL=%.2f%%", slPct * 100));
+
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+        double tp2Mult = rr;
+
+        TradeIdea idea = new TradeIdea(
+                symbol, side, price, sl, tp, tp2Mult,
+                probability, flags, 0.0, 0.0, 0.0,
+                "NONE", cat, null, 1.0, tp2Mult, tp2Mult);
+        idea.setRobustAtrPct(atrPct);
+        idea.setAgreeingClusters(4);
+        return idea;
+    }
+
+    // [v86.84] FLOW_FADE — mean-reversion range-edge fade, GATED to fire ONLY when the
+    // ADVERSE aggressor taker-flow is EXHAUSTING at the edge, ONLY in chop (htfSep<TA_HTF_SEP_MIN
+    // = exactly where TREND is silent). Falsification (MR×flow-exhaustion, v86.83) showed the
+    // exhaustion subset = WR 71% / +0.543% vs the rest WR 40% / −0.304%. LEAK-FREE: flow is
+    // computed ONLY from CLOSED pre-entry bars (the forming bar is stripped, mirror of v86.15).
+    // Measure-only shadow (FLOW_FADE-SHADOW); never feeds calibrator/ISC. Clone of MR + 4 gates
+    // (chop / wick-rejection / flow-exhaustion / stricter R:R). Returns null on any reject (MR
+    // semantics); the generate() dispatch converts null → reject("flow_fade_no_setup").
+    private TradeIdea generateFlowFade(String symbol,
+                                       List<com.bot.TradingCore.Candle> c15,
+                                       List<com.bot.TradingCore.Candle> c1h,
+                                       CoinCategory cat,
+                                       long now) {
+        // Pre-filters (same conservative gating как MR/VCB)
+        if (cat == CoinCategory.MEME) return null;
+        if (c15 == null || c15.size() < 100) return null;
+        if (c1h == null || c1h.size() < 50) return null;
+        if (!tpIsMajorCoin(symbol) && cat != CoinCategory.TOP) return null;
+
+        // [v86.84] LEAK-FREE: drop the trailing FORMING (unclosed) bar so flow/wick are read
+        // ONLY from CLOSED bars (mirror of v86.15 in generateTrendAligned/generateFlowBreak).
+        // Live cache includes the in-flight bar; backtest slices never do (closeTime < now), so
+        // this is a no-op in BT and the shadow stays leak-free in both paths.
+        long _nowMs = System.currentTimeMillis();
+        if (!c15.isEmpty() && c15.get(c15.size() - 1).closeTime > _nowMs) c15 = c15.subList(0, c15.size() - 1);
+        if (!c1h.isEmpty() && c1h.get(c1h.size() - 1).closeTime > _nowMs) c1h = c1h.subList(0, c1h.size() - 1);
+
+        int n = c15.size();
+        if (n < 100) return null;
+        com.bot.TradingCore.Candle last15 = c15.get(n - 1);
+        double price = last15.close;
+        if (price <= 0) return null;
+
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return null;
+        double atrPct = atr14 / price;
+        if (atrPct < 0.005 || atrPct > 0.05) return null;
+
+        // ── 1. RANGE REGIME — ADX gates (MR_ADX_MAX / MR_ADX1H_MAX)
+        com.bot.TradingCore.ADXResult adxR = com.bot.TradingCore.adx(c15, 14);
+        if (adxR.adx > csEnvDouble("MR_ADX_MAX", 32)) return null;
+        com.bot.TradingCore.ADXResult adx1h = com.bot.TradingCore.adx(c1h, 14);
+        if (adx1h.adx > csEnvDouble("MR_ADX1H_MAX", 35)) return null;
+
+        // ── 2. NOT in squeeze — bandwidth gate
+        com.bot.TradingCore.BollingerSqueeze bb =
+                com.bot.TradingCore.bollingerSqueeze(c15, 20, 2.0, 96);
+        if (bb.upper <= 0 || bb.lower <= 0) return null;
+        if (bb.bandwidthPctile < csEnvDouble("MR_BW_MIN", 0.20)) return null;
+
+        // ── 3. BB EXTREME TOUCH — pctB extreme (отбой от ЗОНЫ границы)
+        double pctB = (price - bb.lower) / Math.max(1e-9, bb.upper - bb.lower);
+        double pctBedge = csEnvDouble("MR_PCTB_EDGE", 0.12);
+        boolean upperTouch = pctB > (1.0 - pctBedge);
+        boolean lowerTouch = pctB < pctBedge;
+        if (!upperTouch && !lowerTouch) return null;
+        boolean wantLong = lowerTouch;
+
+        // ── 4. RSI EXTREME
+        double[] rsi = com.bot.TradingCore.rsiSeries(c15, 14);
+        double rsiNow = rsi[n - 1];
+        double rsiLong = csEnvDouble("MR_RSI_LONG", 42);
+        if (wantLong && rsiNow > rsiLong) return null;
+        if (!wantLong && rsiNow < (100.0 - rsiLong)) return null;
+
+        // ── 5. NORMAL volume band
+        double volSma = tpComputeVolSma(c15, 20);
+        if (volSma <= 0) return null;
+        double volRatio = last15.volume / volSma;
+        if (volRatio > csEnvDouble("MR_VOL_MAX", 2.0)) return null;
+        if (volRatio < 0.4) return null; // dead market, no liquidity
+
+        // ── 6. BTC REGIME guard
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC) return null;
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH) return null;
+            if (wantLong && btc.onlyShort) return null;
+            if (!wantLong && btc.onlyLong) return null;
+        }
+
+        // ══ FLOW_FADE GATES (added on top of the MR base) ══
+
+        // ── (A) CHOP gate — copy generateTrendAligned's 4h EMA20/50 separation "htfSep" and
+        // require htfSep < TA_HTF_SEP_MIN. TREND rejects on htfSep < TA_HTF_SEP_MIN ("ta_htf_tangled"),
+        // so this confines FLOW_FADE to EXACTLY the chop where TREND is silent (complement, no overlap).
+        double[] hFast = com.bot.TradingCore.emaSeries(c1h, 20);
+        double[] hSlow = com.bot.TradingCore.emaSeries(c1h, 50);
+        if (hFast.length < 3 || hSlow.length < 3) return null;
+        double hFastNow = hFast[hFast.length - 1];
+        double hSlowNow = hSlow[hSlow.length - 1];
+        double hPrice = c1h.get(c1h.size() - 1).close;
+        double htfSep = Math.abs(hFastNow - hSlowNow) / Math.max(1e-9, hPrice);
+        if (htfSep >= csEnvDouble("TA_HTF_SEP_MIN", 0.004)) return null; // 4h-тренд есть → не чоп → TREND-зона
+
+        // ── (B) WICK-REJECTION gate — the extreme bar must reject the edge with a wick + close
+        // back inside (failed push). SHORT(top): long upper wick + red close; LONG(bottom): long
+        // lower wick + green close. Wick ratios from TradingCore.Candle (upperWickRatio/lowerWickRatio).
+        double wickMin = csEnvDouble("FF_WICK_MIN", 0.45);
+        if (wantLong) {
+            if (!(last15.lowerWickRatio() >= wickMin && last15.close > last15.open)) return null;
+        } else {
+            if (!(last15.upperWickRatio() >= wickMin && last15.close < last15.open)) return null;
+        }
+
+        // ── (C) FLOW-EXHAUSTION gate — LEAK-FREE: only the last 3 CLOSED bars (forming bar already
+        // stripped, so c15.get(n-1) is the last closed bar). takerBuySellRatio ∈ [0..1], default 0.5
+        // when volume 0 (safe). SHORT (fade top → buyers exhausting): buy-ratio falling over 3 bars
+        // (fc-fa >= drop), now bearish (fa<0.50), and ≥1 of the 2 steps declining. LONG (fade bottom →
+        // sellers exhausting → buy-ratio RISING): fa-fc >= drop, now bullish (fa>0.50), and ≥1 step rising.
+        double fa = c15.get(n - 1).takerBuySellRatio();   // most recent closed
+        double fb = c15.get(n - 2).takerBuySellRatio();
+        double fc = c15.get(n - 3).takerBuySellRatio();
+        double drop = csEnvDouble("FF_FLOW_DROP", 0.06);
+        if (wantLong) {
+            int steps = (fb > fc ? 1 : 0) + (fa > fb ? 1 : 0);
+            if (!(fa - fc >= drop && fa > 0.50 && steps >= 1)) return null;
+        } else {
+            int steps = (fb < fc ? 1 : 0) + (fa < fb ? 1 : 0);
+            if (!(fc - fa >= drop && fa < 0.50 && steps >= 1)) return null;
+        }
+
+        // ── (D) RISK geometry — MR's SL beyond BB extreme + ATR×FF_SL_ATR, TP=midBB; but STRICTER
+        // rr-gate (FF_MIN_RR=1.6) — MR's TP=midBB is too close to clear 1h cost at MR's 1.1.
+        double sl;
+        double tp;
+        if (wantLong) {
+            sl = bb.lower - atr14 * csEnvDouble("FF_SL_ATR", 0.6);
+            tp = bb.mid;
+        } else {
+            sl = bb.upper + atr14 * csEnvDouble("FF_SL_ATR", 0.6);
+            tp = bb.mid;
+        }
+        double slDist = Math.abs(price - sl);
+        double tpDist = Math.abs(tp - price);
+        if (slDist < 1e-9 || tpDist < 1e-9) return null;
+        double slPct = slDist / price;
+        if (slPct < 0.005 || slPct > 0.03) return null;
+
+        double rr = tpDist / slDist;
+        if (rr < csEnvDouble("FF_MIN_RR", 1.6)) return null;
+
+        // ── PROBABILITY scoring (MR tail, unchanged)
+        double prob01 = 0.55;
+        if (Math.abs(rsiNow - 50) > 30) prob01 += 0.05;
+        if (bb.bandwidthPctile > 0.70) prob01 += 0.03;
+        if (adxR.adx < 18) prob01 += 0.03;
+        if (volRatio < 0.7) prob01 += 0.04;
+        if (tpIsMajorCoin(symbol)) prob01 += 0.03;
+        if (btc != null && btc.regime ==
+                com.bot.GlobalImpulseController.GlobalRegime.NEUTRAL) prob01 += 0.03;
+
+        prob01 = Math.min(0.78, prob01);
+        double probability = prob01 * 100.0;
+
+        // ── BUILD IDEA (MR build-tail; only the strategy flags changed)
+        List<String> flags = new ArrayList<>();
+        flags.add("FLOW_FADE_1H");
+        flags.add(wantLong ? "FLOW_FADE_LONG" : "FLOW_FADE_SHORT");
+        flags.add("CLUSTER_HTF_RANGE");
+        flags.add("CLUSTER_MOM_OVERSOLD");
+        flags.add(String.format("BB_PCTB=%.2f", pctB));
+        flags.add(String.format("RSI=%.1f", rsiNow));
+        flags.add(String.format("ADX=%.0f", adxR.adx));
+        flags.add(String.format("VOL=%.1fx", volRatio));
+        flags.add(String.format("ATR=%.2f%%", atrPct * 100));
+        flags.add(String.format("SL=%.2f%%", slPct * 100));
+        flags.add(String.format("FLOW=%.2f/%.2f/%.2f", fc, fb, fa));
 
         com.bot.TradingCore.Side side = wantLong
                 ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
