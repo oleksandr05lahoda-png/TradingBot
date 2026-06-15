@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.80";
+    private static final String BOT_VERSION = "v86.81";
 
     static final class ForecastRecord {
         final String symbol;
@@ -3115,7 +3115,18 @@ public final class BotMain {
                                                  com.bot.TelegramBotSender telegram) {
         try {
             com.bot.SimpleBacktester bt = new com.bot.SimpleBacktester();
-            List<String> symbols = new ArrayList<>(SECTOR_LEADERS.keySet());
+            // [v86.81] Wider OOS universe — 8 SECTOR_LEADERS gave only ~8 held-out trades
+            // (< min). Use the live scan universe (same source the startup-BT samples) so the
+            // OOS sample is usable; fall back to leaders if the snapshot isn't ready yet. Runs
+            // AFTER the startup-BT (memory freed) so the extra fetches are safe on -Xmx380m.
+            List<String> symbols;
+            try {
+                List<String> snap = sender.getScanUniverseSnapshot(30);
+                symbols = (snap != null && snap.size() >= 8)
+                        ? new ArrayList<>(snap) : new ArrayList<>(SECTOR_LEADERS.keySet());
+            } catch (Throwable t) {
+                symbols = new ArrayList<>(SECTOR_LEADERS.keySet());
+            }
             int alerts = 0, totalWindows = 0;
             double totalDelta = 0;
             java.util.List<Double> oosPnls = new ArrayList<>();  // [v86.80] real purged-OOS per-trade net
@@ -3157,7 +3168,7 @@ public final class BotMain {
             // [v86.80] REAL purged-OOS edge verdict — bootstrap CI on held-out trades.
             // The startup-BT "X/4 периодов" line is IN-SAMPLE entryTime-bucketing (not OOS);
             // THIS is the honest out-of-sample (train→gap→test→embargo) significance.
-            if (oosPnls.size() >= 30) {
+            if (oosPnls.size() >= 20) {   // [v86.81] align with in-sample gate (allPnls>=20)
                 int m = oosPnls.size();
                 double net = 0.0; for (double p : oosPnls) net += p;
                 double avg = net / m;
@@ -3184,7 +3195,7 @@ public final class BotMain {
                 LOG.info(String.format("[WalkForward] OOS %d trades net=%.1f avg=%.3f CI[%.3f,%.3f]",
                         m, net, avg, ciLo, ciHi));
             } else {
-                LOG.info("[WalkForward] OOS sample too small (" + oosPnls.size() + " < 30) — no verdict");
+                LOG.info("[WalkForward] OOS sample too small (" + oosPnls.size() + " < 20) — no verdict");
             }
             if (alerts > 0) {
                 LOG.info(String.format(
