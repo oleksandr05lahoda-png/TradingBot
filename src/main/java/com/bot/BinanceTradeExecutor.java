@@ -79,6 +79,32 @@ public final class BinanceTradeExecutor {
 
     private static final Logger LOG = Logger.getLogger("BinanceTradeExecutor");
 
+    // ─── Idempotency: client order IDs ────────────────────────────────
+    // [v86.85 LIVE-MONEY] Each LIVE order carries a deterministic
+    // newClientOrderId so that a retried order after an AMBIGUOUS timeout
+    // cannot double-fill. Binance rejects a re-POST with the SAME id via
+    // error -4015 ("Client order id is duplicate") — we treat that as
+    // SUCCESS (the order already exists) instead of resending blindly.
+    // The SAME id string MUST be reused across retries of one logical
+    // action (entry / close / emergency). DORMANT in paper
+    // (LIVE_TRADING_ARMED=0 → these methods are never called); the
+    // backtest never touches the executor.
+    private static final java.util.concurrent.atomic.AtomicLong CID_SEQ =
+            new java.util.concurrent.atomic.AtomicLong(0);
+
+    /**
+     * Build a Binance-valid newClientOrderId. Must match
+     * {@code ^[\.A-Za-z0-9_-]{1,36}$}. Kept short & unique per process
+     * (nanoTime + monotonic seq). tag: "e"=entry, "c"=close, "x"=emergency.
+     */
+    private static String newClientOrderId(String tag, String symbol) {
+        String s = symbol == null ? "" : symbol.replaceAll("[^A-Za-z0-9]", "");
+        if (s.length() > 12) s = s.substring(0, 12);
+        String id = "b" + tag + s + "-" + Long.toString(System.nanoTime() % 1_000_000_000L, 36)
+                + "-" + CID_SEQ.incrementAndGet();
+        return id.length() > 36 ? id.substring(0, 36) : id;
+    }
+
     // ─── Configuration ────────────────────────────────────────────────
     private final boolean useTestnet;
     private final String  apiKey;
@@ -844,7 +870,12 @@ public final class BinanceTradeExecutor {
             }
 
             // 4. Send MARKET order
-            String entryOrderId = sendMarketOrder(symbol, isLong, qty);
+            // [v86.85] ONE clientOrderId for this logical entry, reused on the
+            // retry below. If the first POST actually filled but its response
+            // timed out / -1109'd, the retry's POST is refused with -4015 →
+            // treated as SUCCESS → no double-fill.
+            String entryCid = newClientOrderId("e", symbol);
+            String entryOrderId = sendMarketOrder(symbol, isLong, qty, entryCid);
             // [v86.21] On rejection (e.g. intermittent -1109) retry ONCE — but only after
             // confirming no position actually opened, to avoid a double-fill.
             if (entryOrderId == null) {
@@ -855,7 +886,7 @@ public final class BinanceTradeExecutor {
                 boolean confirmedFlat = !Double.isNaN(_chk) && Math.abs(_chk) < 1e-9;
                 if (confirmedFlat) {
                     try { Thread.sleep(500L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                    entryOrderId = sendMarketOrder(symbol, isLong, qty);
+                    entryOrderId = sendMarketOrder(symbol, isLong, qty, entryCid);
                 } else if (Double.isNaN(_chk)) {
                     LOG.warning("[Executor] " + symbol + " entry rejected AND position-read failed (-1109?) — NOT retrying to avoid double-fill; treat as possibly-open");
                 }
@@ -1236,7 +1267,12 @@ public final class BinanceTradeExecutor {
             cancelAllOpenOrders(symbol);
 
             // 3. Send opposite-side market order
-            String orderId = sendMarketOrder(symbol, !wasLong, absQty);
+            // [v86.85] Idempotent close: a single clientOrderId for this close.
+            // closePosition has no pre-flat check, so if a caller-level retry
+            // re-invokes after an ambiguous timeout, the SAME id makes Binance
+            // refuse the resend with -4015 → treated as SUCCESS → no double-fill.
+            String closeCid = newClientOrderId("c", symbol);
+            String orderId = sendMarketOrder(symbol, !wasLong, absQty, closeCid);
             if (orderId == null) {
                 LOG.severe("[Executor] CLOSE FAILED on " + symbol + " — manual intervention needed");
                 return false;
@@ -1471,13 +1507,26 @@ public final class BinanceTradeExecutor {
         } catch (Exception e) { return null; }
     }
 
-    /** Send a MARKET order. Returns orderId on success, null on failure. */
-    private String sendMarketOrder(String symbol, boolean buy, double qty) throws Exception {
+    /**
+     * Send a MARKET order. Returns orderId on success, null on failure.
+     *
+     * [v86.85 LIVE-MONEY IDEMPOTENCY] {@code clientId} is sent as Binance
+     * {@code newClientOrderId}. Callers MUST reuse the SAME clientId across
+     * retries of one logical action so an ambiguous timeout can't double-fill:
+     *   - The hedge-mode (-4061) retry reuses the SAME id (safe: a -4061 means
+     *     the first POST did NOT fill).
+     *   - If Binance rejects with -4015 ("Client order id is duplicate") the
+     *     order with this id ALREADY EXISTS (a prior attempt actually
+     *     succeeded) → treated as SUCCESS: returns the clientId (non-null) so
+     *     the caller does NOT resend → no double-fill.
+     */
+    private String sendMarketOrder(String symbol, boolean buy, double qty, String clientId) throws Exception {
         long ts = ts();
         String body = "symbol=" + symbol
                 + "&side=" + (buy ? "BUY" : "SELL")
                 + "&type=MARKET"
                 + "&quantity=" + formatQty(qty)
+                + "&newClientOrderId=" + clientId
                 + "&newOrderRespType=RESULT"
                 + "&timestamp=" + ts + "&recvWindow=60000";
         String sig = hmacSHA256(apiSecret, body);
@@ -1492,9 +1541,20 @@ public final class BinanceTradeExecutor {
                 HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
             String b = resp.body() == null ? "" : resp.body();
+            // [v86.85] -4015 = "Client order id is duplicate" → the order with
+            // this id was ALREADY accepted by a prior (ambiguously-timed-out)
+            // attempt. Treat as SUCCESS to convert a dangerous resend into a
+            // safe no-op. Return the clientId (non-null) so the caller stops.
+            if (b.contains("-4015") || b.toLowerCase().contains("duplicate")) {
+                LOG.warning("[Executor] MARKET " + symbol + " duplicate clientId "
+                        + clientId + " refused by Binance (-4015) — prior attempt already "
+                        + "placed the order; treating as SUCCESS (prevented double-fill)");
+                return clientId;
+            }
             // -4061 = "Order's position side does not match." HEDGE mode
             // detected despite ensureOneWayMode() at boot — retry with explicit
-            // positionSide as fallback.
+            // positionSide as fallback. Reuse the SAME clientId (the -4061 means
+            // the first POST did NOT fill, so re-using the id is safe).
             if (b.contains("-4061") || b.contains("position side")) {
                 LOG.warning("[Executor] " + symbol + " HEDGE mode detected, retrying with positionSide");
                 long ts2 = ts();
@@ -1503,6 +1563,7 @@ public final class BinanceTradeExecutor {
                         + "&positionSide=" + (buy ? "LONG" : "SHORT")
                         + "&type=MARKET"
                         + "&quantity=" + formatQty(qty)
+                        + "&newClientOrderId=" + clientId
                         + "&newOrderRespType=RESULT"
                         + "&timestamp=" + ts2 + "&recvWindow=60000";
                 String sig2 = hmacSHA256(apiSecret, body2);
@@ -1518,8 +1579,16 @@ public final class BinanceTradeExecutor {
                 if (resp2.statusCode() == 200) {
                     return new JSONObject(resp2.body()).optString("orderId", null);
                 }
+                // [v86.85] same -4015 safety on the hedge retry.
+                String b2 = resp2.body() == null ? "" : resp2.body();
+                if (b2.contains("-4015") || b2.toLowerCase().contains("duplicate")) {
+                    LOG.warning("[Executor] MARKET retry " + symbol + " duplicate clientId "
+                            + clientId + " refused (-4015) — prior attempt already placed; "
+                            + "treating as SUCCESS (prevented double-fill)");
+                    return clientId;
+                }
                 LOG.warning("[Executor] MARKET retry " + symbol + " HTTP " + resp2.statusCode()
-                        + ": " + resp2.body());
+                        + ": " + b2);
                 return null;
             }
             LOG.warning("[Executor] MARKET order " + symbol + " HTTP " + resp.statusCode()
@@ -2068,6 +2137,11 @@ public final class BinanceTradeExecutor {
         int    lastStatus = 0;
         String lastBody   = "";
         final int maxAttempts = 3;
+        // [v86.85 LIVE-MONEY] ONE clientOrderId reused across ALL retry
+        // iterations of this emergency close. The loop re-POSTs on timeout;
+        // reusing the id means a re-POST after an ambiguous timeout dedups
+        // (Binance -4015) instead of double-closing.
+        final String emCid = newClientOrderId("x", symbol);
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 long ts = ts();
@@ -2076,6 +2150,7 @@ public final class BinanceTradeExecutor {
                         + "&type=MARKET"
                         + "&quantity=" + formatQty(qty)
                         + "&reduceOnly=true"
+                        + "&newClientOrderId=" + emCid
                         + "&timestamp=" + ts + "&recvWindow=60000";
                 String sig = hmacSHA256(apiSecret, body);
                 HttpResponse<String> resp = http.send(
@@ -2107,14 +2182,25 @@ public final class BinanceTradeExecutor {
                     }
                     LOG.severe("[Executor] emergencyClose " + symbol
                             + " HTTP200 but position still open after 1.5s verify — retrying");
+                } else if (lastBody.contains("-4015") || lastBody.toLowerCase().contains("duplicate")) {
+                    // [v86.85] A re-POST of this emergency close hit a duplicate
+                    // clientOrderId → the close from a prior (timed-out) attempt
+                    // already went through. Treat as SUCCESS and STOP retrying so
+                    // we don't double-close.
+                    LOG.warning("[Executor] emergencyClose " + symbol + " duplicate clientId "
+                            + emCid + " refused (-4015) — close already placed by a prior "
+                            + "attempt; treating as SUCCESS (prevented double-close)");
+                    return true;
                 } else if (lastBody.contains("-4061") || lastBody.contains("position side")) {
-                    // HEDGE-mode require explicit positionSide
+                    // HEDGE-mode require explicit positionSide. Reuse the SAME
+                    // emCid (a -4061 means this POST did NOT execute the close).
                     long ts2 = ts();
                     String body2 = "symbol=" + symbol
                             + "&side=" + (wasLong ? "SELL" : "BUY")
                             + "&positionSide=" + (wasLong ? "LONG" : "SHORT")
                             + "&type=MARKET"
                             + "&quantity=" + formatQty(qty)
+                            + "&newClientOrderId=" + emCid
                             + "&timestamp=" + ts2 + "&recvWindow=60000";
                     String sig2 = hmacSHA256(apiSecret, body2);
                     HttpResponse<String> resp2 = http.send(
@@ -2142,6 +2228,13 @@ public final class BinanceTradeExecutor {
                                 return true;
                             }
                         }
+                    } else if (lastBody.contains("-4015") || lastBody.toLowerCase().contains("duplicate")) {
+                        // [v86.85] HEDGE retry hit duplicate clientId → close already
+                        // placed by a prior attempt. Treat as SUCCESS, stop retrying.
+                        LOG.warning("[Executor] emergencyClose " + symbol + " HEDGE retry duplicate clientId "
+                                + emCid + " refused (-4015) — close already placed; "
+                                + "treating as SUCCESS (prevented double-close)");
+                        return true;
                     } else {
                         LOG.warning("[Executor] emergencyClose " + symbol
                                 + " attempt " + attempt + " HEDGE retry failed: HTTP "
