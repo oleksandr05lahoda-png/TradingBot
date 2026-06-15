@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.77";
+    private static final String BOT_VERSION = "v86.78";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2599,6 +2599,24 @@ public final class BotMain {
         }
         String halfBreakdown = hb.toString();
 
+        // [v86.78] CI-ВЕРДИКТ: «🟢 РЕАЛЬНЫЙ edge» теперь требует, чтобы нижняя граница
+        // bootstrap-CI95 на avg/сделку была > 0 (ПОСЛЕ косто́в). Раньше вердикт ВРАЛ —
+        // зелёный по порогу Net PnL>20, хотя CI накрывал ноль (= возможно везучее окно).
+        // Тот же seed, что у sigBlock → значения совпадают. Защита от арма реала на шуме.
+        boolean ciSignificant = false;
+        if (allPnls.size() >= 20) {
+            int vB = 1000, vm = allPnls.size();
+            double[] vMeans = new double[vB];
+            java.util.Random vRng = new java.util.Random(20260614L);
+            for (int b = 0; b < vB; b++) {
+                double s = 0.0;
+                for (int i = 0; i < vm; i++) s += allPnls.get(vRng.nextInt(vm));
+                vMeans[b] = s / vm;
+            }
+            java.util.Arrays.sort(vMeans);
+            ciSignificant = vMeans[(int) (0.025 * vB)] > 0;  // нижняя граница CI95 > 0
+        }
+
         // [FIX-1] Differentiate technical failure vs strategy verdict.
         String verdict;
         boolean techFailure = totalTrades == 0
@@ -2657,14 +2675,21 @@ public final class BotMain {
             double expectancyR = avgPnLPerTrade / 1.0; // assume avg risk = 1% (estimate)
             double monthlyPnL  = avgPnLPerTrade * 30; // grobering daily count
 
-            if (totalNetPnL > 20.0 && wr >= 35.0) {
-                verdict = "🟢 *Стратегия показывает РЕАЛЬНЫЙ edge.*\n"
+            if (totalNetPnL > 20.0 && wr >= 35.0 && ciSignificant) {
+                verdict = "🟢 *Стратегия показывает РЕАЛЬНЫЙ edge.* (CI95 исключает ноль)\n"
                         + "WR=" + String.format("%.1f%%", wr)
                         + " · Net PnL=" + String.format("%+.1f%%", totalNetPnL)
                         + " на " + totalTrades + " сделках.\n"
                         + "Avg/trade=" + String.format("%+.2f%%", avgPnLPerTrade) + ".\n"
                         + "Низкий WR при positive PnL — это профессиональная норма для RR 1:2.\n"
                         + "Дальше paper для подтверждения 100+ сделок.";
+            } else if (totalNetPnL > 0 && !ciSignificant) {
+                verdict = "🟡 *Положительный, но НЕ ДОКАЗАН.* Net PnL="
+                        + String.format("%+.1f%%", totalNetPnL) + " (avg "
+                        + String.format("%+.2f%%", avgPnLPerTrade) + "/сд), но\n"
+                        + "bootstrap-CI95 НАКРЫВАЕТ НОЛЬ → статистически неотличим от нуля\n"
+                        + "(возможно везение окна, не доказанный edge).\n"
+                        + "Реал НЕЛЬЗЯ — нужно больше сделок / живое подтверждение.";
             } else if (totalNetPnL > 0 && wr >= 30.0) {
                 verdict = "🟡 *Положительный edge, но слабый.*\n"
                         + "WR=" + String.format("%.1f%%", wr)
