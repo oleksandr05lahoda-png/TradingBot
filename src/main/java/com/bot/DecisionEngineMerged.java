@@ -2507,16 +2507,22 @@ public final class DecisionEngineMerged {
         double hSlowNow = hSlow[hSlow.length - 1];
         double hPrice = c1h.get(c1h.size() - 1).close;
         double htfSep = Math.abs(hFastNow - hSlowNow) / Math.max(1e-9, hPrice);
-        if (htfSep >= csEnvDouble("TA_HTF_SEP_MIN", 0.004)) return null; // 4h-тренд есть → не чоп → TREND-зона
+        // [v86.85] OFF by default (FF_HTF_SEP_MAX=999) — over-restricting cut the validated
+        // population 110→3. FIRST confirm the flow-exhaustion edge leak-free on the full MR
+        // population; re-enable chop-targeting later via FF_HTF_SEP_MAX=0.004 (TREND complement).
+        if (htfSep >= csEnvDouble("FF_HTF_SEP_MAX", 999.0)) return null;
 
         // ── (B) WICK-REJECTION gate — the extreme bar must reject the edge with a wick + close
         // back inside (failed push). SHORT(top): long upper wick + red close; LONG(bottom): long
         // lower wick + green close. Wick ratios from TradingCore.Candle (upperWickRatio/lowerWickRatio).
-        double wickMin = csEnvDouble("FF_WICK_MIN", 0.45);
-        if (wantLong) {
-            if (!(last15.lowerWickRatio() >= wickMin && last15.close > last15.open)) return null;
-        } else {
-            if (!(last15.upperWickRatio() >= wickMin && last15.close < last15.open)) return null;
+        // [v86.85] OFF by default (FF_WICK_MIN=0) — was 0.45; part of the over-restriction (110→3).
+        double wickMin = csEnvDouble("FF_WICK_MIN", 0.0);
+        if (wickMin > 0) {
+            if (wantLong) {
+                if (!(last15.lowerWickRatio() >= wickMin && last15.close > last15.open)) return null;
+            } else {
+                if (!(last15.upperWickRatio() >= wickMin && last15.close < last15.open)) return null;
+            }
         }
 
         // ── (C) FLOW-EXHAUSTION gate — LEAK-FREE: only the last 3 CLOSED bars (forming bar already
@@ -2554,7 +2560,9 @@ public final class DecisionEngineMerged {
         if (slPct < 0.005 || slPct > 0.03) return null;
 
         double rr = tpDist / slDist;
-        if (rr < csEnvDouble("FF_MIN_RR", 1.6)) return null;
+        // [v86.85] default 1.6→1.1 (= MR): the falsification's +0.543 NET held at MR's rr —
+        // the edge is in the 71% WR, not R:R. Raise FF_MIN_RR later if cost-clearing needs it.
+        if (rr < csEnvDouble("FF_MIN_RR", 1.1)) return null;
 
         // ── PROBABILITY scoring (MR tail, unchanged)
         double prob01 = 0.55;
