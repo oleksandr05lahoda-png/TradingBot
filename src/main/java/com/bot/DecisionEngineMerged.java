@@ -3279,8 +3279,8 @@ public final class DecisionEngineMerged {
         // A wall absorbs one-sided flow → HIGH taker volume + TINY range (stall),
         // with flow leaning the SAME direction as the eventual break.
         int lookback = (int) csEnvLong("AB_LOOKBACK", 3);
-        double volMin   = csEnvDouble("AB_VOL_MIN", 2.0);
-        double rangeMax = csEnvDouble("AB_RANGE_MAX", 0.8);
+        double volMin   = csEnvDouble("AB_VOL_MIN", 1.7);   // [v86.90] 2.0→1.7 (pre-reg relax: v86.89 gave 0 trades)
+        double rangeMax = csEnvDouble("AB_RANGE_MAX", 1.0);  // [v86.90] 0.8→1.0 (still non-explosive stall)
         double flowHi   = csEnvDouble("AB_FLOW_HI", 0.62);
         double breakFlow = csEnvDouble("AB_BREAK_FLOW", 0.58);
         double breakVol  = csEnvDouble("AB_BREAK_VOL", 1.0);

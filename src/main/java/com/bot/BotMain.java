@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.89";
+    private static final String BOT_VERSION = "v86.90";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2051,6 +2051,12 @@ public final class BotMain {
         // exhaustion bucket is NOT less-bad than the rest, the absorption discriminator is inert.
         int mrExhN = 0, mrExhW = 0, mrNoexhN = 0, mrNoexhW = 0;
         double mrExhNet = 0.0, mrNoexhNet = 0.0;
+        // [v86.90 CVD-RESUME FALSIFY] tag TREND trades by LEAK-FREE flow-resumption at the SIGNAL
+        // bar (ei-1, ei-2 — strictly BEFORE the fill bar ei, so no v86.83-style entry-bar peek) in
+        // the trade direction. Tests if an order-flow gate would cut the dead-cat reclaims that
+        // reverse (user's "вошёл на верху → развернулось"). Cheap: runs on the real 66 TREND trades.
+        int cvdResN = 0, cvdResW = 0, cvdNoresN = 0, cvdNoresW = 0;
+        double cvdResNet = 0.0, cvdNoresNet = 0.0;
         // [v86.60 PHASE-0] PnL по возрасту 4h-тренда (TREND-сделки): бакеты
         // {0-2,3-5,6-12,13-24,25+} + решающая свёртка young(≤12)/old(>12) × WF.
         // Отвечает данными: живёт ли edge в МОЛОДЫХ трендах (тезис TREND_EARLY)?
@@ -2365,6 +2371,8 @@ public final class BotMain {
                         if (t.entryTime > tMax) tMax = t.entryTime;
                     }
                     long tSpan = Math.max(1L, tMax - tMin);
+                    java.util.Map<Long, Integer> cvdIdx = new java.util.HashMap<>();  // [v86.90] m15 openTime→idx
+                    for (int mi = 0; mi < m15.size(); mi++) cvdIdx.put(m15.get(mi).openTime, mi);
                     for (com.bot.SimpleBacktester.TradeRecord t : r.trades) {
                         int bi = (int) ((t.confidence - 50.0) / 5.0);
                         if (bi < 0) bi = 0;
@@ -2373,6 +2381,17 @@ public final class BotMain {
                         if (t.pnlPct > 0.05) tierWin[bi]++;
                         tierPnL[bi] += t.pnlPct;
                         allPnls.add(t.pnlPct);  // [v86.70] для bootstrap-CI / Monte-Carlo
+                        // [v86.90 CVD-RESUME] leak-free flow-resumption tag (bars cei-1, cei-2 < fill bar cei)
+                        Integer cei = cvdIdx.get(t.entryTime);
+                        if (cei != null && cei >= 2) {
+                            double d1 = 2.0 * m15.get(cei - 1).takerBuyBaseVolume - m15.get(cei - 1).volume;
+                            double d2 = 2.0 * m15.get(cei - 2).takerBuyBaseVolume - m15.get(cei - 2).volume;
+                            boolean tLong = t.side == com.bot.TradingCore.Side.LONG;
+                            boolean resume = tLong ? (d1 > 0 && d1 >= d2) : (d1 < 0 && d1 <= d2);
+                            boolean tWin = t.pnlPct > 0.05;
+                            if (resume) { cvdResN++; if (tWin) cvdResW++; cvdResNet += t.pnlPct; }
+                            else        { cvdNoresN++; if (tWin) cvdNoresW++; cvdNoresNet += t.pnlPct; }
+                        }
 
                         int hi = (int) (WF_PERIODS * (t.entryTime - tMin) / tSpan);
                         if (hi < 0) hi = 0;
@@ -2892,6 +2911,16 @@ public final class BotMain {
                         + "  _по периодам: П1 %+.0f · П2 %+.0f · П3 %+.0f · П4 %+.0f — order-flow ранний вход; нужен зелёный net на >=3 прогонах_\n",
                         abTrades, 100.0 * abWins / abTrades, abNet,
                         abHalfPnL[0], abHalfPnL[1], abHalfPnL[2], abHalfPnL[3]));
+            }
+            // [v86.90 CVD-RESUME FALSIFY] does leak-free flow-resumption at the signal bar separate
+            // TREND winners? on-target for the user's late-reversal pain. Decision: подтв clearly
+            // greener → build the CVD_RESUME gate on TREND; ≈/worse → flow doesn't carry info here.
+            if (cvdResN + cvdNoresN > 0) {
+                sb2.append(String.format(
+                        "🧪 _TREND×CVD-возобновление (тест гейта CVD_RESUME): flow-подтв %d сд WR %.0f%% net %+.1f%% avg %+.3f · без %d сд WR %.0f%% net %+.1f%% avg %+.3f_\n"
+                        + "  _подтв зеленее → flow-гейт улучшит TREND (режет дохлые отскоки); ≈/хуже → не несёт инфо_\n",
+                        cvdResN, cvdResN > 0 ? 100.0 * cvdResW / cvdResN : 0.0, cvdResNet, cvdResN > 0 ? cvdResNet / cvdResN : 0.0,
+                        cvdNoresN, cvdNoresN > 0 ? 100.0 * cvdNoresW / cvdNoresN : 0.0, cvdNoresNet, cvdNoresN > 0 ? cvdNoresNet / cvdNoresN : 0.0));
             }
             shadowBlock = sb2.toString();
         }
