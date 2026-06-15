@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.79";
+    private static final String BOT_VERSION = "v86.80";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1070,8 +1070,7 @@ public final class BotMain {
         auxSched.scheduleAtFixedRate(
                 safe("WalkForward", () -> {
                     int hourUtc = ZonedDateTime.now(ZoneOffset.UTC).getHour();
-                    int dayOfYear = ZonedDateTime.now(ZoneOffset.UTC).getDayOfYear();
-                    if (hourUtc == 5 && dayOfYear % 3 == 0) {
+                    if (hourUtc == 5) {   // [v86.80] daily (was every 3rd day) — real OOS verdict
                         runWalkForwardValidation(sender, telegram);
                     }
                 }),
@@ -1260,6 +1259,17 @@ public final class BotMain {
             }
         } catch (Throwable t) {
             LOG.warning("[STARTUP-BT] init failed: " + t.getMessage());
+        }
+
+        // [v86.80] One-shot REAL OOS walk-forward after boot — queues on the SAME
+        // single-thread heavySched BEHIND the startup-BT, so it runs AFTER the heavy BT
+        // frees its memory (no -Xmx380m OOM overlap). Sends an honest out-of-sample verdict
+        // (the startup-BT "X/4" line is in-sample bucketing, not OOS).
+        try {
+            heavySched.submit(safe("WalkForwardBoot",
+                    () -> runWalkForwardValidation(sender, telegram)));
+        } catch (Throwable t) {
+            LOG.warning("[WF-BOOT] init failed: " + t.getMessage());
         }
 
     }
@@ -2534,7 +2544,7 @@ public final class BotMain {
         String tierBreakdown = tb.toString();
 
         // [v84.3] Walk-forward ВНУТРИ 30д: 4 периода. Edge = плюс на ВСЕХ 4.
-        StringBuilder hb = new StringBuilder("🔭 *Walk-forward (4 периода × ~7.5д):*\n");
+        StringBuilder hb = new StringBuilder("🔭 *In-sample стабильность (4 периода × ~7.5д, бакеты по entryTime — НЕ OOS):*\n");
         String[] halfLbl = {"П1 (старый)", "П2", "П3", "П4 (свежий)"};
         int wfGreens = 0;
         for (int k = 0; k < WF_PERIODS; k++) {
@@ -2547,7 +2557,7 @@ public final class BotMain {
                     "  %s %s: %d сд · WR %.0f%% · %+.1f%% · avg %+.3f%%\n",
                     g ? "🟢" : "🔴", halfLbl[k], halfN[k], hWr, halfPnL[k], hAvg));
         }
-        hb.append(String.format("  _%d/4 периодов в плюс — все 4 = edge; меньше = везение окна_\n", wfGreens));
+        hb.append(String.format("  _%d/4 периодов в плюс (IN-SAMPLE по entryTime, НЕ OOS — настоящий OOS приходит отдельным walk-forward сообщением)_\n", wfGreens));
         // [v86.54] shadow-варианты по периодам: C(текущий)/B(1.5R)/D(100%→TP2).
         // Решающий тест: если D/B бьют C и в красных периодах (П2/П4-чоп), смена
         // выхода робастна; если выигрывают только в трендовых П1/П3 — это window-fit.
@@ -3108,6 +3118,7 @@ public final class BotMain {
             List<String> symbols = new ArrayList<>(SECTOR_LEADERS.keySet());
             int alerts = 0, totalWindows = 0;
             double totalDelta = 0;
+            java.util.List<Double> oosPnls = new ArrayList<>();  // [v86.80] real purged-OOS per-trade net
             for (String sym : symbols) {
                 try {
                     // [v90] Walk-forward bars scale with TF.
@@ -3125,7 +3136,11 @@ public final class BotMain {
                     if (cat == null) cat = com.bot.DecisionEngineMerged.CoinCategory.ALT;
                     List<com.bot.SimpleBacktester.BacktestResult> oos =
                             bt.walkForward(sym, m15, h1, cat, wfWindow, wfStep);
-                    for (com.bot.SimpleBacktester.BacktestResult r : oos) totalWindows++;
+                    for (com.bot.SimpleBacktester.BacktestResult r : oos) {
+                        totalWindows++;
+                        if (r.trades != null)
+                            for (com.bot.SimpleBacktester.TradeRecord t : r.trades) oosPnls.add(t.pnlPct);
+                    }
                     if (oos.size() >= 2) {
                         double firstHalf = 0, secondHalf = 0;
                         int half = oos.size() / 2;
@@ -3138,6 +3153,38 @@ public final class BotMain {
                         if (Math.abs(delta) > 8.0) alerts++;
                     }
                 } catch (Throwable ignored) {}
+            }
+            // [v86.80] REAL purged-OOS edge verdict — bootstrap CI on held-out trades.
+            // The startup-BT "X/4 периодов" line is IN-SAMPLE entryTime-bucketing (not OOS);
+            // THIS is the honest out-of-sample (train→gap→test→embargo) significance.
+            if (oosPnls.size() >= 30) {
+                int m = oosPnls.size();
+                double net = 0.0; for (double p : oosPnls) net += p;
+                double avg = net / m;
+                int B = 1000;
+                double[] means = new double[B];
+                java.util.Random rng = new java.util.Random(20260614L);  // seeded → воспроизводимо
+                for (int b = 0; b < B; b++) {
+                    double s = 0.0; for (int i = 0; i < m; i++) s += oosPnls.get(rng.nextInt(m));
+                    means[b] = s / m;
+                }
+                java.util.Arrays.sort(means);
+                double ciLo = means[(int) (0.025 * B)], ciHi = means[(int) (0.975 * B)];
+                String mark = ciLo > 0 ? "🟢 OOS edge ОТЛИЧИМ от нуля"
+                                       : "🔴 OOS НЕотличим от нуля (CI покрывает шум/кост — реал нельзя)";
+                String msg = String.format(
+                        "🔭 *НАСТОЯЩИЙ OOS — purged walk-forward (embargo)*\n"
+                      + "━━━━━━━━━━━━━━━━━━━━━\n"
+                      + "%d OOS-сделок · %d окон · %d монет (SECTOR_LEADERS)\n"
+                      + "Net %+.1f%% · avg %+.3f%%/сд · CI95 [%+.3f, %+.3f]\n"
+                      + "%s\n"
+                      + "_Out-of-sample: train→gap→test→embargo. In-sample «X/4» в стартовой сводке — НЕ это._",
+                        m, totalWindows, symbols.size(), net, avg, ciLo, ciHi, mark);
+                try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
+                LOG.info(String.format("[WalkForward] OOS %d trades net=%.1f avg=%.3f CI[%.3f,%.3f]",
+                        m, net, avg, ciLo, ciHi));
+            } else {
+                LOG.info("[WalkForward] OOS sample too small (" + oosPnls.size() + " < 30) — no verdict");
             }
             if (alerts > 0) {
                 LOG.info(String.format(
