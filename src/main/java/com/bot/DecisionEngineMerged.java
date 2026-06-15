@@ -1758,6 +1758,17 @@ public final class DecisionEngineMerged {
             return reject("flow_fade_no_setup");
         }
 
+        // [v86.89] ABSORB_BREAK — order-flow "absorption→break": a passive wall absorbs one-sided
+        // aggressor flow (CLOSED bars: HIGH taker vol + TINY range = stall), then price breaks the
+        // stall level WITH continued flow. STRUCTURAL INVERSE of MOMENTUM (no explosive bar needed).
+        // Leak-free (window n-2..n-4 + release n-1 are CLOSED; next-bar-open fill). Measure-only
+        // shadow (ABSORB-SHADOW). Mirror of the FLOW_BREAK/FLOW_FADE dispatch shape.
+        if (stratMode.equals("ABSORB_BREAK")) {
+            TradeIdea ab = generateAbsorbBreak(symbol, c15, c1h, cat, now);
+            if (ab != null) { csLastSignalTime.put(symbol, now); return ab; }
+            return reject("absorb_no_setup");
+        }
+
         // ── FUNDING: изолированный тест funding-edge ──
         if (stratMode.equals("FUNDING")) {
             TradeIdea f = generateFromFundingMomentum(symbol, c1, c5, c15, c1h, c2h, cat, now);
@@ -3211,6 +3222,161 @@ public final class DecisionEngineMerged {
         flags.add("MOMENTUM_1H");
         flags.add(wantLong ? "EXPL_UP" : "EXPL_DOWN");
         flags.add(String.format("FLOW=%.2f", flow));
+        HTFBias bias = detectBias2H(c1h);
+
+        TradeIdea idea = new TradeIdea(
+                symbol, side, price, stop, tp2, tpR, prob, flags,
+                0.0, 0.0, 0.0, bias != null ? bias.name() : "NEUTRAL", cat, null,
+                CS_TP1_R, tpR, tpR);
+        idea.setRobustAtrPct(atrPct);
+        idea.setAgreeingClusters(3);
+        return idea;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // [v86.89 ABSORB_BREAK] STRUCTURAL INVERSE of MOMENTUM/generateFlowBreak.
+    // MOMENTUM needs an EXPLOSIVE big-range bar; ABSORB_BREAK needs a passive
+    // wall ABSORBING one-sided aggressor flow first — on CLOSED bars this shows
+    // as HIGH taker volume + TINY price range (a "stall", not an explosion).
+    // When price then BREAKS the stall level WITH continued flow, it runs.
+    // Fully backtestable on per-bar taker-buy data (BT candles since v86.68).
+    // LEAK-FREE: window n-2..n-4 and release bar n-1 are CLOSED (forming bar
+    // stripped at top, mirror generateFlowBreak's strip); never reads c15.get(n)
+    // or any future bar. BT fills entry on the next bar's open.
+    // ──────────────────────────────────────────────────────────────────────
+    private TradeIdea generateAbsorbBreak(String symbol,
+                                          List<com.bot.TradingCore.Candle> c15,  // PRIMARY (1h)
+                                          List<com.bot.TradingCore.Candle> c1h,  // HTF (4h)
+                                          CoinCategory cat, long now) {
+        if (!valid(c15) || !valid(c1h)) return reject("ab_invalid_candles");
+        if (CS_SKIP_MEME && cat == CoinCategory.MEME) return reject("ab_skip_meme");
+        Long lastSig = csLastSignalTime.get(symbol);
+        if (lastSig != null && (now - lastSig) < CS_COOLDOWN_MS) return reject("ab_cooldown");
+
+        // closed-bars only (зеркало v86.15 / generateFlowBreak): drop the trailing
+        // FORMING bar so every read below is on a CLOSED bar. No-op in BT (slices
+        // never include the in-flight bar), so the shadow stays leak-free both paths.
+        long _nowMs = System.currentTimeMillis();
+        if (!c15.isEmpty() && c15.get(c15.size() - 1).closeTime > _nowMs) c15 = c15.subList(0, c15.size() - 1);
+        if (!c1h.isEmpty() && c1h.get(c1h.size() - 1).closeTime > _nowMs) c1h = c1h.subList(0, c1h.size() - 1);
+
+        int n = c15.size();
+        if (n < 50) return reject("ab_short");
+        com.bot.TradingCore.Candle T = c15.get(n - 1);   // last CLOSED bar = release/breakout candidate
+        double price = T.close;
+        if (price <= 0) return reject("ab_bad_price");
+
+        double atr14 = com.bot.TradingCore.atr(c15, 14);
+        if (atr14 <= 0) return reject("ab_bad_atr");
+        double atrPct = atr14 / price;
+        if (atrPct < csEnvDouble("TA_ATR_MIN", 0.004) || atrPct > csEnvDouble("TA_ATR_MAX", 0.06))
+            return reject("ab_atr_oob");
+
+        double volSma20 = tpComputeVolSma(c15, 20);
+        if (volSma20 <= 0) return reject("ab_no_volsma");
+
+        // ── ABSORPTION WINDOW = bars n-2, n-3, n-4 (T-1..T-3, env AB_LOOKBACK=3).
+        // A wall absorbs one-sided flow → HIGH taker volume + TINY range (stall),
+        // with flow leaning the SAME direction as the eventual break.
+        int lookback = (int) csEnvLong("AB_LOOKBACK", 3);
+        double volMin   = csEnvDouble("AB_VOL_MIN", 2.0);
+        double rangeMax = csEnvDouble("AB_RANGE_MAX", 0.8);
+        double flowHi   = csEnvDouble("AB_FLOW_HI", 0.62);
+        double breakFlow = csEnvDouble("AB_BREAK_FLOW", 0.58);
+        double breakVol  = csEnvDouble("AB_BREAK_VOL", 1.0);
+
+        // window indices: n-2 .. n-(lookback+1); guard against running off the front.
+        int wHiIdx = n - 2;
+        int wLoIdx = n - 1 - lookback;
+        if (wLoIdx < 0) return reject("ab_short");
+
+        // scan window for LONG-side and SHORT-side absorption qualifiers in one pass.
+        boolean longAbs = false, shortAbs = false;
+        double absHighLong = Double.NEGATIVE_INFINITY;   // max high over LONG-qualifying bars
+        double absLowShort = Double.POSITIVE_INFINITY;   // min low  over SHORT-qualifying bars
+        double winLow  = Double.POSITIVE_INFINITY;       // min low  over the FULL window (LONG stop ref)
+        double winHigh = Double.NEGATIVE_INFINITY;       // max high over the FULL window (SHORT stop ref)
+        for (int k = wHiIdx; k >= wLoIdx; k--) {
+            com.bot.TradingCore.Candle bk = c15.get(k);
+            if (bk.low  < winLow)  winLow  = bk.low;
+            if (bk.high > winHigh) winHigh = bk.high;
+            double volR_k   = bk.volume / volSma20;
+            double rangeR_k = bk.range / atr14;
+            double ratio_k  = bk.takerBuySellRatio();
+            boolean stall = volR_k >= volMin && rangeR_k <= rangeMax;
+            if (!stall) continue;
+            if (ratio_k >= flowHi) {                 // buy-side wall absorbing sellers → LONG bias
+                longAbs = true;
+                if (bk.high > absHighLong) absHighLong = bk.high;
+            }
+            if (ratio_k <= (1.0 - flowHi)) {         // sell-side wall absorbing buyers → SHORT bias
+                shortAbs = true;
+                if (bk.low < absLowShort) absLowShort = bk.low;
+            }
+        }
+
+        // ── RELEASE on T: close breaks the stall level WITH continued flow + impulse body.
+        double ratioT = T.takerBuySellRatio();
+        double volRT  = T.volume / volSma20;
+        if (T.range <= 0) return reject("ab_no_range");
+        double bodyRatioT = T.body / T.range;
+
+        boolean wantLong;
+        double absStopRef;   // window extreme used for the stop on the losing side
+        if (longAbs
+                && T.close > absHighLong
+                && ratioT >= breakFlow
+                && volRT >= breakVol
+                && bodyRatioT >= 0.5) {
+            wantLong = true;
+            absStopRef = winLow;
+        } else if (shortAbs
+                && T.close < absLowShort
+                && ratioT <= (1.0 - breakFlow)
+                && volRT >= breakVol
+                && bodyRatioT >= 0.5) {
+            wantLong = false;
+            absStopRef = winHigh;
+        } else {
+            return reject("ab_no_setup");
+        }
+
+        // ── BTC-гейт (как у TREND / generateFlowBreak) ──
+        com.bot.GlobalImpulseController.GlobalContext btc =
+                (gicRef != null) ? gicRef.getContext() : null;
+        if (btc != null) {
+            if (btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_PANIC
+             || btc.regime == com.bot.GlobalImpulseController.GlobalRegime.BTC_CRASH) return reject("ab_btc_bad");
+            if (wantLong && btc.onlyShort) return reject("ab_btc_only_short");
+            if (!wantLong && btc.onlyLong) return reject("ab_btc_only_long");
+        }
+
+        // ── SL: below/above the absorption window extreme + ATR buffer; clamp to [0.004,0.05].
+        double slAtr = csEnvDouble("AB_SL_ATR", 0.5);
+        double stop = wantLong ? absStopRef - atr14 * slAtr : absStopRef + atr14 * slAtr;
+        double slDist = Math.abs(price - stop);
+        double slPct = slDist / price;
+        if (slPct < 0.004 || slPct > 0.05) return reject("ab_sl_oob");
+
+        // ── TARGET: tp = entry ± slDist * AB_TP_R (2.5R, not 3.5R) ──
+        double tpR = csEnvDouble("AB_TP_R", 2.5);
+        double tp2 = wantLong ? price + slDist * tpR : price - slDist * tpR;
+
+        // ── score: break-flow strength = confidence (mirror generateFlowBreak's prob-scoring) ──
+        double flowEdge = wantLong ? (ratioT - 0.5) : (0.5 - ratioT);   // ∈ [0..0.5]
+        double prob = 58.0;
+        if (flowEdge > 0.10) prob += 4;
+        if (flowEdge > 0.20) prob += 3;
+        if (volRT > 1.5)     prob += 2;
+        prob = Math.min(75.0, prob);
+        if (prob < csEnvDouble("AB_MIN_CONF", 50.0)) return reject("ab_low_conf");
+
+        com.bot.TradingCore.Side side = wantLong
+                ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT;
+        List<String> flags = new ArrayList<>();
+        flags.add("ABSORB_BREAK_1H");
+        flags.add(wantLong ? "ABSORB_UP" : "ABSORB_DOWN");
+        flags.add(String.format("FLOW=%.2f", ratioT));
         HTFBias bias = detectBias2H(c1h);
 
         TradeIdea idea = new TradeIdea(

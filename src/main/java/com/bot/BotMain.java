@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.88";
+    private static final String BOT_VERSION = "v86.89";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2078,6 +2078,11 @@ public final class BotMain {
         int ffTrades = 0, ffWins = 0;
         double ffNet = 0.0;
         double[] ffHalfPnL = new double[4];
+        // [v86.89 ABSORB-SHADOW] поглощение→пробой + flow (структурный инверс MOMENTUM), measure-only.
+        // На ТЕХ ЖЕ свечах. Никогда не кормит калибратор/ISC; только строка сравнения в сводке.
+        int abTrades = 0, abWins = 0;
+        double abNet = 0.0;
+        double[] abHalfPnL = new double[4];
         // [v83.7] Разбивка по тирам уверенности (confidence/score, шкала 0-100).
         // Цель: увидеть, есть ли edge у "уверенных" сигналов (какой score-тир в
         // плюсе), чтобы оставить только их. Бины по 5: 50-55,55-60,...,75+.
@@ -2547,6 +2552,36 @@ public final class BotMain {
                     bt.setStrategyModeOverride(null);
                 }
 
+                // [v86.89 ABSORB-SHADOW] поглощение→пробой + flow measure-only на ТЕХ ЖЕ свечах.
+                // Структурный инверс MOMENTUM (стена поглощает поток → пробой стойла). Никогда не
+                // кормит калибратор/ISC; только строка сравнения в сводке. Mirror of FLOW_FADE block.
+                try {
+                    bt.setStrategyModeOverride("ABSORB_BREAK");
+                    com.bot.SimpleBacktester.BacktestResult r6 =
+                            bt.run(sym, empty, m5, m15, h1, cat);
+                    if (r6 != null && r6.trades != null && !r6.trades.isEmpty()) {
+                        abTrades += r6.total;
+                        abWins   += r6.wins;
+                        abNet    += r6.netPnL;
+                        long tMin6 = Long.MAX_VALUE, tMax6 = Long.MIN_VALUE;
+                        for (com.bot.SimpleBacktester.TradeRecord t : r6.trades) {
+                            if (t.entryTime < tMin6) tMin6 = t.entryTime;
+                            if (t.entryTime > tMax6) tMax6 = t.entryTime;
+                        }
+                        long tSpan6 = Math.max(1L, tMax6 - tMin6);
+                        for (com.bot.SimpleBacktester.TradeRecord t : r6.trades) {
+                            int hi6 = (int) (WF_PERIODS * (t.entryTime - tMin6) / tSpan6);
+                            if (hi6 < 0) hi6 = 0;
+                            if (hi6 >= WF_PERIODS) hi6 = WF_PERIODS - 1;
+                            abHalfPnL[hi6] += t.pnlPct;
+                        }
+                    }
+                } catch (Throwable abEx) {
+                    LOG.fine("[STARTUP-BT] ABSORB-shadow " + sym + " failed: " + abEx.getMessage());
+                } finally {
+                    bt.setStrategyModeOverride(null);
+                }
+
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt(); break;
             } catch (Exception e) {
@@ -2770,7 +2805,7 @@ public final class BotMain {
         // [v86.61] было if(shadowN>0) вокруг ВСЕГО блока — при пустом основном прогоне
         // (0 TREND-сделок) строки MR/TE-SHADOW копились, но не печатались (минор из
         // ревью v86.60). Теперь печатаем всё, что есть; EXIT-таблица — только при shadowN>0.
-        if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0 || fbTrades > 0 || ffTrades > 0) {
+        if (shadowN > 0 || mrTrades > 0 || teTrades[0] > 0 || teTrades[1] > 0 || fbTrades > 0 || ffTrades > 0 || abTrades > 0) {
             String[] svName = {
                     "C 50%@TP1+BE (текущий)",
                     "F D+актив (PL+stag, ~live)",
@@ -2848,6 +2883,15 @@ public final class BotMain {
                         + "  _по периодам: П1 %+.0f · П2 %+.0f · П3 %+.0f · П4 %+.0f — нужен зелёный в П2/П4 (чоп), где TREND молчит_\n",
                         ffTrades, 100.0 * ffWins / ffTrades, ffNet,
                         ffHalfPnL[0], ffHalfPnL[1], ffHalfPnL[2], ffHalfPnL[3]));
+            }
+            // [v86.89 ABSORB-SHADOW] поглощение→пробой + flow (структурный инверс MOMENTUM), measure-only.
+            // ЦЕЛЬ: зелёный net на ≥3 прогонах = order-flow ранний вход несёт edge.
+            if (abTrades > 0) {
+                sb2.append(String.format(
+                        "🧪 ABSORB-SHADOW (поглощение→пробой + flow, measure-only): %d сд · WR %.0f%% · %+.1f%%\n"
+                        + "  _по периодам: П1 %+.0f · П2 %+.0f · П3 %+.0f · П4 %+.0f — order-flow ранний вход; нужен зелёный net на >=3 прогонах_\n",
+                        abTrades, 100.0 * abWins / abTrades, abNet,
+                        abHalfPnL[0], abHalfPnL[1], abHalfPnL[2], abHalfPnL[3]));
             }
             shadowBlock = sb2.toString();
         }
