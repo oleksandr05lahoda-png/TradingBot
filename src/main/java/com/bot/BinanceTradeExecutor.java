@@ -869,31 +869,115 @@ public final class BinanceTradeExecutor {
                         + " failed (non-fatal): " + preClean.getMessage());
             }
 
-            // 4. Send MARKET order
+            // 4. Send entry order (MAKER post-only LIMIT, or TAKER MARKET).
             // [v86.85] ONE clientOrderId for this logical entry, reused on the
             // retry below. If the first POST actually filled but its response
             // timed out / -1109'd, the retry's POST is refused with -4015 →
             // treated as SUCCESS → no double-fill.
-            String entryCid = newClientOrderId("e", symbol);
-            String entryOrderId = sendMarketOrder(symbol, isLong, qty, entryCid);
-            // [v86.21] On rejection (e.g. intermittent -1109) retry ONCE — but only after
-            // confirming no position actually opened, to avoid a double-fill.
-            if (entryOrderId == null) {
-                // [v86.24] Only retry if the position is CONFIRMED flat (a 200 read returning ~0).
-                // A -1109 read now returns NaN → unknown → do NOT resend, else we double-fill when
-                // the first order actually filled but its response/verify -1109'd.
-                double _chk = fetchPositionAmountChecked(symbol);
-                boolean confirmedFlat = !Double.isNaN(_chk) && Math.abs(_chk) < 1e-9;
-                if (confirmedFlat) {
-                    try { Thread.sleep(500L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                    entryOrderId = sendMarketOrder(symbol, isLong, qty, entryCid);
-                } else if (Double.isNaN(_chk)) {
-                    LOG.warning("[Executor] " + symbol + " entry rejected AND position-read failed (-1109?) — NOT retrying to avoid double-fill; treat as possibly-open");
+            String entryOrderId = null;
+            boolean makerFilled = false;
+
+            // ════════════════════════════════════════════════════════════════
+            // [v86.86 MAKER ENTRY] Optional post-only LIMIT entry. Env-gated,
+            // DEFAULT "taker" → this whole branch is SKIPPED and openPosition
+            // behaves EXACTLY as before. When EXEC_ENTRY_MODE=maker we try to get
+            // filled passively at the near touch to avoid the taker fee+slippage
+            // on the entry leg; if it doesn't fill within EXEC_MAKER_TIMEOUT_MS we
+            // cancel and fall through to the existing taker MARKET path below.
+            // ════════════════════════════════════════════════════════════════
+            String entryMode = System.getenv().getOrDefault("EXEC_ENTRY_MODE", "taker");
+            String entryCid = newClientOrderId("e", symbol); // maker id (also taker id when mode=taker)
+            if ("maker".equalsIgnoreCase(entryMode)) {
+                double[] ba = fetchBestBidAsk(symbol);
+                if (ba != null && ba.length >= 2 && ba[0] > 0 && ba[1] > 0) {
+                    double makerPx = isLong ? ba[0] : ba[1];          // join the near touch (bid for long, ask for short)
+                    makerPx = roundToTick(makerPx, si.tickSize, isLong);
+                    String mkId = sendLimitMakerOrder(symbol, isLong, qty, makerPx, entryCid);
+                    if (mkId != null) {
+                        // Poll for fill up to EXEC_MAKER_TIMEOUT_MS (default 20000), 500ms steps.
+                        long deadline = System.currentTimeMillis() + (long) envDouble("EXEC_MAKER_TIMEOUT_MS", 20000);
+                        while (System.currentTimeMillis() < deadline) {
+                            double amt = fetchPositionAmountChecked(symbol);
+                            if (!Double.isNaN(amt) && Math.abs(amt) >= qty * 0.999) {
+                                makerFilled = true;
+                                entryOrderId = mkId;
+                                break;
+                            }
+                            Thread.sleep(500);
+                        }
+                        if (!makerFilled) {
+                            // [v86.86] Not fully filled in time. Cancel the resting limit FIRST so
+                            // it can't fill after we've also sent a taker order (→ double-fill).
+                            try { cancelAllOpenOrders(symbol); } catch (Throwable ig) {}
+                            // Re-check the position AFTER the cancel: a PARTIAL maker fill may have
+                            // occurred and now rests as a real position. Conservative rule: never end
+                            // up with MORE than qty. If a partial position exists, KEEP it as the entry
+                            // (set qty = filled amount) and do NOT also send a taker order — sending
+                            // taker for the full qty would double up. The downstream SL/TP then cover
+                            // exactly the confirmed on-exchange amount.
+                            double partial = fetchPositionAmountChecked(symbol);
+                            if (Double.isNaN(partial)) {
+                                // [v86.88 DOUBLE-FILL GUARD] Position read FAILED at timeout — we do NOT
+                                // know whether the maker order filled. Sending a taker now could
+                                // DOUBLE-FILL. Fail-safe: abort (do NOT fall to taker); startup reconcile
+                                // adopts/cleans any orphan next cycle. Mirrors the taker-retry -1109 guard.
+                                LOG.warning("[Executor] " + symbol + " maker timeout AND position read failed "
+                                        + "(-1109?) — NOT sending taker to avoid double-fill; treat as possibly-open");
+                                return ExecutionResult.fail("maker entry ambiguous (position read failed) — "
+                                        + "taker suppressed to avoid double-fill; reconcile handles any orphan");
+                            }
+                            if (Math.abs(partial) >= si.stepSize) {
+                                double partAmt = roundDownToStep(Math.abs(partial), si.stepSize);
+                                if (partAmt > 0) {
+                                    makerFilled = true;
+                                    entryOrderId = mkId; // avgPrice of the maker order = real partial fill price
+                                    LOG.info("[Executor] " + symbol + " maker PARTIAL fill " + formatQtyForLog(partAmt)
+                                            + " of " + formatQtyForLog(qty) + " — proceeding with partial qty (no taker top-up to avoid double-fill)");
+                                    qty = partAmt;
+                                }
+                            }
+                            if (!makerFilled) {
+                                LOG.info("[Executor] " + symbol + " maker entry not filled in time — falling back to taker");
+                            }
+                        }
+                    } else {
+                        LOG.info("[Executor] " + symbol + " maker LIMIT rejected/would-cross — falling back to taker");
+                    }
+                } else {
+                    LOG.info("[Executor] " + symbol + " maker entry: no valid bid/ask — falling back to taker");
                 }
             }
-            if (entryOrderId == null) {
-                return ExecutionResult.fail("MARKET order rejected by Binance "
-                        + "(see [Executor] log for code+msg)");
+
+            // Existing TAKER MARKET path — runs ONLY if the maker branch did not
+            // produce a (full or partial) fill. When EXEC_ENTRY_MODE=taker (default)
+            // makerFilled is false and this executes exactly as before.
+            if (!makerFilled) {
+                // [v86.86] CRITICAL: use a FRESH clientId for the taker order. A cancelled
+                // maker order may still RESERVE entryCid on Binance → a -4015 "duplicate" on
+                // the taker POST would be wrongly treated as SUCCESS (returning the maker id
+                // for an order that never filled). A fresh "t" id can only -4015 against a
+                // real prior taker attempt, preserving the genuine double-fill guard.
+                String takerCid = newClientOrderId("t", symbol);
+                entryOrderId = sendMarketOrder(symbol, isLong, qty, takerCid);
+                // [v86.21] On rejection (e.g. intermittent -1109) retry ONCE — but only after
+                // confirming no position actually opened, to avoid a double-fill.
+                if (entryOrderId == null) {
+                    // [v86.24] Only retry if the position is CONFIRMED flat (a 200 read returning ~0).
+                    // A -1109 read now returns NaN → unknown → do NOT resend, else we double-fill when
+                    // the first order actually filled but its response/verify -1109'd.
+                    double _chk = fetchPositionAmountChecked(symbol);
+                    boolean confirmedFlat = !Double.isNaN(_chk) && Math.abs(_chk) < 1e-9;
+                    if (confirmedFlat) {
+                        try { Thread.sleep(500L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                        entryOrderId = sendMarketOrder(symbol, isLong, qty, takerCid);
+                    } else if (Double.isNaN(_chk)) {
+                        LOG.warning("[Executor] " + symbol + " entry rejected AND position-read failed (-1109?) — NOT retrying to avoid double-fill; treat as possibly-open");
+                    }
+                }
+                if (entryOrderId == null) {
+                    return ExecutionResult.fail("MARKET order rejected by Binance "
+                            + "(see [Executor] log for code+msg)");
+                }
             }
 
             // Active poll for fill (50ms × 10 = 500ms max). Beats blind sleep
@@ -1592,6 +1676,135 @@ public final class BinanceTradeExecutor {
                 return null;
             }
             LOG.warning("[Executor] MARKET order " + symbol + " HTTP " + resp.statusCode()
+                    + ": " + b);
+            return null;
+        }
+        return new JSONObject(resp.body()).optString("orderId", null);
+    }
+
+    /**
+     * [v86.86 MAKER ENTRY] Send a post-only LIMIT (maker) entry order.
+     *
+     * Mirrors {@link #sendMarketOrder}'s HMAC/POST plumbing, but:
+     *   - type=LIMIT, timeInForce=GTX (post-only: Binance REJECTS the order
+     *     if it would cross the book / take liquidity, so a 200 guarantees the
+     *     order rests as a maker).
+     *   - price = caller-supplied {@code price} (already rounded to tickSize).
+     *   - newOrderRespType=RESULT.
+     *
+     * Returns:
+     *   - the orderId (non-null) on a 200 (order accepted, resting as maker),
+     *   - {@code clientId} (non-null) on -4015 duplicate (a prior attempt with
+     *     this id already placed the order → treat as SUCCESS, no double-place),
+     *   - {@code null} on a GTX would-cross reject (-5022 / "GTX" / "post only" /
+     *     "immediately match") — logged as "GTX-cross" so the caller falls
+     *     through to taker rather than aborting,
+     *   - {@code null} on any other reject (logged).
+     *
+     * Keeps the same -4061 hedge-mode fallback (re-sends with explicit
+     * positionSide, reusing the SAME clientId — a -4061 means the first POST
+     * did NOT rest) and -4015 duplicate=success handling sendMarketOrder uses.
+     *
+     * NOTE: unlike a MARKET order, a 200 here does NOT mean filled — it means
+     * the limit is RESTING. The caller must poll the position for an actual
+     * fill and cancel + fall back to taker on timeout.
+     */
+    private String sendLimitMakerOrder(String symbol, boolean buy, double qty, double price, String clientId) throws Exception {
+        long ts = ts();
+        String body = "symbol=" + symbol
+                + "&side=" + (buy ? "BUY" : "SELL")
+                + "&type=LIMIT"
+                + "&timeInForce=GTX"
+                + "&price=" + formatPrice(price)
+                + "&quantity=" + formatQty(qty)
+                + "&newClientOrderId=" + clientId
+                + "&newOrderRespType=RESULT"
+                + "&timestamp=" + ts + "&recvWindow=60000";
+        String sig = hmacSHA256(apiSecret, body);
+        HttpResponse<String> resp = http.send(
+                HttpRequest.newBuilder()
+                        .uri(URI.create(baseUrl + "/fapi/v1/order"))
+                        .timeout(Duration.ofSeconds(10))
+                        .header("X-MBX-APIKEY", apiKey)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .POST(HttpRequest.BodyPublishers.ofString(body + "&signature=" + sig))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            String b = resp.body() == null ? "" : resp.body();
+            String bl = b.toLowerCase();
+            // GTX post-only would have crossed/taken → Binance rejects so we never
+            // pay taker via the maker path. NOT a hard error: caller falls through
+            // to the taker MARKET path. Return null but log distinctly as GTX-cross.
+            if (b.contains("-5022") || bl.contains("gtx")
+                    || bl.contains("post only") || bl.contains("post-only")
+                    || bl.contains("immediately match") || bl.contains("execute as maker")
+                    || bl.contains("could not be executed as maker")) {
+                LOG.info("[Executor] LIMIT-MAKER " + symbol + " GTX-cross (would take, not maker) — "
+                        + "falling through to taker: " + b);
+                return null;
+            }
+            // -4015 = "Client order id is duplicate" → the order with this id was
+            // ALREADY accepted by a prior (ambiguously-timed-out) attempt. Treat as
+            // SUCCESS (the limit is resting under this id) so the caller polls/cancels
+            // it rather than placing a second one. Return clientId (non-null).
+            if (b.contains("-4015") || bl.contains("duplicate")) {
+                LOG.warning("[Executor] LIMIT-MAKER " + symbol + " duplicate clientId "
+                        + clientId + " refused by Binance (-4015) — prior attempt already "
+                        + "placed the order; treating as SUCCESS (resting maker)");
+                return clientId;
+            }
+            // -4061 = "Order's position side does not match." HEDGE mode detected —
+            // retry with explicit positionSide. Reuse the SAME clientId (a -4061 means
+            // the first POST did NOT rest, so re-using the id is safe).
+            if (b.contains("-4061") || b.contains("position side")) {
+                LOG.warning("[Executor] LIMIT-MAKER " + symbol + " HEDGE mode detected, retrying with positionSide");
+                long ts2 = ts();
+                String body2 = "symbol=" + symbol
+                        + "&side=" + (buy ? "BUY" : "SELL")
+                        + "&positionSide=" + (buy ? "LONG" : "SHORT")
+                        + "&type=LIMIT"
+                        + "&timeInForce=GTX"
+                        + "&price=" + formatPrice(price)
+                        + "&quantity=" + formatQty(qty)
+                        + "&newClientOrderId=" + clientId
+                        + "&newOrderRespType=RESULT"
+                        + "&timestamp=" + ts2 + "&recvWindow=60000";
+                String sig2 = hmacSHA256(apiSecret, body2);
+                HttpResponse<String> resp2 = http.send(
+                        HttpRequest.newBuilder()
+                                .uri(URI.create(baseUrl + "/fapi/v1/order"))
+                                .timeout(Duration.ofSeconds(10))
+                                .header("X-MBX-APIKEY", apiKey)
+                                .header("Content-Type", "application/x-www-form-urlencoded")
+                                .POST(HttpRequest.BodyPublishers.ofString(body2 + "&signature=" + sig2))
+                                .build(),
+                        HttpResponse.BodyHandlers.ofString());
+                if (resp2.statusCode() == 200) {
+                    return new JSONObject(resp2.body()).optString("orderId", null);
+                }
+                String b2 = resp2.body() == null ? "" : resp2.body();
+                String bl2 = b2.toLowerCase();
+                // GTX-cross on the hedge retry → same soft fall-through to taker.
+                if (b2.contains("-5022") || bl2.contains("gtx")
+                        || bl2.contains("post only") || bl2.contains("post-only")
+                        || bl2.contains("immediately match") || bl2.contains("execute as maker")
+                        || bl2.contains("could not be executed as maker")) {
+                    LOG.info("[Executor] LIMIT-MAKER retry " + symbol + " GTX-cross — falling through to taker: " + b2);
+                    return null;
+                }
+                // -4015 duplicate safety on the hedge retry.
+                if (b2.contains("-4015") || bl2.contains("duplicate")) {
+                    LOG.warning("[Executor] LIMIT-MAKER retry " + symbol + " duplicate clientId "
+                            + clientId + " refused (-4015) — prior attempt already placed; "
+                            + "treating as SUCCESS (resting maker)");
+                    return clientId;
+                }
+                LOG.warning("[Executor] LIMIT-MAKER retry " + symbol + " HTTP " + resp2.statusCode()
+                        + ": " + b2);
+                return null;
+            }
+            LOG.warning("[Executor] LIMIT-MAKER order " + symbol + " HTTP " + resp.statusCode()
                     + ": " + b);
             return null;
         }
