@@ -172,7 +172,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.82";
+    private static final String BOT_VERSION = "v86.83";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2045,6 +2045,12 @@ public final class BotMain {
         int mrTrades = 0, mrWins = 0;
         double mrNet = 0.0;
         double[] mrHalfPnL = new double[4];
+        // [v86.83 FLOW-FALSIFY] bucket MR trades by entry flow-EXHAUSTION (the FLOW_FADE thesis:
+        // aggressor-flow turning AGAINST the trade side into the extreme = absorption). Cheap
+        // falsification on the 507-trade MR sample BEFORE writing a FLOW_FADE generator — if the
+        // exhaustion bucket is NOT less-bad than the rest, the absorption discriminator is inert.
+        int mrExhN = 0, mrExhW = 0, mrNoexhN = 0, mrNoexhW = 0;
+        double mrExhNet = 0.0, mrNoexhNet = 0.0;
         // [v86.60 PHASE-0] PnL по возрасту 4h-тренда (TREND-сделки): бакеты
         // {0-2,3-5,6-12,13-24,25+} + решающая свёртка young(≤12)/old(>12) × WF.
         // Отвечает данными: живёт ли edge в МОЛОДЫХ трендах (тезис TREND_EARLY)?
@@ -2405,11 +2411,30 @@ public final class BotMain {
                             if (t.entryTime > tMax2) tMax2 = t.entryTime;
                         }
                         long tSpan2 = Math.max(1L, tMax2 - tMin2);
+                        // [v86.83] index m15 by openTime for entry-bar flow lookup
+                        java.util.Map<Long, Integer> mIdx = new java.util.HashMap<>();
+                        for (int mi = 0; mi < m15.size(); mi++) mIdx.put(m15.get(mi).openTime, mi);
                         for (com.bot.SimpleBacktester.TradeRecord t : r2.trades) {
                             int hi2 = (int) (WF_PERIODS * (t.entryTime - tMin2) / tSpan2);
                             if (hi2 < 0) hi2 = 0;
                             if (hi2 >= WF_PERIODS) hi2 = WF_PERIODS - 1;
                             mrHalfPnL[hi2] += t.pnlPct;
+                            // [v86.83 FLOW-FALSIFY] tag entry flow-exhaustion (FLOW_FADE core thesis)
+                            Integer ei = mIdx.get(t.entryTime);
+                            if (ei != null && ei >= 2) {
+                                double f0 = m15.get(ei).takerBuySellRatio();
+                                double f2 = m15.get(ei - 2).takerBuySellRatio();
+                                boolean isLong = t.side == com.bot.TradingCore.Side.LONG;
+                                // exhaustion = aggressor flow turning AGAINST the trade side into entry:
+                                //   SHORT faded at top    → buyers fading  → flow falling & <0.50
+                                //   LONG  faded at bottom  → sellers fading → flow rising  & >0.50
+                                boolean exh = isLong
+                                        ? (f0 - f2 >= 0.06 && f0 > 0.50)
+                                        : (f2 - f0 >= 0.06 && f0 < 0.50);
+                                boolean win = t.pnlPct > 0.05;
+                                if (exh) { mrExhN++; if (win) mrExhW++; mrExhNet += t.pnlPct; }
+                                else     { mrNoexhN++; if (win) mrNoexhW++; mrNoexhNet += t.pnlPct; }
+                            }
                         }
                     }
                 } catch (Throwable mrEx) {
@@ -2735,6 +2760,13 @@ public final class BotMain {
                         + "  _по периодам: П1 %+.0f · П2 %+.0f · П3 %+.0f · П4 %+.0f — ценно, если зелёный в П2/П4 (чоп), где TREND красный_\n",
                         mrTrades, 100.0 * mrWins / mrTrades, mrNet,
                         mrHalfPnL[0], mrHalfPnL[1], mrHalfPnL[2], mrHalfPnL[3]));
+                if (mrExhN + mrNoexhN > 0) {
+                    sb2.append(String.format(
+                            "  🧪 _MR×flow-ИСТОЩЕНИЕ (тест ядра FLOW_FADE): истощ %d сд WR %.0f%% net %+.1f%% avg %+.3f · без %d сд WR %.0f%% net %+.1f%% avg %+.3f_\n"
+                            + "  _истощ зеленее/менее-красного → flow-дискриминатор несёт инфо → строю FLOW_FADE; ≈ или хуже → absorption-гипотеза мертва_\n",
+                            mrExhN, mrExhN > 0 ? 100.0 * mrExhW / mrExhN : 0.0, mrExhNet, mrExhN > 0 ? mrExhNet / mrExhN : 0.0,
+                            mrNoexhN, mrNoexhN > 0 ? 100.0 * mrNoexhW / mrNoexhN : 0.0, mrNoexhNet, mrNoexhN > 0 ? mrNoexhNet / mrNoexhN : 0.0));
+                }
             } else {
                 sb2.append("🧪 MR-SHADOW: 0 сделок (mean-rev сетапов на истории нет)\n");
             }
