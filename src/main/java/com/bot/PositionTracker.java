@@ -99,12 +99,15 @@ public final class PositionTracker {
         this.riskGuard = RiskGuard.getInstance();
         this.telegram  = null;
         // [v86.3] Time-stop масштабируется под PRIMARY_TF, чтобы СОВПАДАТЬ с backtest
-        // (SimpleBacktester: 15m=12 баров=180мин, 1h=8 баров=480мин=8ч). Раньше был фикс
-        // 180мин → на 1h live резал сделку за 3ч, а backtest держал 8ч = расхождение,
-        // меньше профита live. env PT_TIME_STOP_MS перебивает.
+        // (SimpleBacktester: 15m=12 баров=180мин, 1h=8 баров=480мин=8ч, 4h=6 баров=1440мин=24ч).
+        // Раньше был фикс 180мин → на 1h live резал сделку за 3ч, а backtest держал 8ч =
+        // расхождение, меньше профита live. env PT_TIME_STOP_MS перебивает.
+        // [v86.91] 4h: было 180мин (else-ветка, НЕВЕРНО) → 1440мин (24ч), синхрон с ISC/BT.
+        String ptPrimaryTf = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
         this.TIME_STOP_MS      = envLong("PT_TIME_STOP_MS",
-                "1h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim())
-                        ? 480L * 60_000L : 180L * 60_000L);
+                "1h".equals(ptPrimaryTf) ? 480L * 60_000L
+                        : "4h".equals(ptPrimaryTf) ? 1440L * 60_000L
+                        : 180L * 60_000L);
         this.POLL_INTERVAL_MS  = envLong("PT_POLL_INTERVAL_MS", 30_000L);
         this.BE_OFFSET_PCT     = envDouble("PT_BE_OFFSET_PCT", 0.05);
         this.BE_ENABLED        = "1".equals(System.getenv().getOrDefault("PT_BE_ENABLED", "1"));
@@ -942,6 +945,10 @@ public final class PositionTracker {
     }
 
     // ─── Env helpers ──────────────────────────────────────────────────
+    // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
+    private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }
     private static long envLong(String k, long d) {
         try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(d))); }
         catch (Exception e) { return d; }

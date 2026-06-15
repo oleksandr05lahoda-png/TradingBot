@@ -58,10 +58,17 @@ public final class SimpleBacktester {
     // [v90 1H-PRIMARY 2026-05-09] timeStopBars default scales with PRIMARY_TF.
     //   PRIMARY_TF=15m: 12 bars (180 min stop window)
     //   PRIMARY_TF=1h:   8 bars (480 min = 8h stop window)
+    //   PRIMARY_TF=4h:   6 bars (1440 min = 24h stop window)  [v86.91]
     // ENV BACKTEST_TIME_STOP_BARS overrides; must match ISC_TIME_STOP_BARS in
     // live ISC for walk-forward consistency.
+    // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
+    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "4h".equals(tf)?"1d" : "4h"; }
+    private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }
     private int    timeStopBars     = envInt("BACKTEST_TIME_STOP_BARS",
-            "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 12 : 8);
+            "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 12
+            : "4h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 6 : 8);
     private boolean compound        = true;
     private boolean useM1Resolution = true;
 
@@ -499,7 +506,9 @@ public final class SimpleBacktester {
         // [v90] Min bars: 200 on 15m primary (50 hours), 150 on 1h primary
         // (6.25 days). The lower floor on 1h is offset by each bar carrying
         // 4× more information; 150 bars = stable VWAP/sigma calc.
-        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
+        // [v86.91] 4h uses the same 150-bar floor as 1h (each 4h bar = 4× a 1h bar's info).
+        String _runPrimaryTf = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+        boolean is15m = "15m".equals(_runPrimaryTf);
         int minBars = is15m ? 200 : 150;
         if (m15 == null || m15.size() < minBars) return result;
 
@@ -1483,7 +1492,10 @@ public final class SimpleBacktester {
         public SelfValidator(SignalSender sender, TelegramBotSender tg) {
             this.sender         = sender;
             this.tg             = tg;
-            this.daysOfHistory  = envInt("VALIDATOR_DAYS",         4);
+            // [v86.91] 4h: default window 270 days (~1620 4h-bars). 4 days on 4h = 24 bars =
+            // 0 trades (MAIN BLOCKER). 15m/1h default stays 4 (byte-identical). VALIDATOR_DAYS overrides.
+            this.daysOfHistory  = envInt("VALIDATOR_DAYS",
+                    "4h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 270 : 4);
             this.topNPairs      = envInt("VALIDATOR_TOP_N",        12);
             this.reportEveryMs  = envLong("VALIDATOR_REPORT_EVERY_MS", 6 * 60 * 60_000L);
             this.enabled        = envInt("VALIDATOR_ENABLED", 1) == 1;
@@ -1536,11 +1548,14 @@ public final class SimpleBacktester {
             // the engine was configured for 1h primary — root cause of the
             // "13 days, 5 trades" anomaly.
             String primaryTfBT = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+            // [v86.91] 4h → 6 bars/day. On 4h, HTF=1d → ratio is /6 (a day has 6 4h-bars).
             int barsPerDayPrimary = "1h".equals(primaryTfBT) ? 24
-                    : "30m".equals(primaryTfBT) ? 48 : 96;
+                    : "30m".equals(primaryTfBT) ? 48 : "4h".equals(primaryTfBT) ? 6 : 96;
             int barsNeeded = daysOfHistory * barsPerDayPrimary + 250; // warmup + window
             int h1Limit    = "1h".equals(primaryTfBT)
                     ? Math.max(200, barsNeeded + 50)            // primary IS 1h
+                    : "4h".equals(primaryTfBT)
+                    ? Math.max(100, barsNeeded / 6 + 50)        // 4h primary, 1d is HTF (/6)
                     : Math.max(200, barsNeeded / 4 + 50);       // 15m primary, 1h is HTF
 
             // Aggregate across all pairs
@@ -1572,17 +1587,26 @@ public final class SimpleBacktester {
                     // LOOSER 1h-HTF config than live actually runs (4h), inflating its signal
                     // count and making live look broken/"lying" by comparison. Now mirrors
                     // live exactly: 4h HTF on 1h-primary, 1h HTF on 15m-primary.
-                    String htfTfBT = "1h".equals(primaryTfBT) ? "4h" : "1h";
-                    int htfLimitBT = "1h".equals(primaryTfBT) ? Math.max(150, barsNeeded / 4 + 60) : h1Limit;
+                    // [v86.91] 4h-primary HTF=1d (CRITICAL — was falling to the 15m "1h" arm,
+                    // running the validator on the wrong HTF). 1d limit uses the /6 ratio.
+                    String htfTfBT = "1h".equals(primaryTfBT) ? "4h"
+                            : "4h".equals(primaryTfBT) ? "1d" : "1h";
+                    int htfLimitBT = "1h".equals(primaryTfBT) ? Math.max(150, barsNeeded / 4 + 60)
+                            : "4h".equals(primaryTfBT) ? Math.max(60, barsNeeded / 6 + 30)
+                            : h1Limit;
                     h1  = sender.fetchKlines(pair, htfTfBT, htfLimitBT);
                 } catch (Throwable e) {
                     continue;
                 }
                 // Min-bars guard: 100 on 1h primary (4 days), 250 on 15m primary
                 // (matches engine MIN_BARS gate after 150→100 lowering).
-                int minBarsBT = "1h".equals(primaryTfBT) ? 100 : 250;
+                // [v86.91] 4h: 150 primary bars; HTF=1d so the 80-bar HTF floor (=80 days)
+                // is too strict → lower to 40 days for the 1d HTF.
+                int minBarsBT = "1h".equals(primaryTfBT) ? 100
+                        : "4h".equals(primaryTfBT) ? 150 : 250;
+                int minHtfBT  = "4h".equals(primaryTfBT) ? 40 : 80;
                 if (m15 == null || m15.size() < minBarsBT) continue;
-                if (h1  == null || h1.size()  < 80)         continue;
+                if (h1  == null || h1.size()  < minHtfBT)   continue;
 
                 DecisionEngineMerged.CoinCategory cat = sender.getCoinCategory(pair);
 

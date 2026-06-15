@@ -82,13 +82,19 @@ public final class SignalSender {
             System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
     private static final long PRIMARY_TF_MS = primaryTfMs(PRIMARY_TF);
     private static final int PRIMARY_TF_MIN = (int) (PRIMARY_TF_MS / 60_000L);
-    // HTF (higher timeframe) used for bias filters. For 1h primary, default 4h.
+    // HTF (higher timeframe) used for bias filters. For 1h primary, default 4h; for 4h, 1d.
     private static final String HTF_FAST =
             System.getenv().getOrDefault("HTF_FAST",
-                    "1h".equals(PRIMARY_TF) ? "4h" : "1h").trim();
+                    "1h".equals(PRIMARY_TF) ? "4h" : "4h".equals(PRIMARY_TF) ? "1d" : "1h").trim();
     private static final String HTF_SLOW =
             System.getenv().getOrDefault("HTF_SLOW",
-                    "1h".equals(PRIMARY_TF) ? "1d" : "2h").trim();
+                    "1h".equals(PRIMARY_TF) ? "1d" : "4h".equals(PRIMARY_TF) ? "1d" : "2h").trim();
+
+    // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
+    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "4h".equals(tf)?"1d" : "4h"; }
+    private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }   // 1d handled at call sites as 86_400_000
 
     private static long primaryTfMs(String tf) {
         switch (tf) {
@@ -1238,8 +1244,10 @@ public final class SignalSender {
             // For VWAP-MR strategy we want ≥120 bars (5 days) to compute stable VWAP/dev.
             // Min keeps strict floor at 100; relaxes from 200 because each 1h bar carries
             // 4× more information than a 15m bar.
+            // [v86.91] 4h: primary floor 100 (unchanged from else), HTF floor 40 — on
+            // 4h-primary HTF=1d, so 60 bars = 60 days is too strict; 40 days suffices.
             int primaryMinBars = "15m".equals(PRIMARY_TF) ? 200 : 100;
-            int htfMinBars     = "15m".equals(PRIMARY_TF) ? 160 : 60;
+            int htfMinBars     = "15m".equals(PRIMARY_TF) ? 160 : "4h".equals(PRIMARY_TF) ? 40 : 60;
             if (m15 == null || m15.size() < primaryMinBars || h1 == null || h1.size() < htfMinBars) {
                 cyclePairsStale.incrementAndGet();
                 recordStaleEvent(pair); // [v78.1]
@@ -1259,7 +1267,10 @@ public final class SignalSender {
                 return null;
             }
             // HTF staleness: skip if last HTF bar > 1.5× HTF period old.
-            long htfBarMs = "4h".equals(HTF_FAST) ? 4 * 60 * 60_000L
+            // [v86.91] 1d arm added — was missing, so 4h-primary (HTF=1d) fell into the
+            // 60min else-branch → every pair rejected as stale (CRITICAL).
+            long htfBarMs = "1d".equals(HTF_FAST) ? 86_400_000L
+                    : "4h".equals(HTF_FAST) ? 4 * 60 * 60_000L
                     : "2h".equals(HTF_FAST) ? 2 * 60 * 60_000L
                       : 60 * 60_000L;
             long lastH1Age = nowMs - h1.get(h1.size() - 1).closeTime;
@@ -3413,8 +3424,11 @@ public final class SignalSender {
             List<com.bot.TradingCore.Candle> etC15 = getPrimaryTfCandles(symbol);
             List<com.bot.TradingCore.Candle> etC5  = getM5FromWsOrRest(symbol, 100);
             List<com.bot.TradingCore.Candle> etC1h = getCached(symbol, HTF_FAST, 100);
-            int etC15MinBars = "15m".equals(PRIMARY_TF) ? 100 : 60;
-            int etC1hMinBars = "15m".equals(PRIMARY_TF) ? 50  : 30;
+            // [v86.91] 4h: HTF=1d here. Floors aligned to the main history-gate (primary 100,
+            // HTF 40 on 4h) so EARLY_TICK is never STRICTER than the path it shadows — but the
+            // EARLY_TICK forecast tolerates fewer bars, so keep it at/below the main gate.
+            int etC15MinBars = "15m".equals(PRIMARY_TF) ? 100 : "4h".equals(PRIMARY_TF) ? 60 : 60;
+            int etC1hMinBars = "15m".equals(PRIMARY_TF) ? 50  : "4h".equals(PRIMARY_TF) ? 40 : 30;
             if (etC15 != null && etC15.size() >= etC15MinBars && etC1h != null && etC1h.size() >= etC1hMinBars) {
                 double etDelta = getNormalizedDelta(symbol);
                 etForecast = forecastEngineDirect.forecast(etC5, etC15, etC1h, etDelta);
@@ -3884,11 +3898,15 @@ public final class SignalSender {
         Boolean cached = historyOkCache.get(symbol);
         if (cached != null) return cached;
 
-        boolean is15m = "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim());
-        String  primaryTf  = is15m ? "15m" : "1h";
-        String  htfTf      = is15m ? "1h"  : "4h";
-        int     primaryMin = is15m ? 250  : 200;   // STARTUP-BT needs ≥200/150 + warmup
-        int     htfMin     = is15m ? 200  : 150;
+        // [v86.91] 4h arm: primary=4h, HTF=1d (CRITICAL — without it 4h probed 1h/4h and
+        // the startup-BT ran on the wrong TF). 4h needs 150 primary bars (~25d) + 40 1d HTF.
+        String  primaryTfEnv = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
+        boolean is15m = "15m".equals(primaryTfEnv);
+        boolean is4h  = "4h".equals(primaryTfEnv);
+        String  primaryTf  = is15m ? "15m" : is4h ? "4h" : "1h";
+        String  htfTf      = is15m ? "1h"  : is4h ? "1d" : "4h";
+        int     primaryMin = is15m ? 250  : is4h ? 150 : 200;   // STARTUP-BT needs ≥200/150 + warmup
+        int     htfMin     = is15m ? 200  : is4h ? 40  : 150;
 
         boolean ok;
         try {
