@@ -223,13 +223,84 @@ public final class PositionTracker {
     // ─── Internal: polling loop ───────────────────────────────────────
 
     private void pollAll() {
-        if (tracked.isEmpty()) return;
+        if (tracked.isEmpty()) {
+            // [uPnL throttle] Flat — clear any stale open-uPnL so a leftover negative
+            // value doesn't latch the daily-drawdown cap after the position closed.
+            pushOpenUnrealizedPnl(0.0, /*allFlat*/ true);
+            return;
+        }
         for (String symbol : new java.util.ArrayList<>(tracked.keySet())) {
             try {
                 pollOne(symbol);
             } catch (Throwable t) {
                 LOG.warning("[Tracker] poll " + symbol + " error: " + t.getMessage());
             }
+        }
+        // [uPnL throttle] UNCONDITIONAL per-cycle push (runs even if TRAIL/PROFIT_LOCK/
+        // STAGNATION are all off). Sum live unrealized PnL (USDT) across ALL positions
+        // still tracked after this cycle's poll, then feed it to RiskGuard so an open
+        // drawdown throttles NEW entries before the position closes. At maxConcurrent=1
+        // there's at most one position, but we accumulate over all open positions so it
+        // stays correct if concurrency rises.
+        try {
+            double sumUPnl = 0.0;
+            boolean anyOpen = false;
+            for (String symbol : new java.util.ArrayList<>(tracked.keySet())) {
+                Tracked t = tracked.get(symbol);
+                if (t == null) continue;
+                double mark = executor.fetchMarkPrice(symbol);
+                if (mark <= 0) continue; // API hiccup — skip this symbol, don't poison the sum
+                anyOpen = true;
+                sumUPnl += computePnl(t, mark);
+            }
+            if (!anyOpen) {
+                // All marks unreadable (or map emptied mid-cycle): don't loosen the gate by
+                // pushing a fabricated 0. Leave the last pushed value in place; a real flat
+                // is handled by the tracked.isEmpty() / close-handler resets.
+                return;
+            }
+            pushOpenUnrealizedPnl(sumUPnl, /*allFlat*/ false);
+        } catch (Throwable t) {
+            LOG.warning("[Tracker] open-uPnL push error: " + t.getMessage());
+        }
+    }
+
+    // [uPnL throttle] 2-poll guard: a single mark-price spike must not falsely trip the
+    // daily cap. We only let a NEW, MORE-NEGATIVE uPnL reach RiskGuard after it persists
+    // for 2 consecutive polls. Pushes that are flat (reset) or LESS negative than the last
+    // pushed value go through immediately (those can only loosen/clear the block, never
+    // create a false one). lastPushedUPnl is read/written only on the single poll thread.
+    private double pendingMoreNegativeUPnl = Double.NaN; // candidate awaiting a 2nd confirming poll
+    private double lastPushedUPnl = 0.0;
+    private void pushOpenUnrealizedPnl(double sumUPnl, boolean allFlat) {
+        if (allFlat) {
+            pendingMoreNegativeUPnl = Double.NaN;
+            lastPushedUPnl = 0.0;
+            riskGuard.setOpenUnrealizedPnl(0.0);
+            return;
+        }
+        if (sumUPnl >= lastPushedUPnl) {
+            // Same or LESS negative (improving) — safe to push immediately; can only relax
+            // the unrealized term, never manufacture a false block. Clears any pending spike.
+            pendingMoreNegativeUPnl = Double.NaN;
+            lastPushedUPnl = sumUPnl;
+            riskGuard.setOpenUnrealizedPnl(sumUPnl);
+            return;
+        }
+        // sumUPnl is MORE negative than what we last pushed → require 2 consecutive polls
+        // before tightening the gate, so one mark spike alone can't trip the daily cap.
+        if (!Double.isNaN(pendingMoreNegativeUPnl)) {
+            // Second consecutive more-negative poll — confirm and push the (more conservative)
+            // of the two readings so a brief deeper spike doesn't over-tighten.
+            double confirmed = Math.min(pendingMoreNegativeUPnl, sumUPnl);
+            pendingMoreNegativeUPnl = Double.NaN;
+            lastPushedUPnl = confirmed;
+            riskGuard.setOpenUnrealizedPnl(confirmed);
+            LOG.info(String.format(
+                    "[Tracker] open-uPnL tightened after 2 consecutive polls: $%+.4f", confirmed));
+        } else {
+            // First more-negative reading — stage it, push next poll only if it persists.
+            pendingMoreNegativeUPnl = sumUPnl;
         }
     }
 
@@ -470,6 +541,10 @@ public final class PositionTracker {
 
         tracked.remove(t.symbol);
         riskGuard.recordTradeClosed(t.symbol, pnl);
+        // [uPnL throttle] If this was the last open position, reset the open-uPnL sum to 0
+        // immediately so a stale negative value can't latch the daily-drawdown cap now that
+        // the position is closed (its loss is now counted as REALIZED via recordTradeClosed).
+        if (tracked.isEmpty()) pushOpenUnrealizedPnl(0.0, /*allFlat*/ true);
         sendCloseNotification(t, exitPrice, pnl, reason);
         LOG.info(String.format("[Tracker] CLOSED %s pnl=$%+.4f exit=%.6f reason=%s "
                         + "(entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f BE=%s)",
@@ -486,6 +561,8 @@ public final class PositionTracker {
         double pnl = computePnl(t, exitPrice);
         tracked.remove(t.symbol);
         riskGuard.recordTradeClosed(t.symbol, pnl);
+        // [uPnL throttle] Reset open-uPnL to 0 when flat (loss now realized) — see handlePositionClosed.
+        if (tracked.isEmpty()) pushOpenUnrealizedPnl(0.0, /*allFlat*/ true);
         sendCloseNotification(t, exitPrice, pnl, forcedReason);
         LOG.info(String.format("[Tracker] FORCED-CLOSE %s pnl=$%+.4f exit=%.6f reason=%s",
                 t.symbol, pnl, exitPrice, forcedReason));

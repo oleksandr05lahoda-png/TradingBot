@@ -142,6 +142,26 @@ public final class RiskGuard {
     private volatile double dayStartBalance = 0.0;
     private volatile double weekStartBalance = 0.0;
 
+    /**
+     * [uPnL throttle] Live sum of OPEN unrealized PnL (USDT) across all open
+     * positions, pushed by the PositionTracker poll thread every cycle. Read by
+     * canTrade() so an open position sitting at a big loss throttles NEW entries
+     * BEFORE it closes (realized dailyPnlUsd alone misses an open −X% drawdown).
+     *
+     * Live-only & TRANSIENT: deliberately NOT persisted (kept OUT of
+     * saveState/loadState) — it's reconciled live by the tracker within one poll
+     * (~30s) after a restart, so persisting it would only risk latching a stale
+     * value. volatile: written by the tracker thread, read by canTrade().
+     */
+    private volatile double openUnrealizedPnl = 0.0;
+
+    /**
+     * [uPnL throttle] Push the live open-unrealized-PnL sum from the tracker poll.
+     * Conservative by design: this value can only ever make the DAILY drawdown
+     * gate BLOCK harder — it never enables a trade. Reset to 0 when flat.
+     */
+    public void setOpenUnrealizedPnl(double v) { this.openUnrealizedPnl = v; }
+
     private static final class DayPnl {
         final LocalDate date;
         double pnlUsd;
@@ -193,13 +213,35 @@ public final class RiskGuard {
         }
 
         // 2. Daily loss limit
+        //    [uPnL throttle] Effective day PnL = REALIZED dailyPnlUsd + live OPEN
+        //    unrealized PnL. Previously this gate counted only realized PnL, so a
+        //    position sitting at e.g. −10% did NOT throttle new entries until it
+        //    closed. We now test (realized + min(0, openUnrealizedPnl)) against the
+        //    daily-loss cap so an open drawdown blocks new entries in real time.
+        //    [v86.87 FAIL-SAFE FIX] Only the NEGATIVE part of open uPnL counts — a
+        //    WINNING open position must NOT mask a realized daily loss (paper gains can
+        //    vanish; a realized −10% must still block regardless). So this term can ONLY
+        //    tighten the gate, never loosen it / enable a trade. A transient negative
+        //    mark spike at worst causes a 1-cycle block (rate-limited to 2 polls on the
+        //    PositionTracker side — acceptable, fail-safe).
         if (dayStartBalance > 0) {
-            double dayDrawdownPct = -100.0 * dailyPnlUsd / dayStartBalance;
+            double effectiveDayPnl = dailyPnlUsd + Math.min(0.0, openUnrealizedPnl);
+            double dayDrawdownPct = -100.0 * effectiveDayPnl / dayStartBalance;
             if (dayDrawdownPct >= DAILY_LOSS_LIMIT_PCT) {
+                boolean dueToUnrealized = (-100.0 * dailyPnlUsd / dayStartBalance) < DAILY_LOSS_LIMIT_PCT;
+                if (dueToUnrealized) {
+                    LOG.warning(String.format(
+                            "[RiskGuard] DAILY-DD block via OPEN uPnL: realized=$%+.2f "
+                                    + "openUPnL=$%+.2f effective=$%+.2f (-%.1f%% of $%.2f start) "
+                                    + "≥ cap %.1f%% — blocking NEW entries (open position drawdown)",
+                            dailyPnlUsd, openUnrealizedPnl, effectiveDayPnl,
+                            dayDrawdownPct, dayStartBalance, DAILY_LOSS_LIMIT_PCT));
+                }
                 return Decision.block("daily loss limit",
-                        String.format("dayPnL=%.2f USD (-%.1f%% of $%.2f start). "
-                                        + "Resume at 00:00 UTC.",
-                                dailyPnlUsd, dayDrawdownPct, dayStartBalance));
+                        String.format("dayPnL=%.2f USD (realized %+.2f + openUPnL %+.2f) "
+                                        + "(-%.1f%% of $%.2f start). Resume at 00:00 UTC.",
+                                effectiveDayPnl, dailyPnlUsd, openUnrealizedPnl,
+                                dayDrawdownPct, dayStartBalance));
             }
         }
 
