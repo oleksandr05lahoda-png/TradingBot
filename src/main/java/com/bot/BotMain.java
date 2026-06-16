@@ -183,7 +183,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.92";
+    private static final String BOT_VERSION = "v86.93";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2165,6 +2165,12 @@ public final class BotMain {
         // [v86.91] 4h: HTF=1d → floor 270 bars (=270 days), not 720 (=720 days, impossible).
         final int barsHtfTarget = Math.min(2000, Math.max(btIs4h ? 270 : 720, htfBarsCfg));
         final long pacingMs     = Math.max(3000L, envInt("STARTUP_BT_PACING_MS", 8000));  // [v85.3] 5000→8000: мягче темп запросов
+        // [v86.93] WINDOW-DIAG: surface the raw env + actual fetch window so a malformed
+        // STARTUP_BT_BARS_PRIMARY (whitespace → envInt fallback, fixed v86.93) is visible in logs.
+        LOG.info("[STARTUP-BT] WINDOW-DIAG PRIMARY_TF=" + btPrimaryTf
+                + " rawEnv[STARTUP_BT_BARS_PRIMARY]=[" + System.getenv("STARTUP_BT_BARS_PRIMARY") + "]"
+                + " cfg=" + primaryBarsCfg + " target=" + barsPrimaryTarget
+                + " (~" + (barsPrimaryTarget / (btIs15m ? 96 : btIs4h ? 6 : 24)) + "d) htfTarget=" + barsHtfTarget);
 
         // Min bars guard for primary TF: 200 on 15m, 150 on 1h.
         final int primaryMinBars = btIs15m ? 200 : 150;
@@ -3262,7 +3268,11 @@ public final class BotMain {
     }
 
     private static int envInt(String k, int d) {
-        try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); }
+        String v = System.getenv(k);
+        if (v == null || v.isBlank()) return d;
+        // [v86.93] .trim(): a stray space in a Railway value (e.g. "6000 ") used to throw in
+        // parseInt → catch → silent fallback to default. That hid STARTUP_BT_BARS_PRIMARY=6000.
+        try { return Integer.parseInt(v.trim()); }
         catch (Exception e) { return d; }
     }
 
