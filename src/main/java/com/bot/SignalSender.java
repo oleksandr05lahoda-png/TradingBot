@@ -794,7 +794,7 @@ public final class SignalSender {
             // [v86.27] On REAL skip the boot-time bulk leverage/margin rewrite of ~60 symbols
             // (mutates real-account state + 60 API calls). The executor sets leverage/margin
             // lazily per-symbol at trade time (and ABORTS on real if it can't). Testnet only.
-            if ("1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "1"))) {
+            if ("1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "0"))) {
                 udsExecutor.schedule(this::initLeverageAndMarginMode, 10, TimeUnit.SECONDS);
             }
         }

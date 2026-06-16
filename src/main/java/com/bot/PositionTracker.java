@@ -386,7 +386,7 @@ public final class PositionTracker {
      * flags for surgical A/B testing.
      */
     /** [v86.24c] true on demo/testnet — gates spike-rejection clamps we don't want on a real venue. */
-    private static final boolean PT_TESTNET = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "1"));
+    private static final boolean PT_TESTNET = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "0"));
     private void applyActiveManagement(Tracked t, long age) {
         double mark = executor.fetchMarkPrice(t.symbol);
         if (mark <= 0) return; // API hiccup — try again next poll

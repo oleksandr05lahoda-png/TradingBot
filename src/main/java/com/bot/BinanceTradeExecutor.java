@@ -44,10 +44,13 @@ import java.util.logging.Logger;
  *     Перед каждой сделкой проверяется реальный баланс на бирже. Если
  *     баланс < min_required для риска 2% — не открываем.
  *
- *  3. TESTNET-FIRST.
- *     env BINANCE_USE_TESTNET=1 переключает все URL на testnet.
- *     Default = 1 (testnet). Чтобы перейти на real — поставить =0.
- *     Это специально: дефолт безопасный, ошибка → testnet, не real.
+ *  3. REAL BY DEFAULT [v86.92].
+ *     env BINANCE_USE_TESTNET=1 переключает все URL на testnet/demo.
+ *     Default = 0 (real). [v86.92] было =1 (testnet): юзер торгует РЕАЛЬНЫМИ
+ *     ключами и testnet/demo не использует → дефолт-testnet с live-ключами
+ *     ронял каждый account/order вызов (-1109) и спамил пробой. Настоящий
+ *     trade-gate = LIVE_TRADING_ARMED=0 (без него ордеров НЕТ даже на real,
+ *     бот read-only). Testnet остаётся доступен явным BINANCE_USE_TESTNET=1.
  *
  *  4. ISOLATED MARGIN, FIXED LEVERAGE.
  *     Перед первой сделкой по символу выставляются:
@@ -65,7 +68,7 @@ import java.util.logging.Logger;
  *     > 0.5% — отказываемся (тонкий стакан, плохое исполнение).
  *
  * env vars:
- *   BINANCE_USE_TESTNET     = 1 (default)  | 0 для real
+ *   BINANCE_USE_TESTNET     = 0 (default, real)  | 1 для testnet/demo
  *   BINANCE_API_KEY         — ключ (real или testnet, в зависимости от флага)
  *   BINANCE_API_SECRET      — секрет
  *   BINANCE_TESTNET_API_KEY — отдельный testnet ключ (если хочешь держать оба)
@@ -184,7 +187,7 @@ public final class BinanceTradeExecutor {
     public static BinanceTradeExecutor getInstance() { return INSTANCE; }
 
     private BinanceTradeExecutor() {
-        this.useTestnet = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "1"));
+        this.useTestnet = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "0"));
 
         if (useTestnet) {
             this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
