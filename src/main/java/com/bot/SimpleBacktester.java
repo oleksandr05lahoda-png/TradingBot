@@ -1498,7 +1498,8 @@ public final class SimpleBacktester {
             // [v86.91] 4h: default window 270 days (~1620 4h-bars). 4 days on 4h = 24 bars =
             // 0 trades (MAIN BLOCKER). 15m/1h default stays 4 (byte-identical). VALIDATOR_DAYS overrides.
             this.daysOfHistory  = envInt("VALIDATOR_DAYS",
-                    "4h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 270 : 4);
+                    "4h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 270
+                            : "30m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 60 : 4); // [v86.95] 30m: 60d (~2880 30m-bars), matches startup-BT floor; 15m/1h stay 4 (byte-identical)
             this.topNPairs      = envInt("VALIDATOR_TOP_N",        12);
             this.reportEveryMs  = envLong("VALIDATOR_REPORT_EVERY_MS", 6 * 60 * 60_000L);
             this.enabled        = envInt("VALIDATOR_ENABLED", 1) == 1;
