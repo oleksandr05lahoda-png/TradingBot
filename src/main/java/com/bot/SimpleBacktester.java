@@ -59,15 +59,18 @@ public final class SimpleBacktester {
     //   PRIMARY_TF=15m: 12 bars (180 min stop window)
     //   PRIMARY_TF=1h:   8 bars (480 min = 8h stop window)
     //   PRIMARY_TF=4h:   6 bars (1440 min = 24h stop window)  [v86.91]
+    //   PRIMARY_TF=30m: 10 bars (300 min = 5h stop window)   [v86.94]
     // ENV BACKTEST_TIME_STOP_BARS overrides; must match ISC_TIME_STOP_BARS in
     // live ISC for walk-forward consistency.
     // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
-    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
-    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
-    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "4h".equals(tf)?"1d" : "4h"; }
+    // [v86.94] 30m added additively; HTF for 30m reuses the already-wired 4h interval.
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "30m".equals(tf)?30 : "4h".equals(tf)?240 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "30m".equals(tf)?48 : "4h".equals(tf)?6  : 24; }
+    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "30m".equals(tf)?"4h" : "4h".equals(tf)?"1d" : "4h"; }
     private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }
     private int    timeStopBars     = envInt("BACKTEST_TIME_STOP_BARS",
             "15m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 12
+            : "30m".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 10
             : "4h".equals(System.getenv().getOrDefault("PRIMARY_TF", "1h").trim()) ? 6 : 8);
     private boolean compound        = true;
     private boolean useM1Resolution = true;
@@ -1589,9 +1592,13 @@ public final class SimpleBacktester {
                     // live exactly: 4h HTF on 1h-primary, 1h HTF on 15m-primary.
                     // [v86.91] 4h-primary HTF=1d (CRITICAL — was falling to the 15m "1h" arm,
                     // running the validator on the wrong HTF). 1d limit uses the /6 ratio.
+                    // [v86.94] 30m-primary HTF=4h (reuses the 1h-primary HTF interval).
+                    // Without this 30m would fall to the 15m "1h" arm — wrong HTF.
                     String htfTfBT = "1h".equals(primaryTfBT) ? "4h"
+                            : "30m".equals(primaryTfBT) ? "4h"
                             : "4h".equals(primaryTfBT) ? "1d" : "1h";
                     int htfLimitBT = "1h".equals(primaryTfBT) ? Math.max(150, barsNeeded / 4 + 60)
+                            : "30m".equals(primaryTfBT) ? Math.max(60, barsNeeded / 8 + 30)
                             : "4h".equals(primaryTfBT) ? Math.max(60, barsNeeded / 6 + 30)
                             : h1Limit;
                     h1  = sender.fetchKlines(pair, htfTfBT, htfLimitBT);
@@ -1603,6 +1610,7 @@ public final class SimpleBacktester {
                 // [v86.91] 4h: 150 primary bars; HTF=1d so the 80-bar HTF floor (=80 days)
                 // is too strict → lower to 40 days for the 1d HTF.
                 int minBarsBT = "1h".equals(primaryTfBT) ? 100
+                        : "30m".equals(primaryTfBT) ? 150
                         : "4h".equals(primaryTfBT) ? 150 : 250;
                 int minHtfBT  = "4h".equals(primaryTfBT) ? 40 : 80;
                 if (m15 == null || m15.size() < minBarsBT) continue;

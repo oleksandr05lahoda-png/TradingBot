@@ -107,6 +107,7 @@ public final class PositionTracker {
         this.TIME_STOP_MS      = envLong("PT_TIME_STOP_MS",
                 "1h".equals(ptPrimaryTf) ? 480L * 60_000L
                         : "4h".equals(ptPrimaryTf) ? 1440L * 60_000L
+                        : "30m".equals(ptPrimaryTf) ? 300L * 60_000L
                         : 180L * 60_000L);
         this.POLL_INTERVAL_MS  = envLong("PT_POLL_INTERVAL_MS", 30_000L);
         this.BE_OFFSET_PCT     = envDouble("PT_BE_OFFSET_PCT", 0.05);
@@ -946,8 +947,8 @@ public final class PositionTracker {
 
     // ─── Env helpers ──────────────────────────────────────────────────
     // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
-    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
-    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "30m".equals(tf)?30 : "4h".equals(tf)?240 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "30m".equals(tf)?48 : "4h".equals(tf)?6  : 24; }
     private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }
     private static long envLong(String k, long d) {
         try { return Long.parseLong(System.getenv().getOrDefault(k, String.valueOf(d))); }

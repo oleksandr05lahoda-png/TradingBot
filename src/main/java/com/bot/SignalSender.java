@@ -85,15 +85,15 @@ public final class SignalSender {
     // HTF (higher timeframe) used for bias filters. For 1h primary, default 4h; for 4h, 1d.
     private static final String HTF_FAST =
             System.getenv().getOrDefault("HTF_FAST",
-                    "1h".equals(PRIMARY_TF) ? "4h" : "4h".equals(PRIMARY_TF) ? "1d" : "1h").trim();
+                    "1h".equals(PRIMARY_TF) ? "4h" : "30m".equals(PRIMARY_TF) ? "4h" : "4h".equals(PRIMARY_TF) ? "1d" : "1h").trim();
     private static final String HTF_SLOW =
             System.getenv().getOrDefault("HTF_SLOW",
-                    "1h".equals(PRIMARY_TF) ? "1d" : "4h".equals(PRIMARY_TF) ? "1d" : "2h").trim();
+                    "1h".equals(PRIMARY_TF) ? "1d" : "30m".equals(PRIMARY_TF) ? "1d" : "4h".equals(PRIMARY_TF) ? "1d" : "2h").trim();
 
     // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
-    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
-    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
-    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "4h".equals(tf)?"1d" : "4h"; }
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "30m".equals(tf)?30 : "4h".equals(tf)?240 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "30m".equals(tf)?48 : "4h".equals(tf)?6  : 24; }
+    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "30m".equals(tf)?"4h" : "4h".equals(tf)?"1d" : "4h"; }
     private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }   // 1d handled at call sites as 86_400_000
 
     private static long primaryTfMs(String tf) {
@@ -3902,11 +3902,12 @@ public final class SignalSender {
         // the startup-BT ran on the wrong TF). 4h needs 150 primary bars (~25d) + 40 1d HTF.
         String  primaryTfEnv = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
         boolean is15m = "15m".equals(primaryTfEnv);
+        boolean is30m = "30m".equals(primaryTfEnv);
         boolean is4h  = "4h".equals(primaryTfEnv);
-        String  primaryTf  = is15m ? "15m" : is4h ? "4h" : "1h";
-        String  htfTf      = is15m ? "1h"  : is4h ? "1d" : "4h";
-        int     primaryMin = is15m ? 250  : is4h ? 150 : 200;   // STARTUP-BT needs ≥200/150 + warmup
-        int     htfMin     = is15m ? 200  : is4h ? 40  : 150;
+        String  primaryTf  = is15m ? "15m" : is30m ? "30m" : is4h ? "4h" : "1h";
+        String  htfTf      = is15m ? "1h"  : is30m ? "4h"  : is4h ? "1d" : "4h";
+        int     primaryMin = is15m ? 250  : is30m ? 250 : is4h ? 150 : 200;   // STARTUP-BT needs ≥200/150 + warmup
+        int     htfMin     = is15m ? 200  : is30m ? 150 : is4h ? 40  : 150;
 
         boolean ok;
         try {

@@ -1362,8 +1362,9 @@ public final class DecisionEngineMerged {
         // where the real position time-stop (PositionTracker PT_TIME_STOP_MS) is 480 мин.
         // Show the value that actually applies for the current PRIMARY_TF.
         // [v86.91] 4h → 1440 мин (24ч), синхрон с PT_TIME_STOP_MS / ISC / BT.
+        // [v86.94] 30m → 300 мин (10 баров × 30мин), синхрон с PT_TIME_STOP_MS / ISC / BT.
         String _tsPrimaryTf = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
-        int _tsMin = "1h".equals(_tsPrimaryTf) ? 480 : "4h".equals(_tsPrimaryTf) ? 1440 : 180;
+        int _tsMin = "1h".equals(_tsPrimaryTf) ? 480 : "4h".equals(_tsPrimaryTf) ? 1440 : "30m".equals(_tsPrimaryTf) ? 300 : 180;
         sb.append(String.format("%n⏳ Time-stop: %d мин", _tsMin));
 
             sb.append("\n⏱ ").append(timeStr).append(" · ").append(city);
@@ -2778,8 +2779,9 @@ public final class DecisionEngineMerged {
         // [24h,96h]. For 4h-primary the HTF is 1d, so HTF-based age would be in 1d-bar units →
         // [6,24] = [6,24] DAYS (6× too long). To preserve the [24h,96h] semantics, count the
         // age on the PRIMARY 4h series (c15) instead — its EMA20/50 crosses are in 4h-bar units.
+        // [v86.94] 30m mirrors the 4h-on-primary path: count the age on the PRIMARY 30m series.
         int age4h;
-        if (CS_IS_4H) {
+        if (CS_IS_4H || CS_IS_30M) {
             double[] pFast = com.bot.TradingCore.emaSeries(c15, 20);
             double[] pSlow = com.bot.TradingCore.emaSeries(c15, 50);
             age4h = computeTrendAge4h(pFast, pSlow);
@@ -3046,8 +3048,9 @@ public final class DecisionEngineMerged {
         // [v86.91] CRITICAL 4h: age measured in 4h-bar units. For 4h-primary the HTF is 1d,
         // so count the cross on the PRIMARY 4h series (c15), NOT the 1d HTF — see the matching
         // note in generateTrendAligned. Keeps TE_MAX_AGE_4H=12 = ≤48h on every primary TF.
+        // [v86.94] 30m mirrors the 4h-on-primary path: count the cross on the PRIMARY 30m series.
         int age4h;
-        if (CS_IS_4H) {
+        if (CS_IS_4H || CS_IS_30M) {
             double[] pFast = com.bot.TradingCore.emaSeries(c15, 20);
             double[] pSlow = com.bot.TradingCore.emaSeries(c15, 50);
             age4h = computeTrendAge4h(pFast, pSlow);
@@ -3628,12 +3631,15 @@ public final class DecisionEngineMerged {
     // To revert to 15m defaults set env CS_PROFILE=15m (overrides below).
     // ──────────────────────────────────────────────────────────────────────
     // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
-    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
-    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
+    // [v86.94] 30m-support: 30m arm added everywhere 4h has one (tfMin/barsPerDay,
+    // trendAge-on-primary, time-stop). HTF for 30m = 4h (reuses the wired 4h HTF).
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : "30m".equals(tf)?30 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : "30m".equals(tf)?48 : 24; }
     private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }
     private static final String CS_PRIMARY_TF = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
     private static final boolean CS_IS_15M = "15m".equals(CS_PRIMARY_TF);
     private static final boolean CS_IS_4H  = "4h".equals(CS_PRIMARY_TF);
+    private static final boolean CS_IS_30M = "30m".equals(CS_PRIMARY_TF);
 
     // 4h inherits the 1h sigma thresholds (1.6 / 2.2) — same else-branch value.
     private static final double CS_SIGMA_THRESHOLD   = csEnvDouble("CS_SIGMA_THRESHOLD",
@@ -3663,10 +3669,11 @@ public final class DecisionEngineMerged {
             CS_IS_15M ? 1.5 : 1.8);
     // [v86.91] 4h: cooldown 960 min (= 4 bars × 240min, mirrors 1h's 4-bar cooldown);
     // time-stop 6 bars (= 24h), the hard invariant.
+    // [v86.94] 30m: time-stop 10 bars (= 300 min), the hard invariant (mirror of the 4h arm).
     private static final long   CS_COOLDOWN_MS       = csEnvLong("CS_COOLDOWN_MIN",
             CS_IS_15M ? 60 : CS_IS_4H ? 960 : 240) * 60_000L;
     private static final long   CS_TIME_STOP_BARS_M15 = csEnvLong("CS_TIME_STOP_BARS",
-            CS_IS_15M ? 12 : CS_IS_4H ? 6 : 8);
+            CS_IS_15M ? 12 : CS_IS_4H ? 6 : CS_IS_30M ? 10 : 8);
     private static final boolean CS_SKIP_MEME        = csEnvBool("CS_SKIP_MEME",           true);
 
     /** Per-symbol last signal timestamp for cooldown. */

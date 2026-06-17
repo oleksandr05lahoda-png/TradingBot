@@ -34,19 +34,20 @@ public final class InstitutionalSignalCore {
 
     // TIME_STOP_BARS scales with PRIMARY_TF:
     //   15m: 12 bars × 15min = 180 min
+    //   30m: 10 bars × 30min = 300 min
     //   1h:   8 bars × 60min = 480 min (8h)
     //   4h:   6 bars × 240min = 1440 min (24h)
     // Must match BACKTEST_TIME_STOP_BARS in SimpleBacktester for walk-forward
     // consistency.
     // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
-    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "30m".equals(tf)?30 : "4h".equals(tf)?240 : 60; }
     private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }
     private static final String ISC_PRIMARY_TF = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
     private static final boolean ISC_IS_15M = "15m".equals(ISC_PRIMARY_TF);
     // [v86.91] ISC_BAR_MS now derives from tfBarMs(PRIMARY_TF): 4h→14_400_000.
     private static final long ISC_BAR_MS = tfBarMs(ISC_PRIMARY_TF);
     private static final int  TIME_STOP_BARS  = envInt("ISC_TIME_STOP_BARS",
-            ISC_IS_15M ? 12 : "4h".equals(ISC_PRIMARY_TF) ? 6 : 8);
+            ISC_IS_15M ? 12 : "30m".equals(ISC_PRIMARY_TF) ? 10 : "4h".equals(ISC_PRIMARY_TF) ? 6 : 8);
     private static final long TIME_STOP_MS    = TIME_STOP_BARS * ISC_BAR_MS;
     private static final int  MAX_HISTORY     = 100;
 

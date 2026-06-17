@@ -74,14 +74,14 @@ public final class BotMain {
     public static final String PRIMARY_TF =
             System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
     // [v86.91] 4h-support helpers (duplicated per-file by design — no new classes).
-    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "4h".equals(tf)?240 : 60; }
-    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "4h".equals(tf)?6  : 24; }
-    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "4h".equals(tf)?"1d" : "4h"; }
+    private static int    tfMin(String tf)      { return "15m".equals(tf)?15 : "30m".equals(tf)?30 : "4h".equals(tf)?240 : 60; }
+    private static int    barsPerDay(String tf) { return "15m".equals(tf)?96 : "30m".equals(tf)?48 : "4h".equals(tf)?6  : 24; }
+    private static String htfFast(String tf)    { return "15m".equals(tf)?"1h" : "30m".equals(tf)?"4h" : "4h".equals(tf)?"1d" : "4h"; }
     private static long   tfBarMs(String tf)     { return tfMin(tf)*60_000L; }
     // [v86.91] 4h → HTF_FAST=1d (was falling to the 15m "1h" arm).
     public static final String HTF_FAST =
             System.getenv().getOrDefault("HTF_FAST",
-                    "1h".equals(PRIMARY_TF) ? "4h" : "4h".equals(PRIMARY_TF) ? "1d" : "1h").trim();
+                    "1h".equals(PRIMARY_TF) ? "4h" : "30m".equals(PRIMARY_TF) ? "4h" : "4h".equals(PRIMARY_TF) ? "1d" : "1h").trim();
     public static final boolean PRIMARY_IS_15M = "15m".equals(PRIMARY_TF);
     // [v86.91] 4h → 14_400_000 ms (was falling to the 15m else-branch).
     public static final long PRIMARY_TF_MS = "1h".equals(PRIMARY_TF) ? 60 * 60_000L
@@ -138,7 +138,8 @@ public final class BotMain {
     // which would force-resolve every 4h signal after ~2h as a false TIME_STOP.
     private static final long VERIFIER_TIME_STOP_MS =
             "1h".equals(PRIMARY_TF) ? 480L * 60_000L
-            : "4h".equals(PRIMARY_TF) ? 1440L * 60_000L : 90L * 60_000L;
+            : "4h".equals(PRIMARY_TF) ? 1440L * 60_000L
+            : "30m".equals(PRIMARY_TF) ? 300L * 60_000L : 90L * 60_000L;
     private static final long VERIFIER_GRACE_MS     = 30 * 60_000L;
     private static final long VERIFIER_MAX_AGE_MS   = VERIFIER_TIME_STOP_MS + VERIFIER_GRACE_MS;
 
@@ -183,7 +184,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.93";
+    private static final String BOT_VERSION = "v86.94";
 
     static final class ForecastRecord {
         final String symbol;
@@ -2135,11 +2136,13 @@ public final class BotMain {
         final String btPrimaryTfEnv = System.getenv().getOrDefault("PRIMARY_TF", "1h").trim();
         final boolean btIs15m = "15m".equals(btPrimaryTfEnv);
         final boolean btIs4h  = "4h".equals(btPrimaryTfEnv);
+        final boolean btIs30m = "30m".equals(btPrimaryTfEnv);
         // [v86.91] 4h: primary "4h", HTF "1d" (headline bug — was running 1h candles labelled 4h);
         // default 1620 primary bars = 270 days × 6 bars/day.
-        final String btPrimaryTf = btIs15m ? "15m" : btIs4h ? "4h" : "1h";
-        final String btHtfTf     = btIs15m ? "1h"  : btIs4h ? "1d" : "4h";
-        final int defaultPrimaryBars = btIs15m ? 1000 : btIs4h ? 1620 : 720; // 1h: 30 days / 4h: 270 days
+        // [30m] primary "30m", HTF "4h" (reuse wired 4h HTF); default 2880 primary bars = 60 days × 48 bars/day.
+        final String btPrimaryTf = btIs15m ? "15m" : btIs30m ? "30m" : btIs4h ? "4h" : "1h";
+        final String btHtfTf     = btIs15m ? "1h"  : btIs30m ? "4h"  : btIs4h ? "1d" : "4h";
+        final int defaultPrimaryBars = btIs15m ? 1000 : btIs30m ? 2880 : btIs4h ? 1620 : 720; // 1h: 30 days / 4h: 270 days / 30m: 60 days
 
         // Backward compat: read both legacy STARTUP_BT_BARS_15M and new STARTUP_BT_BARS_PRIMARY.
         int legacyBars = envInt("STARTUP_BT_BARS_15M", -1);
@@ -2154,23 +2157,23 @@ public final class BotMain {
         // экономия Railway (меньше данных = короче прогон = дешевле) + 30 дней
         // (≈2880 баров 15m ≈ 100+ сделок) достаточно для оценки edge. 60 дней
         // были нужны для разовой сверки VCB vs 1h — больше не нужны.
-        int statFloor = btIs15m ? 2880 : btIs4h ? 1620 : 1440; // [v86.39] 1h: 30дн→60дн; [v86.91] 4h: 1620 баров = 270 дней (env STARTUP_BT_BARS_PRIMARY override; cap 6000)
+        int statFloor = btIs15m ? 2880 : btIs30m ? 2880 : btIs4h ? 1620 : 1440; // [v86.39] 1h: 30дн→60дн; [v86.91] 4h: 1620 баров = 270 дней; [30m] 2880 баров = 60 дней (env STARTUP_BT_BARS_PRIMARY override; cap 6000)
         final int barsPrimaryTarget = Math.min(6000, Math.max(statFloor, primaryBarsCfg));
         int legacyHtf = envInt("STARTUP_BT_BARS_1H", -1);
         // [v86.91] 4h: HTF=1d, default 300 1d-bars (≈ the 270-day window + warmup).
         int htfBarsCfg = (legacyHtf > 0 && btIs15m) ? legacyHtf
-                : envInt("STARTUP_BT_BARS_HTF", btIs4h ? 300 : 250);
+                : envInt("STARTUP_BT_BARS_HTF", btIs30m ? 900 : btIs4h ? 300 : 250);
         // [v83.6] HTF floor 1440→720: на 15m primary HTF=1h, 30 дней = 720 баров.
         // Синхронно с откатом окна 60→30 дней (экономия Railway).
         // [v86.91] 4h: HTF=1d → floor 270 bars (=270 days), not 720 (=720 days, impossible).
-        final int barsHtfTarget = Math.min(2000, Math.max(btIs4h ? 270 : 720, htfBarsCfg));
+        final int barsHtfTarget = Math.min(2000, Math.max(btIs30m ? 360 : btIs4h ? 270 : 720, htfBarsCfg));
         final long pacingMs     = Math.max(3000L, envInt("STARTUP_BT_PACING_MS", 8000));  // [v85.3] 5000→8000: мягче темп запросов
         // [v86.93] WINDOW-DIAG: surface the raw env + actual fetch window so a malformed
         // STARTUP_BT_BARS_PRIMARY (whitespace → envInt fallback, fixed v86.93) is visible in logs.
         LOG.info("[STARTUP-BT] WINDOW-DIAG PRIMARY_TF=" + btPrimaryTf
                 + " rawEnv[STARTUP_BT_BARS_PRIMARY]=[" + System.getenv("STARTUP_BT_BARS_PRIMARY") + "]"
                 + " cfg=" + primaryBarsCfg + " target=" + barsPrimaryTarget
-                + " (~" + (barsPrimaryTarget / (btIs15m ? 96 : btIs4h ? 6 : 24)) + "d) htfTarget=" + barsHtfTarget);
+                + " (~" + (barsPrimaryTarget / (btIs15m ? 96 : btIs30m ? 48 : btIs4h ? 6 : 24)) + "d) htfTarget=" + barsHtfTarget);
 
         // Min bars guard for primary TF: 200 on 15m, 150 on 1h.
         final int primaryMinBars = btIs15m ? 200 : 150;
@@ -3320,12 +3323,14 @@ public final class BotMain {
                     //   15m: 2880 bars; train 672 (~7d), test 480 (~5d)
                     //   1h:   720 bars; train 168 (~7d), test 120 (~5d)
                     //   4h:  1620 bars (270d); HTF=1d 300 bars; train 42 (~7d), test 30 (~5d)  [v86.91]
+                    //   30m: 2880 bars (60d); HTF=4h 900 bars; train 336 (~7d), test 240 (~5d)
                     boolean wfIs4h  = "4h".equals(PRIMARY_TF);
-                    int wfTotalBars = PRIMARY_IS_15M ? 2880 : wfIs4h ? 1620 : 720;
-                    int wfHtfBars   = PRIMARY_IS_15M ? 720  : wfIs4h ? 300  : 180;
-                    int wfMinBars   = PRIMARY_IS_15M ? 1500 : wfIs4h ? 900  : 400;
-                    int wfWindow    = PRIMARY_IS_15M ? 672  : wfIs4h ? 42   : 168;   // train bars (~7d)
-                    int wfStep      = PRIMARY_IS_15M ? 480  : wfIs4h ? 30   : 120;   // test bars (~5d)
+                    boolean wfIs30m = "30m".equals(PRIMARY_TF);
+                    int wfTotalBars = PRIMARY_IS_15M ? 2880 : wfIs30m ? 2880 : wfIs4h ? 1620 : 720;
+                    int wfHtfBars   = PRIMARY_IS_15M ? 720  : wfIs30m ? 900  : wfIs4h ? 300  : 180;
+                    int wfMinBars   = PRIMARY_IS_15M ? 1500 : wfIs30m ? 1500 : wfIs4h ? 900  : 400;
+                    int wfWindow    = PRIMARY_IS_15M ? 672  : wfIs30m ? 336  : wfIs4h ? 42   : 168;   // train bars (~7d)
+                    int wfStep      = PRIMARY_IS_15M ? 480  : wfIs30m ? 240  : wfIs4h ? 30   : 120;   // test bars (~5d)
                     List<com.bot.TradingCore.Candle> m15 = sender.fetchKlines(sym, PRIMARY_TF, wfTotalBars);
                     List<com.bot.TradingCore.Candle> h1  = sender.fetchKlines(sym, HTF_FAST,  wfHtfBars);
                     if (m15 == null || m15.size() < wfMinBars) continue;
