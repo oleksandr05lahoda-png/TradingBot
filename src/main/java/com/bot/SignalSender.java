@@ -406,6 +406,7 @@ public final class SignalSender {
     // Dedupe micro-rows by "symbol|openTime" within active recording windows.
     private final Set<String> nlSeenRecords = ConcurrentHashMap.newKeySet();
     private volatile boolean nlLoaded = false;
+    private volatile boolean nlAnnounced = false; // one-time-per-boot "catcher active" status sent?
 
     private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
     private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
@@ -4057,13 +4058,11 @@ public final class SignalSender {
 
             // One exchangeInfo fetch (weight 1) → symbol -> onboardDate(ms).
             Map<String, Long> onboard = nlFetchExchangeInfo();
-            // Rate-limited/ban/parse failure → tiny or empty map. Never diff against that.
-            // Log a non-empty-but-tiny result so the operator can tell "feed unhealthy"
-            // from "genuinely few symbols".
+            // Rate-limited/ban/parse failure → tiny or empty map. Never diff against that;
+            // log EVERY skip (incl. empty) so a persistent feed failure is visible, not silent.
             if (onboard.size() < NL_SANITY_FLOOR) {
-                if (!onboard.isEmpty())
-                    LOG.warning("[NL] exchangeInfo returned " + onboard.size()
-                            + " symbols (<" + NL_SANITY_FLOOR + ") — feed unhealthy, skipping diff");
+                LOG.warning("[NL] exchangeInfo returned " + onboard.size()
+                        + " symbols (<" + NL_SANITY_FLOOR + ") — skipping diff this cycle");
                 return;
             }
 
@@ -4075,10 +4074,12 @@ public final class SignalSender {
             boolean coldStart = nlKnownSymbols.isEmpty();
 
             boolean dirty = false;
+            int seeded = 0, armed = 0;
             for (Map.Entry<String, Long> e : onboard.entrySet()) {
                 String sym = e.getKey();
                 if (nlKnownSymbols.contains(sym)) continue;
                 nlKnownSymbols.add(sym);
+                seeded++;
                 dirty = true;
                 long onboardMs = e.getValue();
                 // Steady state: every not-yet-known symbol is new. Cold start: only the
@@ -4088,6 +4089,7 @@ public final class SignalSender {
                 // Anchor the window to the real listing time when known → exactly first-N-hours.
                 long until = (onboardMs > 0 ? onboardMs : now) + NL_RECORD_HOURS * 3600_000L;
                 nlRecordingUntil.put(sym, until);
+                armed++;
                 String age = onboardMs > 0
                         ? String.format("%.1fч назад", (now - onboardMs) / 3600_000.0) : "время неизв.";
                 try {
@@ -4099,6 +4101,8 @@ public final class SignalSender {
                 } catch (Throwable ignored) {}
                 LOG.info("[NL] NEW LISTING " + sym + " — recording until " + until);
             }
+            if (coldStart)
+                LOG.info("[NL] cold-start seeded " + seeded + " known symbols, armed " + armed + " recent");
 
             // (2) Advance every active recording window (including just-armed ones).
             List<String> done = new ArrayList<>();
@@ -4113,6 +4117,21 @@ public final class SignalSender {
                 LOG.info("[NL] recording window finished for " + sym);
             }
             if (dirty) nlSave();
+
+            // One-time-per-boot confirmation (first healthy cycle) so the operator can SEE
+            // the catcher is alive — without waiting days for the next real listing.
+            if (!nlAnnounced) {
+                nlAnnounced = true;
+                LOG.info("[NL] active: tracking " + nlKnownSymbols.size() + " symbols, "
+                        + nlRecordingUntil.size() + " recording");
+                try {
+                    this.bot.sendMessageAsync(
+                            "🛰 *Ловец листингов активен* (v86.97)\n"
+                          + "Отслеживаю " + nlKnownSymbols.size() + " символов"
+                          + (nlRecordingUntil.size() > 0 ? (", пишу " + nlRecordingUntil.size()) : "")
+                          + "\nНовый листинг → 🆕 алерт + запись в ./data · _бот не торгует_");
+                } catch (Throwable ignored) {}
+            }
         } catch (Throwable t) {
             LOG.warning("[NL] checkNewListings: " + t.getMessage());
         }
