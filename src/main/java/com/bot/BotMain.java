@@ -111,6 +111,15 @@ public final class BotMain {
     public static final boolean LIVE_TRADING_ARMED =
             "1".equals(System.getenv().getOrDefault("LIVE_TRADING_ARMED", "0"));
 
+    // [v86.96] New-listings catcher (observation-only). Detects freshly listed
+    // USDT-M futures symbols (exchangeInfo diff vs a persisted known-set) and
+    // records their first-N-hours microstructure (1m klines + funding + L1 spread)
+    // to ./data for edge research. NEVER trades — sits entirely outside the
+    // signal/execution path. Default ON; disable with NEW_LISTING_CATCHER=0.
+    // Implemented in SignalSender.checkNewListings().
+    public static final boolean NEW_LISTING_CATCHER =
+            !"0".equals(System.getenv().getOrDefault("NEW_LISTING_CATCHER", "1"));
+
     // [v79 I5] Cross-exchange price validation. Compares Binance kline last close
     // with Bybit/OKX. If discrepancy >0.5% → log warning + dispatch blocked.
     // Default OFF — Binance is generally trustworthy, but available for paranoid setups.
@@ -184,7 +193,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.95";
+    private static final String BOT_VERSION = "v86.96";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1316,6 +1325,8 @@ public final class BotMain {
         updateBtcContext(sender, gic);
         updateSectors(sender, gic);
         try { sender.getPumpHunter().periodicCleanup(); } catch (Throwable ignored) {}
+        // [v86.96] New-listings catcher — observation-only, never trades.
+        if (NEW_LISTING_CATCHER) { try { sender.checkNewListings(); } catch (Throwable ignored) {} }
 
         double bal = sender.getAccountBalance();
         if (bal > 0) isc.updateBalance(bal);

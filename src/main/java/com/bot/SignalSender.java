@@ -377,6 +377,36 @@ public final class SignalSender {
     private static final int    BINANCE_WEIGHT_SIGNED_LIGHT  = 1;
     private static final int    BINANCE_WEIGHT_BALANCE       = 5;
 
+    // ════════════ [v86.96] NEW-LISTINGS CATCHER (observation-only) ════════════
+    // Detects freshly listed USDT-M futures symbols (diff exchangeInfo vs a
+    // persisted known-set) and records their first-N-hours microstructure
+    // (1m klines + funding + L1 spread) to ./data for edge research. It NEVER
+    // trades and never feeds the calibrator/decision engine — pure data capture
+    // + a Telegram alert. Gated by BotMain.NEW_LISTING_CATCHER (default ON).
+    // Reuses the existing rate-limited REST wrapper, so it shares the weight budget.
+    private static final String NL_KNOWN_FILE =
+            System.getenv().getOrDefault("NEW_LISTINGS_KNOWN_FILE", "./data/known_symbols.csv").trim();
+    private static final String NL_MICRO_FILE =
+            System.getenv().getOrDefault("NEW_LISTINGS_MICRO_FILE", "./data/new_listing_micro.csv").trim();
+    // Hours to keep recording a symbol after first detection (clamped 1..72 — guards
+    // against an absurd env value overflowing the recording-deadline arithmetic).
+    private static final long NL_RECORD_HOURS =
+            Math.max(1L, Math.min(72L, nlEnvLong("NEW_LISTING_MICRO_HOURS", 6)));
+    // A bar's funding/spread snapshot is trustworthy only if the bar closed within
+    // ~one scan cycle of the snapshot. Older backfilled bars carry klines only
+    // (funding/bid/ask=0, live=0) — we never fabricate microstructure we can't observe.
+    private static final long NL_FRESH_MS = 7 * 60_000L;
+    // If exchangeInfo returns fewer than this many symbols it's the rate-limit/ban
+    // fallback (3 symbols) — skip the diff so we never flag the ~400 universe as "new".
+    private static final int  NL_SANITY_FLOOR = 50;
+    // Persisted known universe (every symbol ever seen).
+    private final Set<String> nlKnownSymbols = ConcurrentHashMap.newKeySet();
+    // symbol -> epoch ms until which we keep recording it.
+    private final Map<String, Long> nlRecordingUntil = new ConcurrentHashMap<>();
+    // Dedupe micro-rows by "symbol|openTime" within active recording windows.
+    private final Set<String> nlSeenRecords = ConcurrentHashMap.newKeySet();
+    private volatile boolean nlLoaded = false;
+
     private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
     private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
     private final AtomicLong    rlWindowStart   = new AtomicLong(System.currentTimeMillis());
@@ -4000,6 +4030,281 @@ public final class SignalSender {
             for (int i = 0; i < arr.length(); i++) { JSONObject s = arr.getJSONObject(i); if ("TRADING".equalsIgnoreCase(s.optString("status","TRADING")) && s.getString("symbol").endsWith("USDT")) res.add(s.getString("symbol")); }
             return res;
         } catch (Exception e) { return new HashSet<>(Arrays.asList("BTCUSDT","ETHUSDT","BNBUSDT")); }
+    }
+
+    // ════════════ [v86.96] NEW-LISTINGS CATCHER methods ════════════
+
+    private static long nlEnvLong(String k, long d) {
+        String v = System.getenv(k);
+        if (v == null || v.isBlank()) return d;
+        try { return Long.parseLong(v.trim()); } catch (Exception e) { return d; }
+    }
+
+    /**
+     * [v86.96] Called once per scan cycle from BotMain.runCycle (gated by
+     * BotMain.NEW_LISTING_CATCHER). Two jobs, both observation-only:
+     *   (1) diff live exchangeInfo symbols vs the persisted known-set → on a
+     *       genuinely new symbol: arm a recording window (anchored to its real
+     *       onboard time), send a Telegram alert, add it to the known-set.
+     *   (2) advance every active recording window: append fresh 1m klines +
+     *       (live) funding + L1 spread to ./data, idempotently; retire expired windows.
+     * Never trades, never touches the signal/calibrator path. Runs single-threaded
+     * on mainSched, so the maps need no extra locking.
+     */
+    public void checkNewListings() {
+        try {
+            if (!nlLoaded) { nlLoad(); nlLoaded = true; }
+
+            // One exchangeInfo fetch (weight 1) → symbol -> onboardDate(ms).
+            Map<String, Long> onboard = nlFetchExchangeInfo();
+            // Rate-limited/ban/parse failure → tiny or empty map. Never diff against that.
+            // Log a non-empty-but-tiny result so the operator can tell "feed unhealthy"
+            // from "genuinely few symbols".
+            if (onboard.size() < NL_SANITY_FLOOR) {
+                if (!onboard.isEmpty())
+                    LOG.warning("[NL] exchangeInfo returned " + onboard.size()
+                            + " symbols (<" + NL_SANITY_FLOOR + ") — feed unhealthy, skipping diff");
+                return;
+            }
+
+            long now = System.currentTimeMillis();
+            long recentCut = now - NL_RECORD_HOURS * 3600_000L;
+            // Cold start: first boot with no known-set → seed the whole universe, but only
+            // ARM+ALERT symbols onboarded within the last NL_RECORD_HOURS, so an in-flight
+            // listing isn't silently absorbed on the first deploy (no ~400-symbol alert storm).
+            boolean coldStart = nlKnownSymbols.isEmpty();
+
+            boolean dirty = false;
+            for (Map.Entry<String, Long> e : onboard.entrySet()) {
+                String sym = e.getKey();
+                if (nlKnownSymbols.contains(sym)) continue;
+                nlKnownSymbols.add(sym);
+                dirty = true;
+                long onboardMs = e.getValue();
+                // Steady state: every not-yet-known symbol is new. Cold start: only the
+                // recently-onboarded ones (older symbols are just the seeded baseline).
+                boolean isNew = !coldStart || (onboardMs > 0 && onboardMs >= recentCut);
+                if (!isNew) continue;
+                // Anchor the window to the real listing time when known → exactly first-N-hours.
+                long until = (onboardMs > 0 ? onboardMs : now) + NL_RECORD_HOURS * 3600_000L;
+                nlRecordingUntil.put(sym, until);
+                String age = onboardMs > 0
+                        ? String.format("%.1fч назад", (now - onboardMs) / 3600_000.0) : "время неизв.";
+                try {
+                    this.bot.sendMessageAsync(
+                            "🆕 *NEW LISTING* `" + sym + "`\n"
+                          + "onboard " + age + " · запись микроструктуры "
+                          + NL_RECORD_HOURS + "ч → ./data\n"
+                          + "_observation-only, бот не торгует_");
+                } catch (Throwable ignored) {}
+                LOG.info("[NL] NEW LISTING " + sym + " — recording until " + until);
+            }
+
+            // (2) Advance every active recording window (including just-armed ones).
+            List<String> done = new ArrayList<>();
+            for (Map.Entry<String, Long> e : nlRecordingUntil.entrySet()) {
+                if (now > e.getValue()) { done.add(e.getKey()); continue; }
+                nlRecordOne(e.getKey());
+            }
+            for (String sym : done) {
+                nlRecordingUntil.remove(sym);
+                nlSeenRecords.removeIf(key -> key.startsWith(sym + "|"));
+                dirty = true;
+                LOG.info("[NL] recording window finished for " + sym);
+            }
+            if (dirty) nlSave();
+        } catch (Throwable t) {
+            LOG.warning("[NL] checkNewListings: " + t.getMessage());
+        }
+    }
+
+    /** Fetch exchangeInfo → map of TRADING USDT-M symbol → onboardDate(ms). Empty on failure. */
+    private Map<String, Long> nlFetchExchangeInfo() {
+        Map<String, Long> out = new HashMap<>();
+        try {
+            HttpResponse<String> resp = sendBinanceRequest(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create("https://fapi.binance.com/fapi/v1/exchangeInfo"))
+                            .timeout(Duration.ofSeconds(10)).GET().build(),
+                    BINANCE_WEIGHT_EXCHANGE_INFO);
+            if (resp == null) return out;
+            JSONArray arr = new JSONObject(resp.body()).getJSONArray("symbols");
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject s = arr.getJSONObject(i);
+                String sym = s.getString("symbol");
+                if (!"TRADING".equalsIgnoreCase(s.optString("status", "TRADING"))) continue;
+                if (!sym.endsWith("USDT")) continue;
+                out.put(sym, s.optLong("onboardDate", 0L));
+            }
+        } catch (Exception e) {
+            LOG.warning("[NL] exchangeInfo: " + e.getMessage());
+            return new HashMap<>();
+        }
+        return out;
+    }
+
+    /** Fetch a fresh snapshot for one recording symbol and append new 1m bars (batched). */
+    private void nlRecordOne(String sym) {
+        try {
+            // Bypass the kline cache — a brand-new symbol needs fresh history. 500 bars (~8h)
+            // fully backfills a cold-start-recent listing and survives any skipped cycle.
+            List<com.bot.TradingCore.Candle> kl = fetchKlinesDirect(sym, "1m", 500);
+            if (kl == null || kl.size() < 2) return; // null=hard fail, tiny=no history yet
+
+            double funding = nlFetchFunding(sym);
+            double[] ba = nlFetchBookTicker(sym);
+            boolean snapOk = ba != null;          // L1 spread actually fetched (not rate-limited)
+            double bid = snapOk ? ba[0] : 0.0;
+            double ask = snapOk ? ba[1] : 0.0;
+            long snap = System.currentTimeMillis();
+
+            // Skip the last (forming) bar; collect only not-yet-recorded closed bars.
+            // Funding/spread are point-in-time and CANNOT be backfilled, so attach them
+            // (live=1) ONLY to bars that closed within NL_FRESH_MS of this snapshot; older
+            // backfill bars carry klines only (funding/bid/ask=0, live=0).
+            List<String> rows = new ArrayList<>();
+            List<String> keys = new ArrayList<>();
+            for (int i = 0; i < kl.size() - 1; i++) {
+                com.bot.TradingCore.Candle c = kl.get(i);
+                String key = sym + "|" + c.openTime;
+                if (nlSeenRecords.contains(key)) continue; // already recorded
+                boolean live = snapOk && (snap - c.closeTime) <= NL_FRESH_MS;
+                rows.add(nlMicroRow(sym, c,
+                        live ? funding : 0.0, live ? bid : 0.0, live ? ask : 0.0, snap, live));
+                keys.add(key);
+            }
+            // Mark bars as seen ONLY after a successful write, so a failed append is retried.
+            if (!rows.isEmpty() && nlAppendMicro(rows)) nlSeenRecords.addAll(keys);
+        } catch (Throwable t) {
+            LOG.warning("[NL] record " + sym + ": " + t.getMessage());
+        }
+    }
+
+    /** Build one pipe-delimited micro-record row. Symbols are Binance [A-Z0-9]+ so no escaping needed. */
+    private static String nlMicroRow(String sym, com.bot.TradingCore.Candle c,
+                                     double funding, double bid, double ask, long snapMs, boolean live) {
+        return sym + "|" + c.openTime + "|" + c.open + "|" + c.high + "|" + c.low
+                + "|" + c.close + "|" + c.volume + "|" + c.quoteVolume + "|" + c.numberOfTrades
+                + "|" + c.takerBuyBaseVolume + "|" + c.takerBuyQuoteVolume
+                + "|" + funding + "|" + bid + "|" + ask + "|" + snapMs + "|" + (live ? 1 : 0);
+    }
+
+    /** Single-symbol funding rate (premiumIndex, weight 1). 0.0 on any failure. */
+    private double nlFetchFunding(String sym) {
+        try {
+            HttpResponse<String> resp = sendBinanceRequest(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=" + sym))
+                            .timeout(Duration.ofSeconds(6)).GET().build(),
+                    1); // single-symbol premiumIndex = weight 1
+            if (resp == null) return 0.0;
+            return new JSONObject(resp.body()).optDouble("lastFundingRate", 0.0);
+        } catch (Exception e) { return 0.0; }
+    }
+
+    /** Single-symbol best bid/ask (bookTicker, weight 2). null on any failure. */
+    private double[] nlFetchBookTicker(String sym) {
+        try {
+            HttpResponse<String> resp = sendBinanceRequest(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create("https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=" + sym))
+                            .timeout(Duration.ofSeconds(6)).GET().build(),
+                    2); // single-symbol bookTicker = weight 2
+            if (resp == null) return null;
+            JSONObject j = new JSONObject(resp.body());
+            double bid = j.optDouble("bidPrice", 0.0);
+            double ask = j.optDouble("askPrice", 0.0);
+            if (bid <= 0 || ask <= 0) return null;
+            return new double[]{bid, ask};
+        } catch (Exception e) { return null; }
+    }
+
+    /** Append micro-record rows (append-only, one file open per call). Returns true on success. */
+    private synchronized boolean nlAppendMicro(List<String> rows) {
+        try {
+            java.io.File f = new java.io.File(NL_MICRO_FILE);
+            java.io.File parent = f.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            boolean fresh = !f.exists() || f.length() == 0;
+            try (java.io.PrintWriter pw = new java.io.PrintWriter(
+                    new java.io.BufferedWriter(new java.io.FileWriter(f, true)))) {
+                if (fresh) pw.println("# new_listing_micro v1 | symbol|openTime|open|high|low|close|"
+                        + "volume|quoteVolume|trades|takerBuyBase|takerBuyQuote|funding|bid|ask|snapMs|live");
+                for (String row : rows) pw.println(row);
+            }
+            return true;
+        } catch (Throwable t) { LOG.warning("[NL] append: " + t.getMessage()); return false; }
+    }
+
+    /** Persist known-set + active recording windows. Atomic temp-then-rename so a crash
+     *  mid-write can't truncate the source-of-truth known-set (→ false re-listing storm). */
+    private synchronized void nlSave() {
+        try {
+            java.io.File f = new java.io.File(NL_KNOWN_FILE);
+            java.io.File parent = f.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            java.io.File tmp = new java.io.File(NL_KNOWN_FILE + ".tmp");
+            try (java.io.PrintWriter pw = new java.io.PrintWriter(
+                    new java.io.BufferedWriter(new java.io.FileWriter(tmp)))) {
+                pw.println("# known_symbols v1 | K|symbol  OR  R|symbol|recordUntilMs");
+                for (String s : nlKnownSymbols) pw.println("K|" + s);
+                for (Map.Entry<String, Long> e : nlRecordingUntil.entrySet())
+                    pw.println("R|" + e.getKey() + "|" + e.getValue());
+            }
+            try {
+                java.nio.file.Files.move(tmp.toPath(), f.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (Exception atomicUnsupported) {
+                // Some filesystems reject ATOMIC_MOVE — fall back to a plain replace.
+                java.nio.file.Files.move(tmp.toPath(), f.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (Throwable t) { LOG.warning("[NL] save: " + t.getMessage()); }
+    }
+
+    /** Load known-set + active recording windows; warm dedupe set for active windows only. */
+    private synchronized void nlLoad() {
+        try {
+            java.io.File f = new java.io.File(NL_KNOWN_FILE);
+            if (f.exists()) {
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        if (line.startsWith("#") || line.isBlank()) continue;
+                        String[] p = line.split("\\|", -1);
+                        if (p[0].equals("K") && p.length >= 2) nlKnownSymbols.add(p[1]);
+                        else if (p[0].equals("R") && p.length >= 3) {
+                            try { nlRecordingUntil.put(p[1], Long.parseLong(p[2])); } catch (Exception ignored) {}
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) { LOG.warning("[NL] load known: " + t.getMessage()); }
+
+        // Warm dedupe only for symbols still inside an active window — keeps the set bounded.
+        try {
+            java.io.File f = new java.io.File(NL_MICRO_FILE);
+            if (f.exists() && !nlRecordingUntil.isEmpty()) {
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        if (line.startsWith("#") || line.isBlank()) continue;
+                        int a = line.indexOf('|');
+                        if (a <= 0) continue;
+                        int b = line.indexOf('|', a + 1);
+                        if (b <= a) continue;
+                        String sym = line.substring(0, a);
+                        if (!nlRecordingUntil.containsKey(sym)) continue;
+                        nlSeenRecords.add(line.substring(0, b));
+                    }
+                }
+            }
+        } catch (Throwable t) { LOG.warning("[NL] load micro: " + t.getMessage()); }
+
+        LOG.info("[NL] loaded known=" + nlKnownSymbols.size()
+                + " activeRecordings=" + nlRecordingUntil.size()
+                + " seenRecords=" + nlSeenRecords.size());
     }
 
     // DYNAMIC COIN CATEGORIZATION
