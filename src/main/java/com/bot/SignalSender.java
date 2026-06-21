@@ -416,6 +416,15 @@ public final class SignalSender {
     private static final String SUPABASE_KEY = System.getenv().getOrDefault("SUPABASE_KEY", "").trim();
     private static final boolean SUPABASE_ON = !SUPABASE_URL.isEmpty() && !SUPABASE_KEY.isEmpty();
 
+    // ════════════ [v86.99] FUNDING-EXTREME SNAPSHOT (hypothesis #2, observation-only) ════════════
+    // Each cycle, snapshot symbols with extreme funding (|fr|>=thr or peak/trough warning) →
+    // ./data + Supabase. Forward returns computed at ANALYSIS time from klines (no in-bot resolver).
+    private static final String FS_FILE = System.getenv().getOrDefault("FUNDING_SNAPS_FILE", "./data/funding_snaps.csv").trim();
+    private static final double FS_EXTREME_THR = 0.0005; // |funding| >= 0.05% = "extreme"
+    private static final String FS_HEADER = "# funding_snaps v1 | symbol|snap_minute|funding_rate|prev_funding_rate|funding_delta|fr_acceleration|open_interest|peak_warn|trough_warn|snap_ms";
+    private volatile long fsLastMinute = 0L;
+    private volatile boolean fsAnnounced = false;
+
     private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
     private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
     private final AtomicLong    rlWindowStart   = new AtomicLong(System.currentTimeMillis());
@@ -4381,6 +4390,90 @@ public final class SignalSender {
         LOG.info("[NL] loaded known=" + nlKnownSymbols.size()
                 + " activeRecordings=" + nlRecordingUntil.size()
                 + " seenRecords=" + nlSeenRecords.size());
+    }
+
+    // ════════════ [v86.99] FUNDING-EXTREME SNAPSHOT methods ════════════
+
+    /** [v86.99] Called once per cycle from BotMain.runCycle (gated by BotMain.FUNDING_SNAPSHOT).
+     *  Snapshots symbols whose funding is extreme into ./data + Supabase. Observation-only —
+     *  reads the funding cache the 15-min refresh already populates; no extra REST. */
+    public void snapshotFundingExtremes() {
+        try {
+            long now = System.currentTimeMillis();
+            long snapMinute = now / 60_000L;
+            if (snapMinute == fsLastMinute) return; // at most one snapshot per minute
+            fsLastMinute = snapMinute;
+
+            List<String> rows = new ArrayList<>();
+            JSONArray json = new JSONArray();
+            for (String sym : cachedPairs) {
+                com.bot.DecisionEngineMerged.FundingOIData d = decisionEngine.getFundingOI(sym);
+                if (d == null) continue;
+                boolean extreme = Math.abs(d.fundingRate) >= FS_EXTREME_THR || d.frPeakWarning || d.frTroughWarning;
+                if (!extreme) continue;
+                rows.add(sym + "|" + snapMinute + "|" + d.fundingRate + "|" + d.prevFundingRate
+                        + "|" + d.fundingDelta + "|" + d.frAcceleration + "|" + d.openInterest
+                        + "|" + (d.frPeakWarning ? 1 : 0) + "|" + (d.frTroughWarning ? 1 : 0) + "|" + now);
+                json.put(new JSONObject()
+                        .put("symbol", sym).put("snap_minute", snapMinute)
+                        .put("funding_rate", d.fundingRate).put("prev_funding_rate", d.prevFundingRate)
+                        .put("funding_delta", d.fundingDelta).put("fr_acceleration", d.frAcceleration)
+                        .put("open_interest", d.openInterest)
+                        .put("peak_warn", d.frPeakWarning).put("trough_warn", d.frTroughWarning)
+                        .put("snap_ms", now));
+            }
+            if (!rows.isEmpty()) {
+                appendCsv(FS_FILE, FS_HEADER, rows);
+                sbPost("funding_snaps?on_conflict=symbol,snap_minute", json);
+            }
+            if (!fsAnnounced) {
+                fsAnnounced = true;
+                LOG.info("[FS] funding-extreme snapshot active (thr=" + FS_EXTREME_THR
+                        + ", storage ./data" + (SUPABASE_ON ? " + Supabase" : "") + ")");
+            }
+        } catch (Throwable t) { LOG.warning("[FS] " + t.getMessage()); }
+    }
+
+    /** Generic append-only CSV writer (mkdirs + header on fresh file). Shared by funding/liq capture. */
+    private synchronized void appendCsv(String file, String header, java.util.List<String> rows) {
+        try {
+            java.io.File f = new java.io.File(file);
+            java.io.File parent = f.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            boolean fresh = !f.exists() || f.length() == 0;
+            try (java.io.PrintWriter pw = new java.io.PrintWriter(
+                    new java.io.BufferedWriter(new java.io.FileWriter(f, true)))) {
+                if (fresh) pw.println(header);
+                for (String r : rows) pw.println(r);
+            }
+        } catch (Throwable t) { LOG.warning("[CSV] append " + file + ": " + t.getMessage()); }
+    }
+
+    /** Generic best-effort Supabase PostgREST insert (ignore-duplicates). No-op if Supabase off.
+     *  pathQuery e.g. "funding_snaps?on_conflict=symbol,snap_minute". ./data stays source of truth. */
+    private void sbPost(String pathQuery, JSONArray rows) {
+        if (!SUPABASE_ON || rows.isEmpty()) return;
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(SUPABASE_URL + "/rest/v1/" + pathQuery))
+                    .timeout(Duration.ofSeconds(10))
+                    .header("apikey", SUPABASE_KEY)
+                    .header("Authorization", "Bearer " + SUPABASE_KEY)
+                    .header("Content-Type", "application/json")
+                    .header("Prefer", "resolution=ignore-duplicates,return=minimal")
+                    .POST(HttpRequest.BodyPublishers.ofString(rows.toString()))
+                    .build();
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            int sc = resp.statusCode();
+            if (sc < 200 || sc >= 300) {
+                String b = resp.body() == null ? "" : resp.body();
+                LOG.warning("[SB] " + pathQuery + " HTTP " + sc + ": " + b.substring(0, Math.min(160, b.length())));
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (Exception ex) {
+            LOG.warning("[SB] " + pathQuery + " failed (./data still has it): " + ex.getMessage());
+        }
     }
 
     // DYNAMIC COIN CATEGORIZATION
