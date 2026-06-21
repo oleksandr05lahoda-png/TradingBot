@@ -408,6 +408,14 @@ public final class SignalSender {
     private volatile boolean nlLoaded = false;
     private volatile boolean nlAnnounced = false; // one-time-per-boot "catcher active" status sent?
 
+    // [v86.98] Optional Supabase sink — mirror micro-records to a queryable Postgres DB in
+    // ADDITION to ./data (./data stays the source of truth). Off unless both env vars are set,
+    // so the bot still works with zero config. Writes via PostgREST with the anon key (the
+    // table has INSERT-only RLS, so the key can write but not read).
+    private static final String SUPABASE_URL = System.getenv().getOrDefault("SUPABASE_URL", "").trim();
+    private static final String SUPABASE_KEY = System.getenv().getOrDefault("SUPABASE_KEY", "").trim();
+    private static final boolean SUPABASE_ON = !SUPABASE_URL.isEmpty() && !SUPABASE_KEY.isEmpty();
+
     private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
     private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
     private final AtomicLong    rlWindowStart   = new AtomicLong(System.currentTimeMillis());
@@ -4126,10 +4134,11 @@ public final class SignalSender {
                         + nlRecordingUntil.size() + " recording");
                 try {
                     this.bot.sendMessageAsync(
-                            "🛰 *Ловец листингов активен* (v86.97)\n"
+                            "🛰 *Ловец листингов активен* (v86.98)\n"
                           + "Отслеживаю " + nlKnownSymbols.size() + " символов"
                           + (nlRecordingUntil.size() > 0 ? (", пишу " + nlRecordingUntil.size()) : "")
-                          + "\nНовый листинг → 🆕 алерт + запись в ./data · _бот не торгует_");
+                          + "\nХранилище: ./data" + (SUPABASE_ON ? " + Supabase ✅" : " (Supabase выкл)")
+                          + "\nНовый листинг → 🆕 алерт + запись · _бот не торгует_");
                 } catch (Throwable ignored) {}
             }
         } catch (Throwable t) {
@@ -4183,17 +4192,22 @@ public final class SignalSender {
             // backfill bars carry klines only (funding/bid/ask=0, live=0).
             List<String> rows = new ArrayList<>();
             List<String> keys = new ArrayList<>();
+            JSONArray json = new JSONArray();
             for (int i = 0; i < kl.size() - 1; i++) {
                 com.bot.TradingCore.Candle c = kl.get(i);
                 String key = sym + "|" + c.openTime;
                 if (nlSeenRecords.contains(key)) continue; // already recorded
                 boolean live = snapOk && (snap - c.closeTime) <= NL_FRESH_MS;
-                rows.add(nlMicroRow(sym, c,
-                        live ? funding : 0.0, live ? bid : 0.0, live ? ask : 0.0, snap, live));
+                double fnd = live ? funding : 0.0, bd = live ? bid : 0.0, ak = live ? ask : 0.0;
+                rows.add(nlMicroRow(sym, c, fnd, bd, ak, snap, live));
+                json.put(nlMicroJson(sym, c, fnd, bd, ak, snap, live));
                 keys.add(key);
             }
-            // Mark bars as seen ONLY after a successful write, so a failed append is retried.
-            if (!rows.isEmpty() && nlAppendMicro(rows)) nlSeenRecords.addAll(keys);
+            // Mark bars as seen ONLY after a successful ./data write, so a failed append is retried.
+            if (!rows.isEmpty() && nlAppendMicro(rows)) {
+                nlSeenRecords.addAll(keys);
+                nlPushSupabase(json); // best-effort mirror; ./data is the source of truth
+            }
         } catch (Throwable t) {
             LOG.warning("[NL] record " + sym + ": " + t.getMessage());
         }
@@ -4206,6 +4220,49 @@ public final class SignalSender {
                 + "|" + c.close + "|" + c.volume + "|" + c.quoteVolume + "|" + c.numberOfTrades
                 + "|" + c.takerBuyBaseVolume + "|" + c.takerBuyQuoteVolume
                 + "|" + funding + "|" + bid + "|" + ask + "|" + snapMs + "|" + (live ? 1 : 0);
+    }
+
+    /** Build one micro-record as JSON for the Supabase REST sink (keys = table columns). */
+    private static JSONObject nlMicroJson(String sym, com.bot.TradingCore.Candle c,
+                                          double funding, double bid, double ask, long snapMs, boolean live) {
+        return new JSONObject()
+                .put("symbol", sym).put("open_time", c.openTime)
+                .put("open", c.open).put("high", c.high).put("low", c.low).put("close", c.close)
+                .put("volume", c.volume).put("quote_volume", c.quoteVolume)
+                .put("trades", c.numberOfTrades)
+                .put("taker_buy_base", c.takerBuyBaseVolume).put("taker_buy_quote", c.takerBuyQuoteVolume)
+                .put("funding", funding).put("bid", bid).put("ask", ask)
+                .put("snap_ms", snapMs).put("live", live);
+    }
+
+    /** Best-effort mirror of micro-rows to Supabase (PostgREST bulk insert, ignore-duplicates).
+     *  ./data stays the source of truth — a Supabase failure NEVER loses data. No-op unless
+     *  SUPABASE_URL + SUPABASE_KEY are set. Uses the bot's HttpClient directly (not the Binance
+     *  rate-limiter — different host, no weight). */
+    private void nlPushSupabase(JSONArray rows) {
+        if (!SUPABASE_ON || rows.isEmpty()) return;
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(SUPABASE_URL + "/rest/v1/nl_micro?on_conflict=symbol,open_time"))
+                    .timeout(Duration.ofSeconds(10))
+                    .header("apikey", SUPABASE_KEY)
+                    .header("Authorization", "Bearer " + SUPABASE_KEY)
+                    .header("Content-Type", "application/json")
+                    .header("Prefer", "resolution=ignore-duplicates,return=minimal")
+                    .POST(HttpRequest.BodyPublishers.ofString(rows.toString()))
+                    .build();
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            int sc = resp.statusCode();
+            if (sc < 200 || sc >= 300) {
+                String b = resp.body() == null ? "" : resp.body();
+                LOG.warning("[NL] Supabase insert HTTP " + sc + ": "
+                        + b.substring(0, Math.min(200, b.length())));
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            LOG.warning("[NL] Supabase push failed (./data still has it): " + e.getMessage());
+        }
     }
 
     /** Single-symbol funding rate (premiumIndex, weight 1). 0.0 on any failure. */
