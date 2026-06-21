@@ -126,6 +126,13 @@ public final class BotMain {
     public static final boolean FUNDING_SNAPSHOT =
             !"0".equals(System.getenv().getOrDefault("FUNDING_SNAPSHOT", "1"));
 
+    // [v87.0] Liquidation capture (hypothesis #3, observation-only). Buffers liquidation events
+    // from the existing WS stream and flushes a batch per cycle to ./data + Supabase. NEVER trades.
+    // Default ON; disable with LIQ_CAPTURE=0. Implemented in SignalSender (processLiquidationEvent
+    // buffers, flushLiquidations drains).
+    public static final boolean LIQ_CAPTURE =
+            !"0".equals(System.getenv().getOrDefault("LIQ_CAPTURE", "1"));
+
     // [v79 I5] Cross-exchange price validation. Compares Binance kline last close
     // with Bybit/OKX. If discrepancy >0.5% → log warning + dispatch blocked.
     // Default OFF — Binance is generally trustworthy, but available for paranoid setups.
@@ -199,7 +206,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v86.99";
+    private static final String BOT_VERSION = "v87.0";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1335,6 +1342,8 @@ public final class BotMain {
         if (NEW_LISTING_CATCHER) { try { sender.checkNewListings(); } catch (Throwable ignored) {} }
         // [v86.99] Funding-extreme snapshot (#2) — observation-only.
         if (FUNDING_SNAPSHOT) { try { sender.snapshotFundingExtremes(); } catch (Throwable ignored) {} }
+        // [v87.0] Liquidation capture flush (#3) — observation-only.
+        if (LIQ_CAPTURE) { try { sender.flushLiquidations(); } catch (Throwable ignored) {} }
 
         double bal = sender.getAccountBalance();
         if (bal > 0) isc.updateBalance(bal);

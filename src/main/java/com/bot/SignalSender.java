@@ -425,6 +425,17 @@ public final class SignalSender {
     private volatile long fsLastMinute = 0L;
     private volatile boolean fsAnnounced = false;
 
+    // ════════════ [v87.0] LIQUIDATION CAPTURE (hypothesis #3, observation-only) ════════════
+    // The existing !forceOrder@arr WS stream feeds processLiquidationEvent; we buffer each event
+    // there and flush a batch once per cycle → ./data + Supabase. Reversion outcome is computed
+    // at ANALYSIS time from klines (no in-bot resolver).
+    private static final String LQ_FILE = System.getenv().getOrDefault("LIQ_EVENTS_FILE", "./data/liq_events.csv").trim();
+    private static final String LQ_HEADER = "# liq_events v1 | symbol|order_time|side|price|qty|notional|snap_ms";
+    private static final int LQ_FLUSH_MAX  = 2000;   // cap rows written per cycle
+    private static final int LQ_BUFFER_MAX = 20000;  // backpressure: drop new beyond this
+    private final java.util.Queue<org.json.JSONObject> liqBuffer = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private volatile boolean lqAnnounced = false;
+
     private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
     private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
     private final AtomicLong    rlWindowStart   = new AtomicLong(System.currentTimeMillis());
@@ -4476,6 +4487,40 @@ public final class SignalSender {
         }
     }
 
+    /** [v87.0] Called once per cycle from BotMain.runCycle (gated by BotMain.LIQ_CAPTURE).
+     *  Drains buffered liquidation events (filled by the WS stream) → ./data + Supabase. */
+    public void flushLiquidations() {
+        try {
+            if (liqBuffer.isEmpty()) {
+                if (!lqAnnounced) {
+                    lqAnnounced = true;
+                    LOG.info("[LQ] liquidation capture active (storage ./data" + (SUPABASE_ON ? " + Supabase" : "") + ")");
+                }
+                return;
+            }
+            List<String> rows = new ArrayList<>();
+            JSONArray json = new JSONArray();
+            org.json.JSONObject e;
+            int n = 0;
+            while (n < LQ_FLUSH_MAX && (e = liqBuffer.poll()) != null) {
+                n++;
+                rows.add(e.getString("symbol") + "|" + e.getLong("order_time") + "|" + e.optString("side")
+                        + "|" + e.getDouble("price") + "|" + e.getDouble("qty") + "|" + e.getDouble("notional")
+                        + "|" + e.getLong("snap_ms"));
+                json.put(e);
+            }
+            if (!rows.isEmpty()) {
+                appendCsv(LQ_FILE, LQ_HEADER, rows);
+                sbPost("liq_events?on_conflict=symbol,order_time,side,price,qty", json);
+            }
+            if (!lqAnnounced) {
+                lqAnnounced = true;
+                LOG.info("[LQ] liquidation capture active (storage ./data" + (SUPABASE_ON ? " + Supabase" : "") + ")");
+            }
+            LOG.info("[LQ] flushed " + n + " liquidations");
+        } catch (Throwable t) { LOG.warning("[LQ] " + t.getMessage()); }
+    }
+
     // DYNAMIC COIN CATEGORIZATION
     // Old: hardcoded switch → missed new TOP coins, couldn't adapt.
     // New: volume-based dynamic classification + known-list seed.
@@ -4701,6 +4746,16 @@ public final class SignalSender {
 
             double notional = avgPrice * qty;
             if (notional < LIQ_MIN_NOTIONAL) return; // игнорируем мелкие
+
+            // [v87.0] Observation-only capture for hypothesis #3 (forced-flow reversion).
+            // Buffer here (WS thread); BotMain.runCycle drains+batch-writes via flushLiquidations().
+            if (com.bot.BotMain.LIQ_CAPTURE && liqBuffer.size() < LQ_BUFFER_MAX) {
+                long lqT = o.optLong("T", event.optLong("E", System.currentTimeMillis()));
+                liqBuffer.add(new org.json.JSONObject()
+                        .put("symbol", symbol).put("order_time", lqT).put("side", side)
+                        .put("price", avgPrice).put("qty", qty).put("notional", notional)
+                        .put("snap_ms", System.currentTimeMillis()));
+            }
 
             // Ценовой bucket: округляем до 0.1% от цены
             double bucketSize = avgPrice * 0.001;
