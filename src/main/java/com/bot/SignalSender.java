@@ -4488,6 +4488,83 @@ public final class SignalSender {
         } catch (Throwable t) { LOG.warning("[FS] " + t.getMessage()); }
     }
 
+    // ════════════ [v87.4] BREAKOUT TREND TRACKER (hypothesis #5, observation-only) ════════════
+    // The ONLY strategy that survived offline validation: daily Donchian breakout + trailing exit =
+    // the trend-following premium (regime-dependent, loses in bears, NOT all-weather). Forward-test it
+    // leak-free: log FRESH daily breakouts; trailing-exit OUTCOMES computed OFFLINE from klines.
+    private static final String TS_FILE = System.getenv().getOrDefault("TREND_SIGNALS_FILE", "./data/trend_signals.csv").trim();
+    private static final String TS_HEADER = "# trend_signals v1 | symbol|signal_day|direction|entry|init_stop|atr|donchian_n|bar_close_ms|snap_ms";
+    private static final int TS_DONCHIAN = 20;
+    private static final int TS_PER_CYCLE = 6;     // coins per cycle (spread daily-kline REST load over ~1 sweep)
+    private final java.util.Set<String> tsSeen = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private int tsIndex = 0;
+    private volatile boolean tsAnnounced = false;
+
+    /** [v87.4] Called once per cycle from BotMain.runCycle (gated by BotMain.TREND_TRACK). Round-robins
+     *  a few coins/cycle: detects a FRESH daily Donchian breakout on the last CLOSED bar and logs the
+     *  entry + initial stop. Outcomes (trailing exit) computed at ANALYSIS time from klines — no in-bot resolver. */
+    public void trackBreakoutSignals() {
+        try {
+            java.util.List<String> pairs = new java.util.ArrayList<>(cachedPairs);
+            if (pairs.isEmpty()) return;
+            if (!tsAnnounced) {
+                tsAnnounced = true;
+                LOG.info("[TS] breakout trend tracker active (Donchian" + TS_DONCHIAN
+                        + ", storage ./data" + (SUPABASE_ON ? " + Supabase" : "") + ")");
+            }
+            java.util.List<String> rows = new java.util.ArrayList<>();
+            JSONArray json = new JSONArray();
+            int batch = Math.min(TS_PER_CYCLE, pairs.size());
+            for (int b = 0; b < batch; b++) {
+                String sym = pairs.get(Math.floorMod(tsIndex++, pairs.size()));
+                List<com.bot.TradingCore.Candle> kl = fetchKlinesDirect(sym, "1d", TS_DONCHIAN + 25);
+                if (kl == null || kl.size() < TS_DONCHIAN + 4) continue;
+                int last = kl.size() - 2;                 // last CLOSED daily bar (skip forming bar)
+                com.bot.TradingCore.Candle cNow = kl.get(last), cPrev = kl.get(last - 1);
+                double hhNow = tsDon(kl, last, TS_DONCHIAN, true),  llNow = tsDon(kl, last, TS_DONCHIAN, false);
+                double hhPre = tsDon(kl, last - 1, TS_DONCHIAN, true), llPre = tsDon(kl, last - 1, TS_DONCHIAN, false);
+                int dir = 0;
+                if (cNow.close > hhNow && cPrev.close <= hhPre) dir = 1;        // fresh upside breakout
+                else if (cNow.close < llNow && cPrev.close >= llPre) dir = -1;  // fresh downside breakout
+                if (dir == 0) continue;
+                long day = cNow.closeTime / 86_400_000L;
+                if (!tsSeen.add(sym + "|" + day + "|" + dir)) continue;         // log once per coin/day/dir
+                double atr = tsAtr(kl, last, 14);
+                double entry = cNow.close;
+                double initStop = dir == 1 ? entry - 1.5 * atr : entry + 1.5 * atr;
+                long snap = System.currentTimeMillis();
+                rows.add(sym + "|" + day + "|" + dir + "|" + entry + "|" + initStop + "|" + atr
+                        + "|" + TS_DONCHIAN + "|" + cNow.closeTime + "|" + snap);
+                json.put(new JSONObject().put("symbol", sym).put("signal_day", day).put("direction", dir)
+                        .put("entry", entry).put("init_stop", initStop).put("atr", atr)
+                        .put("donchian_n", TS_DONCHIAN).put("bar_close_ms", cNow.closeTime).put("snap_ms", snap));
+            }
+            if (!rows.isEmpty()) {
+                appendCsv(TS_FILE, TS_HEADER, rows);
+                sbPost("trend_signals?on_conflict=symbol,signal_day,direction", json);
+                LOG.info("[TS] logged " + rows.size() + " breakout signal(s)");
+            }
+        } catch (Throwable t) { LOG.warning("[TS] " + t.getMessage()); }
+    }
+
+    /** Donchian extreme over the n bars ENDING just before index `end` (exclusive). high=true→max high, else→min low. */
+    private double tsDon(List<com.bot.TradingCore.Candle> kl, int end, int n, boolean high) {
+        double v = high ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+        for (int i = Math.max(0, end - n); i < end; i++)
+            v = high ? Math.max(v, kl.get(i).high) : Math.min(v, kl.get(i).low);
+        return v;
+    }
+    /** Simple ATR over the n bars ending at index `end`. */
+    private double tsAtr(List<com.bot.TradingCore.Candle> kl, int end, int n) {
+        double sum = 0; int cnt = 0;
+        for (int i = Math.max(1, end - n + 1); i <= end; i++) {
+            com.bot.TradingCore.Candle c = kl.get(i), p = kl.get(i - 1);
+            sum += Math.max(c.high - c.low, Math.max(Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
+            cnt++;
+        }
+        return cnt > 0 ? sum / cnt : 0.0;
+    }
+
     /** Generic append-only CSV writer (mkdirs + header on fresh file). Shared by funding/liq capture. */
     private synchronized void appendCsv(String file, String header, java.util.List<String> rows) {
         try {

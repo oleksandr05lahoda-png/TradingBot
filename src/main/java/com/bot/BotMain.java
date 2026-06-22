@@ -132,6 +132,12 @@ public final class BotMain {
     // buffers, flushLiquidations drains).
     public static final boolean LIQ_CAPTURE =
             !"0".equals(System.getenv().getOrDefault("LIQ_CAPTURE", "1"));
+    // [v87.4] Breakout trend tracker (hypothesis #5, observation-only). The ONLY strategy that survived
+    // offline validation (daily Donchian breakout + trailing = regime-dependent trend premium). Logs
+    // fresh daily breakout signals for forward-testing; outcomes computed offline. Default ON; LIQ-style.
+    // Disable with TREND_TRACK=0. Implemented in SignalSender.trackBreakoutSignals().
+    public static final boolean TREND_TRACK =
+            !"0".equals(System.getenv().getOrDefault("TREND_TRACK", "1"));
 
     // [v79 I5] Cross-exchange price validation. Compares Binance kline last close
     // with Bybit/OKX. If discrepancy >0.5% → log warning + dispatch blocked.
@@ -206,7 +212,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v87.3";
+    private static final String BOT_VERSION = "v87.4";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1344,6 +1350,8 @@ public final class BotMain {
         if (FUNDING_SNAPSHOT) { try { sender.snapshotFundingExtremes(); } catch (Throwable ignored) {} }
         // [v87.0] Liquidation capture flush (#3) — observation-only.
         if (LIQ_CAPTURE) { try { sender.flushLiquidations(); } catch (Throwable ignored) {} }
+        // [v87.4] Breakout trend signal tracker (#5) — observation-only forward test of the one survivor.
+        if (TREND_TRACK) { try { sender.trackBreakoutSignals(); } catch (Throwable ignored) {} }
 
         double bal = sender.getAccountBalance();
         if (bal > 0) isc.updateBalance(bal);
