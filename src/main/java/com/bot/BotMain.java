@@ -218,7 +218,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v87.6";
+    private static final String BOT_VERSION = "v87.7";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1261,7 +1261,8 @@ public final class BotMain {
         } catch (Throwable ignored) {}
 
         try {
-            com.bot.SimpleBacktester.SelfValidator.start(sender, telegram, 5 * 60_000L);
+            if (LEGACY_BT)   // [v87.7] candle self-validator gated off (dead strategy + 30m HARD-FAIL spam)
+                com.bot.SimpleBacktester.SelfValidator.start(sender, telegram, 5 * 60_000L);
         } catch (Throwable t) {
             LOG.warning("[SELF-VALIDATOR] init failed: " + t.getMessage());
         }
@@ -1323,8 +1324,9 @@ public final class BotMain {
         // frees its memory (no -Xmx380m OOM overlap). Sends an honest out-of-sample verdict
         // (the startup-BT "X/4" line is in-sample bucketing, not OOS).
         try {
-            heavySched.submit(safe("WalkForwardBoot",
-                    () -> runWalkForwardValidation(sender, telegram)));
+            if (LEGACY_BT)   // [v87.7] candle walk-forward gated off (dead strategy)
+                heavySched.submit(safe("WalkForwardBoot",
+                        () -> runWalkForwardValidation(sender, telegram)));
         } catch (Throwable t) {
             LOG.warning("[WF-BOOT] init failed: " + t.getMessage());
         }
