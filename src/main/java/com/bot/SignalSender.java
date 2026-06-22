@@ -4513,6 +4513,7 @@ public final class SignalSender {
                         + ", storage ./data" + (SUPABASE_ON ? " + Supabase" : "") + ")");
             }
             java.util.List<String> rows = new java.util.ArrayList<>();
+            java.util.List<String> alerts = new java.util.ArrayList<>();
             JSONArray json = new JSONArray();
             int batch = Math.min(TS_PER_CYCLE, pairs.size());
             for (int b = 0; b < batch; b++) {
@@ -4538,11 +4539,17 @@ public final class SignalSender {
                 json.put(new JSONObject().put("symbol", sym).put("signal_day", day).put("direction", dir)
                         .put("entry", entry).put("init_stop", initStop).put("atr", atr)
                         .put("donchian_n", TS_DONCHIAN).put("bar_close_ms", cNow.closeTime).put("snap_ms", snap));
+                alerts.add((dir == 1 ? "🟢 LONG  " : "🔴 SHORT ") + sym + " @ " + entry + "  (стоп " + initStop + ")");
             }
             if (!rows.isEmpty()) {
                 appendCsv(TS_FILE, TS_HEADER, rows);
                 sbPost("trend_signals?on_conflict=symbol,signal_day,direction", json);
                 LOG.info("[TS] logged " + rows.size() + " breakout signal(s)");
+                try {
+                    bot.sendMessageAsync("📈 *BREAKOUT-сигналы* (стратегия v5, observation-only)\n"
+                            + String.join("\n", alerts)
+                            + "\n\nДневной Donchian-пробой · бот НЕ торгует · копим форвард-статистику");
+                } catch (Throwable ignored) {}
             }
         } catch (Throwable t) { LOG.warning("[TS] " + t.getMessage()); }
     }

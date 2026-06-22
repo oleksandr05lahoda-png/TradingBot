@@ -103,6 +103,12 @@ public final class BotMain {
     // must explicitly set BINANCE_USE_TESTNET=0 with valid real API keys.
     public static final boolean AUTO_TRADE_ENABLED =
             "1".equals(System.getenv().getOrDefault("BOT_AUTO_TRADE", "0"));
+    // [v87.5] Legacy candle-strategy backtests (startup + periodic + walk-forward). The candle strategy
+    // is settled-DEAD; OFF by default now to silence the −142% noise/HARD-FAIL spam and focus the bot on
+    // the breakout tracker (#5). Live candle scan stays (paper, mostly silent) — only the backtests are
+    // gated. Re-enable everything with LEGACY_BT=1. NOT a delete — fully reversible.
+    public static final boolean LEGACY_BT =
+            "1".equals(System.getenv().getOrDefault("LEGACY_BT", "0"));
 
     // [v86.35] HARD live-trading kill switch — default OFF (DISARMED). While we validate the edge
     // (honest backtest + live verifier), the bot analyzes, sends signals, and the verifier
@@ -212,7 +218,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v87.4";
+    private static final String BOT_VERSION = "v87.5";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1110,7 +1116,7 @@ public final class BotMain {
         auxSched.scheduleAtFixedRate(
                 safe("WalkForward", () -> {
                     int hourUtc = ZonedDateTime.now(ZoneOffset.UTC).getHour();
-                    if (hourUtc == 5) {   // [v86.80] daily (was every 3rd day) — real OOS verdict
+                    if (hourUtc == 5 && LEGACY_BT) {   // [v86.80] daily OOS verdict — [v87.5] gated off (candle dead)
                         runWalkForwardValidation(sender, telegram);
                     }
                 }),
@@ -1118,7 +1124,7 @@ public final class BotMain {
         auxSched.scheduleAtFixedRate(
                 safe("BacktestSubmit", () -> {
                     int hourUtc = ZonedDateTime.now(ZoneOffset.UTC).getHour();
-                    if (hourUtc == 3) {
+                    if (hourUtc == 3 && LEGACY_BT) {   // [v87.5] periodic candle BT gated off (settled dead)
                         heavySched.submit(safe("Backtest",
                                 () -> runPeriodicBacktest(sender, isc)));
                     }
@@ -1271,8 +1277,8 @@ public final class BotMain {
             // [v85.2] Вернул DEFAULT ON (юзер хочет обычный бэктест). На нормальной каденции
             // (без частых рестартов) startup-BT грузит ОК — 418 был от ~10 рестартов подряд
             // + тяжёлого pairs-BT. pairs-BT остаётся OFF. Откл: STARTUP_BACKTEST=0.
-            boolean startupBacktestEnabled =
-                    !"0".equals(System.getenv().getOrDefault("STARTUP_BACKTEST", "1"));
+            boolean startupBacktestEnabled = LEGACY_BT     // [v87.5] candle BT off by default
+                    && !"0".equals(System.getenv().getOrDefault("STARTUP_BACKTEST", "1"));
             int existingOutcomes =
                     com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
             int minSamplesNeeded = Integer.parseInt(System.getenv()
