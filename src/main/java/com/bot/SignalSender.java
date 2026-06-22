@@ -4572,6 +4572,58 @@ public final class SignalSender {
         return cnt > 0 ? sum / cnt : 0.0;
     }
 
+    /** [v87.6] Startup backtest of the NEW breakout strategy (daily Donchian-20 + 1.5ATR stop + 3ATR
+     *  trailing, long+short) across the bot's coins → honest Telegram summary (per-year + survivorship
+     *  caveat). Replaces the disabled candle backtest. Backtest ONLY — live green-light needs the forward test. */
+    public void runBreakoutBacktest(com.bot.TelegramBotSender tg) {
+        try {
+            java.util.List<String> pairs = new java.util.ArrayList<>(cachedPairs);
+            if (pairs.isEmpty()) return;
+            int nTrades = 0, wins = 0; double sumRet = 0.0; int coins = 0;
+            java.util.Map<String,double[]> byYear = new java.util.TreeMap<>(); // year -> [sumRet, n]
+            for (String sym : pairs) {
+                List<com.bot.TradingCore.Candle> kl = fetchKlinesDirect(sym, "1d", 1000);
+                if (kl == null || kl.size() < 60) continue;
+                coins++;
+                int pos = 0; double entry = 0, stop = 0, ext = 0;
+                for (int i = 21; i < kl.size(); i++) {
+                    double a = tsAtr(kl, i, 14); if (a <= 0) continue;
+                    com.bot.TradingCore.Candle c = kl.get(i), p = kl.get(i - 1);
+                    if (pos == 0) {
+                        double hh = tsDon(kl, i, 20, true), ll = tsDon(kl, i, 20, false);
+                        double hhP = tsDon(kl, i - 1, 20, true), llP = tsDon(kl, i - 1, 20, false);
+                        if (c.close > hh && p.close <= hhP) { pos = 1; entry = c.close; stop = entry - 1.5 * a; ext = entry; }
+                        else if (c.close < ll && p.close >= llP) { pos = -1; entry = c.close; stop = entry + 1.5 * a; ext = entry; }
+                    } else if (pos == 1) {
+                        ext = Math.max(ext, c.close); stop = Math.max(stop, ext - 3 * a);
+                        if (c.close <= stop) { double r = (c.close - entry) / entry - 0.001; nTrades++; if (r > 0) wins++; sumRet += r; btYear(c, r, byYear); pos = 0; }
+                    } else {
+                        ext = Math.min(ext, c.close); stop = Math.min(stop, ext + 3 * a);
+                        if (c.close >= stop) { double r = (entry - c.close) / entry - 0.001; nTrades++; if (r > 0) wins++; sumRet += r; btYear(c, r, byYear); pos = 0; }
+                    }
+                }
+            }
+            if (nTrades == 0) { LOG.info("[BREAKOUT-BT] no trades"); return; }
+            StringBuilder yb = new StringBuilder();
+            for (java.util.Map.Entry<String,double[]> e : byYear.entrySet())
+                yb.append(e.getKey()).append(" ").append(String.format("%+.1f%%", e.getValue()[0] / e.getValue()[1] * 100)).append(" · ");
+            String msg = String.format(
+                    "📊 *BREAKOUT-стратегия v5 — бэктест* (дневки, %d монет)%n"
+                  + "Сделок: %d · Винрейт: %.0f%%%n"
+                  + "Средн. на сделку: %+.2f%% (после костов)%n"
+                  + "По годам (средн/сделку): %s%n%n"
+                  + "⚠️ Это БЭКТЕСТ — заражён survivorship (как и тот +732%%). НЕ реальная прибыль.%n"
+                  + "Зелёный свет на LIVE даёт ТОЛЬКО форвард-тест (≥100 живых сделок, CI>0), не бэктест.",
+                    coins, nTrades, 100.0 * wins / nTrades, 100.0 * sumRet / nTrades, yb.toString());
+            tg.sendMessageAsync(msg);
+            LOG.info("[BREAKOUT-BT] " + nTrades + " trades wr=" + (100 * wins / nTrades) + "% avg=" + String.format("%.2f", 100.0 * sumRet / nTrades));
+        } catch (Throwable t) { LOG.warning("[BREAKOUT-BT] " + t.getMessage()); }
+    }
+    private void btYear(com.bot.TradingCore.Candle c, double r, java.util.Map<String,double[]> byYear) {
+        String y = String.valueOf(java.time.Instant.ofEpochMilli(c.closeTime).atZone(java.time.ZoneOffset.UTC).getYear());
+        byYear.computeIfAbsent(y, k -> new double[2]); byYear.get(y)[0] += r; byYear.get(y)[1] += 1;
+    }
+
     /** Generic append-only CSV writer (mkdirs + header on fresh file). Shared by funding/liq capture. */
     private synchronized void appendCsv(String file, String header, java.util.List<String> rows) {
         try {

@@ -218,7 +218,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v87.5";
+    private static final String BOT_VERSION = "v87.6";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1305,6 +1305,17 @@ public final class BotMain {
             }
         } catch (Throwable t) {
             LOG.warning("[STARTUP-BT] init failed: " + t.getMessage());
+        }
+
+        // [v87.6] NEW-strategy backtest summary (breakout): replaces the disabled candle one. Honest —
+        // per-year + survivorship caveat in the message; live green-light still requires the forward test.
+        // Disable with BREAKOUT_BT=0.
+        try {
+            if (!"0".equals(System.getenv().getOrDefault("BREAKOUT_BT", "1"))) {
+                heavySched.submit(safe("BreakoutBT", () -> sender.runBreakoutBacktest(telegram)));
+            }
+        } catch (Throwable t) {
+            LOG.warning("[BREAKOUT-BT] init failed: " + t.getMessage());
         }
 
         // [v86.80] One-shot REAL OOS walk-forward after boot — queues on the SAME
