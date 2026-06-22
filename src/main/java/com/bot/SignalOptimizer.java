@@ -49,7 +49,6 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  * <h2>Changelog v72 (vs v5.0)</h2>
  * <ul>
  *   <li>Removed dead {@code microTrendCache} field (was written, never read).</li>
- *   <li>Removed dead {@code clamp()} private static method.</li>
  *   <li>Consolidated 4 {@code MicroTrendResult} constructor overloads into 2.</li>
  *   <li>Replaced uppercase magic numbers with named constants for every threshold.</li>
  *   <li>{@code computeAdaptiveImpulseCap} extracted into 3 named branches with

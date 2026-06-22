@@ -1,6 +1,5 @@
 package com.bot;
 
-import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.net.URI;

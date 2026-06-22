@@ -8,7 +8,6 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /** SignalSender — TRADINGBOT PRO EDITION v37.0 */
@@ -5056,7 +5055,6 @@ public final class SignalSender {
     public static List<Integer> detectSwingHighs(List<com.bot.TradingCore.Candle> c, int lr) { return com.bot.DecisionEngineMerged.swingHighs(c, lr); }
     public static List<Integer> detectSwingLows(List<com.bot.TradingCore.Candle> c, int lr)  { return com.bot.DecisionEngineMerged.swingLows(c, lr); }
     public static int marketStructure(List<com.bot.TradingCore.Candle> c) { return com.bot.DecisionEngineMerged.marketStructure(c); }
-    public static boolean detectLiquiditySweep(List<com.bot.TradingCore.Candle> c) { return com.bot.DecisionEngineMerged.detectLiquiditySweep(c); }
 
     private static String hmacSHA256(String secret, String data) throws Exception {
         javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
