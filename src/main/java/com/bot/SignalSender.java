@@ -182,7 +182,8 @@ public final class SignalSender {
     private final Map<String, java.util.NavigableMap<Double, Double>> liqHeatmap
             = new ConcurrentHashMap<>();
     private volatile WebSocket liqWebSocket = null;
-    private static final double LIQ_MIN_NOTIONAL = 50_000.0;  // игнорируем < $50k
+    private static final double LIQ_MIN_NOTIONAL =          // [v87.2] $50k→$5k: для СБОРА данных (#3) ловим больше; фильтр вверх — при анализе
+            envDouble("LIQ_MIN_NOTIONAL", 5_000.0);
     private static final long   LIQ_DECAY_MS     = 30 * 60_000L; // ликвидации "протухают" за 30 мин
     private final Map<String, Long> liqTimestamps = new ConcurrentHashMap<>();
 
@@ -435,6 +436,8 @@ public final class SignalSender {
     private static final int LQ_BUFFER_MAX = 20000;  // backpressure: drop new beyond this
     private final java.util.Queue<org.json.JSONObject> liqBuffer = new java.util.concurrent.ConcurrentLinkedQueue<>();
     private volatile boolean lqAnnounced = false;
+    private final AtomicLong liqRawCount = new AtomicLong(0); // [v87.2] всего forceOrder-событий получено (до фильтра) — диагностика
+    private volatile long    liqLastEventMs = 0;             // [v87.2] время последнего пойманного события
 
     private final java.util.concurrent.Semaphore rlSemaphore = new java.util.concurrent.Semaphore(RL_MAX_CONCURRENT);
     private final AtomicInteger rlCurrentWeight = new AtomicInteger(0);
@@ -4562,6 +4565,15 @@ public final class SignalSender {
         } catch (Throwable t) { LOG.warning("[LQ] " + t.getMessage()); }
     }
 
+    /** [v87.2] Диагностика захвата ликвидаций для heartbeat: сырых событий получено (любой размер),
+     *  возраст последнего, размер буфера, статус WS. Если raw=0 → поток ликвидаций до бота НЕ доходит. */
+    public String getLiqCaptureDiag() {
+        long raw = liqRawCount.get();
+        long last = liqLastEventMs;
+        String age = (last == 0) ? "never" : ((System.currentTimeMillis() - last) / 1000L) + "s";
+        return "raw=" + raw + " last=" + age + " buf=" + liqBuffer.size() + " ws=" + (liqWebSocket != null ? "up" : "down");
+    }
+
     // DYNAMIC COIN CATEGORIZATION
     // Old: hardcoded switch → missed new TOP coins, couldn't adapt.
     // New: volume-based dynamic classification + known-list seed.
@@ -4779,6 +4791,8 @@ public final class SignalSender {
         try {
             org.json.JSONObject o = event.optJSONObject("o");
             if (o == null) return;
+            liqRawCount.incrementAndGet();               // [v87.2] считаем КАЖДОЕ событие (любой размер) до фильтра
+            liqLastEventMs = System.currentTimeMillis();
             String symbol   = o.optString("s");
             double avgPrice = o.optDouble("ap", 0);
             double qty      = o.optDouble("q", 0);

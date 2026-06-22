@@ -206,7 +206,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    private static final String BOT_VERSION = "v87.1";
+    private static final String BOT_VERSION = "v87.2";
 
     static final class ForecastRecord {
         final String symbol;
@@ -1966,6 +1966,13 @@ public final class BotMain {
             }
             if (deRejects != null && !deRejects.isEmpty()) {
                 sb.append("\nDE-rejects: ").append(deRejects);
+            }
+            // [v87.2] Диагностика захвата ликвидаций (#3) прямо в heartbeat — видно в Telegram,
+            // доходит ли поток до бота (raw>0 = доходит). Fail-soft.
+            String liqDiag = "";
+            try { liqDiag = sender.getLiqCaptureDiag(); } catch (Throwable ignored) {}
+            if (liqDiag != null && !liqDiag.isEmpty()) {
+                sb.append("\nLIQ#3: ").append(liqDiag);
             }
             telegram.sendMessageAsync(sb.toString());
             lastHeartbeatMs = now;

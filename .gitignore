@@ -40,3 +40,9 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Claude Code (personal, local) ###
+.claude/settings.local.json
+
+### Offline analysis scratch (data, not code) ###
+/analysis/
