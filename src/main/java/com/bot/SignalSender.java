@@ -4204,12 +4204,16 @@ public final class SignalSender {
             boolean snapOk = ba != null;          // L1 spread actually fetched (not rate-limited)
             double bid = snapOk ? ba[0] : 0.0;
             double ask = snapOk ? ba[1] : 0.0;
+            double[] dep = nlFetchDepth(sym);     // [v87.1] L10 orderbook depth (bid/ask qty sums)
+            double bidDepth = dep != null ? dep[0] : 0.0;
+            double askDepth = dep != null ? dep[1] : 0.0;
+            double oi = nlFetchOI(sym);           // [v87.1] open interest
             long snap = System.currentTimeMillis();
 
             // Skip the last (forming) bar; collect only not-yet-recorded closed bars.
-            // Funding/spread are point-in-time and CANNOT be backfilled, so attach them
+            // Funding/spread/depth/OI are point-in-time and CANNOT be backfilled, so attach them
             // (live=1) ONLY to bars that closed within NL_FRESH_MS of this snapshot; older
-            // backfill bars carry klines only (funding/bid/ask=0, live=0).
+            // backfill bars carry klines only (live=0, microstructure fields = 0).
             List<String> rows = new ArrayList<>();
             List<String> keys = new ArrayList<>();
             JSONArray json = new JSONArray();
@@ -4219,8 +4223,9 @@ public final class SignalSender {
                 if (nlSeenRecords.contains(key)) continue; // already recorded
                 boolean live = snapOk && (snap - c.closeTime) <= NL_FRESH_MS;
                 double fnd = live ? funding : 0.0, bd = live ? bid : 0.0, ak = live ? ask : 0.0;
-                rows.add(nlMicroRow(sym, c, fnd, bd, ak, snap, live));
-                json.put(nlMicroJson(sym, c, fnd, bd, ak, snap, live));
+                double bdep = live ? bidDepth : 0.0, adep = live ? askDepth : 0.0, oiv = live ? oi : 0.0;
+                rows.add(nlMicroRow(sym, c, fnd, bd, ak, bdep, adep, oiv, snap, live));
+                json.put(nlMicroJson(sym, c, fnd, bd, ak, bdep, adep, oiv, snap, live));
                 keys.add(key);
             }
             // Mark bars as seen ONLY after a successful ./data write, so a failed append is retried.
@@ -4235,16 +4240,20 @@ public final class SignalSender {
 
     /** Build one pipe-delimited micro-record row. Symbols are Binance [A-Z0-9]+ so no escaping needed. */
     private static String nlMicroRow(String sym, com.bot.TradingCore.Candle c,
-                                     double funding, double bid, double ask, long snapMs, boolean live) {
+                                     double funding, double bid, double ask,
+                                     double bidDepth, double askDepth, double oi, long snapMs, boolean live) {
         return sym + "|" + c.openTime + "|" + c.open + "|" + c.high + "|" + c.low
                 + "|" + c.close + "|" + c.volume + "|" + c.quoteVolume + "|" + c.numberOfTrades
                 + "|" + c.takerBuyBaseVolume + "|" + c.takerBuyQuoteVolume
-                + "|" + funding + "|" + bid + "|" + ask + "|" + snapMs + "|" + (live ? 1 : 0);
+                + "|" + funding + "|" + bid + "|" + ask
+                + "|" + bidDepth + "|" + askDepth + "|" + oi
+                + "|" + snapMs + "|" + (live ? 1 : 0);
     }
 
     /** Build one micro-record as JSON for the Supabase REST sink (keys = table columns). */
     private static JSONObject nlMicroJson(String sym, com.bot.TradingCore.Candle c,
-                                          double funding, double bid, double ask, long snapMs, boolean live) {
+                                          double funding, double bid, double ask,
+                                          double bidDepth, double askDepth, double oi, long snapMs, boolean live) {
         return new JSONObject()
                 .put("symbol", sym).put("open_time", c.openTime)
                 .put("open", c.open).put("high", c.high).put("low", c.low).put("close", c.close)
@@ -4252,6 +4261,7 @@ public final class SignalSender {
                 .put("trades", c.numberOfTrades)
                 .put("taker_buy_base", c.takerBuyBaseVolume).put("taker_buy_quote", c.takerBuyQuoteVolume)
                 .put("funding", funding).put("bid", bid).put("ask", ask)
+                .put("bid_depth", bidDepth).put("ask_depth", askDepth).put("open_interest", oi)
                 .put("snap_ms", snapMs).put("live", live);
     }
 
@@ -4315,6 +4325,37 @@ public final class SignalSender {
         } catch (Exception e) { return null; }
     }
 
+    /** [v87.1] Single-symbol L10 orderbook depth → [sum bid qty, sum ask qty] (weight 2). null on failure. */
+    private double[] nlFetchDepth(String sym) {
+        try {
+            HttpResponse<String> resp = sendBinanceRequest(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create("https://fapi.binance.com/fapi/v1/depth?symbol=" + sym + "&limit=10"))
+                            .timeout(Duration.ofSeconds(6)).GET().build(),
+                    2);
+            if (resp == null) return null;
+            JSONObject j = new JSONObject(resp.body());
+            double bd = 0.0, ad = 0.0;
+            JSONArray bids = j.optJSONArray("bids"), asks = j.optJSONArray("asks");
+            if (bids != null) for (int i = 0; i < bids.length(); i++) bd += Double.parseDouble(bids.getJSONArray(i).getString(1));
+            if (asks != null) for (int i = 0; i < asks.length(); i++) ad += Double.parseDouble(asks.getJSONArray(i).getString(1));
+            return new double[]{bd, ad};
+        } catch (Exception e) { return null; }
+    }
+
+    /** [v87.1] Single-symbol open interest (weight 1). 0.0 on failure. */
+    private double nlFetchOI(String sym) {
+        try {
+            HttpResponse<String> resp = sendBinanceRequest(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create("https://fapi.binance.com/fapi/v1/openInterest?symbol=" + sym))
+                            .timeout(Duration.ofSeconds(6)).GET().build(),
+                    1);
+            if (resp == null) return 0.0;
+            return new JSONObject(resp.body()).optDouble("openInterest", 0.0);
+        } catch (Exception e) { return 0.0; }
+    }
+
     /** Append micro-record rows (append-only, one file open per call). Returns true on success. */
     private synchronized boolean nlAppendMicro(List<String> rows) {
         try {
@@ -4324,8 +4365,8 @@ public final class SignalSender {
             boolean fresh = !f.exists() || f.length() == 0;
             try (java.io.PrintWriter pw = new java.io.PrintWriter(
                     new java.io.BufferedWriter(new java.io.FileWriter(f, true)))) {
-                if (fresh) pw.println("# new_listing_micro v1 | symbol|openTime|open|high|low|close|"
-                        + "volume|quoteVolume|trades|takerBuyBase|takerBuyQuote|funding|bid|ask|snapMs|live");
+                if (fresh) pw.println("# new_listing_micro v2 | symbol|openTime|open|high|low|close|"
+                        + "volume|quoteVolume|trades|takerBuyBase|takerBuyQuote|funding|bid|ask|bidDepth|askDepth|oi|snapMs|live");
                 for (String row : rows) pw.println(row);
             }
             return true;
