@@ -4180,7 +4180,7 @@ public final class SignalSender {
                         + nlRecordingUntil.size() + " recording");
                 try {
                     this.bot.sendMessageAsync(
-                            "🛰 *Ловец листингов активен* (v86.98)\n"
+                            "🛰 *Ловец листингов активен* (" + com.bot.BotMain.BOT_VERSION + ")\n"
                           + "Отслеживаю " + nlKnownSymbols.size() + " символов"
                           + (nlRecordingUntil.size() > 0 ? (", пишу " + nlRecordingUntil.size()) : "")
                           + "\nХранилище: ./data" + (SUPABASE_ON ? " + Supabase ✅" : " (Supabase выкл)")
