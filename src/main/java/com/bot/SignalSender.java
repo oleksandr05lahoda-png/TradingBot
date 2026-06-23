@@ -667,6 +667,9 @@ public final class SignalSender {
             // Tokenized stocks (Binance pre-IPO / equity perpetuals)
             "NVDAUSDT", "SNDKUSDT", "MUUSDT", "CRCLUSDT",
             "AAPLUSDT", "MSFTUSDT", "AMZNUSDT", "GOOGLUSDT",
+            // [v87.9] more tokenized equity perps (semiconductors / ETFs / pre-IPO) that leaked into the breakout sample
+            "INTCUSDT", "SOXLUSDT", "MRVLUSDT", "SKHYNIXUSDT", "QQQUSDT", "SPCXUSDT",
+            "MSTRUSDT", "COINUSDT", "HOODUSDT",
             // Political / meme that don't behave like crypto
             "TRUMPUSDT", "TRUTHUSDT",
             "DOGSUSDT", "PUMPUSDT", "UBUSDT", "LAYERUSDT"
@@ -4519,12 +4522,32 @@ public final class SignalSender {
     private static final int TS_PER_CYCLE = 6;     // coins per cycle (spread daily-kline REST load over ~1 sweep)
     private static final int    TS_MIN_BARS    = 40;                              // [v87.8] need >=40 daily bars (real track record, not a fresh listing)
     private static final double TS_MAX_ATR_PCT = tsEnvD("TS_MAX_ATR_PCT", 0.18);  // [v87.8] skip if ATR/price > 18% (fresh-listing chaos / garbage stop)
+    // [v87.9] CRYPTO-only forward sample is enforced upstream via HARD_BLACKLIST (stripped from cachedPairs in
+    // getTopSymbolsSet) — tokenized stocks/ETFs/metals never reach this tracker. Backtest confirms the edge is
+    // crypto-driven (crypto-only CI [+1.37%,+5.98%] ALIVE vs non-crypto DEAD). To exclude a new equity perp, append
+    // it to HARD_BLACKLIST (NOT here) — exact-match, no false positives, fixes the whole bot.
     private final java.util.Set<String> tsSeen = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private int tsIndex = 0;
     private volatile boolean tsAnnounced = false;
+    private volatile boolean tsSeenLoaded = false;                                 // [v87.9] load persisted seen-keys once (survive restart)
     private static double tsEnvD(String k, double d) {
         try { String v = System.getenv(k); return (v == null || v.isBlank()) ? d : Double.parseDouble(v.trim()); }
         catch (Exception e) { return d; }
+    }
+    /** [v87.9] Repopulate tsSeen from the persisted CSV so a RESTART does not re-alert/re-log the same daily breakouts
+     *  (Supabase upsert is already idempotent on the unique key; this stops duplicate Telegram alerts + CSV lines). */
+    private void tsLoadSeen() {
+        try {
+            java.nio.file.Path p = java.nio.file.Paths.get(TS_FILE);
+            if (!java.nio.file.Files.exists(p)) return;
+            int n = 0;
+            for (String line : java.nio.file.Files.readAllLines(p)) {
+                if (line.isBlank() || line.startsWith("#")) continue;
+                String[] f = line.split("\\|");
+                if (f.length >= 3 && tsSeen.add(f[0] + "|" + f[1] + "|" + f[2])) n++;
+            }
+            if (n > 0) LOG.info("[TS] loaded " + n + " seen breakout key(s) from " + TS_FILE);
+        } catch (Throwable t) { LOG.warning("[TS] seen-load: " + t.getMessage()); }
     }
 
     /** [v87.4] Called once per cycle from BotMain.runCycle (gated by BotMain.TREND_TRACK). Round-robins
@@ -4532,6 +4555,7 @@ public final class SignalSender {
      *  entry + initial stop. Outcomes (trailing exit) computed at ANALYSIS time from klines — no in-bot resolver. */
     public void trackBreakoutSignals() {
         try {
+            if (!tsSeenLoaded) { tsSeenLoaded = true; tsLoadSeen(); }   // [v87.9] survive restart: don't re-alert already-logged signals
             java.util.List<String> pairs = new java.util.ArrayList<>(cachedPairs);
             if (pairs.isEmpty()) return;
             if (!tsAnnounced) {
