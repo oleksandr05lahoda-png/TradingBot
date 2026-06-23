@@ -34,6 +34,10 @@ public final class SignalSender {
     private final com.bot.TelegramBotSender bot;
     private final HttpClient              http;
     private final ExecutorService         httpIoExecutor;
+    // [v87.8] Dedicated client+executor for the liquidation WebSocket — root-cause fix for liq_events=0.
+    private final HttpClient              liqHttp;
+    private final ExecutorService         liqWsExecutor;
+    private static final boolean LIQ_DEDICATED_WS = !"0".equals(System.getenv().getOrDefault("LIQ_DEDICATED_WS", "1"));
     private final com.bot.GlobalImpulseController gic;
     private final com.bot.InstitutionalSignalCore isc;
     private final Object wsLock = new Object();
@@ -740,6 +744,23 @@ public final class SignalSender {
                 .connectTimeout(Duration.ofSeconds(12))
                 .version(HttpClient.Version.HTTP_2)
                 .executor(httpIoExecutor)
+                .build();
+        // [v87.8] LIQ ROOT-CAUSE FIX (#3 liq_events stuck at 0): the liquidation WebSocket previously shared
+        // `http` above, whose executor (httpIoExecutor: 8 threads, bounded queue, DiscardPolicy) is saturated by
+        // blocking REST http.send() calls. HttpClient dispatches WS read-callbacks on its OWN executor, so under
+        // REST load the liquidation frames were SILENTLY DISCARDED → processLiquidationEvent ~never fired → 0 rows.
+        // Fix: a dedicated client+executor used ONLY by the liq WS. Tiny pool (one sparse connection),
+        // CallerRunsPolicy so a frame is NEVER silently dropped, bounded queue so no OOM. Rollback: LIQ_DEDICATED_WS=0.
+        this.liqWsExecutor = new ThreadPoolExecutor(
+                1, 2, 30L, TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<>(256),
+                r -> { Thread t = new Thread(r, "liq-ws-" + r.hashCode()); t.setDaemon(true); return t; },
+                new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+        this.liqHttp = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(12))
+                .version(HttpClient.Version.HTTP_2)
+                .executor(liqWsExecutor)
                 .build();
 
         this.API_KEY    = System.getenv().getOrDefault("BINANCE_API_KEY", "");
@@ -4496,9 +4517,15 @@ public final class SignalSender {
     private static final String TS_HEADER = "# trend_signals v1 | symbol|signal_day|direction|entry|init_stop|atr|donchian_n|bar_close_ms|snap_ms";
     private static final int TS_DONCHIAN = 20;
     private static final int TS_PER_CYCLE = 6;     // coins per cycle (spread daily-kline REST load over ~1 sweep)
+    private static final int    TS_MIN_BARS    = 40;                              // [v87.8] need >=40 daily bars (real track record, not a fresh listing)
+    private static final double TS_MAX_ATR_PCT = tsEnvD("TS_MAX_ATR_PCT", 0.18);  // [v87.8] skip if ATR/price > 18% (fresh-listing chaos / garbage stop)
     private final java.util.Set<String> tsSeen = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private int tsIndex = 0;
     private volatile boolean tsAnnounced = false;
+    private static double tsEnvD(String k, double d) {
+        try { String v = System.getenv(k); return (v == null || v.isBlank()) ? d : Double.parseDouble(v.trim()); }
+        catch (Exception e) { return d; }
+    }
 
     /** [v87.4] Called once per cycle from BotMain.runCycle (gated by BotMain.TREND_TRACK). Round-robins
      *  a few coins/cycle: detects a FRESH daily Donchian breakout on the last CLOSED bar and logs the
@@ -4519,7 +4546,7 @@ public final class SignalSender {
             for (int b = 0; b < batch; b++) {
                 String sym = pairs.get(Math.floorMod(tsIndex++, pairs.size()));
                 List<com.bot.TradingCore.Candle> kl = fetchKlinesDirect(sym, "1d", TS_DONCHIAN + 25);
-                if (kl == null || kl.size() < TS_DONCHIAN + 4) continue;
+                if (kl == null || kl.size() < TS_MIN_BARS) continue;       // [v87.8] require real track record (was TS_DONCHIAN+4)
                 int last = kl.size() - 2;                 // last CLOSED daily bar (skip forming bar)
                 com.bot.TradingCore.Candle cNow = kl.get(last), cPrev = kl.get(last - 1);
                 double hhNow = tsDon(kl, last, TS_DONCHIAN, true),  llNow = tsDon(kl, last, TS_DONCHIAN, false);
@@ -4528,10 +4555,14 @@ public final class SignalSender {
                 if (cNow.close > hhNow && cPrev.close <= hhPre) dir = 1;        // fresh upside breakout
                 else if (cNow.close < llNow && cPrev.close >= llPre) dir = -1;  // fresh downside breakout
                 if (dir == 0) continue;
-                long day = cNow.closeTime / 86_400_000L;
-                if (!tsSeen.add(sym + "|" + day + "|" + dir)) continue;         // log once per coin/day/dir
                 double atr = tsAtr(kl, last, 14);
                 double entry = cNow.close;
+                // [v87.8] CLEANLINESS GATE — reject fresh-listing / garbage-volatility breakouts whose ATR is an
+                // outsized fraction of price (e.g. ESPORTSUSDT: ATR 0.0886 on price 0.0255 → 1.5*ATR stop 521% away).
+                // Such names never existed in the backtest universe (56 established coins) and pollute the forward sample.
+                if (atr <= 0 || entry <= 0 || atr / entry > TS_MAX_ATR_PCT) continue;
+                long day = cNow.closeTime / 86_400_000L;
+                if (!tsSeen.add(sym + "|" + day + "|" + dir)) continue;         // log once per coin/day/dir
                 double initStop = dir == 1 ? entry - 1.5 * atr : entry + 1.5 * atr;
                 long snap = System.currentTimeMillis();
                 rows.add(sym + "|" + day + "|" + dir + "|" + entry + "|" + initStop + "|" + atr
@@ -4878,7 +4909,7 @@ public final class SignalSender {
 
     private void connectLiquidationStream() {
         try {
-            http.newWebSocketBuilder()
+            (LIQ_DEDICATED_WS ? liqHttp : http).newWebSocketBuilder()    // [v87.8] dedicated client so liq callbacks aren't starved by REST
                     .buildAsync(URI.create("wss://fstream.binance.com/ws/!forceOrder@arr"),
                             new WebSocket.Listener() {
                                 private final StringBuilder buf = new StringBuilder();
