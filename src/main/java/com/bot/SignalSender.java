@@ -4934,7 +4934,7 @@ public final class SignalSender {
     private void connectLiquidationStream() {
         try {
             (LIQ_DEDICATED_WS ? liqHttp : http).newWebSocketBuilder()    // [v87.8] dedicated client so liq callbacks aren't starved by REST
-                    .buildAsync(URI.create("wss://fstream.binance.com/ws/!forceOrder@arr"),
+                    .buildAsync(URI.create("wss://fstream.binance.com/ws"),    // [v88.1] base endpoint; subscribe via message below — the '!' in /ws/!forceOrder@arr silently broke auto-subscribe (ws=up raw=0 forever)
                             new WebSocket.Listener() {
                                 private final StringBuilder buf = new StringBuilder();
 
@@ -4965,7 +4965,12 @@ public final class SignalSender {
                             })
                     .thenAccept(ws -> {
                         liqWebSocket = ws;
-                        LOG.info("[LIQ] ✅ Liquidation stream connected");
+                        // [v88.1] Explicit SUBSCRIBE — auto-subscribe via the '!'-prefixed URL path never delivered (ws=up raw=0
+                        // forever). Here '!' lives inside the JSON param, not the URL. The ack {"result":null,"id":1} arrives as a
+                        // text frame and is harmlessly ignored by processLiquidationEvent (no "o" field). Reconnects re-subscribe.
+                        try { ws.sendText("{\"method\":\"SUBSCRIBE\",\"params\":[\"!forceOrder@arr\"],\"id\":1}", true); }
+                        catch (Throwable t) { LOG.warning("[LIQ] subscribe send: " + t.getMessage()); }
+                        LOG.info("[LIQ] ✅ Liquidation stream connected + SUBSCRIBE sent");
                     })
                     .exceptionally(ex -> {
                         LOG.warning("[LIQ] Connect failed: " + ex.getMessage());

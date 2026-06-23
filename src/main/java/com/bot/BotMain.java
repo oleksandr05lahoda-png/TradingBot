@@ -218,7 +218,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    static final String BOT_VERSION = "v88.0";   // package-private so SignalSender can show the live version in Telegram
+    static final String BOT_VERSION = "v88.1";   // package-private so SignalSender can show the live version in Telegram
 
     static final class ForecastRecord {
         final String symbol;
