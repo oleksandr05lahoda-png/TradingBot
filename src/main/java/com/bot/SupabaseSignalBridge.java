@@ -139,8 +139,13 @@ public final class SupabaseSignalBridge {
             try {
                 double reqMult = o.optDouble("size_mult", 1.0);
                 DecisionEngineMerged.TradeIdea idea = buildLongIdea(o);
-                if (BAL_PER_LEG <= 0) { patch(id, "failed", "BRIDGE_BALANCE_PER_LEG not set"); continue; }
-                BinanceTradeExecutor.ExecutionResult r = executor.openPositionWithSl(idea, BAL_PER_LEG);
+                // Sizing base = LIVE account balance from Binance (the account is the truth,
+                // not an env constant). BRIDGE_BALANCE_PER_LEG, if set >0, acts as a CAP on
+                // the sizing base (useful to fence off part of the account), never a substitute.
+                double bal = executor.fetchAvailableBalance();
+                if (bal <= 0) { patch(id, "failed", "balance fetch failed (" + bal + ") — order not sized"); continue; }
+                if (BAL_PER_LEG > 0 && bal > BAL_PER_LEG) bal = BAL_PER_LEG;
+                BinanceTradeExecutor.ExecutionResult r = executor.openPositionWithSl(idea, bal);
                 if (r != null && r.success) {
                     patch(id, "open", String.format("opened notional=$%.2f qty=%.6f tps=%d mult req=%.2f applied=%.2f",
                             r.notionalUsd, r.qty, r.tpsPlaced, reqMult, idea.getExecutorSizeMultiplier()));
