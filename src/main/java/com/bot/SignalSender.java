@@ -38,8 +38,6 @@ public final class SignalSender {
     private final HttpClient              liqHttp;
     private final ExecutorService         liqWsExecutor;
     private static final boolean LIQ_DEDICATED_WS = !"0".equals(System.getenv().getOrDefault("LIQ_DEDICATED_WS", "1"));
-    private final com.bot.GlobalImpulseController gic;
-    private final com.bot.InstitutionalSignalCore isc;
     private final Object wsLock = new Object();
 
     private final int    TOP_N;
@@ -569,8 +567,6 @@ public final class SignalSender {
     // Core
     private final com.bot.DecisionEngineMerged decisionEngine;
     private final com.bot.TradingCore.AdaptiveBrain adaptiveBrain;
-    private final com.bot.SignalOptimizer optimizer;
-    private final com.bot.PumpHunter pumpHunter;
     private final CorrelationGuard correlationGuard;
     private final ExecutorService fetchPool;
 
@@ -722,12 +718,8 @@ public final class SignalSender {
 
     //  CONSTRUCTOR
 
-    public SignalSender(com.bot.TelegramBotSender bot,
-                        com.bot.GlobalImpulseController sharedGIC,
-                        com.bot.InstitutionalSignalCore sharedISC) {
+    public SignalSender(com.bot.TelegramBotSender bot) {
         this.bot = bot;
-        this.gic = sharedGIC;
-        this.isc = sharedISC;
         // OOM FIX — httpIoExecutor.
         // Executors.newFixedThreadPool() uses LinkedBlockingQueue (UNBOUNDED).
         // Under Binance API lag: tasks pile up infinitely → Railway OOM crash.
@@ -800,27 +792,12 @@ public final class SignalSender {
 
         this.decisionEngine   = new com.bot.DecisionEngineMerged();
         this.adaptiveBrain    = new com.bot.TradingCore.AdaptiveBrain();
-        this.optimizer        = new com.bot.SignalOptimizer(this.tickPriceDeque);
-        this.pumpHunter       = new com.bot.PumpHunter();
         this.correlationGuard = new CorrelationGuard();
 
-        this.decisionEngine.setPumpHunter(this.pumpHunter);
-        this.decisionEngine.setGIC(this.gic);
-        this.decisionEngine.setIsc(this.isc); // chain-pause gate uses ISC's chain state
-
-        // [FIX] Pre-load garbage coins into PumpHunter so it skips them entirely.
-        // Prevents UAIUSDT/BASUSDT noise events from spamming logs every 90s.
-        for (String garbageSym : GARBAGE_COIN_BLOCKLIST) {
-            this.pumpHunter.addGarbageSymbol(garbageSym);
-        }
         // [v14.0 FIX #Forecast] Wire ForecastEngine so TradeIdea.forecast is not always null.
-        // [v64] Also keep a direct reference — EARLY_TICK needs to call forecast() itself
-        // because it builds TradeIdea outside DecisionEngine.analyze() flow. Without this,
-        // every EARLY_TICK signal had forecast=null → fcConf=0.00 → Dispatcher gate blocked 100%.
         com.bot.TradingCore.ForecastEngine fe = new com.bot.TradingCore.ForecastEngine();
         this.decisionEngine.setForecastEngine(fe);
         this.forecastEngineDirect = fe;
-        this.optimizer.setPumpHunter(this.pumpHunter);
 
         // FETCH POOL BACKPRESSURE REDESIGN.
         //
@@ -893,11 +870,6 @@ public final class SignalSender {
         // Depth snapshot: 60s→120s, ограничены top-10 пары (DEPTH_SNAPSHOT_TOP_N=10).
         // Экономия: ~90% depth REST weight (~$4/мес). bookTicker WS покрывает L1 real-time.
         wsWatcher.scheduleAtFixedRate(this::refreshDepth5Snapshots, 35, 120, TimeUnit.SECONDS);
-
-        // [v17.0 §2] EARLY TICK SIGNAL BUFFER FLUSHER — runs every 1500ms.
-        // Drains earlyTickBuffer, sorts candidates by probability (highest first),
-        // dispatches TOP-1 per pair. Prevents burst spam of 5+ signals on the same pair.
-        wsWatcher.scheduleAtFixedRate(this::flushEarlyTickBuffer, 2, 2, TimeUnit.SECONDS);
 
         // HotPair rescan monitor — logs hotPairTotalTriggers every 10 min
         wsWatcher.scheduleAtFixedRate(() -> {
@@ -984,8 +956,6 @@ public final class SignalSender {
     public void addToGarbageBlocklist(String symbol) {
         if (symbol != null && !symbol.isBlank()) {
             GARBAGE_COIN_BLOCKLIST.add(symbol);
-            // [FIX] Also tell PumpHunter to skip this coin
-            this.pumpHunter.addGarbageSymbol(symbol);
         }
     }
 
@@ -1003,109 +973,6 @@ public final class SignalSender {
     }
 
 
-    public List<com.bot.DecisionEngineMerged.TradeIdea> generateSignals() {
-
-        // If IP banned — skip entire cycle silently, wait for ban to expire
-        if (rlIpBanned && System.currentTimeMillis() < rlIpBanUntil) {
-            return Collections.emptyList();
-        }
-        if (rlIpBanned) rlIpBanned = false;
-
-        if (volume24hUSD.isEmpty() || System.currentTimeMillis() - lastVolRefresh > VOL_REFRESH_MS) {
-            refreshVolume24h();
-            lastVolRefresh = System.currentTimeMillis();
-        }
-
-        if (cachedPairs.isEmpty() ||
-                System.currentTimeMillis() - lastPairsRefresh > BINANCE_REFRESH_MS) {
-            Set<String> fresh = getTopSymbolsSet(TOP_N);
-            if (!fresh.isEmpty()) {
-                startWebSocketsForTopPairs(fresh);
-                cachedPairs = fresh;
-                lastPairsRefresh = System.currentTimeMillis();
-            }
-            // Пауза после тяжёлой загрузки пар (exchangeInfo+CoinGecko = ~80 weight)
-            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-        }
-
-        if (System.currentTimeMillis() - lastFundingRefresh > FUNDING_REFRESH_MS) {
-            refreshAllFundingRates();
-            lastFundingRefresh = System.currentTimeMillis();
-            // Пауза после funding refresh (premiumIndex + 100× OI = ~700 weight)
-            try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
-        }
-
-        correlationGuard.resetCycle();
-        cyclePairsSeen.set(0);
-        cyclePairsStale.set(0);
-
-        try {
-            List<com.bot.TradingCore.Candle> btc5m = getCached("BTCUSDT", "5m", 30);
-            if (btc5m != null && btc5m.size() >= 10) gic.updateFast(btc5m);
-        } catch (Exception ignored) {}
-
-        int pairBudget = computePairBudget();
-        List<String> scanPairs = selectPairsForScan(pairBudget);
-        List<CompletableFuture<com.bot.DecisionEngineMerged.TradeIdea>> futures = new ArrayList<>();
-        for (String pair : scanPairs) {
-            futures.add(CompletableFuture.supplyAsync(() -> processPair(pair), fetchPool));
-        }
-
-        List<com.bot.DecisionEngineMerged.TradeIdea> result = new ArrayList<>();
-        for (CompletableFuture<com.bot.DecisionEngineMerged.TradeIdea> f : futures) {
-            try {
-                com.bot.DecisionEngineMerged.TradeIdea idea = f.get(18, TimeUnit.SECONDS);
-                if (idea != null) result.add(idea);
-            } catch (Exception ignored) {}
-        }
-
-        result.sort(Comparator.comparingDouble(
-                (com.bot.DecisionEngineMerged.TradeIdea i) -> i.probability).reversed());
-
-        refreshCycleQuality(scanPairs.size());
-        logCycleStats();
-
-        // [v66] Per-cycle diagnostic — prints WHY candidates die. Without this, "No signals"
-        // is a black hole: you can't tell if 0/27 reached analyze, or 27/27 were rejected
-        // silently in upstream gates. Produces one-line summary per cycle with block deltas.
-        long dLiq = blockedLiq.get()       - prevLiq;
-        long dCorr = blockedCorr.get()     - prevCorr;
-        // [v67 FIX] cyclePairsStale is per-cycle (reset at line 960), not cumulative like
-        // blockedLiq/blockedCorr. Using delta arithmetic with prevStale produced negative values.
-        // Read raw cycle value; don't update prevStale below.
-        long dStale = cyclePairsStale.get();
-        long dProfit = blockedProfit.get() - prevProfit;
-        long dEarly = blockedEarlyConf.get() - prevEarlyConf;
-        long dOpt = blockedOptConf.get()   - prevOptConf;
-        long dVpoc = blockedVpoc.get()     - prevVpoc;
-        long dFinal = blockedFinalConf.get() - prevFinalConf;
-        long dIsc = blockedIsc.get()       - prevIsc;
-        long droppedInAnalyze = scanPairs.size() - result.size()
-                - dLiq - dCorr - dStale - dProfit - dEarly - dOpt - dVpoc - dFinal - dIsc;
-        System.out.printf("[DIAG] scan=%d kept=%d | analyze_null=%d stale=%d liq=%d corr=%d prof=%d early=%d opt=%d vpoc=%d finConf=%d isc=%d%n",
-                scanPairs.size(), result.size(), Math.max(0, droppedInAnalyze),
-                dStale, dLiq, dCorr, dProfit, dEarly, dOpt, dVpoc, dFinal, dIsc);
-        // [v67] Show WHY analyze() returned null — top reject reasons from DecisionEngineMerged.
-        String rejectTrace = com.bot.DecisionEngineMerged.getAndResetRejectTrace();
-        if (!rejectTrace.isEmpty()) {
-            LOG.info("[DIAG-ANALYZE] " + rejectTrace);
-        }
-        // Print calibrator state every cycle so we see at a glance WHY signals
-        // are being blocked (DISABLED / BIAS-RISK / mature, etc.).
-        try {
-            com.bot.DecisionEngineMerged.ProbabilityCalibrator.HealthSnapshot calHealth =
-                    com.bot.DecisionEngineMerged.getCalibrator().health();
-            LOG.info("[DIAG-CAL] " + calHealth.summary);
-        } catch (Throwable ignored) {
-            // Health method is optional — older DE versions may not expose it.
-        }
-        prevLiq = blockedLiq.get(); prevCorr = blockedCorr.get(); // prevStale: no-op — per-cycle
-        prevProfit = blockedProfit.get(); prevEarlyConf = blockedEarlyConf.get();
-        prevOptConf = blockedOptConf.get(); prevVpoc = blockedVpoc.get();
-        prevFinalConf = blockedFinalConf.get(); prevIsc = blockedIsc.get();
-
-        return result;
-    }
 
     private void refreshCycleQuality(int requestedPairs) {
         int seen = cyclePairsSeen.get();
@@ -1156,7 +1023,6 @@ public final class SignalSender {
         List<String> sorted = new ArrayList<>(cachedPairs);
         sorted.removeIf(pair -> {
             if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return true;
-            if (isc.isHardBlacklisted(pair)) return true;
             if (!passesTradeTier(pair)) return true;   // [v86.36] liquidity-tier filter
             com.bot.DecisionEngineMerged.AssetType at =
                     com.bot.DecisionEngineMerged.detectAssetType(pair);
@@ -1183,7 +1049,6 @@ public final class SignalSender {
         // and memory on garbage coins that processPair() would reject anyway.
         pairs = pairs.stream()
                 .filter(p -> !GARBAGE_COIN_BLOCKLIST.contains(p))
-                .filter(p -> !isc.isHardBlacklisted(p))
                 .collect(java.util.stream.Collectors.toSet());
         // MEMORY LEAK FIX: clean up pairs that dropped out of TOP-N
         // Without this, wsMap/tickPriceDeque/liveM1Buffer grow forever
@@ -1293,616 +1158,6 @@ public final class SignalSender {
         }
     }
 
-    private com.bot.DecisionEngineMerged.TradeIdea processPair(String pair) {
-        try {
-            // [v78.1] Chronic-stale eviction — skip pairs that consistently fail
-            // staleness guards. Frees up scan budget for active pairs.
-            if (isChronicallyStale(pair)) {
-                cyclePairsStale.incrementAndGet();
-                return null;
-            }
-            // GARBAGE COIN BLOCKLIST — instant reject for known micro-cap / rug tokens
-            if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return null;
-            // Hard blacklist check — symbols with WR < 25% after 20 trades
-            if (isc.isHardBlacklisted(pair)) return null;
-            // REST для 1m больше не вызывается в основном цикле — только холодный старт.
-            // Экономия: ~50 REST запросов/мин × weight=5 = 250 weight/мин.
-            List<com.bot.TradingCore.Candle> m1  = getM1FromWs(pair);
-            // 5m из WS-буфера (liveM1Buffer) вместо REST getCached("5m").
-            // При достаточном буфере (≥5 баров) — 0 REST weight. Fallback на REST при холодном старте.
-            // Экономия: ~25% klines REST weight (~$6-8/мес при TOP_N=30).
-            // [v90] Primary TF candles. Pre-v90 was hardcoded "15m"; now respects PRIMARY_TF.
-            // Variable name `m15` preserved for downstream compatibility — it now contains
-            // PRIMARY_TF candles (1h by default). Live-splice gracefully falls back when
-            // primary TF != 15m (no partial 1h-candle assembly yet — see v91 todo).
-            List<com.bot.TradingCore.Candle> m5  = getM5FromWsOrRest(pair, KLINES_LIMIT);
-            List<com.bot.TradingCore.Candle> m15 = getPrimaryTfCandles(pair); // [v90]
-            List<com.bot.TradingCore.Candle> h1  = getCached(pair, HTF_FAST, KLINES_LIMIT);
-            List<com.bot.TradingCore.Candle> h2  = getCached(pair, HTF_SLOW, 120);
-            // updateLiveM1Buffer больше не нужен — буфер заполняется из processAggTrade()
-
-            // [ДЫРА №1] CVD — считаем накопленную дельту из 1m свечей
-            double cvdNormalized = computeAndStoreCVD(pair, m1);
-            decisionEngine.setCVD(pair, cvdNormalized);
-
-            // [v90 HISTORY-GATE] On 1h primary TF: 200 bars = 8.3 days (vs 50h on 15m).
-            // For VWAP-MR strategy we want ≥120 bars (5 days) to compute stable VWAP/dev.
-            // Min keeps strict floor at 100; relaxes from 200 because each 1h bar carries
-            // 4× more information than a 15m bar.
-            // [v86.91] 4h: primary floor 100 (unchanged from else), HTF floor 40 — on
-            // 4h-primary HTF=1d, so 60 bars = 60 days is too strict; 40 days suffices.
-            int primaryMinBars = "15m".equals(PRIMARY_TF) ? 200 : 100;
-            int htfMinBars     = "15m".equals(PRIMARY_TF) ? 160 : "4h".equals(PRIMARY_TF) ? 40 : 60;
-            if (m15 == null || m15.size() < primaryMinBars || h1 == null || h1.size() < htfMinBars) {
-                cyclePairsStale.incrementAndGet();
-                recordStaleEvent(pair); // [v78.1]
-                return null;
-            }
-
-            // STALE DATA GUARD — scaled to PRIMARY_TF.
-            // 15m primary: skip if last bar > 10 min old (was original guard).
-            // 1h primary: skip if last bar > 75 min old (1.25× bar period).
-            long nowMs = System.currentTimeMillis();
-            long lastBarAge = nowMs - m15.get(m15.size() - 1).closeTime;
-            long staleThresholdMs = (long)(PRIMARY_TF_MS * 1.25);
-            if ("15m".equals(PRIMARY_TF)) staleThresholdMs = 10 * 60_000L; // legacy
-            if (lastBarAge > staleThresholdMs) {
-                cyclePairsStale.incrementAndGet();
-                recordStaleEvent(pair); // [v78.1]
-                return null;
-            }
-            // HTF staleness: skip if last HTF bar > 1.5× HTF period old.
-            // [v86.91] 1d arm added — was missing, so 4h-primary (HTF=1d) fell into the
-            // 60min else-branch → every pair rejected as stale (CRITICAL).
-            long htfBarMs = "1d".equals(HTF_FAST) ? 86_400_000L
-                    : "4h".equals(HTF_FAST) ? 4 * 60 * 60_000L
-                    : "2h".equals(HTF_FAST) ? 2 * 60 * 60_000L
-                      : 60 * 60_000L;
-            long lastH1Age = nowMs - h1.get(h1.size() - 1).closeTime;
-            if (lastH1Age > (long)(htfBarMs * 1.5)) {
-                cyclePairsStale.incrementAndGet();
-                recordStaleEvent(pair); // [v78.1]
-                return null;
-            }
-
-            // Categorize early — needed for event filter and all downstream logic
-            com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
-            String sector = detectSector(pair);
-
-            // [v13.0+v34.0] EVENT COIN FILTER — category-aware
-            // TOP coins: 5% daily move = massive event (BTC rarely does 8%)
-            // ALT: 8% = event
-            // MEME: 12% = event (they routinely move 5-8%)
-            // [v50 §12] EVENT COIN FILTER — DIRECTIONAL BLOCK.
-            // Old: blocked ALL signals on coins with >5-8% daily move.
-            // Problem: this blocked counter-trend entries (reversals/pullbacks)
-            // which are often the BEST setups after a large move.
-            // New: store event direction, block only same-direction signals later.
-            // Counter-trend (reversal) signals are ALLOWED through.
-            boolean eventCoinUp = false, eventCoinDown = false;
-            {
-                int n15 = m15.size();
-                int dayBarsAgo = Math.min(96, n15 - 1);
-                double dayOpen = m15.get(n15 - 1 - dayBarsAgo).close;
-                double dayCurrent = m15.get(n15 - 1).close;
-                double dailyChangePct = Math.abs(dayCurrent - dayOpen) / (dayOpen + 1e-9);
-
-                // [v77 LATENCY] Thresholds raised — old 5/8/12% blocked the
-                // signals that actually wanted the move to continue. Coins
-                // routinely move 8-10% in trending sessions; that's not an
-                // "event", that's the trade. New floors: 8/12/18%. Beyond
-                // these levels we still mark the direction so that DE can
-                // bias toward reversal setups, but day-trend continuation
-                // signals now pass freely.
-                double eventThreshold = switch (cat) {
-                    case TOP  -> 0.08;
-                    case ALT  -> 0.12;
-                    case MEME -> 0.18;
-                };
-                if (dailyChangePct > eventThreshold) {
-                    if (dayCurrent > dayOpen) eventCoinUp = true;
-                    else eventCoinDown = true;
-                    // NOT returning null — allow counter-trend entries
-                }
-
-                // Volume anomaly: also directional, not total block
-                if (n15 > 100) {
-                    double recentVol = 0;
-                    for (int vi = n15 - 4; vi < n15; vi++) recentVol += m15.get(vi).volume;
-                    recentVol /= 4;
-
-                    double histVol = 0;
-                    for (int vi = n15 - 100; vi < n15 - 4; vi++) histVol += m15.get(vi).volume;
-                    histVol /= 96;
-
-                    double volEventMult = switch (cat) {
-                        case TOP  -> 4.0;
-                        case ALT  -> 5.0;
-                        case MEME -> 8.0;
-                    };
-                    if (histVol > 0 && recentVol > histVol * volEventMult) {
-                        double recentMove = m15.get(n15-1).close - m15.get(n15-5).close;
-                        if (recentMove > 0) eventCoinUp = true;
-                        else eventCoinDown = true;
-                    }
-                }
-            }
-
-            if (!checkLiquidity(pair, cat)) { blockedLiq.incrementAndGet(); return null; }
-            cyclePairsSeen.incrementAndGet();
-
-            Long lastRealtimeTick = lastTickTime.get(pair);
-            // [v16.0 FIX] Stale WS tick no longer hard-blocks the signal.
-            // OLD: stale → return null → ALL pairs without recent WS tick dropped (UDS=❌ caused
-            //      the bot to discard most pairs when WebSocket connectivity was degraded).
-            // NEW: stale → zero out delta/VDA (conservative assumption: no momentum) and CONTINUE.
-            // The historical candle data (15m/1h/2h) is still valid and sufficient for analysis.
-            // [v68 FIX] Removed cyclePairsStale.incrementAndGet() here — this path does NOT
-            // return null, so the pair still reaches analyze(). Incrementing cyclePairsStale
-            // here double-counted into [DIAG] droppedInAnalyze math: stale=24/seen=18 (>100%)
-            // made analyze_null compute as 0, masking the real reject reasons in [DIAG-ANALYZE].
-            if (lastRealtimeTick == null || System.currentTimeMillis() - lastRealtimeTick > REALTIME_STALE_SKIP_MS) {
-                decisionEngine.setVolumeDelta(pair, 0.0);
-                decisionEngine.setVDA(pair, 0.0);
-                // Note: NOT returning null here anymore — analysis continues with zeroed delta
-            }
-
-            optimizer.updateFromCandles(pair, m15);
-
-            double normDelta = getNormalizedDelta(pair);
-            decisionEngine.setVolumeDelta(pair, normDelta);
-
-            double relStrength = computeRelativeStrength(pair, m15);
-            decisionEngine.updateRelativeStrength(pair, getSymbolReturn15m(m15), getBtcReturn15m());
-
-            com.bot.DecisionEngineMerged.TradeIdea idea =
-                    decisionEngine.analyze(pair, m1, m5, m15, h1, h2, cat);
-
-            if (idea == null) return null;
-
-            // [v75] EVENT COIN DIRECTIONAL — был hard block, теперь soft penalty.
-            // Старая логика отрезала ровно те моменты когда тренд продолжается:
-            // монета +7% за день и идёт ещё +5% → бот молчит. Теперь:
-            //   - LONG на already-up coin → -6 probability (требуем больше confluence)
-            //   - SHORT на already-down coin → -6 probability
-            // Reversal (LONG на already-down, SHORT на already-up) проходит без штрафа.
-            if (eventCoinUp && idea.side == com.bot.TradingCore.Side.LONG) {
-                List<String> evFlags = new ArrayList<>(idea.flags);
-                evFlags.add("EVENT_COIN_UP_LONG_PENALTY");
-                idea = rebuildIdea(idea, Math.max(0, idea.probability - 6), evFlags);
-            }
-            if (eventCoinDown && idea.side == com.bot.TradingCore.Side.SHORT) {
-                List<String> evFlags = new ArrayList<>(idea.flags);
-                evFlags.add("EVENT_COIN_DOWN_SHORT_PENALTY");
-                idea = rebuildIdea(idea, Math.max(0, idea.probability - 6), evFlags);
-            }
-
-            // SL is authoritative via DecisionEngine.volBucket.maxStopPct
-            // (LOW=4% / MED=6% / HIGH=9% / EXT=14%). Дублирующий SS-уровень
-            // с другими константами (1.2/2.5/4.5/7.5%) создавал конфликт:
-            // DE выпускал валидный SL=4.32% для HIGH-bucket, SS блокировал на 3.6%.
-            // Источник SL — один (DE), повторная гейтировка убрана.
-
-            // OLD: earlyMinConf = effConf + symbolBoost + qualityPenalty (could reach 80%+)
-            // NEW: earlyMinConf = effConf + symbolBoost (max ~68+4=72%, actually achievable)
-            // qualityPenalty still reduces position size in getPositionSizeUsdt() below.
-            double symbolConfBoost = isc.getSymbolMinConfBoost(pair);
-            double qualityPenalty = cycleQualityPenalty;
-            // [FIX-ROUND2 2026-05-02] earlyMinConf = MIN_CONF baseline,
-            // никаких discount-3pt по умолчанию.
-            // Старая логика отдавала ISC возможность снизить порог на 3pt при
-            // хорошем track record. Но ISC.getEffectiveMinConfidence на cold-start
-            // возвращает 50 < MIN_CONF=58 → discount активен ПОСТОЯННО → реальный
-            // floor = 55 вместо 58. ISC всё ещё может ПОДНЯТЬ порог (penalty за
-            // daily loss, etc.) — это сохранено через iscFloor=min(cap,iscRaw).
-            double iscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
-            double iscCap  = MIN_CONF + 4.0;                          // ISC не задирает выше env+4
-            double iscFloor = Math.min(iscCap, iscRaw);               // обрезаем сверху
-            // Calibrator warmup bypass. With cold calibrator, env MIN_CONF dead-
-            // zone would block all signals before they could mature the calibrator.
-            // While outcomes < CAL_WARMUP_OUTCOMES (default 50), use lower floor
-            // CAL_WARMUP_FLOOR (default 52 == DE floor). Snap back when mature.
-            int _calOutcomes = decisionEngine.getCalibrator().totalOutcomeCount();
-            int _calWarmupTarget = envInt("CAL_WARMUP_OUTCOMES", 50);
-            double _calWarmupFloor = envDouble("CAL_WARMUP_FLOOR", 52.0);
-            double effMinConfBase = (_calOutcomes < _calWarmupTarget)
-                    ? Math.min(MIN_CONF, _calWarmupFloor)
-                    : MIN_CONF;
-            double earlyMinConf = Math.max(effMinConfBase, iscFloor);
-            // Debug option: lower early gate by N points to see how many signals
-            // would pass without calibrator/ISC suppression. Telemetry knob only —
-            // does NOT bypass authoritative finalMinConf gate downstream.
-            double earlyGateBoostDown = envDouble("EARLY_GATE_LOOSEN", 0.0);
-            if (earlyGateBoostDown > 0 && earlyGateBoostDown <= 5.0) {
-                earlyMinConf = Math.max(0.0, earlyMinConf - earlyGateBoostDown);
-            }
-            if (idea.probability < earlyMinConf) {
-                blockedEarlyConf.incrementAndGet();
-                return null;
-            }
-
-            boolean isLong   = idea.side == com.bot.TradingCore.Side.LONG;
-            double gicWeight = gic.getFilterWeight(pair, isLong, relStrength, sector);
-            if (gicWeight <= 0.05) gicHardHeadwind.incrementAndGet();
-
-            // GIC weight → probability penalty, NOT hard veto
-            // Old: gicWeight <= 0 → return null (killed ALL longs during BTC dip)
-            // New: gicWeight → scaled penalty. Panic = -25, Danger = -15, Watch = -8
-            if (gicWeight <= 0.05) {
-                // Effectively blocked — apply massive penalty but let probability gate decide
-                List<String> gicFlags = new ArrayList<>(idea.flags);
-                gicFlags.add("GIC_BLOCK");
-                idea = rebuildIdea(idea, Math.max(40, idea.probability - 25), gicFlags);
-            } else if (gicWeight < 0.50) {
-                List<String> gicFlags = new ArrayList<>(idea.flags);
-                gicFlags.add("GIC_WEAK" + String.format("%.0f", gicWeight * 100));
-                double penalty = (0.50 - gicWeight) * 30; // 0.05 → -13.5, 0.30 → -6, 0.49 → -0.3
-                idea = rebuildIdea(idea, Math.max(50, idea.probability - penalty), gicFlags);
-            } else if (gicWeight > 1.10) {
-                // GIC boost — slightly increase probability
-                double boost = Math.min(5, (gicWeight - 1.0) * 8);
-                List<String> gicFlags = new ArrayList<>(idea.flags);
-                gicFlags.add("GIC_BOOST" + String.format("%.0f", gicWeight * 100));
-                // [v50 FIX BUG-18] Removed duplicate Math.min(85,...) — single cap lives in
-                // SignalOptimizer.MAX_CONF=85 which is applied after all boosts are applied.
-                idea = rebuildIdea(idea, idea.probability + boost, gicFlags);
-            }
-
-            if (!correlationGuard.allow(pair, idea.side, cat, sector)) {
-                blockedCorr.incrementAndGet(); return null;
-            }
-
-            // PumpHunter удалён — TrendPullback стратегия не использует его теги.
-            // SignalOptimizer.μ оставлен (мягкий ±10pt micro-momentum, может помочь).
-            idea = optimizer.withAdjustedConfidence(idea);
-            // [v75] Removed duplicate MIN_CONF check here. Was: probability < MIN_CONF → reject.
-            // The same check happens at line ~1570 (finalMinConf) which is the authoritative
-            // gate. Two consecutive checks of the same threshold = no extra protection,
-            // just confusing logs and an extra rejection counter that double-counted.
-
-            // [v18.0 REFACTOR] OBI: flag only, no probability scaling, no blocking
-            // ANTI-SPOOFING: cross-validate OBI with realised taker flow.
-            // A limit wall (OBI) WITHOUT confirmed taker activity = likely spoofing.
-            // Spoofer pattern: large bid wall appears → bot flags bullish → wall yanked → dump.
-            // Validation: if OBI says bullish (bid > ask) but normDelta says sell flow → SKIP OBI.
-            // This does NOT block the signal — it just removes the OBI confidence flag.
-            OrderbookSnapshot obs = orderbookMap.get(pair);
-            if (obs != null && obs.isFresh()) {
-                double obi = obs.obi();
-                boolean obiAligned = (isLong && obi > OBI_THRESHOLD) || (!isLong && obi < -OBI_THRESHOLD);
-                if (obiAligned) {
-                    // Anti-spoofing: OBI bullish but taker flow bearish = spoof suspect
-                    boolean obiAndFlowAgree = isLong
-                            ? normDelta > -0.10   // bid wall + some sell flow OK, but not heavy sell
-                            : normDelta < 0.10;   // ask wall + some buy flow OK, but not heavy buy
-                    if (obiAndFlowAgree) {
-                        List<String> nf = new ArrayList<>(idea.flags);
-                        nf.add("OBI" + String.format("%+.0f", obi * 100));
-                        idea = rebuildIdea(idea, idea.probability, nf);
-                    } else {
-                        // Spoof suspected — tag it but don't boost
-                        List<String> nf = new ArrayList<>(idea.flags);
-                        nf.add("OBI_SPOOF?");
-                        idea = rebuildIdea(idea, idea.probability, nf);
-                    }
-                }
-            }
-
-            // [MODULE 2 v33] ORDER FLOW VELOCITY — applied after OBI check.
-            // OFV measures whether the bid/ask wall is ACTIVELY GROWING (real demand)
-            // or static (probable spoof). Key distinction from plain OBI:
-            //
-            //   OBI strong + OFV positive → real institutional accumulation → BOOST signal
-            //   OBI strong + OFV ≈ 0     → static wall, no active buyers → no boost (spoof risk)
-            //   OFV strong + no OBI flag  → flow building before wall appears → EARLY signal boost
-            //   OFV negative vs direction → active distribution into price → PENALTY
-            //
-            // Score [-1..+1]: positive = bullish flow velocity, negative = bearish
-            Double ofvScore = ofvScoreMap.get(pair);
-            if (ofvScore != null && Math.abs(ofvScore) >= OFV_SIGNAL_THRESH) {
-                boolean ofvBullish = ofvScore > 0;
-                boolean ofvBearish = ofvScore < 0;
-                boolean aligned    = (isLong && ofvBullish) || (!isLong && ofvBearish);
-                boolean opposed    = (isLong && ofvBearish) || (!isLong && ofvBullish);
-
-                List<String> nf = new ArrayList<>(idea.flags);
-                if (aligned) {
-                    // OFV boost снижен 4.5→2.0 / 2.5→1.5.
-                    // Старые значения вносили до +4.5 к confidence на чистом OFV — слишком много.
-                    // OFV подтверждает направление, но не должен самостоятельно поднимать сигнал
-                    // через финальный порог confidence. Убрана cap 85.0 — теперь общий cap в generate().
-                    double boost = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 2.0 : 1.5;
-                    String tag = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? "OFV_STRONG" : "OFV_ALIGN";
-                    nf.add(tag + (isLong ? "↑" : "↓"));
-                    // [v50 FIX BUG-18] Removed Math.min(85.0,...) — single cap in SignalOptimizer
-                    idea = rebuildIdea(idea, idea.probability + boost, nf);
-                } else if (opposed) {
-                    // Active flow against the signal direction — reduce confidence
-                    double penalty = Math.abs(ofvScore) >= OFV_STRONG_THRESH ? 5.0 : 2.5;
-                    nf.add("OFV_OPPOSE" + (isLong ? "↓" : "↑"));
-                    idea = rebuildIdea(idea, idea.probability - penalty, nf);
-                }
-            }
-            if (Math.abs(normDelta) > 0.28) {
-                List<String> nf = new ArrayList<>(idea.flags);
-                nf.add("Δ" + (normDelta > 0 ? "BUY" : "SELL") + pct(Math.abs(normDelta)));
-                idea = rebuildIdea(idea, idea.probability, nf);
-            }
-
-            // [v18.0 REFACTOR] Sector Weakness: tag only, no confidence fading
-            if (sector != null && isLong) {
-                double weakness = gic.getSectorWeakness(sector);
-                if (weakness > 0.7) {
-                    List<String> nf = new ArrayList<>(idea.flags);
-                    nf.add("WEAK_SECTOR");
-                    idea = rebuildIdea(idea, idea.probability, nf);
-                }
-            }
-
-            // [v9.3 2026-05-28] SKIP adjustStopForClusters FOR VCB SIGNALS.
-            // ROOT CAUSE найден: VCB strategy выставляет structural SL (midBB или
-            // ATR×1.4, clamped 0.5-2.5%) от которого TradeIdea ctor рассчитывает
-            // TP1/TP2 пропорционально. adjustStopForClusters расширял SL до swing
-            // low/high (cap ATR×2.2 = до 5.5%), и TradeIdea ctor пересчитывал TP
-            // от нового risk → TP отъезжал на 12-25% дальше plan.
-            //
-            // Эффект в live (6 сигналов, 26-28 мая 2026):
-            //   - SL_ADJ→3.12% при VCB max=2.5% (NEAR), 3.00% (RENDER), 2.81% (FIL)
-            //   - TP2 cap 6-9% вместо backtest 5-6%
-            //   - Time-stops 2/6 = 33% vs backtest 2/48 = 4% (8× регрессия)
-            //   - Live WR 33% vs backtest 52% (на малой выборке)
-            //
-            // ВАЖНО: backtest НЕ применяет adjustStopForClusters (вызывает
-            // engine.analyze напрямую, не через processPair). То есть backtest
-            // +3.54% NetPnL не отражает real live performance — гарантия
-            // вранья. Skip для VCB восстанавливает live↔backtest consistency.
-            //
-            // Откат: убрать !idea.flags.contains("VCB_v8") condition.
-            // [v86.2] TREND_ALIGNED_1H тоже ставит структурный ATR-SL — adjustStopForClusters
-            // расширял бы его (как ломал VCB: live time-stops 8×, WR 52→33%). Скип = live ставит
-            // ТОТ ЖЕ SL/TP, что симулирует backtest → backtest↔live консистентность. Без этого
-            // backtest +40% не отражал бы лайв (юзер верно заподозрил расхождение).
-            if (!idea.flags.contains("VCB_v8") && !idea.flags.contains("TREND_ALIGNED_1H")) {
-                idea = adjustStopForClusters(idea, m15);
-            }
-            idea = applyVpocBarrierGuard(idea, m15);
-            if (idea == null) { blockedVpoc.incrementAndGet(); return null; }
-
-            if (!checkMinProfit(idea, cat)) { blockedProfit.incrementAndGet(); return null; }
-
-            // Добавляем рекомендованный размер позиции
-            double posSize = getPositionSizeUsdt(idea, cat);
-            // SURVIVAL MODE (day <= -6%): position size ×0.25.
-            // CAUTIOUS MODE (day <= -3%): position size ×0.5.
-            // This replaces the old hard signal block with meaningful size reduction.
-            //
-            // [HOLE-1 REGRESSION FIX 2026-05-08] Эти множители применяются и к
-            // posSize (для Telegram-display), И к idea.executorSizeMultiplier
-            // (через extraMult ниже), чтобы биржа открывала тот же размер.
-            // Раньше они были только display-side → биржа в SURVIVAL открывала
-            // в 4× больше чем показано (катастрофа в худший день).
-            double extraMult = 1.0;
-            if (isc.isSurvivalMode()) {
-                posSize = posSize * 0.25;
-                extraMult *= 0.25;
-            } else if (isc.isCautiousMode()) {
-                posSize = posSize * 0.5;
-                extraMult *= 0.5;
-            }
-            if (qualityPenalty > 0.0) {
-                double qm = Math.max(0.55, 1.0 - qualityPenalty * 0.06);
-                posSize *= qm;
-                extraMult *= qm;
-            }
-            // CORRELATION SIZE REDUCTION
-            // Каждая дополнительная позиция в том же направлении уменьшает размер.
-            // 8 ALT LONG = фактически 1 позиция с 8× риском (corr ~0.85).
-            double corrMult = correlationGuard.getCorrelationSizeMultiplier(pair, idea.side, cat);
-            posSize *= corrMult;
-            extraMult *= corrMult;
-
-            List<String> nf = new ArrayList<>(idea.flags);
-            String sizeMode = isc.isSurvivalMode() ? " 🆘SURVIVAL"
-                    : isc.isCautiousMode() ? " ⚠️CAUTIOUS" : "";
-            // [v17.0 §4] Append REDUCED_RISK flag from DrawdownManager if active
-            String rrFlag = isc.getReducedRiskFlag();
-            if (!rrFlag.isEmpty()) sizeMode += " " + rrFlag;
-            if (qualityPenalty > 0.0) sizeMode += String.format(" Q+%.0f", qualityPenalty);
-            nf.add(String.format("SIZE=%.1f$%s", posSize, sizeMode));
-            // [v76] THIN_LIQ warning — render in Telegram so trader knows fill
-            // may slip 0.05–0.20% from displayed entry/SL on low-volume pairs.
-            Double pairVol = volume24hUSD.get(pair);
-            if (pairVol != null && pairVol < 5_000_000.0) {
-                nf.add("THIN_LIQ");
-            }
-            idea = rebuildIdea(idea, idea.probability, nf);
-
-            // SESSION WEIGHT → FLAG + SIZE REDUCTION ONLY.
-            // Session context predicts LIQUIDITY, not signal direction.
-            // Low liquidity = smaller position. Signal validity is unchanged.
-            // Probability modification removed — it was incorrectly killing valid setups at 03:00 UTC.
-            double sessionW = getSessionWeight();
-            List<String> sf = new ArrayList<>(idea.flags);
-            if (sessionW < 0.85) {
-                sf.add("SESS_LOW");    // carried to SignalSender for size reduction
-            } else if (sessionW >= 1.20) {
-                sf.add("SESS_NY");     // London/NY overlap — max liquidity
-            } else if (sessionW >= 1.10) {
-                sf.add("SESS_LONDON"); // London open
-            }
-            // NO probability modification. Size is adjusted in getPositionSizeUsdt() via sessionW.
-            idea = rebuildIdea(idea, idea.probability, sf);
-
-            // [ДЫРА №2] LIQUIDATION SCORE — тегируем сигнал если рядом крупные ликвидации
-            double atrForLiq = com.bot.TradingCore.atr(m15, 14);
-            double liqScore  = getLiquidationScore(pair, idea.price, atrForLiq, idea.side);
-            if (liqScore > 0.25) {
-                List<String> lf = new ArrayList<>(idea.flags);
-                lf.add(String.format("LIQ_MAGNET+%.0f%%", liqScore * 100));
-                // Убран confidence boost от LIQ_MAGNET (liqScore * 8, max +8).
-                // Проблема: ликвидационный магнит — это дополнительный контекст (информация о ТА),
-                // а не сигнал качества входа. Накачка confidence через LIQ_MAGNET приводила
-                // к тому что слабые сигналы "проходили" финальный порог только из-за близких ликвидаций.
-                // Оставляем тег в flags — трейдер видит контекст в Telegram, но без inflation.
-                idea = rebuildIdea(idea, idea.probability, lf);
-            }
-
-            // [FIX-ROUND2 2026-05-02] finalMinConf = MIN_CONF baseline.
-            // Убрана -1pt скидка. ISC всё ещё может ПОДНЯТЬ порог (track record),
-            // но не может опустить ниже env-MIN_CONF.
-            // [A4 2026-05-08] Same warmup bypass as earlyMinConf — both gates must
-            // agree on the floor or the looser early gate is meaningless.
-            double finalIscRaw  = isc.getEffectiveMinConfidence() + symbolConfBoost;
-            double finalIscCap  = MIN_CONF + 4.0;
-            double effFinalBase = (_calOutcomes < _calWarmupTarget)
-                    ? Math.min(MIN_CONF, _calWarmupFloor)
-                    : MIN_CONF;
-            double finalMinConf = Math.max(effFinalBase, Math.min(finalIscCap, finalIscRaw));
-            if (idea.probability < finalMinConf) {
-                blockedFinalConf.incrementAndGet();
-                return null;
-            }
-            if (!isc.allowSignal(idea)) {
-                blockedIsc.incrementAndGet();
-                return null;
-            }
-
-            // PATCH #12: Adaptive TP calibration based on real historical RR.
-            // Problem: TP_TREND_EARLY sets tp3Mult=4.2, but if symbol historically only
-            //          reaches avgRR=1.3, those wide TPs are wishful thinking.
-            //          Bot waited for TP3 that never came, missing TP1 exits.
-            // Fix: if real avgRR < 70% of assumed tp3Mult → compress all TP multipliers.
-
-            // ORDERBOOK WALL TP GUARD — if a strong wall sits in TP direction,
-            // the TP probably won't be reached. Detect via L1-L5 depth imbalance.
-            // OrderbookSnapshot doesn't store individual price levels, so we use
-            // total depth5 as a proxy: if the OPPOSING side (where TP1 sits) has
-            // very heavy depth, there's a wall blocking the move.
-            OrderbookSnapshot wallCheck = orderbookMap.get(pair);
-            if (wallCheck != null && wallCheck.isFresh()) {
-                // Reuse outer isLong (declared at line 1175)
-                // For LONG: TP is above price → ask side is the obstacle
-                // For SHORT: TP is below price → bid side is the obstacle
-                double obstacleDepth = isLong ? wallCheck.askDepth5 : wallCheck.bidDepth5;
-                double supportDepth  = isLong ? wallCheck.bidDepth5 : wallCheck.askDepth5;
-                // Wall = obstacle 2.5× heavier than support side
-                if (obstacleDepth > supportDepth * 2.5 && supportDepth > 0) {
-                    // Strong wall detected — compress TP1/TP2 by 30% to take profit before wall
-                    double newTp1 = Math.max(0.60, idea.tp1Mult * 0.70);
-                    double newTp2 = Math.max(1.00, idea.tp2Mult * 0.75);
-                    double newTp3 = Math.max(1.50, idea.tp3Mult * 0.85);
-                    // [v86.46 compress-then-block FIX] Жёсткий RR-GATE ниже требует tp2Mult >= 2.00:
-                    // при TA_TP_R=2.05 компрессия ×0.75 даёт 1.5375 → сигнал гарантированно умирал
-                    // на гейте с вводящим в заблуждение логом [RR-GATE]. Если стенка прижимает TP2
-                    // ниже флора — профит-путь заблокирован, скипаем сразу и с честной причиной.
-                    if (newTp2 < 2.00) {  // sync: effMinRR ниже
-                        correlationGuard.unregister(pair);
-                        System.out.printf("[OB-WALL] %s %s SKIPPED: wall %.1fx blocks TP path (tp2Mult %.2f→%.2f < RR floor 2.00)%n",
-                                pair, idea.side, obstacleDepth / supportDepth, idea.tp2Mult, newTp2);
-                        return null;
-                    }
-                    List<String> wf = new ArrayList<>(idea.flags);
-                    wf.add(String.format("OB_WALL%.1fx", obstacleDepth / supportDepth));
-                    // [HOLE-1 REGRESSION FIX 2026-05-08] Preserve executorSizeMultiplier
-                    // when constructing new TradeIdea directly (bypasses rebuildIdea).
-                    double prevMult = idea.getExecutorSizeMultiplier();
-                    idea = new com.bot.DecisionEngineMerged.TradeIdea(
-                            idea.symbol, idea.side, idea.price, idea.stop, idea.take,
-                            idea.rr, idea.probability, wf,
-                            idea.fundingRate, idea.fundingDelta, idea.oiChange,
-                            idea.htfBias, idea.category, idea.forecast,
-                            newTp1, newTp2, newTp3);
-                    if (prevMult > 0 && prevMult != 1.0) idea.setExecutorSizeMultiplier(prevMult);
-                }
-            }
-
-            double realRR = isc.getAvgRealizedRR(pair);
-            if (realRR > 0 && idea.tp3Mult > 0 && realRR < idea.tp3Mult * 0.70) {
-                // Symbol's real edge is weaker than the TP targets assume.
-                // Scale all TP levels down proportionally. TP1 always stays >= 0.6×risk.
-                double scale = Math.max(0.60, realRR / idea.tp3Mult);
-                double newTp1 = Math.max(0.60, idea.tp1Mult * scale);
-                double newTp2 = Math.max(1.00, idea.tp2Mult * scale);
-                double newTp3 = Math.max(1.50, idea.tp3Mult * scale);
-                // [v86.46 compress-then-block FIX] то же, что у OB_WALL: scale<0.70 даёт
-                // tp2Mult<1.44 — гарантированная смерть на RR-GATE ниже. Реализованный RR
-                // символа не дотягивает до целей при флоре 2.00 → честный скип вместо
-                // ложного [RR-GATE] лога.
-                if (newTp2 < 2.00) {  // sync: effMinRR ниже
-                    correlationGuard.unregister(pair);
-                    System.out.printf("[TP-CAL] %s %s SKIPPED: realized RR %.2f too weak for targets (tp2Mult %.2f→%.2f < RR floor 2.00)%n",
-                            pair, idea.side, realRR, idea.tp2Mult, newTp2);
-                    return null;
-                }
-                List<String> tf = new ArrayList<>(idea.flags);
-                tf.add(String.format("TP_CAL×%.1f", scale));
-                // [HOLE-1 REGRESSION FIX 2026-05-08] Preserve executorSizeMultiplier
-                // when constructing new TradeIdea directly (bypasses rebuildIdea).
-                double prevMult = idea.getExecutorSizeMultiplier();
-                idea = new com.bot.DecisionEngineMerged.TradeIdea(
-                        idea.symbol, idea.side, idea.price, idea.stop, idea.take,
-                        idea.rr, idea.probability, tf,
-                        idea.fundingRate, idea.fundingDelta, idea.oiChange,
-                        idea.htfBias, idea.category, idea.forecast,
-                        newTp1, newTp2, newTp3);
-                if (prevMult > 0 && prevMult != 1.0) idea.setExecutorSizeMultiplier(prevMult);
-            }
-
-            // [v78.2 CRITICAL FIX] Removed `isc.registerSignal(idea)` from this path.
-            // ROOT CAUSE: registering here caused activeSymbols.containsKey(symbol)=true,
-            // which made Dispatcher.isSymbolAvailable() return false, blocking 100% of
-            // valid signals as "bipolar/cooldown" on a fresh start with no real cooldown.
-            // Pattern matches HOT_RESCAN flow (line 3322-3326): dispatch FIRST, then
-            // registerApprovedSignal on success. ISC registration now happens in
-            // BotMain after Dispatcher.dispatch() returns dispatched=true.
-            //
-            // HARD R:R GATE — raised 1.80→2.00 (user preference ≥1:2).
-            // Синхронизировано с BotMain dispatch gate и tp2Mult floor в DecisionEngineMerged.
-            // При tp2Mult всегда ≥ 2.00 этот gate — финальная страховка (должен почти не срабатывать).
-            // [B6 2026-05-08] Adaptive RR floor by BTC regime — closes the 2.00..2.20
-            // pass-through gap where signals slipped past SignalSender then died at
-            // Dispatcher.FLAT_MARKET_MIN_RR=2.20 (wasted CPU, wasted REST weight, no
-            // calibrator data). When BTC trend is weak (|str|<0.30), demand 2.20 here
-            // already, matching Dispatcher; otherwise the historical 2.00.
-            double _riskDist = Math.abs(idea.stop - idea.price);
-            double _tp2Dist  = Math.abs(idea.tp2 - idea.price);
-            double actualRR  = _riskDist > 1e-9 ? _tp2Dist / _riskDist : 0;
-            double _trendStrForRR = 0.0;
-            try {
-                com.bot.GlobalImpulseController.GlobalContext _gc = gic.getContext();
-                if (_gc != null) _trendStrForRR = Math.abs(_gc.impulseStrength);
-            } catch (Throwable ignored) {}
-            double effMinRR = 2.00;  // [PATCH 2026-05-13] was `(_trendStrForRR<0.30)?2.20:2.00` — synced with CS_TP2_R=2.4 + BotMain FLAT_MARKET_MIN_RR=2.00
-            if (actualRR < effMinRR) {
-                // [v78.2] No ISC unregister needed — we never registered.
-                // correlationGuard.unregister still called for safety in case
-                // a parallel correlation register slipped in. No-op if not registered.
-                correlationGuard.unregister(pair);
-                System.out.printf("[RR-GATE] %s %s BLOCKED: actualRR=%.2f < %.2f (TP2=%.6f entry=%.6f SL=%.6f trendStr=%.2f)%n",
-                        pair, idea.side, actualRR, effMinRR, idea.tp2, idea.price, idea.stop, _trendStrForRR);
-                return null;
-            }
-            // Confirm signal → sets cooldown + lastSigPrice in DecisionEngine
-            decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, System.currentTimeMillis());
-            correlationGuard.register(pair, idea.side, cat, sector);
-
-            // [HOLE-1 REGRESSION FIX 2026-05-08] Apply accumulated extraMult
-            // (survival/cautious/quality/corr) to executorSizeMultiplier AFTER
-            // all rebuildIdea + direct constructor calls (OB_WALL/TP_CAL paths
-            // create new TradeIdea via constructor, which resets the multiplier).
-            // Do it here, at the last point before return — guarantees the
-            // multiplier survives to autoTradeHook.
-            if (extraMult > 0 && extraMult != 1.0) {
-                double base = idea.getExecutorSizeMultiplier();
-                idea.setExecutorSizeMultiplier(base * extraMult);
-            }
-
-            return idea;
-        } catch (Exception e) {
-            LOG.info("[processPair] " + pair + ": " + e.getMessage());
-            return null;
-        }
-    }
 
     //  LIVE CANDLE ASSEMBLER
 
@@ -2116,71 +1371,6 @@ public final class SignalSender {
      * По мере роста баланса $18→$100→$1000→$100000 позиции растут пропорционально.
      * Это и есть механизм превращения малого депозита в крупный.
      */
-    public double getPositionSizeUsdt(com.bot.DecisionEngineMerged.TradeIdea idea,
-                                      com.bot.DecisionEngineMerged.CoinCategory cat) {
-        // [HOLE-1+2 FIX 2026-05-08+v2] UNIFIED RISK CALC + EXECUTOR PASSTHROUGH.
-        //
-        // Раньше Telegram показывал posSize вычисленный с модификаторами (catMult,
-        // flag mods, sessionW, ISC, smallBalance), а Executor открывал позицию
-        // ИГНОРИРУЯ эти модификаторы — только base RISK_PCT × balance / SL_dist.
-        // Расхождение до 4× для сигналов с COUNTER_TREND/MEME флагами.
-        //
-        // FIX: вычисляем итоговый sizeMultiplier (отношение posSize_with_mods
-        //      к posSize_without_mods) и пишем его на idea через
-        //      idea.setExecutorSizeMultiplier(). Executor читает и применяет
-        //      к qty в openPositionWithSl(). Теперь Telegram = биржа.
-        //
-        // Авторитетный источник: env RISK_PCT_PER_TRADE и LEVERAGE.
-        if (System.currentTimeMillis() - lastBalanceRefresh > 30_000L) {
-            try { refreshAccountBalance(); } catch (Throwable ignored) {}
-        }
-
-        double balance = Math.max(accountBalance, 5.0); // floor at $5 only (min viable order)
-
-        double envRiskPct = envDouble("RISK_PCT_PER_TRADE", 2.0);
-        envRiskPct = Math.max(0.5, Math.min(5.0, envRiskPct));
-        int envLeverage = envInt("LEVERAGE", 5);
-        envLeverage = Math.max(1, Math.min(10, envLeverage));
-
-        // Aggregate modifier — start at 1.0, multiply each applicable factor.
-        double sizeMult = 1.0;
-
-        // Category modifier (MEME режется)
-        if (cat == com.bot.DecisionEngineMerged.CoinCategory.MEME) sizeMult *= 0.60;
-
-        // Small-balance safety (защита от копеечных аккаунтов)
-        if (balance < 50.0)        sizeMult *= 0.50;
-        else if (balance < 150.0)  sizeMult *= 0.75;
-
-        // Flag-based modifiers (синхрон с DE.java tags)
-        if (idea.flags.contains("EARLY_TICK"))             sizeMult *= 0.85;
-
-        // ISC institutional risk multiplier (depends on signal strength)
-        sizeMult *= isc.getRiskSizeMultiplier();
-
-        // Session liquidity (time-of-day)
-        double sessionW = getSessionWeight();
-        if (sessionW < 0.85)        sizeMult *= Math.max(0.50, sessionW);
-        else if (sessionW >= 1.20)  sizeMult *= 1.10;
-
-        // Pass to Executor via idea (clamped to [0.20, 1.20] in setter).
-        idea.setExecutorSizeMultiplier(sizeMult);
-
-        // Compute display posSize for Telegram (same formula as Executor + mult).
-        double riskUsdt = balance * (envRiskPct / 100.0) * sizeMult;
-
-        // Floor stopPct=0.001 (0.1%) — синхронизация с executor sanity-check.
-        double stopPct = Math.max(0.001, Math.abs(idea.price - idea.stop) / idea.price);
-        double posSize = riskUsdt / stopPct;
-
-        // CAP идентичный Executor: marginUsed ≤ balance × 0.5.
-        double maxNotionalByMargin = balance * 0.5 * envLeverage;
-        double minPosAbs = Math.max(balance * 0.01, 1.0);  // min 1% balance, floor $1
-        posSize = Math.min(posSize, maxNotionalByMargin);
-        posSize = Math.max(posSize, minPosAbs);
-
-        return Math.round(posSize * 100.0) / 100.0;
-    }
 
     //  ОБНОВЛЕНИЕ БАЛАНСА
 
@@ -2397,18 +1587,13 @@ public final class SignalSender {
                             ? com.bot.TradingCore.Side.SHORT
                             : com.bot.TradingCore.Side.LONG;
                     double pnlPct = (avgPrice > 0 && qty > 0) ? realizedPnl / (avgPrice * qty) * 100 : 0;
-                    // UDS confirmed result → register in ISC properly
+                    // UDS confirmed result → record in DecisionEngine calibration
                     if (realizedPnl > 0) {
-                        isc.registerConfirmedResult(true, closedSide);
                         decisionEngine.recordWin(symbol, closedSide);
                     } else if (realizedPnl < 0) {
-                        isc.registerConfirmedResult(false, closedSide);
                         decisionEngine.recordLoss(symbol, closedSide);
                     }
                     decisionEngine.markPostExitCooldown(symbol, closedSide);
-                    String closeReason = realizedPnl > 0 ? "UDS_TP"
-                            : realizedPnl < 0 ? "UDS_SL" : "UDS_CLOSE";
-                    isc.closeTrade(symbol, closedSide, pnlPct, closeReason);
                     // Remove from BotMain TradeResolver tracking
                     com.bot.BotMain.trackedSignals.remove(symbol + "_" + closedSide);
                     String emoji = realizedPnl >= 0 ? "✅" : "❌";
@@ -2654,43 +1839,6 @@ public final class SignalSender {
 
     //  STOP CLUSTER AVOIDANCE
 
-    private com.bot.DecisionEngineMerged.TradeIdea adjustStopForClusters(
-            com.bot.DecisionEngineMerged.TradeIdea idea,
-            List<com.bot.TradingCore.Candle> m15) {
-        if (m15 == null || m15.size() < 20) return idea;
-        double price = idea.price, oldStop = idea.stop, newStop = oldStop;
-        int n = m15.size(), lookback = Math.min(20, n - 1);
-
-        if (idea.side == com.bot.TradingCore.Side.LONG) {
-            double swingLow = Double.MAX_VALUE;
-            for (int i = n - lookback; i < n - 1; i++) {
-                double low = m15.get(i).low;
-                if (low >= oldStop * 0.98 && low <= oldStop * 1.005) swingLow = Math.min(swingLow, low);
-            }
-            if (swingLow != Double.MAX_VALUE) {
-                newStop = Math.max(swingLow * (1 - STOP_CLUSTER_SHIFT), price - atr(m15, 14) * 2.2);
-            }
-        } else {
-            double swingHigh = Double.NEGATIVE_INFINITY;
-            for (int i = n - lookback; i < n - 1; i++) {
-                double high = m15.get(i).high;
-                if (high >= oldStop * 0.995 && high <= oldStop * 1.02) swingHigh = Math.max(swingHigh, high);
-            }
-            if (swingHigh != Double.NEGATIVE_INFINITY) {
-                newStop = Math.min(swingHigh * (1 + STOP_CLUSTER_SHIFT), price + atr(m15, 14) * 2.2);
-            }
-        }
-
-        if (newStop == oldStop) return idea;
-        List<String> nf = new ArrayList<>(idea.flags);
-        nf.add(String.format("SL_ADJ→%.2f%%", Math.abs(newStop - idea.price) / idea.price * 100));
-        return new com.bot.DecisionEngineMerged.TradeIdea(
-                idea.symbol, idea.side, idea.price, newStop, idea.take, idea.rr,
-                idea.probability, nf, idea.fundingRate, idea.fundingDelta,
-                idea.oiChange, idea.htfBias, idea.category,
-                idea.forecast,
-                idea.tp1Mult, idea.tp2Mult, idea.tp3Mult);
-    }
 
     //  MINIMUM PROFIT GUARD
 
@@ -2702,72 +1850,7 @@ public final class SignalSender {
         return (gross - 0.0008 - slip) >= min;
     }
 
-    private com.bot.DecisionEngineMerged.TradeIdea applyVpocBarrierGuard(
-            com.bot.DecisionEngineMerged.TradeIdea idea,
-            List<com.bot.TradingCore.Candle> m15) {
-        if (idea == null || idea.forecast == null || m15 == null || m15.size() < 20) return idea;
 
-        double vpoc = idea.forecast.magnetLevel;
-        if (!(vpoc > 0.0) || !Double.isFinite(vpoc)) return idea;
-
-        double price = idea.price;
-        double tp1 = idea.tp1;
-        double stopDist = Math.abs(price - idea.stop);
-        double tp1Dist = Math.abs(tp1 - price);
-        if (stopDist <= 0.0 || tp1Dist <= 0.0) return idea;
-
-        boolean inPath = idea.side == com.bot.TradingCore.Side.LONG
-                ? (vpoc > price && vpoc < tp1)
-                : (vpoc < price && vpoc > tp1);
-        if (!inPath) return idea;
-
-        double barrierDist = Math.abs(vpoc - price);
-        double atr14 = atr(m15, 14);
-        boolean leadBreakout = hasLeadBreakout(idea);
-        boolean strongForecast = idea.forecast.confidence >= 0.64
-                && ((idea.side == com.bot.TradingCore.Side.LONG && idea.forecast.directionScore > 0.20)
-                || (idea.side == com.bot.TradingCore.Side.SHORT && idea.forecast.directionScore < -0.20));
-        boolean tightBarrier = barrierDist <= Math.max(stopDist * VPOC_NEAR_STOP_MULT, atr14 * VPOC_NEAR_ATR_MULT);
-
-        if (tightBarrier && !(leadBreakout || strongForecast)) {
-            return null;
-        }
-
-        if (barrierDist <= tp1Dist * 0.55) {
-            List<String> nf = new ArrayList<>(idea.flags);
-            nf.add(leadBreakout ? "VPOC_BREAKTRY" : "VPOC_NEAR");
-            double penalty = leadBreakout ? 1.5 : VPOC_SOFT_PENALTY;
-            return rebuildIdea(idea, Math.max(50, idea.probability - penalty), nf);
-        }
-
-        return idea;
-    }
-
-    private boolean hasLeadBreakout(com.bot.DecisionEngineMerged.TradeIdea idea) {
-        if (idea == null || idea.flags == null || idea.flags.isEmpty()) return false;
-        // [v9.7 2026-05-28] VCB_v8 → lead-breakout: VCB сигнал ВСЕГДА является
-        // structural breakout setup (BB squeeze release + volume + HTF align).
-        // Раньше hasLeadBreakout не знал про VCB → VPOC barrier guard мог
-        // блочить VCB-сигналы если они проходили рядом с VPOC. Сейчас VCB
-        // передаёт forecast=null → applyVpocBarrierGuard делает early return,
-        // НО если в будущем добавится forecast — block ловушка активируется.
-        // Defensive fix.
-        if (idea.flags.contains("VCB_v8")) return true;
-        if (idea.side == com.bot.TradingCore.Side.LONG) {
-            return idea.flags.contains("EARLY_SOLO")
-                    || idea.flags.contains("BOS_UP_5M")
-                    || idea.flags.contains("COMP_BREAK_UP")
-                    || idea.flags.contains("ANTI_LAG_UP")
-                    || idea.flags.contains("PUMP_HUNT_B")
-                    || idea.flags.stream().anyMatch(f -> f.startsWith("VDA+"));
-        }
-        return idea.flags.contains("EARLY_SOLO")
-                || idea.flags.contains("BOS_DN_5M")
-                || idea.flags.contains("COMP_BREAK_DN")
-                || idea.flags.contains("ANTI_LAG_DN")
-                || idea.flags.contains("PUMP_HUNT_S")
-                || idea.flags.stream().anyMatch(f -> f.startsWith("VDA-"));
-    }
 
     //  CORRELATION GUARD
 
@@ -3298,11 +2381,6 @@ public final class SignalSender {
         lastTickPrice.put(pair, price);
         lastTickTime.put(pair, ts);
 
-        // HOT PAIR RESCAN — detect rapid price acceleration and trigger immediate analysis.
-        // Called after tick deques updated so maybeHotRescan() has fresh 30-tick window.
-        // Non-blocking: submits to fetchPool only if threshold exceeded AND cooldown clear.
-        maybeHotRescan(pair, price);
-
         // [v36-FIX Дыра1/2] Wire WS tick → liveM1Buffer (1m candle from aggTrade)
         Optional<com.bot.TradingCore.Candle> closedM1 =
                 microBuilders.computeIfAbsent(pair, k -> new MicroCandleBuilder(60_000))
@@ -3314,256 +2392,11 @@ public final class SignalSender {
             if (buf.size() > LIVE_M1_BUFFER_SIZE) buf.subList(0, buf.size() - LIVE_M1_BUFFER_SIZE).clear();
             return buf;
         }));
-
-        if (ENABLE_EARLY_TICK) {
-            // [v62 FIX] Cheapest filter first: refuse to even compute EARLY_TICK
-            // for blocklisted (non-ASCII / garbage) or soft-blocklisted (3× SL>max)
-            // pairs. Previously these passed through here, got rejected at SL-gate
-            // one second later, and spam-logged. Stop at the source.
-            if (isBlocklisted(pair)) return;
-            Long earlySoftUntil = hotSoftBlocklist.get(pair);
-            if (earlySoftUntil != null) {
-                if (System.currentTimeMillis() < earlySoftUntil) return;
-                hotSoftBlocklist.remove(pair);
-                hotSlFailures.remove(pair);
-            }
-
-            // Soft session gate. Asian session is exactly when meme pumps happen —
-            // hard-blocking would systematically miss the most profitable setups.
-            // Penalty was 12pt — too aggressive, killed valid pre-pump signals
-            // in the only window where they fire on small-cap coins. 6pt is enough
-            // to suppress noise but lets real velocity events through.
-            double sessionWeight = getSessionWeight();
-            double sessionPenalty = sessionWeight < 0.85 ? 6.0 : 0.0;
-
-            com.bot.DecisionEngineMerged.TradeIdea et = generateEarlyTickSignal(pair, price, ts);
-            if (et != null && sessionPenalty > 0) {
-                List<String> thinFlags = new ArrayList<>(et.flags);
-                thinFlags.add("THIN_SESSION_" + String.format("%.2f", sessionWeight));
-                et = rebuildIdea(et, et.probability - sessionPenalty, thinFlags);
-            }
-            if (et != null && filterEarlySignal(et)) {
-                // EARLY_TICK forecast gate — category-aware, asymmetric.
-                // Blocks only when ForecastEngine is *actively* against the trade
-                // by more than the category-specific opposing threshold.
-                boolean fcPasses = com.bot.DecisionEngineMerged.forecastPassesEarlyTickGate(
-                        et.forecast,
-                        et.side == com.bot.TradingCore.Side.LONG,
-                        et.category != null ? et.category : categorizePair(et.symbol));
-                if (!fcPasses) {
-                    return;
-                }
-
-                earlyTickBuffer.merge(pair, et, (existing, candidate) ->
-                        candidate.probability > existing.probability ? candidate : existing);
-            }
-        }
     }
 
     // [v29+v30+v34] EARLY TICK — rewritten with exhaustion guard + VDA + correct conf floor
     // Category-aware velocity threshold: TOP coins (BTC/ETH) move slower in %
-    private com.bot.DecisionEngineMerged.TradeIdea generateEarlyTickSignal(String symbol, double price, long ts) {
-        Deque<Double> dq = tickPriceDeque.get(symbol);
-        Deque<Double> vq = tickVolumeDeque.get(symbol);
-        if (dq == null || dq.size() < 30 || vq == null || vq.size() < 30) return null;
-        List<Double> buf    = new ArrayList<>(dq);
-        List<Double> volBuf = new ArrayList<>(vq);
-        int n = buf.size();
 
-        double move = buf.get(n - 1) - buf.get(n - 22);
-        double avg  = buf.stream().mapToDouble(Double::doubleValue).average().orElse(price);
-        double vel  = Math.abs(move) / (avg + 1e-9);
-
-        // [v77 LATENCY] Velocity floors halved — catch the impulse 1-2 ticks
-        // earlier. On low-volume pairs (SOON, $10M/24h) 30 ticks ~= 3-10 min;
-        // the old 0.0025 ALT floor required a 0.25% move within that window
-        // — i.e. half the move was already done before EARLY_TICK considered
-        // the pair. Halving brings detection forward to "impulse forming".
-        // Counter-balanced by stronger acceleration check below + downstream
-        // gates (fcConf, conf floor) so false-positive volume doesn't grow.
-        com.bot.DecisionEngineMerged.CoinCategory etCat = categorizePair(symbol);
-        double velThreshold = switch (etCat) {
-            case TOP  -> 0.0008;  // [v77] 0.0015 → 0.0008. BTC/ETH 0.08% in 30s = real flow start.
-            case ALT  -> 0.0012;  // [v77] 0.0025 → 0.0012. ALT 0.12% in 30s = early impulse.
-            case MEME -> 0.0020;  // [v77] 0.0035 → 0.0020. MEME stays higher (noisy by nature).
-        };
-        if (vel < velThreshold) return null;
-        boolean up = move > 0;
-
-        // atrV computed below in confidence gate (with robustAtr) — pre-fetch for exhaustion guard
-        double atrV = getAtr(symbol);
-        if (atrV <= 0) atrV = price * 0.005;
-
-        // EXHAUSTION GUARD: if already > 2.5×ATR from base → tail, not start
-        double recentBase = up
-                ? buf.subList(Math.max(0, n - 40), n - 1).stream().mapToDouble(Double::doubleValue).min().orElse(price)
-                : buf.subList(Math.max(0, n - 40), n - 1).stream().mapToDouble(Double::doubleValue).max().orElse(price);
-        double moveFromBase  = Math.abs(price - recentBase);
-        double tickRangeHigh = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).max().orElse(price);
-        double tickRangeLow  = buf.subList(Math.max(0, n - 40), n).stream().mapToDouble(Double::doubleValue).min().orElse(price);
-        double exhaustThresh = Math.max(atrV, (tickRangeHigh - tickRangeLow) * 0.60);
-        // Exhaustion guard lowered 2.5→2.0 — was letting through late entries
-        if (moveFromBase > exhaustThresh * 2.0) return null;
-
-        // Acceleration check
-        // TOP coins have smoother moves — lower acceleration threshold
-        // Acceleration threshold lowered: 1.35→1.15 for ALT.
-        // At 1.35 the second half must be 35% faster = move already obvious.
-        // At 1.15 we catch the acceleration 1-2 ticks earlier.
-        double accelThreshold = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.08 : 1.15;
-        double m1 = buf.get(n / 2 - 1) - buf.get(0);
-        double m2 = buf.get(n - 1) - buf.get(n / 2);
-        if (!(Math.abs(m2) > Math.abs(m1) * accelThreshold)) return null;
-
-        // VDA: must not actively disagree
-        double vda = vdaScoreMap.getOrDefault(symbol, 0.0);
-        if (Math.abs(vda) > 0.30 && ((up && vda < 0) || (!up && vda > 0))) return null;
-
-        // Volume spike
-        // TOP coins: lower volume spike threshold (institutional flow is steadier)
-        // Volume spike threshold lowered for earlier detection.
-        double volSpikeThresh = etCat == com.bot.DecisionEngineMerged.CoinCategory.TOP ? 1.08 : 1.18;
-        int vw = Math.min(30, volBuf.size());
-        double avgVol = volBuf.subList(0, vw - 5).stream().mapToDouble(Double::doubleValue).average().orElse(0.001);
-        double recVol = volBuf.subList(vw - 5, vw).stream().mapToDouble(Double::doubleValue).average().orElse(0);
-        if (recVol < avgVol * volSpikeThresh) return null;
-
-        // Tick streak
-        int streak = 0;
-        for (int i = n - 1; i >= Math.max(1, n - 5); i--) {
-            if ((buf.get(i) >= buf.get(i - 1)) == up) streak++; else break;
-        }
-        if (streak < 2) return null;
-
-        // VOLATILITY-AWARE EARLY_TICK CONFIDENCE GATE
-        //
-        // ПРОБЛЕМА (RIVER): бот давал сигнал на шумной монете с conf=73%.
-        // На ALT с ATR/price > 2%, 73% confidence вообще не означает "высокое".
-        // Noise score > 3 = хаотичные хвосты → нужно 78%+ чтобы пробить фильтр.
-        //
-        // Правило:
-        //   LOW_VOL   (BTC/ETH-class): floor 66%
-        //   MEDIUM_VOL:                floor 68%
-        //   HIGH_VOL (>1.5% ATR):     floor 74%
-        //   EXTREME_VOL (>3.5% ATR):  floor 82% (почти никогда не проходит — правильно)
-        //   + noiseScore > 3.0:        +6% к порогу
-        //   + noiseScore > 4.0:        блок полностью
-        // atrV already declared above (reused from exhaustion guard)
-        double atrVPct     = atrV / price;
-        double noiseScoreV = getNoiseScore(symbol);
-
-        // EXTREME noise block: хаотичная монета — EARLY_TICK невозможен
-        if (noiseScoreV > 4.0 && atrVPct > 0.015) {
-            blockedEarlyConf.incrementAndGet();
-            return null;
-        }
-
-        // Dynamic confidence floor per volatility bucket
-        double etConfFloor = switch (etCat) {
-            case TOP  -> 66.0; // BTC/ETH — чистый сигнал, низкий порог
-            case ALT  -> atrVPct > 0.035 ? 82.0
-                    : atrVPct > 0.015 ? 74.0
-                      : atrVPct > 0.008 ? 70.0 : 67.0;
-            case MEME -> atrVPct > 0.035 ? 85.0 : 78.0;
-        };
-        // Noise penalty
-        if (noiseScoreV > 3.0) etConfFloor += 6.0;
-        else if (noiseScoreV > 2.5) etConfFloor += 3.0;
-
-        // Velocity-based confidence (kept from before)
-        double velMultiplier = switch (etCat) {
-            case TOP  -> 6000;
-            case ALT  -> 3500;
-            case MEME -> 2500;
-        };
-        double conf = etConfFloor
-                + Math.min(8.0, vel * velMultiplier)
-                + Math.min(5.0, Math.abs(vda) * 15)
-                + (((up && vda > 0.15) || (!up && vda < -0.15)) ? 3.0 : 0.0);
-        conf = Math.min(87.0, conf);
-
-        // Final gate: if conf < dynamic floor, drop signal
-        if (conf < etConfFloor) {
-            blockedEarlyConf.incrementAndGet();
-            return null;
-        }
-
-        // EARLY_TICK stop uses VolatilityBucket minimum ATR mult.
-        // БЫЛО: atrV * 1.4 — слишком близко для HIGH/EXTREME vol монет.
-        // СТАЛО: atrV * bucket.minAtrMult — гарантирует уважение к шуму монеты.
-        com.bot.DecisionEngineMerged.VolatilityBucket etVolBucket =
-                com.bot.DecisionEngineMerged.classifyVolatility(atrVPct);
-        double etStopMult = etVolBucket.minAtrMult;
-        double etTpMult   = etStopMult * (etVolBucket == com.bot.DecisionEngineMerged.VolatilityBucket.EXTREME ? 1.8
-                : etVolBucket == com.bot.DecisionEngineMerged.VolatilityBucket.HIGH   ? 2.2 : 2.8);
-
-        // [v64] Build a REAL forecast for this EARLY_TICK so Dispatcher can read fcConf > 0.
-        // The 7-arg TradeIdea ctor silently set forecast=null. This was invisible but lethal:
-        // 100% of EARLY_TICK signals were blocked because Dispatcher required either
-        // clusters>=3 (impossible for EARLY_TICK flags) OR fcConf>=0.50 (null → 0.00).
-        // Now we call ForecastEngine directly on cached candles. If anything fails
-        // (insufficient data, races), we fall back to the original null-forecast ctor,
-        // and Dispatcher's probability-solo-pass path will still let strong signals through.
-        com.bot.TradingCore.ForecastEngine.ForecastResult etForecast = null;
-        try {
-            List<com.bot.TradingCore.Candle> etC15 = getPrimaryTfCandles(symbol);
-            List<com.bot.TradingCore.Candle> etC5  = getM5FromWsOrRest(symbol, 100);
-            List<com.bot.TradingCore.Candle> etC1h = getCached(symbol, HTF_FAST, 100);
-            // [v86.91] 4h: HTF=1d here. Floors aligned to the main history-gate (primary 100,
-            // HTF 40 on 4h) so EARLY_TICK is never STRICTER than the path it shadows — but the
-            // EARLY_TICK forecast tolerates fewer bars, so keep it at/below the main gate.
-            int etC15MinBars = "15m".equals(PRIMARY_TF) ? 100 : "4h".equals(PRIMARY_TF) ? 60 : 60;
-            int etC1hMinBars = "15m".equals(PRIMARY_TF) ? 50  : "4h".equals(PRIMARY_TF) ? 40 : 30;
-            if (etC15 != null && etC15.size() >= etC15MinBars && etC1h != null && etC1h.size() >= etC1hMinBars) {
-                double etDelta = getNormalizedDelta(symbol);
-                etForecast = forecastEngineDirect.forecast(etC5, etC15, etC1h, etDelta);
-            }
-        } catch (Throwable ignored) { /* fall through — null forecast is acceptable */ }
-
-        boolean isLong = up;
-        double riskDist = atrV * etStopMult;
-        double entry = price;
-        double stop  = isLong ? price - riskDist : price + riskDist;
-        double take  = isLong ? price + atrV * etTpMult : price - atrV * etTpMult;
-        List<String> flags = new java.util.ArrayList<>(java.util.List.of(
-                "EARLY_TICK", up ? "UP" : "DN",
-                String.format("vel=%.2e", vel),
-                String.format("vda=%+.2f", vda),
-                "stk=" + streak,
-                "vBkt=" + etVolBucket.label));
-
-        // Use 14-arg TradeIdea ctor to attach forecast + category + htfBias.
-        return new com.bot.DecisionEngineMerged.TradeIdea(
-                symbol,
-                isLong ? com.bot.TradingCore.Side.LONG : com.bot.TradingCore.Side.SHORT,
-                entry, stop, take,
-                /* rr          */ 2.0,
-                /* probability */ conf,
-                flags,
-                /* fundingRate  */ 0.0,
-                /* fundingDelta */ 0.0,
-                /* oiChange     */ 0.0,
-                /* htfBias      */ "NONE",
-                etCat,
-                etForecast);
-    }
-
-    private boolean filterEarlySignal(com.bot.DecisionEngineMerged.TradeIdea sig) {
-        boolean isLong = sig.side == com.bot.TradingCore.Side.LONG;
-        double rs = relStrengthHistory.getOrDefault(sig.symbol, new java.util.concurrent.ConcurrentLinkedDeque<>())
-                .stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
-        double gicWeight = gic.getFilterWeight(sig.symbol, isLong, rs, detectSector(sig.symbol));
-        // Tiered GIC threshold — high-confidence ideas only need weak macro alignment,
-        // marginal ideas need stronger macro tailwind.
-        double minEarlyGicWeight =
-                sig.probability >= 78.0 ? 0.40 :
-                        sig.probability >= 70.0 ? 0.48 : 0.55;
-        if (gicWeight < minEarlyGicWeight) return false;
-        if (!isc.allowSignal(sig)) return false;
-        // Probability gating is owned by the dispatcher (effectiveMinConfidence is
-        // applied uniformly there). No duplicate check here.
-        return true;
-    }
 
     /**
      * EARLY_TICK buffer flush — drains earlyTickBuffer atomically, sorts by
@@ -3588,320 +2421,10 @@ public final class SignalSender {
     //  Runs a full processPair() in the background fetchPool.
     //  Result: if valid signal found → sent to Telegram immediately.
     //  Reduces worst-case detection latency from 60s → ≤5s.
-    private void maybeHotRescan(String pair, double price) {
-        // [v62] FIRST: cheap string-level filter. Non-ASCII symbols (币安人生USDT),
-        // known garbage, and soft-blocked ultra-volatile pairs are rejected BEFORE
-        // any compute. Previously these triggered [HOT] logs and processPair
-        // compute only to be discarded downstream.
-        if (isBlocklisted(pair)) return;
-        Long softUntil = hotSoftBlocklist.get(pair);
-        if (softUntil != null) {
-            if (System.currentTimeMillis() < softUntil) return;
-            hotSoftBlocklist.remove(pair);
-            hotSlFailures.remove(pair);
-        }
 
-        // Cooldown: don't rescan same pair more often than HOT_PAIR_COOLDOWN_MS
-        Long lastRescan = hotPairLastRescan.get(pair);
-        long now = System.currentTimeMillis();
-        if (lastRescan != null && now - lastRescan < HOT_PAIR_COOLDOWN_MS) return;
-
-        // Max concurrent rescans: protect fetchPool
-        if (hotPairActiveCount.get() >= HOT_PAIR_MAX_CONCURRENT) return;
-
-        // Measure 30-tick price move
-        Deque<Double> dq = tickPriceDeque.get(pair);
-        if (dq == null || dq.size() < 30) return;
-
-        List<Double> ticks = new ArrayList<>(dq);
-        int sz = ticks.size();
-        double priceBase = ticks.get(Math.max(0, sz - 31));
-        if (priceBase <= 0) return;
-        double movePct = (price - priceBase) / priceBase;
-
-        com.bot.DecisionEngineMerged.CoinCategory cat = categorizePair(pair);
-        double threshold = switch (cat) {
-            case TOP  -> HOT_PAIR_TOP_PCT;
-            case ALT  -> HOT_PAIR_ALT_PCT;
-            case MEME -> HOT_PAIR_MEME_PCT;
-        };
-
-        if (Math.abs(movePct) < threshold) return;
-
-        // [v62] Volume gate at HOT level too (was only in EARLY_TICK path).
-        // SPKUSDT/UBUSDT type listings trigger HOT but have ~$2M daily volume —
-        // untradeable even if a signal would form.
-        Double vol24h = volume24hUSD.get(pair);
-        if (vol24h != null) {
-            double minVol = switch (cat) {
-                case TOP  -> MIN_VOL_TOP_USD;
-                case ALT  -> MIN_VOL_ALT_USD;
-                case MEME -> MIN_VOL_MEME_USD;
-            };
-            if (vol24h < minVol) return;
-        }
-
-        if (GARBAGE_COIN_BLOCKLIST.contains(pair)) return;
-        if (isc.isHardBlacklisted(pair)) return;
-
-        // Mark rescan to prevent duplicate triggers during this move
-        hotPairLastRescan.put(pair, now);
-        hotPairActiveCount.incrementAndGet();
-        hotPairTotalTriggers.incrementAndGet();
-
-        String direction = movePct > 0 ? "UP" : "DOWN";
-        // [FIX] Throttle [HOT] console output: same pair at most once per 5 min.
-        // The old code printed every trigger — on a volatile day this is 200+ lines/hour
-        // per pair, making Railway logs unreadable and masking real errors.
-        // Total trigger count is still tracked via hotPairTotalTriggers.
-        System.out.printf("[HOT] %s %s %.3f%% in 30 ticks → rescan triggered%n",
-                pair, direction, movePct * 100);
-
-        // Submit to fetchPool (same pool used by normal cycle)
-        fetchPool.submit(() -> {
-            try {
-                com.bot.DecisionEngineMerged.TradeIdea idea = processPair(pair);
-                if (idea != null) {
-                    // Respect ISC availability check
-                    if (!isc.isSymbolAvailable(idea.symbol)) return;
-
-                    // R:R check — синхронизирован с BotMain/processPair gate (≥2.00)
-                    double rrRisk = Math.abs(idea.stop  - idea.price);
-                    double rrTp2  = Math.abs(idea.tp2   - idea.price);
-                    double rr     = rrRisk > 1e-9 ? rrTp2 / rrRisk : 0;
-                    if (rr < 2.00) return;
-
-                    // Flag the signal as hot-rescan triggered
-                    List<String> hotFlags = new ArrayList<>(idea.flags);
-                    hotFlags.add("HOT_RESCAN_" + direction);
-                    idea = rebuildIdea(idea, idea.probability, hotFlags);
-
-                    // v61: route through central Dispatcher (cold-start gate, dedup, hourly cap)
-                    com.bot.BotMain.Dispatcher disp = com.bot.BotMain.Dispatcher.getInstance();
-                    if (disp == null) return;
-                    com.bot.BotMain.Dispatcher.Result res = disp.dispatch(idea, "HOT_RESCAN");
-                    if (res.dispatched) {
-                        com.bot.DecisionEngineMerged.CoinCategory hotCat = categorizePair(pair);
-                        String hotSector = detectSector(pair);
-                        registerApprovedSignalNoTrack(idea, pair, hotCat, hotSector, now);
-                        System.out.printf("[HOT] %s signal sent: %s %.0f%%%n",
-                                pair, idea.side, idea.probability);
-                    } else {
-                        System.out.printf("[HOT-BLOCK] %s: %s%n", pair, res.reason);
-                    }
-                }
-            } catch (Exception ex) {
-                LOG.warning("[HOT] Error rescanning " + pair + ": " + ex.getMessage());
-            } finally {
-                hotPairActiveCount.decrementAndGet();
-            }
-        });
-    }
-
-    private void flushEarlyTickBuffer() {
-        if (earlyTickBuffer.isEmpty()) return;
-
-        // After WS reconnect, velocity data is stale — suppress dispatch.
-        // Prevents "5 signals in 3 minutes" flood that happens on reconnect.
-        if (System.currentTimeMillis() - wsLastReconnectMs < WS_WARMUP_MS) {
-            earlyTickBuffer.clear(); // Discard stale pre-reconnect candidates
-            return;
-        }
-
-        // Drain atomically — swap out the entire map contents
-        List<com.bot.DecisionEngineMerged.TradeIdea> candidates = new ArrayList<>();
-        for (String pair : new ArrayList<>(earlyTickBuffer.keySet())) {
-            com.bot.DecisionEngineMerged.TradeIdea idea = earlyTickBuffer.remove(pair);
-            if (idea != null) candidates.add(idea);
-        }
-        if (candidates.isEmpty()) return;
-
-        // Drop hard-stale candidates (>90s old). These fired on price
-        // that is no longer current; acting on them = chasing the move.
-        int droppedStale = 0;
-        Iterator<com.bot.DecisionEngineMerged.TradeIdea> it = candidates.iterator();
-        while (it.hasNext()) {
-            com.bot.DecisionEngineMerged.TradeIdea c = it.next();
-            if (c.ageMs() > EARLY_STALE_DROP_MS) {
-                it.remove();
-                droppedStale++;
-            }
-        }
-        if (droppedStale > 0) {
-            LOG.info("[EARLY_TICK] Dropped " + droppedStale + " stale candidate(s) (>"
-                    + (EARLY_STALE_DROP_MS / 1000) + "s old)");
-        }
-        if (candidates.isEmpty()) return;
-
-        // Sort by AGE-ADJUSTED probability — older candidates get decay penalty.
-        // Fresh signal with prob=70 beats 5s-old signal with prob=72.
-        // effectiveProb = probability * (1.0 - age/decay_horizon), clamped to [0.3, 1.0] multiplier.
-        candidates.sort(Comparator.comparingDouble(
-                (com.bot.DecisionEngineMerged.TradeIdea i) -> {
-                    double decayMul = Math.max(0.30, i.ageDecay(EARLY_STALE_DECAY_MS));
-                    return i.probability * decayMul;
-                }).reversed());
-
-        // Cap to top-N best signals per flush
-        if (candidates.size() > MAX_EARLY_PER_FLUSH) {
-            candidates = new ArrayList<>(candidates.subList(0, MAX_EARLY_PER_FLUSH));
-        }
-
-        // [v17.0 §4] Apply REDUCED_RISK flag from DrawdownManager
-        String rrFlag = isc.getReducedRiskFlag();
-        double rrMult = isc.getReducedRiskMultiplier();
-
-        for (com.bot.DecisionEngineMerged.TradeIdea et : candidates) {
-            // Re-check ISC (state may have changed since buffering)
-            if (!isc.isSymbolAvailable(et.symbol)) continue;
-
-            // EARLY_TICK hourly rate limit — max 3 per pair per hour
-            if (earlyTickHourlyLimitReached(et.symbol)) continue;
-
-            // VOLUME FILTER for EARLY_TICK — blocks trash coins.
-            // Problem: RIVERUSDT, SIRENUSDT, VVVUSDT pass EARLY_TICK without
-            // any liquidity check. Their $2M daily volume = untradeable.
-            // Fix: same MIN_VOL check as processPair.
-            Double etVol = volume24hUSD.get(et.symbol);
-            if (etVol != null) {
-                com.bot.DecisionEngineMerged.CoinCategory etCatCheck = categorizePair(et.symbol);
-                double minVol = switch (etCatCheck) {
-                    case TOP  -> MIN_VOL_TOP_USD;
-                    case ALT  -> MIN_VOL_ALT_USD;
-                    case MEME -> MIN_VOL_MEME_USD;
-                };
-                if (etVol < minVol) continue; // Skip illiquid pair
-            }
-
-            // [v34.0 FIX] Categorize BEFORE using cat
-            com.bot.DecisionEngineMerged.CoinCategory cat =
-                    et.category != null ? et.category : categorizePair(et.symbol);
-            String sector = detectSector(et.symbol);
-
-            // [v76 FIX] EARLY_TICK position sizing — was hardcoded $20 placeholder.
-            //
-            // Old behavior: EARLY_TICK signals built via generateEarlyTickSignal() did
-            // NOT carry a SIZE= flag. Trader saw the entry/SL/TP but no recommended
-            // size. The only place size was attached was the REDUCED_RISK rebuild
-            // branch below — and even there, baseSize defaulted to literal $20 if
-            // no prior SIZE= flag existed (which is always the case for EARLY_TICK).
-            // Result: trader either guessed size or used $20 regardless of balance.
-            //
-            // Fix: compute the real risk-based size via getPositionSizeUsdt() — same
-            // function that processPair uses (line ~1516). This applies all guards:
-            // riskPct by category, balance floors, EARLY_TICK ×0.85 multiplier,
-            // session weight, ISC drawdown multiplier (survival/cautious), correlation
-            // size reduction. Then the optional REDUCED_RISK rrMult is layered on top.
-            double etPosSize = getPositionSizeUsdt(et, cat);
-            if (isc.isSurvivalMode()) {
-                etPosSize *= 0.25;
-            } else if (isc.isCautiousMode()) {
-                etPosSize *= 0.5;
-            }
-            // Correlation size cut — same logic as processPair.
-            double etCorrMult = correlationGuard.getCorrelationSizeMultiplier(
-                    et.symbol, et.side, cat);
-            etPosSize *= etCorrMult;
-
-            // Apply REDUCED_RISK flag (drawdown mode) on top, if active.
-            com.bot.DecisionEngineMerged.TradeIdea finalEt;
-            {
-                List<String> nf = new ArrayList<>(et.flags);
-                nf.removeIf(f -> f.startsWith("SIZE="));
-                double finalSize = rrFlag.isEmpty() ? etPosSize : etPosSize * rrMult;
-                String sizeSuffix = isc.isSurvivalMode() ? " 🆘SURVIVAL"
-                        : isc.isCautiousMode() ? " ⚠️CAUTIOUS" : "";
-                if (!rrFlag.isEmpty()) sizeSuffix += " " + rrFlag;
-                nf.add(String.format("SIZE=%.1f$%s", finalSize, sizeSuffix));
-                // [v76] THIN_LIQ warning — flag low-volume pairs so trader knows
-                // the displayed entry/SL may slip 0.05–0.20% on real fill.
-                Double etVolWarn = volume24hUSD.get(et.symbol);
-                if (etVolWarn != null && etVolWarn < 5_000_000.0) {
-                    nf.add("THIN_LIQ");
-                }
-                finalEt = rebuildIdea(et, et.probability, nf);
-            }
-
-            // [FIX] Block non-ASCII symbols — listing pumps with Chinese/special names.
-            // These bypass selectPairsForScan() when they spike into top-N by volume.
-            // The same check exists in generate() but EARLY_TICK path skips generate().
-            if (isBlocklisted(et.symbol)) {
-                System.out.printf("[EARLY_TICK-BLOCK] %s: garbage/non-ASCII symbol%n", et.symbol);
-                continue;
-            }
-
-            // Same MAX SL% check as processPair() — closes the EARLY_TICK backdoor.
-            // Without this, EARLY_TICK signals bypassed the 3-5% SL cap entirely.
-            // This is why ARIAUSDT (SL=18%) and LABUSDT (SL=11%) reached Telegram.
-            double etSlPct = Math.abs(et.price - et.stop) / et.price;
-            double etMaxSlPct = getMaxSlPct();
-            if (etSlPct > etMaxSlPct) {
-                // [v62 FIX] Only trigger soft-block ONCE per pair. Previously each
-                // flush-cycle re-ran the counter and spam-logged "[SOFT-BLOCK] ..."
-                // repeatedly for the same pair. Now we check if it's already banned.
-                boolean alreadySoftBlocked =
-                        hotSoftBlocklist.containsKey(et.symbol)
-                                && System.currentTimeMillis() < hotSoftBlocklist.get(et.symbol);
-                if (!alreadySoftBlocked) {
-                    int failures = hotSlFailures.merge(et.symbol, 1, Integer::sum);
-                    if (failures >= 3) {
-                        hotSoftBlocklist.put(et.symbol,
-                                System.currentTimeMillis() + HOT_SOFT_BLOCK_MS);
-                        hotSlFailures.remove(et.symbol);
-                        // Purge remaining buffered candidates for this pair
-                        earlyTickBuffer.remove(et.symbol);
-                        System.out.printf("[SOFT-BLOCK] %s: 3× SL>max in a row, suspended 2h%n",
-                                et.symbol);
-                    }
-                    System.out.printf("[EARLY-SL-GATE] %s BLOCKED: SL=%.2f%% > max=%.2f%%%n",
-                            et.symbol, etSlPct * 100, etMaxSlPct * 100);
-                }
-                continue;
-            }
-
-            // v61: route through central Dispatcher (cold-start gate, dedup, hourly cap)
-            com.bot.BotMain.Dispatcher disp = com.bot.BotMain.Dispatcher.getInstance();
-            if (disp == null) {
-                // Safety: dispatcher not initialized (should never happen after main()).
-                continue;
-            }
-            com.bot.BotMain.Dispatcher.Result res = disp.dispatch(finalEt, "EARLY_TICK");
-            if (res.dispatched) {
-                earlySignals.incrementAndGet();
-                recordEarlyTickSent(finalEt.symbol);
-                registerApprovedSignalNoTrack(finalEt, finalEt.symbol, cat, sector,
-                        System.currentTimeMillis());
-            } else {
-                System.out.printf("[EARLY_TICK-BLOCK] %s %s: %s%n",
-                        finalEt.symbol, finalEt.side, res.reason);
-            }
-        }
-    }
 
     /** v61: register w/o tracking (tracking happens inside Dispatcher.dispatch). */
-    private void registerApprovedSignalNoTrack(com.bot.DecisionEngineMerged.TradeIdea idea,
-                                               String pair,
-                                               com.bot.DecisionEngineMerged.CoinCategory cat,
-                                               String sector,
-                                               long approvedAtMs) {
-        isc.registerSignal(idea);
-        decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, approvedAtMs);
-        correlationGuard.register(pair, idea.side, cat, sector);
-    }
 
-    private void registerApprovedSignal(com.bot.DecisionEngineMerged.TradeIdea idea,
-                                        String pair,
-                                        com.bot.DecisionEngineMerged.CoinCategory cat,
-                                        String sector,
-                                        long approvedAtMs,
-                                        boolean trackLifecycle) {
-        isc.registerSignal(idea);
-        decisionEngine.confirmSignal(idea.symbol, idea.side, idea.price, approvedAtMs);
-        correlationGuard.register(pair, idea.side, cat, sector);
-        if (trackLifecycle) {
-            com.bot.BotMain.trackSignal(idea);
-        }
-    }
 
     //  FUNDING + OI
 
@@ -5102,7 +3625,6 @@ public final class SignalSender {
         return volume24hUSD.entrySet().stream()
                 .filter(e -> e.getValue() >= MIN_VOL_ALT_USD)
                 .filter(e -> !isBlocklisted(e.getKey()))
-                .filter(e -> !isc.isHardBlacklisted(e.getKey()))
                 .filter(e -> passesTradeTier(e.getKey()))   // [v86.36] liquidity-tier filter
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .limit(n)
@@ -5132,7 +3654,7 @@ public final class SignalSender {
      * E.g. "📭 No signals 90 min (CD=14 pairs locked)" — clearly normal, not an error.
      */
     public int getCooldownedSymbolCount() {
-        return isc.getCooldownedSymbolCount();
+        return 0;
     }
     /** [MODULE 2 v33] Returns OFV score for a pair: >0 bullish flow, <0 bearish. 0 if no data. */
     public double getOfvScore(String pair) {
@@ -5169,10 +3691,6 @@ public final class SignalSender {
     }
 
     public com.bot.DecisionEngineMerged getDecisionEngine() { return decisionEngine; }
-    public com.bot.SignalOptimizer getOptimizer()           { return optimizer; }
-    public com.bot.InstitutionalSignalCore getSignalCore()  { return isc; }
-    public com.bot.PumpHunter getPumpHunter()               { return pumpHunter; }
-    public com.bot.GlobalImpulseController getGIC()         { return gic; }
     public Map<String, Deque<Double>> getTickDeque()        { return tickPriceDeque; }
 
     /**
