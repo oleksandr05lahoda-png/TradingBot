@@ -218,7 +218,7 @@ public final class BotMain {
     // boot-логе и заголовке сводки бектеста, ломая сравнение сводок между версиями
     // (сводка прямо говорит «цифра — для сравнения версий»). Поднимать при каждом
     // versioned-коммите. БЕЗ символа '%' — строка попадает в format-шаблон.
-    static final String BOT_VERSION = "v88.1";   // package-private so SignalSender can show the live version in Telegram
+    static final String BOT_VERSION = "v88.2.2";   // package-private so SignalSender can show the live version in Telegram
 
     static final class ForecastRecord {
         final String symbol;
@@ -561,14 +561,16 @@ public final class BotMain {
                 try { telegram.sendMessageAsync(msg); } catch (Throwable ignored) {}
             });
             if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady() && !LIVE_TRADING_ARMED) {
-                // [v86.35] Auto-trade configured but DISARMED — experiment/validation mode.
-                LOG.warning("[BOOT] LIVE TRADING DISARMED (LIVE_TRADING_ARMED=0) — experiment mode: "
-                        + "signals + verifier run, NO real trades. Arm with LIVE_TRADING_ARMED=1 when proven.");
+                // [v88.2.2] LIVE_TRADING_ARMED gates only the (deleted) candle path — the
+                // SupabaseSignalBridge has its own gates (BRIDGE_ALLOW_REAL et al). The old
+                // "торговля ВЫКЛЮЧЕНА" TG banner was misleading while the bridge trades real.
+                LOG.info("[BOOT] Legacy candle auto-trade path disarmed (LIVE_TRADING_ARMED=0) — "
+                        + "irrelevant since v88.2: execution goes through SupabaseSignalBridge.");
                 telegram.sendMessageAsync(
-                        "🛡 *Живая торговля ВЫКЛЮЧЕНА* (режим эксперимента)\n" +
-                                "Бот анализирует рынок, шлёт сигналы и копит Live WR в верификаторе — "
-                                + "но РЕАЛЬНЫХ сделок НЕ открывает. Деньги не рискуют.\n" +
-                                "_Включим, когда докажем edge: `LIVE_TRADING_ARMED=1`._");
+                        "🤖 *Бот v88.2.2 запущен* (исполнитель)\n" +
+                                "Сделки открываются ТОЛЬКО из очереди ордеров (Supabase → мост → Binance"
+                                + (SupabaseSignalBridge.isEnabled() ? ", мост ВКЛЮЧЁН" : ", мост выключен") + ").\n" +
+                                "_Стратегии пишут в очередь после прохождения своих гейтов._");
             } else if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady()) {
                 LOG.info("[BOOT] Auto-trade ENABLED. Mode: "
                         + (ex.isTestnet() ? "TESTNET" : "REAL/LIVE")
