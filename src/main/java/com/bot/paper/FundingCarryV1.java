@@ -72,7 +72,8 @@ public final class FundingCarryV1 implements CarryHypothesis {
             boolean crossedUp = last.rate > ENTRY_FUNDING && prev.rate <= ENTRY_FUNDING;
             if (!crossedInThisBar || !crossedUp) continue;
 
-            out.add(new CarryPosition(symbol, pb.closeMs, EXIT_BASIS_BP, EXIT_FUNDING, 1.0,
+            out.add(new CarryPosition(symbol, pb.closeMs, EXIT_BASIS_BP, EXIT_FUNDING,
+                    CarryPosition.FundingExit.AT_OR_BELOW, 1.0,
                     String.format("funding %.5f crossed %.5f at %d", last.rate, ENTRY_FUNDING, last.timeMs)));
         }
         return out;

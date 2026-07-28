@@ -70,7 +70,7 @@ class EntryTimingInvariantTest {
         for (int signalBar = 1; signalBar <= 6; signalBar++) {
             long signalClose = perp.get(signalBar).closeMs;
             CarryPosition p = new CarryPosition("BTCUSDT", signalClose,
-                    Double.NaN, Double.NaN, 1.0, "t");
+                    Double.NaN, Double.NaN, null, 1.0, "t");
             CarryPaperExecutor.Fill f =
                     new CarryPaperExecutor().simulate(p, perp, spot, List.of(), 3);
             assertTrue(f != null, "expected a fill for signal bar " + signalBar);

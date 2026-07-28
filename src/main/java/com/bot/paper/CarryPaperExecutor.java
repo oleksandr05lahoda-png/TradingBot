@@ -131,7 +131,7 @@ public final class CarryPaperExecutor {
             if (!Double.isNaN(pos.exitFundingBelow) && funding != null) {
                 for (PaperExecutor.FundingPoint fp : funding) {
                     if (fp.timeMs > pb.openMs && fp.timeMs <= pb.closeMs
-                            && fp.rate <= pos.exitFundingBelow) {
+                            && pos.fundingExitTriggered(fp.rate)) {
                         return build(pos, perpEntryBar, perpEntryPx, spotEntryPx, basisEntryBp,
                                 pb, pb.close, sb.close, ExitReason.funding_flipped, slip, funding);
                     }
