@@ -174,14 +174,21 @@ public final class CarryPaperExecutor {
         // negative cost. The spot leg has no funding. Signed to match paper_signals.funding, where
         // positive always means "it cost us" — the same convention PaperExecutor uses.
         //
-        // Window is half-open, (entryOpen, exitClose], identical to PaperExecutor and to the flip
-        // detection above: a settlement exactly on the entry bar's open accrued before we held the
-        // position. The accrual used to be inclusive at the start while the flip check was not,
-        // so a settlement at that instant was charged but could never end the trade.
+        // Window is half-open, (entryOpen, exitInstant]. The start is exclusive because a
+        // settlement exactly on the entry bar's open accrued before we held the position.
+        //
+        // THE END IS THE INSTANT THE EXIT PRICE COMES FROM, not simply the exit bar's close. A
+        // time stop is priced at that bar's OPEN, so the window has to stop there too; running it
+        // to the close credited up to four more hours of funding than the position was held for.
+        // Measured before the fix: 22 of 84 time_stop episodes carried an extra settlement, +0.0057%
+        // on that group. Small, and it flattered the result — which is why it goes regardless of size.
+        // The other two exits are priced at the bar's CLOSE, so for them the close IS the instant.
+        long exitInstantMs = reason == ExitReason.time_stop ? exitBar.openMs : exitBar.closeMs;
+
         double fundingCost = 0.0;
         if (funding != null) {
             for (PaperExecutor.FundingPoint fp : funding) {
-                if (fp.timeMs > entryBar.openMs && fp.timeMs <= exitBar.closeMs) {
+                if (fp.timeMs > entryBar.openMs && fp.timeMs <= exitInstantMs) {
                     fundingCost -= fp.rate;
                 }
             }

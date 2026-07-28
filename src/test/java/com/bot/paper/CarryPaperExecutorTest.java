@@ -76,6 +76,29 @@ class CarryPaperExecutorTest {
     }
 
     @Test
+    @DisplayName("a time stop does not collect funding settled after its OPEN price")
+    void timeStopWindowEndsAtItsOwnPrice() {
+        List<Bar> perp = new ArrayList<>(), spot = new ArrayList<>();
+        flat(perp, spot, 20, 1000.0, 10.0);
+
+        // Entry bar opens at 1h, hold 5 bars => time stop on the bar opening at 6h, priced at its
+        // OPEN. A settlement at 6h30 falls inside that bar but AFTER the moment we are priced out,
+        // so the position was not held for it.
+        List<PaperExecutor.FundingPoint> funding = List.of(
+                new PaperExecutor.FundingPoint(3 * H, 0.0001),              // held: counts
+                new PaperExecutor.FundingPoint(6 * H + 1_800_000L, 0.0009)); // after exit: must not
+
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, Double.NaN, null, 1.0, "t");
+        CarryPaperExecutor.Fill f = exec.simulate(pos, perp, spot, funding, 5);
+
+        assertSame(CarryPaperExecutor.ExitReason.time_stop, f.exitReason);
+        assertEquals(6 * H, f.exitBarMs);
+        assertEquals(-0.0001, f.funding, EPS,
+                "only the settlement inside the holding period counts; funding cannot be earned "
+                        + "for time after the exit price was taken");
+    }
+
+    @Test
     @DisplayName("basis drift is signed so that a widening basis LOSES money")
     void basisDriftSign() {
         // Spot flat at 1000. Perp starts 20bp rich and ends 60bp rich: the short perp leg loses.

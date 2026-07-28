@@ -151,10 +151,17 @@ public final class PaperExecutor {
         // bar's open covers the interval BEFORE the position existed, so it is not ours. Binance
         // settles on 4h boundaries, so this is a real case rather than a corner one, and
         // CarryPaperExecutor uses the identical rule.
+        // The window ends at the instant the exit price comes from. A time stop is priced at the
+        // exit bar's OPEN, so it ends there; running it to the close would credit or charge funding
+        // for hours the position was not held (same defect fixed in CarryPaperExecutor).
+        //
+        // For a stop or target the level is touched somewhere INSIDE the bar and OHLC cannot say
+        // when, so the bar's close is used. That is an approximation, and it is the only place in
+        // either executor where the funding window is not exact — stated rather than hidden.
         double fundingCost = 0.0;
         if (funding != null) {
             long from = entryBar.openMs;
-            long to   = exitBar.closeMs;
+            long to   = reason == ExitReason.time_stop ? exitBar.openMs : exitBar.closeMs;
             for (FundingPoint fp : funding) {
                 if (fp.timeMs > from && fp.timeMs <= to) {
                     fundingCost += isLong ? fp.rate : -fp.rate;
