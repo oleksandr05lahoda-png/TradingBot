@@ -721,16 +721,14 @@ public final class BinanceTradeExecutor {
             }
 
             // 1. Initialize symbol settings (leverage + isolated)
-            // [v82.7 2026-06-01] DEMO FIX: on testnet/demo, SKIP per-symbol
-            // marginType/leverage POSTs entirely. demo-fapi returns -1109 on them
-            // and that poisons the session so the следующий MARKET order also
-            // gets -1109. User sets Isolated + leverage MANUALLY in demo UI, so
-            // these calls are redundant on demo. On REAL they run as before.
-            if (useTestnet) {
-                LOG.info("[Executor] testnet/demo — skip initSymbolMargin/Leverage for "
-                        + symbol + " (set manually in UI; avoids -1109)");
-                initializedSymbols.add(symbol);
-            }
+            // [project_state id=32c] The testnet/demo skip is gone. It pre-added the symbol to
+            // initializedSymbols so the block below never ran, and since the endpoint gate only
+            // permits opening on a demo host, that meant ISOLATED margin and the configured
+            // leverage were applied to NO position anywhere — while the class javadoc and the boot
+            // banner both advertised them. The v82.7 note said demo-fapi answers -1109 here and
+            // poisons the session; if that is still true the open below now FAILS with the real
+            // error body instead of proceeding with unknown margin and leverage, which is the
+            // outcome we want: settings that cannot be applied must stop the trade, not be skipped.
             if (!initializedSymbols.contains(symbol)) {
                 if (!initSymbolMargin(symbol)) {
                     // [C5 2026-05-08] Include real Binance error body so user can act on it
@@ -1597,23 +1595,18 @@ public final class BinanceTradeExecutor {
             LOG.warning("[Executor] marginType retry failed " + symbol + " " + lastInitErrorBody);
             return false;
         }
-        // [v82.1 2026-06-01] FIX -1109 "Invalid account" на marginType.
-        // ROOT: demo/PM/Multi-Assets аккаунт не даёт менять маржу per-symbol через
-        // классический /fapi/v1/marginType. Баланс при этом читается (ключи валидны).
-        // Раньше -1109 → abort трейда. Теперь: НЕ фатально — торгуем в текущем
-        // режиме маржи аккаунта (как делают prod-боты, не форсящие ISOLATED).
+        // -1109 "Invalid account": a demo / PM / Multi-Assets account will not set per-symbol
+        // margin through /fapi/v1/marginType (the balance still reads, so the keys are valid).
+        //
+        // [project_state id=32c] This aborts on EVERY endpoint now. The demo branch used to
+        // swallow it and trade at whatever margin mode the account happened to be in; since the
+        // gate only permits opening on a demo host, that meant ISOLATED was confirmed for no
+        // position the bot can actually open, while the sizing math assumes it. An unconfirmed
+        // setting stops the trade.
         if (body.contains("-1109")) {
-            if (!useTestnet) {
-                // [v86.27] On REAL do NOT swallow -1109: trading at an unconfirmed margin mode
-                // (account-default CROSS) while risk math assumes ISOLATED is unsafe → abort.
-                lastInitErrorBody = "HTTP " + code + ": " + body + " (real: marginType not confirmed — abort)";
-                LOG.severe("[Executor] marginType -1109 on REAL " + symbol + " — ABORT trade (cannot confirm ISOLATED)");
-                return false;
-            }
-            LOG.warning("[Executor] marginType -1109 для " + symbol
-                    + " — НЕ фатально, торгую в текущем режиме маржи аккаунта");
-            lastInitErrorBody = "";
-            return true;
+            lastInitErrorBody = "HTTP " + code + ": " + body + " (marginType not confirmed — abort)";
+            LOG.severe("[Executor] marginType -1109 on " + symbol + " — ABORT trade (cannot confirm ISOLATED)");
+            return false;
         }
         // [C5 2026-05-08] Save body so caller can surface real reason in Telegram.
         lastInitErrorBody = "HTTP " + code + ": " + body;
@@ -1637,20 +1630,15 @@ public final class BinanceTradeExecutor {
         if (resp.statusCode() == 200) { lastInitErrorBody = ""; return true; }
         // [C5 2026-05-08] Save body so caller can surface real reason in Telegram.
         String body = resp.body() == null ? "" : resp.body();
-        // [v82.1 2026-06-01] -1109 на leverage тоже НЕ фатально (см. marginType).
-        // Аккаунт в режиме где per-symbol leverage не ставится → торгуем с текущим.
+        // [project_state id=32c] -1109 aborts on EVERY endpoint, same as marginType above. The
+        // demo branch used to trade at the account's current leverage — often 20x — while the
+        // liquidation-distance guard computes from the local `leverage` field (5x by default).
+        // That is the exact drift the guard exists to catch, so it cannot be waved through.
         if (body.contains("-1109")) {
-            if (!useTestnet) {
-                // [v86.27] On REAL do NOT swallow -1109: trading at the account-default leverage
-                // (often 20x) while risk math assumes 5x is a liquidation risk → abort.
-                lastInitErrorBody = "HTTP " + resp.statusCode() + ": " + body + " (real: leverage not confirmed — abort)";
-                LOG.severe("[Executor] leverage -1109 on REAL " + symbol + " — ABORT trade (cannot confirm 5x)");
-                return false;
-            }
-            LOG.warning("[Executor] leverage -1109 для " + symbol
-                    + " — НЕ фатально, торгую с текущим плечом аккаунта");
-            lastInitErrorBody = "";
-            return true;
+            lastInitErrorBody = "HTTP " + resp.statusCode() + ": " + body + " (leverage not confirmed — abort)";
+            LOG.severe("[Executor] leverage -1109 on " + symbol + " — ABORT trade (cannot confirm "
+                    + leverage + "x)");
+            return false;
         }
         lastInitErrorBody = "HTTP " + resp.statusCode() + ": " + body;
         LOG.warning("[Executor] leverage " + symbol + " " + lastInitErrorBody);
