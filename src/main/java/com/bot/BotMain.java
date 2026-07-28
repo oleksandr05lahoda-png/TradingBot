@@ -19,12 +19,13 @@ import java.util.logging.*;
  *   присутствует в DecisionEngineMerged.java, секреты живут в env vars).
  *
  *   ИСПРАВЛЕНО:
- *     [I1] AMBIGUOUS outcomes теперь ЗАПИСЫВАЮТСЯ в калибратор с весом 0.5
- *          (раньше игнорировались → искусственно завышенный win-rate).
- *     [I2] TIME_STOP/FLAT outcomes теперь ЗАПИСЫВАЮТСЯ в калибратор как
- *          LOSS с весом 1.0 (раньше выпадали из статистики совсем).
- *     [I3] Все outcomes идут в append-only audit log с HMAC-SHA256.
- *          Запись через DecisionEngineMerged.getCalibrator().recordOutcome*().
+ *     [I1] [I2] [I3] УСТАРЕЛИ 2026-07-28 — project_state id=14. Все три пункта
+ *          описывали запись исходов в калибратор. Записи НЕТ: recordOutcome*()
+ *          не вызывается ниоткуда, BotMain.recordSignalOutcome — мёртвая точка
+ *          входа, data/calibrator.csv весит 102 байта. Загрузка CSV на старте,
+ *          автосохранение и показ счётчика исходов в Telegram удалены — врущая
+ *          приборная панель хуже отсутствующей. Учёт исходов переезжает в
+ *          paper-harness: предрегистрация + HMAC-цепочка (project_state id=17).
  *     [I4] maxAgeMs синхронизирован с ISC TIME_STOP_BARS = 90 мин (было 5h).
  *          Это устраняет несоответствие между live time-stop правилом и
  *          верификатором (ранее verifier ждал 5 часов после того, как ISC
@@ -42,11 +43,15 @@ import java.util.logging.*;
  *   ПРАВДА:
  *     ✔ AMBIGUOUS игнорировались — ИСПРАВЛЕНО [I1]
  *     ✔ TIME_STOP игнорировались — ИСПРАВЛЕНО [I2]
- *     ✔ Нет cryptographic proof — ИСПРАВЛЕНО [I3] (HMAC в калибраторе)
+ *     ✔ Нет cryptographic proof — НЕ исправлено. HMAC-цепочка в калибраторе
+ *       написана, но подписывать ей нечего: ни одного записанного исхода.
+ *       Требование перенесено в paper-harness (project_state id=17).
  *     ✔ Backtester / verifier мismatch — ИСПРАВЛЕНО [I4]
  *     ✔ Нет cross-exchange validation — ИСПРАВЛЕНО [I5] (опц.)
  *   ЛОЖЬ (аудит ИИ ошибался):
- *     ✘ "ProbabilityCalibrator не в коде" — он ЕСТЬ, DecisionEngineMerged.java:5048
+ *     ✘ "ProbabilityCalibrator не в коде" — класс ЕСТЬ в DecisionEngineMerged
+ *        (ссылка на строку 5048 устарела, файл теперь короче 2600 строк), но
+ *        исходов в нём ноль — см. [I1]-[I3] выше.
  *     ✘ "API ключи в коде" — все через requireEnv/System.getenv()
  *     ✘ "OBSERVATION_MODE не гарантирует ничего" — он напрямую проверяется
  *        в Dispatcher.dispatch перед каждой отправкой в Telegram
@@ -422,49 +427,13 @@ public final class BotMain {
         final com.bot.TelegramBotSender telegram = new com.bot.TelegramBotSender(TG_TOKEN, CHAT_ID);
         final com.bot.SignalSender sender         = new com.bot.SignalSender(telegram);
 
-        final String calibratorFile = System.getenv()
-                .getOrDefault("CALIBRATOR_FILE", "./data/calibrator.csv");
-
-        // [A1+ 2026-05-08] One-shot calibrator wipe via env. Use when:
-        //   1. Startup backtest poisoned the file (WR=32% baseline → blocks live).
-        //   2. Switching strategy and want to start clean.
-        // Procedure on Railway:
-        //   - Set RESET_CALIBRATOR_ON_BOOT=1 in env.
-        //   - Redeploy. On boot the .csv is moved to .bak (kept for forensic
-        //     review), in-memory state is cleared.
-        //   - REMOVE the env var (or set =0) immediately after this deploy
-        //     succeeds — otherwise EVERY restart wipes the calibrator and you
-        //     never accumulate live data.
-        if ("1".equals(System.getenv().getOrDefault("RESET_CALIBRATOR_ON_BOOT", "0"))) {
-            try {
-                java.io.File f = new java.io.File(calibratorFile);
-                if (f.exists()) {
-                    java.io.File bak = new java.io.File(calibratorFile + ".bak."
-                            + System.currentTimeMillis());
-                    if (f.renameTo(bak)) {
-                        LOG.warning("[Calibrator] RESET_CALIBRATOR_ON_BOOT=1 — "
-                                + "renamed " + calibratorFile + " → " + bak.getName());
-                    } else {
-                        // renameTo can fail across mount boundaries — try delete instead.
-                        if (f.delete()) {
-                            LOG.warning("[Calibrator] RESET_CALIBRATOR_ON_BOOT=1 — "
-                                    + "deleted " + calibratorFile + " (rename failed)");
-                        }
-                    }
-                }
-                com.bot.DecisionEngineMerged.getCalibrator().resetAll();
-                LOG.warning("[Calibrator] in-memory state cleared. "
-                        + "REMEMBER to unset RESET_CALIBRATOR_ON_BOOT after this deploy.");
-            } catch (Throwable t) {
-                LOG.warning("[Calibrator] reset-on-boot failed: " + t.getMessage());
-            }
-        }
-
-        try {
-            com.bot.DecisionEngineMerged.getCalibrator().loadFromFile(calibratorFile);
-        } catch (Throwable t) {
-            LOG.warning("[Calibrator] load failed: " + t.getMessage());
-        }
+        // [project_state id=14] Calibrator dashboard removed. Nothing has ever called
+        // recordOutcome*() — the write path was dead — so loading the CSV, auto-saving it
+        // and reporting its outcome count only dressed an empty file up as evidence of
+        // learning. Outcome accounting belongs to the paper-harness, which has
+        // pre-registration and an HMAC chain by construction (project_state id=17); running
+        // two accounting systems side by side would only let them drift apart.
+        // CALIBRATOR_FILE and RESET_CALIBRATOR_ON_BOOT are no longer read.
 
         com.bot.DecisionEngineMerged.USER_ZONE = ZONE;
 
@@ -509,17 +478,9 @@ public final class BotMain {
                 60, INTERVAL * 60L, TimeUnit.SECONDS);
 
         auxSched.scheduleAtFixedRate(
-                safe("CalibratorSave", () -> {
-                    com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFile);
-                    int cnt = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-                    LOG.info("[Calibrator] auto-saved, total outcomes: " + cnt);
-                }),
-                30, 30, TimeUnit.MINUTES);
-        auxSched.scheduleAtFixedRate(
                 safe("TimeSync", sender::syncServerTime),
                 5, 120, TimeUnit.MINUTES);
 
-        final String calibratorFileFinal = calibratorFile;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("═══ Shutdown. Cycles: " + totalCycles.get()
                     + " | Signals: " + totalSignals.get() + " ═══");
@@ -527,9 +488,6 @@ public final class BotMain {
             try { mainSched.awaitTermination(4, TimeUnit.SECONDS); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             mainSched.shutdownNow();
-            try {
-                com.bot.DecisionEngineMerged.getCalibrator().saveToFile(calibratorFileFinal);
-            } catch (Throwable ignored) {}
             telegram.flushAndShutdown(8000);
         }, "ShutdownHook"));
 
@@ -612,22 +570,6 @@ public final class BotMain {
             LOG.warning("[BOOT] Executor/Tracker init failed: " + t.getMessage());
         }
 
-        try {
-            int _calN = com.bot.DecisionEngineMerged.getCalibrator().totalOutcomeCount();
-            if (!OBSERVATION_MODE && _calN < 50) {
-                telegram.sendMessageAsync(String.format(
-                        "🚨 *ВНИМАНИЕ: LIVE режим без калибровки*\n"
-                                + "━━━━━━━━━━━━━━━━━━━━━\n"
-                                + "Калибратор: %d/50 исходов\n"
-                                + "Сигналы выходят с НЕкалиброванной вероятностью.\n"
-                                + "━━━━━━━━━━━━━━━━━━━━━\n"
-                                + "_Рекомендации:_\n"
-                                + "• Установи `OBSERVATION_MODE=1` в Railway env\n"
-                                + "• Либо торгуй размером ×0.25 от обычного\n"
-                                + "• Не больше 2 позиций в одну сторону одновременно",
-                        _calN));
-            }
-        } catch (Throwable ignored) {}
 
         // [v87.6] NEW-strategy backtest summary (breakout): replaces the disabled candle one. Honest —
         // per-year + survivorship caveat in the message; live green-light still requires the forward test.
