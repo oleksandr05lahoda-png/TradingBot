@@ -54,3 +54,7 @@ bin/
 
 ### Offline analysis scratch (data, not code) ###
 /analysis/
+### Local secrets — never commit ###
+local.env
+*.env
+!.env.example
