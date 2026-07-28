@@ -23,9 +23,13 @@ import org.json.JSONObject;
  *
  * Hard safety (defence in depth):
  *   - LONG-ONLY: rejects any row whose side != LONG (DB also enforces side='LONG').
- *   - TESTNET-LOCKED IN CODE: refuses to place ANY order unless BINANCE_USE_TESTNET=1.
- *     Real money is NOT reachable via env flags — arming real requires a deliberate code
- *     change + the queue-security hardening (service-role key, tight RLS) + sign-off.
+ *   - TESTNET-LOCKED IN CODE: refuses to place ANY order unless the executor reports the
+ *     testnet/demo endpoint AND BINANCE_USE_TESTNET was set explicitly (absence is a refusal,
+ *     never a default). Real money is NOT reachable via env flags: BRIDGE_ALLOW_REAL is still
+ *     read but grants nothing, and the endpoint is taken from BinanceTradeExecutor.isTestnet()
+ *     rather than re-read here, so the two can never disagree. Unlocking is a deliberate code
+ *     change gated on {@link #REAL_UNLOCK_REQUIREMENTS}, plus queue hardening (service-role key,
+ *     tight RLS) + sign-off.
  *   - DEFAULT-OFF: no-op unless SUPABASE_BRIDGE_ENABLED=1 (existing bot behaviour unchanged).
  *   - IDEMPOTENT: pending->sent is claimed by a conditional PostgREST PATCH (CAS) before
  *     execution; close_requested->close_sent likewise; a reconcile sweep adopts/fails stale
@@ -43,15 +47,45 @@ public final class SupabaseSignalBridge {
     private static final String  SUPABASE_KEY = firstNonBlank(
             System.getenv().get("BRIDGE_SUPABASE_KEY"), System.getenv().get("SUPABASE_KEY"));
     private static final boolean ENABLED      = "1".equals(System.getenv().getOrDefault("SUPABASE_BRIDGE_ENABLED", "0"));
-    private static final boolean USE_TESTNET  = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "0"));
+    /**
+     * Raw BINANCE_USE_TESTNET, deliberately left UNPARSED so that "absent" stays distinguishable
+     * from "explicitly 0". A missing variable must not select an endpoint by default — that is
+     * exactly how an unset Railway variable became live orders (project_state id=2).
+     */
+    private static final String  TESTNET_ENV  = System.getenv("BINANCE_USE_TESTNET");
+    private static final boolean TESTNET_SET  = TESTNET_ENV != null && !TESTNET_ENV.isBlank();
+    /** Read, but no longer grants anything — see {@link #REAL_UNLOCK_REQUIREMENTS}. Kept so the log can say it was ignored. */
     private static final boolean ALLOW_REAL   = "1".equals(System.getenv().getOrDefault("BRIDGE_ALLOW_REAL", "0"));
     private static final double  BAL_PER_LEG  = envDouble("BRIDGE_BALANCE_PER_LEG", 0.0);
     private static final int     MAX_OPEN     = (int) envDouble("BRIDGE_MAX_OPEN", 20);
     private static final int     MAX_PENDING_AGE_MIN = (int) envDouble("BRIDGE_MAX_PENDING_AGE_MIN", 15);
 
+    /**
+     * GREPPABLE UNLOCK CONTRACT — the real endpoint is locked in code, not behind an env flag.
+     * All of the following must hold, and this lock be lifted in the same deliberate commit,
+     * before real capital is reachable again:
+     *   1. paper-harness merged — Hypothesis / MarketSnapshot / PaperExecutor, entry at the OPEN of
+     *      the first bar strictly after the signal bar, 0.10% round-trip taker + funding in PnL;
+     *   2. isSleeveApproved() enforced fail-closed in this class against strategy_trials.passed_v2;
+     *   3. at least one sleeve with strategy_trials.passed_v2 = true AND lab_forward_status.forward_ok = true
+     *      (as of 2026-07-28: 63 trials with 0 passed, 23 forward rows with 0 ok — zero sleeves qualify);
+     *   4. operator sign-off recorded in public.project_state.
+     */
+    static final String REAL_UNLOCK_REQUIREMENTS =
+            "real endpoint is locked in code — see SupabaseSignalBridge.REAL_UNLOCK_REQUIREMENTS "
+          + "(paper-harness + isSleeveApproved + a sleeve with passed_v2 & forward_ok + operator sign-off)";
+
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     private final BinanceTradeExecutor executor = BinanceTradeExecutor.getInstance();
+    /**
+     * SINGLE SOURCE OF TRUTH for which endpoint we are on: taken from the executor that actually
+     * builds the URLs, never re-read from env here. Two independent reads of BINANCE_USE_TESTNET
+     * are precisely how this bridge could log "TESTNET(demo)" while the executor traded fapi.binance.com.
+     */
+    private final boolean useTestnet = executor.isTestnet();
     private volatile boolean bannerLogged = false;
+    /** Last gate refusal already logged — poll() runs on a timer, so log each distinct reason once. */
+    private volatile String lastGateLog = null;
 
     private static SupabaseSignalBridge instance;
     public static synchronized SupabaseSignalBridge getInstance() {
@@ -71,7 +105,7 @@ public final class SupabaseSignalBridge {
         if (!executionAllowed()) return;
         if (!bannerLogged) {
             bannerLogged = true;
-            LOG.warning("[Bridge] ARMED endpoint=" + (USE_TESTNET ? "TESTNET(demo)" : "*** REAL ***")
+            LOG.warning("[Bridge] ARMED endpoint=" + (useTestnet ? "TESTNET(demo)" : "*** REAL ***")
                     + " allowReal=" + ALLOW_REAL + " balPerLeg=$" + BAL_PER_LEG
                     + " maxOpen=" + MAX_OPEN + " maxPendingAgeMin=" + MAX_PENDING_AGE_MIN
                     + " key=" + (SUPABASE_KEY.isEmpty() ? "none" : "set"));
@@ -82,16 +116,36 @@ public final class SupabaseSignalBridge {
     }
 
     /**
-     * Endpoint gate. Testnet is always allowed. The REAL endpoint requires an explicit, deliberate
-     * opt-in: BRIDGE_ALLOW_REAL=1 (AND, not OR). Unset/null env => testnet=false + allowReal=false =>
-     * refused. Real money therefore needs THREE deliberate flags together:
-     *   BINANCE_USE_TESTNET=0  +  BRIDGE_ALLOW_REAL=1  +  SUPABASE_BRIDGE_ENABLED=1.
+     * Endpoint gate — FAIL-CLOSED, and no longer an env decision. Three checks, in order:
+     *   1. BINANCE_USE_TESTNET absent          -> refuse (absence must never pick an endpoint silently);
+     *   2. executor is on the REAL endpoint    -> refuse UNCONDITIONALLY (BRIDGE_ALLOW_REAL cannot override);
+     *   3. explicit testnet/demo               -> allow.
+     *
+     * There is no combination of environment variables that reaches real capital from here; lifting
+     * the lock is a code change gated on {@link #REAL_UNLOCK_REQUIREMENTS}.
      */
     private boolean executionAllowed() {
-        if (USE_TESTNET) return true;
-        if (ALLOW_REAL)  return true;
-        LOG.severe("[Bridge] BLOCKED: real endpoint (BINANCE_USE_TESTNET!=1) without BRIDGE_ALLOW_REAL=1 — refusing every order.");
-        return false;
+        if (ALLOW_REAL) {
+            gateLog("[Bridge] BRIDGE_ALLOW_REAL=1 IGNORED: " + REAL_UNLOCK_REQUIREMENTS);
+        }
+        if (!TESTNET_SET) {
+            gateLog("[Bridge] BLOCKED: BINANCE_USE_TESTNET is not set — refusing to trade rather than "
+                    + "silently choosing an endpoint.");
+            return false;
+        }
+        if (!useTestnet) {
+            gateLog("[Bridge] BLOCKED: executor is on the REAL endpoint (BINANCE_USE_TESTNET="
+                    + TESTNET_ENV.trim() + ") — " + REAL_UNLOCK_REQUIREMENTS);
+            return false;
+        }
+        return true;
+    }
+
+    /** poll() runs on a timer; log each distinct gate reason once so severe keeps its meaning. */
+    private void gateLog(String msg) {
+        if (msg.equals(lastGateLog)) return;
+        lastGateLog = msg;
+        LOG.severe(msg);
     }
 
     /**
@@ -101,7 +155,7 @@ public final class SupabaseSignalBridge {
      */
     private void reconcileSent() throws Exception {
         String cutoff = Instant.now().minusSeconds(120).toString();
-        JSONArray stuck = sbGet("/rest/v1/bot_orders?status=eq.sent&testnet=eq." + USE_TESTNET
+        JSONArray stuck = sbGet("/rest/v1/bot_orders?status=eq.sent&testnet=eq." + useTestnet
                 + "&sent_at=lt." + enc(cutoff) + "&order=sent_at.asc&limit=20");
         for (int i = 0; i < stuck.length(); i++) {
             JSONObject o = stuck.getJSONObject(i);
@@ -116,7 +170,7 @@ public final class SupabaseSignalBridge {
 
     private void drainOpens() throws Exception {
         int active = countActive();
-        JSONArray pend = sbGet("/rest/v1/bot_orders?status=eq.pending&testnet=eq." + USE_TESTNET
+        JSONArray pend = sbGet("/rest/v1/bot_orders?status=eq.pending&testnet=eq." + useTestnet
                 + "&order=created_at.asc&limit=20");
         for (int i = 0; i < pend.length(); i++) {
             JSONObject o = pend.getJSONObject(i);
@@ -167,7 +221,7 @@ public final class SupabaseSignalBridge {
     }
 
     private void drainCloses() throws Exception {
-        JSONArray cl = sbGet("/rest/v1/bot_orders?status=eq.close_requested&testnet=eq." + USE_TESTNET
+        JSONArray cl = sbGet("/rest/v1/bot_orders?status=eq.close_requested&testnet=eq." + useTestnet
                 + "&order=created_at.asc&limit=20");
         for (int i = 0; i < cl.length(); i++) {
             JSONObject o = cl.getJSONObject(i);
@@ -181,7 +235,7 @@ public final class SupabaseSignalBridge {
     }
 
     private int countActive() throws Exception {
-        JSONArray a = sbGet("/rest/v1/bot_orders?status=in.(sent,open)&testnet=eq." + USE_TESTNET + "&select=id&limit=200");
+        JSONArray a = sbGet("/rest/v1/bot_orders?status=in.(sent,open)&testnet=eq." + useTestnet + "&select=id&limit=200");
         return a.length();
     }
 
