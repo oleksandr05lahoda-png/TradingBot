@@ -255,6 +255,9 @@ public final class SupabaseSignalBridge {
     }
 
     private void drainOpens() throws Exception {
+        // [project_state id=32a] Account-mode normalisation is no longer a side effect of building
+        // the executor; the path that actually trades asks for it. One-shot inside the executor.
+        executor.prepareForTrading();
         int active = countActive();
         JSONArray pend = sbGet("/rest/v1/bot_orders?status=eq.pending&testnet=eq." + useTestnet
                 + "&order=created_at.asc&limit=20");

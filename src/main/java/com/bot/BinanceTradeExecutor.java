@@ -17,10 +17,10 @@ import java.util.logging.Logger;
 /**
  * BinanceTradeExecutor v83.3 — live order execution for Binance USD-M Futures.
  *
- * ┌─────────────────────────────────────────────────────────────────────┐
- * │  ВАЖНО: этот класс ничего не делает без явного вызова из BotMain.   │
- * │  Сам по себе он лежит "в спячке". Активация — на Этапе 3.           │
- * └─────────────────────────────────────────────────────────────────────┘
+ * Драйвер — SupabaseSignalBridge, не BotMain: мост держит getInstance() полем и вызывает
+ * openPositionWithSl/closePosition из своего цикла. Конструктор больше не мутирует аккаунт
+ * (см. prepareForTrading, project_state id=32a); до v88.2.x он POSTил positionSide/dual прямо
+ * при инициализации класса, хотя рамка здесь обещала "спячку до явного вызова из BotMain".
  *
  * [v83.3] BREAKING CHANGE на стороне Binance (effective 2025-12-09):
  * условные ордера (STOP_MARKET / TAKE_PROFIT_MARKET / STOP / TAKE_PROFIT /
@@ -256,25 +256,34 @@ public final class BinanceTradeExecutor {
                 leverage, riskPctPerTrade,
                 apiKey.isBlank() ? "MISSING" : "present"));
 
-        // Normalize position mode to ONE_WAY at boot. HEDGE-mode accounts
-        // reject MARKET orders without positionSide=LONG/SHORT (-4061).
-        // Idempotent: if already ONE_WAY, Binance returns -4059 (ignored).
-        //
-        // [v82.7 2026-06-01] DEMO FIX: skip ensureOneWayMode on testnet/demo.
-        // Корень -1109: demo-fapi отбивает попытку сменить positionSide/dual
-        // (-4067/-1109), и это переводит demo-сессию в "Invalid account" на КАЖДУЮ
-        // последующую запись (order/leverage/marginType). Юзер уже выставил режим
-        // (One-Way + Isolated) РУКАМИ в demo UI — боту НЕ нужно его трогать.
-        // На реале (useTestnet=false) поведение прежнее: бот сам нормализует режим.
-        if (!apiKey.isBlank() && !apiSecret.isBlank()) {
-            if (!useTestnet) {
-                try { ensureOneWayMode(); } catch (Exception e) {
-                    LOG.warning("[Executor] ensureOneWayMode failed (non-fatal): " + e.getMessage());
-                }
-            } else {
-                LOG.info("[Executor] testnet/demo — skip ensureOneWayMode "
-                        + "(account mode is set manually in demo UI; avoids -1109 corruption)");
-            }
+        // [project_state id=32a] The constructor used to call ensureOneWayMode() here, which POSTs
+        // /fapi/v1/positionSide/dual — a MUTATION of the live account — during class
+        // initialisation, i.e. the first time anyone so much as touched this class. Constructing a
+        // singleton must not change the exchange account. Moved to prepareForTrading(), which the
+        // trading path calls explicitly.
+    }
+
+    private volatile boolean accountModePrepared = false;
+
+    /**
+     * Normalise the account's position mode to ONE_WAY. Call this explicitly before trading —
+     * the constructor deliberately does not (project_state id=32a).
+     *
+     * Idempotent and one-shot per process. Skipped on testnet/demo: demo-fapi rejects the
+     * positionSide/dual switch (-4067/-1109) and that rejection poisons the demo session into
+     * "Invalid account" for every subsequent write, so the mode is set by hand in the demo UI.
+     */
+    public synchronized void prepareForTrading() {
+        if (accountModePrepared) return;
+        if (!isReady()) return;
+        accountModePrepared = true;
+        if (useTestnet) {
+            LOG.info("[Executor] testnet/demo — skip ensureOneWayMode "
+                    + "(account mode is set manually in demo UI; avoids -1109 corruption)");
+            return;
+        }
+        try { ensureOneWayMode(); } catch (Exception e) {
+            LOG.warning("[Executor] ensureOneWayMode failed (non-fatal): " + e.getMessage());
         }
     }
 
