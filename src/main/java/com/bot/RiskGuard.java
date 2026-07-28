@@ -10,27 +10,37 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 /**
- * RiskGuard v1.0 — pre-trade safety layer.
+ * RiskGuard v1.0 — pre-trade risk logic. NOT WIRED IN (project_state id=22, id=25).
  *
  * ┌────────────────────────────────────────────────────────────────────┐
- * │  Назначение: ПЕРЕД исполнением каждой сделки спросить у RiskGuard  │
- * │  "можно?" через canTrade(). Если нельзя — он скажет почему,        │
- * │  и сделка не открывается.                                          │
+ * │  СТАТУС на 2026-07-28: canTrade(), recordTradeOpened(),            │
+ * │  recordTradeClosed(), updateBtcPrice(), manualHalt(),              │
+ * │  manualResume() НЕ ВЫЗЫВАЮТСЯ НИОТКУДА. BotMain создаёт инстанс    │
+ * │  и печатает statusLine() — на этом всё. Ни одно ограничение ниже   │
+ * │  не применяется ни к одной сделке. Живой путь исполнения —         │
+ * │  SupabaseSignalBridge.drainOpens(), он RiskGuard не спрашивает.    │
+ * │  Подключение — project_state id=25, отдельной веткой.              │
  * └────────────────────────────────────────────────────────────────────┘
  *
- * Защиты:
- *  1. DAILY LOSS LIMIT    — при -10% дня (configurable) останавливает
- *                            торги до начала следующих суток UTC.
- *  2. WEEKLY LOSS LIMIT   — при -20% за 7 дней останавливает до ручного
- *                            включения через RESUME_AFTER_WEEKLY_BLOCK env.
- *  3. DAILY TRADE LIMIT   — не более N сделок в сутки (default 3).
- *  4. BTC CRASH DETECTOR  — при движении BTC -3% за 30мин или -5% за 60мин
- *                            блокирует новые входы на 2 часа.
- *  5. CONCURRENT POSITIONS — не более N одновременно открытых позиций
- *                            (default 2). Защита от каскадного слива
- *                            на синхронных движениях рынка.
- *  6. COLD START          — первые 24ч после рестарта/после weekly-block
- *                            режим только Telegram-confirmation.
+ * Что здесь РЕАЛИЗОВАНО (и заработает только после id=25):
+ *  1. DAILY LOSS LIMIT     — canTrade() отказывает при дневном убытке сверх
+ *                            RG_DAILY_LOSS_LIMIT_PCT; счётчики обнуляет
+ *                            rolloverIfNewDay() на границе суток UTC.
+ *  2. WEEKLY LOSS LIMIT    — canTrade() отказывает при недельном убытке сверх
+ *                            лимита. Разблокировка — manualResume(), у которого
+ *                            тоже нет вызывающих. Переменной
+ *                            RESUME_AFTER_WEEKLY_BLOCK не существует: старый
+ *                            javadoc называл её, но код её никогда не читал.
+ *  3. DAILY TRADE LIMIT    — RG_DAILY_TRADE_LIMIT, дефолт 8.
+ *  4. BTC CRASH DETECTOR   — updateBtcPrice() кормит буфер, canTrade() отказывает
+ *                            при -3% за 30мин или -5% за 60мин; блок на 2 часа.
+ *  5. CONCURRENT POSITIONS — RG_MAX_CONCURRENT_POSITIONS, дефолт 1. Счётчик
+ *                            наполняет recordTradeOpened(), поэтому пока он не
+ *                            вызывается, множество открытых позиций всегда пусто.
+ *  6. COLD START           — isColdStart() возвращает true первые 24ч; его читают
+ *                            только строки статуса внутри этого файла. Никакого
+ *                            режима Telegram-подтверждения в коде нет: входящих
+ *                            команд TelegramBotSender не обрабатывает.
  *
  * Все цифры — env-переменные с дефолтами. Состояние держится в памяти,
  * сбрасывается при рестарте Railway. Это намеренно: после рестарта daily

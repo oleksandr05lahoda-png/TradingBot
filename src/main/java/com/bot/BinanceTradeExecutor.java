@@ -34,29 +34,34 @@ import java.util.logging.Logger;
  *
  * Принципы безопасности:
  *
- *  1. NEVER OPEN WITHOUT SL.
- *     После MARKET-открытия позиции — немедленно (в той же транзакции,
- *     одним методом) отправляется STOP_MARKET ордер на SL через algoOrder.
- *     Если SL не подтвердился за 5 секунд — позиция закрывается
- *     принудительно. Лучше потерять комиссию, чем остаться без стопа.
+ *  1. SL СРАЗУ ПОСЛЕ ВХОДА.
+ *     После MARKET-открытия тем же методом отправляется STOP_MARKET через
+ *     algoOrder. Если поставить SL не удалось — позиция закрывается
+ *     принудительно, и лишь при неудаче ЭТОГО закрытия результат помечается
+ *     NAKED. Ограничение по времени задаётся числом попыток, а не секундомером:
+ *     4 попытки, у каждой свой HTTP-таймаут 10с и пауза 300-500мс между ними,
+ *     то есть худший случай ~40с. Поле slPlacementTimeoutMs (env
+ *     SL_PLACEMENT_TIMEOUT_MS) присваивается и НИГДЕ не читается — прежний
+ *     javadoc обещал по нему 5 секунд (при дефолте 2000мс).
  *
  *  2. NO FUNDS, NO MOVE.
  *     Перед каждой сделкой проверяется реальный баланс на бирже. Если
- *     баланс < min_required для риска 2% — не открываем.
+ *     баланс < min_required — не открываем.
  *
- *  3. REAL BY DEFAULT [v86.92].
- *     env BINANCE_USE_TESTNET=1 переключает все URL на testnet/demo.
- *     Default = 0 (real). [v86.92] было =1 (testnet): юзер торгует РЕАЛЬНЫМИ
- *     ключами и testnet/demo не использует → дефолт-testnet с live-ключами
- *     ронял каждый account/order вызов (-1109) и спамил пробой. Настоящий
- *     trade-gate = LIVE_TRADING_ARMED=0 (без него ордеров НЕТ даже на real,
- *     бот read-only). Testnet остаётся доступен явным BINANCE_USE_TESTNET=1.
+ *  3. ЭНДПОИНТ.
+ *     BINANCE_USE_TESTNET=1 переключает URL на testnet/demo, дефолт 0 (real).
+ *     Ордера идут ТОЛЬКО из SupabaseSignalBridge, и его гейт открывает позицию
+ *     лишь когда isDemoEndpoint() подтверждает demo-хост (project_state id=28).
+ *     LIVE_TRADING_ARMED торговым гейтом НЕ является: его читает только BotMain
+ *     для вырезанного свечного пути, живой путь его не смотрит.
  *
  *  4. ISOLATED MARGIN, FIXED LEVERAGE.
- *     Перед первой сделкой по символу выставляются:
- *       - margin type = ISOLATED (не CROSS — изолируем риск каждой пары)
- *       - leverage    = LEVERAGE (default 5x)
- *     Эти параметры запоминаются — повторно не дёргаем.
+ *     Перед первой сделкой по символу выставляются margin type = ISOLATED и
+ *     leverage = LEVERAGE (дефолт 5x); результат запоминается в
+ *     initializedSymbols. Если биржа не подтвердила любую из настроек — открытие
+ *     отклоняется (project_state id=32c). До 2026-07-28 обе настройки
+ *     пропускались на testnet, то есть не применялись ни к одной позиции,
+ *     которую бот вообще способен открыть.
  *
  *  5. HARDCODED LEVERAGE CAP.
  *     LEVERAGE захардкожен в коде с верхней границей 10. Даже если кто-то
@@ -83,15 +88,15 @@ public final class BinanceTradeExecutor {
     private static final Logger LOG = Logger.getLogger("BinanceTradeExecutor");
 
     // ─── Idempotency: client order IDs ────────────────────────────────
-    // [v86.85 LIVE-MONEY] Each LIVE order carries a deterministic
-    // newClientOrderId so that a retried order after an AMBIGUOUS timeout
-    // cannot double-fill. Binance rejects a re-POST with the SAME id via
-    // error -4015 ("Client order id is duplicate") — we treat that as
-    // SUCCESS (the order already exists) instead of resending blindly.
-    // The SAME id string MUST be reused across retries of one logical
-    // action (entry / close / emergency). DORMANT in paper
-    // (LIVE_TRADING_ARMED=0 → these methods are never called); the
-    // backtest never touches the executor.
+    // [v86.85 LIVE-MONEY] An id is minted per logical action and REUSED across the
+    // retries of that action, so a re-POST after an ambiguous timeout comes back as
+    // -4015 ("Client order id is duplicate"), which is treated as SUCCESS instead of
+    // resending blindly. Scope of that protection, measured 2026-07-28:
+    //   - it covers the retry loop WITHIN one call; the id is nanoTime + a counter, so
+    //     it is NOT stable across restarts or across separate calls. A caller-level
+    //     retry mints a fresh id and Binance cannot dedupe it.
+    //   - only the MARKET paths pass an id at all. The SL and TP algo orders send none.
+    // LIVE_TRADING_ARMED does not gate any of this — the bridge never reads it.
     private static final java.util.concurrent.atomic.AtomicLong CID_SEQ =
             new java.util.concurrent.atomic.AtomicLong(0);
 
@@ -301,9 +306,10 @@ public final class BinanceTradeExecutor {
      * Force account into ONE_WAY position mode so MARKET orders without
      * positionSide=LONG/SHORT are accepted. Idempotent — safe to call repeatedly.
      *
-     * Auto-handles -4067 ("Position side cannot be changed if there exists
-     * open orders") by enumerating all open orders, cancelling them, then
-     * retrying the position-side switch once.
+     * On -4067 ("Position side cannot be changed if there exists open orders") it logs a warning
+     * and leaves the account mode unchanged — it does NOT enumerate, cancel and retry, which is
+     * what this javadoc claimed until 2026-07-28. The afterCancel parameter is vestigial: the only
+     * call site passes false and nothing ever passes true.
      */
     private void ensureOneWayMode() throws Exception {
         ensureOneWayMode(false); // first attempt without cancel
@@ -1412,9 +1418,9 @@ public final class BinanceTradeExecutor {
     }
 
     /**
-     * Force-close an open position market-style. Used by RiskGuard when
-     * kill-switch fires, by TimeStop, or by emergency procedures.
-     * Also cancels any open SL/TP orders for this symbol.
+     * Force-close an open position market-style, cancelling any open SL/TP orders for the symbol
+     * first. The only caller is SupabaseSignalBridge.drainCloses(); RiskGuard does not reference
+     * this class at all and there is no TimeStop component, though this javadoc named both.
      */
     public boolean closePosition(String symbol, String reason) {
         if (!isReady()) return false;
