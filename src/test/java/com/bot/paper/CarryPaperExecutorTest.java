@@ -42,7 +42,7 @@ class CarryPaperExecutorTest {
         List<Bar> perp = new ArrayList<>(), spot = new ArrayList<>();
         flat(perp, spot, 10, 1000.0, 10.0);
 
-        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, false, 1.0, "t");
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, Double.NaN, 1.0, "t");
         CarryPaperExecutor.Fill f = exec.simulate(pos, perp, spot, List.of(), 5);
 
         assertEquals(4, CarryPaperExecutor.CARRY_FILLS);
@@ -66,7 +66,7 @@ class CarryPaperExecutorTest {
                 new PaperExecutor.FundingPoint(40 * H, 0.0001));  // after exit — excluded
 
         // Entry at the bar opening 1h, 25 bars held => time stop at the bar opening 26h.
-        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, false, 1.0, "t");
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, Double.NaN, 1.0, "t");
         CarryPaperExecutor.Fill f = exec.simulate(pos, perp, spot, funding, 25);
 
         assertSame(CarryPaperExecutor.ExitReason.time_stop, f.exitReason);
@@ -88,7 +88,7 @@ class CarryPaperExecutorTest {
         perp.add(bar("BTCUSDT", 2 * H, perpOut, perpOut));  // time-stop bar
         for (int i = 0; i <= 2; i++) spot.add(bar("BTCUSDT", i * H, spotPx, spotPx));
 
-        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, false, 1.0, "t");
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, Double.NaN, 1.0, "t");
         CarryPaperExecutor.Fill f = exec.simulate(pos, perp, spot, List.of(), 1);
 
         assertEquals(20.0, f.basisEntryBp, 1e-6);
@@ -114,7 +114,7 @@ class CarryPaperExecutorTest {
         spot.add(bar("BTCUSDT", H, s0, s0));
         spot.add(bar("BTCUSDT", 2 * H, s1, s1));
 
-        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, false, 1.0, "t");
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, Double.NaN, 1.0, "t");
         CarryPaperExecutor.Fill f = exec.simulate(pos, perp, spot, List.of(), 1);
 
         double perpEntry = p0 * (1 - SLIP);   // sold the perp
@@ -146,7 +146,7 @@ class CarryPaperExecutorTest {
         perp.add(bar("BTCUSDT", 3 * H, s * 1.0004, s * 1.0004));   // 4bp -> at/below 5bp
         for (int i = 4; i <= 6; i++) perp.add(bar("BTCUSDT", i * H, s, s));
 
-        CarryPosition pos = new CarryPosition("BTCUSDT", H, 5.0, false, 1.0, "t");
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, 5.0, Double.NaN, 1.0, "t");
         CarryPaperExecutor.Fill f = exec.simulate(pos, perp, spot, List.of(), 5);
 
         assertSame(CarryPaperExecutor.ExitReason.basis_converged, f.exitReason);
@@ -163,7 +163,7 @@ class CarryPaperExecutorTest {
                 new PaperExecutor.FundingPoint(2 * H, 0.0001),
                 new PaperExecutor.FundingPoint(4 * H, -0.0002));   // the flip
 
-        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, true, 1.0, "t");
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, -0.00001, 1.0, "t");
         CarryPaperExecutor.Fill f = exec.simulate(pos, perp, spot, funding, 8);
 
         assertSame(CarryPaperExecutor.ExitReason.funding_flipped, f.exitReason);
@@ -182,7 +182,7 @@ class CarryPaperExecutorTest {
         for (int i = 0; i <= 5; i++) perp.add(bar("BTCUSDT", i * H, 1002, 1002));
         spot.add(bar("BTCUSDT", 0, 1000, 1000));   // spot stops before the entry bar
 
-        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, false, 1.0, "t");
+        CarryPosition pos = new CarryPosition("BTCUSDT", H, Double.NaN, Double.NaN, 1.0, "t");
         assertNull(exec.simulate(pos, perp, spot, List.of(), 3),
                 "filling one leg would invent a hedge that was never there");
     }

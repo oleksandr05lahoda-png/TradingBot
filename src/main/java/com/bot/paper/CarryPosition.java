@@ -23,26 +23,34 @@ public final class CarryPosition {
      */
     public final double exitBasisBp;
 
-    /** Exit at the first funding settlement that turns negative — the trade would start paying. */
-    public final boolean exitOnFundingFlip;
+    /**
+     * Exit at the first funding settlement at or below this rate. {@code NaN} disables the rule.
+     *
+     * A THRESHOLD, not a sign test. The rule that matters is "the reason for holding has gone",
+     * and that reason is the entry condition, not zero: a carry entered at 5bp per 8h stops being
+     * the trade that was pre-registered long before the rate turns negative. An earlier version of
+     * this field was a boolean that fired only below zero, which would have held every position
+     * through the entire decay from the entry rate down to nothing.
+     */
+    public final double exitFundingBelow;
 
     public final double sizeMultiplier;
     public final String rationale;
 
     public CarryPosition(String symbol, long signalBarCloseMs, double exitBasisBp,
-                         boolean exitOnFundingFlip, double sizeMultiplier, String rationale) {
+                         double exitFundingBelow, double sizeMultiplier, String rationale) {
         if (symbol == null || symbol.isBlank()) throw new IllegalArgumentException("symbol required");
         if (sizeMultiplier <= 0) throw new IllegalArgumentException("sizeMultiplier must be positive");
         this.symbol            = symbol;
         this.signalBarCloseMs  = signalBarCloseMs;
         this.exitBasisBp       = exitBasisBp;
-        this.exitOnFundingFlip = exitOnFundingFlip;
+        this.exitFundingBelow  = exitFundingBelow;
         this.sizeMultiplier    = sizeMultiplier;
         this.rationale         = rationale == null ? "" : rationale;
     }
 
     @Override public String toString() {
         return "CARRY " + symbol + " @signalClose=" + signalBarCloseMs
-                + " exitBasisBp=" + exitBasisBp + " exitOnFundingFlip=" + exitOnFundingFlip;
+                + " exitBasisBp=" + exitBasisBp + " exitFundingBelow=" + exitFundingBelow;
     }
 }

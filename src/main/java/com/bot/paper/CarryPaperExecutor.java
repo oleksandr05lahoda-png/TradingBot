@@ -121,9 +121,10 @@ public final class CarryPaperExecutor {
             // The window is half-open, (openMs, closeMs]. Binance settles at 00:00/08:00/16:00 UTC,
             // which land exactly on 4h bar boundaries, so a settlement at time T belongs to the bar
             // that ENDS at T — the bar over which it accrued — not to the one starting there.
-            if (pos.exitOnFundingFlip && funding != null) {
+            if (!Double.isNaN(pos.exitFundingBelow) && funding != null) {
                 for (PaperExecutor.FundingPoint fp : funding) {
-                    if (fp.timeMs > pb.openMs && fp.timeMs <= pb.closeMs && fp.rate < 0) {
+                    if (fp.timeMs > pb.openMs && fp.timeMs <= pb.closeMs
+                            && fp.rate <= pos.exitFundingBelow) {
                         return build(pos, perpEntryBar, perpEntryPx, spotEntryPx, basisEntryBp,
                                 pb, pb.close, sb.close, ExitReason.funding_flipped, slip, funding);
                     }

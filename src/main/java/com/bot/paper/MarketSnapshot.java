@@ -23,10 +23,13 @@ public final class MarketSnapshot {
 
     private final long asOfMs;
     private final Map<String, List<Bar>> bars;
+    private final Map<String, List<PaperExecutor.FundingPoint>> funding;
 
-    private MarketSnapshot(long asOfMs, Map<String, List<Bar>> bars) {
+    private MarketSnapshot(long asOfMs, Map<String, List<Bar>> bars,
+                           Map<String, List<PaperExecutor.FundingPoint>> funding) {
         this.asOfMs = asOfMs;
         this.bars = bars;
+        this.funding = funding;
     }
 
     /**
@@ -36,6 +39,27 @@ public final class MarketSnapshot {
      * @param fullSeries symbol -> bars in ascending openMs order
      */
     public static MarketSnapshot asOf(long asOfMs, Map<String, List<Bar>> fullSeries) {
+        return asOf(asOfMs, fullSeries, Collections.emptyMap());
+    }
+
+    /**
+     * Snapshot including funding settlements, cut by the SAME rule: a settlement is visible only
+     * when {@code timeMs <= asOfMs}. Funding is the entry signal for carry hypotheses, so letting a
+     * future settlement leak in here would be look-ahead of the most direct kind — deciding to
+     * collect a rate that has not been announced yet.
+     */
+    public static MarketSnapshot asOf(long asOfMs, Map<String, List<Bar>> fullSeries,
+                                      Map<String, List<PaperExecutor.FundingPoint>> fullFunding) {
+        Map<String, List<PaperExecutor.FundingPoint>> visibleFunding = new LinkedHashMap<>();
+        for (Map.Entry<String, List<PaperExecutor.FundingPoint>> e : fullFunding.entrySet()) {
+            List<PaperExecutor.FundingPoint> src = e.getValue();
+            int lo = 0, hi = src.size();
+            while (lo < hi) {
+                int mid = (lo + hi) >>> 1;
+                if (src.get(mid).timeMs <= asOfMs) lo = mid + 1; else hi = mid;
+            }
+            visibleFunding.put(e.getKey(), Collections.unmodifiableList(src.subList(0, lo)));
+        }
         Map<String, List<Bar>> visible = new LinkedHashMap<>();
         for (Map.Entry<String, List<Bar>> e : fullSeries.entrySet()) {
             List<Bar> src = e.getValue();
@@ -46,7 +70,8 @@ public final class MarketSnapshot {
             // them once and hands over unmodifiable lists.
             visible.put(e.getKey(), Collections.unmodifiableList(src.subList(0, cut)));
         }
-        return new MarketSnapshot(asOfMs, Collections.unmodifiableMap(visible));
+        return new MarketSnapshot(asOfMs, Collections.unmodifiableMap(visible),
+                Collections.unmodifiableMap(visibleFunding));
     }
 
     /** Index of the first bar that is NOT yet closed at asOfMs. Binary search; series is ascending. */
@@ -68,6 +93,18 @@ public final class MarketSnapshot {
     public List<Bar> bars(String symbol) {
         List<Bar> b = bars.get(symbol);
         return b == null ? Collections.emptyList() : b;
+    }
+
+    /** Funding settlements already announced at asOfMs, oldest first. */
+    public List<PaperExecutor.FundingPoint> funding(String symbol) {
+        List<PaperExecutor.FundingPoint> f = funding.get(symbol);
+        return f == null ? Collections.emptyList() : f;
+    }
+
+    /** The latest announced settlement, or null when none has been announced yet. */
+    public PaperExecutor.FundingPoint lastFunding(String symbol) {
+        List<PaperExecutor.FundingPoint> f = funding(symbol);
+        return f.isEmpty() ? null : f.get(f.size() - 1);
     }
 
     /** The most recently CLOSED bar, or null when the symbol has none yet. */

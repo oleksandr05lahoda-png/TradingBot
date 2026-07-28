@@ -172,7 +172,7 @@ public final class HistoricalDriver {
      * book was empty, and that selection correlates with the very conditions being measured.
      */
     static int run(Config c, PaperStore store) throws Exception {
-        Hypothesis h = loadHypothesis(c.hypothesisClass);
+        Object h = loadAny(c.hypothesisClass);
         String table = c.timeframe.equals("4h") ? "klines_4h" : "klines_1h";
         long intervalMs = c.timeframe.equals("4h") ? 4 * 3_600_000L : 3_600_000L;
 
@@ -189,6 +189,18 @@ public final class HistoricalDriver {
             }
         }
 
+        if (h instanceof CarryHypothesis) {
+            if (!c.timeframe.equals("4h")) {
+                throw new IllegalArgumentException(
+                        "carry needs 4h: the spot proxy is index_klines_4h and there is no 1h index table");
+            }
+            return runCarry(c, store, (CarryHypothesis) h, intervalMs, fromMs, toMs);
+        }
+        return runDirectional(c, store, (Hypothesis) h, table, intervalMs, fromMs, toMs);
+    }
+
+    private static int runDirectional(Config c, PaperStore store, Hypothesis h, String table,
+                                      long intervalMs, long fromMs, long toMs) throws Exception {
         Map<String, List<Bar>> series = new LinkedHashMap<>();
         Map<String, List<PaperExecutor.FundingPoint>> funding = new LinkedHashMap<>();
         TreeSet<Long> closes = new TreeSet<>();
@@ -232,14 +244,78 @@ public final class HistoricalDriver {
         return written;
     }
 
-    static Hypothesis loadHypothesis(String className) {
+    /**
+     * The carry route. Loads BOTH legs and hands the hypothesis two snapshots taken at the same
+     * instant, cut by the same rule. Funding travels with the perp snapshot because funding is the
+     * carry entry signal, and letting an unannounced settlement leak in would be look-ahead of the
+     * most direct kind.
+     *
+     * The holding window comes from the hypothesis, not from --hold: the horizon is part of the
+     * claim, and a command-line hold would let two different predictions share one version and so
+     * share the single holdout run that version is permitted.
+     */
+    private static int runCarry(Config c, PaperStore store, CarryHypothesis h,
+                                long intervalMs, long fromMs, long toMs) throws Exception {
+        Map<String, List<Bar>> perpSeries = new LinkedHashMap<>();
+        Map<String, List<Bar>> spotSeries = new LinkedHashMap<>();
+        Map<String, List<PaperExecutor.FundingPoint>> funding = new LinkedHashMap<>();
+        TreeSet<Long> closes = new TreeSet<>();
+
+        for (String sym : c.symbols) {
+            List<Bar> perp = store.loadBars("klines_4h", sym, intervalMs, fromMs, toMs);
+            List<Bar> spot = store.loadBars("index_klines_4h", sym, intervalMs, fromMs, toMs);
+            perpSeries.put(sym, Collections.unmodifiableList(perp));
+            spotSeries.put(sym, Collections.unmodifiableList(spot));
+            funding.put(sym, store.loadFunding(sym, fromMs, toMs));
+            for (Bar b : perp) closes.add(b.closeMs);
+            System.out.println("loaded " + sym + ": perp=" + perp.size() + " spot=" + spot.size()
+                    + " funding=" + funding.get(sym).size());
+        }
+        if (closes.isEmpty()) {
+            System.out.println("no bars in range — nothing to replay");
+            return 0;
+        }
+
+        CarryPaperExecutor exec = new CarryPaperExecutor();
+        String prevHash = store.lastHash(h.name(), h.version(), c.mode.dbValue);
+        int written = 0, unresolved = 0;
+
+        for (long t : closes) {
+            MarketSnapshot perpSnap = MarketSnapshot.asOf(t, perpSeries, funding);
+            MarketSnapshot spotSnap = MarketSnapshot.asOf(t, spotSeries);
+            List<CarryPosition> positions = h.evaluate(perpSnap, spotSnap);
+            if (positions == null || positions.isEmpty()) continue;
+
+            for (CarryPosition p : positions) {
+                List<Bar> perp = perpSeries.get(p.symbol);
+                List<Bar> spot = spotSeries.get(p.symbol);
+                if (perp == null || spot == null) continue;
+                CarryPaperExecutor.Fill f =
+                        exec.simulate(p, perp, spot, funding.get(p.symbol), h.maxHoldBars());
+                if (f == null) { unresolved++; continue; }
+
+                long id = store.insertCarryPrediction(h.name(), h.version(), c.mode.dbValue,
+                        c.universeId, p, f, false, prevHash);
+                store.updateCarryOutcome(id, f);
+                prevHash = store.lastHash(h.name(), h.version(), c.mode.dbValue);
+                written++;
+            }
+        }
+        System.out.println("carry: " + written + " resolved, " + unresolved
+                + " left unresolved (holding window not finished or a leg missing)");
+        return written;
+    }
+
+    /** Load a hypothesis of either kind. The caller decides which route it takes. */
+    static Object loadAny(String className) {
         try {
             Class<?> k = Class.forName(className);
             Object o = k.getDeclaredConstructor().newInstance();
-            if (!(o instanceof Hypothesis)) {
-                throw new IllegalArgumentException(className + " does not implement Hypothesis");
+            if (!(o instanceof Hypothesis) && !(o instanceof CarryHypothesis)) {
+                throw new IllegalArgumentException(
+                        className + " implements neither Hypothesis nor CarryHypothesis");
             }
-            return (Hypothesis) o;
+            return o;
         } catch (ClassNotFoundException e) {
             throw new IllegalArgumentException("hypothesis class not found: " + className);
         } catch (ReflectiveOperationException e) {
