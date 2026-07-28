@@ -1,14 +1,12 @@
-.gradle
+.gradle/
 build/
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/
 
 ### IntelliJ IDEA ###
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
+# Whole directory: workspace.xml is per-user churn and was tracked until 2026-07-28.
+.idea/
 *.iws
 *.iml
 *.ipr
@@ -42,7 +40,17 @@ bin/
 .DS_Store
 
 ### Claude Code (personal, local) ###
-.claude/settings.local.json
+# Anchored form only matched the repo root; a second .claude exists deeper in the
+# tree (src/main/java/com/bot/.claude), so match at any depth.
+**/.claude/settings.local.json
+**/.claude/worktrees/
+
+### Runtime state, written relative to the process CWD ###
+# BotMain writes ./data/calibrator.csv and ./data/forecast_records.csv, RiskGuard
+# writes ./data/riskguard.csv. Whichever directory the bot is launched from grows a
+# data/ folder — including inside the source tree when launched from an IDE run
+# config. State, never source: ignore it wherever it lands.
+**/data/
 
 ### Offline analysis scratch (data, not code) ###
 /analysis/
