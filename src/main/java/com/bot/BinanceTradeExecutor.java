@@ -1742,10 +1742,38 @@ public final class BinanceTradeExecutor {
             // NOTE: body2 deliberately omits reduceOnly — Binance forbids it in Hedge Mode.
             if (b.contains("-4061") || b.contains("position side")) {
                 LOG.warning("[Executor] " + symbol + " HEDGE mode detected, retrying with positionSide");
+                // [project_state id=31] Hedge Mode forbids reduceOnly, so this retry cannot carry
+                // the flag that makes a close incapable of opening. Two corrections.
+                //
+                // (a) positionSide must name the side being REDUCED. In hedge mode a long is closed
+                //     by SELL with positionSide=LONG. The old code derived it as (buy?LONG:SHORT),
+                //     which is right for an ENTRY and inverted for a close — a hedge-mode close of a
+                //     long sent SELL + positionSide=SHORT, i.e. it OPENED a short.
+                // (b) with no reduceOnly to lean on, confirm against the exchange immediately before
+                //     sending that the position is still there, on the expected side, at least this
+                //     big. Any other answer, including a failed read, is a refusal.
+                String posSide = reduceOnly ? (buy ? "SHORT" : "LONG") : (buy ? "LONG" : "SHORT");
+                if (reduceOnly) {
+                    double cur = fetchPositionAmountChecked(symbol);
+                    boolean expectLong = !buy;
+                    if (Double.isNaN(cur)) {
+                        LOG.severe("[Executor] " + symbol + " hedge close: position read FAILED — refusing"
+                                + " to send an order that cannot carry reduceOnly");
+                        return null;
+                    }
+                    if ((expectLong && cur <= 0) || (!expectLong && cur >= 0)
+                            || Math.abs(cur) + 1e-12 < qty) {
+                        LOG.severe("[Executor] " + symbol + " hedge close ABORTED: exchange reports"
+                                + " positionAmt=" + cur + " but this close needs a "
+                                + (expectLong ? "LONG" : "SHORT") + " of at least " + qty
+                                + " — without reduceOnly the order would CREATE exposure");
+                        return null;
+                    }
+                }
                 long ts2 = ts();
                 String body2 = "symbol=" + symbol
                         + "&side=" + (buy ? "BUY" : "SELL")
-                        + "&positionSide=" + (buy ? "LONG" : "SHORT")
+                        + "&positionSide=" + posSide
                         + "&type=MARKET"
                         + "&quantity=" + formatQty(qty)
                         + "&newClientOrderId=" + clientId
@@ -2537,6 +2565,21 @@ public final class BinanceTradeExecutor {
                 } else if (lastBody.contains("-4061") || lastBody.contains("position side")) {
                     // HEDGE-mode require explicit positionSide. Reuse the SAME
                     // emCid (a -4061 means this POST did NOT execute the close).
+                    // [project_state id=31] positionSide is already the side being reduced here,
+                    // but Hedge Mode forbids reduceOnly, so this retry has no flag protecting it.
+                    // Confirm against the exchange before sending; a failed read is a refusal.
+                    double curHedge = fetchPositionAmountChecked(symbol);
+                    if (Double.isNaN(curHedge)) {
+                        LOG.severe("[Executor] emergencyClose " + symbol + " hedge retry: position read"
+                                + " FAILED — refusing to send an order that cannot carry reduceOnly");
+                        return false;
+                    }
+                    if ((wasLong && curHedge <= 0) || (!wasLong && curHedge >= 0)) {
+                        LOG.info("[Executor] emergencyClose " + symbol + " hedge retry: exchange reports"
+                                + " positionAmt=" + curHedge + " — the " + (wasLong ? "LONG" : "SHORT")
+                                + " is already gone, treating as SUCCESS instead of opening the other side");
+                        return true;
+                    }
                     long ts2 = ts();
                     String body2 = "symbol=" + symbol
                             + "&side=" + (wasLong ? "SELL" : "BUY")
