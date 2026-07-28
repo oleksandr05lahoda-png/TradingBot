@@ -190,8 +190,22 @@ public final class BinanceTradeExecutor {
         this.useTestnet = "1".equals(System.getenv().getOrDefault("BINANCE_USE_TESTNET", "0"));
 
         if (useTestnet) {
-            this.apiKey    = pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", "");
-            this.apiSecret = pick("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET", "");
+            // [project_state id=28] NO FALLBACK TO REAL CREDENTIALS. This used to be
+            // pick("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY", ""), i.e. a missing demo key
+            // silently armed the real-account key. Combined with TESTNET_BASE_URL that is a
+            // straight path to trading real money while every log says testnet. Missing demo
+            // credentials are now a refusal: blank keys make isReady() false and nothing trades.
+            String tKey = System.getenv().getOrDefault("BINANCE_TESTNET_API_KEY", "").trim();
+            String tSec = System.getenv().getOrDefault("BINANCE_TESTNET_API_SECRET", "").trim();
+            if (tKey.isBlank() || tSec.isBlank()) {
+                LOG.severe("[Executor] BINANCE_USE_TESTNET=1 but BINANCE_TESTNET_API_KEY/SECRET are not set."
+                        + " REFUSING to fall back to the real-account key — executor stays not-ready.");
+                this.apiKey = "";
+                this.apiSecret = "";
+            } else {
+                this.apiKey    = tKey;
+                this.apiSecret = tSec;
+            }
             // [v86.26 2026-06-08] Host = demo-fapi.binance.com (official Demo Trading API host).
             // VERIFIED: testnet.binancefuture.com now 301-redirects to demo.binance.com (Binance
             // retired the standalone Futures Testnet site); the documented API base is
@@ -460,7 +474,39 @@ public final class BinanceTradeExecutor {
         return !apiKey.isBlank() && !apiSecret.isBlank();
     }
 
+    /** The BINANCE_USE_TESTNET flag. This is NOT the endpoint — see {@link #isDemoEndpoint()}. */
     public boolean isTestnet() { return useTestnet; }
+
+    /**
+     * Hosts recognised as Binance demo/testnet. A whitelist on purpose: TESTNET_BASE_URL can point
+     * anywhere, so anything not listed here — including an unparseable URL — counts as real.
+     */
+    private static final java.util.Set<String> DEMO_HOSTS = java.util.Set.of(
+            "demo-fapi.binance.com",
+            "testnet.binancefuture.com",
+            "demo.binance.com");
+
+    /** The host every order, balance and position request is actually sent to. "" if unparseable. */
+    public String endpointHost() {
+        try {
+            String h = URI.create(baseUrl).getHost();
+            return h == null ? "" : h.toLowerCase(java.util.Locale.ROOT);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * True only when the ACTUAL endpoint host is a recognised demo host (project_state id=28).
+     *
+     * Callers that need to know whether real capital is reachable must use this, never
+     * isTestnet(): BINANCE_USE_TESTNET=1 with TESTNET_BASE_URL=https://fapi.binance.com leaves the
+     * flag true while every request goes to the real exchange. Unknown or unparseable host -> false.
+     */
+    public boolean isDemoEndpoint() {
+        String h = endpointHost();
+        return !h.isEmpty() && DEMO_HOSTS.contains(h);
+    }
     public int  getLeverage()    { return leverage; }
     public double getRiskPct()   { return riskPctPerTrade; }
 
@@ -2781,11 +2827,6 @@ public final class BinanceTradeExecutor {
         }
     }
 
-    private static String pick(String primaryKey, String fallbackKey, String def) {
-        String v = System.getenv().getOrDefault(primaryKey, "");
-        if (!v.isBlank()) return v;
-        return System.getenv().getOrDefault(fallbackKey, def);
-    }
     private static int envInt(String k, int d) {
         try { return Integer.parseInt(System.getenv().getOrDefault(k, String.valueOf(d))); }
         catch (Exception e) { return d; }

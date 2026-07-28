@@ -28,21 +28,17 @@ import org.json.JSONObject;
  * Hard safety (defence in depth):
  *   - LONG-ONLY: rejects any row whose side != LONG (DB also enforces it —
  *     constraint bot_orders_side_long CHECK (side = 'LONG')). Survived adversarial review.
- *   - TESTNET-GATED: refuses to OPEN any position unless BINANCE_USE_TESTNET was set explicitly
- *     (absence is a refusal, never a default) AND the executor reports testnet. BRIDGE_ALLOW_REAL
- *     is read but grants nothing — that much survived review. CLOSES are deliberately NOT gated,
- *     see poll(), because a lock that seals positions in is not a safety feature.
+ *   - TESTNET-GATED: refuses to OPEN unless BINANCE_USE_TESTNET was set explicitly (absence is a
+ *     refusal, never a default) AND BinanceTradeExecutor.isDemoEndpoint() reports that the host
+ *     orders actually go to is a recognised demo host. The gate reads the endpoint, not a flag
+ *     standing in for it (project_state id=28). BRIDGE_ALLOW_REAL is read but grants nothing.
+ *     CLOSES are deliberately NOT gated, see poll().
  *   - DEFAULT-OFF: no-op unless SUPABASE_BRIDGE_ENABLED=1.
  *   - IDEMPOTENT: pending->sent is claimed by a conditional PostgREST PATCH (CAS) before
  *     execution; close_requested->close_sent likewise. Two reconcile sweeps resolve rows against
  *     the exchange truth rather than guessing, and both skip on a failed read.
  *
  * KNOWN HOLES — do not read the list above as stronger than this:
- *   - project_state id=28 (P0): the gate checks the BINANCE_USE_TESTNET FLAG via
- *     BinanceTradeExecutor.isTestnet(), NOT the endpoint. TESTNET_BASE_URL repoints the
- *     "testnet" base URL at any host, so BINANCE_USE_TESTNET=1 + TESTNET_BASE_URL=fapi.binance.com
- *     opens REAL positions with real keys while every log here says TESTNET(demo). Real capital IS
- *     reachable by env alone today. Earlier revisions of this javadoc claimed the opposite.
  *   - project_state id=30: only reconcileOpen() PATCHes conditionally. reconcileSent() calls
  *     patch(), which has no status predicate, so it can overwrite a close_requested written
  *     concurrently by the live_time_closer cron and silently lose the close.
@@ -109,13 +105,9 @@ public final class SupabaseSignalBridge {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     private final BinanceTradeExecutor executor = BinanceTradeExecutor.getInstance();
     /**
-     * The BINANCE_USE_TESTNET FLAG as the executor sees it — deliberately not a second env read,
-     * so bridge and executor cannot disagree about the flag.
-     *
-     * It is NOT the endpoint, and this comment used to claim it was. isTestnet() reports the flag;
-     * the endpoint is the executor's baseUrl, which TESTNET_BASE_URL can repoint at any host. The
-     * exact failure the old wording claimed to have eliminated — logging TESTNET(demo) while orders
-     * hit fapi.binance.com — is still reachable. See project_state id=28.
+     * The BINANCE_USE_TESTNET flag as the executor sees it. Used ONLY for the per-row `testnet`
+     * routing filter in the PostgREST queries below — it is a routing hint, not a safety check.
+     * The gate uses executor.isDemoEndpoint().
      */
     private final boolean useTestnet = executor.isTestnet();
     private volatile boolean bannerLogged = false;
@@ -159,9 +151,8 @@ public final class SupabaseSignalBridge {
         boolean opensAllowed = executionAllowed();
         if (!bannerLogged) {
             bannerLogged = true;
-            // NOTE (id=28): this reports the BINANCE_USE_TESTNET flag, not the URL actually used.
-            // With TESTNET_BASE_URL repointed it will print "flag=TESTNET" while trading real.
-            LOG.warning("[Bridge] polling flag=" + (useTestnet ? "TESTNET" : "*** REAL ***")
+            LOG.warning("[Bridge] polling host=" + executor.endpointHost()
+                    + (executor.isDemoEndpoint() ? " (demo)" : " *** NOT A DEMO HOST ***")
                     + " opens=" + (opensAllowed ? "ALLOWED" : "LOCKED") + " closes=ALWAYS"
                     + " allowReal=" + ALLOW_REAL + " balPerLeg=$" + BAL_PER_LEG
                     + " maxOpen=" + MAX_OPEN + " maxPendingAgeMin=" + MAX_PENDING_AGE_MIN
@@ -179,17 +170,12 @@ public final class SupabaseSignalBridge {
     }
 
     /**
-     * Endpoint gate — fail-closed on the FLAG. Three checks, in order:
-     *   1. BINANCE_USE_TESTNET absent      -> refuse (absence must never pick an endpoint silently);
-     *   2. flag says real                  -> refuse unconditionally (BRIDGE_ALLOW_REAL cannot override);
-     *   3. flag says testnet               -> allow.
-     *
-     * LIMIT OF THIS GATE, project_state id=28: it checks the flag, never the URL. TESTNET_BASE_URL
-     * repoints the executor's "testnet" baseUrl at any host, so BINANCE_USE_TESTNET=1 plus
-     * TESTNET_BASE_URL=https://fapi.binance.com passes every check here and trades real money with
-     * real keys. An earlier version of this comment asserted that no combination of environment
-     * variables could reach real capital — that was false. Closing it means checking the endpoint
-     * itself, not the flag.
+     * Endpoint gate. Checks the HOST the executor actually sends orders to, not a flag that stands
+     * in for it (project_state id=28). Two refusals:
+     *   1. BINANCE_USE_TESTNET absent — configuration must be explicit, absence is never a default;
+     *   2. the executor's endpoint host is not a recognised demo host — which covers the flag being
+     *      0, the flag being 1 with TESTNET_BASE_URL repointed at the real exchange, and an
+     *      unparseable URL. BRIDGE_ALLOW_REAL cannot override either.
      */
     private boolean executionAllowed() {
         if (ALLOW_REAL) {
@@ -200,9 +186,10 @@ public final class SupabaseSignalBridge {
                     + "silently choosing an endpoint.");
             return false;
         }
-        if (!useTestnet) {
-            gateLog("[Bridge] BLOCKED: executor is on the REAL endpoint (BINANCE_USE_TESTNET="
-                    + TESTNET_ENV.trim() + ") — " + REAL_UNLOCK_REQUIREMENTS);
+        if (!executor.isDemoEndpoint()) {
+            gateLog("[Bridge] BLOCKED: orders would go to host '" + executor.endpointHost()
+                    + "' which is not a recognised Binance demo host (BINANCE_USE_TESTNET="
+                    + TESTNET_ENV.trim() + ", check TESTNET_BASE_URL) — " + REAL_UNLOCK_REQUIREMENTS);
             return false;
         }
         return true;
