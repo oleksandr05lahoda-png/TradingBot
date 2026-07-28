@@ -39,14 +39,24 @@ public final class MarketSnapshot {
         Map<String, List<Bar>> visible = new LinkedHashMap<>();
         for (Map.Entry<String, List<Bar>> e : fullSeries.entrySet()) {
             List<Bar> src = e.getValue();
-            List<Bar> dst = new ArrayList<>(Math.min(src.size(), 512));
-            for (Bar b : src) {
-                if (b.closeMs <= asOfMs) dst.add(b);
-                else break;                       // ascending order: everything after is newer
-            }
-            visible.put(e.getKey(), Collections.unmodifiableList(dst));
+            int cut = firstIndexClosingAfter(src, asOfMs);
+            // A VIEW, not a copy: a historical run builds a snapshot per bar per symbol, and
+            // copying would make that quadratic — roughly 3e9 element copies over 49 symbols and
+            // 1300 days. The caller must not mutate the source lists afterwards; the driver builds
+            // them once and hands over unmodifiable lists.
+            visible.put(e.getKey(), Collections.unmodifiableList(src.subList(0, cut)));
         }
         return new MarketSnapshot(asOfMs, Collections.unmodifiableMap(visible));
+    }
+
+    /** Index of the first bar that is NOT yet closed at asOfMs. Binary search; series is ascending. */
+    private static int firstIndexClosingAfter(List<Bar> src, long asOfMs) {
+        int lo = 0, hi = src.size();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (src.get(mid).closeMs <= asOfMs) lo = mid + 1; else hi = mid;
+        }
+        return lo;
     }
 
     /** The instant this snapshot is taken at. Nothing in it closed later than this. */
