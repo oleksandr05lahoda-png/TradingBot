@@ -23,8 +23,6 @@ public final class DecisionEngineMerged {
 
     // ── Enums ──────────────────────────────────────────────────────
     public enum CoinCategory { TOP, ALT, MEME }
-    public enum MarketState  { STRONG_TREND, WEAK_TREND, RANGE }
-    public enum HTFBias      { BULL, BEAR, NONE }
 
     public enum AssetType {
         CRYPTO("₿", "Криптовалюта"),
@@ -300,10 +298,6 @@ public final class DecisionEngineMerged {
 
 
 
-    /** Diagnostic — returns current regime shift magnitude (|fast-slow|). */
-    public double getBayesRegimeShift() {
-        return Math.abs(bayesPriorFast.get() - bayesPriorSlow.get());
-    }
 
 
     // ── Setters ───────────────────────────────────────────────────
@@ -412,26 +406,6 @@ public final class DecisionEngineMerged {
     }
 
 
-    /**
-     * [v42.0 FIX #12] Lazy garbage collector for postExitCooldown.
-     * Runs at most once per minute. Removes expired entries and bounds map size.
-     */
-    private void cooldownGc() {
-        long now = System.currentTimeMillis();
-        if (now - lastCooldownGcMs < 60_000L) return;
-        lastCooldownGcMs = now;
-        postExitCooldown.entrySet().removeIf(e -> now - e.getValue() > POST_EXIT_COOLDOWN_MS);
-        if (postExitCooldown.size() > POST_EXIT_MAX_SIZE) {
-            // Hard bound — drop oldest entries by timestamp
-            java.util.List<Map.Entry<String, Long>> sorted =
-                    new java.util.ArrayList<>(postExitCooldown.entrySet());
-            sorted.sort(Map.Entry.comparingByValue());
-            int toDrop = postExitCooldown.size() - POST_EXIT_MAX_SIZE;
-            for (int i = 0; i < toDrop && i < sorted.size(); i++) {
-                postExitCooldown.remove(sorted.get(i).getKey());
-            }
-        }
-    }
 
 
     /** [ДЫРА №1] CVD — устанавливается из SignalSender после вычисления накопленной дельты */
@@ -453,11 +427,6 @@ public final class DecisionEngineMerged {
 
 
 
-    private double getRelativeStrength(String symbol) {
-        Deque<Double> h = relStrengthHistory.get(symbol);
-        if (h == null || h.isEmpty()) return 0.5;
-        return h.stream().mapToDouble(Double::doubleValue).average().orElse(0.5);
-    }
 
     //  CLUSTER SCORE HOLDER
     //  Каждый кластер хранит свой лучший LONG и SHORT score
@@ -1197,20 +1166,6 @@ public final class DecisionEngineMerged {
     }
 
 
-    private void updateSymbolThreshold(String sym) {
-        Deque<CalibRecord> hist = calibHist.get(sym);
-        if (hist == null || hist.size() < 20) return;
-        long correct = hist.stream().filter(r -> r.correct).count();
-        double accuracy = (double) correct / hist.size();
-        double base = globalMinConf.get();
-        if (accuracy < 0.45)      base += 5.0;
-        else if (accuracy < 0.50) base += 2.5;
-        else if (accuracy > 0.65) base -= 3.0;
-        else if (accuracy > 0.60) base -= 1.5;
-        // compute() — атомарное обновление, безопасно при конкурентном доступе
-        final double newVal = clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL);
-        symbolMinConf.compute(sym, (k, cur) -> newVal);
-    }
 
 
 
@@ -1592,26 +1547,6 @@ public final class DecisionEngineMerged {
 
     //  COOLDOWN
 
-    /**
-     * [v24.0 FIX BUG-2] CHECK ONLY — does NOT set cooldown anymore.
-     * Old code set cooldown here (line 1295), so rejected signals burned the cooldown window.
-     * Valid signals coming 30s later were blocked because the rejected signal consumed the cooldown.
-     * Now cooldown is set ONLY through confirmSignal() after ISC approves.
-     */
-    private boolean cooldownAllowedEx(String sym, com.bot.TradingCore.Side side,
-                                      CoinCategory cat, long now, long shortOverrideMs) {
-        String key  = sym + "_" + side;
-        long   base;
-        if (side == com.bot.TradingCore.Side.SHORT && shortOverrideMs > 0) {
-            base = shortOverrideMs;
-        } else {
-            base = cat == CoinCategory.TOP  ? COOLDOWN_TOP :
-                    cat == CoinCategory.ALT  ? COOLDOWN_ALT : COOLDOWN_MEME;
-        }
-        Long last = cooldownMap.get(key);
-        // CHECK ONLY — removed: cooldownMap.put(key, now)
-        return last == null || now - last >= base;
-    }
 
 
 
@@ -1697,25 +1632,7 @@ public final class DecisionEngineMerged {
 
 
 
-    private boolean checkHH_HL(List<com.bot.TradingCore.Candle> c) {
-        if (c.size() < 15) return false;
-        int n = c.size();
-        double h1 = c.subList(n-15,n-8).stream().mapToDouble(x->x.high).max().orElse(0);
-        double h2 = c.subList(n-8, n).stream().mapToDouble(x->x.high).max().orElse(0);
-        double l1 = c.subList(n-15,n-8).stream().mapToDouble(x->x.low).min().orElse(0);
-        double l2 = c.subList(n-8, n).stream().mapToDouble(x->x.low).min().orElse(0);
-        return h2 > h1 && l2 > l1;
-    }
 
-    private boolean checkLL_LH(List<com.bot.TradingCore.Candle> c) {
-        if (c.size() < 15) return false;
-        int n = c.size();
-        double h1 = c.subList(n-15,n-8).stream().mapToDouble(x->x.high).max().orElse(0);
-        double h2 = c.subList(n-8, n).stream().mapToDouble(x->x.high).max().orElse(0);
-        double l1 = c.subList(n-15,n-8).stream().mapToDouble(x->x.low).min().orElse(0);
-        double l2 = c.subList(n-8, n).stream().mapToDouble(x->x.low).min().orElse(0);
-        return h2 < h1 && l2 < l1;
-    }
 
 
 
