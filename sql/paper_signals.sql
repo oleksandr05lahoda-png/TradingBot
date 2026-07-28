@@ -62,7 +62,10 @@ create table if not exists public.paper_signals (
             or (extract(epoch from recorded_at) * 1000)::bigint < entry_bar_open_ms
         ),
 
-    -- Исход дописывается одним UPDATE целиком: либо всё пусто, либо всё заполнено.
+    -- Исход целиком: либо всё пусто, либо всё заполнено. ВНИМАНИЕ: этот CHECK НЕ запрещает
+    -- вставить сигнал вместе с исходом — CHECK не отличает INSERT от UPDATE. Первая версия
+    -- этого файла утверждала обратное; проверка вставкой показала, что утверждение ложно.
+    -- Запрет вынесен в триггер ниже.
     constraint paper_signals_outcome_atomic_ck
         check (
             (resolved_at is null and exit_px is null and ret_net is null)
@@ -72,6 +75,31 @@ create table if not exists public.paper_signals (
     constraint paper_signals_exit_reason_ck
         check (exit_reason is null or exit_reason in ('stop','target','time_stop'))
 );
+
+-- Запрет вставлять сигнал вместе с исходом. CHECK этого не может (не видит разницы между
+-- INSERT и UPDATE), поэтому триггер. Именно раздельность записи и есть доказательство, что
+-- предсказание существовало до факта.
+create or replace function public.paper_signals_reject_outcome_on_insert()
+returns trigger
+language plpgsql
+as $$
+begin
+    if new.exit_bar_ms is not null or new.exit_px is not null or new.exit_reason is not null
+       or new.ret_gross is not null or new.fees is not null or new.funding is not null
+       or new.ret_net is not null or new.resolved_at is not null then
+        raise exception
+            'paper_signals: outcome columns must be NULL on INSERT — record the prediction first, '
+            'then write the outcome with a separate UPDATE (this is the evidence that the '
+            'prediction preceded the fact)'
+            using errcode = 'check_violation';
+    end if;
+    return new;
+end $$;
+
+drop trigger if exists paper_signals_no_outcome_on_insert on public.paper_signals;
+create trigger paper_signals_no_outcome_on_insert
+    before insert on public.paper_signals
+    for each row execute function public.paper_signals_reject_outcome_on_insert();
 
 -- ГЛАВНЫЙ КОНСТРЕЙНТ. "Holdout один раз на версию гипотезы" становится физически
 -- неотменяемым: второй прогон той же версии по holdout не вставится.
