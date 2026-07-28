@@ -105,6 +105,8 @@ public final class SupabaseSignalBridge {
      * The gate uses executor.isDemoEndpoint().
      */
     private final boolean useTestnet = executor.isTestnet();
+    /** [project_state id=25] Pre-trade risk layer. Wired for the full lifecycle — see feedRiskState(). */
+    private final RiskGuard guard = RiskGuard.getInstance();
     private volatile boolean bannerLogged = false;
     /** Last gate refusal already logged — poll() runs on a timer, so log each distinct reason once. */
     private volatile String lastGateLog = null;
@@ -154,6 +156,11 @@ public final class SupabaseSignalBridge {
                     + " key=" + (SUPABASE_KEY.isEmpty() ? "none" : "set"));
         }
 
+        // [project_state id=25] Feed RiskGuard's state from the exchange before anything reads it.
+        // Deliberately NOT wrapped in a "best effort" shrug: if these fail the feed goes stale and
+        // canTrade() refuses on staleness, which is the fail-closed outcome.
+        try { feedRiskState(); } catch (Exception e) { LOG.warning("[Bridge] feedRiskState: " + e.getMessage()); }
+
         // --- exposure-reducing, never gated ---
         try { reconcileSent(); } catch (Exception e) { LOG.warning("[Bridge] reconcile: " + e.getMessage()); }
         try { reconcileOpen(); } catch (Exception e) { LOG.warning("[Bridge] reconcileOpen: " + e.getMessage()); }
@@ -196,6 +203,68 @@ public final class SupabaseSignalBridge {
      * (IGNORED, then BLOCKED) and they alternate, so both are re-logged every poll. Known, not
      * fixed here — it is log noise, not a safety property.
      */
+    /**
+     * [project_state id=25] Hand a closed position back to RiskGuard with its realized PnL.
+     *
+     * Called from BOTH close paths — drainCloses() and reconcileOpen() — because a position that
+     * died on the exchange is just as closed as one we closed ourselves, and skipping either leaves
+     * its notional pinned against the aggregate cap and its loss invisible to the daily limit.
+     *
+     * PnL is derived from the exchange's own closing fills, not from our intent. When those cannot
+     * be read the position is still released, but it is charged the risk that was ACCEPTED when it
+     * opened — the distance to its stop — rather than zero. An unknown outcome must not read as
+     * "broke even": that is the direction that lets a bad day slip past the daily cap.
+     */
+    private void releaseToRiskGuard(String symbol, JSONObject row, long sinceMs) {
+        double notional = guard.openNotionalFor(symbol);
+        if (notional <= 0) return;                       // guard never booked it; nothing to release
+        double entryPx = row.optDouble("entry", 0);
+        double slPx    = row.optDouble("sl", 0);
+
+        double closePx = sinceMs > 0 ? executor.fetchRealizedClosingPrice(symbol, true, sinceMs) : 0.0;
+        if (closePx > 0 && entryPx > 0) {
+            guard.recordTradeClosed(symbol, notional * (closePx - entryPx) / entryPx);
+            return;
+        }
+        if (entryPx > 0 && slPx > 0 && slPx < entryPx) {
+            double assumed = -notional * (entryPx - slPx) / entryPx;
+            LOG.severe("[Bridge] " + symbol + ": realized close price unavailable — charging the"
+                    + " accepted stop risk $" + String.format("%.2f", assumed) + " instead of zero");
+            guard.recordTradeClosed(symbol, assumed);
+            return;
+        }
+        LOG.severe("[Bridge] " + symbol + ": cannot determine realized PnL and no usable stop on the"
+                + " row — releasing the slot with PnL 0, daily loss limit will UNDERSTATE this trade");
+        guard.recordTradeClosed(symbol, 0.0);
+    }
+
+    /** Epoch millis of an ISO timestamp column, or 0 when absent/unparseable. */
+    private static long rowEpochMs(String iso) {
+        if (iso == null || iso.isEmpty()) return 0L;
+        try { return java.time.OffsetDateTime.parse(iso).toInstant().toEpochMilli(); }
+        catch (Exception e) { return 0L; }
+    }
+
+    private void feedRiskState() {
+        double btc = executor.fetchMarkPrice("BTCUSDT");
+        if (btc > 0 && !Double.isNaN(btc)) {
+            guard.updateBtcPrice(btc);
+        } else {
+            LOG.warning("[Bridge] BTC mark price unavailable — RiskGuard feed left stale on purpose");
+        }
+
+        JSONArray pos = executor.fetchAllOpenPositionsRaw();
+        if (pos == null) {
+            LOG.warning("[Bridge] positionRisk read failed — open uPnL left at its previous value");
+            return;
+        }
+        double uPnl = 0.0;
+        for (int i = 0; i < pos.length(); i++) {
+            uPnl += pos.getJSONObject(i).optDouble("unRealizedProfit", 0.0);
+        }
+        guard.setOpenUnrealizedPnl(uPnl);
+    }
+
     private void gateLog(String msg) {
         if (msg.equals(lastGateLog)) return;
         lastGateLog = msg;
@@ -250,6 +319,10 @@ public final class SupabaseSignalBridge {
                     .put("closed_at", Instant.now().toString())
                     .put("exec_note", trunc("reconciled: flat on exchange (closed outside the bridge)", 300));
             sbPatch("/rest/v1/bot_orders?id=eq." + id + "&status=eq.open", body.toString());
+            // [project_state id=25] A position that died on the exchange still has to leave
+            // RiskGuard's books, or its notional stays counted against the aggregate cap forever
+            // and the daily PnL never sees the loss. Same accounting as an explicit close.
+            releaseToRiskGuard(symbol, o, rowEpochMs(o.optString("sent_at", "")));
             LOG.info("[Bridge] reconciled stale open id=" + id + " " + symbol + " -> closed (flat on exchange)");
         }
     }
@@ -264,6 +337,7 @@ public final class SupabaseSignalBridge {
         for (int i = 0; i < pend.length(); i++) {
             JSONObject o = pend.getJSONObject(i);
             long id = o.getLong("id");
+            String symbol = o.optString("symbol", "");
             String side = o.optString("side", "");
             if (!"LONG".equalsIgnoreCase(side)) {                 // LONG-ONLY guard at the wire
                 patch(id, "pending", "failed", "rejected: side=" + side + " (long-only bridge)");
@@ -288,8 +362,25 @@ public final class SupabaseSignalBridge {
                 double bal = executor.fetchAvailableBalance();
                 if (bal <= 0) { patch(id, "sent", "failed", "balance fetch failed (" + bal + ") — order not sized"); continue; }
                 if (BAL_PER_LEG > 0 && bal > BAL_PER_LEG) bal = BAL_PER_LEG;
+
+                // [project_state id=25] Pre-trade gate. The incoming size is bounded by the
+                // executor's own ceiling rather than guessed, so the aggregate check can never
+                // understate what this order would add.
+                double incoming = executor.plannedNotionalCeilingUsd(bal);
+                RiskGuard.Decision d = guard.canTrade(symbol, bal, incoming);
+                if (!d.allowed) {
+                    LOG.warning("[Bridge] RiskGuard BLOCKED " + symbol + ": " + d.reason
+                            + (d.hint == null || d.hint.isEmpty() ? "" : " — " + d.hint));
+                    patch(id, "sent", "failed", "riskguard: " + d.reason
+                            + (d.hint == null || d.hint.isEmpty() ? "" : " — " + d.hint));
+                    continue;
+                }
+
                 BinanceTradeExecutor.ExecutionResult r = executor.openPositionWithSl(idea, bal);
                 if (r != null && r.success) {
+                    // ACTUAL fill, not the intended size: notionalUsd is qty x actualEntry, both
+                    // read back from the order response (principle id=34).
+                    guard.recordTradeOpened(symbol, r.notionalUsd);
                     patch(id, "sent", "open", String.format("opened notional=$%.2f qty=%.6f tps=%d mult req=%.2f applied=%.2f",
                             r.notionalUsd, r.qty, r.tpsPlaced, reqMult, idea.getExecutorSizeMultiplier()));
                 } else {
@@ -326,7 +417,9 @@ public final class SupabaseSignalBridge {
             String symbol = o.optString("symbol", "");
             if (!symbol.matches("^[A-Z0-9]{2,20}USDT$")) { patch(id, "close_requested", "failed", "bad symbol: " + symbol); continue; }
             if (!claimClose(id)) continue;                        // CAS close_requested -> close_sent
+            long sinceMs = rowEpochMs(o.optString("sent_at", ""));
             boolean closed = executor.closePosition(symbol, "supabase-bridge");  // reduce-only, fail-closed
+            if (closed) releaseToRiskGuard(symbol, o, sinceMs);
             patch(id, "close_sent", closed ? "closed" : "failed", closed ? "closed reduce-only" : "close failed (verify exchange)");
         }
     }

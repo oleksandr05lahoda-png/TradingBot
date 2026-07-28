@@ -538,6 +538,17 @@ public final class BinanceTradeExecutor {
     public double getMaxNotionalUsd() { return maxNotionalUsd; }
 
     /**
+     * The largest notional a single open can reach at this balance, after both ceilings.
+     *
+     * A pre-trade risk check has to bound the incoming position BEFORE sizing happens, and the
+     * bound must not understate it — so this is the ceiling, not an estimate (project_state id=25).
+     */
+    public double plannedNotionalCeilingUsd(double balanceUsd) {
+        double byPct = balanceUsd * (maxNotionalPct / 100.0);
+        return maxNotionalUsd > 0 ? Math.min(byPct, maxNotionalUsd) : byPct;
+    }
+
+    /**
      * [project_state id=32b] The most a single trade can actually lose to its stop, in dollars.
      *
      * riskPctPerTrade only seeds the quantity; EXEC_MAX_NOTIONAL_PCT and EXEC_MAX_NOTIONAL_USD then

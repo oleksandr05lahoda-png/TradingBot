@@ -145,6 +145,12 @@ public final class RiskGuard {
      * Total open notional this guard currently believes is live, in USD.
      * Fed by recordTradeOpened/recordTradeClosed — see their contract about ACTUAL fills.
      */
+    /** Notional this guard recorded for {@code symbol} at open, or 0 when it holds no position. */
+    public synchronized double openNotionalFor(String symbol) {
+        Double v = openPositions.get(symbol);
+        return v == null ? 0.0 : v;
+    }
+
     public synchronized double openNotionalUsd() {
         double s = 0;
         for (double v : openPositions.values()) s += v;
