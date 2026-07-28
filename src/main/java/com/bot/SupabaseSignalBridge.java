@@ -80,11 +80,19 @@ public final class SupabaseSignalBridge {
      *   2. isSleeveApproved() enforced fail-closed in this class against strategy_trials.passed_v2;
      *   3. at least one sleeve with strategy_trials.passed_v2 = true AND lab_forward_status.forward_ok = true
      *      (as of 2026-07-28: 63 trials with 0 passed, 23 forward rows with 0 ok — zero sleeves qualify);
-     *   4. operator sign-off recorded in public.project_state.
+     *   4. RiskGuard wired into drainOpens() — canTrade() consulted before opening,
+     *      recordTradeOpened/recordTradeClosed driving its state — and covered by a test that
+     *      proves an order is refused once the daily loss limit is breached (project_state id=25).
+     *      Today RiskGuard constrains nothing: it is instantiated in BotMain and never called;
+     *   5. operator sign-off recorded in public.project_state.
      */
     static final String REAL_UNLOCK_REQUIREMENTS =
             "real endpoint is locked in code — see SupabaseSignalBridge.REAL_UNLOCK_REQUIREMENTS "
-          + "(paper-harness + isSleeveApproved + a sleeve with passed_v2 & forward_ok + operator sign-off)";
+          + "(paper-harness + isSleeveApproved + a sleeve with passed_v2 & forward_ok "
+          + "+ RiskGuard wired to drainOpens and tested + operator sign-off)";
+
+    /** The only cap actually enforced on the live path today — read by the BotMain boot banner. */
+    static int maxOpen() { return MAX_OPEN; }
 
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     private final BinanceTradeExecutor executor = BinanceTradeExecutor.getInstance();

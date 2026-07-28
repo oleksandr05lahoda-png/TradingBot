@@ -496,20 +496,24 @@ public final class BotMain {
                 + (OBSERVATION_MODE ? "ON/PAPER" : "OFF/LIVE")
                 + ", X-EXCHANGE_CHECK=" + (CROSS_EXCHANGE_VALIDATION ? "ON" : "OFF") + ") ═══");
 
-        // [v83 PHASE-1] Force RiskGuard to load now so we see its init line in
-        // logs even before any trading code calls it. RiskGuard is a no-op at
-        // this stage — it only gets wired into BotMain.Dispatcher in PHASE-3.
-        // This call is just "ping, are you there" and prints status.
+        // [project_state id=22] RiskGuard is instantiated here and NOWHERE ELSE calls it.
+        // canTrade / recordTradeOpened / recordTradeClosed / updateBtcPrice are unreachable
+        // from every live root, so the daily and weekly loss limits, MAX_CONCURRENT_POSITIONS,
+        // the BTC-crash block and the cooldowns constrain NOTHING today. The old comment here
+        // said RiskGuard "only gets wired into BotMain.Dispatcher in PHASE-3" — that Dispatcher
+        // was deleted in v88.2, so the wiring it was waiting for is never coming.
+        // Wiring it to SupabaseSignalBridge.drainOpens() is project_state id=25, on its own
+        // branch. Until then this line is a status print, not a guarantee.
         try {
             com.bot.RiskGuard rg = com.bot.RiskGuard.getInstance();
-            LOG.info("[BOOT] " + rg.statusLine());
+            LOG.info("[BOOT] RiskGuard (NOT ENFORCED — see project_state id=25): " + rg.statusLine());
         } catch (Throwable t) {
             LOG.warning("[BOOT] RiskGuard init failed: " + t.getMessage());
         }
 
-        // [v83 PHASE-3] Initialize Executor + Tracker. They are no-ops until
-        // BOT_AUTO_TRADE=1 AND OBSERVATION_MODE=0. Even then, every trade
-        // passes through RiskGuard.canTrade() first.
+        // Initialize the executor. It is a no-op until BOT_AUTO_TRADE=1 AND OBSERVATION_MODE=0.
+        // The only limit that actually applies on the live path is BRIDGE_MAX_OPEN inside
+        // SupabaseSignalBridge; RiskGuard.canTrade() is NOT consulted (project_state id=22).
         try {
             com.bot.BinanceTradeExecutor ex = com.bot.BinanceTradeExecutor.getInstance();
             // Wire emergency-close failure alerts to Telegram. If SL placement
@@ -534,24 +538,19 @@ public final class BotMain {
                         + (ex.isTestnet() ? "TESTNET" : "REAL/LIVE")
                         + " leverage=" + ex.getLeverage()
                         + "x risk=" + ex.getRiskPct() + "%");
-                // Pull actual limits from RiskGuard so Telegram boot banner
-                // reflects any env overrides.
-                com.bot.RiskGuard rg = com.bot.RiskGuard.getInstance();
-                int    dailyLim     = rg.getDailyTradeLimit();
-                int    concurrentLim= rg.getMaxConcurrentPositions();
-                double dlPct        = rg.getDailyLossLimitPct();
-                double wlPct        = rg.getWeeklyLossLimitPct();
-                String dailyStr     = (dailyLim     >= 1000) ? "∞" : String.valueOf(dailyLim);
-                String concurrentStr= (concurrentLim>= 1000) ? "∞" : String.valueOf(concurrentLim);
+                // [project_state id=22] The RiskGuard limits used to be printed here, which
+                // advertised protection that is not applied to any trade — canTrade() is never
+                // called. Stating them is worse than silence, so the banner now reports only
+                // what is actually enforced.
                 telegram.sendMessageAsync(String.format(
                         "🤖 *Auto-trade АКТИВИРОВАН*\n" +
                                 "Режим: %s\n" +
                                 "Плечо: %dx | Риск: %.1f%%/сделка\n" +
-                                "Защиты: dailyLoss -%.0f%%, weeklyLoss -%.0f%%, max %s сделок/день, max %s одновременно\n" +
-                                "_Любая сделка → автоматическая остановка при срабатывании защит._",
+                                "⚠️ Риск-лимиты RiskGuard НЕ применяются (project_state id=25).\n" +
+                                "Единственное ограничение на живом пути — не более %d открытых позиций из очереди.",
                         ex.isTestnet() ? "🧪 TESTNET" : "🔴 REAL/LIVE",
                         ex.getLeverage(), ex.getRiskPct(),
-                        dlPct, wlPct, dailyStr, concurrentStr));
+                        (int) SupabaseSignalBridge.maxOpen()));
             } else if (AUTO_TRADE_ENABLED && OBSERVATION_MODE) {
                 LOG.warning("[BOOT] BOT_AUTO_TRADE=1 but OBSERVATION_MODE=1 — paper wins, no live trades.");
             } else if (AUTO_TRADE_ENABLED && !ex.isReady()) {
