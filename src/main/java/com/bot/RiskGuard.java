@@ -92,6 +92,14 @@ public final class RiskGuard {
      * per trade, and twenty alts opened in one window behave as a single position anyway.
      */
     private final double MAX_AGGREGATE_NOTIONAL_PCT;
+    /*
+     * WHICH CAP ACTUALLY BINDS. With RG_MAX_CONCURRENT_POSITIONS at its default of 1, the position
+     * COUNT refuses the second position before the aggregate cap is ever reached, so in live mode
+     * the aggregate cap does not bind. It takes effect in two situations: under OBSERVATION_MODE,
+     * where the count check is skipped on purpose, and once the count limit is raised. Not a
+     * defect — recorded so nobody later reads a passing aggregate check as proof it was tested.
+     * A unit test asserted the opposite and was wrong (project_state id=25).
+     */
     /**
      * OBSERVATION_MODE, read here rather than through BotMain.OBSERVATION_MODE.
      *
