@@ -117,6 +117,48 @@ class PaperExecutorTest {
     }
 
     @Test
+    @DisplayName("funding is signed by SIDE: long pays what short receives, exactly")
+    void fundingIsSignedBySide() {
+        // project_state id=43: funding on this universe is positive 72.5% of the time, averaging
+        // 3.85% annualised. If shorts were charged instead of credited they would be understated by
+        // about 7.7% a year — enough to invert the sign of any result with a small edge. So this
+        // asserts the symmetry directly rather than trusting the comment above the loop.
+        List<Bar> series = new ArrayList<>();
+        series.add(bar(0, 100, 100, 100, 100));
+        for (int i = 1; i <= 12; i++) series.add(bar(i * H, 100, 100.5, 99.5, 100));
+
+        List<PaperExecutor.FundingPoint> positiveRate =
+                List.of(new PaperExecutor.FundingPoint(9 * H, 0.0010));   // longs pay 10bp
+
+        Signal longS  = new Signal("BTCUSDT", Signal.Side.LONG,  H,  1.0, 0.0, 1.0, "t");
+        Signal shortS = new Signal("BTCUSDT", Signal.Side.SHORT, H, 999.0, 0.0, 1.0, "t");
+
+        PaperExecutor.Fill fl = exec.simulate(longS,  series, positiveRate, 10);
+        PaperExecutor.Fill fs = exec.simulate(shortS, series, positiveRate, 10);
+
+        assertEquals(0.0010, fl.funding, EPS, "the long PAYS a positive rate: a positive cost");
+        assertEquals(-0.0010, fs.funding, EPS, "the short RECEIVES it: a negative cost");
+        assertEquals(-fl.funding, fs.funding, EPS, "equal magnitude, opposite sign");
+        assertNotEquals(fl.funding, fs.funding, "funding must not be charged to both sides alike");
+    }
+
+    @Test
+    @DisplayName("a settlement exactly on the entry bar's open is not ours")
+    void settlementAtEntryOpenIsExcluded() {
+        // It accrued over the interval before the position existed. Binance settles on 4h
+        // boundaries, so this lands on a real bar edge rather than a contrived one.
+        List<Bar> series = new ArrayList<>();
+        series.add(bar(0, 100, 100, 100, 100));
+        for (int i = 1; i <= 6; i++) series.add(bar(i * H, 100, 100.5, 99.5, 100));
+
+        Signal s = new Signal("BTCUSDT", Signal.Side.LONG, H, 1.0, 0.0, 1.0, "t");
+        PaperExecutor.Fill f = exec.simulate(s, series,
+                List.of(new PaperExecutor.FundingPoint(H, 0.0010)), 4);   // exactly at entry open
+
+        assertEquals(0.0, f.funding, EPS, "must not charge a settlement from before the entry");
+    }
+
+    @Test
     @DisplayName("a signal with no bar after it is not a trade")
     void unresolvableSignalReturnsNull() {
         List<Bar> series = new ArrayList<>();

@@ -164,11 +164,16 @@ public final class CarryPaperExecutor {
 
         // The SHORT perp leg collects funding when the rate is positive, so a positive rate is a
         // negative cost. The spot leg has no funding. Signed to match paper_signals.funding, where
-        // positive always means "it cost us".
+        // positive always means "it cost us" — the same convention PaperExecutor uses.
+        //
+        // Window is half-open, (entryOpen, exitClose], identical to PaperExecutor and to the flip
+        // detection above: a settlement exactly on the entry bar's open accrued before we held the
+        // position. The accrual used to be inclusive at the start while the flip check was not,
+        // so a settlement at that instant was charged but could never end the trade.
         double fundingCost = 0.0;
         if (funding != null) {
             for (PaperExecutor.FundingPoint fp : funding) {
-                if (fp.timeMs >= entryBar.openMs && fp.timeMs <= exitBar.closeMs) {
+                if (fp.timeMs > entryBar.openMs && fp.timeMs <= exitBar.closeMs) {
                     fundingCost -= fp.rate;
                 }
             }

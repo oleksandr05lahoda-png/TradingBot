@@ -110,6 +110,7 @@ public final class PaperStore {
                                  String universeId, Signal s, long entryBarOpenMs, double entryPx,
                                  boolean isForward, String prevHash) throws Exception {
         JSONObject body = new JSONObject()
+                .put("kind", "directional")
                 .put("hypothesis_name", hypothesisName)
                 .put("hypothesis_version", hypothesisVersion)
                 .put("mode", mode)
@@ -132,6 +133,74 @@ public final class PaperStore {
         JSONArray a = new JSONArray(r.body());
         if (a.isEmpty()) throw new IllegalStateException("insertPrediction returned no row");
         return a.getJSONObject(0).getLong("id");
+    }
+
+    /**
+     * Write a delta-neutral carry prediction, with NO outcome.
+     *
+     * side is SHORT because the perp leg defines the position; stop_px is left NULL, which the
+     * schema now permits for kind='carry' — a carry has no stop, and inventing one to satisfy a
+     * constraint would journal a protective level that never existed. entry_px carries the perp
+     * fill so the directional columns stay meaningful, and both legs go in their own columns:
+     * paper_signals_carry_legs_ck rejects the row otherwise.
+     */
+    public long insertCarryPrediction(String hypothesisName, String hypothesisVersion, String mode,
+                                      String universeId, CarryPosition pos,
+                                      CarryPaperExecutor.Fill f, boolean isForward, String prevHash)
+            throws Exception {
+        JSONObject body = new JSONObject()
+                .put("kind", "carry")
+                .put("hypothesis_name", hypothesisName)
+                .put("hypothesis_version", hypothesisVersion)
+                .put("mode", mode)
+                .put("universe_id", universeId)
+                .put("symbol", pos.symbol)
+                .put("side", "SHORT")
+                .put("signal_bar_close_ms", pos.signalBarCloseMs)
+                .put("entry_bar_open_ms", f.entryBarOpenMs)
+                .put("entry_px", f.perpEntryPx)
+                .put("perp_entry_px", f.perpEntryPx)
+                .put("spot_entry_px", f.spotEntryPx)
+                .put("basis_entry_bp", f.basisEntryBp)
+                .put("is_forward", isForward);
+        if (prevHash != null) body.put("prev_hash", prevHash);
+        body.put("row_hash", chainHash(prevHash, body));
+
+        HttpResponse<String> r = send("POST", "/rest/v1/paper_signals", body.toString(), true);
+        if (r.statusCode() / 100 != 2) {
+            throw new IllegalStateException("insertCarryPrediction HTTP " + r.statusCode() + ": " + r.body());
+        }
+        JSONArray a = new JSONArray(r.body());
+        if (a.isEmpty()) throw new IllegalStateException("insertCarryPrediction returned no row");
+        return a.getJSONObject(0).getLong("id");
+    }
+
+    /**
+     * Write a carry outcome. Separate operation, always.
+     *
+     * Both exit legs are required by paper_signals_carry_exit_legs_ck: without them the two-legged
+     * P&amp;L could not be reconstructed from the row, and ret_net would have to be taken on trust.
+     * ret_gross, fees and funding go with it for the same reason — the atomic check now demands
+     * every term, so ret_net can always be re-derived rather than believed.
+     */
+    public void updateCarryOutcome(long id, CarryPaperExecutor.Fill f) throws Exception {
+        JSONObject body = new JSONObject()
+                .put("exit_bar_ms", f.exitBarMs)
+                .put("exit_px", f.perpExitPx)
+                .put("perp_exit_px", f.perpExitPx)
+                .put("spot_exit_px", f.spotExitPx)
+                .put("basis_exit_bp", f.basisExitBp)
+                .put("exit_reason", f.exitReason.name())
+                .put("ret_gross", f.retGross)
+                .put("fees", f.fees)
+                .put("funding", f.funding)
+                .put("ret_net", f.retNet)
+                .put("resolved_at", java.time.Instant.now().toString());
+        HttpResponse<String> r = send("PATCH", "/rest/v1/paper_signals?id=eq." + id
+                + "&resolved_at=is.null", body.toString(), false);
+        if (r.statusCode() / 100 != 2) {
+            throw new IllegalStateException("updateCarryOutcome HTTP " + r.statusCode() + ": " + r.body());
+        }
     }
 
     /** Write the outcome onto an existing prediction. Separate operation, always. */

@@ -132,14 +132,22 @@ public final class PaperExecutor {
 
         double fees = 2.0 * PAPER_TAKER_FEE;
 
-        // Every settlement inside the holding window is charged. A long pays a positive rate; a
-        // short receives it, so the sign flips. Held over 25h across 8h settlements => 3 accruals.
+        // SIGNED BY SIDE, not subtracted unconditionally. A long pays a positive rate, a short
+        // receives it. Funding on this universe is positive 72.5% of the time and averages 3.85%
+        // annualised (project_state id=43), so charging shorts instead of crediting them would
+        // understate every short by roughly 7.7% a year — enough to invert the sign of any result
+        // with a small edge. `funding` is stored as a COST: positive means it cost us.
+        //
+        // Window is half-open, (entryOpen, exitClose]. A settlement landing exactly on the entry
+        // bar's open covers the interval BEFORE the position existed, so it is not ours. Binance
+        // settles on 4h boundaries, so this is a real case rather than a corner one, and
+        // CarryPaperExecutor uses the identical rule.
         double fundingCost = 0.0;
         if (funding != null) {
             long from = entryBar.openMs;
             long to   = exitBar.closeMs;
             for (FundingPoint fp : funding) {
-                if (fp.timeMs >= from && fp.timeMs <= to) {
+                if (fp.timeMs > from && fp.timeMs <= to) {
                     fundingCost += isLong ? fp.rate : -fp.rate;
                 }
             }
