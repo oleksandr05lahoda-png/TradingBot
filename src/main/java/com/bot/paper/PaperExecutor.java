@@ -87,6 +87,15 @@ public final class PaperExecutor {
         if (entryIdx < 0) return null;                 // nothing after the signal bar — no trade
 
         Bar entryBar = series.get(entryIdx);
+        // The entry bar must be the IMMEDIATELY following one. Across a hole in the series the
+        // search above lands on a bar a full interval or more later, which is a different trade
+        // from the one that was pre-registered — entering hours after the decision, at a price the
+        // decision never saw. Refuse instead of quietly filling it; the database rejects such a row
+        // anyway (paper_signals_entry_after_signal_ck), and a mid-run abort is a worse way to find
+        // out than no trade at all.
+        if (entryBar.openMs - signal.signalBarCloseMs >= entryBar.closeMs - entryBar.openMs) {
+            return null;
+        }
         boolean isLong = signal.side == Signal.Side.LONG;
         double slip = PAPER_SLIPPAGE_BP / 10_000.0;
 

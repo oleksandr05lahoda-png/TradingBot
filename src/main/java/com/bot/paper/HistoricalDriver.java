@@ -228,7 +228,7 @@ public final class HistoricalDriver {
                 // TWO operations. The prediction first, on its own; the outcome afterwards. The
                 // database now refuses to take them together, so this cannot regress silently.
                 long id = store.insertPrediction(h.name(), h.version(), c.mode.dbValue,
-                        c.universeId, s, f.entryBarOpenMs, f.entryPx, false, prevHash);
+                        c.universeId, s, f.entryBarOpenMs, f.entryPx, intervalMs, false, prevHash);
                 store.updateOutcome(id, f);
                 prevHash = store.lastHash(h.name(), h.version(), c.mode.dbValue);
                 written++;
@@ -317,7 +317,7 @@ public final class HistoricalDriver {
                 if (f == null) { unresolved++; continue; }
 
                 long id = store.insertCarryPrediction(h.name(), h.version(), c.mode.dbValue,
-                        c.universeId, p, f, false, prevHash);
+                        c.universeId, p, f, intervalMs, false, prevHash);
                 store.updateCarryOutcome(id, f);
                 prevHash = store.lastHash(h.name(), h.version(), c.mode.dbValue);
                 written++;

@@ -98,6 +98,13 @@ public final class CarryPaperExecutor {
         if (entryIdx < 0) return null;
 
         Bar perpEntryBar = perpSeries.get(entryIdx);
+        // Same rule as the directional path: the entry bar must be the immediately following one.
+        // Across a hole in the series this would otherwise enter a full interval or more late — a
+        // different trade from the pre-registered one, and a row the database rejects.
+        if (perpEntryBar.openMs - pos.signalBarCloseMs
+                >= perpEntryBar.closeMs - perpEntryBar.openMs) {
+            return null;
+        }
         Bar spotEntryBar = findByOpenMs(spotSeries, perpEntryBar.openMs);
         if (spotEntryBar == null) return null;          // no hedge available at entry — not a trade
 

@@ -137,9 +137,11 @@ public final class PaperStore {
      */
     public long insertPrediction(String hypothesisName, String hypothesisVersion, String mode,
                                  String universeId, Signal s, long entryBarOpenMs, double entryPx,
-                                 boolean isForward, String prevHash) throws Exception {
+                                 long barIntervalMs, boolean isForward, String prevHash)
+            throws Exception {
         JSONObject body = new JSONObject()
                 .put("kind", "directional")
+                .put("bar_interval_ms", barIntervalMs)
                 .put("hypothesis_name", hypothesisName)
                 .put("hypothesis_version", hypothesisVersion)
                 .put("mode", mode)
@@ -175,10 +177,12 @@ public final class PaperStore {
      */
     public long insertCarryPrediction(String hypothesisName, String hypothesisVersion, String mode,
                                       String universeId, CarryPosition pos,
-                                      CarryPaperExecutor.Fill f, boolean isForward, String prevHash)
+                                      CarryPaperExecutor.Fill f, long barIntervalMs,
+                                      boolean isForward, String prevHash)
             throws Exception {
         JSONObject body = new JSONObject()
                 .put("kind", "carry")
+                .put("bar_interval_ms", barIntervalMs)
                 .put("hypothesis_name", hypothesisName)
                 .put("hypothesis_version", hypothesisVersion)
                 .put("mode", mode)
