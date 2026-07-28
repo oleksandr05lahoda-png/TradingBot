@@ -487,23 +487,27 @@ public final class BotMain {
                                 + (SupabaseSignalBridge.isEnabled() ? ", мост ВКЛЮЧЁН" : ", мост выключен") + ").\n" +
                                 "_Стратегии пишут в очередь после прохождения своих гейтов._");
             } else if (AUTO_TRADE_ENABLED && !OBSERVATION_MODE && ex.isReady()) {
-                LOG.info("[BOOT] Auto-trade ENABLED. Mode: "
-                        + (ex.isTestnet() ? "TESTNET" : "REAL/LIVE")
-                        + " leverage=" + ex.getLeverage()
-                        + "x risk=" + ex.getRiskPct() + "%");
-                // [project_state id=22] The RiskGuard limits used to be printed here, which
-                // advertised protection that is not applied to any trade — canTrade() is never
-                // called. Stating them is worse than silence, so the banner now reports only
-                // what is actually enforced.
+                LOG.info("[BOOT] Auto-trade ENABLED. host=" + ex.endpointHost()
+                        + " leverage=" + ex.getLeverage() + "x"
+                        + " notionalCap=min(" + ex.getMaxNotionalPct() + "%, $" + ex.getMaxNotionalUsd() + ")");
+                // [project_state id=22] RiskGuard limits are not printed: canTrade() is never
+                // called, so stating them advertises protection that does not apply.
+                // [project_state id=32b] The risk percentage is not printed either. It only seeds
+                // the sizing; EXEC_MAX_NOTIONAL_PCT and EXEC_MAX_NOTIONAL_USD then truncate the
+                // notional, so on a $1000 balance the $6 default caps a 2%-stop trade at about
+                // $0.12 of risk, not $20. The banner states the ceilings that actually bind.
                 telegram.sendMessageAsync(String.format(
                         "🤖 *Auto-trade АКТИВИРОВАН*\n" +
-                                "Режим: %s\n" +
-                                "Плечо: %dx | Риск: %.1f%%/сделка\n" +
+                                "Эндпоинт: %s (%s)\n" +
+                                "Плечо: %dx\n" +
+                                "Потолок нотионала: min(%.0f%% баланса, $%.2f) — он и определяет риск,\n" +
+                                "убыток по стопу ≈ нотионал × дистанция стопа.\n" +
                                 "⚠️ Риск-лимиты RiskGuard НЕ применяются (project_state id=25).\n" +
-                                "Единственное ограничение на живом пути — не более %d открытых позиций из очереди.",
-                        ex.isTestnet() ? "🧪 TESTNET" : "🔴 REAL/LIVE",
-                        ex.getLeverage(), ex.getRiskPct(),
-                        (int) SupabaseSignalBridge.maxOpen()));
+                                "Ограничение на живом пути — не более %d открытых позиций из очереди.",
+                        ex.endpointHost(), ex.isDemoEndpoint() ? "demo" : "🔴 НЕ demo",
+                        ex.getLeverage(),
+                        ex.getMaxNotionalPct(), ex.getMaxNotionalUsd(),
+                        SupabaseSignalBridge.maxOpen()));
             } else if (AUTO_TRADE_ENABLED && OBSERVATION_MODE) {
                 LOG.warning("[BOOT] BOT_AUTO_TRADE=1 but OBSERVATION_MODE=1 — paper wins, no live trades.");
             } else if (AUTO_TRADE_ENABLED && !ex.isReady()) {

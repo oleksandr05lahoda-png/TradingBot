@@ -113,7 +113,14 @@ public final class BinanceTradeExecutor {
     private final String  apiKey;
     private final String  apiSecret;
     private final int     leverage;            // 1..10 hard cap
-    private final double  riskPctPerTrade;     // 0.5..5.0 hard cap
+    private final double  riskPctPerTrade;     // 0.5..5.0 hard cap — a SIZING SEED, not realized risk
+    /**
+     * [project_state id=32b] Notional ceilings, read once here rather than at each sizing call.
+     * These bind AFTER riskPctPerTrade has sized the position, so they, not the risk percentage,
+     * determine what is actually risked on a trade.
+     */
+    private final double  maxNotionalPct;      // EXEC_MAX_NOTIONAL_PCT, % of balance
+    private final double  maxNotionalUsd;      // EXEC_MAX_NOTIONAL_USD, absolute $ ceiling (0 = off)
     private final long    slPlacementTimeoutMs;
     private final double  maxSpreadPct;
 
@@ -232,6 +239,8 @@ public final class BinanceTradeExecutor {
         // Risk per trade: floor 0.05%, ceiling 5%. Floor prevents accidental 0%
         // (zeroes-out qty calc); ceiling caps overcommit.
         this.riskPctPerTrade = Math.max(0.05, Math.min(5.0, rp));
+        this.maxNotionalPct  = envDouble("EXEC_MAX_NOTIONAL_PCT", 20.0);
+        this.maxNotionalUsd  = envDouble("EXEC_MAX_NOTIONAL_USD", 6.0);
         if (rp < 0.05 && rp > 0) {
             LOG.warning("[Executor] RISK_PCT_PER_TRADE=" + rp + " requested (below 0.05% floor), using 0.05%");
         } else if (rp > 5.0) {
@@ -517,7 +526,28 @@ public final class BinanceTradeExecutor {
         return !h.isEmpty() && DEMO_HOSTS.contains(h);
     }
     public int  getLeverage()    { return leverage; }
+    /** SIZING SEED only. The notional ceilings below bind afterwards — see {@link #realizedRiskCeilingUsd}. */
     public double getRiskPct()   { return riskPctPerTrade; }
+    public double getMaxNotionalPct() { return maxNotionalPct; }
+    public double getMaxNotionalUsd() { return maxNotionalUsd; }
+
+    /**
+     * [project_state id=32b] The most a single trade can actually lose to its stop, in dollars.
+     *
+     * riskPctPerTrade only seeds the quantity; EXEC_MAX_NOTIONAL_PCT and EXEC_MAX_NOTIONAL_USD then
+     * truncate the notional, so on a $1000 balance with the $6 default the advertised "risk=2.0%"
+     * ($20) is unreachable — the loss is bounded by notional x stop distance, i.e. $6 x slPct.
+     *
+     * @param balanceUsd account balance the sizing would use
+     * @param slDistPct  stop distance as a fraction of entry (0.02 = 2%)
+     * @return dollars at risk if the stop fills, after every cap
+     */
+    public double realizedRiskCeilingUsd(double balanceUsd, double slDistPct) {
+        double byRisk     = balanceUsd * (riskPctPerTrade / 100.0);
+        double byPctCap   = balanceUsd * (maxNotionalPct / 100.0) * slDistPct;
+        double byAbsCap   = maxNotionalUsd > 0 ? maxNotionalUsd * slDistPct : Double.MAX_VALUE;
+        return Math.min(byRisk, Math.min(byPctCap, byAbsCap));
+    }
 
     // [HELD pending project_state id=25] Unreachable today (PositionTracker era), but NOT
     // deleted: wiring RiskGuard into the bridge needs position tracking and will call back
@@ -868,7 +898,6 @@ public final class BinanceTradeExecutor {
             // Теперь нижний потолок капа = minNotional + 2 шага qty (в $), что
             // ГАРАНТИРУЕТ: после округления qty вниз нотионал останется > minNotional.
             // Защита от over-size (20%-кап) на нормальном балансе не меняется.
-            double maxNotionalPct = envDouble("EXEC_MAX_NOTIONAL_PCT", 20.0);
             double maxNotional = balanceUsd * (maxNotionalPct / 100.0);
             double stepNotional = si.stepSize * entry; // стоимость одного шага qty в $
             double minTradable = si.minNotional + 2.0 * stepNotional; // min + 2 шага запаса
@@ -888,9 +917,8 @@ public final class BinanceTradeExecutor {
             // defeated by minNotional on a small balance, so add a hard USD ceiling. Default $6
             // (just above the $5 alt minNotional) → exactly one small position fits; high-min
             // symbols (ETH $20 / BTC $100) then correctly fail the minNotional check below.
-            double absCapUsd = envDouble("EXEC_MAX_NOTIONAL_USD", 6.0);
-            if (absCapUsd > 0 && notional > absCapUsd && entry > 0) {
-                qty = absCapUsd / entry;
+            if (maxNotionalUsd > 0 && notional > maxNotionalUsd && entry > 0) {
+                qty = maxNotionalUsd / entry;
                 notional = qty * entry;
             }
 
