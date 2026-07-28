@@ -99,7 +99,11 @@ public final class SupabaseSignalBridge {
         return ENABLED && !SUPABASE_URL.isEmpty() && !SUPABASE_KEY.isEmpty();
     }
 
-    /** One poll cycle: reconcile orphans, place pending opens, process requested closes. */
+    /**
+     * One poll cycle: reconcile 'sent' orphans, reconcile 'open' ghosts, place pending opens,
+     * process requested closes. reconcileOpen() runs BEFORE drainOpens() so capacity freed by a
+     * position that died on the exchange is usable in the same cycle.
+     */
     public void poll() {
         if (!isEnabled()) return;
         if (!executionAllowed()) return;
@@ -111,6 +115,7 @@ public final class SupabaseSignalBridge {
                     + " key=" + (SUPABASE_KEY.isEmpty() ? "none" : "set"));
         }
         try { reconcileSent(); } catch (Exception e) { LOG.warning("[Bridge] reconcile: " + e.getMessage()); }
+        try { reconcileOpen(); } catch (Exception e) { LOG.warning("[Bridge] reconcileOpen: " + e.getMessage()); }
         try { drainOpens();   } catch (Exception e) { LOG.warning("[Bridge] drainOpens: " + e.getMessage()); }
         try { drainCloses();  } catch (Exception e) { LOG.warning("[Bridge] drainCloses: " + e.getMessage()); }
     }
@@ -165,6 +170,38 @@ public final class SupabaseSignalBridge {
             if (Double.isNaN(amt)) continue;                           // do NOT guess; retry next sweep
             if (Math.abs(amt) > 1e-9) patch(id, "open",   "reconciled: adopted live position qty=" + amt);
             else                      patch(id, "failed", "reconciled: no position on exchange");
+        }
+    }
+
+    /**
+     * Reconcile 'open' rows against the exchange. A position closed ON THE EXCHANGE — stop, take-profit,
+     * manual intervention, liquidation — leaves its row 'open' forever, because nothing else transitions
+     * it: drainCloses() only ever looks at close_requested. Those ghosts inflate countActive() until it
+     * reaches BRIDGE_MAX_OPEN and the bridge silently stops opening anything (project_state id=3;
+     * bot_orders id=1 sat 'open' for 20 days after the operator closed it by hand).
+     *
+     * Conservative by construction: only a SUCCESSFUL read showing flat closes the row; a failed read
+     * (NaN) is left for the next sweep. The PATCH is conditional on the row still being 'open', so it
+     * cannot clobber a close_requested raced in by the live_time_closer cron between GET and PATCH.
+     */
+    private void reconcileOpen() throws Exception {
+        String cutoff = Instant.now().minusSeconds(120).toString();
+        JSONArray live = sbGet("/rest/v1/bot_orders?status=eq.open&testnet=eq." + useTestnet
+                + "&sent_at=lt." + enc(cutoff) + "&order=sent_at.asc&limit=20");
+        for (int i = 0; i < live.length(); i++) {
+            JSONObject o = live.getJSONObject(i);
+            long id = o.getLong("id");
+            String symbol = o.optString("symbol", "");
+            if (symbol.isEmpty()) continue;
+            double amt = executor.fetchPositionAmountChecked(symbol);  // NaN = read failed
+            if (Double.isNaN(amt)) continue;                           // do NOT guess; retry next sweep
+            if (Math.abs(amt) > 1e-9) continue;                        // still live on the exchange
+            JSONObject body = new JSONObject()
+                    .put("status", "closed")
+                    .put("closed_at", Instant.now().toString())
+                    .put("exec_note", trunc("reconciled: flat on exchange (closed outside the bridge)", 300));
+            sbPatch("/rest/v1/bot_orders?id=eq." + id + "&status=eq.open", body.toString());
+            LOG.info("[Bridge] reconciled stale open id=" + id + " " + symbol + " -> closed (flat on exchange)");
         }
     }
 
