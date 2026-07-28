@@ -287,13 +287,10 @@ public final class SupabaseSignalBridge {
     /**
      * Drain close_requested. Runs UNGATED (see poll()) because closing only shrinks exposure.
      *
-     * CAVEAT, verified 2026-07-28 and filed as project_state id=18: closePosition() is reduce-only
-     * BY CONSTRUCTION but NOT at the API level — it reads the position, sizes the market order to
-     * exactly |posQty| and skips entirely when flat, yet it does not send reduceOnly=true. If the
-     * exchange-side stop fills inside the read->send window, the order lands as a NEW opposite-side
-     * position instead of a close. Narrow, but on the real endpoint it is the one way this ungated
-     * path could create exposure. The fix is one parameter in BinanceTradeExecutor.sendMarketOrder;
-     * not applied here because rewriting the execution layer is out of scope for this refactor.
+     * That safety now holds at the API level, not just by construction: closePosition() sends
+     * reduceOnly=true, so Binance itself refuses to let the close turn into a new opposite-side
+     * position if the exchange-side stop fills inside its read->send window (project_state id=18,
+     * closed). A refusal is settled against the exchange rather than assumed either way.
      */
     private void drainCloses() throws Exception {
         JSONArray cl = sbGet("/rest/v1/bot_orders?status=eq.close_requested&testnet=eq." + useTestnet

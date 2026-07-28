@@ -1359,9 +1359,25 @@ public final class BinanceTradeExecutor {
             // re-invokes after an ambiguous timeout, the SAME id makes Binance
             // refuse the resend with -4015 → treated as SUCCESS → no double-fill.
             String closeCid = newClientOrderId("c", symbol);
-            String orderId = sendMarketOrder(symbol, !wasLong, absQty, closeCid);
+            String orderId = sendMarketOrder(symbol, !wasLong, absQty, closeCid, true);
             if (orderId == null) {
-                LOG.severe("[Executor] CLOSE FAILED on " + symbol + " — manual intervention needed");
+                // The order did not go through. Do NOT guess why — ask the exchange whether we are
+                // flat. A reduceOnly refusal because the position closed inside the read->send window
+                // IS a successful close; the same refusal with the position still open is a real
+                // failure, and a failed read is neither.
+                double after = fetchPositionAmountChecked(symbol);
+                if (Double.isNaN(after)) {
+                    LOG.severe("[Executor] CLOSE " + symbol + ": order refused AND position read failed"
+                            + " — state unknown, keeping the row open for the next sweep");
+                    return false;
+                }
+                if (Math.abs(after) < 1e-12) {
+                    LOG.info("[Executor] CLOSE " + symbol + ": order refused but exchange reports FLAT"
+                            + " — position was already closed, reporting success");
+                    return true;
+                }
+                LOG.severe("[Executor] CLOSE FAILED on " + symbol + " — position STILL OPEN qty=" + after
+                        + " — manual intervention needed");
                 return false;
             }
             LOG.info(String.format("[Executor] CLOSED %s qty=%.6f reason=%s orderId=%s",
@@ -1608,11 +1624,27 @@ public final class BinanceTradeExecutor {
      *     the caller does NOT resend → no double-fill.
      */
     private String sendMarketOrder(String symbol, boolean buy, double qty, String clientId) throws Exception {
+        return sendMarketOrder(symbol, buy, qty, clientId, false);
+    }
+
+    /**
+     * @param reduceOnly when true the order carries reduceOnly=true, so Binance will REFUSE it rather
+     *        than let it open exposure. Used by the close path: closePosition() sizes to the position
+     *        it just read, and without this flag a stop filling inside that read->send window would
+     *        turn the close into a NEW opposite-side position (project_state id=18).
+     *        <p>
+     *        Binance restriction, verified against the USDS-M New Order docs: reduceOnly "Cannot be
+     *        sent in Hedge Mode" — it is One-way Mode only. The -4061 hedge fallback below therefore
+     *        omits it deliberately; there, positionSide already pins which side is being reduced.
+     */
+    private String sendMarketOrder(String symbol, boolean buy, double qty, String clientId,
+                                   boolean reduceOnly) throws Exception {
         long ts = ts();
         String body = "symbol=" + symbol
                 + "&side=" + (buy ? "BUY" : "SELL")
                 + "&type=MARKET"
                 + "&quantity=" + formatQty(qty)
+                + (reduceOnly ? "&reduceOnly=true" : "")
                 + "&newClientOrderId=" + clientId
                 + "&newOrderRespType=RESULT"
                 + "&timestamp=" + ts + "&recvWindow=60000";
@@ -1638,10 +1670,24 @@ public final class BinanceTradeExecutor {
                         + "placed the order; treating as SUCCESS (prevented double-fill)");
                 return clientId;
             }
+            // [project_state id=18] reduceOnly refusals. Per the USDS-M error-code docs,
+            // -2022 REDUCE_ONLY_REJECT and -2024 POSITION_NOT_SUFFICIENT both mean Binance
+            // declined to let this order reduce anything. That is USUALLY "already flat",
+            // which is a successful close — but -2022 is ALSO documented for a conflict with
+            // existing open orders, where the position may well still be open. So it is NOT
+            // declared a success here: return null and let closePosition() settle it against
+            // the exchange, the same fail-closed discipline used for the -1109 read.
+            if (reduceOnly && (b.contains("-2022") || b.contains("-2024"))) {
+                LOG.info("[Executor] reduceOnly MARKET " + symbol + " refused ("
+                        + (b.contains("-2022") ? "-2022" : "-2024") + ") — nothing was reduced; "
+                        + "caller must confirm flat against the exchange");
+                return null;
+            }
             // -4061 = "Order's position side does not match." HEDGE mode
             // detected despite ensureOneWayMode() at boot — retry with explicit
             // positionSide as fallback. Reuse the SAME clientId (the -4061 means
             // the first POST did NOT fill, so re-using the id is safe).
+            // NOTE: body2 deliberately omits reduceOnly — Binance forbids it in Hedge Mode.
             if (b.contains("-4061") || b.contains("position side")) {
                 LOG.warning("[Executor] " + symbol + " HEDGE mode detected, retrying with positionSide");
                 long ts2 = ts();
