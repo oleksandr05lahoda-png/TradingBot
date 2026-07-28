@@ -35,13 +35,13 @@ import org.json.JSONObject;
  *     CLOSES are deliberately NOT gated, see poll().
  *   - DEFAULT-OFF: no-op unless SUPABASE_BRIDGE_ENABLED=1.
  *   - IDEMPOTENT: pending->sent is claimed by a conditional PostgREST PATCH (CAS) before
- *     execution; close_requested->close_sent likewise. Two reconcile sweeps resolve rows against
- *     the exchange truth rather than guessing, and both skip on a failed read.
+ *     execution; close_requested->close_sent likewise. EVERY status write goes through patch(),
+ *     which carries the status the caller read the row in as a predicate, so no write can
+ *     overwrite a transition made concurrently by the live_time_closer cron (project_state id=30).
+ *     Two reconcile sweeps resolve rows against the exchange truth rather than guessing, and a
+ *     failed Supabase read throws rather than reading as an empty result (project_state id=29).
  *
  * KNOWN HOLES — do not read the list above as stronger than this:
- *   - project_state id=30: only reconcileOpen() PATCHes conditionally. reconcileSent() calls
- *     patch(), which has no status predicate, so it can overwrite a close_requested written
- *     concurrently by the live_time_closer cron and silently lose the close.
  *   - BRIDGE_MAX_OPEN counts ROWS, not notional: 20 rows at 20% of balance each is 400% of the
  *     account, and correlated alts opened in one window behave as one position. An exposure cap in
  *     percent of balance is project_state id=25.
@@ -217,8 +217,8 @@ public final class SupabaseSignalBridge {
             String symbol = o.optString("symbol", "");
             double amt = executor.fetchPositionAmountChecked(symbol);  // NaN = read failed
             if (Double.isNaN(amt)) continue;                           // do NOT guess; retry next sweep
-            if (Math.abs(amt) > 1e-9) patch(id, "open",   "reconciled: adopted live position qty=" + amt);
-            else                      patch(id, "failed", "reconciled: no position on exchange");
+            if (Math.abs(amt) > 1e-9) patch(id, "sent", "open",   "reconciled: adopted live position qty=" + amt);
+            else                      patch(id, "sent", "failed", "reconciled: no position on exchange");
         }
     }
 
@@ -263,11 +263,11 @@ public final class SupabaseSignalBridge {
             long id = o.getLong("id");
             String side = o.optString("side", "");
             if (!"LONG".equalsIgnoreCase(side)) {                 // LONG-ONLY guard at the wire
-                patch(id, "failed", "rejected: side=" + side + " (long-only bridge)");
+                patch(id, "pending", "failed", "rejected: side=" + side + " (long-only bridge)");
                 continue;
             }
             if (isStale(o.optString("created_at", ""))) {         // don't open at a stale enqueue price
-                patch(id, "failed", "stale pending (>" + MAX_PENDING_AGE_MIN + "min)");
+                patch(id, "pending", "failed", "stale pending (>" + MAX_PENDING_AGE_MIN + "min)");
                 continue;
             }
             if (active >= MAX_OPEN) {
@@ -283,25 +283,25 @@ public final class SupabaseSignalBridge {
                 // not an env constant). BRIDGE_BALANCE_PER_LEG, if set >0, acts as a CAP on
                 // the sizing base (useful to fence off part of the account), never a substitute.
                 double bal = executor.fetchAvailableBalance();
-                if (bal <= 0) { patch(id, "failed", "balance fetch failed (" + bal + ") — order not sized"); continue; }
+                if (bal <= 0) { patch(id, "sent", "failed", "balance fetch failed (" + bal + ") — order not sized"); continue; }
                 if (BAL_PER_LEG > 0 && bal > BAL_PER_LEG) bal = BAL_PER_LEG;
                 BinanceTradeExecutor.ExecutionResult r = executor.openPositionWithSl(idea, bal);
                 if (r != null && r.success) {
-                    patch(id, "open", String.format("opened notional=$%.2f qty=%.6f tps=%d mult req=%.2f applied=%.2f",
+                    patch(id, "sent", "open", String.format("opened notional=$%.2f qty=%.6f tps=%d mult req=%.2f applied=%.2f",
                             r.notionalUsd, r.qty, r.tpsPlaced, reqMult, idea.getExecutorSizeMultiplier()));
                 } else {
                     String reason = (r == null ? "null" : r.reason);
                     if (reason != null && reason.toUpperCase().contains("NAKED")) {
                         // SL failed AND emergency close failed => a LIVE unhedged position. Never bury this in 'failed'.
-                        patch(id, "failed_naked", "*** NAKED — verify exchange MANUALLY: " + reason);
+                        patch(id, "sent", "failed_naked", "*** NAKED — verify exchange MANUALLY: " + reason);
                         LOG.severe("[Bridge] *** NAKED POSITION " + o.optString("symbol", "") + " id=" + id
                                 + " — manual intervention required: " + reason);
                     } else {
-                        patch(id, "failed", "exec: " + reason);
+                        patch(id, "sent", "failed", "exec: " + reason);
                     }
                 }
             } catch (Throwable t) {
-                patch(id, "failed", "ex: " + t.getMessage());
+                patch(id, "sent", "failed", "ex: " + t.getMessage());
             }
         }
     }
@@ -321,10 +321,10 @@ public final class SupabaseSignalBridge {
             JSONObject o = cl.getJSONObject(i);
             long id = o.getLong("id");
             String symbol = o.optString("symbol", "");
-            if (!symbol.matches("^[A-Z0-9]{2,20}USDT$")) { patch(id, "failed", "bad symbol: " + symbol); continue; }
+            if (!symbol.matches("^[A-Z0-9]{2,20}USDT$")) { patch(id, "close_requested", "failed", "bad symbol: " + symbol); continue; }
             if (!claimClose(id)) continue;                        // CAS close_requested -> close_sent
             boolean closed = executor.closePosition(symbol, "supabase-bridge");  // reduce-only, fail-closed
-            patch(id, closed ? "closed" : "failed", closed ? "closed reduce-only" : "close failed (verify exchange)");
+            patch(id, "close_sent", closed ? "closed" : "failed", closed ? "closed reduce-only" : "close failed (verify exchange)");
         }
     }
 
@@ -443,10 +443,32 @@ public final class SupabaseSignalBridge {
         } catch (Exception e) { return false; }
     }
 
-    private void patch(long id, String status, String note) throws Exception {
+    /**
+     * [project_state id=30] Conditional status write — applies only while the row is still in
+     * {@code expect}.
+     *
+     * This used to build "?id=eq.N" with no predicate and discard the response, so a
+     * close_requested written by the live_time_closer cron between a sweep's GET and its PATCH was
+     * overwritten back to open/failed: the close request vanished, the position stayed live, and
+     * nothing was logged. Every caller knows the status it read the row in, so every caller passes
+     * it. A missed CAS means someone else moved the row first — leave it alone and say so.
+     */
+    private void patch(long id, String expect, String status, String note) throws Exception {
         JSONObject body = new JSONObject().put("status", status).put("exec_note", trunc(note, 300));
         if ("closed".equals(status)) body.put("closed_at", Instant.now().toString());
-        sbPatch("/rest/v1/bot_orders?id=eq." + id, body.toString());
+        HttpResponse<String> resp = sbPatch(
+                "/rest/v1/bot_orders?id=eq." + id + "&status=eq." + enc(expect), body.toString());
+        if (resp.statusCode() / 100 != 2) {
+            LOG.warning("[Bridge] patch id=" + id + " " + expect + "->" + status
+                    + " HTTP " + resp.statusCode());
+            return;
+        }
+        try {
+            if (new JSONArray(resp.body()).length() == 0) {
+                LOG.warning("[Bridge] patch id=" + id + " " + expect + "->" + status
+                        + " matched no row — status changed concurrently, not overwriting");
+            }
+        } catch (Exception ignored) { /* body shape is not worth failing the sweep over */ }
     }
 
     private HttpResponse<String> sbPatch(String pathQuery, String json) throws Exception {
