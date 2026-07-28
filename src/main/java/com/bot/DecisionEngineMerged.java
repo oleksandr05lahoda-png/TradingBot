@@ -194,10 +194,6 @@ public final class DecisionEngineMerged {
     private static final double MIN_CLUSTER_SCORE        = 0.22;
 
 
-    /** [HOLE-4] Required agreeing clusters for the given market state. */
-    private static int clustersRequired(MarketState ms) {
-        return ms == MarketState.RANGE ? MIN_AGREEING_CLUSTERS_RANGE : MIN_AGREEING_CLUSTERS;
-    }
 
     // Single authoritative probability ceiling. All intermediate caps and the
     // final calibrator clamp must reference this constant. Previously hardcoded 85 in 5+ places.
@@ -236,47 +232,7 @@ public final class DecisionEngineMerged {
         REJECT_TRACE.computeIfAbsent(reason, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
         return null;
     }
-    /** Returns "k1=v1 k2=v2 ..." of deltas since last call, resets the map. */
-    public static String getAndResetRejectTrace() {
-        if (REJECT_TRACE.isEmpty()) return "";
-        StringBuilder sb = new StringBuilder();
-        java.util.List<java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLong>> entries =
-                new java.util.ArrayList<>(REJECT_TRACE.entrySet());
-        entries.sort((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()));
-        int count = 0;
-        for (var e : entries) {
-            long v = e.getValue().getAndSet(0);
-            if (v == 0) continue;
-            if (sb.length() > 0) sb.append(' ');
-            sb.append(e.getKey()).append('=').append(v);
-            if (++count >= 12) break;
-        }
-        return sb.toString();
-    }
 
-    /**
-     * [A3 2026-05-08] Peek-only variant of getAndResetRejectTrace.
-     * Returns top-N reasons WITHOUT resetting counters, so the same trace
-     * can be sent to multiple destinations (heartbeat + diag log) without
-     * one consumer wiping data needed by the other.
-     * Used by BotMain.maybeSendHeartbeat for "DE-rejects:" line.
-     */
-    public static String peekRejectTrace(int top) {
-        if (REJECT_TRACE.isEmpty()) return "";
-        java.util.List<java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLong>> entries =
-                new java.util.ArrayList<>(REJECT_TRACE.entrySet());
-        entries.sort((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()));
-        StringBuilder sb = new StringBuilder();
-        int count = 0;
-        for (var e : entries) {
-            long v = e.getValue().get();
-            if (v == 0) continue;
-            if (sb.length() > 0) sb.append(' ');
-            sb.append(e.getKey()).append('=').append(v);
-            if (++count >= Math.max(1, top)) break;
-        }
-        return sb.toString();
-    }
 
     // [v42.0 FIX #12] Last GC timestamp for postExitCooldown leak fix
     private volatile long lastCooldownGcMs = 0L;
@@ -342,76 +298,13 @@ public final class DecisionEngineMerged {
     private static final int    BAYES_MIN_TRADES = 15;     // below this, hold neutral 0.50
     private static final int    BAYES_FULL_TRUST = 80;     // above this, fully trust live priors
 
-    /**
-     * Update Bayesian prior with recent trade outcome.
-     *
-     * @param winRate         rolling win-rate over last N trades (0.0–1.0)
-     * @param confirmedTrades total confirmed trades count
-     */
-    public void updateBayesPrior(double winRate, int confirmedTrades) {
-        int trades = Math.max(0, confirmedTrades);
-        bayesSampleTrades.set(trades);
 
-        if (trades < BAYES_MIN_TRADES) {
-            // Too few trades to trust: use neutral prior
-            bayesPrior.set(0.50);
-            bayesPriorFast.set(0.50);
-            bayesPriorSlow.set(0.50);
-            return;
-        }
-
-        // Clamp live prior to realistic range — protects against outlier streaks
-        double livePrior = Math.max(0.40, Math.min(0.75, winRate));
-
-        // Update both EWMAs
-        double newFast = bayesPriorFast.get() * (1.0 - BAYES_FAST_ALPHA)
-                + livePrior * BAYES_FAST_ALPHA;
-        double newSlow = bayesPriorSlow.get() * (1.0 - BAYES_SLOW_ALPHA)
-                + livePrior * BAYES_SLOW_ALPHA;
-        bayesPriorFast.set(newFast);
-        bayesPriorSlow.set(newSlow);
-        bayesUpdateCount.incrementAndGet();
-
-        // Warmup blend: 15 → 80 trades = linearly shift from neutral to EWMA blend
-        double warmupMix;
-        if (trades >= BAYES_FULL_TRUST) {
-            warmupMix = 1.0;
-        } else {
-            warmupMix = (trades - BAYES_MIN_TRADES) / (double)(BAYES_FULL_TRUST - BAYES_MIN_TRADES);
-            warmupMix = Math.max(0.0, Math.min(1.0, warmupMix));
-        }
-
-        // Regime detection: when fast deviates from slow, weight fast higher.
-        // This is the core of two-speed design — adapts to regime change in ~8 trades
-        // instead of waiting 100+ trades for pure linear blend.
-        double divergence = Math.abs(newFast - newSlow);
-        double fastWeight;
-        if (divergence > BAYES_REGIME_SHIFT) {
-            // Regime change detected — bias toward fast EWMA (cap at 0.7)
-            fastWeight = Math.min(0.70, 0.40 + (divergence - BAYES_REGIME_SHIFT) * 3.0);
-        } else {
-            // Stable regime — slow dominates (fast weight 0.25)
-            fastWeight = 0.25;
-        }
-
-        double blended = newFast * fastWeight + newSlow * (1.0 - fastWeight);
-        double finalPrior = 0.50 * (1.0 - warmupMix) + blended * warmupMix;
-
-        // Clamp final output to safe range
-        bayesPrior.set(Math.max(0.42, Math.min(0.72, finalPrior)));
-    }
-
-    public double getBayesPrior() { return bayesPrior.get(); }
 
     /** Diagnostic — returns current regime shift magnitude (|fast-slow|). */
     public double getBayesRegimeShift() {
         return Math.abs(bayesPriorFast.get() - bayesPriorSlow.get());
     }
 
-    /** Diagnostic — true if fast and slow EWMAs diverge beyond threshold. */
-    public boolean isBayesRegimeShift() {
-        return getBayesRegimeShift() > BAYES_REGIME_SHIFT;
-    }
 
     // ── Setters ───────────────────────────────────────────────────
     public void setForecastEngine(com.bot.TradingCore.ForecastEngine fe) { this.forecastEngine = fe; }
@@ -420,7 +313,6 @@ public final class DecisionEngineMerged {
     // comparison passes (e.g. does the dormant mean-rev earn in chop where TREND
     // bleeds?). Live path never sets this — stays null → env/default as before.
     private volatile String strategyModeOverride = null;
-    public void setStrategyModeOverride(String m) { this.strategyModeOverride = m; }
 
     // Category-aware directional score thresholds for EARLY_TICK gate.
     //
@@ -519,18 +411,6 @@ public final class DecisionEngineMerged {
         postExitCooldown.put(symbol + "_" + side.name(), System.currentTimeMillis());
     }
 
-    private boolean isPostExitBlocked(String symbol, com.bot.TradingCore.Side side) {
-        cooldownGc();  // [v42.0 FIX #12] lazy TTL cleanup — was leaking forever
-        String k = symbol + "_" + side.name();
-        Long ts = postExitCooldown.get(k);
-        if (ts == null) return false;
-        long age = System.currentTimeMillis() - ts;
-        if (age >= POST_EXIT_COOLDOWN_MS) {
-            postExitCooldown.remove(k);
-            return false;
-        }
-        return true;
-    }
 
     /**
      * [v42.0 FIX #12] Lazy garbage collector for postExitCooldown.
@@ -553,12 +433,6 @@ public final class DecisionEngineMerged {
         }
     }
 
-    public void setVolumeDelta(String sym, double delta) {
-        volumeDeltaMap.put(sym, delta);
-        Deque<Double> hist = vdHistory.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-        hist.addLast(Math.abs(delta));
-        if (hist.size() > 50) hist.removeFirst();
-    }
 
     /** [ДЫРА №1] CVD — устанавливается из SignalSender после вычисления накопленной дельты */
     public void setCVD(String sym, double cvdNormalized) {
@@ -570,57 +444,14 @@ public final class DecisionEngineMerged {
         if (hist.size() > 10) hist.removeFirst();
     }
 
-    /**
-     * CVD Persistence check.
-     * Returns true only if the LAST minBars readings ALL agree in direction.
-     * Prevents short-covering spikes from triggering LONG signals.
-     * FIXED: was counting any matching bar in the window — now requires the last N to be consecutive.
-     */
-    private boolean isCVDPersistent(String sym, boolean bullish, int minBars) {
-        Deque<Double> hist = cvdHistory.get(sym);
-        if (hist == null || hist.size() < minBars) return false;
-        List<Double> list = new ArrayList<>(hist);
-        int n = list.size();
-        // Check only the LAST minBars entries — all must agree
-        for (int i = n - minBars; i < n; i++) {
-            double v = list.get(i);
-            if (bullish  && v <= 0.05) return false;  // any non-positive breaks the chain
-            if (!bullish && v >= -0.05) return false; // any non-negative breaks the chain
-        }
-        return true;
-    }
 
-    private int getBullCvdPersistenceBars(String symbol) {
-        return getRelativeStrength(symbol) >= 0.62 ? 2 : CVD_PERSIST_BARS;
-    }
 
     /** [v29] VDA score [-1..+1]: +1=buy acceleration, -1=sell acceleration */
     public void setVDA(String sym, double score) {
         vdaMap.put(sym, score);
     }
 
-    private double getVolumeDeltaRatio(String sym) {
-        Double current = volumeDeltaMap.get(sym);
-        if (current == null || current == 0) return 0.0;
-        Deque<Double> hist = vdHistory.get(sym);
-        if (hist == null || hist.size() < 5) return 1.0;
-        double avg = hist.stream().mapToDouble(Double::doubleValue).average().orElse(1.0);
-        return avg < 1e-9 ? 1.0 : Math.abs(current) / avg;
-    }
 
-    public void updateRelativeStrength(String symbol, double symbolReturn15m, double btcReturn15m) {
-        double rs;
-        if (Math.abs(btcReturn15m) < 0.0001) {
-            rs = symbolReturn15m > 0 ? 0.7 : 0.3;
-        } else if (btcReturn15m < 0 && symbolReturn15m > 0) {
-            rs = 0.85 + Math.min(Math.abs(symbolReturn15m) * 10, 0.14);
-        } else {
-            rs = clamp(0.5 + (symbolReturn15m - btcReturn15m) / (Math.abs(btcReturn15m) * 2), 0.0, 1.0);
-        }
-        Deque<Double> h = relStrengthHistory.computeIfAbsent(symbol, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-        h.addLast(rs);
-        if (h.size() > 20) h.removeFirst();
-    }
 
     private double getRelativeStrength(String symbol) {
         Deque<Double> h = relStrengthHistory.get(symbol);
@@ -631,46 +462,6 @@ public final class DecisionEngineMerged {
     //  CLUSTER SCORE HOLDER
     //  Каждый кластер хранит свой лучший LONG и SHORT score
 
-    private static final class ClusterScores {
-        double longScore  = 0;
-        double shortScore = 0;
-        final List<String> flags = new ArrayList<>();
-
-        // Per-cluster cap reduced: prevents single market event
-        // from inflating one cluster's score via correlated sub-signals.
-        // 0.75 (was 0.85) — more conservative, fewer false-strong signals
-        private static final double CLUSTER_CAP = 0.75;
-
-        void addLong(double score, String flag) {
-            longScore = Math.min(CLUSTER_CAP, Math.max(longScore, score));
-            if (flag != null) flags.add(flag);
-        }
-
-        void addShort(double score, String flag) {
-            shortScore = Math.min(CLUSTER_CAP, Math.max(shortScore, score));
-            if (flag != null) flags.add(flag);
-        }
-
-        void boostLong(double score, String flag) {
-            longScore = Math.min(CLUSTER_CAP, longScore + score);
-            if (flag != null) flags.add(flag);
-        }
-
-        void boostShort(double score, String flag) {
-            shortScore = Math.min(CLUSTER_CAP, shortScore + score);
-            if (flag != null) flags.add(flag);
-        }
-
-        void penalizeLong(double mult) { longScore *= mult; }
-        void penalizeShort(double mult) { shortScore *= mult; }
-
-        boolean favorsLong()  { return longScore > shortScore && longScore > 0.10; }
-        boolean favorsShort() { return shortScore > longScore && shortScore > 0.10; }
-        boolean hasSignal()   { return longScore > 0.10 || shortScore > 0.10; }
-
-        double netLong()  { return longScore - shortScore * 0.3; }
-        double netShort() { return shortScore - longScore * 0.3; }
-    }
 
 
     //  VOLATILITY BUCKET — per-symbol volatility classification
@@ -699,13 +490,6 @@ public final class DecisionEngineMerged {
         }
     }
 
-    /** Classify coin by robust ATR percentage (uses long-term ATR to avoid consolidation trap) */
-    public static VolatilityBucket classifyVolatility(double atrPct) {
-        if (atrPct < 0.005) return VolatilityBucket.LOW;
-        if (atrPct < 0.015) return VolatilityBucket.MEDIUM;
-        if (atrPct < 0.035) return VolatilityBucket.HIGH;
-        return VolatilityBucket.EXTREME;
-    }
 
     /**
      * Robust ATR: max(currentATR, longTermATR × 0.80).
@@ -881,18 +665,6 @@ public final class DecisionEngineMerged {
         /** Age of the signal in milliseconds since creation. */
         public long ageMs() { return System.currentTimeMillis() - createdAtMs; }
 
-        /**
-         * Confidence decay factor (1.0 = fresh, 0.0 = fully stale).
-         * Linear decay over staleThresholdMs; clamped to [0, 1].
-         * Typical use: adjustedProb = probability * ageDecay(90_000L).
-         */
-        public double ageDecay(long staleThresholdMs) {
-            if (staleThresholdMs <= 0) return 1.0;
-            long age = ageMs();
-            if (age <= 0) return 1.0;
-            if (age >= staleThresholdMs) return 0.0;
-            return 1.0 - ((double) age / staleThresholdMs);
-        }
 
         // [HOLE-1 FIX 2026-05-08] Unified size multiplier passthrough.
         // SignalSender computes ALL modifiers (category, flag-based, session, ISC,
@@ -1424,12 +1196,6 @@ public final class DecisionEngineMerged {
         return (d != null && d.isValid()) ? d : null;
     }
 
-    public void recordSignalResult(String sym, double prob, boolean correct) {
-        Deque<CalibRecord> h = calibHist.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-        h.addLast(new CalibRecord(prob, correct));
-        while (h.size() > CALIBRATION_WIN) h.removeFirst();
-        updateSymbolThreshold(sym);
-    }
 
     private void updateSymbolThreshold(String sym) {
         Deque<CalibRecord> hist = calibHist.get(sym);
@@ -1621,45 +1387,12 @@ public final class DecisionEngineMerged {
     // (chop / wick-rejection / flow-exhaustion / stricter R:R). Returns null on any reject (MR
     // semantics); the generate() dispatch converts null → reject("flow_fade_no_setup").
 
-    /** Major coins имеют больше institutional liquidity для защиты levels. */
-    /**
-     * Major coins имеют больше institutional liquidity для защиты levels.
-     * [v8.2] Расширен список до top-30 ликвидных по volume24h на Binance Futures.
-     * Все эти coins имеют: volume > $50M/day, spread < 0.05%, deep orderbook,
-     * active institutional trading. Исключены: мемы, новые/спекулятивные тикеры.
-     */
-    private boolean tpIsMajorCoin(String symbol) {
-        if (symbol == null) return false;
-        String s = symbol.toUpperCase();
-        // Tier 1 — top 10 by market cap (BTC, ETH ecosystem)
-        if (s.startsWith("BTC") || s.startsWith("ETH") || s.startsWith("SOL")
-                || s.startsWith("BNB") || s.startsWith("XRP") || s.startsWith("ADA")
-                || s.startsWith("AVAX") || s.startsWith("LINK") || s.startsWith("DOGE")
-                || s.startsWith("TON") || s.startsWith("DOT") || s.startsWith("MATIC")) {
-            return true;
-        }
-        // Tier 2 — proven liquid coins (v9.2: убраны ICP/FET/RNDR/STX/ALGO как
-        // наиболее волатильные/манипулируемые — давали worst WR в backtest)
-        return s.startsWith("LTC") || s.startsWith("BCH") || s.startsWith("TRX")
-                || s.startsWith("ATOM") || s.startsWith("UNI") || s.startsWith("AAVE")
-                || s.startsWith("NEAR") || s.startsWith("APT") || s.startsWith("SUI")
-                || s.startsWith("OP") || s.startsWith("ARB") || s.startsWith("INJ")
-                || s.startsWith("FIL") || s.startsWith("HBAR") || s.startsWith("XLM")
-                || s.startsWith("ETC");
-    }
 
     // [v8.4 CLEANUP] Удалены dead helpers от старой Sweep+Reclaim стратегии:
     //   tpDetectTrendDirection, tpDetectPullback, tpCheckEntryBar,
     //   tpIsExtendedMove, tpComputeStop — не вызываются нигде после VCB v7.
     // Оставлены только active helpers: tpComputeVolSma, tpIsMajorCoin.
 
-    private double tpComputeVolSma(List<com.bot.TradingCore.Candle> c, int period) {
-        int n = c.size();
-        if (n < period) return 0;
-        double sum = 0;
-        for (int i = n - period; i < n; i++) sum += c.get(i).volume;
-        return sum / period;
-    }
 
 
 
@@ -1713,17 +1446,6 @@ public final class DecisionEngineMerged {
     // MUST be confirmed by walk-forward — this is the best version, not a promise.
     // All thresholds are env-tunable (TA_*) for tuning без передеплоя.
 
-    // [v86.60 PHASE-0] Закрытых 4h-баров с последнего пересечения EMA20/50.
-    // Обратный скан смены знака (hFast-hSlow); насыщение = длина окна.
-    private static int computeTrendAge4h(double[] hFast, double[] hSlow) {
-        int len = Math.min(hFast.length, hSlow.length);
-        if (len < 2) return len;
-        double curSign = Math.signum(hFast[len - 1] - hSlow[len - 1]);
-        for (int i = len - 2; i >= 0; i--) {
-            if (Math.signum(hFast[i] - hSlow[i]) != curSign) return (len - 1) - i;
-        }
-        return len;  // флипа в окне нет → старый тренд (бакет 25+)
-    }
 
     // ─────────────────────────────────────────────────────────────────────
     // [v86.60] TREND_EARLY — ранний вход: первый 1h-откат после СВЕЖЕГО
@@ -1769,69 +1491,14 @@ public final class DecisionEngineMerged {
     // ──────────────────────────────────────────────────────────────────────
 
 
-    /**
-     * Inject simulated funding rate for backtest replay.
-     * Called by SimpleBacktester before each analyze() invocation to populate
-     * fundingCache with the historical funding rate that was active at that bar.
-     * In live mode, fundingCache is populated by SignalSender.refreshAllFundingRates().
-     */
-    public void setSimulatedFunding(String symbol, double fundingRate, double prevFundingRate) {
-        double delta = fundingRate - prevFundingRate;
-        FundingOIData data = new FundingOIData(fundingRate, 0, 0, 0, prevFundingRate, delta, 0);
-        fundingCache.put(symbol, data);
-    }
 
 
     // ──────────────────────────────────────────────────────────────────────
     // VWAP & deviation helpers
     // ──────────────────────────────────────────────────────────────────────
 
-    /** Volume-weighted average price over last `window` bars. */
-    private static double computeVwap(List<com.bot.TradingCore.Candle> candles, int window) {
-        int n = candles.size();
-        int from = Math.max(0, n - window);
-        double pvSum = 0, vSum = 0;
-        for (int i = from; i < n; i++) {
-            com.bot.TradingCore.Candle c = candles.get(i);
-            double tp = (c.high + c.low + c.close) / 3.0;
-            pvSum += tp * c.volume;
-            vSum  += c.volume;
-        }
-        return vSum > 0 ? pvSum / vSum : 0.0;
-    }
 
-    /** Stdev of (close - vwap)/vwap over last `window` bars. */
-    private static double computeDeviationStdev(List<com.bot.TradingCore.Candle> candles,
-                                                double vwap, int window) {
-        if (vwap <= 0) return 0.0;
-        int n = candles.size();
-        int from = Math.max(0, n - window);
-        int count = n - from;
-        if (count < 2) return 0.0;
 
-        double mean = 0;
-        for (int i = from; i < n; i++) {
-            mean += (candles.get(i).close - vwap) / vwap;
-        }
-        mean /= count;
-
-        double var = 0;
-        for (int i = from; i < n; i++) {
-            double d = (candles.get(i).close - vwap) / vwap - mean;
-            var += d * d;
-        }
-        var /= (count - 1);
-        return Math.sqrt(var);
-    }
-
-    /** Simple moving average of volume over last `period` bars. */
-    private static double computeVolumeSma(List<com.bot.TradingCore.Candle> candles, int period) {
-        int n = candles.size();
-        if (n < period) return 0.0;
-        double sum = 0;
-        for (int i = n - period; i < n; i++) sum += candles.get(i).volume;
-        return sum / period;
-    }
 
     // ──────────────────────────────────────────────────────────────────────
     // CleanStrategy v111 parameters — env-overridable. DO NOT TUNE on
@@ -1946,17 +1613,7 @@ public final class DecisionEngineMerged {
         return last == null || now - last >= base;
     }
 
-    private boolean cooldownAllowed(String sym, com.bot.TradingCore.Side side, CoinCategory cat, long now) {
-        return cooldownAllowedEx(sym, side, cat, now, -1);
-    }
 
-    private boolean flipAllowed(String sym, com.bot.TradingCore.Side newSide) {
-        Deque<String> h = recentDirs.computeIfAbsent(sym, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
-        if (h.size() < 2) return true;
-        Iterator<String> it = h.descendingIterator();
-        String last = it.next(), prev = it.next();
-        return !(!last.equals(newSide.name()) && prev.equals(newSide.name()));
-    }
 
     private void registerSignal(String sym, com.bot.TradingCore.Side side, long now) {
         cooldownMap.put(sym + "_" + side, now);
@@ -2037,82 +1694,8 @@ public final class DecisionEngineMerged {
 
     //  MARKET STATE + HTF BIAS
 
-    private MarketState detectState(List<com.bot.TradingCore.Candle> c) {
-        if (c.size() < 55) return MarketState.WEAK_TREND;
-        double ema20 = ema(c, 20);
-        double ema50 = ema(c, 50);
-        int    n     = c.size();
-        double slope = (ema20 - ema(c.subList(0, Math.max(1, n - 10)), 20)) / (c.get(0).close + 1e-9);
-        double vol   = atr(c, 14) / (c.get(n - 1).close + 1e-9);
-        if (Math.abs(slope) < 0.0005 || vol < 0.0015) return MarketState.RANGE;
-        if ((ema20 > ema50 && slope > 0) || (ema20 < ema50 && slope < 0))
-            return MarketState.STRONG_TREND;
-        return MarketState.WEAK_TREND;
-    }
 
 
-    /**
-     * detectBias2H uses EMA12/26/50 — already faster than 1H version,
-     * but still biased to slow cross. Add RSI and swing structure confirmation.
-     * Same 3/4 factors threshold to avoid BEAR lock during corrections.
-     */
-    /**
-     * detectBias2H — same weighted approach as 1H.
-     * Weights slightly higher since 2H is slower/more significant than 1H.
-     */
-    private HTFBias detectBias2H(List<com.bot.TradingCore.Candle> c) {
-        if (c == null || c.size() < 30) return HTFBias.NONE;
-
-        double ema12 = ema(c, 12);
-        double ema26 = ema(c, 26);
-        double ema50 = c.size() >= 50 ? ema(c, 50) : ema26;
-        double price = last(c).close;
-
-        double bullWeight = 0;
-        double bearWeight = 0;
-
-        // Factor 1: EMA alignment (up to 1.6)
-        boolean bullEMA = ema12 > ema26 && ema26 > ema50 * 0.998;
-        boolean bearEMA = ema12 < ema26 && ema26 < ema50 * 1.002;
-        if (bullEMA) {
-            double strength = (ema12 - ema26) / (ema26 + 1e-9);
-            bullWeight += Math.min(1.6, strength / 0.005 * 1.6);
-        } else if (bearEMA) {
-            double strength = (ema26 - ema12) / (ema26 + 1e-9);
-            bearWeight += Math.min(1.6, strength / 0.005 * 1.6);
-        }
-
-        // Factor 2: Price vs EMAs (up to 1.5)
-        if (price > ema12 && price > ema26) {
-            double r = (price - ema26) / (ema26 + 1e-9);
-            bullWeight += Math.min(1.5, r / 0.015 * 1.5);
-        } else if (price < ema12 && price < ema26) {
-            double r = (ema26 - price) / (ema26 + 1e-9);
-            bearWeight += Math.min(1.5, r / 0.015 * 1.5);
-        }
-
-        // Factor 3: RSI (up to 1.1)
-        double rsi2h = rsi(c, 14);
-        if (rsi2h > 52)      bullWeight += Math.min(1.1, (rsi2h - 50) / 20.0 * 1.1);
-        else if (rsi2h < 48) bearWeight += Math.min(1.1, (50 - rsi2h) / 20.0 * 1.1);
-
-        // Factor 4: Swing structure (up to 1.4)
-        if (checkHH_HL(c))      bullWeight += 1.4;
-        else if (checkLL_LH(c)) bearWeight += 1.4;
-
-        // Factor 5: Price slope over last 15 bars (up to 0.9)
-        int n = c.size();
-        if (n >= 20) {
-            double priceChangePct = (c.get(n - 1).close - c.get(n - 15).close)
-                    / (c.get(n - 15).close + 1e-9);
-            if (priceChangePct > 0.015)       bullWeight += Math.min(0.9, priceChangePct / 0.05 * 0.9);
-            else if (priceChangePct < -0.015) bearWeight += Math.min(0.9, -priceChangePct / 0.05 * 0.9);
-        }
-
-        if (bullWeight >= 3.0 && bullWeight > bearWeight + 0.5) return HTFBias.BULL;
-        if (bearWeight >= 3.0 && bearWeight > bullWeight + 0.5) return HTFBias.BEAR;
-        return HTFBias.NONE;
-    }
 
     private boolean checkHH_HL(List<com.bot.TradingCore.Candle> c) {
         if (c.size() < 15) return false;
@@ -2134,18 +1717,6 @@ public final class DecisionEngineMerged {
         return h2 < h1 && l2 < l1;
     }
 
-    private synchronized void adaptGlobalMinConf(MarketState state, double atr, double price) {
-        double vol  = atr / (price + 1e-9);
-        double base = BASE_CONF;
-        if (state == MarketState.STRONG_TREND) base -= 3.0;
-        else if (state == MarketState.RANGE)   base += 1.0;
-        if (vol > 0.025)      base += 2.0;
-        else if (vol > 0.018) base += 1.0;
-        int utcHour = java.time.ZonedDateTime.now(java.time.ZoneId.of("UTC")).getHour();
-        if (utcHour >= 8 && utcHour <= 12)       base -= 1.0;
-        else if (utcHour >= 13 && utcHour <= 21)  base -= 1.5;
-        globalMinConf.set(clamp(base, MIN_CONF_FLOOR, MIN_CONF_CEIL));
-    }
 
 
     //  MATH PRIMITIVES
@@ -2261,31 +1832,10 @@ public final class DecisionEngineMerged {
     }
 
 
-    public boolean impulse(List<com.bot.TradingCore.Candle> c) {
-        if (c == null || c.size() < 15) return false;
-        return Math.abs(last(c).close - c.get(c.size() - 5).close) > atr(c, 14) * 0.55;
-    }
-
-    public boolean volumeSpike(List<com.bot.TradingCore.Candle> c, CoinCategory cat) {
-        if (c.size() < 10) return false;
-        double avg = c.subList(c.size() - 10, c.size() - 1)
-                .stream().mapToDouble(cd -> cd.volume).average().orElse(1);
-        double thr = cat == CoinCategory.MEME ? 1.25 : cat == CoinCategory.ALT ? 1.20 : 1.15;
-        return last(c).volume / avg > thr;
-    }
 
 
-    private boolean bullishStructure(List<com.bot.TradingCore.Candle> c) {
-        if (c.size() < 12) return false;
-        return c.get(c.size()-4).high > c.get(c.size()-8).high &&
-                c.get(c.size()-4).low  > c.get(c.size()-8).low;
-    }
 
-    private boolean bearishStructure(List<com.bot.TradingCore.Candle> c) {
-        if (c.size() < 12) return false;
-        return c.get(c.size()-4).high < c.get(c.size()-8).high &&
-                c.get(c.size()-4).low  < c.get(c.size()-8).low;
-    }
+
 
     private double vwap(List<com.bot.TradingCore.Candle> c) {
         double pv = 0, vol = 0;
@@ -2742,26 +2292,7 @@ public final class DecisionEngineMerged {
             return Math.max(0.0, Math.min(1.0, v));
         }
 
-        public int sampleCount(String symbol) {
-            int n = 0;
-            for (var entry : history.entrySet()) {
-                if (entry.getKey().startsWith(symbol + "#")) {
-                    n += entry.getValue().size();
-                }
-            }
-            return n;
-        }
 
-        public double rawWinRate(String symbol) {
-            java.util.List<Outcome> all = collectAllForSymbol(symbol);
-            if (all.isEmpty()) return Double.NaN;
-            double hits = 0, total = 0;
-            for (Outcome o : all) {
-                total += o.weight;
-                if (o.hit) hits += o.weight;
-            }
-            return total > 0 ? hits / total : Double.NaN;
-        }
 
         public void reset(String symbol) {
             history.entrySet().removeIf(e -> e.getKey().startsWith(symbol + "#"));
@@ -2976,27 +2507,6 @@ public final class DecisionEngineMerged {
             }
         }
 
-        public synchronized void writeDispatchAudit(String symbol, String side, double price,
-                                                    double tp1, double sl, double prob,
-                                                    String btcRegime, String source,
-                                                    boolean paperMode) {
-            try {
-                long seq = auditSeq.incrementAndGet();
-                long ts = System.currentTimeMillis();
-                String payload = String.format(
-                        "%d;DISPATCH;%d;%s;%s;%.8f;%.8f;%.8f;%.2f;%s;%s;%s;%s",
-                        seq, ts, escape(symbol), side,
-                        price, tp1, sl, prob,
-                        escape(btcRegime), escape(source),
-                        paperMode ? "PAPER" : "LIVE",
-                        lastAuditHmac == null ? "" : lastAuditHmac);
-                String hmac = hmacSha256(payload, HMAC_KEY);
-                appendAuditLine(payload + ";" + hmac);
-                lastAuditHmac = hmac;
-            } catch (Throwable t) {
-                LOG.warning("[AuditLog] dispatch write failed: " + t.getMessage());
-            }
-        }
 
         private void appendAuditLine(String line) throws java.io.IOException {
             java.io.File f = new java.io.File(AUDIT_LOG_PATH);
@@ -3059,71 +2569,7 @@ public final class DecisionEngineMerged {
             }
         }
 
-        /**
-         * [v79 I6] PUBLIC INTEGRITY CHECK.
-         * Reads the entire audit log and verifies every HMAC + chain link.
-         * Returns short status string for Telegram/UI display.
-         *
-         * Anyone with the HMAC key (the bot operator + auditors) can run this
-         * to confirm the bot has not "lost" or modified any outcomes.
-         */
-        public synchronized String verifyAuditIntegrity() {
-            java.io.File f = new java.io.File(AUDIT_LOG_PATH);
-            if (!f.exists()) return "no_audit_log";
-            int total = 0, ok = 0, broken = 0;
-            String prevHmac = "";
-            try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    if (line.isBlank() || line.startsWith("#")) continue;
-                    total++;
-                    int lastSemi = line.lastIndexOf(';');
-                    if (lastSemi < 0) { broken++; continue; }
-                    String payload = line.substring(0, lastSemi);
-                    String hmac = line.substring(lastSemi + 1);
-                    String calc = hmacSha256(payload, HMAC_KEY);
-                    if (!calc.equals(hmac)) { broken++; continue; }
-                    // Chain check: payload должен заканчиваться предыдущим hmac.
-                    if (!payload.endsWith(";" + prevHmac)) {
-                        // First record has empty prev — special case.
-                        if (!(prevHmac.isEmpty() && payload.endsWith(";"))) {
-                            broken++; continue;
-                        }
-                    }
-                    ok++;
-                    prevHmac = hmac;
-                }
-            } catch (Exception e) {
-                return "error: " + e.getMessage();
-            }
-            if (broken == 0) return "✓OK n=" + total;
-            return String.format("⚠TAMPERED %d/%d", broken, total);
-        }
 
-        /** [v79 I6] Public stats for daily integrity report. */
-        public String getPublicStats() {
-            int total = totalOutcomeCount();
-            double weightedHits = 0, weightedTotal = 0;
-            int byTag_TP1 = 0, byTag_SL = 0, byTag_AMB = 0, byTag_TS = 0;
-            for (java.util.concurrent.ConcurrentLinkedDeque<Outcome> dq : history.values()) {
-                for (Outcome o : dq) {
-                    weightedTotal += o.weight;
-                    if (o.hit) weightedHits += o.weight;
-                    // [v79 FIX] Switch on String tag (was broken: bare TP1/SL etc. didn't resolve
-                    // because we removed the OutcomeTag enum and converted to String constants).
-                    switch (o.tag) {
-                        case TAG_TP1:       byTag_TP1++; break;
-                        case TAG_SL:        byTag_SL++;  break;
-                        case TAG_AMBIGUOUS: byTag_AMB++; break;
-                        case TAG_TIME_STOP: byTag_TS++;  break;
-                        default: break;
-                    }
-                }
-            }
-            double wr = weightedTotal > 0 ? weightedHits / weightedTotal * 100 : 0;
-            return String.format("n=%d wr=%.1f%% TP1=%d SL=%d Amb=%d TS=%d",
-                    total, wr, byTag_TP1, byTag_SL, byTag_AMB, byTag_TS);
-        }
 
         // ─────────────────────────────────────────────────────────────────
         //  HMAC-SHA256 helper.
