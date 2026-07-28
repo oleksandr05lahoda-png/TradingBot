@@ -23,6 +23,17 @@ dependencies {
     implementation 'org.telegram:telegrambots:6.8.0'
     implementation 'org.telegram:telegrambots-meta:6.8.0'
     implementation 'org.slf4j:slf4j-simple:2.0.9'
+
+    // [project_state id=25] src/test/java existed but was empty, so `test` ran NO-SOURCE and
+    // every "verified" claim in this repo was verified by reading, never by executing.
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging { events 'passed', 'failed', 'skipped' }
 }
 
 application {

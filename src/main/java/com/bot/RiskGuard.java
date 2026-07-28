@@ -93,6 +93,18 @@ public final class RiskGuard {
      */
     private final double MAX_AGGREGATE_NOTIONAL_PCT;
     /**
+     * OBSERVATION_MODE, read here rather than through BotMain.OBSERVATION_MODE.
+     *
+     * Referencing BotMain drags its static initialiser in, and that calls requireEnv on the
+     * Telegram token — so RiskGuard became unusable from anything that is not the bot's main entry
+     * point, including its own tests and the coming paper harness. A unit test caught it.
+     *
+     * This is NOT the id=2 shape: that defect was one value (a flag) standing in for a DIFFERENT
+     * thing (the endpoint). Here both sites read the same variable with identical parsing, so they
+     * cannot disagree about what OBSERVATION_MODE means.
+     */
+    private final boolean PAPER_MODE;
+    /**
      * How stale the BTC feed may be before canTrade() refuses. The crash detector is worthless if
      * nobody is feeding it, and an unfed detector must not read as "no crash" (fail-closed).
      */
@@ -102,7 +114,19 @@ public final class RiskGuard {
     private final long   BTC_CRASH_BLOCK_MS;
     private final long   COLD_START_MS;
 
-    private RiskGuard() {
+    /**
+     * A fresh guard with clean in-memory state and persistence DISABLED, for tests. Without this a
+     * test would inherit — and overwrite — the running bot's ./data/riskguard.csv, and the daily
+     * caps under test would depend on whatever the last real trading day left behind.
+     */
+    static RiskGuard newIsolatedForTest() { return new RiskGuard(false); }
+
+    private final boolean persist;
+
+    private RiskGuard() { this(true); }
+
+    private RiskGuard(boolean persist) {
+        this.persist = persist;
         this.DAILY_LOSS_LIMIT_PCT      = envDouble("RG_DAILY_LOSS_LIMIT_PCT", 10.0);
         this.WEEKLY_LOSS_LIMIT_PCT     = envDouble("RG_WEEKLY_LOSS_LIMIT_PCT", 20.0);
         // [v82.8 2026-06-01] User request: больше сделок на demo для набора
@@ -112,6 +136,7 @@ public final class RiskGuard {
         this.DAILY_TRADE_LIMIT         = envInt("RG_DAILY_TRADE_LIMIT", 8);   // [v86.27] real default (was 30 for demo stat-gathering)
         this.MAX_CONCURRENT_POSITIONS  = envInt("RG_MAX_CONCURRENT_POSITIONS", 1);  // [v86.27] real default (was 5 demo); 1 position at a time for a tiny account
         this.MAX_AGGREGATE_NOTIONAL_PCT = envDouble("RG_MAX_AGGREGATE_NOTIONAL_PCT", 60.0);
+        this.PAPER_MODE                 = "1".equals(System.getenv().getOrDefault("OBSERVATION_MODE", "0"));
         this.BTC_FEED_MAX_AGE_MS        = envLong("RG_BTC_FEED_MAX_AGE_MS", 10 * 60_000L);
         this.BTC_CRASH_30M_PCT         = envDouble("RG_BTC_CRASH_30M_PCT", 3.0);
         this.BTC_CRASH_60M_PCT         = envDouble("RG_BTC_CRASH_60M_PCT", 5.0);
@@ -131,7 +156,7 @@ public final class RiskGuard {
         // the loss caps. The existing rolloverIfNewDay() on the first canTrade() will
         // archive+reset cleanly if the persisted day is no longer today (caps reset at
         // the real UTC boundary, not on restart).
-        loadState();
+        if (persist) loadState();
     }
 
     // ─── Public config getters (for status messages / Telegram boot banner) ───
@@ -361,7 +386,7 @@ public final class RiskGuard {
         }
         // 7. Position COUNT — secondary, and deliberately NOT applied on paper. A paper run wants
         //    many positions for sample size; the aggregate cap above still bounds the risk.
-        if (!BotMain.OBSERVATION_MODE && openPositions.size() >= MAX_CONCURRENT_POSITIONS) {
+        if (!PAPER_MODE && openPositions.size() >= MAX_CONCURRENT_POSITIONS) {
             return Decision.block("max concurrent positions",
                     String.format("already %d open (limit %d): %s",
                             openPositions.size(), MAX_CONCURRENT_POSITIONS,
@@ -412,6 +437,15 @@ public final class RiskGuard {
      * by SignalSender (it already tracks BTC price). Called frequently is
      * safe — we cap history at 30 entries.
      */
+    /**
+     * Package-private: record a sample with an explicit timestamp so a test can age the feed.
+     * Production always goes through {@link #updateBtcPrice(double)}.
+     */
+    synchronized void updateBtcPriceAt(double priceUsd, long tsMs) {
+        if (priceUsd <= 0) return;
+        btcPriceHistory.addLast(new PricePoint(tsMs, priceUsd));
+    }
+
     public synchronized void updateBtcPrice(double priceUsd) {
         if (priceUsd <= 0) return;
         long now = System.currentTimeMillis();
@@ -615,6 +649,7 @@ public final class RiskGuard {
     // persisted (positions are reconciled live by PositionTracker on startup; the
     // BTC-crash block re-detects from the live price feed within a minute).
     private synchronized void saveState() {
+        if (!persist) return;   // isolated test instance — never touch ./data
         try {
             java.io.File f = new java.io.File(STATE_FILE);
             java.io.File parent = f.getParentFile();
