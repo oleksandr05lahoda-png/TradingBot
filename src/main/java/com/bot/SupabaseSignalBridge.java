@@ -21,8 +21,12 @@ import org.json.JSONObject;
  * existing {@link BinanceTradeExecutor}. It never decides what to trade and never shorts.
  * The dead candle brain (DecisionEngineMerged.analyze) is simply not invoked on this path.
  *
+ * Every claim below was re-verified against the code and the live schema on 2026-07-28
+ * (project_state id=4); the DB-side checks cited are real constraints on public.bot_orders.
+ *
  * Hard safety (defence in depth):
- *   - LONG-ONLY: rejects any row whose side != LONG (DB also enforces side='LONG').
+ *   - LONG-ONLY: rejects any row whose side != LONG (DB also enforces it —
+ *     constraint bot_orders_side_long CHECK (side = 'LONG')).
  *   - TESTNET-LOCKED IN CODE: refuses to place ANY order unless the executor reports the
  *     testnet/demo endpoint AND BINANCE_USE_TESTNET was set explicitly (absence is a refusal,
  *     never a default). Real money is NOT reachable via env flags: BRIDGE_ALLOW_REAL is still
@@ -32,9 +36,14 @@ import org.json.JSONObject;
  *     tight RLS) + sign-off.
  *   - DEFAULT-OFF: no-op unless SUPABASE_BRIDGE_ENABLED=1 (existing bot behaviour unchanged).
  *   - IDEMPOTENT: pending->sent is claimed by a conditional PostgREST PATCH (CAS) before
- *     execution; close_requested->close_sent likewise; a reconcile sweep adopts/fails stale
- *     'sent' orphans against the exchange truth so a crash can never leave a silent live position.
- *   - BUDGETED: refuses to open beyond BRIDGE_MAX_OPEN concurrent (aggregate exposure cap).
+ *     execution; close_requested->close_sent likewise. TWO reconcile sweeps resolve rows against
+ *     the exchange truth rather than guessing: reconcileSent() adopts/fails stale 'sent' orphans
+ *     so a crash can never leave a silent live position, and reconcileOpen() closes 'open' rows
+ *     the exchange reports flat so a stop/take-profit hit outside the bridge cannot permanently
+ *     consume a slot. Both skip on a failed read and both PATCH conditionally on the expected
+ *     current status, so neither can clobber a concurrent transition.
+ *   - BUDGETED: defers any pending beyond BRIDGE_MAX_OPEN concurrent (aggregate exposure cap);
+ *     deferred rows stay 'pending' and are retried, or expire via MAX_PENDING_AGE_MIN.
  *
  * NOTE: the per-row `testnet` filter is a ROUTING hint, not isolation — real isolation comes
  * from the code-level testnet lock above and (before real money) a service-role key + tight RLS.
