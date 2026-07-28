@@ -123,9 +123,6 @@ public final class TelegramBotSender {
         return null;
     }
 
-    public void sendMessageSync(String message) {
-        sendWithRetry(message);
-    }
 
     public void shutdown() {
         running.set(false);
@@ -149,11 +146,6 @@ public final class TelegramBotSender {
         shutdown();
     }
 
-    public boolean isHealthy() {
-        if (!running.get()) return false;
-        if (System.currentTimeMillis() - workerHeartbeatMs > 30_000L) return false;
-        return consecutiveFailures.get() < 10;
-    }
 
     public int  getQueueSize()   { return queue.size(); }
     public long getTotalSent()   { return totalSent.get(); }

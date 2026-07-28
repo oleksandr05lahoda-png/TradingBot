@@ -420,6 +420,9 @@ public final class BinanceTradeExecutor {
         return total;
     }
 
+    // [HELD pending project_state id=25] Unreachable today (PositionTracker era), but NOT
+    // deleted: wiring RiskGuard into the bridge needs position tracking and will call back
+    // into this API. Delete only if id=25 closes without using it.
     /**
      * Public re-entry point for one-way mode setup. Called by PositionTracker
      * after startup reconcile completes (positions closed, orders cancelled).
@@ -461,6 +464,9 @@ public final class BinanceTradeExecutor {
     public int  getLeverage()    { return leverage; }
     public double getRiskPct()   { return riskPctPerTrade; }
 
+    // [HELD pending project_state id=25] Unreachable today (PositionTracker era), but NOT
+    // deleted: wiring RiskGuard into the bridge needs position tracking and will call back
+    // into this API. Delete only if id=25 closes without using it.
     /**
      * [HOLE-3 FIX 2026-05-08] Public emergency-close helper used by PositionTracker
      * startup reconcile when an orphan position is detected (no SL on exchange).
@@ -2019,6 +2025,9 @@ public final class BinanceTradeExecutor {
         }
     }
 
+    // [HELD pending project_state id=25] Unreachable today (PositionTracker era), but NOT
+    // deleted: wiring RiskGuard into the bridge needs position tracking and will call back
+    // into this API. Delete only if id=25 closes without using it.
     /**
      * Cancel ALL open orders on a symbol — обычные И алго-ордера.
      *
@@ -2235,6 +2244,9 @@ public final class BinanceTradeExecutor {
         }
     }
 
+    // [HELD pending project_state id=25] Unreachable today (PositionTracker era), but NOT
+    // deleted: wiring RiskGuard into the bridge needs position tracking and will call back
+    // into this API. Delete only if id=25 closes without using it.
     /**
      * Fetch ALL non-zero positions on the futures account. Used by PositionTracker
      * at startup to detect orphan positions (Railway restart while a trade was open).
@@ -2301,6 +2313,9 @@ public final class BinanceTradeExecutor {
         }
     }
 
+    // [HELD pending project_state id=25] Unreachable today (PositionTracker era), but NOT
+    // deleted: wiring RiskGuard into the bridge needs position tracking and will call back
+    // into this API. Delete only if id=25 closes without using it.
     /**
      * [HOLE-3 FIX 2026-05-08] Returns true if there is an active STOP_MARKET (SL)
      * order on the exchange for this symbol — checked across both the plain
@@ -2453,6 +2468,26 @@ public final class BinanceTradeExecutor {
                             + emCid + " refused (-4015) — close already placed by a prior "
                             + "attempt; treating as SUCCESS (prevented double-close)");
                     return true;
+                } else if (lastBody.contains("-2022") || lastBody.contains("-2024")) {
+                    // [project_state id=18] This path already sent reduceOnly=true but had no
+                    // branch for its refusals, so -2022 REDUCE_ONLY_REJECT / -2024
+                    // POSITION_NOT_SUFFICIENT burned all three attempts and then reported a
+                    // failed emergency close on a position that was already flat — a spurious
+                    // NAKED alert. Same discipline as closePosition(): a refusal is not assumed
+                    // to mean anything, it is settled against the exchange.
+                    double remaining = fetchPositionAmountChecked(symbol);
+                    if (Double.isNaN(remaining)) {
+                        LOG.warning("[Executor] emergencyClose " + symbol + " reduceOnly refused AND"
+                                + " position read failed — retrying");
+                        continue;
+                    }
+                    if (Math.abs(remaining) < 1e-9) {
+                        LOG.info("[Executor] emergencyClose " + symbol + " reduceOnly refused but"
+                                + " exchange reports FLAT — already closed, treating as SUCCESS");
+                        return true;
+                    }
+                    LOG.severe("[Executor] emergencyClose " + symbol + " reduceOnly refused while the"
+                            + " position is STILL OPEN qty=" + remaining + " — retrying");
                 } else if (lastBody.contains("-4061") || lastBody.contains("position side")) {
                     // HEDGE-mode require explicit positionSide. Reuse the SAME
                     // emCid (a -4061 means this POST did NOT execute the close).

@@ -256,46 +256,9 @@ public final class BotMain {
         }
         long ageMs() { return System.currentTimeMillis() - createdAt; }
 
-        /** [v79 I7] CSV serialization for persistence. */
-        String toCsvLine() {
-            return String.join(";",
-                    escape(symbol),
-                    side == null ? "" : side.name(),
-                    Double.toString(entryPrice),
-                    escape(forecastBias),
-                    Double.toString(forecastScore),
-                    Double.toString(signalProbability),
-                    Double.toString(robustAtrPctAtSignal),
-                    Double.toString(tp1Level),
-                    Double.toString(slLevel),
-                    escape(btcRegimeAtSignal),
-                    Long.toString(createdAt),
-                    Boolean.toString(resolved),
-                    actualOutcome == null ? "" : escape(actualOutcome),
-                    Boolean.toString(counted.get()));
-        }
         private static String escape(String s) {
             if (s == null) return "";
             return s.replace(";", ",").replace("\n", " ");
-        }
-        static ForecastRecord fromCsvLine(String line) {
-            try {
-                String[] p = line.split(";", -1);
-                if (p.length < 14) return null;
-                ForecastRecord fr = new ForecastRecord(
-                        p[0], com.bot.TradingCore.Side.valueOf(p[1]),
-                        Double.parseDouble(p[2]), p[3], Double.parseDouble(p[4]),
-                        Double.parseDouble(p[5]), Double.parseDouble(p[6]),
-                        Double.parseDouble(p[7]), Double.parseDouble(p[8]),
-                        p[9]);
-                java.lang.reflect.Field cf = ForecastRecord.class.getDeclaredField("createdAt");
-                cf.setAccessible(true);
-                cf.setLong(fr, Long.parseLong(p[10]));
-                fr.resolved = Boolean.parseBoolean(p[11]);
-                fr.actualOutcome = p[12].isEmpty() ? null : p[12];
-                if (Boolean.parseBoolean(p[13])) fr.counted.set(true);
-                return fr;
-            } catch (Throwable ignored) { return null; }
         }
     }
 
@@ -327,10 +290,6 @@ public final class BotMain {
     private static final ConcurrentLinkedDeque<SignalOutcome> signalOutcomes = new ConcurrentLinkedDeque<>();
     private static final int SIGNAL_OUTCOME_WINDOW = 200;
 
-    public static void recordSignalOutcome(String sym, double conf, String cat, boolean hit) {
-        signalOutcomes.addLast(new SignalOutcome(sym, conf, cat, hit));
-        while (signalOutcomes.size() > SIGNAL_OUTCOME_WINDOW) signalOutcomes.pollFirst();
-    }
 
     static final ConcurrentHashMap<String, TrackedSignal> trackedSignals = new ConcurrentHashMap<>();
 
@@ -363,12 +322,6 @@ public final class BotMain {
             this.createdAt = System.currentTimeMillis();
         }
         long ageMs() { return System.currentTimeMillis() - createdAt; }
-        void updateExtremes(double low, double high) {
-            synchronized (extremeLock) {
-                extremeLow  = Math.min(extremeLow,  low);
-                extremeHigh = Math.max(extremeHigh, high);
-            }
-        }
         double getExtremeLow()  { synchronized (extremeLock) { return extremeLow; } }
         double getExtremeHigh() { synchronized (extremeLock) { return extremeHigh; } }
     }
@@ -662,10 +615,6 @@ public final class BotMain {
                 .format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"));
     }
 
-    public static String formatLocalTime(long utcMillis) {
-        return Instant.ofEpochMilli(utcMillis).atZone(ZONE)
-                .format(DateTimeFormatter.ofPattern("HH:mm"));
-    }
 
     private static void resolveTimezoneAsync() {
         String envTz = System.getenv("TIMEZONE");
@@ -715,10 +664,6 @@ public final class BotMain {
         catch (Exception e) { return d; }
     }
 
-    private static double envDbl(String k, double d) {
-        try { return Double.parseDouble(System.getenv().getOrDefault(k, String.valueOf(d))); }
-        catch (Exception e) { return d; }
-    }
 
     private static int envIntAny(int defaultValue, String... keys) {
         for (String k : keys) {
