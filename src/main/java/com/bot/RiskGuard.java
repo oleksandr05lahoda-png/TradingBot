@@ -85,6 +85,18 @@ public final class RiskGuard {
     private final double WEEKLY_LOSS_LIMIT_PCT;
     private final int    DAILY_TRADE_LIMIT;
     private final int    MAX_CONCURRENT_POSITIONS;
+    /**
+     * [project_state id=25] The cap that actually binds: total open notional as a percentage of
+     * balance. A position COUNT does not measure risk — MAX_CONCURRENT_POSITIONS=20 with a 20%
+     * notional ceiling per position permits 400% of the account, i.e. 4x portfolio leverage at 1x
+     * per trade, and twenty alts opened in one window behave as a single position anyway.
+     */
+    private final double MAX_AGGREGATE_NOTIONAL_PCT;
+    /**
+     * How stale the BTC feed may be before canTrade() refuses. The crash detector is worthless if
+     * nobody is feeding it, and an unfed detector must not read as "no crash" (fail-closed).
+     */
+    private final long   BTC_FEED_MAX_AGE_MS;
     private final double BTC_CRASH_30M_PCT;
     private final double BTC_CRASH_60M_PCT;
     private final long   BTC_CRASH_BLOCK_MS;
@@ -99,6 +111,8 @@ public final class RiskGuard {
         // при dailyLoss -10% один плохой блок = стоп на день. На реале вернуть 2-3.
         this.DAILY_TRADE_LIMIT         = envInt("RG_DAILY_TRADE_LIMIT", 8);   // [v86.27] real default (was 30 for demo stat-gathering)
         this.MAX_CONCURRENT_POSITIONS  = envInt("RG_MAX_CONCURRENT_POSITIONS", 1);  // [v86.27] real default (was 5 demo); 1 position at a time for a tiny account
+        this.MAX_AGGREGATE_NOTIONAL_PCT = envDouble("RG_MAX_AGGREGATE_NOTIONAL_PCT", 60.0);
+        this.BTC_FEED_MAX_AGE_MS        = envLong("RG_BTC_FEED_MAX_AGE_MS", 10 * 60_000L);
         this.BTC_CRASH_30M_PCT         = envDouble("RG_BTC_CRASH_30M_PCT", 3.0);
         this.BTC_CRASH_60M_PCT         = envDouble("RG_BTC_CRASH_60M_PCT", 5.0);
         this.BTC_CRASH_BLOCK_MS        = envLong  ("RG_BTC_CRASH_BLOCK_MS",   2 * 60 * 60_000L);
@@ -125,6 +139,27 @@ public final class RiskGuard {
     public int    getMaxConcurrentPositions() { return MAX_CONCURRENT_POSITIONS; }
     public double getDailyLossLimitPct()      { return DAILY_LOSS_LIMIT_PCT; }
     public double getWeeklyLossLimitPct()     { return WEEKLY_LOSS_LIMIT_PCT; }
+    public double getMaxAggregateNotionalPct() { return MAX_AGGREGATE_NOTIONAL_PCT; }
+
+    /**
+     * Total open notional this guard currently believes is live, in USD.
+     * Fed by recordTradeOpened/recordTradeClosed — see their contract about ACTUAL fills.
+     */
+    public synchronized double openNotionalUsd() {
+        double s = 0;
+        for (double v : openPositions.values()) s += v;
+        return s;
+    }
+
+    /**
+     * Age of the newest BTC price sample, or -1 when the detector has never been fed.
+     * canTrade() refuses on both -1 and "too old": an unfed crash detector is not a calm market.
+     */
+    public synchronized long btcFeedAgeMs(long now) {
+        PricePoint last = btcPriceHistory.peekLast();
+        if (last == null) return -1L;
+        return Math.max(0L, now - last.ts);
+    }
 
     // ─── State ────────────────────────────────────────────────────────
     private final long startupTime;
@@ -213,8 +248,32 @@ public final class RiskGuard {
      * @param balanceUsd  текущий баланс счёта в USD
      * @return Decision.allow() или Decision.block(reason)
      */
-    public synchronized Decision canTrade(String symbol, double balanceUsd) {
+    public synchronized Decision canTrade(String symbol, double balanceUsd, double incomingNotionalUsd) {
         long now = System.currentTimeMillis();
+
+        // 0. FAIL-CLOSED INPUTS (project_state id=25, principle id=34).
+        //    Every limit below is a fraction of balance or a function of fed state. An unknown
+        //    input must refuse, never pass: a failed balance read is not "balance 0", and an
+        //    unfed BTC detector is not "no crash".
+        if (!(balanceUsd > 0) || Double.isNaN(balanceUsd)) {
+            return Decision.block("balance unknown",
+                    "canTrade needs a positive balance; got " + balanceUsd);
+        }
+        if (Double.isNaN(incomingNotionalUsd) || incomingNotionalUsd < 0) {
+            return Decision.block("incoming notional unknown",
+                    "cannot size the aggregate check against " + incomingNotionalUsd);
+        }
+        long btcAge = btcFeedAgeMs(now);
+        if (btcAge < 0) {
+            return Decision.block("BTC feed absent",
+                    "crash detector has never been fed — refusing rather than assuming calm");
+        }
+        if (btcAge > BTC_FEED_MAX_AGE_MS) {
+            return Decision.block("BTC feed stale",
+                    String.format("last BTC price %.1f min old (max %.1f)",
+                            btcAge / 60000.0, BTC_FEED_MAX_AGE_MS / 60000.0));
+        }
+
         rolloverIfNewDay(balanceUsd);
 
         // 1. Manual lock (weekly limit или ручная команда)
@@ -276,12 +335,27 @@ public final class RiskGuard {
                             openedToday, DAILY_TRADE_LIMIT));
         }
 
-        // 5. Max concurrent positions
+        // 5. AGGREGATE EXPOSURE — the cap that binds (project_state id=25).
+        //    Measured in percent of balance, not in positions, because twenty correlated alts
+        //    opened in one window are one bet, and a count cannot see that.
+        double openNotional = openNotionalUsd();
+        double projected    = openNotional + incomingNotionalUsd;
+        double projectedPct = 100.0 * projected / balanceUsd;
+        if (projectedPct > MAX_AGGREGATE_NOTIONAL_PCT) {
+            return Decision.block("aggregate exposure cap",
+                    String.format("open $%.2f + new $%.2f = %.1f%% of $%.2f balance (limit %.1f%%)",
+                            openNotional, incomingNotionalUsd, projectedPct, balanceUsd,
+                            MAX_AGGREGATE_NOTIONAL_PCT));
+        }
+
+        // 6. One position per symbol, always.
         if (openPositions.containsKey(symbol)) {
             return Decision.block("position already open",
                     "already have a position on " + symbol);
         }
-        if (openPositions.size() >= MAX_CONCURRENT_POSITIONS) {
+        // 7. Position COUNT — secondary, and deliberately NOT applied on paper. A paper run wants
+        //    many positions for sample size; the aggregate cap above still bounds the risk.
+        if (!BotMain.OBSERVATION_MODE && openPositions.size() >= MAX_CONCURRENT_POSITIONS) {
             return Decision.block("max concurrent positions",
                     String.format("already %d open (limit %d): %s",
                             openPositions.size(), MAX_CONCURRENT_POSITIONS,
