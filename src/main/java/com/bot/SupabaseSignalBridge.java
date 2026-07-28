@@ -27,9 +27,11 @@ import org.json.JSONObject;
  * Hard safety (defence in depth):
  *   - LONG-ONLY: rejects any row whose side != LONG (DB also enforces it —
  *     constraint bot_orders_side_long CHECK (side = 'LONG')).
- *   - TESTNET-LOCKED IN CODE: refuses to place ANY order unless the executor reports the
+ *   - TESTNET-LOCKED IN CODE: refuses to OPEN any position unless the executor reports the
  *     testnet/demo endpoint AND BINANCE_USE_TESTNET was set explicitly (absence is a refusal,
- *     never a default). Real money is NOT reachable via env flags: BRIDGE_ALLOW_REAL is still
+ *     never a default). CLOSES are deliberately NOT gated — see poll() — because a lock that
+ *     seals positions in is not a safety feature. Real money is NOT reachable via env flags for
+ *     opening new exposure: BRIDGE_ALLOW_REAL is still
  *     read but grants nothing, and the endpoint is taken from BinanceTradeExecutor.isTestnet()
  *     rather than re-read here, so the two can never disagree. Unlocking is a deliberate code
  *     change gated on {@link #REAL_UNLOCK_REQUIREMENTS}, plus queue hardening (service-role key,
@@ -109,24 +111,40 @@ public final class SupabaseSignalBridge {
     }
 
     /**
-     * One poll cycle: reconcile 'sent' orphans, reconcile 'open' ghosts, place pending opens,
-     * process requested closes. reconcileOpen() runs BEFORE drainOpens() so capacity freed by a
-     * position that died on the exchange is usable in the same cycle.
+     * One poll cycle, deliberately ASYMMETRIC about the endpoint lock.
+     *
+     * Everything that can only SHRINK exposure runs unconditionally — reconciling 'sent' orphans
+     * and 'open' ghosts (both DB-only, they place no orders) and draining close_requested. Only
+     * drainOpens(), the single path that can create exposure, sits behind executionAllowed().
+     *
+     * The reason is that a lock which seals positions IN is not a safety feature: while the gate
+     * covered the whole cycle, a live position could not be closed by the bridge at all and the
+     * live_time_closer cron's close_requested rows piled up unprocessed, so time-stops silently
+     * stopped working (project_state id=11).
+     *
+     * reconcileOpen() still runs before drainOpens(), so capacity freed by a position that died
+     * on the exchange is usable in the same cycle.
      */
     public void poll() {
         if (!isEnabled()) return;
-        if (!executionAllowed()) return;
+        boolean opensAllowed = executionAllowed();
         if (!bannerLogged) {
             bannerLogged = true;
-            LOG.warning("[Bridge] ARMED endpoint=" + (useTestnet ? "TESTNET(demo)" : "*** REAL ***")
+            LOG.warning("[Bridge] polling endpoint=" + (useTestnet ? "TESTNET(demo)" : "*** REAL ***")
+                    + " opens=" + (opensAllowed ? "ALLOWED" : "LOCKED") + " closes=ALWAYS"
                     + " allowReal=" + ALLOW_REAL + " balPerLeg=$" + BAL_PER_LEG
                     + " maxOpen=" + MAX_OPEN + " maxPendingAgeMin=" + MAX_PENDING_AGE_MIN
                     + " key=" + (SUPABASE_KEY.isEmpty() ? "none" : "set"));
         }
+
+        // --- exposure-reducing, never gated ---
         try { reconcileSent(); } catch (Exception e) { LOG.warning("[Bridge] reconcile: " + e.getMessage()); }
         try { reconcileOpen(); } catch (Exception e) { LOG.warning("[Bridge] reconcileOpen: " + e.getMessage()); }
-        try { drainOpens();   } catch (Exception e) { LOG.warning("[Bridge] drainOpens: " + e.getMessage()); }
         try { drainCloses();  } catch (Exception e) { LOG.warning("[Bridge] drainCloses: " + e.getMessage()); }
+
+        // --- the ONLY exposure-increasing path ---
+        if (!opensAllowed) return;
+        try { drainOpens();   } catch (Exception e) { LOG.warning("[Bridge] drainOpens: " + e.getMessage()); }
     }
 
     /**
@@ -266,6 +284,17 @@ public final class SupabaseSignalBridge {
         }
     }
 
+    /**
+     * Drain close_requested. Runs UNGATED (see poll()) because closing only shrinks exposure.
+     *
+     * CAVEAT, verified 2026-07-28 and filed as project_state id=16: closePosition() is reduce-only
+     * BY CONSTRUCTION but NOT at the API level — it reads the position, sizes the market order to
+     * exactly |posQty| and skips entirely when flat, yet it does not send reduceOnly=true. If the
+     * exchange-side stop fills inside the read->send window, the order lands as a NEW opposite-side
+     * position instead of a close. Narrow, but on the real endpoint it is the one way this ungated
+     * path could create exposure. The fix is one parameter in BinanceTradeExecutor.sendMarketOrder;
+     * not applied here because rewriting the execution layer is out of scope for this refactor.
+     */
     private void drainCloses() throws Exception {
         JSONArray cl = sbGet("/rest/v1/bot_orders?status=eq.close_requested&testnet=eq." + useTestnet
                 + "&order=created_at.asc&limit=20");
