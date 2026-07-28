@@ -42,12 +42,9 @@ import org.json.JSONObject;
  *   - project_state id=30: only reconcileOpen() PATCHes conditionally. reconcileSent() calls
  *     patch(), which has no status predicate, so it can overwrite a close_requested written
  *     concurrently by the live_time_closer cron and silently lose the close.
- *   - project_state id=29: BRIDGE_MAX_OPEN is NOT a reliable cap — countActive() uses sbGet(),
- *     which returns an empty array on any non-2xx, so a failed count reads as 0 and drainOpens()
- *     proceeds uncapped. It also counts rows, not notional, so it is not an exposure cap at all
- *     (see project_state id=25).
- *   - project_state id=31: the -4061 hedge-mode fallback sends the close WITHOUT reduceOnly
- *     (Binance forbids it in Hedge Mode), so on a hedge account the ungated close path can open.
+ *   - BRIDGE_MAX_OPEN counts ROWS, not notional: 20 rows at 20% of balance each is 400% of the
+ *     account, and correlated alts opened in one window behave as one position. An exposure cap in
+ *     percent of balance is project_state id=25.
  *
  * NOTE: the per-row `testnet` filter is a ROUTING hint, not isolation — real isolation comes
  * from the code-level testnet lock above and (before real money) a service-role key + tight RLS.
@@ -94,11 +91,9 @@ public final class SupabaseSignalBridge {
           + "+ RiskGuard wired to drainOpens and tested + operator sign-off)";
 
     /**
-     * BRIDGE_MAX_OPEN, for the BotMain boot banner. NOT the only constraint on the live path
-     * (BRIDGE_BALANCE_PER_LEG caps the sizing base, MAX_PENDING_AGE_MIN expires pendings, and the
-     * executor clamps leverage, risk-per-trade and spread), and NOT a reliable one — see
-     * project_state id=29: a failed countActive() read counts as 0 and lets drainOpens() proceed
-     * uncapped. It also counts ROWS, not notional.
+     * BRIDGE_MAX_OPEN, for the BotMain boot banner. One of several constraints on the live path —
+     * BRIDGE_BALANCE_PER_LEG caps the sizing base, MAX_PENDING_AGE_MIN expires pendings, and the
+     * executor clamps leverage, risk-per-trade and spread. Counts ROWS, not notional.
      */
     static int maxOpen() { return MAX_OPEN; }
 
@@ -333,6 +328,14 @@ public final class SupabaseSignalBridge {
         }
     }
 
+    /**
+     * Rows currently holding a slot. Propagates a read failure rather than reporting 0 — an
+     * unknown exposure must never read as "no exposure" (project_state id=29).
+     *
+     * Still a ROW count, not notional: 20 rows at 20% of balance each is 400% of the account, and
+     * correlated alts opened in one window behave as one position. The exposure cap proper is
+     * project_state id=25.
+     */
     private int countActive() throws Exception {
         JSONArray a = sbGet("/rest/v1/bot_orders?status=in.(sent,open)&testnet=eq." + useTestnet + "&select=id&limit=200");
         return a.length();
@@ -389,14 +392,25 @@ public final class SupabaseSignalBridge {
         return b;
     }
 
+    /**
+     * [project_state id=29] THROWS on a non-2xx instead of returning an empty array.
+     *
+     * The empty array was indistinguishable from a genuinely empty result, and the two mean
+     * opposite things: for the sweeps it read as "nothing to do", but for countActive() it read as
+     * "no open exposure" and switched BRIDGE_MAX_OPEN off exactly when Supabase was unhealthy.
+     *
+     * Every caller sits inside poll()'s per-sweep try/catch, so a throw now skips that sweep for
+     * one cycle — which is the fail-closed answer for all of them: no reconcile, no closes, and in
+     * particular no opens, because drainOpens() cannot get past its own countActive() call.
+     */
     private JSONArray sbGet(String pathQuery) throws Exception {
         HttpResponse<String> resp = http.send(sbAuth(HttpRequest.newBuilder()
                 .uri(URI.create(SUPABASE_URL + pathQuery)))
                 .timeout(Duration.ofSeconds(15)).GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() / 100 != 2) {
-            LOG.warning("[Bridge] GET " + pathQuery + " HTTP " + resp.statusCode());
-            return new JSONArray();
+            throw new java.io.IOException("Supabase GET " + pathQuery + " HTTP " + resp.statusCode()
+                    + ": " + trunc(resp.body() == null ? "" : resp.body(), 200));
         }
         return new JSONArray(resp.body());
     }
