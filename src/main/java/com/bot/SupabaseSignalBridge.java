@@ -21,31 +21,37 @@ import org.json.JSONObject;
  * existing {@link BinanceTradeExecutor}. It never decides what to trade and never shorts.
  * The dead candle brain (DecisionEngineMerged.analyze) is simply not invoked on this path.
  *
- * Every claim below was re-verified against the code and the live schema on 2026-07-28
- * (project_state id=4); the DB-side checks cited are real constraints on public.bot_orders.
+ * The claims below were audited on 2026-07-28 (project_state id=26) by following the actual
+ * calls, and several earlier ones did NOT survive. Read the KNOWN HOLES section as part of the
+ * contract — an unqualified safety claim here has been wrong three times already.
  *
  * Hard safety (defence in depth):
  *   - LONG-ONLY: rejects any row whose side != LONG (DB also enforces it —
- *     constraint bot_orders_side_long CHECK (side = 'LONG')).
- *   - TESTNET-LOCKED IN CODE: refuses to OPEN any position unless the executor reports the
- *     testnet/demo endpoint AND BINANCE_USE_TESTNET was set explicitly (absence is a refusal,
- *     never a default). CLOSES are deliberately NOT gated — see poll() — because a lock that
- *     seals positions in is not a safety feature. Real money is NOT reachable via env flags for
- *     opening new exposure: BRIDGE_ALLOW_REAL is still
- *     read but grants nothing, and the endpoint is taken from BinanceTradeExecutor.isTestnet()
- *     rather than re-read here, so the two can never disagree. Unlocking is a deliberate code
- *     change gated on {@link #REAL_UNLOCK_REQUIREMENTS}, plus queue hardening (service-role key,
- *     tight RLS) + sign-off.
- *   - DEFAULT-OFF: no-op unless SUPABASE_BRIDGE_ENABLED=1 (existing bot behaviour unchanged).
+ *     constraint bot_orders_side_long CHECK (side = 'LONG')). Survived adversarial review.
+ *   - TESTNET-GATED: refuses to OPEN any position unless BINANCE_USE_TESTNET was set explicitly
+ *     (absence is a refusal, never a default) AND the executor reports testnet. BRIDGE_ALLOW_REAL
+ *     is read but grants nothing — that much survived review. CLOSES are deliberately NOT gated,
+ *     see poll(), because a lock that seals positions in is not a safety feature.
+ *   - DEFAULT-OFF: no-op unless SUPABASE_BRIDGE_ENABLED=1.
  *   - IDEMPOTENT: pending->sent is claimed by a conditional PostgREST PATCH (CAS) before
- *     execution; close_requested->close_sent likewise. TWO reconcile sweeps resolve rows against
- *     the exchange truth rather than guessing: reconcileSent() adopts/fails stale 'sent' orphans
- *     so a crash can never leave a silent live position, and reconcileOpen() closes 'open' rows
- *     the exchange reports flat so a stop/take-profit hit outside the bridge cannot permanently
- *     consume a slot. Both skip on a failed read and both PATCH conditionally on the expected
- *     current status, so neither can clobber a concurrent transition.
- *   - BUDGETED: defers any pending beyond BRIDGE_MAX_OPEN concurrent (aggregate exposure cap);
- *     deferred rows stay 'pending' and are retried, or expire via MAX_PENDING_AGE_MIN.
+ *     execution; close_requested->close_sent likewise. Two reconcile sweeps resolve rows against
+ *     the exchange truth rather than guessing, and both skip on a failed read.
+ *
+ * KNOWN HOLES — do not read the list above as stronger than this:
+ *   - project_state id=28 (P0): the gate checks the BINANCE_USE_TESTNET FLAG via
+ *     BinanceTradeExecutor.isTestnet(), NOT the endpoint. TESTNET_BASE_URL repoints the
+ *     "testnet" base URL at any host, so BINANCE_USE_TESTNET=1 + TESTNET_BASE_URL=fapi.binance.com
+ *     opens REAL positions with real keys while every log here says TESTNET(demo). Real capital IS
+ *     reachable by env alone today. Earlier revisions of this javadoc claimed the opposite.
+ *   - project_state id=30: only reconcileOpen() PATCHes conditionally. reconcileSent() calls
+ *     patch(), which has no status predicate, so it can overwrite a close_requested written
+ *     concurrently by the live_time_closer cron and silently lose the close.
+ *   - project_state id=29: BRIDGE_MAX_OPEN is NOT a reliable cap — countActive() uses sbGet(),
+ *     which returns an empty array on any non-2xx, so a failed count reads as 0 and drainOpens()
+ *     proceeds uncapped. It also counts rows, not notional, so it is not an exposure cap at all
+ *     (see project_state id=25).
+ *   - project_state id=31: the -4061 hedge-mode fallback sends the close WITHOUT reduceOnly
+ *     (Binance forbids it in Hedge Mode), so on a hedge account the ungated close path can open.
  *
  * NOTE: the per-row `testnet` filter is a ROUTING hint, not isolation — real isolation comes
  * from the code-level testnet lock above and (before real money) a service-role key + tight RLS.
@@ -91,15 +97,25 @@ public final class SupabaseSignalBridge {
           + "(paper-harness + isSleeveApproved + a sleeve with passed_v2 & forward_ok "
           + "+ RiskGuard wired to drainOpens and tested + operator sign-off)";
 
-    /** The only cap actually enforced on the live path today — read by the BotMain boot banner. */
+    /**
+     * BRIDGE_MAX_OPEN, for the BotMain boot banner. NOT the only constraint on the live path
+     * (BRIDGE_BALANCE_PER_LEG caps the sizing base, MAX_PENDING_AGE_MIN expires pendings, and the
+     * executor clamps leverage, risk-per-trade and spread), and NOT a reliable one — see
+     * project_state id=29: a failed countActive() read counts as 0 and lets drainOpens() proceed
+     * uncapped. It also counts ROWS, not notional.
+     */
     static int maxOpen() { return MAX_OPEN; }
 
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     private final BinanceTradeExecutor executor = BinanceTradeExecutor.getInstance();
     /**
-     * SINGLE SOURCE OF TRUTH for which endpoint we are on: taken from the executor that actually
-     * builds the URLs, never re-read from env here. Two independent reads of BINANCE_USE_TESTNET
-     * are precisely how this bridge could log "TESTNET(demo)" while the executor traded fapi.binance.com.
+     * The BINANCE_USE_TESTNET FLAG as the executor sees it — deliberately not a second env read,
+     * so bridge and executor cannot disagree about the flag.
+     *
+     * It is NOT the endpoint, and this comment used to claim it was. isTestnet() reports the flag;
+     * the endpoint is the executor's baseUrl, which TESTNET_BASE_URL can repoint at any host. The
+     * exact failure the old wording claimed to have eliminated — logging TESTNET(demo) while orders
+     * hit fapi.binance.com — is still reachable. See project_state id=28.
      */
     private final boolean useTestnet = executor.isTestnet();
     private volatile boolean bannerLogged = false;
@@ -121,14 +137,19 @@ public final class SupabaseSignalBridge {
     /**
      * One poll cycle, deliberately ASYMMETRIC about the endpoint lock.
      *
-     * Everything that can only SHRINK exposure runs unconditionally — reconciling 'sent' orphans
-     * and 'open' ghosts (both DB-only, they place no orders) and draining close_requested. Only
-     * drainOpens(), the single path that can create exposure, sits behind executionAllowed().
+     * Exposure-reducing work runs unconditionally — reconciling 'sent' orphans and 'open' ghosts
+     * (both DB-only, they place no orders) and draining close_requested. drainOpens() sits behind
+     * executionAllowed().
      *
      * The reason is that a lock which seals positions IN is not a safety feature: while the gate
      * covered the whole cycle, a live position could not be closed by the bridge at all and the
      * live_time_closer cron's close_requested rows piled up unprocessed, so time-stops silently
      * stopped working (project_state id=11).
+     *
+     * CAVEAT, project_state id=31: "the ungated paths can only shrink exposure" holds on a one-way
+     * account, where the close carries reduceOnly=true. It does NOT hold on a hedge-mode account —
+     * Binance forbids reduceOnly there, so the -4061 fallback sends a plain market order that can
+     * open the opposite side if the position vanishes mid-flight.
      *
      * reconcileOpen() still runs before drainOpens(), so capacity freed by a position that died
      * on the exchange is usable in the same cycle.
@@ -138,7 +159,9 @@ public final class SupabaseSignalBridge {
         boolean opensAllowed = executionAllowed();
         if (!bannerLogged) {
             bannerLogged = true;
-            LOG.warning("[Bridge] polling endpoint=" + (useTestnet ? "TESTNET(demo)" : "*** REAL ***")
+            // NOTE (id=28): this reports the BINANCE_USE_TESTNET flag, not the URL actually used.
+            // With TESTNET_BASE_URL repointed it will print "flag=TESTNET" while trading real.
+            LOG.warning("[Bridge] polling flag=" + (useTestnet ? "TESTNET" : "*** REAL ***")
                     + " opens=" + (opensAllowed ? "ALLOWED" : "LOCKED") + " closes=ALWAYS"
                     + " allowReal=" + ALLOW_REAL + " balPerLeg=$" + BAL_PER_LEG
                     + " maxOpen=" + MAX_OPEN + " maxPendingAgeMin=" + MAX_PENDING_AGE_MIN
@@ -156,13 +179,17 @@ public final class SupabaseSignalBridge {
     }
 
     /**
-     * Endpoint gate — FAIL-CLOSED, and no longer an env decision. Three checks, in order:
-     *   1. BINANCE_USE_TESTNET absent          -> refuse (absence must never pick an endpoint silently);
-     *   2. executor is on the REAL endpoint    -> refuse UNCONDITIONALLY (BRIDGE_ALLOW_REAL cannot override);
-     *   3. explicit testnet/demo               -> allow.
+     * Endpoint gate — fail-closed on the FLAG. Three checks, in order:
+     *   1. BINANCE_USE_TESTNET absent      -> refuse (absence must never pick an endpoint silently);
+     *   2. flag says real                  -> refuse unconditionally (BRIDGE_ALLOW_REAL cannot override);
+     *   3. flag says testnet               -> allow.
      *
-     * There is no combination of environment variables that reaches real capital from here; lifting
-     * the lock is a code change gated on {@link #REAL_UNLOCK_REQUIREMENTS}.
+     * LIMIT OF THIS GATE, project_state id=28: it checks the flag, never the URL. TESTNET_BASE_URL
+     * repoints the executor's "testnet" baseUrl at any host, so BINANCE_USE_TESTNET=1 plus
+     * TESTNET_BASE_URL=https://fapi.binance.com passes every check here and trades real money with
+     * real keys. An earlier version of this comment asserted that no combination of environment
+     * variables could reach real capital — that was false. Closing it means checking the endpoint
+     * itself, not the flag.
      */
     private boolean executionAllowed() {
         if (ALLOW_REAL) {
@@ -181,7 +208,12 @@ public final class SupabaseSignalBridge {
         return true;
     }
 
-    /** poll() runs on a timer; log each distinct gate reason once so severe keeps its meaning. */
+    /**
+     * De-duplicates gate messages against the PREVIOUS one only. That is enough when a cycle emits
+     * a single message, but with BRIDGE_ALLOW_REAL=1 executionAllowed() emits two different ones
+     * (IGNORED, then BLOCKED) and they alternate, so both are re-logged every poll. Known, not
+     * fixed here — it is log noise, not a safety property.
+     */
     private void gateLog(String msg) {
         if (msg.equals(lastGateLog)) return;
         lastGateLog = msg;
