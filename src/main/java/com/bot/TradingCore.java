@@ -595,63 +595,6 @@ public final class TradingCore {
         public boolean isNearby(double price, double atr) { return Math.abs(price - midpoint()) < atr * 1.5; }
     }
 
-    public static List<OrderBlock> detectOrderBlocks(List<Candle> candles, int lookback) {
-        List<OrderBlock> blocks = new ArrayList<>();
-        if (candles == null || candles.size() < lookback + 3) return blocks;
-
-        int n = candles.size();
-        int start = Math.max(1, n - lookback);
-        double atr14 = atr(candles, 14);
-
-        for (int i = start; i < n - 2; i++) {
-            Candle c0 = candles.get(i);
-            Candle c1 = candles.get(i + 1);
-            Candle c2 = candles.get(i + 2);
-
-            // Bullish Order Block: bearish candle immediately followed by a strong bullish impulse
-            boolean strongBullishMove = c1.isBullish && c1.body > atr14 * 0.8;
-            if (!c0.isBullish && strongBullishMove) {
-                // The OB is the last bearish candle before the impulse
-                double avgVolLookback = 0;
-                int volCount = 0;
-                for (int j = Math.max(0, i - 20); j < i; j++) {
-                    avgVolLookback += candles.get(j).volume; volCount++;
-                }
-                avgVolLookback = volCount > 0 ? avgVolLookback / volCount : 1;
-                double volRatio = avgVolLookback > 0 ? c1.volume / avgVolLookback : 1;
-                double strength = clamp(c1.body / (atr14 + 1e-10) * 0.4 + volRatio * 0.2, 0.1, 0.95);
-                blocks.add(new OrderBlock(c0.high, c0.low, true, strength, i));
-            }
-
-            // Bearish Order Block: bullish candle immediately followed by a strong bearish impulse
-            boolean strongBearishMove = !c1.isBullish && c1.body > atr14 * 0.8;
-            if (c0.isBullish && strongBearishMove) {
-                double avgVolLookback = 0;
-                int volCount = 0;
-                for (int j = Math.max(0, i - 20); j < i; j++) {
-                    avgVolLookback += candles.get(j).volume; volCount++;
-                }
-                avgVolLookback = volCount > 0 ? avgVolLookback / volCount : 1;
-                double volRatio = avgVolLookback > 0 ? c1.volume / avgVolLookback : 1;
-                double strength = clamp(c1.body / (atr14 + 1e-10) * 0.4 + volRatio * 0.2, 0.1, 0.95);
-                blocks.add(new OrderBlock(c0.high, c0.low, false, strength, i));
-            }
-        }
-
-        // Keep only fresh, unmitigated blocks (price hasn't returned to them)
-        double currentPrice = candles.get(n - 1).close;
-        blocks.removeIf(ob -> {
-            // Mitigated = price has touched the zone again after formation
-            for (int i = ob.formationBar + 3; i < n; i++) {
-                if (candles.get(i).low <= ob.top && candles.get(i).high >= ob.bottom) return true;
-            }
-            return false;
-        });
-
-        // Sort by strength descending
-        blocks.sort(Comparator.comparingDouble((OrderBlock ob) -> ob.strength).reversed());
-        return blocks.subList(0, Math.min(blocks.size(), 5)); // Top 5 only
-    }
 
     /* ════════════════════════════════════════════════════════════════
        [v13.0 NEW] ATR PERCENTILE — Volatility regime detection
@@ -2062,40 +2005,6 @@ public final class TradingCore {
         public double size() { return upperBound - lowerBound; }
     }
 
-    public static List<FairValueGap> detectFVGs(List<Candle> c, int lookback, int maxGaps) {
-        List<FairValueGap> result = new ArrayList<>();
-        if (c == null || c.size() < 4) return result;
-        int n = c.size();
-        double atrV = atr(c, 14);
-        if (atrV <= 0) return result;
-        double minGap = atrV * 0.20; // ignore micro-gaps that are just spread noise
-
-        int start = Math.max(1, n - lookback);
-        for (int i = n - 2; i >= start; i--) {
-            Candle prev = c.get(i - 1);
-            Candle next = c.get(i + 1);
-            // Bullish FVG: prev.high < next.low → gap above prev
-            if (prev.high < next.low && (next.low - prev.high) >= minGap) {
-                boolean filled = false;
-                for (int j = i + 2; j < n; j++) {
-                    if (c.get(j).low <= prev.high) { filled = true; break; }
-                }
-                result.add(new FairValueGap(next.low, prev.high, true,
-                        c.get(i).openTime, i, filled));
-            }
-            // Bearish FVG: prev.low > next.high → gap below prev
-            else if (prev.low > next.high && (prev.low - next.high) >= minGap) {
-                boolean filled = false;
-                for (int j = i + 2; j < n; j++) {
-                    if (c.get(j).high >= prev.low) { filled = true; break; }
-                }
-                result.add(new FairValueGap(prev.low, next.high, false,
-                        c.get(i).openTime, i, filled));
-            }
-            if (result.size() >= maxGaps) break;
-        }
-        return result;
-    }
 
     /** Liquidity sweep detection: price wicks beyond a recent high/low and reverses.
      *  Returns {sweptHigh: bool, sweptLow: bool, reverseStrength: 0..1}. */
@@ -2450,24 +2359,6 @@ public final class TradingCore {
         }
     }
 
-    public static PremiumDiscount premiumDiscount(List<Candle> c, int lookback) {
-        if (c == null || c.size() < 3) {
-            double p = c == null || c.isEmpty() ? 0 : c.get(c.size() - 1).close;
-            return new PremiumDiscount(p, p, p, p, 0.5, false, false);
-        }
-        int n = c.size();
-        int start = Math.max(0, n - lookback);
-        double hi = c.get(start).high, lo = c.get(start).low;
-        for (int i = start; i < n; i++) {
-            hi = Math.max(hi, c.get(i).high);
-            lo = Math.min(lo, c.get(i).low);
-        }
-        double cur = c.get(n - 1).close;
-        double range = Math.max(1e-12, hi - lo);
-        double pos = (cur - lo) / range;
-        return new PremiumDiscount(hi, lo, (hi + lo) / 2.0, cur, pos,
-                pos > 0.70, pos < 0.30);
-    }
 
     // ── 8. FUNDING RATE IMPULSE ────────────────────────────────────────────────
 
@@ -2515,80 +2406,6 @@ public final class TradingCore {
         public boolean detected() { return type != PreMoveType.NONE; }
     }
 
-    /**
-     * Detect predictive pre-move patterns: compressions about to break, accumulation/distribution,
-     * Wyckoff springs/upthrusts, and CVD divergences.
-     *
-     * Returns the strongest detected pattern, or NONE if none qualify.
-     */
-    public static PreMoveSignal detectPreMove(List<Candle> c) {
-        if (c == null || c.size() < 30) {
-            return new PreMoveSignal(PreMoveType.NONE, false, 0, "insufficient data");
-        }
-        int n = c.size();
-        double atrV = atr(c, 14);
-        if (atrV <= 0) return new PreMoveSignal(PreMoveType.NONE, false, 0, "zero ATR");
-        Candle last = c.get(n - 1);
-
-        // --- Pattern 1: COMPRESSION BREAKOUT ---
-        // BB squeeze + last bar breaking out with above-average volume
-        BollingerSqueeze bb = bollingerSqueeze(c, 20, 2.0, 96);
-        double avgVol = 0;
-        for (int i = n - 20; i < n - 1; i++) avgVol += c.get(i).volume;
-        avgVol /= 19;
-        boolean volSurge = last.volume > avgVol * 1.5;
-        if (bb.squeeze && volSurge) {
-            boolean bullBreak = last.close > bb.upper;
-            boolean bearBreak = last.close < bb.lower;
-            if (bullBreak || bearBreak) {
-                double conf = Math.min(1.0, (1.0 - bb.bandwidthPctile) * 0.7
-                        + (last.volume / avgVol - 1.0) * 0.15);
-                return new PreMoveSignal(PreMoveType.COMPRESSION_BREAKOUT, bullBreak, conf,
-                        String.format("BB squeeze pctile=%.2f, vol=%.1fx", bb.bandwidthPctile, last.volume / avgVol));
-            }
-        }
-
-        // --- Pattern 2: ABSORPTION ---
-        // Sustained volume on small-range bars in tight area = institutional accumulation/distribution
-        double sumRange = 0, sumVol = 0;
-        for (int i = n - 5; i < n; i++) {
-            sumRange += (c.get(i).high - c.get(i).low);
-            sumVol += c.get(i).volume;
-        }
-        double avgRange5 = sumRange / 5;
-        double avgVol5   = sumVol / 5;
-        if (avgRange5 < atrV * 0.6 && avgVol5 > avgVol * 1.3) {
-            // Determine direction: which side of CVD has been growing?
-            List<CandleFootprint> fp = footprintSeries(c);
-            double cvdSlope = fp.get(n - 1).cumDelta - fp.get(n - 6).cumDelta;
-            boolean bull = cvdSlope > 0;
-            double conf = Math.min(1.0, (avgVol5 / avgVol - 1.0) * 0.5 + 0.3);
-            return new PreMoveSignal(PreMoveType.ABSORPTION, bull, conf,
-                    String.format("range=%.2fATR, vol=%.1fx, cvdSlope=%.2f", avgRange5/atrV, avgVol5/avgVol, cvdSlope));
-        }
-
-        // --- Pattern 3: SPRING / UPTHRUST (Wyckoff) ---
-        // Recent low broken by wick then reclaimed = Spring (bull)
-        // Recent high broken by wick then rejected = Upthrust (bear)
-        LiquiditySweep sweep = detectLiquiditySweep(c, 20);
-        if (sweep.sweptLow && sweep.reverseStrength > 0.4) {
-            return new PreMoveSignal(PreMoveType.SPRING, true, Math.min(1.0, sweep.reverseStrength),
-                    String.format("low swept @%.4f, reverseStr=%.2f", sweep.sweepLevel, sweep.reverseStrength));
-        }
-        if (sweep.sweptHigh && sweep.reverseStrength > 0.4) {
-            return new PreMoveSignal(PreMoveType.UPTHRUST, false, Math.min(1.0, sweep.reverseStrength),
-                    String.format("high swept @%.4f, reverseStr=%.2f", sweep.sweepLevel, sweep.reverseStrength));
-        }
-
-        // --- Pattern 4: CVD DIVERGENCE ---
-        CVDDivergence div = cvdDivergence(c, 20);
-        if ((div.bullish || div.bearish) && div.strength > 0.35) {
-            return new PreMoveSignal(PreMoveType.DELTA_DIVERGENCE, div.bullish, div.strength,
-                    String.format("%s div, str=%.2f", div.bullish ? "bull" : "bear", div.strength));
-        }
-
-        return new PreMoveSignal(PreMoveType.NONE, false, 0, "no pattern");
-    }
 
     // ── 10. CONFLUENCE AGGREGATOR ─────────────────────────────────────────────
 
