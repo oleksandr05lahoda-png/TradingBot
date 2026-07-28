@@ -21,11 +21,14 @@ import java.util.TreeSet;
  * Usage:
  *   --hypothesis com.example.MyHypothesis   fully qualified class implementing {@link Hypothesis}
  *   --mode       dev | holdout
- *   --symbols    BTCUSDT,ETHUSDT
+ *   --universe   a FROZEN universe_id from public.universes; membership is read from the
+ *                database, never from the command line, so the symbol set cannot be adjusted
+ *                after seeing which symbols worked
  *   --from       2023-01-01        inclusive
  *   --to         2025-06-30        inclusive
  *   --tf         4h | 1h
- *   --hold       6                 maxHoldBars (default 6)
+ *   --hold       6                 maxHoldBars for DIRECTIONAL runs only; a CarryHypothesis owns
+ *                                  its own horizon, because the horizon is part of the claim
  *   --url        https://xxx.supabase.co   (or env SUPABASE_URL)
  *   --key        <read-only key>            (or env SUPABASE_READONLY_KEY / SUPABASE_KEY)
  */
@@ -81,7 +84,7 @@ public final class HistoricalDriver {
 
     static String usage() {
         return "usage: HistoricalDriver --hypothesis <class> --mode dev|holdout "
-                + "--symbols A,B --from YYYY-MM-DD --to YYYY-MM-DD [--tf 4h|1h] [--hold N] "
+                + "--universe <frozen universe_id> --from YYYY-MM-DD --to YYYY-MM-DD [--tf 4h|1h] [--hold N] "
                 + "[--url <supabase url>] [--key <read-only key>]\n"
                 + "  url/key may come from SUPABASE_URL and SUPABASE_READONLY_KEY (or SUPABASE_KEY).\n"
                 + "  dev covers data up to " + DEV_END + "; holdout starts at " + HOLDOUT_START + ".";
@@ -107,13 +110,10 @@ public final class HistoricalDriver {
         try { c.mode = Mode.valueOf(mode); }
         catch (Exception e) { throw new IllegalArgumentException("mode must be dev or holdout, got: " + mode); }
 
-        c.symbols = new ArrayList<>();
-        for (String s : require(a, "symbols").split(",")) {
-            String t = s.trim().toUpperCase();
-            if (!t.isEmpty()) c.symbols.add(t);
-        }
-        if (c.symbols.isEmpty()) throw new IllegalArgumentException("--symbols is empty");
-        Collections.sort(c.symbols);   // universe_id must not depend on argument order
+        // The universe lives in the database, frozen, not on the command line. Resolution happens
+        // in run(); parse() stays free of any database or environment access so it can be tested
+        // and so a bad argument fails before anything is opened.
+        c.universeId = require(a, "universe");
 
         c.from = parseDate(require(a, "from"), "from");
         c.to   = parseDate(require(a, "to"), "to");
@@ -148,18 +148,7 @@ public final class HistoricalDriver {
                 "Supabase key missing. Pass --key, or set SUPABASE_READONLY_KEY (or SUPABASE_KEY). "
                         + "A read-only key is enough — this driver only reads klines and funding.");
 
-        // Fixed BEFORE the run and written to every row, so the universe cannot be chosen later to
-        // suit the result. Deterministic in the symbol set and timeframe, not in their order.
-        c.universeId = universeId(c.symbols, c.timeframe);
         return c;
-    }
-
-    /** Stable identifier of the symbol set + timeframe. Same set, same id, regardless of order. */
-    static String universeId(List<String> sortedSymbols, String timeframe) {
-        String joined = String.join(",", sortedSymbols) + "|" + timeframe;
-        return "u_" + PaperStore.chainHash(null,
-                new org.json.JSONObject().put("u", joined)).substring(0, 16)
-                + "_n" + sortedSymbols.size();
     }
 
     // ─── replay ───────────────────────────────────────────────────────
@@ -188,6 +177,10 @@ public final class HistoricalDriver {
                         + HOLDOUT_START + " — refusing");
             }
         }
+
+        // Resolve the frozen universe now. Refuses an unknown or unfrozen one; never substitutes.
+        c.symbols = store.loadUniverse(c.universeId);
+        System.out.println("universe " + c.universeId + ": " + c.symbols.size() + " symbols (frozen)");
 
         if (h instanceof CarryHypothesis) {
             if (!c.timeframe.equals("4h")) {
@@ -261,16 +254,45 @@ public final class HistoricalDriver {
         Map<String, List<PaperExecutor.FundingPoint>> funding = new LinkedHashMap<>();
         TreeSet<Long> closes = new TreeSet<>();
 
+        int skipped = 0;
         for (String sym : c.symbols) {
             List<Bar> perp = store.loadBars("klines_4h", sym, intervalMs, fromMs, toMs);
             List<Bar> spot = store.loadBars("index_klines_4h", sym, intervalMs, fromMs, toMs);
+            List<PaperExecutor.FundingPoint> fnd = store.loadFunding(sym, fromMs, toMs);
+
+            // FAIL-CLOSED ON EMPTY INPUTS. An HTTP 200 carrying [] is indistinguishable from
+            // "there is genuinely nothing", and the two mean opposite things. Reading funding as
+            // zero would silently delete the ENTIRE income term of a carry backtest and produce a
+            // confident "carry does not work" from data in which carry could not appear — with no
+            // error anywhere. That is exactly what RLS-with-no-policy returns for this table.
+            if (perp.isEmpty() && spot.isEmpty() && fnd.isEmpty()) {
+                System.out.println("skip " + sym + ": no perp, no spot and no funding in range — "
+                        + "not listed over this window");
+                skipped++;
+                continue;
+            }
+            if (perp.isEmpty() || spot.isEmpty()) {
+                throw new IllegalStateException(sym + ": one leg is empty over the window (perp="
+                        + perp.size() + " spot=" + spot.size() + ") while the other has data — "
+                        + "refusing rather than pricing a half-hedged position");
+            }
+            if (fnd.isEmpty()) {
+                throw new IllegalStateException(sym + ": " + perp.size() + " bars but ZERO funding"
+                        + " settlements over the window. A traded symbol always has funding, so this"
+                        + " is a data or permission fault, not an absence. Refusing — for carry the"
+                        + " funding IS the income, and counting it as zero would invert the result."
+                        + " Check SELECT grants AND row-level security policies on funding_history:"
+                        + " RLS enabled with no policy returns 200 with an empty body.");
+            }
+
             perpSeries.put(sym, Collections.unmodifiableList(perp));
             spotSeries.put(sym, Collections.unmodifiableList(spot));
-            funding.put(sym, store.loadFunding(sym, fromMs, toMs));
+            funding.put(sym, fnd);
             for (Bar b : perp) closes.add(b.closeMs);
             System.out.println("loaded " + sym + ": perp=" + perp.size() + " spot=" + spot.size()
-                    + " funding=" + funding.get(sym).size());
+                    + " funding=" + fnd.size());
         }
+        if (skipped > 0) System.out.println("skipped " + skipped + " symbols not listed in range");
         if (closes.isEmpty()) {
             System.out.println("no bars in range — nothing to replay");
             return 0;

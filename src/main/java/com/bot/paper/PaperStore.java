@@ -73,6 +73,35 @@ public final class PaperStore {
         return out;
     }
 
+    /**
+     * The frozen membership of a universe, sorted.
+     *
+     * Refuses an unknown universe and refuses one that has not been frozen. A universe that can
+     * still change is not a pre-registration: the symbol set would be choosable after seeing which
+     * symbols worked, which is survivorship selection dressed as a configuration change. No default
+     * and no fallback — if the universe cannot be established, there is no run.
+     */
+    public List<String> loadUniverse(String universeId) throws Exception {
+        JSONArray u = get("/rest/v1/universes?universe_id=eq." + enc(universeId)
+                + "&select=universe_id,frozen_at&limit=1");
+        if (u.isEmpty()) {
+            throw new IllegalStateException("universe not found: " + universeId
+                    + " — create and freeze it before running");
+        }
+        if (u.getJSONObject(0).isNull("frozen_at")) {
+            throw new IllegalStateException("universe " + universeId + " is NOT frozen — refusing. "
+                    + "A universe that can still change is not a pre-registration.");
+        }
+        List<String> out = new ArrayList<>();
+        JSONArray m = get("/rest/v1/universe_members?universe_id=eq." + enc(universeId)
+                + "&select=symbol&order=symbol.asc&limit=" + PAGE);
+        for (int i = 0; i < m.length(); i++) out.add(m.getJSONObject(i).getString("symbol"));
+        if (out.isEmpty()) {
+            throw new IllegalStateException("universe " + universeId + " is frozen but has no members");
+        }
+        return out;
+    }
+
     /** Funding settlements for one symbol in [fromMs, toMs], ascending. */
     public List<PaperExecutor.FundingPoint> loadFunding(String symbol, long fromMs, long toMs)
             throws Exception {

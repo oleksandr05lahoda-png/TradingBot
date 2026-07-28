@@ -10,6 +10,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -18,7 +19,7 @@ class HistoricalDriverTest {
     private static final String[] BASE = {
             "--hypothesis", "com.bot.paper.HistoricalDriverTest$Noop",
             "--mode", "dev",
-            "--symbols", "ETHUSDT,BTCUSDT",
+            "--universe", "perp49_2026_07_28",
             "--from", "2023-01-01",
             "--to", "2025-06-30",
             "--url", "https://example.supabase.co",
@@ -77,7 +78,8 @@ class HistoricalDriverTest {
         assertEquals("https://example.supabase.co", c.url);
         assertEquals("test-key", c.key);
         assertEquals(HistoricalDriver.Mode.dev, c.mode);
-        assertEquals(List.of("BTCUSDT", "ETHUSDT"), c.symbols, "symbols are sorted for a stable universe id");
+        assertEquals("perp49_2026_07_28", c.universeId);
+        assertNull(c.symbols, "membership is resolved from the frozen universe in run(), not parsed");
     }
 
     @Test
@@ -85,7 +87,7 @@ class HistoricalDriverTest {
     void missingKeyIsActionable() {
         String[] noKey = {
                 "--hypothesis", "com.bot.paper.HistoricalDriverTest$Noop",
-                "--mode", "dev", "--symbols", "BTCUSDT",
+                "--mode", "dev", "--universe", "perp49_2026_07_28",
                 "--from", "2023-01-01", "--to", "2025-06-30",
                 "--url", "https://example.supabase.co"
         };
@@ -142,15 +144,27 @@ class HistoricalDriverTest {
     // ─── universe is fixed before the run ─────────────────────────────
 
     @Test
-    @DisplayName("universe_id depends on the symbol SET, not on argument order")
-    void universeIdIsOrderIndependent() {
-        String a = HistoricalDriver.universeId(List.of("BTCUSDT", "ETHUSDT"), "4h");
-        String b = HistoricalDriver.universeId(List.of("BTCUSDT", "ETHUSDT"), "4h");
-        assertEquals(a, b, "same set and timeframe must give the same id");
-        assertNotEquals(a, HistoricalDriver.universeId(List.of("BTCUSDT"), "4h"),
-                "a different set must give a different id");
-        assertNotEquals(a, HistoricalDriver.universeId(List.of("BTCUSDT", "ETHUSDT"), "1h"),
-                "a different timeframe must give a different id");
-        assertTrue(a.endsWith("_n2"), "the size is visible in the id: " + a);
+    @DisplayName("--universe is required; there is no default symbol set")
+    void universeIsRequired() {
+        String[] a = {
+                "--hypothesis", "com.bot.paper.HistoricalDriverTest$Noop",
+                "--mode", "dev", "--from", "2023-01-01", "--to", "2025-06-30",
+                "--url", "https://example.supabase.co", "--key", "k"
+        };
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> HistoricalDriver.parse(a));
+        assertTrue(e.getMessage().contains("--universe"),
+                "a missing universe must be named, not silently defaulted: " + e.getMessage());
+    }
+
+    @Test
+    @DisplayName("--symbols is gone: a symbol list on the command line is not a pre-registration")
+    void symbolsArgumentIsRejected() {
+        String[] a = BASE.clone();
+        a[4] = "--symbols";
+        a[5] = "BTCUSDT,ETHUSDT";
+        // parse() treats unknown flags as absent required ones rather than accepting them, so the
+        // universe requirement fires. The point is that a caller cannot slip a hand-picked set in.
+        assertThrows(IllegalArgumentException.class, () -> HistoricalDriver.parse(a));
     }
 }
