@@ -287,7 +287,7 @@ public final class SupabaseSignalBridge {
     /**
      * Drain close_requested. Runs UNGATED (see poll()) because closing only shrinks exposure.
      *
-     * CAVEAT, verified 2026-07-28 and filed as project_state id=16: closePosition() is reduce-only
+     * CAVEAT, verified 2026-07-28 and filed as project_state id=18: closePosition() is reduce-only
      * BY CONSTRUCTION but NOT at the API level — it reads the position, sizes the market order to
      * exactly |posQty| and skips entirely when flat, yet it does not send reduceOnly=true. If the
      * exchange-side stop fills inside the read->send window, the order lands as a NEW opposite-side
