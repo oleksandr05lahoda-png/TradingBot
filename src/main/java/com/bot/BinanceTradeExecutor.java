@@ -124,8 +124,18 @@ public final class BinanceTradeExecutor {
      * These bind AFTER riskPctPerTrade has sized the position, so they, not the risk percentage,
      * determine what is actually risked on a trade.
      */
-    private final double  maxNotionalPct;      // EXEC_MAX_NOTIONAL_PCT, % of balance
-    private final double  maxNotionalUsd;      // EXEC_MAX_NOTIONAL_USD, absolute $ ceiling (0 = off)
+    private final double  maxNotionalPct;      // EXEC_MAX_NOTIONAL_PCT, % of balance — the normal cap
+    /**
+     * [project_state id=53] EXEC_ABS_MAX_NOTIONAL_PCT — the highest share of the balance a single
+     * position may ever reach, including when the exchange minimum forces the normal cap upward.
+     *
+     * Replaces EXEC_MAX_NOTIONAL_USD, which was an absolute $6. That figure did not scale: on a
+     * $10000 account it still capped every position at $6, and it is why the boot banner could
+     * advertise risk=2.0%/trade while the real ceiling was about $0.12 (id=32b). Every limit in the
+     * sizing path is now a fraction of capital; the only absolute figures left are the exchange's
+     * own minNotional and stepSize, which belong to the market rather than to our risk appetite.
+     */
+    private final double  maxNotionalHardPct;
     private final long    slPlacementTimeoutMs;
     private final double  maxSpreadPct;
 
@@ -244,8 +254,8 @@ public final class BinanceTradeExecutor {
         // Risk per trade: floor 0.05%, ceiling 5%. Floor prevents accidental 0%
         // (zeroes-out qty calc); ceiling caps overcommit.
         this.riskPctPerTrade = Math.max(0.05, Math.min(5.0, rp));
-        this.maxNotionalPct  = envDouble("EXEC_MAX_NOTIONAL_PCT", 20.0);
-        this.maxNotionalUsd  = envDouble("EXEC_MAX_NOTIONAL_USD", 6.0);
+        this.maxNotionalPct     = envDouble("EXEC_MAX_NOTIONAL_PCT", 20.0);
+        this.maxNotionalHardPct = envDouble("EXEC_ABS_MAX_NOTIONAL_PCT", 35.0);
         if (rp < 0.05 && rp > 0) {
             LOG.warning("[Executor] RISK_PCT_PER_TRADE=" + rp + " requested (below 0.05% floor), using 0.05%");
         } else if (rp > 5.0) {
@@ -534,36 +544,39 @@ public final class BinanceTradeExecutor {
     public int  getLeverage()    { return leverage; }
     /** SIZING SEED only. The notional ceilings below bind afterwards — see {@link #realizedRiskCeilingUsd}. */
     public double getRiskPct()   { return riskPctPerTrade; }
-    public double getMaxNotionalPct() { return maxNotionalPct; }
-    public double getMaxNotionalUsd() { return maxNotionalUsd; }
+    public double getMaxNotionalPct()     { return maxNotionalPct; }
+    public double getMaxNotionalHardPct() { return maxNotionalHardPct; }
 
     /**
-     * The largest notional a single open can reach at this balance, after both ceilings.
+     * The largest notional a single open can reach at this balance — the HARD ceiling, not the
+     * normal cap.
      *
-     * A pre-trade risk check has to bound the incoming position BEFORE sizing happens, and the
-     * bound must not understate it — so this is the ceiling, not an estimate (project_state id=25).
+     * The normal cap is maxNotionalPct, but sizing may raise it as far as the exchange minimum, and
+     * that is allowed up to maxNotionalHardPct (beyond it the open is refused outright). So the
+     * true upper bound is the hard ceiling. A pre-trade risk check has to bound the incoming
+     * position BEFORE sizing runs and must not UNDERSTATE it (project_state id=25), which is why
+     * the looser of the two is the right answer here.
      */
     public double plannedNotionalCeilingUsd(double balanceUsd) {
-        double byPct = balanceUsd * (maxNotionalPct / 100.0);
-        return maxNotionalUsd > 0 ? Math.min(byPct, maxNotionalUsd) : byPct;
+        return balanceUsd * (maxNotionalHardPct / 100.0);
     }
 
     /**
-     * [project_state id=32b] The most a single trade can actually lose to its stop, in dollars.
+     * [project_state id=32b, id=53] The most a single trade can lose to its stop, in dollars.
      *
-     * riskPctPerTrade only seeds the quantity; EXEC_MAX_NOTIONAL_PCT and EXEC_MAX_NOTIONAL_USD then
-     * truncate the notional, so on a $1000 balance with the $6 default the advertised "risk=2.0%"
-     * ($20) is unreachable — the loss is bounded by notional x stop distance, i.e. $6 x slPct.
+     * riskPctPerTrade only seeds the quantity; the notional ceilings then truncate it, so the loss
+     * is bounded by notional x stop distance. Every term scales with the balance — there is no
+     * longer an absolute dollar figure anywhere in this calculation, which is what made the old
+     * "risk=2.0%/trade" banner meaningless on any account except the one it was tuned for.
      *
      * @param balanceUsd account balance the sizing would use
      * @param slDistPct  stop distance as a fraction of entry (0.02 = 2%)
      * @return dollars at risk if the stop fills, after every cap
      */
     public double realizedRiskCeilingUsd(double balanceUsd, double slDistPct) {
-        double byRisk     = balanceUsd * (riskPctPerTrade / 100.0);
-        double byPctCap   = balanceUsd * (maxNotionalPct / 100.0) * slDistPct;
-        double byAbsCap   = maxNotionalUsd > 0 ? maxNotionalUsd * slDistPct : Double.MAX_VALUE;
-        return Math.min(byRisk, Math.min(byPctCap, byAbsCap));
+        double byRisk   = balanceUsd * (riskPctPerTrade / 100.0);
+        double byPctCap = balanceUsd * (maxNotionalHardPct / 100.0) * slDistPct;
+        return Math.min(byRisk, byPctCap);
     }
 
     // [HELD pending project_state id=25] Unreachable today (PositionTracker era), but NOT
@@ -918,7 +931,23 @@ public final class BinanceTradeExecutor {
             double maxNotional = balanceUsd * (maxNotionalPct / 100.0);
             double stepNotional = si.stepSize * entry; // стоимость одного шага qty в $
             double minTradable = si.minNotional + 2.0 * stepNotional; // min + 2 шага запаса
+            double hardCeiling = balanceUsd * (maxNotionalHardPct / 100.0);
+
             if (maxNotional < minTradable) {
+                // [project_state id=53] The exchange minimum sits above our normal cap. Raising the
+                // cap to it is acceptable only while it stays inside the hard ceiling. Past that the
+                // account is simply too small for this symbol, and the honest answer is to refuse —
+                // not to open a position that is a third of the balance because the venue said so.
+                // The old code raised the cap unconditionally and then clamped with a flat $6, which
+                // is why the whole system was pinned to one account size.
+                if (minTradable > hardCeiling) {
+                    return ExecutionResult.fail(String.format(
+                            "account too small for %s: exchange minimum $%.2f (min $%.2f + 2 steps "
+                                    + "$%.2f) is %.1f%% of the $%.2f balance, above the %.1f%% hard "
+                                    + "ceiling. Use a symbol with a lower minimum, or fund the account.",
+                            symbol, minTradable, si.minNotional, stepNotional,
+                            100.0 * minTradable / balanceUsd, balanceUsd, maxNotionalHardPct));
+                }
                 maxNotional = minTradable; // не капать ниже реально-исполнимого минимума
             }
             if (notional > maxNotional && entry > 0) {
@@ -930,12 +959,12 @@ public final class BinanceTradeExecutor {
                 notional = qty * entry;
             }
 
-            // [v86.27] Absolute per-trade notional cap for tiny accounts: the 20% cap above is
-            // defeated by minNotional on a small balance, so add a hard USD ceiling. Default $6
-            // (just above the $5 alt minNotional) → exactly one small position fits; high-min
-            // symbols (ETH $20 / BTC $100) then correctly fail the minNotional check below.
-            if (maxNotionalUsd > 0 && notional > maxNotionalUsd && entry > 0) {
-                qty = maxNotionalUsd / entry;
+            // [project_state id=53] The flat $6 ceiling that used to sit here is gone. It existed
+            // because the block above raised the cap to the exchange minimum unconditionally; that
+            // is now refused instead, so the clamp has nothing left to protect against — and being
+            // absolute, it capped a $10000 account at $6 just the same.
+            if (notional > hardCeiling && entry > 0) {
+                qty = hardCeiling / entry;
                 notional = qty * entry;
             }
 
