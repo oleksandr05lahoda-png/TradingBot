@@ -248,8 +248,10 @@ public final class SupabaseQueueSource implements SignalSource {
         JSONObject body = new JSONObject();
         body.put("status", STATUS_CLOSED);
         body.put("closed_at", clock.instant().toString());
-        body.put("filled_qty", feedback.filledQuantity().doubleValue());
-        body.put("filled_price", feedback.averageFillPrice().doubleValue());
+        // close_*, not filled_*: filled_price is the ENTRY fill, and overwriting it with the
+        // close fill would destroy the entry-slippage measurement the row exists to carry.
+        body.put("close_qty", feedback.filledQuantity().doubleValue());
+        body.put("close_price", feedback.averageFillPrice().doubleValue());
         body.put("exec_note", feedback.note());
 
         HttpResponse<String> response = send(HttpRequest.newBuilder()
