@@ -32,7 +32,16 @@ public final class OrderTypes {
         /** Conditional market order — the protective stop. Triggers on {@link WorkingType}. */
         STOP_MARKET,
         /** Conditional market order on the winning side — the reduce-only exits. */
-        TAKE_PROFIT_MARKET
+        TAKE_PROFIT_MARKET;
+
+        /**
+         * True for trigger order types. Since December 2025 Binance refuses these on
+         * {@code POST /fapi/v1/order} with {@code -4120} and requires {@code /fapi/v1/algoOrder},
+         * which uses different parameter names and a separate id space.
+         */
+        public boolean isConditional() {
+            return this == STOP_MARKET || this == TAKE_PROFIT_MARKET;
+        }
     }
 
     public enum TimeInForce {

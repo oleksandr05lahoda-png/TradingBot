@@ -54,6 +54,16 @@ public interface ExchangePort extends AutoCloseable {
     /** Every order still working on the symbol, including ones this process did not create. */
     List<OrderStatus> openOrders(String symbol);
 
+    /**
+     * Whether {@link #openOrders} can see conditional (trigger) orders.
+     *
+     * <p>False means a protective stop may exist and not appear in the list, so the absence of one
+     * proves nothing. The reconciler must not call a position naked on that basis — a check that
+     * cries wolf on every healthy position is worse than no check, because it trains the operator to
+     * ignore the one that matters.
+     */
+    default boolean canListConditionalOrders() { return true; }
+
     /** Every non-flat position on the account. */
     List<PositionSnapshot> openPositions();
 

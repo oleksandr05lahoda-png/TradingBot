@@ -35,6 +35,15 @@ public final class BinanceErrorCodes {
     /** {@code -4118} ReduceOnly order failed — check the existing position and open orders. */
     public static final int REDUCE_ONLY_MARGIN_CHECK_FAILED = -4118;
 
+    /**
+     * {@code -4120} Order type not supported on this endpoint; use the Algo Order API.
+     *
+     * <p>Binance moved conditional orders to {@code /fapi/v1/algoOrder} in December 2025. Seeing
+     * this means a trigger order was sent to the plain order endpoint — the adapter routes by
+     * {@link com.bot.exec.OrderTypes.OrderType#isConditional()} to prevent it.
+     */
+    public static final int ORDER_TYPE_NEEDS_ALGO_ENDPOINT = -4120;
+
     /** {@code -4164} Order notional is below the symbol's minimum. */
     public static final int MIN_NOTIONAL = -4164;
 

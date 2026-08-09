@@ -187,7 +187,13 @@ public final class Reconciler {
                 Optional<OrderStatus> protectiveStop = working.stream()
                         .filter(o -> o.type() == OrderType.STOP_MARKET && (o.reduceOnly() || o.closePosition()))
                         .findFirst();
-                if (protectiveStop.isEmpty()) {
+                if (protectiveStop.isEmpty() && !port.canListConditionalOrders()) {
+                    // Absence proves nothing when the venue will not enumerate conditional orders.
+                    // Saying "naked" here would halt on every healthy position and teach the operator
+                    // to ignore the one alert that matters most.
+                    LOG.warning("[Reconciler] " + symbol + " holds a position and this venue does not "
+                            + "list conditional orders — cannot confirm its stop is still in place");
+                } else if (protectiveStop.isEmpty()) {
                     drifts.add(new Drift(Drift.Kind.POSITION_WITHOUT_STOP, symbol,
                             "an open position has no working reduce-only stop on the exchange"));
                 } else {

@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.util.Optional;
 
 /**
  * Client order ids derived purely from {@code (signalId, purpose, index)}, so a retry reproduces the
@@ -46,6 +47,24 @@ public final class ClientOrderIdFactory {
         Preconditions.require(OrderRequest.CLIENT_ORDER_ID.matcher(id).matches(),
                 "generated client order id \"" + id + "\" does not match the exchange pattern");
         return id;
+    }
+
+    /**
+     * The purpose an id was minted for, read back from its letter. The adapter needs this to route a
+     * query or a cancel: conditional orders live on a different endpoint with a separate id space,
+     * and asking the wrong one returns "no such order" rather than an error.
+     *
+     * @return empty for an id this factory did not produce
+     */
+    public static Optional<OrderPurpose> purposeOf(String clientOrderId) {
+        if (clientOrderId == null || !clientOrderId.startsWith(PREFIX) || clientOrderId.length() <= PREFIX.length()) {
+            return Optional.empty();
+        }
+        char letter = clientOrderId.charAt(PREFIX.length());
+        for (OrderPurpose purpose : OrderPurpose.values()) {
+            if (letterOf(purpose) == letter) return Optional.of(purpose);
+        }
+        return Optional.empty();
     }
 
     private static char letterOf(OrderPurpose purpose) {

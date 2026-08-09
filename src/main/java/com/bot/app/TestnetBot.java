@@ -87,12 +87,15 @@ public final class TestnetBot {
 
             banner(port, signals, config, defaultLeverage);
 
+            // A start-up disagreement stops OPENING and nothing else. Exiting here would have been
+            // the same mistake in a third place: the operator would be left with a position on the
+            // exchange and no way to unwind it through the bot, which is precisely the state a
+            // trading halt must never create. The loop stays up so closes are still processed.
             if (!reconciler.bootstrap(Instant.now())) {
-                LOG.severe("[Boot] start-up reconciliation did not converge — refusing to trade. "
-                        + "Inspect the account, then restart.");
+                LOG.severe("[Boot] start-up reconciliation did not converge — trading is halted. "
+                        + "Closes are still accepted; inspect the account, then restart to resume.");
                 alerts.critical("Start-up reconciliation failed",
-                        "the bot refused to start trading; local state and the exchange disagree");
-                return;
+                        "no new positions will be opened; the bot stays up so positions can still be closed");
             }
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -115,12 +118,27 @@ public final class TestnetBot {
                 }
 
                 long nowMs = System.currentTimeMillis();
+                // Housekeeping never kills the loop. A dead bot cannot close the position it is
+                // holding, so a transient exchange error during a reconcile or a heartbeat must
+                // leave the process alive and supervising — the halt latch is how a real problem
+                // stops trading, not process death.
                 if (nowMs - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-                    deadMansSwitch.heartbeat(Instant.now());
+                    try {
+                        deadMansSwitch.heartbeat(Instant.now());
+                    } catch (RuntimeException e) {
+                        LOG.warning("[Loop] heartbeat failed: " + e.getMessage());
+                    }
                     lastHeartbeatMs = nowMs;
                 }
                 if (nowMs - lastReconcileMs >= RECONCILE_INTERVAL_MS) {
-                    reconciler.reconcile(Instant.now());
+                    try {
+                        reconciler.reconcile(Instant.now());
+                    } catch (RuntimeException e) {
+                        LOG.severe("[Loop] reconciliation failed: " + e.getMessage()
+                                + " — halting; local state can no longer be trusted");
+                        alerts.critical("Reconciliation could not run", e.getMessage());
+                        halt.halt("reconciliation failed: " + e.getMessage(), Instant.now());
+                    }
                     lastReconcileMs = nowMs;
                 }
                 Thread.sleep(250);

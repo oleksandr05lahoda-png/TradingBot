@@ -160,6 +160,29 @@ class PreTradeValidatorTest {
     }
 
     @Test
+    @DisplayName("trigger types are flagged conditional, so the adapter routes them to the algo endpoint")
+    void conditionalTypesAreFlagged() {
+        // Binance answers -4120 for a trigger type on POST /fapi/v1/order since December 2025.
+        // Found by a live probe, not by any test — which is why this now has one.
+        assertTrue(OrderType.STOP_MARKET.isConditional());
+        assertTrue(OrderType.TAKE_PROFIT_MARKET.isConditional());
+        assertFalse(OrderType.MARKET.isConditional());
+        assertFalse(OrderType.LIMIT.isConditional());
+    }
+
+    @Test
+    @DisplayName("a client order id carries its purpose back, which is what routes a query or a cancel")
+    void purposeRoundTripsThroughTheId() {
+        for (OrderPurpose purpose : OrderPurpose.values()) {
+            String id = ClientOrderIdFactory.create("sig-1", purpose, 0);
+            assertEquals(purpose, ClientOrderIdFactory.purposeOf(id).orElseThrow(),
+                    "purpose did not survive the round trip through " + id);
+        }
+        assertTrue(ClientOrderIdFactory.purposeOf("someone-elses-id").isEmpty());
+        assertTrue(ClientOrderIdFactory.purposeOf(null).isEmpty());
+    }
+
+    @Test
     @DisplayName("an index outside the supported range is refused rather than silently wrapped")
     void clientOrderIdIndexIsBounded() {
         assertThrows(IllegalArgumentException.class,

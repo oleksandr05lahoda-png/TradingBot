@@ -7,7 +7,9 @@ import com.bot.exec.ExchangePort;
 import com.bot.exec.ExchangeSnapshots.AccountSnapshot;
 import com.bot.exec.ExchangeSnapshots.OrderStatus;
 import com.bot.exec.ExchangeSnapshots.PositionSnapshot;
+import com.bot.exec.ClientOrderIdFactory;
 import com.bot.exec.OrderRequest;
+import com.bot.exec.OrderTypes.OrderPurpose;
 import com.bot.exec.OrderTypes.OrderState;
 import com.bot.exec.OrderTypes.OrderType;
 import com.bot.exec.RateLimiter;
@@ -57,6 +59,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     private final ConcurrentHashMap<String, CachedFilters> filterCache = new ConcurrentHashMap<>();
 
     private volatile long clockOffsetMs = 0;
+    private volatile boolean conditionalListingAvailable = true;
 
     public static BinanceFuturesTestnetAdapter fromEnvironment() {
         return new BinanceFuturesTestnetAdapter(
@@ -276,7 +279,17 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
 
     // ─── Orders ──────────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Conditional orders go to {@code /fapi/v1/algoOrder}; everything else to {@code /fapi/v1/order}.
+     * Binance split them in December 2025 and the plain endpoint now answers {@code -4120} for a
+     * trigger type. The two use different parameter names ({@code clientAlgoId} vs
+     * {@code newClientOrderId}, {@code triggerPrice} vs {@code stopPrice}) and separate id spaces.
+     */
     @Override public OrderStatus placeOrder(OrderRequest request) {
+        return request.type().isConditional() ? placeAlgoOrder(request) : placePlainOrder(request);
+    }
+
+    private OrderStatus placePlainOrder(OrderRequest request) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("symbol", request.symbol());
         params.put("side", request.side().name());
@@ -286,22 +299,44 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
 
         if (request.quantity() != null) params.put("quantity", request.quantity().toPlainString());
         if (request.price() != null) params.put("price", request.price().toPlainString());
-        if (request.stopPrice() != null) params.put("stopPrice", request.stopPrice().toPlainString());
         if (request.timeInForce() != null) params.put("timeInForce", request.timeInForce().name());
-        if (request.workingType() != null) params.put("workingType", request.workingType().name());
         // Sent only when true: Binance rejects reduceOnly and closePosition together, even as "false".
         if (request.reduceOnly()) params.put("reduceOnly", "true");
-        if (request.closePosition()) params.put("closePosition", "true");
 
         return parseOrder(new JSONObject(signedPost("/fapi/v1/order", params, 1, true)));
     }
 
-    @Override public Optional<OrderStatus> queryOrder(String symbol, String clientOrderId) {
+    private OrderStatus placeAlgoOrder(OrderRequest request) {
         Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol);
-        params.put("origClientOrderId", clientOrderId);
+        params.put("symbol", request.symbol());
+        params.put("side", request.side().name());
+        // Names are verbatim from the endpoint's parameter table: the order type stays `type` as on
+        // the plain endpoint, but the id becomes `clientAlgoId` and the trigger `triggerPrice`.
+        params.put("algoType", "CONDITIONAL");
+        params.put("type", request.type().name());
+        params.put("clientAlgoId", request.clientOrderId());
+        params.put("triggerPrice", request.stopPrice().toPlainString());
+
+        if (request.quantity() != null) params.put("quantity", request.quantity().toPlainString());
+        if (request.workingType() != null) params.put("workingType", request.workingType().name());
+        if (request.reduceOnly()) params.put("reduceOnly", "true");
+        if (request.closePosition()) params.put("closePosition", "true");
+
+        return parseAlgoOrder(new JSONObject(signedPost("/fapi/v1/algoOrder", params, 1, true)),
+                request.symbol());
+    }
+
+    @Override public Optional<OrderStatus> queryOrder(String symbol, String clientOrderId) {
+        boolean algo = isAlgoId(clientOrderId);
+        Map<String, String> params = new LinkedHashMap<>();
+        // The algo endpoint identifies an order by id alone and rejects nothing else; the plain one
+        // requires the symbol.
+        if (!algo) params.put("symbol", symbol);
+        params.put(algo ? "clientAlgoId" : "origClientOrderId", clientOrderId);
         try {
-            return Optional.of(parseOrder(new JSONObject(signedGet("/fapi/v1/order", params, 1))));
+            String body = signedGet(algo ? "/fapi/v1/algoOrder" : "/fapi/v1/order", params, 1);
+            JSONObject json = new JSONObject(body);
+            return Optional.of(algo ? parseAlgoOrder(json, symbol) : parseOrder(json));
         } catch (ExchangeException e) {
             if (e.exchangeCode() == BinanceErrorCodes.NO_SUCH_ORDER) {
                 // Documented caveat: cancelled orders with no fills stop being queryable after three days.
@@ -311,26 +346,66 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         }
     }
 
+    /**
+     * Plain and conditional working orders together. They live on separate endpoints, and the
+     * reconciler's "position without a stop" check reads this list — omitting the algo half would
+     * report every protected position as naked.
+     */
     @Override public List<OrderStatus> openOrders(String symbol) {
-        JSONArray rows = new JSONArray(signedGet("/fapi/v1/openOrders", Map.of("symbol", symbol), 1));
         List<OrderStatus> out = new ArrayList<>();
-        for (int i = 0; i < rows.length(); i++) out.add(parseOrder(rows.getJSONObject(i)));
+        JSONArray plain = new JSONArray(signedGet("/fapi/v1/openOrders", Map.of("symbol", symbol), 1));
+        for (int i = 0; i < plain.length(); i++) out.add(parseOrder(plain.getJSONObject(i)));
+
+        // The demo host accepts conditional orders but does not implement the endpoint that lists
+        // them, though the production reference documents it. Losing the listing must not lose the
+        // plain orders too, and it must not be mistaken for "there are no stops" — see
+        // canListConditionalOrders.
+        try {
+            JSONArray algo = new JSONArray(signedGet("/fapi/v1/algoOpenOrders", Map.of("symbol", symbol), 1));
+            for (int i = 0; i < algo.length(); i++) out.add(parseAlgoOrder(algo.getJSONObject(i), symbol));
+            conditionalListingAvailable = true;
+        } catch (ExchangeException e) {
+            if (e.httpStatus() != 404) throw e;
+            if (conditionalListingAvailable) {
+                conditionalListingAvailable = false;
+                LOG.warning("[Binance] " + endpointHost() + " does not implement /fapi/v1/algoOpenOrders. "
+                        + "Conditional orders cannot be enumerated, so reconciliation cannot verify "
+                        + "that a position still has its stop.");
+            }
+        }
         return out;
     }
 
+    @Override public boolean canListConditionalOrders() { return conditionalListingAvailable; }
+
     @Override public void cancelOrder(String symbol, String clientOrderId) {
+        boolean algo = isAlgoId(clientOrderId);
         Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol);
-        params.put("origClientOrderId", clientOrderId);
+        if (!algo) params.put("symbol", symbol);
+        params.put(algo ? "clientAlgoId" : "origClientOrderId", clientOrderId);
         try {
-            signedDelete("/fapi/v1/order", params, 1);
+            signedDelete(algo ? "/fapi/v1/algoOrder" : "/fapi/v1/order", params, 1);
         } catch (ExchangeException e) {
             if (!BinanceErrorCodes.isOrderAbsent(e.exchangeCode())) throw e;
         }
     }
 
+    /** Cancels both kinds: {@code allOpenOrders} does not reach the conditional ones. */
     @Override public void cancelAllOpenOrders(String symbol) {
         signedDelete("/fapi/v1/allOpenOrders", new LinkedHashMap<>(Map.of("symbol", symbol)), 1);
+        for (OrderStatus order : openOrders(symbol)) {
+            if (order.isWorking()) cancelOrder(symbol, order.clientOrderId());
+        }
+    }
+
+    /**
+     * Whether an id belongs to the conditional endpoint, read from the purpose letter the factory
+     * encoded. An id from elsewhere is treated as plain — the worst case is one "no such order".
+     */
+    private static boolean isAlgoId(String clientOrderId) {
+        return ClientOrderIdFactory.purposeOf(clientOrderId)
+                .map(p -> p == OrderPurpose.STOP_LOSS || p == OrderPurpose.TAKE_PROFIT)
+                .orElse(false);
     }
 
     @Override public void armDeadMansSwitch(String symbol, long countdownMillis) {
@@ -360,6 +435,49 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
                 o.optBoolean("reduceOnly", false),
                 o.optBoolean("closePosition", false),
                 o.optLong("updateTime", 0));
+    }
+
+    /**
+     * An algo order in the shape the rest of the system expects. The payload names differ
+     * throughout: {@code algoId}/{@code clientAlgoId}/{@code algoStatus}/{@code triggerPrice} rather
+     * than {@code orderId}/{@code clientOrderId}/{@code status}/{@code stopPrice}. A conditional
+     * order has no fill of its own — once it triggers, a separate order carries the execution — so
+     * executed quantity and average price are reported as zero rather than invented.
+     */
+    private static OrderStatus parseAlgoOrder(JSONObject o, String fallbackSymbol) {
+        BigDecimal quantity = decimal(o, "quantity");
+        return new OrderStatus(
+                o.optString("clientAlgoId", ""),
+                o.optLong("algoId", 0),
+                o.optString("symbol", fallbackSymbol),
+                parseAlgoState(o.optString("algoStatus", "")),
+                parseType(o.optString("orderType", "")),
+                quantity,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                decimal(o, "triggerPrice"),
+                o.optBoolean("reduceOnly", false),
+                o.optBoolean("closePosition", false),
+                o.optLong("updateTime", o.optLong("createTime", 0)));
+    }
+
+    /**
+     * Algo status vocabulary. The distinction that matters downstream is working versus not: the
+     * reconciler asks whether a stop is still protecting the position, so anything that is no longer
+     * armed must not read as working. An unrecognised value becomes UNKNOWN, never a guess.
+     */
+    private static OrderState parseAlgoState(String raw) {
+        return switch (raw.toUpperCase(Locale.ROOT)) {
+            case "NEW", "WORKING", "ACTIVE" -> OrderState.NEW;
+            case "TRIGGERED", "FINISHED", "FILLED" -> OrderState.FILLED;
+            case "CANCELLED", "CANCELED", "USER_CANCELLED" -> OrderState.CANCELED;
+            case "EXPIRED" -> OrderState.EXPIRED;
+            case "REJECTED" -> OrderState.REJECTED;
+            default -> {
+                LOG.warning("[Binance] unrecognised algo status \"" + raw + "\"");
+                yield OrderState.UNKNOWN;
+            }
+        };
     }
 
     private static OrderState parseState(String raw) {
