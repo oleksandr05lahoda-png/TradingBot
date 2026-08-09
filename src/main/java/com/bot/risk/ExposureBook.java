@@ -12,20 +12,14 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * What the bot currently believes is open, and therefore what a new position would be added to.
- *
- * <p>A <b>cache</b>, not a record of truth: the exchange decides what is open, the reconciler
- * overwrites this via {@link #replaceAll}, and a disagreement is a defect worth halting for.
- *
- * <p>Long and short are tracked separately and never netted. A 100k long and a 100k short are not a
- * flat book — two positions, two liquidation prices, two funding payments, two ways to be wrong.
+ * What the bot believes is open. A cache, not truth: the exchange decides, and the reconciler
+ * overwrites this via {@link #replaceAll}. Long and short are tracked separately and never netted —
+ * a 100k long plus a 100k short is two positions with two liquidation prices, not a flat book.
  */
 public final class ExposureBook {
 
-    /**
-     * @param quantity  base units held, always positive; direction lives in {@code side}
-     * @param riskUsd   money between entry and stop for this position, as planned at open
-     */
+    /** {@code quantity} is always positive — direction lives in {@code side}; {@code riskUsd} is
+     *  the entry-to-stop money as planned at open. */
     public record OpenPosition(
             String symbol,
             Side side,
@@ -94,10 +88,7 @@ public final class ExposureBook {
         return Optional.ofNullable(positions.remove(symbol));
     }
 
-    /**
-     * Overwrites the whole book from the exchange's answer. Used by reconciliation, which is the only
-     * caller allowed to contradict the local view.
-     */
+    /** Overwrites the book from the exchange; reconciliation is the only caller allowed to do this. */
     public void replaceAll(Collection<OpenPosition> truth) {
         Preconditions.notNull(truth, "truth");
         Map<String, OpenPosition> next = new LinkedHashMap<>();

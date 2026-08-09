@@ -3,9 +3,8 @@ package com.bot.risk;
 import com.bot.core.Preconditions;
 
 /**
- * The engine's answer: either a plan, or a reason there is none. Sealed so that
- * {@code switch} over it is exhaustive and a third outcome cannot be added quietly — there is no
- * "approved with warnings", because a warning that still places an order is an approval.
+ * The engine's answer: either a plan, or a reason there is none. Sealed, so no third outcome can be
+ * added quietly — there is no "approved with warnings", which would still place an order.
  */
 public sealed interface RiskDecision permits RiskDecision.Approved, RiskDecision.Rejected {
 

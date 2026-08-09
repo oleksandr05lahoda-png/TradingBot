@@ -23,34 +23,19 @@ import java.util.logging.Logger;
 
 /**
  * Reads trade requests from an external PostgREST queue (Supabase table {@code public.bot_orders}).
+ * Whatever fills that table is outside this system's trust boundary, so every row still goes through
+ * {@link com.bot.risk.RiskEngine} exactly like a typed line does.
  *
- * <p>This source transports decisions; it does not make them. Whatever fills that table — a person,
- * a cron job, a separate research stack — is outside this system's trust boundary, which is why
- * every row still goes through {@link com.bot.risk.RiskEngine} exactly like a typed line does.
+ * <p>Row contract: {@code id, symbol, side, entry, sl, atr, leverage, status, testnet, created_at};
+ * {@code sl} and {@code atr} are each optional but one must be present, and {@code testnet} must be
+ * true or the row is refused rather than routed. Status runs {@code pending -> sent -> rejected}
+ * (closes: {@code close_requested -> close_sent -> closed}), driven by this class.
  *
- * <h2>Queue contract</h2>
- * <pre>
- *   id          bigint   — row identity; the signal id, and therefore the client order id, derives from it
- *   symbol      text
- *   side        text     — LONG | SHORT
- *   entry       double   — intended entry price
- *   sl          double   — structural stop; optional if atr is present
- *   atr         double   — optional volatility for the fallback stop
- *   leverage    int      — optional, defaults to the configured value, hard-capped at 5
- *   status      text     — pending -> sent (claimed) -> rejected, driven by this class
- *   testnet     bool     — must be true; a row that is not testnet is refused, not routed
- *   created_at  timestamptz
- * </pre>
+ * <p><b>Claim before act.</b> A row is claimed with a conditional PATCH carrying the previous status
+ * as a predicate, so two processes polling the same queue cannot both win it.
  *
- * <p><b>Claim before act.</b> A row moves {@code pending -> sent} with a conditional PATCH carrying
- * {@code status=eq.pending} as a predicate, so two processes polling the same queue cannot both win
- * it and a row becomes at most one order.
- *
- * <p><b>A failed read throws</b> rather than returning an empty list: "the queue looked empty" and
- * "the queue was unreachable" have to stay distinguishable.
- *
- * <p>Credentials come from the environment and are never logged. Configure {@code SUPABASE_URL} and
- * {@code SUPABASE_QUEUE_KEY} (falling back to {@code SUPABASE_KEY}).
+ * <p>Credentials come from {@code SUPABASE_URL} and {@code SUPABASE_QUEUE_KEY} (falling back to
+ * {@code SUPABASE_KEY}) and are never logged.
  */
 public final class SupabaseQueueSource implements SignalSource {
 
@@ -85,16 +70,11 @@ public final class SupabaseQueueSource implements SignalSource {
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     }
 
-    /**
-     * Builds a source from the environment, or returns {@code null} when it is not configured.
-     * Absence is not an error — the smoke run uses {@link ManualTestnetInput} and never needs this.
-     */
+    /** Returns {@code null} when not configured; absence is not an error. */
     public static SupabaseQueueSource fromEnvironmentOrNull(int defaultLeverage) {
         String url = System.getenv("SUPABASE_URL");
-        // In name order of preference, but any of them may hold it. bot_orders has RLS enabled and
-        // no policies, so a publishable key can do nothing with it at all — this has to be a secret
-        // key, and accepting the name the operator already uses saves a duplicated line and the
-        // "which one did I put where" mistake that comes with it.
+        // bot_orders has RLS on with no policies, so a publishable key can do nothing with it: this
+        // must be a secret key, under whichever of the three names the operator already uses.
         String key = firstPresent(System.getenv("SUPABASE_QUEUE_KEY"),
                 System.getenv("SUPABASE_KEY"),
                 System.getenv("SUPABASE_SERVICE_KEY"));
@@ -127,7 +107,6 @@ public final class SupabaseQueueSource implements SignalSource {
                 .GET());
 
         if (response.statusCode() / 100 != 2) {
-            // Fail-closed: an unreachable queue is not an empty queue.
             throw new IOException("queue read failed with HTTP " + response.statusCode()
                     + " — refusing to treat this as 'no signals'");
         }
@@ -139,8 +118,7 @@ public final class SupabaseQueueSource implements SignalSource {
             long id = row.optLong("id", -1);
             try {
                 if (!row.optBoolean("testnet", false)) {
-                    // Belt and braces behind the query filter: a row that is not marked testnet is
-                    // refused outright rather than routed anywhere.
+                    // Belt and braces behind the query filter.
                     reject(id, "row is not marked testnet");
                     continue;
                 }
@@ -159,9 +137,8 @@ public final class SupabaseQueueSource implements SignalSource {
     }
 
     /**
-     * Writes back what the exchange did. This is the row's whole point beyond routing: {@code entry}
-     * is what a sleeve assumed and {@code filled_price} is what it got, and the gap between them is
-     * the execution cost the lab has so far had to guess at.
+     * Writes back what the exchange did: {@code entry} is what was assumed, {@code filled_price}
+     * what was got, and the gap between them is the execution cost.
      */
     @Override public void onAccepted(Signal signal, ExecutionFeedback feedback)
             throws IOException, InterruptedException {
@@ -181,8 +158,7 @@ public final class SupabaseQueueSource implements SignalSource {
                 .method("PATCH", HttpRequest.BodyPublishers.ofString(body.toString())));
 
         if (response.statusCode() / 100 != 2) {
-            // Loud, but not fatal: the position exists and is protected either way. What is lost is
-            // the measurement, and a lost measurement must not read as a lost trade.
+            // Not fatal: the position exists and is protected; only the measurement is lost.
             LOG.warning("[SupabaseQueue] row " + id + " executed but the fill could not be written "
                     + "back (HTTP " + response.statusCode() + ") — this trade is missing from the "
                     + "execution-cost sample");
@@ -208,18 +184,13 @@ public final class SupabaseQueueSource implements SignalSource {
         int leverage = row.has("leverage") && !row.isNull("leverage")
                 ? row.getInt("leverage") : defaultLeverage;
 
-        // Refused, not clamped. Silently lowering it would let a queue publish 20x rows forever with
-        // nothing in the logs, and would disagree with the manual path, which refuses the same row.
+        // Refused, not clamped: silently lowering it would let a queue publish 20x rows unnoticed.
         Preconditions.require(leverage >= 1 && leverage <= RiskConstants.MAX_LEVERAGE,
                 "row " + id + " asks for " + leverage + "x, outside [1, " + RiskConstants.MAX_LEVERAGE + "]");
 
         return new Signal("sbq-" + id, symbol, side, entry, stop, atr, leverage, clock.instant());
     }
 
-    /**
-     * Instructions to close, drained before opens. A close is not put through the risk gate — it can
-     * only give risk back — and is not blocked by a trading halt.
-     */
     @Override public List<CloseRequest> pollCloses() throws IOException, InterruptedException {
         String path = "/rest/v1/bot_orders"
                 + "?status=eq." + STATUS_CLOSE_REQUESTED
@@ -260,8 +231,8 @@ public final class SupabaseQueueSource implements SignalSource {
         JSONObject body = new JSONObject();
         body.put("status", STATUS_CLOSED);
         body.put("closed_at", clock.instant().toString());
-        // close_*, not filled_*: filled_price is the ENTRY fill, and overwriting it with the
-        // close fill would destroy the entry-slippage measurement the row exists to carry.
+        // close_*, not filled_*: overwriting filled_price (the ENTRY fill) would destroy the
+        // entry-slippage measurement the row exists to carry.
         body.put("close_qty", feedback.filledQuantity().doubleValue());
         body.put("close_price", feedback.averageFillPrice().doubleValue());
         body.put("exec_note", feedback.note());
@@ -277,10 +248,9 @@ public final class SupabaseQueueSource implements SignalSource {
     }
 
     /**
-     * Conditional status transition. The {@code from} status travels as a predicate, so two pollers
-     * cannot both win the same row.
+     * Conditional status transition; {@code from} travels as a predicate.
      *
-     * @return false when someone else got there first
+     * @return false when another poller got there first
      */
     private boolean claim(long id, String from, String to) throws IOException, InterruptedException {
         HttpResponse<String> response = send(HttpRequest.newBuilder()
@@ -301,8 +271,8 @@ public final class SupabaseQueueSource implements SignalSource {
         if (id < 0) return;
         JSONObject body = new JSONObject();
         body.put("status", STATUS_REJECTED);
-        // The reason matters as much as the refusal: a gate that rejects everything for one reason
-        // is a defect, and it is invisible if the row only records that something was refused.
+        // The reason matters as much as the refusal: a gate rejecting everything for one reason is
+        // a defect, and invisible if the row only records that something was refused.
         body.put("exec_note", reason == null ? "" : reason);
         HttpResponse<String> response = send(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id))

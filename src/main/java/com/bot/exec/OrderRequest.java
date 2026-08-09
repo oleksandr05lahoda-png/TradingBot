@@ -11,23 +11,15 @@ import java.math.BigDecimal;
 import java.util.regex.Pattern;
 
 /**
- * One order, fully specified, with the client order id that makes sending it twice harmless.
- *
- * <p>The constructor enforces the combinations the exchange actually accepts, so a malformed order
- * fails here — in a pure object, with a message naming the field — instead of arriving as a numeric
- * error code from a REST call made while a position is open.
- *
- * <p>The rule that matters most: an order whose {@link OrderPurpose#isClosing()} is true must carry
- * {@code reduceOnly} or {@code closePosition}. The two are mutually exclusive at Binance, and one of
- * them is mandatory here. Without either, a close that races an already-triggered stop does not
- * no-op — it opens a fresh position in the opposite direction.
+ * One order, fully specified; the constructor enforces the field combinations the exchange accepts.
+ * An order whose {@link OrderPurpose#isClosing()} is true must carry {@code reduceOnly} or
+ * {@code closePosition} (mutually exclusive at Binance): without either, a close that races an
+ * already-triggered stop opens a fresh position in the opposite direction.
  *
  * @param quantity      base units; must be {@code null} exactly when {@code closePosition} is true
  * @param price         limit price; required for {@link OrderType#LIMIT}, null otherwise
  * @param stopPrice     trigger price; required for the conditional types, null otherwise
- * @param closePosition Binance's close-all flag. It is inherently reduce-only — it can only close —
- *                      and it is the right choice for the protective stop, because it stays correct
- *                      after take-profit legs have already shrunk the position
+ * @param closePosition Binance's close-all flag, inherently reduce-only
  */
 public record OrderRequest(
         String symbol,
@@ -95,7 +87,7 @@ public record OrderRequest(
         }
     }
 
-    /** True when this order can only ever shrink a position — by either mechanism. */
+    /** True when this order can only ever shrink a position. */
     public boolean isStrictlyReducing() {
         return reduceOnly || closePosition;
     }
@@ -114,9 +106,8 @@ public record OrderRequest(
     }
 
     /**
-     * The protective stop, as {@code closePosition=true}. It closes whatever remains, which keeps it
-     * correct after a take-profit leg has already reduced the position — a fixed-quantity stop would
-     * be left protecting a size that no longer exists.
+     * The protective stop, as {@code closePosition=true}: it stays correct after a take-profit leg
+     * has shrunk the position, where a fixed-quantity stop would protect a size that no longer exists.
      */
     public static OrderRequest protectiveStop(String symbol, OrderSide closingSide,
                                               BigDecimal stopPrice, String clientOrderId) {

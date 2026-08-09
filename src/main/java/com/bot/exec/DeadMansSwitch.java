@@ -14,25 +14,13 @@ import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 /**
- * Makes sure a bot that stops running does not leave <b>exposure-increasing</b> orders behind it —
- * and, just as importantly, does not take its own protection down with it.
+ * Cancels exposure-increasing orders left behind by a dead process, without stripping protection off
+ * open positions.
  *
- * <p><b>"Cancel all working orders" is the wrong rule here.</b> A resting <i>entry</i> is
- * exposure-increasing: if it fills while the process is dead it creates a leveraged position with
- * nothing protecting it, and cancelling it is right. The protective <i>stop</i> and the reduce-only
- * exits can only shrink a position; cancelling them strips the protection off an open position at
- * the moment nobody is watching.
- *
- * <p>Binance's {@code countdownCancelAll} cancels every open order on the symbol and cannot tell the
- * two apart, so it is armed only for a symbol with a resting entry and <b>no position</b>, and a
- * symbol holding a position is explicitly disarmed. Server-side is the point: a watchdog thread
- * inside this process dies in the same crash that stranded the order.
- *
- * <p>The local half covers "alive but cannot reach the exchange": halt after
- * {@code maxSilenceMillis}, alert, and a best-effort pass that cancels only the non-reducing orders.
- *
- * <p>Arm with roughly twice the heartbeat interval — a 30s heartbeat with a 120s countdown survives
- * three consecutive failures before the exchange acts.
+ * <p>Binance's {@code countdownCancelAll} cancels every open order on the symbol and cannot tell a
+ * resting entry from a protective stop, so it is armed only for a symbol with a resting entry and
+ * <b>no position</b>; a symbol holding a position is explicitly disarmed. Arm with roughly twice the
+ * heartbeat interval, so a few consecutive failures do not trip it.
  */
 public final class DeadMansSwitch {
 
@@ -73,11 +61,9 @@ public final class DeadMansSwitch {
     }
 
     /**
-     * One heartbeat.
-     *
-     * @param symbolsWithRestingEntries symbols carrying an exposure-increasing order that has not
-     *                                  filled yet. These get the exchange-side countdown. Symbols
-     *                                  holding a position never do — see the class javadoc.
+     * @param symbolsWithRestingEntries symbols carrying an unfilled exposure-increasing order. These
+     *                                  get the exchange-side countdown; symbols holding a position
+     *                                  never do.
      */
     public void heartbeat(Instant now, Set<String> symbolsWithRestingEntries) {
         Preconditions.notNull(now, "now");
@@ -103,9 +89,7 @@ public final class DeadMansSwitch {
             }
         }
 
-        // Anything armed that should not be: the entry filled (so the symbol now holds a position
-        // and a stop), or it was cancelled. Disarm, so a countdown left running cannot delete the
-        // protection that was placed after it.
+        // Disarm the rest: a countdown left running would delete protection placed after it.
         for (String symbol : List.copyOf(armed)) {
             if (shouldBeArmed.contains(symbol)) continue;
             try {
@@ -117,9 +101,7 @@ public final class DeadMansSwitch {
             }
         }
 
-        // Liveness is measured even when there is nothing to arm: the point of the local half is to
-        // notice that the exchange has gone away while positions are open, and an idle heartbeat
-        // that never talks to the exchange would notice nothing.
+        // Probe even with nothing to arm, otherwise an idle heartbeat never notices a lost exchange.
         if (shouldBeArmed.isEmpty() && armed.isEmpty()) {
             try {
                 port.serverTimeMillis();
@@ -174,9 +156,8 @@ public final class DeadMansSwitch {
     public Set<String> armedSymbols() { return Set.copyOf(armed); }
 
     /**
-     * Best effort, and deliberately selective: only orders that could <i>increase</i> exposure are
-     * cancelled. A reduce-only stop is the thing keeping an open position survivable, and a
-     * connectivity problem is not a reason to remove it.
+     * Best effort, and deliberately selective: cancelling reduce-only stops would strip an open
+     * position of the protection keeping it survivable.
      */
     private void cancelNonReducingOrdersWhereStillPossible(Set<String> symbols) {
         for (String symbol : symbols) {

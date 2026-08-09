@@ -23,26 +23,11 @@ import static org.junit.jupiter.api.Assertions.fail;
 /**
  * Fails the build if a production Binance endpoint appears anywhere in the sources.
  *
- * <p>This is the load-bearing test of the whole repository. Every other safety property assumes the
- * orders are going to a testnet; if that assumption breaks, none of the rest matters. It is also the
- * property most likely to be broken by accident — by a copied snippet, a commented-out URL, a
- * "temporary" switch — which is exactly why it is asserted mechanically rather than reviewed.
- *
- * <h2>How it avoids matching itself</h2>
- * The forbidden hostnames are assembled at runtime from fragments, so no production host appears as
- * a literal anywhere in this file either. That means this test scans its own source like any other
- * and has no self-exclusion to hide behind.
- *
- * <h2>How it avoids matching the testnet</h2>
- * The hostnames nest: the testnet host {@code demo-fapi.<domain>} ends with the production host
- * {@code fapi.<domain>}, which in turn ends with the spot host {@code api.<domain>}. A plain
- * substring search would therefore flag the legitimate testnet host as a production endpoint. Each
- * pattern is anchored with a negative lookbehind for hostname characters, so a match only counts
- * when the forbidden name <i>starts</i> a hostname label rather than ending one.
- *
- * <p>(This is also why the documentation above writes {@code <domain>} instead of spelling the real
- * one out: the first draft of this file did spell it out, and the test failed on its own javadoc.
- * That failure was correct, and keeping the rule honest is worth a slightly awkward comment.)
+ * <p>Hostnames are assembled at runtime from fragments, including in this javadoc, so that this file
+ * has no self-exclusion and is scanned like any other. The names also nest — testnet
+ * {@code demo-fapi.<domain>} ends with production {@code fapi.<domain>}, which ends with
+ * {@code api.<domain>} — so each pattern needs the negative lookbehind: a match only counts when the
+ * forbidden name <i>starts</i> a hostname label rather than ending one.
  */
 class NoProductionEndpointTest {
 

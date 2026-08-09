@@ -10,11 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Rate limiting, driven by a fake clock so the test costs no wall-clock time.
- *
- * <p>Getting banned is a risk event rather than an inconvenience: a {@code 418} while a position is
- * open means the bot cannot place a stop, amend one or close, and it holds leveraged exposure it
- * has no way to act on until the ban expires.
+ * Rate limiting, driven by a fake clock so the test costs no wall-clock time. A {@code 418} while a
+ * position is open leaves leveraged exposure the bot cannot act on until the ban expires.
  */
 class RateLimiterTest {
 

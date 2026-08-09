@@ -7,27 +7,16 @@ import com.bot.core.Preconditions;
  *
  * <pre>{@code   qty = balance * riskFraction / |entry - stop| }</pre>
  *
- * <p>The direction of that arrow is the point: the stop is chosen first, and the size is whatever
- * makes the loss at that stop equal the budget. Deriving the stop from a desired size is how a
- * position ends up with a stop where it is affordable rather than where it means something — so no
- * method here takes a size and returns a stop.
- *
- * <p>Pure and <b>unclamped</b>: the result always risks exactly {@code balance * riskFraction}.
- * Ceilings are {@link RiskEngine}'s job and only ever reduce. Keeping them apart is what lets
- * risk-is-constant be tested as an absolute rather than "unless some cap bit".
- *
- * <p>Leverage is not an input. It changes only how much margin is locked up, and therefore where the
- * position liquidates.
+ * <p>No method here takes a size and returns a stop: that puts the stop where it is affordable
+ * rather than where it means something. Unclamped — the result risks exactly the budget and ceilings
+ * are {@link RiskEngine}'s job. Leverage is not an input; it only moves the liquidation price.
  */
 public final class PositionSizer {
 
     private PositionSizer() {}
 
     /**
-     * @param balanceUsd   account balance the risk fraction applies to
      * @param riskFraction fraction of balance to put at risk, e.g. 0.005 for 0.5%
-     * @param entryPrice   intended entry
-     * @param stopPrice    stop, on the losing side of the entry
      * @return quantity in base units; exactly {@code balanceUsd * riskFraction} is lost if the stop fills
      */
     public static double quantityForRisk(double balanceUsd, double riskFraction, double entryPrice, double stopPrice) {
@@ -56,7 +45,6 @@ public final class PositionSizer {
         return quantity * Math.abs(entryPrice - stopPrice);
     }
 
-    /** Risk as a fraction of balance, the inverse of {@link #quantityForRisk}. */
     public static double riskFractionOf(double quantity, double entryPrice, double stopPrice, double balanceUsd) {
         Preconditions.positiveFinite(balanceUsd, "balanceUsd");
         return riskUsd(quantity, entryPrice, stopPrice) / balanceUsd;

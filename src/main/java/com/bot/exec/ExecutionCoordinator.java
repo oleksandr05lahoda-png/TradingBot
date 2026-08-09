@@ -22,19 +22,9 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * Turns an approved {@link TradePlan} into orders, and never leaves a filled position unprotected in
- * between. Three rules carry that:
- *
- * <ol>
- *   <li><b>The ordering.</b> The stop goes on immediately after the fill — before slippage is
- *       assessed, before exits are computed, before the book is updated. If it cannot be placed, the
- *       position is closed reduce-only and trading halts.</li>
- *   <li><b>The filled quantity is the only quantity.</b> A partial fill is a different position from
- *       the approved one; a stop sized for the intended quantity leaves the difference exposed while
- *       every log line reads as covered.</li>
- *   <li><b>Slippage can void a trade after it opens.</b> If the real distance to the stop risks more
- *       than the budget, the position is closed rather than kept.</li>
- * </ol>
+ * Turns an approved {@link TradePlan} into orders without ever leaving a filled position unprotected.
+ * The stop goes on immediately after the fill and is sized to the <i>filled</i> quantity; if it
+ * cannot be placed, or slippage pushed realised risk past the budget, the position is closed again.
  */
 public final class ExecutionCoordinator {
 
@@ -51,10 +41,7 @@ public final class ExecutionCoordinator {
         ABORTED_ON_SLIPPAGE,
         /** Filled, but the protective stop could not be placed. Trading is halted. */
         ABORTED_UNPROTECTED,
-        /**
-         * The entry's fate is unknown: the send failed ambiguously and the exchange could not be
-         * asked. A position may exist, unprotected and unrecorded. Trading is halted.
-         */
+        /** Ambiguous send: a position may exist, unprotected and unrecorded. Trading is halted. */
         UNKNOWN_AFTER_SEND,
         /** Refused before anything was sent — halted, or the plan failed a pre-trade check. */
         REFUSED
@@ -79,23 +66,15 @@ public final class ExecutionCoordinator {
             return outcome == Outcome.FILLED || outcome == Outcome.PARTIALLY_FILLED;
         }
 
-        /**
-         * True when a position may exist that this process cannot account for. Distinct from
-         * {@link #opened()}: the answer here is "unknown", and treating unknown as "no" is what
-         * lets a naked position sit while the loop opens the next one.
-         */
+        /** True when a position may exist that this process cannot account for — unknown, not "no". */
         public boolean mayHaveOpenedUnknownRisk() {
             return outcome == Outcome.UNKNOWN_AFTER_SEND || outcome == Outcome.ABORTED_UNPROTECTED;
         }
     }
 
     /**
-     * @param entryType                 MARKET is the default: on a thin testnet book a resting limit
-     *                                  order mostly measures patience, and the entry price is
-     *                                  reconciled against reality afterwards either way
-     * @param fillPollAttempts          how many times to ask the exchange what the entry did
-     * @param maxAdverseRiskOverrun     how far the realised risk may exceed the planned risk before
-     *                                  the position is closed again; 0.20 = 20%
+     * @param maxAdverseRiskOverrun how far realised risk may exceed planned risk before the position
+     *                              is closed again; 0.20 = 20%
      */
     public record Settings(
             OrderType entryType,
@@ -157,8 +136,7 @@ public final class ExecutionCoordinator {
                 ClientOrderIdFactory.create(plan.signalId(), OrderPurpose.STOP_LOSS, 0));
         PreTradeValidator.Result stopCheck = PreTradeValidator.validate(stopRequest, filters, plan.entryPrice());
         if (!stopCheck.ok()) {
-            // Refusing here, before the entry, is the point: a stop that cannot be placed must stop
-            // the trade rather than be discovered after the position exists.
+            // Checked before the entry: an unplaceable stop must not be discovered after the fill.
             return refused(plan, "protective stop would be rejected, so the entry is not sent: "
                     + stopCheck.describe());
         }
@@ -173,13 +151,10 @@ public final class ExecutionCoordinator {
             entry = awaitEntryResolution(entry, entryRequest);
         } catch (ExchangeException e) {
             if (!e.ambiguous()) {
-                // A definite refusal: the exchange evaluated the order and declined it. Nothing
-                // landed, so there is nothing to clean up and no reason to stop trading.
+                // A definite refusal never landed, so there is nothing to clean up.
                 return refused(plan, "entry refused by the exchange: " + e.getMessage());
             }
-            // The placer never established what happened, so the order may be live. Not swallowable
-            // as "the signal failed": the loop would open the next position on top of one it does
-            // not know exists, sized against a book that omits it.
+            // Outcome never established, so the order may be live; not swallowable as "signal failed".
             return unknownAfterSend(plan, e);
         }
 
@@ -234,10 +209,7 @@ public final class ExecutionCoordinator {
                 Optional.of(entry), Optional.of(stop), takeProfits, note);
     }
 
-    /**
-     * @param flat            whether the symbol is confirmed to hold nothing afterwards
-     * @param closedQuantity  what the closing order actually filled
-     */
+    /** @param flat whether the symbol is confirmed to hold nothing afterwards */
     public record CloseReport(
             String symbol,
             boolean flat,
@@ -246,16 +218,10 @@ public final class ExecutionCoordinator {
             String note) {}
 
     /**
-     * Closes out a symbol completely: flatten reduce-only, confirm, then cancel whatever protective
-     * orders are left behind.
-     *
-     * <p>The ordering is the mirror of {@link #execute}. There the stop goes on before anything
-     * else; here it comes off only <b>after</b> the position is confirmed gone, because cancelling
-     * first would leave the position naked for as long as the close takes. A close that fills only
-     * partially therefore keeps its stop and halts, rather than reporting success.
-     *
-     * <p>Reads the position from the exchange rather than the local book: the book is a cache, and
-     * the whole point of a close is to act on what is really there.
+     * Flattens a symbol reduce-only, confirms, then cancels the protective orders left behind — in
+     * that order, since cancelling first would leave the position naked for as long as the close
+     * takes. A partial close therefore keeps its stop and halts rather than reporting success. The
+     * position is read from the exchange, not from the local book.
      */
     public CloseReport closeOut(String symbol, String requestId) throws InterruptedException {
         Preconditions.notBlank(symbol, "symbol");
@@ -307,9 +273,8 @@ public final class ExecutionCoordinator {
     }
 
     /**
-     * Closes a position reduce-only. Used by the slippage abort, by {@link #closeOut} and by the
-     * operator. Deliberately does not consult {@link TradingHalt}: a halt stops opening, never
-     * closing.
+     * Closes a position reduce-only. Deliberately does not consult {@link TradingHalt}: a halt stops
+     * opening, never closing.
      */
     public OrderStatus flatten(String symbol, Side direction, BigDecimal quantity, String signalId)
             throws InterruptedException {
@@ -339,8 +304,7 @@ public final class ExecutionCoordinator {
             try {
                 placed.add(placer.place(request));
             } catch (RuntimeException e) {
-                // A missing exit is a lost opportunity; a missing stop would be a lost account. This
-                // one is logged and alerted, not escalated to closing the position.
+                // A missing exit is a lost opportunity, not a lost account: alert, do not escalate.
                 alerts.warning("Take-profit leg not placed",
                         plan.symbol() + " leg " + i + " at " + leg.rMultiple() + "R: " + e.getMessage());
             }
@@ -358,8 +322,7 @@ public final class ExecutionCoordinator {
         }
 
         if (current.isWorking()) {
-            // Still resting after the poll budget. Cancel the remainder so the intended size stops
-            // growing behind the bot's back, then take the final truth from the exchange.
+            // Cancel the remainder so the size stops growing, then re-read the truth from the exchange.
             LOG.info("[Coordinator] entry " + request.clientOrderId() + " still " + current.state()
                     + " — cancelling the remainder");
             placer.cancelQuietly(request.symbol(), request.clientOrderId());
@@ -368,11 +331,7 @@ public final class ExecutionCoordinator {
         return current;
     }
 
-    /**
-     * The entry was sent and its outcome could not be established. A position may exist, and this
-     * process cannot say. It halts and alerts rather than returning a refusal, because "unknown" and
-     * "did not happen" are different answers and only one of them is safe to keep trading on.
-     */
+    /** Halts and alerts rather than refusing: "unknown" is not "did not happen". */
     private Report unknownAfterSend(TradePlan plan, ExchangeException cause) {
         String note = "the fate of the entry order is unknown (" + cause.getMessage()
                 + "). A position may be open and unprotected. Trading is halted until an operator "
@@ -425,9 +384,7 @@ public final class ExecutionCoordinator {
             OrderStatus close = flatten(plan.symbol(), plan.side(), filled, plan.signalId());
             BigDecimal residual = filled.subtract(close.executedQuantity());
             if (residual.signum() > 0) {
-                // Accepted but incomplete. The exchange returned no error, so nothing was thrown —
-                // and the number that proves the position is still there is the one in the response
-                // that an earlier version of this method discarded. A thin book is enough to cause it.
+                // Accepted but incomplete: no error is thrown, only the response quantity shows it.
                 note = why + "; the reduce-only close filled only " + close.executedQuantity().toPlainString()
                         + " of " + filled.toPlainString() + " — " + residual.toPlainString()
                         + " is still open. Keeping the protective stop and halting.";
@@ -436,9 +393,8 @@ public final class ExecutionCoordinator {
             } else {
                 closedCompletely = true;
                 note = why + "; closed reduce-only";
-                // The book entry goes; the realised PnL does not get invented here. It arrives from
-                // the exchange's own income ledger on the next reconciliation pass, which is the only
-                // source that knows what the close actually cost in slippage and fees.
+                // Realised PnL is not invented here: it arrives from the exchange's income ledger
+                // on the next reconciliation pass, net of slippage and fees.
                 engine.registerClose(plan.symbol());
             }
         } catch (RuntimeException e) {
@@ -448,9 +404,7 @@ public final class ExecutionCoordinator {
             halt.halt("reduce-only close failed on " + plan.symbol(), clock.instant());
         }
 
-        // The stop is cancelled ONLY when the position is confirmed flat. Cancelling it on the
-        // failure path would strip the protection off a position that is demonstrably still open —
-        // and would do so immediately after telling the operator the stop was still working.
+        // Only when confirmed flat: otherwise this strips protection off a still-open position.
         if (closedCompletely) {
             placer.cancelQuietly(plan.symbol(), stop.clientOrderId());
         }

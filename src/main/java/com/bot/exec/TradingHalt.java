@@ -8,16 +8,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
 /**
- * A one-way latch that stops new risk being taken.
- *
- * <p>Tripped by anything meaning the bot no longer knows what is true: reconciliation drift, a fired
- * dead-man's switch, an unestablishable order. Clearing it is an explicit operator act —
- * {@link #clear()} is never called from a retry or a timer, because a halt that heals itself hides
- * what it was raised about.
- *
- * <p>The asymmetry matters, and the previous generation got it wrong: a halt stops <b>opening</b>,
- * never closing. A lock that seals positions in is not a safety feature, it is a way to be unable to
- * exit a losing trade — so the close path never consults this latch.
+ * A one-way latch that stops new risk being taken, tripped by anything meaning the bot no longer
+ * knows what is true. It stops <b>opening</b>, never closing — the close path never consults it, so
+ * a halt can never seal a losing position in. Clearing it is an explicit operator act.
  */
 public final class TradingHalt {
 
@@ -27,7 +20,7 @@ public final class TradingHalt {
 
     private final AtomicReference<State> state = new AtomicReference<>();
 
-    /** Stops new positions. Repeated calls keep the first reason — the earliest cause is the useful one. */
+    /** Stops new positions. Repeated calls keep the first reason. */
     public void halt(String reason, Instant at) {
         Preconditions.notBlank(reason, "reason");
         Preconditions.notNull(at, "at");

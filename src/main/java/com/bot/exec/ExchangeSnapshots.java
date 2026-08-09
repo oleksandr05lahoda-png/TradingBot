@@ -17,13 +17,9 @@ public final class ExchangeSnapshots {
     private ExchangeSnapshots() {}
 
     /**
-     * The state of one order as the exchange reports it.
-     *
-     * <p>{@code executedQuantity} is the number that matters, and it is not implied by
-     * {@code state}: an order can sit in {@link OrderState#PARTIALLY_FILLED} for a long time, and a
-     * {@link OrderState#CANCELED} order may still have filled part of the way before it was pulled.
-     * Sizing the protective stop off the intended quantity rather than this one leaves the
-     * difference unprotected.
+     * The state of one order as the exchange reports it. {@code executedQuantity} is not implied by
+     * {@code state} — a {@link OrderState#CANCELED} order may still have filled part of the way —
+     * and protective stops must be sized off it, not off the intended quantity.
      *
      * @param averagePrice weighted average fill price, {@code ZERO} while nothing has filled
      */
@@ -53,7 +49,7 @@ public final class ExchangeSnapshots {
 
         public boolean hasFill() { return executedQuantity.signum() > 0; }
 
-        /** Filled but not completely — the case that silently changes the risk of the position. */
+        /** Filled but not completely. */
         public boolean isPartial() {
             return hasFill() && executedQuantity.compareTo(originalQuantity) < 0;
         }
@@ -64,9 +60,7 @@ public final class ExchangeSnapshots {
     /**
      * A position as the exchange reports it.
      *
-     * @param signedQuantity positive for a long, negative for a short, zero when flat. Signed
-     *                       because that is how the exchange models it, and translating too early
-     *                       is how a short becomes a long in local state
+     * @param signedQuantity positive for a long, negative for a short, zero when flat
      */
     public record PositionSnapshot(
             String symbol,
@@ -89,7 +83,7 @@ public final class ExchangeSnapshots {
 
         public BigDecimal absoluteQuantity() { return signedQuantity.abs(); }
 
-        /** Empty when flat — a flat position has no direction, and inventing one is a bug generator. */
+        /** Empty when flat. */
         public Optional<Side> direction() {
             int sign = signedQuantity.signum();
             if (sign == 0) return Optional.empty();
@@ -116,9 +110,8 @@ public final class ExchangeSnapshots {
         }
 
         /**
-         * The balance the risk budget is a percentage of: wallet balance plus open PnL, i.e. what the
-         * account is actually worth right now. Using wallet balance alone would let a losing open
-         * position keep sizing new trades as if the loss had not happened.
+         * The balance the risk budget is a percentage of. Wallet balance alone would let a losing
+         * open position keep sizing new trades as if the loss had not happened.
          */
         public double equityUsd() {
             return walletBalance.add(totalUnrealizedPnl).doubleValue();

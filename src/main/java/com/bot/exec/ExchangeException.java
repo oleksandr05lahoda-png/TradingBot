@@ -1,13 +1,9 @@
 package com.bot.exec;
 
 /**
- * A failure that came from, or on the way to, the exchange.
- *
- * <p>{@link #ambiguous} is the distinction that matters. A request that was refused with an error
- * code definitely did not execute. A request that timed out, or died mid-flight, may have executed
- * perfectly with only the response lost — and blindly retrying that one is how an account ends up
- * with two positions where it planned one. Callers use this flag to decide between "retry" and
- * "ask the exchange what happened first".
+ * A failure that came from, or on the way to, the exchange. A refusal with an error code definitely
+ * did not execute; an {@link #ambiguous} failure may have, so callers must ask the exchange what
+ * happened rather than retry blindly.
  */
 public class ExchangeException extends RuntimeException {
 

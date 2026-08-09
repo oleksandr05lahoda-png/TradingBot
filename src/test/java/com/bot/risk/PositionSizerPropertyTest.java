@@ -11,17 +11,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Property-based tests for the sizing rule, over thousands of randomised cases from a seeded PRNG.
+ * Property-based tests for the sizing rule. The seed comes from {@code -Dbot.test.seed} (set by the
+ * Gradle build), so a failing case from CI replays exactly.
  *
- * <p>Seeded rather than random: a failure has to be reproducible. The seed comes from
- * {@code -Dbot.test.seed} (set by the Gradle build), so a failing case reported from CI can be
- * replayed exactly.
- *
- * <p>These properties are asserted against {@link PositionSizer} — the pure, unclamped rule — and
- * not against {@link RiskEngine}. The engine applies ceilings that can legitimately reduce a size,
- * which would turn "risk is always exactly the budget" into "risk is the budget unless something
- * bound", and a property with an escape clause tests nothing. That the engine's ceilings only ever
- * reduce is asserted separately in {@link RiskEngineLimitsTest}.
+ * <p>Asserted against {@link PositionSizer}, the unclamped rule, not {@link RiskEngine}: the engine's
+ * ceilings can legitimately reduce a size, which would give every property an escape clause. That
+ * those ceilings only ever reduce is asserted in {@link RiskEngineLimitsTest}.
  */
 class PositionSizerPropertyTest {
 

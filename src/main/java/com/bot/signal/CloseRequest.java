@@ -5,17 +5,10 @@ import com.bot.core.Preconditions;
 import java.time.Instant;
 
 /**
- * An instruction to close whatever is open on a symbol.
- *
- * <p>Separate from {@link Signal} on purpose. A signal is a request to take risk and goes through
- * the whole gate — sizing, stops, liquidation buffer, exposure caps. A close only ever gives risk
- * back, so it goes through none of them, and in particular it is <b>not</b> blocked by a trading
- * halt. A halt that sealed positions in would not be a safety feature; the previous generation of
- * this codebase made exactly that mistake, and time-stops silently stopped working for weeks.
- *
- * @param id     stable identity; the client order id of the closing order derives from it
- * @param symbol the symbol to flatten
- * @param reason why, for the audit trail — a time stop, an operator, a kill switch
+ * An instruction to close whatever is open on a symbol; its id derives the closing order's client
+ * order id. Separate from {@link Signal} because a close only gives risk back: it skips the risk
+ * gate entirely and is <b>not</b> blocked by a trading halt, which would otherwise seal positions
+ * in and silently break time stops.
  */
 public record CloseRequest(String id, String symbol, String reason, Instant createdAt) {
 

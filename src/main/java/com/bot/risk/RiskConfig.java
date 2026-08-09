@@ -3,24 +3,14 @@ package com.bot.risk;
 import com.bot.core.Preconditions;
 
 /**
- * Everything about the risk core that is allowed to vary, bounded by {@link RiskConstants}.
+ * Everything about the risk core that is allowed to vary, bounded by {@link RiskConstants}: no
+ * value here can widen MAX_LEVERAGE, MAX_RISK_FRACTION_PER_TRADE or MIN_LIQUIDATION_BUFFER_FRACTION,
+ * and no environment variable can either. Every {@code ...Fraction} is a share of balance, not a
+ * dollar amount: this project's earlier version capped position COUNT instead, and twenty
+ * correlated alts at 20% each is 400% of the account showing as "one position at a time".
  *
- * <p>Every ceiling here is a <b>share of capital</b>, not a dollar amount. A fixed dollar cap stops
- * meaning anything the moment the balance moves: $500 of notional is a tenth of one account and
- * five times another, and the version of that mistake this repository already made was capping
- * position <i>count</i> instead of exposure — twenty correlated alts at 20% each is 400% of the
- * account and reads as "one position at a time" on the dashboard. The one absolute value,
- * {@link #maxNotionalUsdPerTrade}, is an extra ceiling on top of the fractional one, never a
- * replacement for it, and defaults to unbounded.
- *
- * <p>Constructing an instance that breaks a hard constant is impossible: the compact constructor
- * refuses. There is no environment variable that widens {@link RiskConstants#MAX_LEVERAGE},
- * {@link RiskConstants#MAX_RISK_FRACTION_PER_TRADE} or
- * {@link RiskConstants#MIN_LIQUIDATION_BUFFER_FRACTION}, and a config may only be stricter.
- *
- * <p>Every {@code ...Fraction} is a share of balance. The rest:
- *
- * @param maxNotionalUsdPerTrade       absolute ceiling on top of the fractional one; {@code +Infinity} = none
+ * @param maxNotionalUsdPerTrade       extra ceiling on top of the fractional one, never a
+ *                                     replacement for it; {@code +Infinity} = none
  * @param dailyLossFractionLimit       realised + open drawdown that trips the kill switch for the UTC day
  * @param minLiquidationBufferFraction may be raised above 30%, never lowered
  * @param takerFeeFraction             discounts isolated margin when projecting liquidation
@@ -67,10 +57,7 @@ public record RiskConfig(
         Preconditions.notNull(takeProfitPolicy, "takeProfitPolicy");
     }
 
-    /**
-     * Starting values for a small testnet account. Deliberately tight; the point of the exercise is
-     * that the machinery refuses correctly, not that it trades often.
-     */
+    /** Starting values for a small testnet account, deliberately tight. */
     public static RiskConfig defaults() {
         return new RiskConfig(
                 RiskConstants.DEFAULT_RISK_FRACTION_PER_TRADE,

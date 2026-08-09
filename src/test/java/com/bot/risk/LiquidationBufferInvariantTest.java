@@ -14,10 +14,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * The liquidation-buffer invariant: the stop sits strictly between entry and liquidation, and leaves
  * at least 30% of that distance unused.
- *
- * <p>The last test is the one that matters most — it says that <i>no approved plan</i>, over
- * thousands of randomised inputs, ever violates the invariant. That is a statement about the gate as
- * a whole rather than about the geometry helper, and it is what makes the property real.
  */
 class LiquidationBufferInvariantTest {
 
@@ -59,9 +55,8 @@ class LiquidationBufferInvariantTest {
     @Test
     @DisplayName("the engine refuses a plan whose stop is too near liquidation, and says what would pass")
     void engineRefusesAndSuggestsALowerLeverage() {
-        // $100k balance at 0.5% risk with a 14,000-wide stop sizes to 0.035 BTC, a notional of $3,500
-        // — the first margin bracket, 1% maintenance and no maintenance amount. There, 5x puts
-        // liquidation 19.14% below entry, and a stop 14% below leaves 26.9% of the distance: too thin.
+        // Sizes to 0.035 BTC / $3,500 notional: the first bracket, 1% maintenance. There 5x puts
+        // liquidation 19.14% below entry, so a stop 14% below leaves 26.9% of the distance: too thin.
         RiskEngine engine = RiskFixtures.engine();
         RiskDecision decision = engine.evaluate(
                 RiskFixtures.request(Side.LONG, 100_000, 86_000, 5), 100_000, RiskFixtures.NOON);

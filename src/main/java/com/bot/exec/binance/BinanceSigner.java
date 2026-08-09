@@ -12,14 +12,10 @@ import java.util.Map;
 import java.util.StringJoiner;
 
 /**
- * HMAC-SHA256 request signing, and the credentials it needs.
- *
- * <p>Keys come from the environment only — {@link #fromEnvironment()} is the only way to build one
- * outside a test, and no constant, config file or default in this repository can hold a key. Nothing
- * here is loggable: {@link #toString()} reveals nothing and the signature never appears in a message.
+ * HMAC-SHA256 request signing, and the credentials it needs. Keys come from the environment only.
  *
  * <p>Binance validates {@code serverTime - timestamp <= recvWindow && timestamp < serverTime + 1000},
- * so the timestamp comes from an exchange-synchronised clock — see
+ * so timestamps must come from an exchange-synchronised clock — see
  * {@link BinanceFuturesTestnetAdapter}'s drift correction.
  */
 public final class BinanceSigner {
@@ -36,13 +32,8 @@ public final class BinanceSigner {
     }
 
     /**
-     * Reads {@code BINANCE_TESTNET_API_KEY} and {@code BINANCE_TESTNET_API_SECRET}.
-     *
-     * <p>The variables are named for the testnet on purpose. A key variable that is not
-     * testnet-specific invites a real key to be pasted into it, and this build has nowhere to send a
-     * real key anyway — but the naming should not be the thing that makes someone find that out.
-     *
-     * @throws IllegalStateException when either variable is missing, naming what to set
+     * Reads {@code BINANCE_TESTNET_API_KEY} and {@code BINANCE_TESTNET_API_SECRET}. The names are
+     * testnet-specific on purpose: a generic name invites a real key to be pasted in.
      */
     public static BinanceSigner fromEnvironment() {
         String key = System.getenv("BINANCE_TESTNET_API_KEY");
@@ -62,10 +53,7 @@ public final class BinanceSigner {
 
     public String apiKey() { return apiKey; }
 
-    /**
-     * Builds the signed query string: parameters in insertion order, then {@code timestamp} and
-     * {@code recvWindow}, then {@code signature} computed over everything preceding it.
-     */
+    /** Parameters in insertion order, then recvWindow and timestamp, then a signature over all of it. */
     public String signedQuery(Map<String, String> parameters, long timestampMs, long recvWindowMs) {
         Preconditions.notNull(parameters, "parameters");
         Map<String, String> all = new LinkedHashMap<>(parameters);
@@ -82,7 +70,6 @@ public final class BinanceSigner {
         for (Map.Entry<String, String> e : parameters.entrySet()) {
             if (e.getValue() == null) continue;
             // Binance signs the literal query string, so signed and sent must be byte-identical.
-            // Every parameter here is a symbol, an enum or a decimal — nothing needing encoding.
             String value = e.getValue();
             Preconditions.require(value.chars().noneMatch(c -> c == '&' || c == '=' || c == '?' || c == ' '),
                     "parameter " + e.getKey() + " contains a character that would corrupt the signed "
@@ -105,7 +92,7 @@ public final class BinanceSigner {
         }
     }
 
-    /** Deliberately reveals nothing: this object ends up inside exception messages and log lines. */
+    /** Redacted on purpose: this object ends up inside exception messages and log lines. */
     @Override public String toString() {
         return "BinanceSigner[credentials redacted]";
     }

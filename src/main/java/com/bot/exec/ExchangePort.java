@@ -10,15 +10,8 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * The seam between this system and any exchange. The core — sizing, stops, liquidation, exposure,
- * reconciliation logic — depends on this interface and on nothing else; HTTP, signing, JSON, rate
- * limit headers and Binance's error codes all live behind it in
- * {@code com.bot.exec.binance}.
- *
- * <p>That is what makes the execution path testable without a network: the tests drive a fake that
- * implements exactly these methods including their failure modes — duplicate client order ids,
- * partial fills, lost responses — which are near-impossible to provoke on demand against a real
- * endpoint.
+ * The seam between the core and any exchange; HTTP, signing, JSON and Binance's error codes all live
+ * behind it in {@code com.bot.exec.binance}.
  *
  * <p>Every method may throw {@link ExchangeException}. Callers must distinguish
  * {@link ExchangeException#ambiguous()} from a plain refusal before deciding to retry.
@@ -71,12 +64,8 @@ public interface ExchangePort extends AutoCloseable {
     void cancelAllOpenOrders(String symbol);
 
     /**
-     * Arms the exchange-side dead-man's switch for {@code symbol}: if this method is not called
-     * again within {@code countdownMillis}, the exchange cancels every open order on that symbol by
-     * itself. Positions are untouched.
-     *
-     * <p>Server-side is the point. A client-side watchdog dies in the same crash that stranded the
-     * orders; this one keeps counting on the exchange's machine. Pass 0 to disarm.
+     * If this is not called again within {@code countdownMillis}, the exchange cancels every open
+     * order on the symbol by itself; positions are untouched. Pass 0 to disarm.
      */
     void armDeadMansSwitch(String symbol, long countdownMillis);
 

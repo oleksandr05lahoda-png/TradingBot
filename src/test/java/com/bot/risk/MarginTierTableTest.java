@@ -10,13 +10,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Validation of the maintenance-margin table.
- *
- * <p>The continuity check is the point. Maintenance margin is {@code notional * rate - amount}, and
- * the amount exists precisely so the function does not step at a bracket boundary. A table whose
- * amounts do not produce continuity is a table with a wrong number in it, and a wrong maintenance
- * margin is a wrong liquidation price — which is a wrong answer to the only question that decides
- * whether a stop is real.
+ * Validation of the maintenance-margin table. Maintenance margin is {@code notional * rate - amount},
+ * and the amount exists precisely so the function does not step at a bracket boundary; a table that
+ * is not continuous has a wrong number in it, and that means a wrong liquidation price.
  */
 class MarginTierTableTest {
 
@@ -106,10 +102,8 @@ class MarginTierTableTest {
     @Test
     @DisplayName("a maintenance rate of 1.0 is refused, because it would zero the long denominator")
     void maintenanceRateOfOneIsRefused() {
-        // liq for a long divides by q*(MMR - 1). At MMR = 1 that is zero, the solve returns
-        // -Infinity, and the non-finite result would be clamped to 0.0 — the sentinel meaning
-        // "liquidation unreachable". The most dangerous possible bracket would produce the most
-        // permissive possible answer, silently. It is refused at construction instead.
+        // liq for a long divides by q*(MMR - 1); at MMR = 1 that is zero, the solve returns -Infinity,
+        // and clamping the non-finite result gives 0.0 — the sentinel for "liquidation unreachable".
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
                 () -> new MarginTier(0, Double.POSITIVE_INFINITY, 1.0, 0, 1));
         assertTrue(thrown.getMessage().contains("must be in (0, 1)"), thrown.getMessage());

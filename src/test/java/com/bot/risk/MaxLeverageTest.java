@@ -18,11 +18,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The leverage ceiling, asserted at every layer that could be used to get around it.
- *
- * <p>One test per bypass route, because a cap enforced in a single place is a cap with one bug
- * between it and being gone: the config can be widened, a signal can ask for more, a plan can be
- * built by hand, or a typed line can carry a number nobody validated.
+ * The leverage ceiling, with one test per layer that could be used to get around it: config, signal,
+ * typed line, plan constructor, and the exchange's own bracket cap.
  */
 class MaxLeverageTest {
 

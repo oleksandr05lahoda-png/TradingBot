@@ -5,20 +5,11 @@ import com.bot.core.Preconditions;
 import java.math.BigDecimal;
 
 /**
- * What actually happened to a signal, sent back to the source that produced it.
+ * What actually happened to a signal, sent back to the source that produced it. The gap between the
+ * intended entry and {@code averageFillPrice} is the only measurement of realised execution cost.
  *
- * <p>Without this the queue is one-way: a row records that an order was sent and nothing more, so
- * the difference between the price a sleeve assumed and the price it got is never written down.
- * That difference is the execution cost, and every gate in the lab currently treats it as a
- * constant — 20bp here, 40bp there — because there has never been anything to measure it with.
- *
- * <p>Deliberately a plain value type in the {@code signal} package rather than a reference to the
- * execution layer's report: a source must not need to know that {@code com.bot.exec} exists.
- *
- * @param clientOrderId    the deterministic id the order carried
- * @param filledQuantity   what the exchange filled, which is not what was requested
- * @param averageFillPrice weighted average fill price; compare with the signal's intended entry
- * @param note             short human-readable outcome, for the operator rather than for arithmetic
+ * <p>A plain value type rather than a reference to the execution layer's report: a source must not
+ * need to know that {@code com.bot.exec} exists.
  */
 public record ExecutionFeedback(
         String clientOrderId,

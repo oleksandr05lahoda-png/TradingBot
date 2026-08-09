@@ -26,16 +26,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The whole chain the definition of done names, asserted end to end against an in-memory exchange:
- *
- * <pre>
- *   typed signal -> size from the stop -> entry order -> stop and take-profits placed
- *                -> reconciliation converges
- * </pre>
- *
- * <p>This is the same wiring {@code TestnetBot} assembles, minus the socket. Running it against the
- * real testnet exercises the adapter as well; running it here proves the protocol, deterministically
- * and on every build.
+ * The whole chain end to end against an in-memory exchange: typed signal, size from the stop, entry
+ * order, stop and take-profits placed, reconciliation converges. Same wiring {@code TestnetBot}
+ * assembles, minus the socket.
  */
 class SmokeRunChainTest {
 

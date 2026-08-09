@@ -9,22 +9,18 @@ import java.util.logging.Logger;
 
 /**
  * Keeps this process inside Binance's two independent budgets: request <b>weight</b> per minute per
- * IP, and <b>order count</b> per 10 seconds and per minute per account.
+ * IP, and <b>order count</b> per 10 seconds and per minute per account. Enforced before sending,
+ * because a ban leaves the bot unable to place or amend a stop for as long as it lasts (Binance
+ * escalates from two minutes to three days).
  *
- * <p>A ban is a risk event, not an inconvenience: a {@code 418} while a position is open means the
- * bot cannot place a stop, amend one or close, for as long as the ban lasts (Binance escalates from
- * two minutes to three days). So the budgets are enforced <i>before</i> sending.
- *
- * <p>Sliding windows, not fixed buckets — a bucket that resets on the minute lets a burst spend a
- * full minute's budget across the boundary, which is the pattern that trips the limit it respects.
- * {@link #observeUsedWeight} folds in {@code X-MBX-USED-WEIGHT-1M}, since other processes may share
- * the IP. Time and sleeping are injected, so the class is testable without waiting.
+ * <p>Sliding windows, not fixed buckets: a bucket resetting on the minute lets a burst spend a full
+ * minute's budget across the boundary, which trips the limit it is meant to respect.
  */
 public final class RateLimiter {
 
     private static final Logger LOG = Logger.getLogger(RateLimiter.class.getName());
 
-    /** Sleeps for a number of milliseconds. Real implementation blocks; tests advance a clock. */
+    /** Injected so tests need not wait: the real implementation blocks, tests advance a clock. */
     @FunctionalInterface
     public interface Sleeper {
         void sleepMillis(long millis) throws InterruptedException;
@@ -67,9 +63,8 @@ public final class RateLimiter {
         Preconditions.positive(weight, "weight");
         while (true) {
             long waitMs;
-            // Wait computed under the lock, waiting done outside it. Sleeping while holding the
-            // monitor would block observeBan for the whole wait, so a thread that had just seen a
-            // 418 could not record it and this one would wake up and send anyway.
+            // Wait computed under the lock, slept outside it: holding the monitor would block
+            // observeBan, so a 418 seen by another thread could not be recorded before this one sends.
             synchronized (this) {
                 long now = nowMs.getAsLong();
                 prune(now);
@@ -106,9 +101,8 @@ public final class RateLimiter {
     }
 
     /**
-     * Folds in the exchange's own view of used weight from {@code X-MBX-USED-WEIGHT-1M}. It supersedes
-     * the local estimate whenever it is higher, since the IP may be shared with another process whose
-     * requests this limiter never saw.
+     * Folds in {@code X-MBX-USED-WEIGHT-1M}, which supersedes the local estimate whenever it is
+     * higher: the IP may be shared with a process whose requests this limiter never saw.
      */
     public synchronized void observeUsedWeight(int usedWeight1m) {
         if (usedWeight1m <= 0) return;
@@ -117,8 +111,8 @@ public final class RateLimiter {
     }
 
     /**
-     * Records a {@code 429} or {@code 418}. Everything stops until the ban expires — including, and
-     * especially, retries, which are what turn a 429 into a 418.
+     * Records a {@code 429} or {@code 418}. Everything stops until the ban expires, retries included
+     * — retries are what turn a 429 into a 418.
      */
     public synchronized void observeBan(long retryAfterMillis) {
         long until = nowMs.getAsLong() + Math.max(1_000L, retryAfterMillis);

@@ -3,18 +3,13 @@ package com.bot.risk;
 import com.bot.core.Preconditions;
 
 /**
- * One maintenance-margin bracket, matching the shape Binance returns from
- * {@code GET /fapi/v1/leverageBracket}.
- *
- * <p>Maintenance margin is piecewise linear in notional, not a flat percentage. Inside a bracket:
+ * One maintenance-margin bracket, shaped as Binance returns it from
+ * {@code GET /fapi/v1/leverageBracket}. Maintenance margin is piecewise linear, not a flat percentage:
  *
  * <pre>{@code   maintenanceMargin = notional * maintenanceMarginRate - maintenanceAmount }</pre>
  *
- * The subtracted {@code maintenanceAmount} ("cum" in Binance's payload) is what makes the function
- * continuous where two brackets meet: without it, crossing a boundary would step the requirement
- * upward discontinuously. Treating maintenance margin as a bare percentage — the usual shortcut —
- * overstates it inside every bracket above the first, which moves the projected liquidation price
- * closer to entry than it is and silently rejects trades that were fine.
+ * The subtracted {@code maintenanceAmount} ("cum" in the payload) keeps the function continuous
+ * across boundaries; a bare percentage overstates the requirement above the first bracket.
  *
  * @param notionalFloor         lower bound of the bracket, inclusive ({@code bracket.notionalFloor})
  * @param notionalCap           upper bound, inclusive ({@code bracket.notionalCap})
@@ -33,9 +28,8 @@ public record MarginTier(
         Preconditions.nonNegativeFinite(notionalFloor, "notionalFloor");
         Preconditions.require(notionalCap > notionalFloor,
                 "notionalCap " + notionalCap + " must exceed notionalFloor " + notionalFloor);
-        // Strictly below 1: at exactly 1.0 the long liquidation denominator q*(MMR - 1) is zero and
-        // the solve returns a non-finite price, which the clamp would turn into the permissive
-        // "unreachable" answer. Refused here instead of reaching the solver.
+        // Strictly below 1: at exactly 1.0 the long denominator q*(MMR - 1) is zero and the solve
+        // returns a non-finite price, which the clamp would turn into a permissive "unreachable".
         Preconditions.require(maintenanceMarginRate > 0 && maintenanceMarginRate < 1.0,
                 "maintenanceMarginRate must be in (0, 1), got " + maintenanceMarginRate);
         Preconditions.nonNegativeFinite(maintenanceAmount, "maintenanceAmount");

@@ -7,16 +7,10 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * The maintenance-margin brackets for one symbol, validated as a whole.
- *
- * <p>The constructor rejects anything that is not a usable maintenance-margin function: brackets
- * starting at zero, contiguous, covering every notional, rates non-decreasing — and the check that
- * actually catches bad data, a <b>continuous</b> margin at every boundary. If
- * {@code cap * rate_i - cum_i} differs from {@code cap * rate_(i+1) - cum_(i+1)}, a number is wrong,
- * and a wrong maintenance margin is a wrong liquidation price.
- *
- * <p>Normally built from {@code GET /fapi/v1/leverageBracket}; {@link #conservativeDefault()} lets
- * the risk core run without a network call and is stricter than BTCUSDT's real brackets.
+ * The maintenance-margin brackets for one symbol, normally from {@code GET /fapi/v1/leverageBracket},
+ * validated as a whole by the constructor: contiguous from zero, full coverage, non-decreasing rates,
+ * and a <b>continuous</b> margin at every boundary. Discontinuity means a number in the payload is
+ * wrong, and a wrong maintenance margin is a wrong liquidation price.
  */
 public final class MarginTierTable {
 
@@ -58,18 +52,15 @@ public final class MarginTierTable {
 
     public List<MarginTier> tiers() { return tiers; }
 
-    /** The bracket that governs {@code notional}. */
     public MarginTier tierFor(double notional) {
         Preconditions.nonNegativeFinite(notional, "notional");
         for (MarginTier t : tiers) {
             if (t.contains(notional)) return t;
         }
-        // Unreachable while the constructor's coverage invariant holds; kept as a loud failure
-        // rather than a silent fall-through to the first bracket.
+        // Unreachable while the coverage invariant holds; loud rather than falling through to tier 0.
         throw new IllegalStateException("no margin bracket covers notional " + notional);
     }
 
-    /** Maintenance margin required to hold {@code notional}. */
     public double maintenanceMargin(double notional) {
         return tierFor(notional).maintenanceMargin(notional);
     }
@@ -80,12 +71,8 @@ public final class MarginTierTable {
     }
 
     /**
-     * A generic USDⓈ-M bracket table, the shape Binance publishes for mid-cap perpetuals. Used only
-     * when the real brackets have not been fetched. It is on the strict side of the real ones for
-     * majors, so a plan approved against it stays approved against the exchange's own numbers.
-     *
-     * <p>Continuity holds at every boundary — 5k, 25k, 100k, 250k and 1M — which the constructor
-     * re-checks on every instantiation.
+     * A generic USDⓈ-M table for when the real brackets have not been fetched. Stricter than the real
+     * ones for majors, so a plan approved against it stays approved against the exchange's numbers.
      */
     public static MarginTierTable conservativeDefault() {
         return new MarginTierTable(List.of(

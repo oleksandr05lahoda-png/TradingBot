@@ -23,21 +23,11 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Enforces the rule that there are exactly two ways a trade idea can enter this system: an operator
- * typing, and an external queue.
+ * typing, and an external queue. A strategy added as a third implementation would inherit every
+ * downstream safety property and be indistinguishable from a person typing a line.
  *
- * <p>The rule is structural rather than stylistic. Everything downstream of a
- * {@link SignalSource} — sizing, stops, liquidation, exposure, reconciliation — is safety machinery
- * that applies to any signal regardless of origin. A strategy added as a third implementation would
- * inherit all of it and would be indistinguishable, from every other layer's point of view, from a
- * person typing a line. That is the disguise this project cannot afford: no strategy in it has ever
- * passed its own pre-registered validation gates, and 92 candidates have failed them.
- *
- * <p>The declaration forms matter. An earlier version of this test matched only the keyword
- * {@code class}, so {@code record X(...) implements SignalSource} — the shape this codebase reaches
- * for by default, used already by {@code RiskDecision.Approved} and {@code StopLoss.Structural} —
- * was invisible to it, and a third implementation could have landed with the suite green. Every
- * declaration form that can implement an interface is matched now, and the strategy scan follows
- * whatever the first check finds rather than a hardcoded list of filenames.
+ * <p>The patterns must match every declaration form, records included, or an implementation lands
+ * with the suite green; the strategy scan follows what the first check finds, not a filename list.
  */
 class SignalSourceImplementationsTest {
 
@@ -51,11 +41,9 @@ class SignalSourceImplementationsTest {
     private static final Pattern ANONYMOUS_SIGNAL_SOURCE = Pattern.compile("new\\s+SignalSource\\s*\\(");
 
     /**
-     * Whole words that only appear when something is computing a trading decision. Matched on word
-     * boundaries, not as substrings, so "representation" is not mistaken for an EMA.
-     *
-     * <p>{@code atr} is deliberately absent: a source may <i>carry</i> a volatility figure supplied
-     * from outside — that is transport. It may not compute one.
+     * Whole words that only appear when something computes a trading decision. Word-bounded so
+     * "representation" is not mistaken for an EMA. {@code atr} is deliberately absent: a source may
+     * carry a volatility figure supplied from outside, it just may not compute one.
      */
     private static final Pattern STRATEGY_SHAPED = Pattern.compile(
             "\\b(ema|sma|rsi|macd|bollinger|keltner|adx|stochastic|indicator|indicators|candle|candles|"

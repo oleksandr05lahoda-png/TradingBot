@@ -11,22 +11,18 @@ import java.util.Set;
  *
  * <pre>{@code   liq = (WB + cum - side * q * EP) / (q * MMR - side * q) }</pre>
  *
- * side = +1 long / -1 short, q = size in base units, EP = entry, MMR/cum = the governing bracket's
- * maintenance rate and maintenance amount, WB = isolated wallet balance. (Binance's general form
- * carries TMM and UPNL terms for other contracts; per its own note they are 0 in isolated mode.)
+ * side = +1 long / -1 short, q = base units, EP = entry, MMR/cum = the governing bracket's
+ * maintenance rate and amount, WB = isolated wallet balance. (Binance's general form carries TMM and
+ * UPNL terms; per its own note they are 0 in isolated mode.)
  *
- * <p><b>Derived, not copied</b>, because a copied formula cannot be checked. Liquidation is where
- * equity meets the maintenance requirement, {@code WB + uPnL = MM}, with {@code MM = q*P*MMR - cum}:
- * a long has {@code uPnL = q(P - EP)} giving {@code P = (WB + cum - q*EP) / (q(MMR - 1))}, a short
- * has {@code uPnL = q(EP - P)} giving {@code P = (WB + cum + q*EP) / (q(MMR + 1))}. Both are the
- * expression above.
+ * <p>Derivation: liquidation is where equity meets the maintenance requirement,
+ * {@code WB + uPnL = MM} with {@code MM = q*P*MMR - cum}. A long has {@code uPnL = q(P - EP)} giving
+ * {@code P = (WB + cum - q*EP) / (q(MMR - 1))}; a short has {@code uPnL = q(EP - P)} giving
+ * {@code P = (WB + cum + q*EP) / (q(MMR + 1))}. Both are the expression above.
  *
- * <p>Not {@code entry * (1 - 1/leverage)}: that ignores maintenance margin and always puts
- * liquidation further from entry than it is, which is the expensive direction to be wrong in.
- *
- * <p>The governing bracket depends on notional and notional depends on price, so the bracket at
- * entry need not be the bracket at liquidation. The solver iterates to a fixed point; if it
- * oscillates it takes whichever solved price is nearer to entry.
+ * <p>Not {@code entry * (1 - 1/leverage)}: that ignores maintenance margin and puts liquidation
+ * further from entry than it is. The governing bracket depends on notional and notional on price, so
+ * the solver iterates to a fixed point, taking the price nearer entry if it oscillates.
  */
 public final class LiquidationCalculator {
 
@@ -36,8 +32,7 @@ public final class LiquidationCalculator {
 
     /**
      * Initial margin minus the entry fee, which on an isolated position comes out of that same
-     * margin. Ignoring the fee would push the projected liquidation price away from entry — small,
-     * but small in the dangerous direction.
+     * margin. Ignoring it would push the projected liquidation away from entry — the wrong direction.
      */
     public static double isolatedWalletBalanceAtOpen(double notional, int leverage, double takerFeeFraction) {
         Preconditions.positiveFinite(notional, "notional");
@@ -53,8 +48,8 @@ public final class LiquidationCalculator {
     }
 
     /**
-     * Liquidation price for an isolated position opened at {@code entryPrice} with {@code quantity}
-     * base units at {@code leverage}.
+     * Liquidation price for an isolated position, re-selecting the maintenance bracket until it
+     * stops moving.
      *
      * @return the mark price at which the position liquidates, or {@code 0.0} for a long whose
      *         liquidation price is not reachable above zero (which happens at 1x)
@@ -83,9 +78,8 @@ public final class LiquidationCalculator {
             MarginTier atLiquidation = tiers.tierFor(Math.max(0.0, price) * quantity);
             if (atLiquidation.equals(tier)) return clampToReachable(side, entryPrice, price);
             if (visited.contains(atLiquidation)) {
-                // Oscillating. Take whichever solved PRICE is nearer entry, not the higher
-                // maintenance rate: with continuity-calibrated maintenance amounts the higher-rate
-                // bracket demands less margin below its own floor, so it lands further away.
+                // Oscillating: take the solved PRICE nearer entry, not the higher maintenance rate —
+                // with calibrated maintenance amounts that bracket lands further away.
                 double a = solve(side, entryPrice, quantity, walletBalance, tier);
                 double b = solve(side, entryPrice, quantity, walletBalance, atLiquidation);
                 double nearer = side == Side.LONG ? Math.max(a, b) : Math.min(a, b);
@@ -101,19 +95,15 @@ public final class LiquidationCalculator {
     private static double solve(Side side, double entryPrice, double quantity, double walletBalance, MarginTier tier) {
         int s = side.sign();
         double numerator = walletBalance + tier.maintenanceAmount() - s * quantity * entryPrice;
-        // q*(MMR - 1) for a long, q*(MMR + 1) for a short; MarginTier bounds MMR to (0, 1), so
-        // neither can be zero.
+        // q*(MMR - 1) long, q*(MMR + 1) short; MarginTier bounds MMR to (0, 1) so neither is zero.
         double denominator = quantity * tier.maintenanceMarginRate() - s * quantity;
         return numerator / denominator;
     }
 
     /**
-     * Both ends of the range. A long solving to zero or below means price would hit zero first (the
-     * ordinary case at 1x): reported as {@code 0.0}, "not reachable". A price on the wrong side of
-     * entry means the initial margin is already at or below the maintenance requirement — the
-     * position would be liquidatable at open — and is clamped to entry, which drives the buffer to
-     * zero so {@link LiquidationSafety} refuses the trade with a readable reason instead of an
-     * exception thrown from inside a pricing routine.
+     * A long solving at or below zero means price hits zero first (ordinary at 1x), reported as
+     * {@code 0.0}. A price on the wrong side of entry means the position is liquidatable at open;
+     * clamping to entry zeroes the buffer so {@link LiquidationSafety} refuses it readably.
      */
     private static double clampToReachable(Side side, double entryPrice, double price) {
         Preconditions.require(Double.isFinite(price) || side == Side.LONG,

@@ -17,11 +17,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Idempotency: the same logical order, sent again, must not become a second position.
- *
- * <p>The dangerous case is the ambiguous one — the request landed, the response did not — and the
- * assertion that matters is on the resulting <b>position</b>, not on the return value. A retry that
- * "looks fine" while doubling the exposure would pass any test that only checked the order object.
+ * Idempotency: the same logical order, sent again, must not become a second position. Assertions are
+ * on the resulting position, not the return value — a doubled exposure returns a fine-looking order.
  */
 class IdempotentResubmitTest {
 

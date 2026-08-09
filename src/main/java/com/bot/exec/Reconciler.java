@@ -24,17 +24,9 @@ import java.util.Set;
 import java.util.logging.Logger;
 
 /**
- * Brings local belief back in line with the exchange, and stops trading when the two disagree.
- *
- * <p>Local state drifts for reasons that are not bugs — a fill delivered during a restart, a
- * position closed by hand, a stop that triggered during a partition — so the question is never "is
- * local state right?" but "what does the exchange say?".
- *
- * <p>Drift is a defect, not a number to correct and forget: the book is realigned <i>and</i>
- * {@link TradingHalt} is tripped, because opening more positions on top of a wrong assumption is how
- * a small bug becomes an expensive one. Closing stays available — a halt never seals a position in.
- *
- * <p>{@link Drift.Kind#POSITION_WITHOUT_STOP} has the sharpest teeth: it is what a crash between
+ * Brings local belief back in line with the exchange, and stops trading when the two disagree: the
+ * book is realigned <i>and</i> {@link TradingHalt} is tripped, since drift is a defect rather than a
+ * number to correct and forget. {@link Drift.Kind#POSITION_WITHOUT_STOP} is what a crash between
  * "entry filled" and "stop placed" leaves behind.
  */
 public final class Reconciler {
@@ -50,17 +42,15 @@ public final class Reconciler {
             GHOST_POSITION,
             /** Same symbol, different size. */
             QUANTITY_MISMATCH,
-            /** Same symbol, opposite direction. The worst kind of quiet. */
+            /** Same symbol, opposite direction. */
             SIDE_MISMATCH,
             /** An open position with no working stop on the exchange. */
             POSITION_WITHOUT_STOP,
             /** A working order on a symbol with no position, old enough not to be a race. */
             ORPHAN_ORDER,
             /**
-             * The stop resting on the exchange no longer sits far enough inside the liquidation
-             * price the exchange itself reports. Checked against the exchange's number rather than
-             * the one computed at approval, so margin changes, funding and added or removed isolated
-             * margin are all accounted for without this system having to model them.
+             * The resting stop no longer sits far enough inside the liquidation price the exchange
+             * itself reports.
              */
             LIQUIDATION_BUFFER_BREACHED
         }
@@ -117,10 +107,10 @@ public final class Reconciler {
     }
 
     /**
-     * One reconciliation pass. Idempotent by construction: it reads the exchange, realigns local
-     * state and cancels orders that are provably unmanaged. It never opens anything.
+     * One reconciliation pass: reads the exchange, realigns local state and cancels provably
+     * unmanaged orders. Idempotent, and never opens anything.
      *
-     * @param now used for the UTC-day boundary of the realised-PnL reseed and for the orphan grace window
+     * @param now used for the UTC-day boundary of the realised-PnL reseed and the orphan grace window
      */
     public Report reconcile(Instant now) {
         Preconditions.notNull(now, "now");
@@ -162,9 +152,8 @@ public final class Reconciler {
             }
 
             // The exchange does not store an intended stop, so the distance comes from the local
-            // record. With no local record the risk is recorded as 0 — a known understatement
-            // rather than a measurement; the UNKNOWN_POSITION drift above is what stops trading,
-            // so it is never sized against.
+            // record; with none, risk is 0 — a known understatement never sized against, because
+            // the UNKNOWN_POSITION drift above halts trading.
             double stopDistance = local != null && local.quantity().signum() > 0
                     ? local.riskUsd() / local.quantity().doubleValue()
                     : 0.0;
@@ -185,9 +174,8 @@ public final class Reconciler {
         // Exchange wins, always and immediately, before any of the checks below act on the book.
         book.replaceAll(truth);
 
-        // Carried over from the previous pass. Otherwise a symbol whose position closed is inspected
-        // exactly once, and an order younger than the grace window at that single moment is never
-        // looked at again — the likely outcome with a 60s grace and a 30s reconcile interval.
+        // Carried over, otherwise a closed symbol is inspected once and an order still inside the
+        // grace window at that single moment is never looked at again.
         symbolsToInspect.addAll(carriedOverSymbols);
         Set<String> stillInteresting = new HashSet<>();
 
@@ -210,8 +198,7 @@ public final class Reconciler {
                     boolean oldEnough = order.updateTimeMs() > 0
                             && now.toEpochMilli() - order.updateTimeMs() > orphanGraceMillis;
                     if (!oldEnough) {
-                        // May belong to an entry that is still being worked. Keep the symbol on the
-                        // list so the next pass can decide, instead of losing sight of it.
+                        // May belong to an entry still being worked; let the next pass decide.
                         stillInteresting.add(symbol);
                         continue;
                     }
@@ -224,9 +211,7 @@ public final class Reconciler {
         }
         carriedOverSymbols = stillInteresting;
 
-        // Realised PnL for the daily limit comes from the exchange's ledger, not from a local tally:
-        // a restart must not be able to clear the day's loss, and only the exchange knows what fees
-        // and funding did to it.
+        // From the exchange's ledger, not a local tally: a restart must not clear the day's loss.
         long utcMidnight = LocalDate.ofInstant(now, ZoneOffset.UTC)
                 .atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli();
         try {
@@ -251,19 +236,11 @@ public final class Reconciler {
     }
 
     /**
-     * Compares the stop actually resting on the exchange against the liquidation price the
-     * <b>exchange</b> reports for that position.
-     *
-     * <p>This is the runtime counterpart to the pre-trade check. The approval-time buffer was
-     * computed from a liquidation price this system worked out itself, at the moment of approval.
-     * The exchange's number moves afterwards for reasons this system does not model — margin added
-     * or removed by hand, funding payments, a maintenance-bracket change as the position's notional
-     * drifts — and a stop that was comfortably inside liquidation at approval can end up outside it
-     * without a single order changing. Checking the exchange's own figure catches that without
-     * having to reproduce its bookkeeping.
-     *
-     * <p>A reported liquidation price of zero means "not reachable" and is skipped rather than
-     * treated as a price of zero.
+     * Runtime counterpart to the pre-trade check, against the liquidation price the <b>exchange</b>
+     * reports: that number moves after approval — manual margin changes, funding, a
+     * maintenance-bracket change — for reasons this system does not model, so a stop can drift
+     * outside liquidation with no order changing. A reported liquidation price of zero means "not
+     * reachable" and is skipped.
      */
     private void checkLiquidationBuffer(String symbol, List<PositionSnapshot> positions,
                                         OrderStatus stop, List<Drift> drifts) {

@@ -18,15 +18,8 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * An in-memory exchange with the failure modes that matter.
- *
- * <p>The point of the port/adapter split is exactly this class. Duplicate client order ids, lost
- * responses, partial fills and positions that change behind the bot's back are the situations the
- * execution layer exists to survive, and provoking any of them against a real endpoint is somewhere
- * between hard and impossible. Here they are one method call.
- *
- * <p>Its behaviour deliberately mirrors Binance's where that matters: a duplicate client order id
- * raises {@code -4116}, an unknown order query returns empty rather than throwing, a market order
+ * An in-memory exchange whose behaviour mirrors Binance's where it matters: a duplicate client order
+ * id raises {@code -4116}, an unknown order query returns empty rather than throwing, a market order
  * fills at {@link #fillPrice} for {@link #fillRatio} of its size, and a conditional order rests.
  */
 final class FakeExchange implements ExchangePort {
@@ -52,11 +45,7 @@ final class FakeExchange implements ExchangePort {
     ExchangeException failNextPlaceWith = null;
     /** Makes the next N queryOrder calls report "no such order", as a propagation delay would. */
     int hideNextQueries = 0;
-    /**
-     * Selective placement failure: returns the exception to throw for a given request, or null to
-     * let it through. Lets a test fail the stop while the entry succeeds, which is the ordering the
-     * coordinator's worst case depends on.
-     */
+    /** Selective placement failure: the exception to throw for a given request, or null to let it through. */
     java.util.function.Function<OrderRequest, ExchangeException> placementFailure = request -> null;
     /** When non-null, every cancelOrder throws this. */
     ExchangeException cancelFailure = null;

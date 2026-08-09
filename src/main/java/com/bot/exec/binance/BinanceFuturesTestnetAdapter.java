@@ -35,26 +35,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 /**
- * {@link ExchangePort} over Binance USDⓈ-M futures <b>testnet</b> REST.
+ * {@link ExchangePort} over Binance USDⓈ-M futures <b>testnet</b> REST. Everything exchange-specific
+ * lives here, so nothing above this class knows Binance exists.
  *
- * <p>Everything exchange-specific lives here: signing, the query-string layout, JSON field names,
- * numeric error codes, rate-limit headers and the base URL. Nothing above this class knows that
- * Binance exists, which is why the risk engine and the whole execution protocol are testable against
- * a fake without a socket.
- *
- * <p>Three details worth pointing at:
- *
- * <p><b>Every URL goes through {@link BinanceTestnetEndpoint#requireTestnet}.</b> Not just the base:
- * each assembled request is re-checked, so no future edit can route a single call somewhere else.
- *
- * <p><b>Clock drift is corrected against the exchange, not trusted from the host.</b> Binance
- * validates {@code serverTime - timestamp <= recvWindow}, so a host clock a few seconds off makes
- * every signed request fail with {@code -1021} — including, at the worst possible moment, the one
- * placing a stop.
- *
- * <p><b>Ambiguity is preserved rather than flattened.</b> A timeout or a 503 becomes
- * {@link ExchangeException#ambiguous()}, an error code becomes a refusal. The caller
- * ({@code IdempotentOrderPlacer}) makes a genuinely different decision in each case.
+ * <p>Ambiguity is preserved rather than flattened: a timeout or a 503 becomes
+ * {@link ExchangeException#ambiguous()}, an error code becomes a refusal, and
+ * {@code IdempotentOrderPlacer} decides differently in each case.
  */
 public final class BinanceFuturesTestnetAdapter implements ExchangePort {
 
@@ -188,9 +174,8 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
             if (!symbol.equals(entry.optString("symbol"))) continue;
             JSONArray brackets = entry.getJSONArray("brackets");
 
-            // The topmost bracket is widened to infinity for the table's coverage invariant, and is
-            // picked by highest notionalFloor rather than array position — a descending response
-            // would otherwise widen the wrong one.
+            // The topmost bracket is widened to infinity, and picked by highest notionalFloor rather
+            // than array position — a descending response would otherwise widen the wrong one.
             double highestFloor = Double.NEGATIVE_INFINITY;
             for (int b = 0; b < brackets.length(); b++) {
                 highestFloor = Math.max(highestFloor, brackets.getJSONObject(b).getDouble("notionalFloor"));
@@ -211,9 +196,8 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     }
 
     @Override public double fetchRealizedPnlSince(long sinceEpochMs) {
-        // Commissions and funding count too: the daily loss limit is about the account, not about a
-        // bookkeeping category. Paged, because income comes back ascending from startTime and a
-        // truncated page would drop the MOST RECENT rows — the ones a bad day is made of.
+        // Commissions and funding count too: the daily loss limit is about the account. Paged because
+        // income comes back ascending from startTime, so a truncated page drops the most recent rows.
         final int pageSize = 1000;
         final int maxPages = 20;
 
@@ -237,8 +221,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
             }
             if (rows.length() < pageSize) return total;
             if (newestSeen <= cursor) {
-                // A full page whose timestamps did not advance: paging on time cannot make progress,
-                // and looping would double-count. Stop and say so rather than silently under-report.
+                // Timestamps did not advance on a full page: paging cannot progress, looping would double-count.
                 LOG.warning("[Binance] income paging stalled at " + cursor
                         + "; the realised-PnL total may be incomplete");
                 return total;
@@ -262,11 +245,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         }
     }
 
-    /**
-     * Sets leverage. Any refusal propagates, {@code -4028 INVALID_LEVERAGE} included: opening at a
-     * leverage other than the one the liquidation buffer was computed against would mean the stop
-     * was validated against the wrong liquidation price.
-     */
+    /** Any refusal propagates, {@link BinanceErrorCodes#INVALID_LEVERAGE} included. */
     @Override public void setLeverage(String symbol, int leverage) {
         Preconditions.positive(leverage, "leverage");
         Map<String, String> params = new LinkedHashMap<>();
@@ -276,8 +255,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     }
 
     @Override public List<PositionSnapshot> openPositions() {
-        // positionRisk rather than the account endpoint: it is the one carrying liquidationPrice,
-        // which Reconciler.checkLiquidationBuffer measures the resting stop against.
+        // positionRisk rather than the account endpoint: only this one carries liquidationPrice.
         JSONArray rows = new JSONArray(signedGet("/fapi/v2/positionRisk", Map.of(), 5));
         List<PositionSnapshot> out = new ArrayList<>();
         for (int i = 0; i < rows.length(); i++) {
@@ -311,8 +289,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         if (request.stopPrice() != null) params.put("stopPrice", request.stopPrice().toPlainString());
         if (request.timeInForce() != null) params.put("timeInForce", request.timeInForce().name());
         if (request.workingType() != null) params.put("workingType", request.workingType().name());
-        // Sent only when true: Binance rejects reduceOnly and closePosition together, and an explicit
-        // "false" for one of them alongside the other is exactly that combination.
+        // Sent only when true: Binance rejects reduceOnly and closePosition together, even as "false".
         if (request.reduceOnly()) params.put("reduceOnly", "true");
         if (request.closePosition()) params.put("closePosition", "true");
 
@@ -327,8 +304,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
             return Optional.of(parseOrder(new JSONObject(signedGet("/fapi/v1/order", params, 1))));
         } catch (ExchangeException e) {
             if (e.exchangeCode() == BinanceErrorCodes.NO_SUCH_ORDER) {
-                // Genuinely unknown to the exchange. Note the documented caveat: cancelled orders with
-                // no fills stop being queryable after three days, far longer than any order here lives.
+                // Documented caveat: cancelled orders with no fills stop being queryable after three days.
                 return Optional.empty();
             }
             throw e;
@@ -365,8 +341,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     }
 
     @Override public void close() {
-        // java.net.http.HttpClient holds no resource that needs releasing here; the method exists so
-        // callers can use try-with-resources uniformly across ExchangePort implementations.
+        // HttpClient holds nothing to release; present so callers can use try-with-resources.
     }
 
     // ─── Parsing ─────────────────────────────────────────────────────────────────────────────
@@ -391,8 +366,8 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         try {
             return OrderState.valueOf(raw);
         } catch (IllegalArgumentException e) {
-            // NEW_INSURANCE / NEW_ADL and any future addition: unknown is unknown, never guessed as
-            // FILLED, because a wrong guess here decides whether a position is believed to exist.
+            // NEW_INSURANCE / NEW_ADL and future additions: never guess FILLED, that decides
+            // whether a position is believed to exist.
             LOG.warning("[Binance] unrecognised order status \"" + raw + "\"");
             return OrderState.UNKNOWN;
         }
@@ -463,8 +438,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
                         + (retryAfterMs / 1000) + "s", status, 0);
             }
             if (status == 503) {
-                // Binance documents 503 as "unknown execution status": the request may have been
-                // executed. That is the definition of ambiguous, and it must not be retried blindly.
+                // Binance documents 503 as "unknown execution status": the request may have executed.
                 throw ExchangeException.ambiguous(
                         "HTTP 503 from the exchange — execution status is unknown", null);
             }
@@ -476,7 +450,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
                     code = error.optInt("code", 0);
                     message = error.optString("msg", message);
                 } catch (RuntimeException ignored) {
-                    // Not JSON — keep the raw body, which is the only information there is.
+                    // Not JSON — keep the raw body.
                 }
                 if (code == BinanceErrorCodes.TIMESTAMP_OUT_OF_RECV_WINDOW) {
                     LOG.warning("[Binance] signature rejected on clock skew — resynchronising");
@@ -508,7 +482,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
                     try {
                         rateLimiter.observeUsedWeight(Integer.parseInt(value.trim()));
                     } catch (NumberFormatException ignored) {
-                        // A malformed header is not worth failing a request over; the local tally stands.
+                        // Malformed header: the local tally stands.
                     }
                 });
     }

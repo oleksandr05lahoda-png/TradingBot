@@ -9,19 +9,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Where the exits sit, in R — multiples of the entry-to-stop distance — never in absolute prices.
- * "Take profit at +2%" means different things on BTC and on a fresh listing; "at 2R" does not.
- * Default: half at 1.5R, half at 2R.
- *
- * <p>Every leg is <b>reduce-only</b>. An exit that is not will open an opposite position if it races
- * a stop that already flattened the book.
+ * Where the exits sit, in R — multiples of the entry-to-stop distance — never in absolute prices,
+ * because "+2%" means different things on BTC and on a fresh listing. Every leg is <b>reduce-only</b>:
+ * an exit that is not would open an opposite position if it raced a stop that already flattened.
  */
 public record TakeProfitPolicy(List<Leg> legs) {
 
-    /**
-     * @param rMultiple          distance from entry in units of {@code |entry - stop|}
-     * @param fractionOfPosition share of the filled quantity this leg closes
-     */
+    /** {@code rMultiple} is a distance from entry in units of {@code |entry - stop|}. */
     public record Leg(double rMultiple, double fractionOfPosition) {
         public Leg {
             Preconditions.positiveFinite(rMultiple, "rMultiple");
@@ -30,7 +24,7 @@ public record TakeProfitPolicy(List<Leg> legs) {
         }
     }
 
-    /** A projected leg: an actual price and an actual, lot-aligned quantity. */
+    /** A leg with a real tick-aligned price and a real lot-aligned quantity. */
     public record ProjectedLeg(double rMultiple, BigDecimal price, BigDecimal quantity) {}
 
     public TakeProfitPolicy {
@@ -50,12 +44,11 @@ public record TakeProfitPolicy(List<Leg> legs) {
         legs = List.copyOf(legs);
     }
 
-    /** Half at 1.5R, half at 2R — the brief's default. */
+    /** Half at 1.5R, half at 2R. */
     public static TakeProfitPolicy standard() {
         return new TakeProfitPolicy(List.of(new Leg(1.5, 0.5), new Leg(2.0, 0.5)));
     }
 
-    /** Single leg closing the whole position at {@code rMultiple}. */
     public static TakeProfitPolicy single(double rMultiple) {
         return new TakeProfitPolicy(List.of(new Leg(rMultiple, 1.0)));
     }
@@ -66,28 +59,15 @@ public record TakeProfitPolicy(List<Leg> legs) {
     }
 
     /**
-     * Turns the policy into orders that the exchange will actually accept for {@code totalQuantity}.
+     * Orders the exchange will accept for {@code totalQuantity} (the filled size, never the intended
+     * one). Quantities are floored to the lot step with the <b>last</b> leg absorbing the remainder —
+     * dust left unclosed is a position the bot believes is flat. If any leg falls below the minimum
+     * lot the split is abandoned rather than patched, because patching pushes the unsendable share
+     * into a later leg and quietly moves size <i>further out</i>; the fallback is one leg at the
+     * <b>nearest</b> R, which reduces exposure sooner. Empty means the stop is the only exit.
      *
-     * <p>Three things happen here that a naive {@code qty * fraction} does not do:
-     * <ol>
-     *   <li>Each leg's quantity is floored to the lot step, and the <b>last</b> leg absorbs the
-     *       rounding remainder, so the legs sum to exactly the quantity being closed rather than to
-     *       "almost" it — an unclosed dust remainder is a position the bot believes is flat.</li>
-     *   <li>If any leg comes out below the exchange's minimum lot, the split is abandoned as a whole
-     *       rather than patched. Patching would mean pushing the unsendable share into a later leg,
-     *       which quietly moves size <i>further out</i> — the opposite of what a risk layer should do
-     *       when it cannot do what was asked.</li>
-     *   <li>The fallback is a single leg at the <b>nearest</b> R holding the whole quantity.
-     *       Collapsing towards the nearer target reduces exposure sooner, which is the direction to
-     *       err in. If even that is unsendable the result is empty, and the stop is the only exit.</li>
-     * </ol>
-     *
-     * <p>Minimum <i>notional</i> is deliberately not applied to these legs. Binance exempts
-     * reduce-only orders from it — its own {@code -4164} message reads "unless you choose reduce
-     * only" — and every leg produced here is reduce-only, so applying the floor would refuse exits
-     * the exchange would have accepted.
-     *
-     * @param totalQuantity lot-aligned quantity actually held (the filled size, never the intended one)
+     * <p>Minimum <i>notional</i> is deliberately not applied: Binance exempts reduce-only orders from
+     * it ({@code -4164}, "unless you choose reduce only") and every leg here is reduce-only.
      */
     public List<ProjectedLeg> project(Side side,
                                       double entryPrice,

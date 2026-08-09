@@ -8,19 +8,11 @@ import java.math.BigDecimal;
 import java.util.List;
 
 /**
- * An approved trade: direction, size, the exact prices that will be sent, and the stop that made the
- * size mean something.
- *
- * <p><b>There is no constructor without a stop.</b> The only constructor is package-private, takes a
- * non-null {@link StopLoss}, and is reachable only from {@link RiskEngine}. Downstream code cannot
- * assemble a plan by hand, cannot null the stop out, and cannot pass a size that was not derived
- * from that stop — so "position without a stop" is not a state the execution layer has to defend
- * against, because it is not a value that exists.
- *
- * <p>The plan carries both the source {@link StopLoss} (with its provenance — structural or ATR) and
- * {@link #stopPrice()}, the tick-aligned price that will actually be sent. They can differ by up to
- * one tick, and every risk number in this object is computed from the price that will be sent, not
- * from the one that was asked for.
+ * An approved trade: direction, size, the exact prices that will be sent, and the stop the size was
+ * derived from. The only constructor is package-private and reachable from {@link RiskEngine} alone,
+ * so a plan without a stop is not a state the execution layer has to defend against. It carries both
+ * the source {@link StopLoss} and {@link #stopPrice()}, the tick-aligned price actually sent; they
+ * can differ by a tick, and every risk number here comes from the price that will be sent.
  */
 public final class TradePlan {
 
@@ -79,8 +71,7 @@ public final class TradePlan {
         this.filters = Preconditions.notNull(filters, "filters");
         this.sizingNote = Preconditions.notNull(sizingNote, "sizingNote");
 
-        // Invariants restated here rather than trusted from the caller. RiskEngine is the only
-        // caller today; this constructor has to stay correct when it is not.
+        // Invariants restated rather than trusted: RiskEngine is the only caller today, not forever.
         Preconditions.require(quantity.signum() > 0, "quantity must be positive");
         Preconditions.require(filters.isQuantityOnStep(quantity),
                 "quantity " + quantity + " is not a multiple of stepSize " + filters.stepSize());
@@ -113,13 +104,11 @@ public final class TradePlan {
     public String signalId() { return signalId; }
     public String symbol() { return symbol; }
     public Side side() { return side; }
-    /** Tick-aligned entry. All risk numbers in this plan are computed against this price. */
+    /** Tick-aligned entry; all risk numbers in this plan are computed against it. */
     public BigDecimal entryPrice() { return entryPrice; }
-    /** Tick-aligned stop, the price the protective order carries. */
     public BigDecimal stopPrice() { return stopPrice; }
-    /** The source stop, including whether it was structural or an ATR fallback. */
+    /** The source stop, structural or ATR fallback. */
     public StopLoss stop() { return stop; }
-    /** Lot-aligned position size in base units, always positive. */
     public BigDecimal quantity() { return quantity; }
     public int leverage() { return leverage; }
     public double notionalUsd() { return notionalUsd; }

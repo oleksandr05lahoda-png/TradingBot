@@ -16,11 +16,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Where "something is wrong" goes.
- *
- * <p>Reconciliation drift and a fired dead-man's switch are the events this system is least able to
- * resolve on its own, and both are useless as a log line nobody reads. The default writes to the
- * log; {@link Telegram} adds a push when the environment supplies credentials.
+ * Destination for operator alerts such as reconciliation drift or a fired dead-man's switch. The
+ * default writes to the log; {@link Telegram} adds a push when the environment supplies credentials.
  */
 public interface AlertSink {
 
@@ -49,13 +46,9 @@ public interface AlertSink {
     }
 
     /**
-     * Telegram push, configured entirely from the environment: {@code TELEGRAM_BOT_TOKEN} and
-     * {@code TELEGRAM_CHAT_ID}. Absent credentials mean this sink is simply not created — an alert
-     * channel that fails to configure must not stop the bot, and a token must never be a constant in
-     * a source file.
-     *
-     * <p>Delivery failures are logged and swallowed on purpose: the alert path must not be able to
-     * throw into the trading path it is reporting on.
+     * Telegram push, configured from {@code TELEGRAM_BOT_TOKEN} and {@code TELEGRAM_CHAT_ID}.
+     * Delivery failures are logged and swallowed on purpose: the alert path must never throw into
+     * the trading path it is reporting on.
      */
     final class Telegram implements AlertSink {
         private static final Logger LOG = Logger.getLogger("Alert.Telegram");

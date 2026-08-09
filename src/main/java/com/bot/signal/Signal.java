@@ -8,19 +8,12 @@ import java.time.Instant;
 import java.util.OptionalDouble;
 
 /**
- * An instruction to consider a trade, from outside this system.
+ * A request to consider a trade, from outside this system; {@link com.bot.risk.RiskEngine} decides.
+ * It carries no size — that is derived from the stop by {@link com.bot.risk.PositionSizer} — and no
+ * confidence, score or urgency, because nothing downstream would be allowed to act on those.
  *
- * <p>What a signal is allowed to carry is deliberately narrow: a symbol, a direction, an entry, an
- * optional structural stop, an optional volatility figure and a requested leverage. It carries no
- * size — size is derived from the stop by {@link com.bot.risk.PositionSizer} and is not negotiable —
- * and no confidence, score or urgency, because nothing downstream would be allowed to act on those.
- *
- * <p>A signal is a <i>request</i>, not a decision. {@link com.bot.risk.RiskEngine} decides.
- *
- * @param id                   stable identity; the client order id is derived from it, so the same
- *                             signal replayed after a crash produces the same order rather than a second one
- * @param structuralStopPrice  a level the producer chose; preferred over the ATR fallback
- * @param atr                  volatility for the fallback stop when no structural level was supplied
+ * @param id stable identity; the client order id derives from it, so a signal replayed after a
+ *           crash produces the same order rather than a second one
  */
 public record Signal(
         String id,

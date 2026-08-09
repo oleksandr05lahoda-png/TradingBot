@@ -11,21 +11,10 @@ import java.util.List;
 import java.util.logging.Logger;
 
 /**
- * The gate. Every position this system opens passes through {@link #evaluate}, and nothing that does
- * not pass it can be constructed downstream, because {@link TradePlan} has no public constructor.
- *
- * <p>The engine is pure in the sense that matters: it performs no I/O, opens no sockets and reads no
- * clock of its own. Balance, filters, margin brackets and the current time are all arguments. That
- * is what makes a refusal reproducible from its log line — and what lets the whole of it be tested
- * without an exchange.
- *
- * <p>The numbered steps in {@link #evaluate} run cheapest-and-most-fatal first, so nothing expensive
- * is computed for a trade a latched kill switch was going to refuse anyway.
- *
- * <p><b>Ceilings only ever reduce.</b> Sizing (step 7) and the ceilings (step 8) are separate on
- * purpose: {@link PositionSizer} is unclamped and always risks exactly the budget, and nothing here
- * can enlarge a position or move the stop. That is what makes "size is derived from the stop" true
- * rather than aspirational.
+ * The gate: every position passes through {@link #evaluate}, and nothing that fails it can be built
+ * downstream because {@link TradePlan} has no public constructor. Balance, filters, brackets and time
+ * are arguments — no I/O, no clock — so a refusal is reproducible from its log line. Ceilings (step 8)
+ * only ever reduce the size sizing (step 7) derived from the stop.
  */
 public final class RiskEngine {
 
@@ -50,18 +39,12 @@ public final class RiskEngine {
     public ExposureBook book() { return book; }
     public DailyLossKillSwitch killSwitch() { return killSwitch; }
 
-    /**
-     * Decides whether {@code request} may become a position, and if so exactly which one.
-     *
-     * @param balanceUsd account balance the risk budget applies to, read from the exchange
-     * @param now        current time; used only for the UTC-day boundary of the loss limit
-     */
+    /** Decides whether {@code request} may become a position; {@code now} only sets the UTC day. */
     public RiskDecision evaluate(TradeRequest request, double balanceUsd, Instant now) {
         Preconditions.notNull(request, "request");
         Preconditions.notNull(now, "now");
 
-        // 1 ─ Fail-closed inputs. A balance that could not be read is not a balance of zero, and a
-        //     NaN is not a small number: both refuse rather than propagate.
+        // 1 ─ Fail-closed inputs: an unreadable balance is not zero, and NaN is not a small number.
         if (!Double.isFinite(balanceUsd) || balanceUsd <= 0) {
             return RiskDecision.reject(RejectReason.INVALID_INPUT,
                     "balance is not a usable number: " + balanceUsd
@@ -75,8 +58,7 @@ public final class RiskEngine {
             return RiskDecision.reject(RejectReason.TRADING_HALTED, halt.reason());
         }
 
-        // 3 ─ Leverage. RiskConfig cannot hold a value above RiskConstants.MAX_LEVERAGE, so this
-        //     check is against both ceilings at once.
+        // 3 ─ Leverage. RiskConfig cannot exceed RiskConstants.MAX_LEVERAGE, so this covers both.
         if (request.leverage() > config.maxLeverage()) {
             return RiskDecision.reject(RejectReason.LEVERAGE_ABOVE_MAX,
                     "requested " + request.leverage() + "x, ceiling is " + config.maxLeverage()
@@ -105,9 +87,8 @@ public final class RiskEngine {
                     e.getMessage());
         }
 
-        // 6 ─ Tick alignment, then re-check the geometry against the aligned prices. The entry moves
-        //     to the tick that is not worse than the one requested; the stop moves towards the entry
-        //     so the realised risk can only shrink.
+        // 6 ─ Tick alignment, then re-check the geometry: entry moves to a tick no worse than
+        //     requested, the stop moves towards entry, so realised risk can only shrink.
         InstrumentFilters filters = request.filters();
         BigDecimal entryTick;
         BigDecimal stopTick;
@@ -139,8 +120,7 @@ public final class RiskEngine {
         double idealQty = PositionSizer.quantityForRisk(
                 balanceUsd, config.riskFractionPerTrade(), entry, stopPrice);
 
-        // 8 ─ Ceilings. Each is expressed as a maximum notional; the tightest one wins, and the
-        //     binding one is recorded so an unexpectedly small position can be explained.
+        // 8 ─ Ceilings, each a maximum notional; the tightest wins and the binding one is recorded.
         double perTradeCap = Math.min(balanceUsd * config.maxNotionalFractionPerTrade(),
                 config.maxNotionalUsdPerTrade());
         double sideCapFraction = request.side() == Side.LONG
@@ -188,8 +168,7 @@ public final class RiskEngine {
         double riskFraction = riskUsd / balanceUsd;
 
         if (riskUsd > budgetedRiskUsd * (1 + 1e-9)) {
-            // Unreachable while steps 7-9 only ever shrink the size. Checked anyway: this is the
-            // last place the number can be caught before it becomes an order.
+            // Unreachable while steps 7-9 only shrink; the last place to catch it before an order.
             return RiskDecision.reject(RejectReason.RISK_BUDGET_OVERRUN,
                     String.format("final size risks $%.6f against a budget of $%.6f", riskUsd, budgetedRiskUsd));
         }
@@ -249,9 +228,8 @@ public final class RiskEngine {
     }
 
     /**
-     * Records that a plan actually became a position. Called with the <b>filled</b> quantity and the
-     * average fill price, never with the plan's intended numbers: a partial fill is a different
-     * position from the one that was approved, and the book has to hold what exists.
+     * Takes the <b>filled</b> quantity and average fill price, never the plan's intended numbers:
+     * a partial fill is a different position from the approved one.
      */
     public void registerFill(TradePlan plan, BigDecimal filledQuantity, double averageFillPrice) {
         Preconditions.notNull(plan, "plan");
@@ -267,12 +245,8 @@ public final class RiskEngine {
     }
 
     /**
-     * Drops a symbol from the exposure book.
-     *
-     * <p>It deliberately does not book a realised PnL. That number comes from the exchange's income
-     * ledger during reconciliation — see {@link DailyLossKillSwitch#seedRealizedPnl} — because a
-     * locally computed PnL misses fees and funding, and because a value accumulated here plus a
-     * value seeded there is the same number counted twice.
+     * Books no realised PnL: that comes from the exchange income ledger via
+     * {@link DailyLossKillSwitch#seedRealizedPnl}, and doing both would count it twice.
      */
     public void registerClose(String symbol) {
         book.close(symbol);

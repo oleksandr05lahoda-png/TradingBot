@@ -8,34 +8,17 @@ import java.time.ZoneOffset;
 import java.util.logging.Logger;
 
 /**
- * The daily loss limit, and the latch it trips.
- *
- * <p><b>It latches.</b> Once the day's loss crosses the limit, trading stops until the next UTC day
- * — it does not resume because the next mark tick made the number look better. A limit that un-trips
- * is one the same losing session tests repeatedly.
- *
- * <p><b>Open drawdown counts, but only against you.</b> Effective day PnL is
- * {@code realised + min(0, unrealised)}: a position at -8% blocks new entries before it closes,
- * while an open <i>winner</i> cannot offset a realised loss. So the unrealised term can only tighten
- * the gate.
- *
- * <p>State is in memory and <b>seeded from the exchange</b> at start-up, not from a local file — see
- * {@link #seedRealizedPnl}. A restart mid-drawdown must not clear the day's loss, and the exchange's
- * income ledger is the one account of it a crashed process cannot have corrupted.
+ * The daily loss limit, latched: once crossed, trading stops until the next UTC day rather than
+ * resuming on a friendlier mark tick. Effective day PnL is {@code realised + min(0, unrealised)},
+ * so an open loser tightens the gate but an open winner cannot offset a realised loss. State is
+ * seeded from the exchange at start-up ({@link #seedRealizedPnl}), never from a local file, so a
+ * restart mid-drawdown cannot clear the day's loss.
  */
 public final class DailyLossKillSwitch {
 
     private static final Logger LOG = Logger.getLogger(DailyLossKillSwitch.class.getName());
 
-    /**
-     * @param tripped           whether trading is stopped
-     * @param reason            human-readable cause, empty when not tripped
-     * @param utcDay            the UTC day this state belongs to
-     * @param dayStartBalance   balance at the first observation of the day
-     * @param realizedPnl       realised PnL booked today
-     * @param openUnrealizedPnl unrealised PnL of everything currently open
-     * @param effectivePnl      {@code realizedPnl + min(0, openUnrealizedPnl)}
-     */
+    /** {@code effectivePnl = realizedPnl + min(0, openUnrealizedPnl)}, as a share of dayStartBalance. */
     public record Status(
             boolean tripped,
             String reason,
@@ -65,28 +48,20 @@ public final class DailyLossKillSwitch {
         this.dailyLossFractionLimit = dailyLossFractionLimit;
     }
 
-    /**
-     * Feeds the current balance. The first call of each UTC day fixes that day's starting balance,
-     * which is what the limit is a percentage of.
-     */
+    /** Feeds the current balance; the first call of each UTC day fixes that day's starting balance. */
     public synchronized void observeBalance(double balanceUsd, Instant now) {
         Preconditions.positiveFinite(balanceUsd, "balanceUsd");
         rolloverIfNewDay(now, balanceUsd);
         if (dayStartBalance <= 0) dayStartBalance = balanceUsd;
     }
 
-    /** Books a realised PnL event. Positive for a win, negative for a loss. */
     public synchronized void recordRealizedPnl(double pnlUsd, Instant now) {
         Preconditions.finite(pnlUsd, "pnlUsd");
         rolloverIfNewDay(now, 0);
         realizedPnl += pnlUsd;
     }
 
-    /**
-     * Replaces today's realised PnL wholesale. This is how the process recovers after a restart:
-     * the caller sums the exchange's own realised-PnL ledger since UTC midnight and hands it over,
-     * so a crash cannot be used — accidentally or otherwise — to reset the day's loss to zero.
-     */
+    /** Replaces today's realised PnL from the exchange's own ledger since UTC midnight. */
     public synchronized void seedRealizedPnl(double realizedPnlToday, Instant now) {
         Preconditions.finite(realizedPnlToday, "realizedPnlToday");
         rolloverIfNewDay(now, 0);
@@ -112,10 +87,7 @@ public final class DailyLossKillSwitch {
         }
     }
 
-    /**
-     * Evaluates the limit and latches if it is breached. Call before every gate decision; it is the
-     * evaluation itself that rolls the day over.
-     */
+    /** Evaluates the limit and latches if breached; this call is also what rolls the UTC day over. */
     public synchronized Status evaluate(Instant now) {
         rolloverIfNewDay(now, 0);
         double effective = realizedPnl + Math.min(0.0, openUnrealizedPnl);

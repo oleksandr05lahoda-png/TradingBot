@@ -18,18 +18,12 @@ public enum Side {
 
     public Side opposite() { return this == LONG ? SHORT : LONG; }
 
-    /**
-     * True when {@code stopPrice} sits on the losing side of {@code entryPrice} for this
-     * direction — the only geometry in which a stop is a stop. A LONG stop must be below
-     * entry, a SHORT stop above.
-     */
+    /** True when the stop is on the losing side of entry: below for a LONG, above for a SHORT. */
     public boolean isValidStopGeometry(double entryPrice, double stopPrice) {
         return this == LONG ? stopPrice < entryPrice : stopPrice > entryPrice;
     }
 
-    /**
-     * True when {@code takeProfitPrice} sits on the winning side of {@code entryPrice}.
-     */
+    /** True when the take-profit is on the winning side of entry. */
     public boolean isValidTakeProfitGeometry(double entryPrice, double takeProfitPrice) {
         return this == LONG ? takeProfitPrice > entryPrice : takeProfitPrice < entryPrice;
     }

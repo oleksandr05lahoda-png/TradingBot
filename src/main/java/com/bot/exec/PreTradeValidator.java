@@ -9,14 +9,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Checks an order against the symbol's filters <b>before</b> it is sent.
- *
- * <p>A stop that comes back {@code -1111 BAD_PRECISION} was not placed, and the position it was to
- * protect is open either way — so the failure that matters is not "rejected" but "naked for the
- * seconds it took to work out why". Everything checkable locally is checked locally.
- *
- * <p>The reduce-only rule is here rather than only in {@link OrderRequest} because this is the one
- * gate every order passes through. Twice is deliberate.
+ * Checks an order against the symbol's filters before it is sent, so a stop is never rejected for
+ * {@code -1111 BAD_PRECISION} while the position it protects is already open. The reduce-only rule
+ * is re-checked here as well as in {@link OrderRequest}: this is the one gate every order passes.
  */
 public final class PreTradeValidator {
 
@@ -77,8 +72,7 @@ public final class PreTradeValidator {
             }
         }
 
-        // MIN_NOTIONAL. Binance exempts reduce-only orders from it, so a take-profit leg that is
-        // small in absolute terms is still sendable; entries are not exempt.
+        // Binance exempts reduce-only orders from MIN_NOTIONAL; entries are not exempt.
         if (order.quantity() != null && !order.isStrictlyReducing()) {
             BigDecimal notionalPrice = order.price() != null ? order.price() : referencePrice;
             if (!filters.meetsMinNotional(notionalPrice, order.quantity())) {
@@ -95,7 +89,7 @@ public final class PreTradeValidator {
         return new Result(violations);
     }
 
-    /** Validates and throws on the first failure. Used on the path where there is nothing to fall back to. */
+    /** Validates and throws on the first failure. */
     public static void validateOrThrow(OrderRequest order, InstrumentFilters filters, BigDecimal referencePrice) {
         Result result = validate(order, filters, referencePrice);
         if (!result.ok()) {

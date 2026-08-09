@@ -15,12 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The queue's row-to-signal contract, tested without a queue.
- *
- * <p>The leverage case is the one that matters: the two permitted signal sources must agree about
- * what a bad row means. An earlier version clamped an over-leveraged row down to the maximum while
- * the manual input refused the identical mistake — so a queue could publish 20x rows indefinitely
- * with nothing in the logs to say the request had ever been made.
+ * The queue's row-to-signal contract, tested without a queue. Both signal sources must agree about
+ * what a bad row means: an over-leveraged row is refused, never clamped down to the maximum.
  */
 class SupabaseQueueSourceTest {
 

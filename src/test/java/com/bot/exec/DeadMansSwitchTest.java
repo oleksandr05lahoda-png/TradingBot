@@ -21,12 +21,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The dead-man's switch.
- *
- * <p>The tests that matter most are the negative ones: the switch must <b>not</b> arm a symbol that
- * holds a position, and must <b>not</b> cancel reduce-only orders. Binance's countdownCancelAll
- * cancels every open order on a symbol, so arming it over an open position schedules the deletion of
- * that position's protective stop — the exact opposite of what the mechanism is for.
+ * The dead-man's switch. Binance's countdownCancelAll cancels every open order on a symbol, so arming
+ * it over an open position would schedule the deletion of that position's protective stop; the
+ * negative tests here are the ones that matter.
  */
 class DeadMansSwitchTest {
 

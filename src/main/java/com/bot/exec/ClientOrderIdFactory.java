@@ -9,20 +9,13 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
 
 /**
- * Client order ids that are a pure function of what the order <i>is</i>.
- *
- * <p>This is the whole of the idempotency story. A retry that invents a fresh id turns an ambiguous
- * timeout into two positions; an id derived from {@code (signalId, purpose, index)} is the same on
- * the retry, so the exchange refuses the duplicate ({@code -4116}) and
- * {@link IdempotentOrderPlacer} can ask what happened instead of guessing.
- *
- * <p>Nothing that varies between attempts may enter the hash — no timestamp, no random suffix, no
- * attempt counter — because a well-meaning "make ids unique" change is how this property gets lost.
- * Pinned by {@code IdempotentResubmitTest.clientOrderIdsAreDeterministic} and
- * {@code reExecutingAPlanIsSafe}.
+ * Client order ids derived purely from {@code (signalId, purpose, index)}, so a retry reproduces the
+ * same id and the exchange rejects the duplicate ({@code -4116}) instead of opening a second
+ * position. Nothing that varies between attempts may enter the hash — no timestamp, no random
+ * suffix, no attempt counter.
  *
  * <p>Format {@code bt-<purpose letter><index>-<22 chars of base64url(sha-256)>}, inside Binance's
- * {@code ^[\.A-Z\:/a-z0-9_-]{1,36}$}. 22 base64url characters is 132 bits of digest.
+ * {@code ^[\.A-Z\:/a-z0-9_-]{1,36}$}.
  */
 public final class ClientOrderIdFactory {
 
@@ -32,9 +25,12 @@ public final class ClientOrderIdFactory {
     private ClientOrderIdFactory() {}
 
     /**
-     * @param signalId stable identity of the originating signal
-     * @param purpose  what the order is for; an entry and its stop must not share an id
-     * @param index    distinguishes several orders of the same purpose, e.g. take-profit legs
+     * 22 base64url characters is 132 bits of digest, so distinct signals do not collide inside
+     * Binance's 36-character limit. Determinism is pinned by
+     * {@code IdempotentResubmitTest.clientOrderIdsAreDeterministic} and {@code reExecutingAPlanIsSafe}.
+     *
+     * @param purpose an entry and its stop must not share an id
+     * @param index   distinguishes several orders of the same purpose, e.g. take-profit legs
      */
     public static String create(String signalId, OrderPurpose purpose, int index) {
         Preconditions.notBlank(signalId, "signalId");

@@ -34,24 +34,8 @@ import java.util.List;
 import java.util.logging.Logger;
 
 /**
- * Entry point: wires the pieces together and runs the loop. Deliberately thin — it contains no risk
- * arithmetic and no exchange knowledge, only assembly, so that reading it tells you what talks to
- * what and nothing else.
- *
- * <pre>
- *   SignalSource ─▶ RiskEngine.evaluate ─▶ ExecutionCoordinator.execute ─▶ ExchangePort
- *                        │                          │                          ▲
- *                        └── ExposureBook ◀── Reconciler ───────────────────────┘
- *                                                   │
- *                                            DeadMansSwitch
- * </pre>
- *
- * <h2>Running it</h2>
- * <pre>
- *   BINANCE_TESTNET_API_KEY=...  BINANCE_TESTNET_API_SECRET=...  ./gradlew run
- *   ./gradlew run --args="--script signals.txt"    # non-interactive smoke run
- *   ./gradlew run --args="--source supabase"       # drain the external queue instead
- * </pre>
+ * Entry point: wires the pieces together and runs the loop. Deliberately thin — assembly only, no
+ * risk arithmetic and no exchange knowledge. Run with {@code --help} for options.
  */
 public final class TestnetBot {
 
@@ -84,15 +68,13 @@ public final class TestnetBot {
         try {
             port = BinanceFuturesTestnetAdapter.fromEnvironment();
         } catch (IllegalStateException e) {
-            // A missing credential is an operator mistake, not a bug. It deserves the sentence that
-            // says how to fix it, not a stack trace that buries it.
+            // A missing credential is an operator mistake: print the fix, not a stack trace.
             System.err.println(e.getMessage());
             System.exit(2);
             return;
         }
 
-        // `closedOnExit` exists only so the port is released on the way out; `port` is what the
-        // components below are wired to.
+        // `closedOnExit` only releases the port on the way out; components are wired to `port`.
         try (ExchangePort closedOnExit = port;
              SignalSource signals = openSource(sourceName, scriptPath, defaultLeverage)) {
 
@@ -124,8 +106,7 @@ public final class TestnetBot {
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
 
-                // Closes first, always. Giving risk back takes precedence over taking more, and a
-                // halt must never be able to stop an unwind.
+                // Closes first, always: a halt must never be able to stop an unwind.
                 for (CloseRequest close : signals.pollCloses()) {
                     handleClose(close, coordinator, signals);
                 }
@@ -156,8 +137,7 @@ public final class TestnetBot {
                 signals.onClosed(close, new ExecutionFeedback(close.id(), report.closedQuantity(),
                         report.averagePrice(), report.note()));
             } else {
-                // The coordinator has already alerted and halted; the row stays claimed so the
-                // failure is visible rather than quietly retried into a loop.
+                // Already alerted and halted; the row stays claimed rather than retried into a loop.
                 LOG.severe("[Loop] close of " + close.symbol() + " did not complete: " + report.note());
             }
         } catch (RuntimeException e) {
@@ -174,8 +154,7 @@ public final class TestnetBot {
             MarginTierTable tiers = port.fetchMarginTiers(signal.symbol());
             AccountSnapshot account = port.fetchAccount();
 
-            // The signal's leverage is already bounded by RiskConstants.MAX_LEVERAGE in Signal's
-            // constructor; RiskEngine bounds it again against the config. Nothing here widens it.
+            // Leverage is bounded in Signal's constructor and again by RiskEngine; nothing here widens it.
             TradeRequest request = new TradeRequest(signal.id(), signal.symbol(), signal.side(),
                     signal.entryPrice(), signal.structuralStopPrice(), signal.atr(),
                     signal.leverage(), filters, tiers);
@@ -189,8 +168,7 @@ public final class TestnetBot {
                 case RiskDecision.Approved approved -> {
                     ExecutionCoordinator.Report report = coordinator.execute(approved.plan());
                     if (report.mayHaveOpenedUnknownRisk()) {
-                        // The coordinator has already alerted and halted. Log at SEVERE so the
-                        // outcome is not mistaken for the ordinary "this signal did not work out".
+                        // Already alerted and halted; SEVERE so it is not read as an ordinary miss.
                         LOG.severe("[Loop] " + report.outcome() + " on " + signal.symbol()
                                 + " — " + report.note());
                     } else {

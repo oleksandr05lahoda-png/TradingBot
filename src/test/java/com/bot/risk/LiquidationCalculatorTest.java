@@ -12,11 +12,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The liquidation price, checked against numbers worked by hand from Binance's formula rather than
- * against whatever the implementation happens to produce.
- *
- * <p>Every expected value below is derived in the comment above it, so a future change that alters
- * the arithmetic has to argue with the derivation and not just re-record a new number.
+ * The liquidation price, checked against numbers worked by hand from Binance's formula. Every
+ * expected value is derived in the comment above it; do not re-record a new number without redoing
+ * the derivation.
  */
 class LiquidationCalculatorTest {
 

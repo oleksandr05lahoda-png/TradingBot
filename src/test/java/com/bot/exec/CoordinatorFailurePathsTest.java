@@ -15,12 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The paths where something goes wrong <i>after</i> money is committed.
- *
- * <p>Each of these was a real defect found by an adversarial audit of this code, and each one had
- * the same shape: a failure that left a leveraged position open while the report, the exposure book
- * or the operator was told otherwise. They are tested here because they are the paths that never run
- * in a normal day and therefore never get exercised by accident.
+ * The paths where something goes wrong <i>after</i> money is committed — each one a failure that
+ * could leave a leveraged position open while the report, the book or the operator says otherwise.
  */
 class CoordinatorFailurePathsTest {
 

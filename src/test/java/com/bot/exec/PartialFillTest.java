@@ -14,12 +14,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Partial fills: the position that exists is not the position that was approved, and everything
- * downstream has to be sized from what filled.
- *
- * <p>A stop sized for the intended quantity leaves the difference unprotected while every log line
- * says the trade is covered — which is the failure mode that looks healthiest right up until it
- * isn't.
+ * Partial fills: everything downstream is sized from what filled, not what was approved. A stop
+ * sized for the intended quantity leaves the difference unprotected while the logs read as covered.
  */
 class PartialFillTest {
 

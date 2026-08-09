@@ -8,24 +8,11 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * Sends orders in a way that a lost response cannot turn into a second position.
- *
- * <p>The dangerous case is not a failed order but one whose <i>outcome is unknown</i>: the request
- * left, the response did not come back, and the exchange may be holding a live order the bot has no
- * record of. Retrying that blindly turns one intended position into two, one of them unmanaged.
- *
- * <p>The protocol:
- * <ol>
- *   <li><b>Ask before sending.</b> The client order id is deterministic, so an order the exchange
- *       already knows <i>is</i> the answer and nothing is sent.</li>
- *   <li><b>Send.</b></li>
- *   <li><b>A definite refusal is final</b> — propagated, never retried.</li>
- *   <li><b>{@code -4116 DUPLICATED_CLIENT_ORDER_ID} is a success in disguise</b>: fetch and return
- *       the existing order.</li>
- *   <li><b>Ambiguous means ask, not resend.</b> Probe by id a few times, and only if the exchange
- *       still has never heard of it, send again <i>with the same id</i> — which keeps step 4 as the
- *       backstop.</li>
- * </ol>
+ * Sends orders so that a lost response cannot become a second position: query first by the
+ * deterministic client order id, treat {@code -4116 DUPLICATED_CLIENT_ORDER_ID} as a success and
+ * adopt the existing order, and after an ambiguous failure probe by id before resending — always
+ * with the same id, which keeps the duplicate rejection as the backstop. A definite refusal is
+ * propagated, never retried.
  */
 public final class IdempotentOrderPlacer {
 
@@ -54,9 +41,8 @@ public final class IdempotentOrderPlacer {
      * Places {@code request}, or returns the order the exchange already holds under the same client
      * order id. Calling this repeatedly with the same request is safe by construction.
      *
-     * @throws ExchangeException on a definite refusal, or when the outcome remains unknown after
-     *         every probe and resend — a state the caller must treat as "halt and reconcile",
-     *         never as "try something else"
+     * @throws ExchangeException on a definite refusal, or when the outcome is still unknown after
+     *         every probe and resend — which the caller must treat as "halt and reconcile"
      */
     public OrderStatus place(OrderRequest request) throws InterruptedException {
         Preconditions.notNull(request, "request");
@@ -101,13 +87,10 @@ public final class IdempotentOrderPlacer {
     }
 
     /**
-     * Cancels by client order id.
+     * Cancels by client order id without throwing.
      *
-     * @return {@code true} when the order is known not to be working any more — either the cancel
-     *         succeeded, or the exchange says no such order exists. {@code false} when the cancel
-     *         failed for any other reason, in which case the order may well still be live and the
-     *         caller must not assume it is gone. "Quietly" refers to not throwing, not to
-     *         pretending every outcome is the same one.
+     * @return {@code true} when the order is known not to be working any more (cancelled, or no such
+     *         order); {@code false} when the cancel failed and it may still be live
      */
     public boolean cancelQuietly(String symbol, String clientOrderId) {
         try {

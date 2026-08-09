@@ -20,26 +20,11 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 /**
- * An operator typing trades, one line at a time. This is the source the smoke run uses, and the
- * reason the system can be exercised end to end without anything that resembles a strategy.
+ * An operator typing trades, one line at a time — the source the smoke run uses.
  *
- * <h2>Line format</h2>
- * <pre>
- *   SYMBOL SIDE entry=&lt;price&gt; [stop=&lt;price&gt;] [atr=&lt;value&gt;] [lev=&lt;1..5&gt;] [id=&lt;text&gt;]
- *   CLOSE SYMBOL [id=&lt;text&gt;] [reason=&lt;text&gt;]
- *
- *   BTCUSDT LONG  entry=64000 stop=62800 lev=3
- *   ETHUSDT SHORT entry=3120  atr=45     lev=2
- *   CLOSE BTCUSDT reason=done
- * </pre>
- * Blank lines and lines starting with {@code #} are ignored. At least one of {@code stop} or
- * {@code atr} must be present — a line with neither is refused at the point of typing rather than
- * silently turned into an unprotected position.
- *
- * <p>Ids are stable per line: an explicit {@code id=} is used as given, otherwise one is derived
- * from the content and a monotonic counter. Because the client order id derives from the signal id,
- * two identical lines typed deliberately are two trades, while the <i>same</i> line replayed from a
- * script after a crash is one.
+ * <p>Format: {@code SYMBOL SIDE entry=<price> [stop=<price>] [atr=<value>] [lev=<1..5>] [id=<text>]}
+ * or {@code CLOSE SYMBOL [id=<text>] [reason=<text>]}; blank lines and {@code #} lines are ignored.
+ * Ids are stable per line, so a scripted line replayed after a crash is one trade, not two.
  */
 public final class ManualTestnetInput implements SignalSource {
 
@@ -53,13 +38,11 @@ public final class ManualTestnetInput implements SignalSource {
     private final Deque<Signal> pendingSignals = new ArrayDeque<>();
     private final Deque<CloseRequest> pendingCloses = new ArrayDeque<>();
 
-    /** Reads from the console. Used by the smoke run. */
     public static ManualTestnetInput fromConsole(int defaultLeverage) {
         return new ManualTestnetInput(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8), Clock.systemUTC(), defaultLeverage, true);
     }
 
-    /** Reads from any reader — a script file in a smoke run, a {@code StringReader} in a test. */
     public static ManualTestnetInput fromReader(Reader reader, Clock clock, int defaultLeverage) {
         return new ManualTestnetInput(reader, clock, defaultLeverage, false);
     }
@@ -76,10 +59,8 @@ public final class ManualTestnetInput implements SignalSource {
     @Override public String name() { return "manual-testnet-input"; }
 
     /**
-     * Consumes whatever lines are available. On the console this blocks for one line at a time, which
-     * is what an operator expects; from a reader it drains what is buffered and returns.
-     *
-     * <p>A malformed line is logged and skipped, not thrown: a typo must not take down a loop that is
+     * On the console this blocks for one line at a time; from a reader it drains what is buffered.
+     * A malformed line is logged and skipped, not thrown: a typo must not take down a loop that is
      * currently holding positions.
      */
     @Override public List<Signal> poll() throws IOException {
@@ -92,7 +73,6 @@ public final class ManualTestnetInput implements SignalSource {
         return takeAll(pendingCloses);
     }
 
-    /** Reads and routes: a {@code CLOSE} line becomes a close request, anything else a signal. */
     private void readAvailableLines() throws IOException {
         while (blocking || reader.ready()) {
             String line = reader.readLine();
@@ -122,11 +102,7 @@ public final class ManualTestnetInput implements SignalSource {
         return out;
     }
 
-    /**
-     * Parses {@code CLOSE SYMBOL [id=<text>] [reason=<text>]}.
-     *
-     * @throws IllegalArgumentException on anything it cannot turn into a close request
-     */
+    /** @throws IllegalArgumentException on anything it cannot turn into a close request */
     public static CloseRequest parseClose(String line, Clock clock, long sequence) {
         Preconditions.notBlank(line, "line");
         String[] parts = line.trim().split("\\s+");
@@ -172,12 +148,7 @@ public final class ManualTestnetInput implements SignalSource {
         reader.close();
     }
 
-    /**
-     * Parses one line into a {@link Signal}. Public and static so the format is testable without a
-     * stream, a clock or a thread.
-     *
-     * @throws IllegalArgumentException on anything it cannot turn into a valid signal
-     */
+    /** @throws IllegalArgumentException on anything it cannot turn into a valid signal */
     public static Signal parse(String line, Clock clock, int defaultLeverage, long sequence) {
         Preconditions.notBlank(line, "line");
         String[] parts = line.trim().split("\\s+");

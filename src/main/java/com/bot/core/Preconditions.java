@@ -1,15 +1,13 @@
 package com.bot.core;
 
 /**
- * Argument checks used across the risk core. Every check is fail-closed: a value that cannot be
- * validated throws rather than being coerced to a "safe looking" default. A failed balance read is
- * not a balance of zero, and NaN is not a small number.
+ * Argument checks used across the risk core. Fail-closed: a value that cannot be validated throws
+ * rather than being coerced to a safe-looking default.
  */
 public final class Preconditions {
 
     private Preconditions() {}
 
-    /** Finite and strictly greater than zero. NaN and infinity both fail. */
     public static double positiveFinite(double v, String name) {
         if (!Double.isFinite(v) || v <= 0.0) {
             throw new IllegalArgumentException(name + " must be a finite positive number, got " + v);
@@ -17,7 +15,6 @@ public final class Preconditions {
         return v;
     }
 
-    /** Finite and greater than or equal to zero. NaN and infinity both fail. */
     public static double nonNegativeFinite(double v, String name) {
         if (!Double.isFinite(v) || v < 0.0) {
             throw new IllegalArgumentException(name + " must be a finite non-negative number, got " + v);
@@ -32,7 +29,6 @@ public final class Preconditions {
         return v;
     }
 
-    /** Inclusive range check on a finite value. */
     public static double inClosedRange(double v, double lo, double hi, String name) {
         finite(v, name);
         if (v < lo || v > hi) {

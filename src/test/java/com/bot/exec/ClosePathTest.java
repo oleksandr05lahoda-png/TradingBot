@@ -12,11 +12,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Closing out a symbol on request.
- *
- * <p>The ordering under test is the mirror of opening: there the stop goes on before anything else,
- * here it comes off only after the position is confirmed gone. Cancelling first would leave the
- * position naked for as long as the close takes — which is the same defect, in reverse.
+ * Closing out a symbol on request. The stop comes off only after the position is confirmed gone;
+ * cancelling first would leave the position naked for as long as the close takes.
  */
 class ClosePathTest {
 
