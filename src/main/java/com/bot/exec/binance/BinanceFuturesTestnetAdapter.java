@@ -303,7 +303,19 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         // Sent only when true: Binance rejects reduceOnly and closePosition together, even as "false".
         if (request.reduceOnly()) params.put("reduceOnly", "true");
 
-        return parseOrder(new JSONObject(signedPost("/fapi/v1/order", params, 1, true)));
+        OrderStatus placed = parseOrder(new JSONObject(signedPost("/fapi/v1/order", params, 1, true)));
+
+        // RESULT is supposed to carry the average fill price, and for an entry it does — but a
+        // reduce-only market close came back with a filled quantity and a price of zero. A missing
+        // price is not a price: it silently corrupts the execution-cost measurement the whole
+        // exercise exists for, so it is fetched rather than accepted.
+        if (placed.hasFill() && placed.averagePrice().signum() == 0) {
+            Optional<OrderStatus> settled = queryOrder(request.symbol(), request.clientOrderId());
+            if (settled.isPresent() && settled.get().averagePrice().signum() > 0) return settled.get();
+            LOG.warning("[Binance] " + request.clientOrderId() + " filled "
+                    + placed.executedQuantity().toPlainString() + " but reported no average price");
+        }
+        return placed;
     }
 
     private OrderStatus placeAlgoOrder(OrderRequest request) {
