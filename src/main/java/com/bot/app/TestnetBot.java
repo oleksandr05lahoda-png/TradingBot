@@ -78,7 +78,20 @@ public final class TestnetBot {
                 new DailyLossKillSwitch(config.dailyLossFractionLimit()));
         TradingHalt halt = new TradingHalt();
 
-        try (ExchangePort port = BinanceFuturesTestnetAdapter.fromEnvironment();
+        ExchangePort port;
+        try {
+            port = BinanceFuturesTestnetAdapter.fromEnvironment();
+        } catch (IllegalStateException e) {
+            // A missing credential is an operator mistake, not a bug. It deserves the sentence that
+            // says how to fix it, not a stack trace that buries it.
+            System.err.println(e.getMessage());
+            System.exit(2);
+            return;
+        }
+
+        // `closedOnExit` exists only so the port is released on the way out; `port` is what the
+        // components below are wired to.
+        try (ExchangePort closedOnExit = port;
              SignalSource signals = openSource(sourceName, scriptPath, defaultLeverage)) {
 
             IdempotentOrderPlacer placer = new IdempotentOrderPlacer(port);

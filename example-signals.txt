@@ -1,0 +1,16 @@
+# Example smoke-run script:  ./gradlew run --args="--script example-signals.txt"
+#
+# Format: SYMBOL SIDE entry=<price> [stop=<price>] [atr=<value>] [lev=<1..5>] [id=<text>]
+# At least one of stop= or atr= is required. Adjust the prices to something near the current
+# testnet mark price before running, or the entry will fill far from where the plan assumed and
+# the coordinator will close it again on slippage.
+
+# A structural stop, the ordinary case.
+BTCUSDT LONG entry=64000 stop=62800 lev=3 id=smoke-btc-long
+
+# No structural level: the ATR fallback sizes the stop instead.
+ETHUSDT SHORT entry=3120 atr=45 lev=2 id=smoke-eth-short
+
+# This one is refused on purpose: the stop is far too close to the liquidation price at 5x.
+# It should print a REJECTED line naming LIQUIDATION_BUFFER and the leverage that would pass.
+BTCUSDT LONG entry=64000 stop=55000 lev=5 id=smoke-should-be-refused

@@ -45,11 +45,16 @@ Then type a signal at the prompt:
 BTCUSDT LONG entry=64000 stop=62800 lev=3
 ```
 
-Non-interactive smoke run from a file:
+Non-interactive smoke run from a file — `example-signals.txt` ships with the repository and includes
+one trade that is refused on purpose, so a single run exercises both outcomes:
 
 ```bash
-./gradlew run --args="--script signals.txt"
+./gradlew run --args="--script example-signals.txt"
 ```
+
+Edit the prices to something near the current testnet mark before running. A stale entry price fills
+far from where the plan assumed, and the coordinator closes the position again on slippage — correct
+behaviour, but not the demonstration you wanted.
 
 Drain the external queue instead of the console:
 

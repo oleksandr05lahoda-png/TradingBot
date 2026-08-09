@@ -187,15 +187,23 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
             JSONObject entry = response.getJSONObject(i);
             if (!symbol.equals(entry.optString("symbol"))) continue;
             JSONArray brackets = entry.getJSONArray("brackets");
+
+            // The topmost bracket carries a large finite cap; it is the "and everything above"
+            // bracket, so it is widened to infinity to satisfy the table's coverage invariant.
+            // Which one is topmost is decided by the highest notionalFloor rather than by array
+            // position: relying on the response's ordering would silently widen the wrong bracket
+            // if it ever arrived descending.
+            double highestFloor = Double.NEGATIVE_INFINITY;
+            for (int b = 0; b < brackets.length(); b++) {
+                highestFloor = Math.max(highestFloor, brackets.getJSONObject(b).getDouble("notionalFloor"));
+            }
+
             List<MarginTier> tiers = new ArrayList<>();
             for (int b = 0; b < brackets.length(); b++) {
                 JSONObject br = brackets.getJSONObject(b);
                 double floor = br.getDouble("notionalFloor");
-                double cap = br.getDouble("notionalCap");
-                // The topmost bracket carries a large finite cap; it is the "and everything above"
-                // bracket, so it is widened to infinity to satisfy the table's coverage invariant.
-                boolean isLast = b == brackets.length() - 1;
-                tiers.add(new MarginTier(floor, isLast ? Double.POSITIVE_INFINITY : cap,
+                double cap = floor == highestFloor ? Double.POSITIVE_INFINITY : br.getDouble("notionalCap");
+                tiers.add(new MarginTier(floor, cap,
                         br.getDouble("maintMarginRatio"), br.getDouble("cum"),
                         br.getInt("initialLeverage")));
             }
