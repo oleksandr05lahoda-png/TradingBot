@@ -7,6 +7,7 @@ import com.bot.exec.ExchangeSnapshots.OrderStatus;
 import com.bot.exec.ExchangeSnapshots.PositionSnapshot;
 import com.bot.exec.OrderTypes.OrderType;
 import com.bot.risk.ExposureBook;
+import com.bot.risk.LiquidationSafety;
 import com.bot.risk.RiskEngine;
 
 import java.math.BigDecimal;
@@ -57,12 +58,19 @@ public final class Reconciler {
             /** An open position with no working stop on the exchange. */
             POSITION_WITHOUT_STOP,
             /** A working order on a symbol with no position, old enough not to be a race. */
-            ORPHAN_ORDER
+            ORPHAN_ORDER,
+            /**
+             * The stop resting on the exchange no longer sits far enough inside the liquidation
+             * price the exchange itself reports. Checked against the exchange's number rather than
+             * the one computed at approval, so margin changes, funding and added or removed isolated
+             * margin are all accounted for without this system having to model them.
+             */
+            LIQUIDATION_BUFFER_BREACHED
         }
 
         public boolean isCritical() {
             return kind == Kind.POSITION_WITHOUT_STOP || kind == Kind.SIDE_MISMATCH
-                    || kind == Kind.UNKNOWN_POSITION;
+                    || kind == Kind.UNKNOWN_POSITION || kind == Kind.LIQUIDATION_BUFFER_BREACHED;
         }
     }
 
@@ -91,6 +99,9 @@ public final class Reconciler {
     private final IdempotentOrderPlacer placer;
     private final BigDecimal quantityTolerance;
     private final long orphanGraceMillis;
+
+    /** Symbols whose working orders were still inside the grace window on the previous pass. */
+    private volatile Set<String> carriedOverSymbols = Set.of();
 
     public Reconciler(ExchangePort port, RiskEngine engine, TradingHalt halt, AlertSink alerts,
                       IdempotentOrderPlacer placer) {
@@ -153,9 +164,12 @@ public final class Reconciler {
                 }
             }
 
-            // The exchange's own numbers rebuild the entry. The stop distance is taken from whatever
-            // the local record believed, because the exchange does not store an intended stop — and
-            // when there is no local record, the risk is recorded as unknown rather than guessed.
+            // The exchange's own numbers rebuild the entry. The stop distance comes from whatever the
+            // local record believed, because the exchange does not store an intended stop. When
+            // there is no local record the recorded risk is 0 — which is a KNOWN understatement, not
+            // a measurement: an adopted position's real risk is unknown, and the only thing this
+            // pass does about it is refuse to invent a number. The UNKNOWN_POSITION drift raised
+            // above is what stops trading, so the understated figure is never sized against.
             double stopDistance = local != null && local.quantity().signum() > 0
                     ? local.riskUsd() / local.quantity().doubleValue()
                     : 0.0;
@@ -176,22 +190,38 @@ public final class Reconciler {
         // Exchange wins, always and immediately, before any of the checks below act on the book.
         book.replaceAll(truth);
 
+        // Symbols carried over from the previous pass. Without this, a symbol whose position closed
+        // is inspected exactly once — it is in neither the book nor the exchange's positions on the
+        // pass after that — so any working order younger than the grace window at that single
+        // moment would never be looked at again. With the default 60s grace and a 30s reconcile
+        // interval, that was the likely outcome rather than the rare one.
+        symbolsToInspect.addAll(carriedOverSymbols);
+        Set<String> stillInteresting = new HashSet<>();
+
         for (String symbol : symbolsToInspect) {
             List<OrderStatus> working = port.openOrders(symbol).stream().filter(OrderStatus::isWorking).toList();
             boolean hasPosition = exchangeSymbols.contains(symbol);
 
             if (hasPosition) {
-                boolean protectedByStop = working.stream()
-                        .anyMatch(o -> o.type() == OrderType.STOP_MARKET && (o.reduceOnly() || o.closePosition()));
-                if (!protectedByStop) {
+                Optional<OrderStatus> protectiveStop = working.stream()
+                        .filter(o -> o.type() == OrderType.STOP_MARKET && (o.reduceOnly() || o.closePosition()))
+                        .findFirst();
+                if (protectiveStop.isEmpty()) {
                     drifts.add(new Drift(Drift.Kind.POSITION_WITHOUT_STOP, symbol,
                             "an open position has no working reduce-only stop on the exchange"));
+                } else {
+                    checkLiquidationBuffer(symbol, exchangePositions, protectiveStop.get(), drifts);
                 }
             } else {
                 for (OrderStatus order : working) {
                     boolean oldEnough = order.updateTimeMs() > 0
                             && now.toEpochMilli() - order.updateTimeMs() > orphanGraceMillis;
-                    if (!oldEnough) continue;   // may belong to an entry that is still being worked
+                    if (!oldEnough) {
+                        // May belong to an entry that is still being worked. Keep the symbol on the
+                        // list so the next pass can decide, instead of losing sight of it.
+                        stillInteresting.add(symbol);
+                        continue;
+                    }
                     drifts.add(new Drift(Drift.Kind.ORPHAN_ORDER, symbol,
                             order.type() + " " + order.clientOrderId()
                                     + " is working with no position behind it — cancelling"));
@@ -199,6 +229,7 @@ public final class Reconciler {
                 }
             }
         }
+        carriedOverSymbols = stillInteresting;
 
         // Realised PnL for the daily limit comes from the exchange's ledger, not from a local tally:
         // a restart must not be able to clear the day's loss, and only the exchange knows what fees
@@ -224,6 +255,47 @@ public final class Reconciler {
             LOG.fine("[Reconciler] converged: " + exchangePositions.size() + " position(s)");
         }
         return report;
+    }
+
+    /**
+     * Compares the stop actually resting on the exchange against the liquidation price the
+     * <b>exchange</b> reports for that position.
+     *
+     * <p>This is the runtime counterpart to the pre-trade check. The approval-time buffer was
+     * computed from a liquidation price this system worked out itself, at the moment of approval.
+     * The exchange's number moves afterwards for reasons this system does not model — margin added
+     * or removed by hand, funding payments, a maintenance-bracket change as the position's notional
+     * drifts — and a stop that was comfortably inside liquidation at approval can end up outside it
+     * without a single order changing. Checking the exchange's own figure catches that without
+     * having to reproduce its bookkeeping.
+     *
+     * <p>A reported liquidation price of zero means "not reachable" and is skipped rather than
+     * treated as a price of zero.
+     */
+    private void checkLiquidationBuffer(String symbol, List<PositionSnapshot> positions,
+                                        OrderStatus stop, List<Drift> drifts) {
+        PositionSnapshot position = positions.stream()
+                .filter(p -> p.symbol().equals(symbol))
+                .findFirst()
+                .orElse(null);
+        if (position == null) return;
+
+        double liquidation = position.liquidationPrice().doubleValue();
+        double entry = position.entryPrice().doubleValue();
+        double stopPrice = stop.stopPrice().doubleValue();
+        if (liquidation <= 0 || entry <= 0 || stopPrice <= 0) return;
+
+        Side direction = position.direction().orElse(null);
+        if (direction == null) return;
+
+        LiquidationSafety.Buffer buffer = LiquidationSafety.evaluate(direction, entry, stopPrice, liquidation);
+        double floor = engine.config().minLiquidationBufferFraction();
+        if (!buffer.satisfies(floor)) {
+            drifts.add(new Drift(Drift.Kind.LIQUIDATION_BUFFER_BREACHED, symbol, String.format(
+                    "the exchange reports liquidation at %.8g; the resting stop at %s now leaves %.1f%% "
+                            + "of the entry-to-liquidation distance, below the %.0f%% floor",
+                    liquidation, stop.stopPrice().toPlainString(), buffer.fraction() * 100, floor * 100)));
+        }
     }
 
     /** Convenience for the boot path: reconcile and return whether it is safe to start trading. */

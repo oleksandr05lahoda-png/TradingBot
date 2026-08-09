@@ -148,6 +148,66 @@ class ReconciliationDriftTest {
     }
 
     @Test
+    @DisplayName("the exchange's own liquidation price is measured against the resting stop")
+    void liquidationBufferIsRecheckedAgainstTheExchange() throws Exception {
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecutionCoordinator coordinator = ExecFixtures.coordinator(exchange, engine, halt, alerts);
+        coordinator.execute(plan);
+
+        // Entry 64,000, stop 62,800. A liquidation price of 63,300 leaves only
+        // (62,800 - 63,300) ... on the wrong side entirely: the stop is now BEYOND liquidation.
+        exchange.reportedLiquidationPrice = new BigDecimal("63300.0");
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.drifts().stream()
+                        .anyMatch(d -> d.kind() == Reconciler.Drift.Kind.LIQUIDATION_BUFFER_BREACHED),
+                report.describe());
+        assertTrue(halt.isHalted(),
+                "a stop that is no longer inside liquidation is not a situation to keep trading through");
+    }
+
+    @Test
+    @DisplayName("a comfortable liquidation price raises nothing")
+    void healthyLiquidationBufferIsQuiet() throws Exception {
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecFixtures.coordinator(exchange, engine, halt, alerts).execute(plan);
+
+        // Liquidation at 50,000: the stop at 62,800 leaves (62,800-50,000)/(64,000-50,000) = 91%.
+        exchange.reportedLiquidationPrice = new BigDecimal("50000.0");
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.converged(), report.describe());
+        assertFalse(halt.isHalted());
+    }
+
+    @Test
+    @DisplayName("a working order still inside the grace window is re-inspected on the next pass")
+    void orphanGraceWindowIsRevisited() throws Exception {
+        // An order young enough to be a race on this pass. Its symbol holds no position, so without
+        // carry-over it would drop off the inspection list and never be looked at again.
+        exchange.placeOrder(OrderRequest.limitEntry("BTCUSDT", com.bot.exec.OrderTypes.OrderSide.BUY,
+                new java.math.BigDecimal("0.001"), new java.math.BigDecimal("60000.0"),
+                com.bot.exec.OrderTypes.TimeInForce.GTC,
+                ClientOrderIdFactory.create("stale-signal", com.bot.exec.OrderTypes.OrderPurpose.ENTRY, 0)));
+        engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2));
+
+        // Pass 1: the book knows the symbol, so it is inspected; the order is younger than the grace.
+        reconciler.reconcile(ExecFixtures.NOON);
+        engine.book().close("BTCUSDT");   // whatever the book thought is gone now
+
+        // Pass 2 is where the old code lost sight of the symbol entirely. Now it is carried over,
+        // and by this point the order is older than the 60s grace window.
+        Reconciler.Report second = reconciler.reconcile(ExecFixtures.NOON.plusSeconds(3600));
+
+        assertTrue(second.drifts().stream().anyMatch(d -> d.kind() == Reconciler.Drift.Kind.ORPHAN_ORDER),
+                "an order that was too young on one pass must still be reachable on the next: "
+                        + second.describe());
+    }
+
+    @Test
     @DisplayName("bootstrap refuses to start trading when the start-up state does not converge")
     void bootstrapRefusesOnDrift() {
         exchange.plantPosition("ETHUSDT", "-2.0", "3000");

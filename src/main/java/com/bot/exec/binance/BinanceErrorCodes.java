@@ -47,12 +47,24 @@ public final class BinanceErrorCodes {
     /** {@code -4046} No need to change margin type — it is already what was asked for. */
     public static final int NO_NEED_TO_CHANGE_MARGIN_TYPE = -4046;
 
-    /** {@code -4028}/{@code -4048} family: leverage/margin adjustments that are already in effect. */
-    public static final int NO_NEED_TO_CHANGE_LEVERAGE = -4028;
+    /**
+     * {@code -4028} Leverage is not valid.
+     *
+     * <p>Named here so it is not mistaken for a benign "already set" code, which is what an earlier
+     * version of this file called it. It is a genuine refusal — the requested leverage is outside
+     * what the exchange permits — and it must propagate, because a position opened at a leverage
+     * other than the one the liquidation buffer was computed for is a position whose stop was
+     * validated against the wrong liquidation price.
+     */
+    public static final int INVALID_LEVERAGE = -4028;
 
-    /** True when the code means "the state you asked for is already the state" — a success, not a failure. */
+    /**
+     * True when the code means "the state you asked for is already the state" — a success, not a
+     * failure. Only the margin-type code qualifies: Binance answers a redundant leverage change with
+     * HTTP 200, so there is no leverage equivalent to swallow.
+     */
     public static boolean isBenignAlreadyInDesiredState(int code) {
-        return code == NO_NEED_TO_CHANGE_MARGIN_TYPE || code == NO_NEED_TO_CHANGE_LEVERAGE;
+        return code == NO_NEED_TO_CHANGE_MARGIN_TYPE;
     }
 
     /** True when the code means the order simply is not there — cancelling it is a no-op, not an error. */

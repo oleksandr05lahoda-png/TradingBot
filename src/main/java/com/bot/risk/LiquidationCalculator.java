@@ -106,12 +106,17 @@ public final class LiquidationCalculator {
             MarginTier atLiquidation = tiers.tierFor(Math.max(0.0, price) * quantity);
             if (atLiquidation.equals(tier)) return clampToReachable(side, entryPrice, price);
             if (visited.contains(atLiquidation)) {
-                // Oscillating between two brackets. Settle on the stricter one: a higher maintenance
-                // rate puts liquidation closer to entry, and being wrong towards "closer" only ever
-                // rejects a trade, while being wrong towards "further" lets a bad one through.
-                MarginTier stricter = atLiquidation.maintenanceMarginRate() > tier.maintenanceMarginRate()
-                        ? atLiquidation : tier;
-                return clampToReachable(side, entryPrice, solve(side, entryPrice, quantity, walletBalance, stricter));
+                // Oscillating between two brackets. Settle on whichever SOLVED PRICE is nearer the
+                // entry — for a long the higher of the two, for a short the lower. Comparing the
+                // maintenance RATES instead would be wrong: because the maintenance amount is
+                // calibrated for continuity, the higher-rate bracket demands *less* maintenance
+                // margin below its own floor, which puts liquidation further away. Being wrong
+                // towards "closer" only ever rejects a trade; being wrong towards "further" lets a
+                // bad one through.
+                double a = solve(side, entryPrice, quantity, walletBalance, tier);
+                double b = solve(side, entryPrice, quantity, walletBalance, atLiquidation);
+                double nearer = side == Side.LONG ? Math.max(a, b) : Math.min(a, b);
+                return clampToReachable(side, entryPrice, nearer);
             }
             tier = atLiquidation;
             price = solve(side, entryPrice, quantity, walletBalance, tier);
@@ -124,8 +129,8 @@ public final class LiquidationCalculator {
         int s = side.sign();
         double numerator = walletBalance + tier.maintenanceAmount() - s * quantity * entryPrice;
         double denominator = quantity * tier.maintenanceMarginRate() - s * quantity;
-        // denominator is q*(MMR - 1) < 0 for a long and q*(MMR + 1) > 0 for a short; MMR <= 1 by
-        // MarginTier's own range check, so it is never zero for a positive quantity.
+        // denominator is q*(MMR - 1) < 0 for a long and q*(MMR + 1) > 0 for a short. MarginTier
+        // requires MMR strictly inside (0, 1), so neither form can be zero for a positive quantity.
         return numerator / denominator;
     }
 

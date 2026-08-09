@@ -216,18 +216,43 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         // Realised PnL alone understates the day: commissions and funding are money that left the
         // account just as surely, and the daily loss limit is about the account, not about a
         // bookkeeping category.
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("startTime", Long.toString(sinceEpochMs));
-        params.put("limit", "1000");
-        JSONArray rows = new JSONArray(signedGet("/fapi/v1/income", params, 30));
+        //
+        // Paged rather than a single limit=1000 call. Income rows come back ascending from
+        // startTime, so a single truncated page silently drops the MOST RECENT entries — i.e. the
+        // ones a bad day is made of — and hands the kill switch a number that is too kind.
+        final int pageSize = 1000;
+        final int maxPages = 20;
+
         double total = 0;
-        for (int i = 0; i < rows.length(); i++) {
-            JSONObject row = rows.getJSONObject(i);
-            String type = row.optString("incomeType", "");
-            if (type.equals("REALIZED_PNL") || type.equals("COMMISSION") || type.equals("FUNDING_FEE")) {
-                total += row.optDouble("income", 0);
+        long cursor = sinceEpochMs;
+        for (int page = 0; page < maxPages; page++) {
+            Map<String, String> params = new LinkedHashMap<>();
+            params.put("startTime", Long.toString(cursor));
+            params.put("limit", Integer.toString(pageSize));
+            JSONArray rows = new JSONArray(signedGet("/fapi/v1/income", params, 30));
+            if (rows.isEmpty()) return total;
+
+            long newestSeen = cursor;
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject row = rows.getJSONObject(i);
+                String type = row.optString("incomeType", "");
+                if (type.equals("REALIZED_PNL") || type.equals("COMMISSION") || type.equals("FUNDING_FEE")) {
+                    total += row.optDouble("income", 0);
+                }
+                newestSeen = Math.max(newestSeen, row.optLong("time", cursor));
             }
+            if (rows.length() < pageSize) return total;
+            if (newestSeen <= cursor) {
+                // A full page whose timestamps did not advance: paging on time cannot make progress,
+                // and looping would double-count. Stop and say so rather than silently under-report.
+                LOG.warning("[Binance] income paging stalled at " + cursor
+                        + "; the realised-PnL total may be incomplete");
+                return total;
+            }
+            // +1ms so the last row of this page is not counted again on the next one.
+            cursor = newestSeen + 1;
         }
+        LOG.warning("[Binance] income paging hit " + maxPages + " pages; the realised-PnL total may be incomplete");
         return total;
     }
 
@@ -243,21 +268,24 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         }
     }
 
+    /**
+     * Sets leverage. Any refusal propagates, {@code -4028 INVALID_LEVERAGE} included: opening at a
+     * leverage other than the one the liquidation buffer was computed against would mean the stop
+     * was validated against the wrong liquidation price.
+     */
     @Override public void setLeverage(String symbol, int leverage) {
         Preconditions.positive(leverage, "leverage");
-        try {
-            Map<String, String> params = new LinkedHashMap<>();
-            params.put("symbol", symbol);
-            params.put("leverage", Integer.toString(leverage));
-            signedPost("/fapi/v1/leverage", params, 1, false);
-        } catch (ExchangeException e) {
-            if (!BinanceErrorCodes.isBenignAlreadyInDesiredState(e.exchangeCode())) throw e;
-        }
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("leverage", Integer.toString(leverage));
+        signedPost("/fapi/v1/leverage", params, 1, false);
     }
 
     @Override public List<PositionSnapshot> openPositions() {
         // positionRisk rather than the account endpoint: it is the one that carries liquidationPrice,
-        // and a liquidation price read from the exchange is the check on the one this system computes.
+        // which Reconciler.checkLiquidationBuffer measures the resting stop against. The pre-trade
+        // buffer uses a liquidation price this system computes; this is the exchange's own figure,
+        // and it moves afterwards for reasons the pre-trade calculation cannot see.
         JSONArray rows = new JSONArray(signedGet("/fapi/v2/positionRisk", Map.of(), 5));
         List<PositionSnapshot> out = new ArrayList<>();
         for (int i = 0; i < rows.length(); i++) {

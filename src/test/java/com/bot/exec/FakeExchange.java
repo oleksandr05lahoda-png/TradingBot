@@ -52,6 +52,16 @@ final class FakeExchange implements ExchangePort {
     ExchangeException failNextPlaceWith = null;
     /** Makes the next N queryOrder calls report "no such order", as a propagation delay would. */
     int hideNextQueries = 0;
+    /**
+     * Selective placement failure: returns the exception to throw for a given request, or null to
+     * let it through. Lets a test fail the stop while the entry succeeds, which is the ordering the
+     * coordinator's worst case depends on.
+     */
+    java.util.function.Function<OrderRequest, ExchangeException> placementFailure = request -> null;
+    /** When non-null, every cancelOrder throws this. */
+    ExchangeException cancelFailure = null;
+    /** Liquidation price the exchange reports for every position. ZERO means "not reachable". */
+    BigDecimal reportedLiquidationPrice = BigDecimal.ZERO;
 
     int placeOrderCalls = 0;
     int queryOrderCalls = 0;
@@ -93,7 +103,10 @@ final class FakeExchange implements ExchangePort {
 
     @Override public String endpointHost() { return "fake.local"; }
 
-    @Override public long serverTimeMillis() { return 1_754_740_800_000L; }
+    /** Kept equal to {@code ExecFixtures.NOON} so order timestamps line up with the test clock. */
+    private static final long CLOCK_MS = java.time.Instant.parse("2026-08-09T12:00:00Z").toEpochMilli();
+
+    @Override public long serverTimeMillis() { return CLOCK_MS; }
 
     @Override public AccountSnapshot fetchAccount() {
         return new AccountSnapshot(walletBalance, walletBalance, unrealizedPnl, serverTimeMillis());
@@ -117,6 +130,8 @@ final class FakeExchange implements ExchangePort {
             failNextPlaceWith = null;
             throw failure;
         }
+        ExchangeException selective = placementFailure.apply(request);
+        if (selective != null) throw selective;
         if (ordersByClientId.containsKey(request.clientOrderId())) {
             throw ExchangeException.refused("clientOrderId is duplicated", 400,
                     BinanceErrorCodes.DUPLICATED_CLIENT_ORDER_ID);
@@ -191,12 +206,13 @@ final class FakeExchange implements ExchangePort {
             if (e.getValue().signum() == 0) continue;
             out.add(new PositionSnapshot(e.getKey(), e.getValue(),
                     entryPrices.getOrDefault(e.getKey(), fillPrice), 3, true,
-                    unrealizedPnl, BigDecimal.ZERO));
+                    unrealizedPnl, reportedLiquidationPrice));
         }
         return out;
     }
 
     @Override public void cancelOrder(String symbol, String clientOrderId) {
+        if (cancelFailure != null) throw cancelFailure;
         OrderStatus existing = ordersByClientId.get(clientOrderId);
         if (existing == null || !existing.isWorking()) return;
         ordersByClientId.put(clientOrderId, new OrderStatus(existing.clientOrderId(),

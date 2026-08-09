@@ -4,6 +4,7 @@ import com.bot.core.InstrumentFilters;
 import com.bot.exec.ExchangeSnapshots.OrderStatus;
 import com.bot.exec.OrderTypes.OrderType;
 import com.bot.risk.MarginTierTable;
+import com.bot.risk.RejectReason;
 import com.bot.risk.RiskDecision;
 import com.bot.risk.RiskEngine;
 import com.bot.risk.TradePlan;
@@ -20,6 +21,8 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -91,9 +94,10 @@ class SmokeRunChainTest {
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
         assertEquals(0, exitTotal.compareTo(report.filledQuantity()), "the exits close the whole position");
 
-        // 4 ─ The dead-man's switch is armed on the exchange side.
-        assertEquals(ExecutionCoordinator.Settings.defaults().deadMansSwitchCountdownMs(),
-                exchange.deadMansCountdownFor("BTCUSDT"));
+        // 4 ─ No exchange-side countdown on a symbol that now holds a position: countdownCancelAll
+        //     would cancel the very stop that was just placed.
+        assertNull(exchange.deadMansCountdownFor("BTCUSDT"),
+                "arming the dead-man's switch over an open position schedules the deletion of its stop");
 
         // 5 ─ Reconciliation converges: the exchange and the book agree, nothing is halted.
         Reconciler reconciler = new Reconciler(exchange, engine, halt, alerts,
@@ -108,7 +112,7 @@ class SmokeRunChainTest {
 
     @Test
     @DisplayName("a signal the gate refuses reaches the exchange as nothing at all")
-    void refusedSignalPlacesNoOrders() {
+    void refusedSignalPlacesNoOrders() throws Exception {
         // A stop 30% below entry at 5x cannot satisfy the liquidation buffer.
         RiskDecision decision = engine.evaluate(new TradeRequest("smoke-2", "BTCUSDT",
                 com.bot.core.Side.LONG, 64_000, java.util.OptionalDouble.of(44_800),
@@ -116,7 +120,24 @@ class SmokeRunChainTest {
                 exchange.fetchFilters("BTCUSDT"), exchange.fetchMarginTiers("BTCUSDT")),
                 10_000, ExecFixtures.NOON);
 
-        assertTrue(decision instanceof RiskDecision.Rejected, "expected a refusal, got " + decision);
+        RiskDecision.Rejected rejected = assertInstanceOf(RiskDecision.Rejected.class, decision);
+        assertEquals(RejectReason.LIQUIDATION_BUFFER, rejected.reason(), rejected.detail());
+
+        // And the loop really would send nothing: the refusal is what stops it, not the absence of
+        // a coordinator in this test. Driving the same signal through the full path proves it.
+        ExecutionCoordinator coordinator = ExecFixtures.coordinator(exchange, engine, halt, alerts);
+        for (Signal signal : List.of(new Signal("smoke-2", "BTCUSDT", com.bot.core.Side.LONG, 64_000,
+                java.util.OptionalDouble.of(44_800), java.util.OptionalDouble.empty(), 5,
+                ExecFixtures.NOON))) {
+            RiskDecision again = engine.evaluate(new TradeRequest(signal.id(), signal.symbol(),
+                    signal.side(), signal.entryPrice(), signal.structuralStopPrice(), signal.atr(),
+                    signal.leverage(), exchange.fetchFilters(signal.symbol()),
+                    exchange.fetchMarginTiers(signal.symbol())), 10_000, ExecFixtures.NOON);
+            if (again instanceof RiskDecision.Approved approved) {
+                coordinator.execute(approved.plan());
+            }
+        }
+
         assertEquals(0, exchange.placeOrderCalls, "a refused signal must never reach the exchange");
         assertTrue(exchange.openPositions().isEmpty());
     }

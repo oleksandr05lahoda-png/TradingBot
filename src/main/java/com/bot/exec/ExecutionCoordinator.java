@@ -55,6 +55,13 @@ public final class ExecutionCoordinator {
         NOT_FILLED,
         /** Filled, then closed again because the fill price broke the risk budget. */
         ABORTED_ON_SLIPPAGE,
+        /** Filled, but the protective stop could not be placed. Trading is halted. */
+        ABORTED_UNPROTECTED,
+        /**
+         * The entry's fate is unknown: the send failed ambiguously and the exchange could not be
+         * asked. A position may exist, unprotected and unrecorded. Trading is halted.
+         */
+        UNKNOWN_AFTER_SEND,
         /** Refused before anything was sent — halted, or the plan failed a pre-trade check. */
         REFUSED
     }
@@ -73,8 +80,18 @@ public final class ExecutionCoordinator {
             takeProfitOrders = List.copyOf(takeProfitOrders);
         }
 
+        /** True when a position is known to exist as a result of this execution. */
         public boolean opened() {
             return outcome == Outcome.FILLED || outcome == Outcome.PARTIALLY_FILLED;
+        }
+
+        /**
+         * True when a position may exist that this process cannot account for. Distinct from
+         * {@link #opened()}: the answer here is "unknown", and treating unknown as "no" is what
+         * lets a naked position sit while the loop opens the next one.
+         */
+        public boolean mayHaveOpenedUnknownRisk() {
+            return outcome == Outcome.UNKNOWN_AFTER_SEND || outcome == Outcome.ABORTED_UNPROTECTED;
         }
     }
 
@@ -85,18 +102,16 @@ public final class ExecutionCoordinator {
      * @param fillPollAttempts          how many times to ask the exchange what the entry did
      * @param maxAdverseRiskOverrun     how far the realised risk may exceed the planned risk before
      *                                  the position is closed again; 0.20 = 20%
-     * @param deadMansSwitchCountdownMs countdown armed on the exchange after a position opens
      */
     public record Settings(
             OrderType entryType,
             TimeInForce entryTimeInForce,
             int fillPollAttempts,
             long fillPollIntervalMs,
-            double maxAdverseRiskOverrun,
-            long deadMansSwitchCountdownMs) {
+            double maxAdverseRiskOverrun) {
 
         public static Settings defaults() {
-            return new Settings(OrderType.MARKET, TimeInForce.IOC, 10, 500, 0.20, 120_000L);
+            return new Settings(OrderType.MARKET, TimeInForce.IOC, 10, 500, 0.20);
         }
     }
 
@@ -158,8 +173,22 @@ public final class ExecutionCoordinator {
         port.ensureIsolatedMargin(plan.symbol());
         port.setLeverage(plan.symbol(), plan.leverage());
 
-        OrderStatus entry = placer.place(entryRequest);
-        entry = awaitEntryResolution(entry, entryRequest);
+        OrderStatus entry;
+        try {
+            entry = placer.place(entryRequest);
+            entry = awaitEntryResolution(entry, entryRequest);
+        } catch (ExchangeException e) {
+            if (!e.ambiguous()) {
+                // A definite refusal: the exchange evaluated the order and declined it. Nothing
+                // landed, so there is nothing to clean up and no reason to stop trading.
+                return refused(plan, "entry refused by the exchange: " + e.getMessage());
+            }
+            // The placer exhausted its probes and resends without ever establishing what happened.
+            // The order may be live. This is the one state that must not be swallowed as "the
+            // signal failed": the loop would open the next position on top of a position it does
+            // not know exists, sized against an exposure book that omits it.
+            return unknownAfterSend(plan, e);
+        }
 
         BigDecimal filled = entry.executedQuantity();
         if (filled.signum() <= 0) {
@@ -199,8 +228,6 @@ public final class ExecutionCoordinator {
 
         // ── Reduce-only exits, re-projected from the price that actually filled. ────────────────
         List<OrderStatus> takeProfits = placeTakeProfits(plan, closeSide, filled, avgPrice, filters);
-
-        port.armDeadMansSwitch(plan.symbol(), settings.deadMansSwitchCountdownMs());
 
         boolean partial = filled.compareTo(plan.quantity()) < 0;
         String note = partial
@@ -276,6 +303,21 @@ public final class ExecutionCoordinator {
         return current;
     }
 
+    /**
+     * The entry was sent and its outcome could not be established. A position may exist, and this
+     * process cannot say. It halts and alerts rather than returning a refusal, because "unknown" and
+     * "did not happen" are different answers and only one of them is safe to keep trading on.
+     */
+    private Report unknownAfterSend(TradePlan plan, ExchangeException cause) {
+        String note = "the fate of the entry order is unknown (" + cause.getMessage()
+                + "). A position may be open and unprotected. Trading is halted until an operator "
+                + "reconciles the account.";
+        alerts.critical("Entry outcome unknown", plan.symbol() + ": " + note);
+        halt.halt("entry outcome unknown on " + plan.symbol(), clock.instant());
+        return new Report(Outcome.UNKNOWN_AFTER_SEND, plan, BigDecimal.ZERO, BigDecimal.ZERO,
+                Optional.empty(), Optional.empty(), List.of(), note);
+    }
+
     private Report abandonUnprotectedPosition(TradePlan plan, OrderStatus entry, BigDecimal filled,
                                               BigDecimal avgPrice, RuntimeException cause)
             throws InterruptedException {
@@ -284,15 +326,25 @@ public final class ExecutionCoordinator {
                         + " but the stop was refused (" + cause.getMessage()
                         + "). Closing the position and halting.");
         halt.halt("protective stop could not be placed on " + plan.symbol(), clock.instant());
-        String note = "stop refused; position closed reduce-only";
+
+        String note;
         try {
-            flatten(plan.symbol(), plan.side(), filled, plan.signalId());
+            OrderStatus close = flatten(plan.symbol(), plan.side(), filled, plan.signalId());
+            BigDecimal residual = filled.subtract(close.executedQuantity());
+            if (residual.signum() > 0) {
+                note = "stop refused; the reduce-only close only filled " + close.executedQuantity()
+                        .toPlainString() + " of " + filled.toPlainString()
+                        + " — " + residual.toPlainString() + " REMAINS OPEN AND UNPROTECTED";
+                alerts.critical("Naked position", plan.symbol() + ": " + note);
+            } else {
+                note = "stop refused; position closed reduce-only in full";
+            }
         } catch (RuntimeException e) {
             note = "stop refused AND the reduce-only close also failed (" + e.getMessage()
                     + ") — MANUAL INTERVENTION REQUIRED";
             alerts.critical("Naked position", plan.symbol() + ": " + note);
         }
-        return new Report(Outcome.ABORTED_ON_SLIPPAGE, plan, filled, avgPrice,
+        return new Report(Outcome.ABORTED_UNPROTECTED, plan, filled, avgPrice,
                 Optional.of(entry), Optional.empty(), List.of(), note);
     }
 
@@ -301,21 +353,44 @@ public final class ExecutionCoordinator {
             throws InterruptedException {
         alerts.critical("Fill broke the risk budget", plan.symbol() + ": " + why
                 + " — closing the position reduce-only");
-        String note = why + "; closed reduce-only";
+
+        String note;
+        boolean closedCompletely = false;
         try {
-            flatten(plan.symbol(), plan.side(), filled, plan.signalId());
-            // The book entry goes; the realised PnL does not get invented here. It arrives from the
-            // exchange's own income ledger on the next reconciliation pass, which is the only source
-            // that knows what the close actually cost in slippage and fees.
-            engine.registerClose(plan.symbol());
+            OrderStatus close = flatten(plan.symbol(), plan.side(), filled, plan.signalId());
+            BigDecimal residual = filled.subtract(close.executedQuantity());
+            if (residual.signum() > 0) {
+                // Accepted but incomplete. The exchange returned no error, so nothing was thrown —
+                // and the number that proves the position is still there is the one in the response
+                // that an earlier version of this method discarded. A thin book is enough to cause it.
+                note = why + "; the reduce-only close filled only " + close.executedQuantity().toPlainString()
+                        + " of " + filled.toPlainString() + " — " + residual.toPlainString()
+                        + " is still open. Keeping the protective stop and halting.";
+                alerts.critical("Slippage abort left a residual position", plan.symbol() + ": " + note);
+                halt.halt("partial reduce-only close on " + plan.symbol(), clock.instant());
+            } else {
+                closedCompletely = true;
+                note = why + "; closed reduce-only";
+                // The book entry goes; the realised PnL does not get invented here. It arrives from
+                // the exchange's own income ledger on the next reconciliation pass, which is the only
+                // source that knows what the close actually cost in slippage and fees.
+                engine.registerClose(plan.symbol());
+            }
         } catch (RuntimeException e) {
             note = why + "; the reduce-only close FAILED (" + e.getMessage()
-                    + ") — the protective stop is still working, but check this position by hand";
+                    + ") — keeping the protective stop and halting; check this position by hand";
             alerts.critical("Slippage abort could not close", plan.symbol() + ": " + note);
+            halt.halt("reduce-only close failed on " + plan.symbol(), clock.instant());
         }
-        placer.cancelQuietly(plan.symbol(), stop.clientOrderId());
+
+        // The stop is cancelled ONLY when the position is confirmed flat. Cancelling it on the
+        // failure path would strip the protection off a position that is demonstrably still open —
+        // and would do so immediately after telling the operator the stop was still working.
+        if (closedCompletely) {
+            placer.cancelQuietly(plan.symbol(), stop.clientOrderId());
+        }
         return new Report(Outcome.ABORTED_ON_SLIPPAGE, plan, filled, avgPrice,
-                Optional.of(entry), Optional.of(stop), List.of(), note);
+                Optional.of(entry), closedCompletely ? Optional.empty() : Optional.of(stop), List.of(), note);
     }
 
     private Report refused(TradePlan plan, String note) {

@@ -33,7 +33,12 @@ public record MarginTier(
         Preconditions.nonNegativeFinite(notionalFloor, "notionalFloor");
         Preconditions.require(notionalCap > notionalFloor,
                 "notionalCap " + notionalCap + " must exceed notionalFloor " + notionalFloor);
-        Preconditions.inClosedRange(maintenanceMarginRate, 0.0, 1.0, "maintenanceMarginRate");
+        // Strictly below 1: at exactly 1.0 the long liquidation denominator q*(MMR - 1) is zero, and
+        // the solved price would come back non-finite. That case is not a pricing edge to handle
+        // gracefully — a 100% maintenance requirement is not a real bracket — so it is refused here
+        // rather than allowed to reach the solver and be clamped into a permissive answer.
+        Preconditions.require(maintenanceMarginRate > 0 && maintenanceMarginRate < 1.0,
+                "maintenanceMarginRate must be in (0, 1), got " + maintenanceMarginRate);
         Preconditions.nonNegativeFinite(maintenanceAmount, "maintenanceAmount");
         Preconditions.positive(maxLeverage, "maxLeverage");
     }

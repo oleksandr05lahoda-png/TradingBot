@@ -103,17 +103,27 @@ public final class IdempotentOrderPlacer {
                         + " attempts — refusing to send again", lastAmbiguous);
     }
 
-    /** Cancels by client order id; an order that is unknown or already finished is not an error. */
-    public void cancelQuietly(String symbol, String clientOrderId) {
+    /**
+     * Cancels by client order id.
+     *
+     * @return {@code true} when the order is known not to be working any more — either the cancel
+     *         succeeded, or the exchange says no such order exists. {@code false} when the cancel
+     *         failed for any other reason, in which case the order may well still be live and the
+     *         caller must not assume it is gone. "Quietly" refers to not throwing, not to
+     *         pretending every outcome is the same one.
+     */
+    public boolean cancelQuietly(String symbol, String clientOrderId) {
         try {
             port.cancelOrder(symbol, clientOrderId);
+            return true;
         } catch (ExchangeException e) {
-            if (e.exchangeCode() == BinanceErrorCodes.NO_SUCH_ORDER
-                    || e.exchangeCode() == BinanceErrorCodes.CANCEL_REJECTED_UNKNOWN_ORDER) {
+            if (BinanceErrorCodes.isOrderAbsent(e.exchangeCode())) {
                 LOG.fine("[Placer] nothing to cancel for " + clientOrderId);
-                return;
+                return true;
             }
-            LOG.warning("[Placer] cancel of " + clientOrderId + " failed: " + e.getMessage());
+            LOG.warning("[Placer] cancel of " + clientOrderId + " failed, the order may still be "
+                    + "working: " + e.getMessage());
+            return false;
         }
     }
 

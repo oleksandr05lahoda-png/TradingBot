@@ -69,37 +69,47 @@ public final class RateLimiter {
      *
      * @param isOrder true for endpoints that also consume the separate order-rate budget
      */
-    public synchronized void acquire(int weight, boolean isOrder) throws InterruptedException {
+    public void acquire(int weight, boolean isOrder) throws InterruptedException {
         Preconditions.positive(weight, "weight");
         while (true) {
-            long now = nowMs.getAsLong();
-            prune(now);
-
-            long waitMs = 0;
-            if (now < bannedUntilMs) {
-                waitMs = bannedUntilMs - now;
-            } else {
-                if (usedWeight(now) + weight > weightPerMinute) {
-                    waitMs = Math.max(waitMs, millisUntilRoomInWindow(weightWindow, now, 60_000L));
+            long waitMs;
+            // The wait is computed under the lock; the waiting itself happens outside it. Sleeping
+            // while holding the monitor would block observeBan and observeUsedWeight for the whole
+            // wait — up to a full ban — so a thread that had just learned of a 418 could not record
+            // it, and the waiting thread would wake up and send anyway.
+            synchronized (this) {
+                long now = nowMs.getAsLong();
+                prune(now);
+                waitMs = waitRequired(now, weight, isOrder);
+                if (waitMs <= 0) {
+                    weightWindow.addLast(new Entry(now, weight));
+                    if (isOrder) orderWindow.addLast(new Entry(now, 1));
+                    return;
                 }
-                if (isOrder) {
-                    if (count(orderWindow, now, 10_000L) + 1 > ordersPer10s) {
-                        waitMs = Math.max(waitMs, millisUntilRoomInWindow(orderWindow, now, 10_000L));
-                    }
-                    if (count(orderWindow, now, 60_000L) + 1 > ordersPerMinute) {
-                        waitMs = Math.max(waitMs, millisUntilRoomInWindow(orderWindow, now, 60_000L));
-                    }
-                }
-            }
-
-            if (waitMs <= 0) {
-                weightWindow.addLast(new Entry(now, weight));
-                if (isOrder) orderWindow.addLast(new Entry(now, 1));
-                return;
             }
             LOG.fine("[RateLimiter] holding " + waitMs + "ms before a weight-" + weight + " request");
             sleeper.sleepMillis(Math.min(waitMs, 5_000L));
         }
+    }
+
+    /** Milliseconds this request must wait, or 0 when it may go now. Caller holds the monitor. */
+    private long waitRequired(long now, int weight, boolean isOrder) {
+        if (now < bannedUntilMs) {
+            return bannedUntilMs - now;
+        }
+        long waitMs = 0;
+        if (usedWeight(now) + weight > weightPerMinute) {
+            waitMs = Math.max(waitMs, millisUntilRoomInWindow(weightWindow, now, 60_000L));
+        }
+        if (isOrder) {
+            if (count(orderWindow, now, 10_000L) + 1 > ordersPer10s) {
+                waitMs = Math.max(waitMs, millisUntilRoomInWindow(orderWindow, now, 10_000L));
+            }
+            if (count(orderWindow, now, 60_000L) + 1 > ordersPerMinute) {
+                waitMs = Math.max(waitMs, millisUntilRoomInWindow(orderWindow, now, 60_000L));
+            }
+        }
+        return waitMs;
     }
 
     /**

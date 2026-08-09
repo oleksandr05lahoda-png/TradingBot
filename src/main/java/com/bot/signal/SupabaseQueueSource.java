@@ -146,7 +146,8 @@ public final class SupabaseQueueSource implements SignalSource {
         if (id >= 0) reject(id, reason);
     }
 
-    private Signal toSignal(JSONObject row) {
+    /** Package-private so the row-to-signal contract can be tested without a queue or a socket. */
+    Signal toSignal(JSONObject row) {
         long id = row.getLong("id");
         String symbol = row.getString("symbol").toUpperCase(Locale.ROOT);
         Side side = Side.valueOf(row.getString("side").toUpperCase(Locale.ROOT));
@@ -159,8 +160,14 @@ public final class SupabaseQueueSource implements SignalSource {
         int leverage = row.has("leverage") && !row.isNull("leverage")
                 ? row.getInt("leverage") : defaultLeverage;
 
-        return new Signal("sbq-" + id, symbol, side, entry, stop, atr,
-                Math.min(leverage, RiskConstants.MAX_LEVERAGE), clock.instant());
+        // Refused, not clamped. Silently lowering the number would let a queue keep publishing rows
+        // asking for 20x forever, with nothing in the logs to say the request was ever made — and
+        // the manual input path refuses the same mistake, so the two sources would disagree about
+        // what a bad row means.
+        Preconditions.require(leverage >= 1 && leverage <= RiskConstants.MAX_LEVERAGE,
+                "row " + id + " asks for " + leverage + "x, outside [1, " + RiskConstants.MAX_LEVERAGE + "]");
+
+        return new Signal("sbq-" + id, symbol, side, entry, stop, atr, leverage, clock.instant());
     }
 
     /** Conditional {@code pending -> sent}. Returns false when another poller won the row. */

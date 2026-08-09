@@ -363,6 +363,12 @@ disagreement means an assumption was wrong and opening more positions on top of 
 how a small bug becomes an expensive one. The sharpest check is an open position with no working
 stop — the state a crash between "entry filled" and "stop placed" would leave.
 
+Each pass also re-measures the liquidation buffer against the price the **exchange** reports, not the
+one computed at approval. The two drift apart for reasons the pre-trade calculation cannot see —
+margin added or removed by hand, funding, a maintenance bracket changing as the notional moves — and
+a stop that was comfortably inside liquidation when it was placed can end up outside it without a
+single order changing.
+
 A halt stops **opening**. It never stops closing. A lock that seals positions in is not a safety
 feature; the earlier version of this codebase learned that when a gate covering the whole cycle made
 live positions unclosable and time-stops silently stopped working.
@@ -377,12 +383,45 @@ act on until the ban lifts.
 locally against live `exchangeInfo` filters. Reduce-only exits are exempt from minimum notional, as
 the exchange exempts them.
 
-**Dead-man's switch.** The exchange-side `countdownCancelAll` is re-armed on a heartbeat for every
-symbol holding a position. If the bot stops calling it, the **exchange** cancels that symbol's
-working orders by itself; positions are untouched, because force-closing a position is a trading
-decision and a watchdog does not get to make one. Server-side is the point: a watchdog thread inside
-this process dies in the same crash that stranded the orders. The local half handles the other
-failure — alive but unable to reach the exchange — by halting new risk and alerting loudly.
+**Dead-man's switch, and the rule it does *not* follow.** The obvious reading is "if the bot goes
+quiet, cancel everything it left on the book". For this system that reading is harmful, and the
+reason is worth stating.
+
+The orders this bot leaves resting have opposite risk signs. A resting **entry** is
+exposure-increasing: if it fills while the process is dead it creates a leveraged position with
+nothing protecting it, and cancelling it is exactly right. The protective **stop** and the
+reduce-only exits can only shrink a position; if they fill while the process is dead they do the job
+they were placed for, and cancelling them strips the protection off an open position at the moment
+nobody is watching.
+
+Binance's `countdownCancelAll` cancels *every* open order on a symbol and cannot tell the two apart.
+So it is armed only for a symbol that has a resting entry and **no position**, and a symbol holding
+a position is explicitly disarmed — arming it there would schedule the deletion of that position's
+stop. Server-side is still the point where it applies: a watchdog thread inside this process dies in
+the same crash that stranded the order.
+
+The local half handles the other failure — alive but unable to reach the exchange — by halting new
+risk, alerting loudly, and making a best-effort pass that cancels **only the non-reducing** working
+orders. Positions are never touched: force-closing one is a trading decision, and a watchdog does not
+get to make it.
+
+With the default MARKET entry there is normally nothing resting, so the exchange-side countdown is
+usually idle. That is the honest outcome, not a gap: it becomes active the moment resting entries
+are used, and the local half is what covers the rest.
+
+**When something fails after money is committed.** Four outcomes exist besides "filled" and "not
+filled", and they exist because each was a way to leave a position open while telling the operator
+otherwise:
+
+| situation | outcome | what happens |
+|---|---|---|
+| the entry's fate cannot be established (ambiguous send, exchange unreachable for the probes) | `UNKNOWN_AFTER_SEND` | critical alert, trading halted. "Unknown" is not "nothing happened": a position may be live and unrecorded, and the loop must not open the next one on top of it |
+| the protective stop is refused | `ABORTED_UNPROTECTED` | position closed reduce-only, trading halted; if the close is itself partial, the residual is named in the report rather than assumed away |
+| the fill breaks the risk budget and the close succeeds | `ABORTED_ON_SLIPPAGE` | position flat, the now-orphaned stop cancelled, trading continues |
+| the fill breaks the budget and the close fails or fills partially | `ABORTED_ON_SLIPPAGE` | **the stop is kept**, trading halted. Cancelling it would remove the protection from a position the code knows is still open |
+
+A definite refusal from the exchange — an error code, meaning it evaluated the order and declined —
+is an ordinary refusal and does not halt. Nothing landed, so there is nothing to stop trading about.
 
 ---
 
@@ -430,7 +469,7 @@ column must accept `rejected`, or refused rows will be polled again.
 ./gradlew test
 ```
 
-156 tests. The property-based ones draw thousands of cases from a seeded PRNG so a failure is
+178 tests. The property-based ones draw thousands of cases from a seeded PRNG so a failure is
 reproducible; override the seed with `-Dbot.test.seed=123456`.
 
 | requirement from the brief | test |
@@ -451,7 +490,14 @@ Two of them are worth calling out because they assert about the system rather th
   buffer — and that enough plans are approved for the sweep to mean anything.
 - `SignalSourceImplementationsTest` asserts that exactly two `SignalSource` implementations exist and
   that neither computes anything strategy-shaped. A third implementation has to delete this test to
-  land, which makes it a conversation rather than an accident.
+  land, which makes it a conversation rather than an accident. It carries its own guard —
+  `detectorCoversEveryDeclarationForm` — because an earlier version matched only the keyword `class`
+  and would have let `record X(...) implements SignalSource`, the shape this codebase writes by
+  default, through unnoticed.
+- `CoordinatorFailurePathsTest` covers the paths that only run when something goes wrong after money
+  is committed: a refused stop, an unestablishable entry, a close that fails, a close that fills
+  only halfway. Every one of them was a real defect found by an adversarial audit of this code, and
+  each had the same shape — a leveraged position left open while the report said otherwise.
 
 The end-to-end chain — typed signal → size from the stop → entry → stop and exits placed →
 reconciliation converges — is `SmokeRunChainTest`, run against an in-memory exchange on every build.

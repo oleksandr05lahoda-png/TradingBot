@@ -104,6 +104,21 @@ class MarginTierTableTest {
     }
 
     @Test
+    @DisplayName("a maintenance rate of 1.0 is refused, because it would zero the long denominator")
+    void maintenanceRateOfOneIsRefused() {
+        // liq for a long divides by q*(MMR - 1). At MMR = 1 that is zero, the solve returns
+        // -Infinity, and the non-finite result would be clamped to 0.0 — the sentinel meaning
+        // "liquidation unreachable". The most dangerous possible bracket would produce the most
+        // permissive possible answer, silently. It is refused at construction instead.
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> new MarginTier(0, Double.POSITIVE_INFINITY, 1.0, 0, 1));
+        assertTrue(thrown.getMessage().contains("must be in (0, 1)"), thrown.getMessage());
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new MarginTier(0, Double.POSITIVE_INFINITY, 0.0, 0, 1));
+    }
+
+    @Test
     @DisplayName("a table whose leverage caps rise with notional is refused")
     void risingLeverageCapIsRefused() {
         assertThrows(IllegalArgumentException.class,

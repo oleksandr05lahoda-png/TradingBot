@@ -18,8 +18,10 @@ import java.util.Base64;
  * {@link IdempotentOrderPlacer} can simply ask what happened to that id instead of guessing.
  *
  * <p>Nothing that varies between attempts may enter the hash: no timestamp, no random suffix, no
- * attempt counter. The test {@code ClientOrderIdFactoryTest} pins that, because a well-meaning
- * "make ids unique" change is exactly how this property gets lost.
+ * attempt counter — because a well-meaning "make ids unique" change is exactly how this property
+ * gets lost. {@code IdempotentResubmitTest.clientOrderIdsAreDeterministic} pins the equality, and
+ * {@code IdempotentResubmitTest.reExecutingAPlanIsSafe} pins what it buys: replaying a whole plan
+ * does not open a second position.
  *
  * <p>Format: {@code bt-<purpose letter><index>-<22 chars of base64url(sha-256)>}, always inside
  * Binance's 36-character {@code ^[\.A-Z\:/a-z0-9_-]{1,36}$}. The digest is truncated to 22 base64url

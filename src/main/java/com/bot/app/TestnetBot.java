@@ -163,7 +163,14 @@ public final class TestnetBot {
                 }
                 case RiskDecision.Approved approved -> {
                     ExecutionCoordinator.Report report = coordinator.execute(approved.plan());
-                    LOG.info("[Loop] " + report.outcome() + " — " + report.note());
+                    if (report.mayHaveOpenedUnknownRisk()) {
+                        // The coordinator has already alerted and halted. Log at SEVERE so the
+                        // outcome is not mistaken for the ordinary "this signal did not work out".
+                        LOG.severe("[Loop] " + report.outcome() + " on " + signal.symbol()
+                                + " — " + report.note());
+                    } else {
+                        LOG.info("[Loop] " + report.outcome() + " — " + report.note());
+                    }
                     if (report.opened()) {
                         signals.onAccepted(signal,
                                 report.entryOrder().map(o -> o.clientOrderId()).orElse("unknown"));
