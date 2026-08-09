@@ -10,7 +10,9 @@ import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.OptionalDouble;
@@ -24,9 +26,11 @@ import java.util.logging.Logger;
  * <h2>Line format</h2>
  * <pre>
  *   SYMBOL SIDE entry=&lt;price&gt; [stop=&lt;price&gt;] [atr=&lt;value&gt;] [lev=&lt;1..5&gt;] [id=&lt;text&gt;]
+ *   CLOSE SYMBOL [id=&lt;text&gt;] [reason=&lt;text&gt;]
  *
  *   BTCUSDT LONG  entry=64000 stop=62800 lev=3
  *   ETHUSDT SHORT entry=3120  atr=45     lev=2
+ *   CLOSE BTCUSDT reason=done
  * </pre>
  * Blank lines and lines starting with {@code #} are ignored. At least one of {@code stop} or
  * {@code atr} must be present — a line with neither is refused at the point of typing rather than
@@ -46,6 +50,8 @@ public final class ManualTestnetInput implements SignalSource {
     private final int defaultLeverage;
     private final AtomicLong sequence = new AtomicLong();
     private final boolean blocking;
+    private final Deque<Signal> pendingSignals = new ArrayDeque<>();
+    private final Deque<CloseRequest> pendingCloses = new ArrayDeque<>();
 
     /** Reads from the console. Used by the smoke run. */
     public static ManualTestnetInput fromConsole(int defaultLeverage) {
@@ -77,7 +83,17 @@ public final class ManualTestnetInput implements SignalSource {
      * currently holding positions.
      */
     @Override public List<Signal> poll() throws IOException {
-        List<Signal> out = new ArrayList<>();
+        readAvailableLines();
+        return takeAll(pendingSignals);
+    }
+
+    @Override public List<CloseRequest> pollCloses() throws IOException {
+        readAvailableLines();
+        return takeAll(pendingCloses);
+    }
+
+    /** Reads and routes: a {@code CLOSE} line becomes a close request, anything else a signal. */
+    private void readAvailableLines() throws IOException {
         while (blocking || reader.ready()) {
             String line = reader.readLine();
             if (line == null) break;
@@ -86,13 +102,58 @@ public final class ManualTestnetInput implements SignalSource {
                 continue;
             }
             try {
-                out.add(parse(line, clock, defaultLeverage, sequence.incrementAndGet()));
+                long seq = sequence.incrementAndGet();
+                if (line.trim().toUpperCase(Locale.ROOT).startsWith("CLOSE")) {
+                    pendingCloses.add(parseClose(line, clock, seq));
+                } else {
+                    pendingSignals.add(parse(line, clock, defaultLeverage, seq));
+                }
             } catch (RuntimeException e) {
                 LOG.warning("[ManualInput] ignoring line \"" + line.trim() + "\": " + e.getMessage());
             }
             if (blocking) break;
         }
+    }
+
+    private static <T> List<T> takeAll(Deque<T> queue) {
+        if (queue.isEmpty()) return List.of();
+        List<T> out = new ArrayList<>(queue);
+        queue.clear();
         return out;
+    }
+
+    /**
+     * Parses {@code CLOSE SYMBOL [id=<text>] [reason=<text>]}.
+     *
+     * @throws IllegalArgumentException on anything it cannot turn into a close request
+     */
+    public static CloseRequest parseClose(String line, Clock clock, long sequence) {
+        Preconditions.notBlank(line, "line");
+        String[] parts = line.trim().split("\\s+");
+        Preconditions.require(parts.length >= 2, "expected: CLOSE SYMBOL");
+
+        String symbol = parts[1].toUpperCase(Locale.ROOT);
+        String id = null;
+        String reason = "operator";
+        for (int i = 2; i < parts.length; i++) {
+            int eq = parts[i].indexOf('=');
+            Preconditions.require(eq > 0, "expected key=value, got \"" + parts[i] + "\"");
+            String key = parts[i].substring(0, eq).toLowerCase(Locale.ROOT);
+            String value = parts[i].substring(eq + 1);
+            switch (key) {
+                case "id" -> id = value;
+                case "reason" -> reason = value;
+                default -> throw new IllegalArgumentException("unknown key \"" + key + "\"");
+            }
+        }
+        return new CloseRequest(
+                id != null && !id.isBlank() ? id : "manual-close-" + sequence + "-" + symbol,
+                symbol, reason, clock.instant());
+    }
+
+    @Override public void onClosed(CloseRequest request, ExecutionFeedback feedback) {
+        LOG.info("[ManualInput] " + request.symbol() + " closed " + feedback.filledQuantity().toPlainString()
+                + " @ " + feedback.averageFillPrice().toPlainString() + " — " + feedback.note());
     }
 
     @Override public void onAccepted(Signal signal, ExecutionFeedback feedback) {

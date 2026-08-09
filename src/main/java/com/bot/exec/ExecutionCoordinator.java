@@ -4,6 +4,7 @@ import com.bot.core.InstrumentFilters;
 import com.bot.core.Preconditions;
 import com.bot.core.Side;
 import com.bot.exec.ExchangeSnapshots.OrderStatus;
+import com.bot.exec.ExchangeSnapshots.PositionSnapshot;
 import com.bot.exec.OrderTypes.OrderPurpose;
 import com.bot.exec.OrderTypes.OrderSide;
 import com.bot.exec.OrderTypes.OrderState;
@@ -234,7 +235,79 @@ public final class ExecutionCoordinator {
     }
 
     /**
-     * Closes a position reduce-only. Used by the slippage abort, by the kill switch and by the
+     * @param flat            whether the symbol is confirmed to hold nothing afterwards
+     * @param closedQuantity  what the closing order actually filled
+     */
+    public record CloseReport(
+            String symbol,
+            boolean flat,
+            BigDecimal closedQuantity,
+            BigDecimal averagePrice,
+            String note) {}
+
+    /**
+     * Closes out a symbol completely: flatten reduce-only, confirm, then cancel whatever protective
+     * orders are left behind.
+     *
+     * <p>The ordering is the mirror of {@link #execute}. There the stop goes on before anything
+     * else; here it comes off only <b>after</b> the position is confirmed gone, because cancelling
+     * first would leave the position naked for as long as the close takes. A close that fills only
+     * partially therefore keeps its stop and halts, rather than reporting success.
+     *
+     * <p>Reads the position from the exchange rather than the local book: the book is a cache, and
+     * the whole point of a close is to act on what is really there.
+     */
+    public CloseReport closeOut(String symbol, String requestId) throws InterruptedException {
+        Preconditions.notBlank(symbol, "symbol");
+        Preconditions.notBlank(requestId, "requestId");
+
+        PositionSnapshot position = port.openPositions().stream()
+                .filter(p -> p.symbol().equals(symbol) && !p.isFlat())
+                .findFirst()
+                .orElse(null);
+
+        if (position == null) {
+            // Already flat. Any protective order still resting is an orphan by definition, so it goes.
+            port.cancelAllOpenOrders(symbol);
+            engine.registerClose(symbol);
+            LOG.info("[Coordinator] " + symbol + " was already flat — cancelled leftover orders");
+            return new CloseReport(symbol, true, BigDecimal.ZERO, BigDecimal.ZERO, "already flat");
+        }
+
+        Side direction = position.direction().orElseThrow();
+        BigDecimal held = position.absoluteQuantity();
+
+        OrderStatus close;
+        try {
+            close = flatten(symbol, direction, held, requestId);
+        } catch (RuntimeException e) {
+            String note = "reduce-only close was refused (" + e.getMessage()
+                    + ") — the position and its stop are still in place";
+            alerts.critical("Close failed", symbol + ": " + note);
+            halt.halt("close failed on " + symbol, clock.instant());
+            return new CloseReport(symbol, false, BigDecimal.ZERO, BigDecimal.ZERO, note);
+        }
+
+        BigDecimal residual = held.subtract(close.executedQuantity());
+        if (residual.signum() > 0) {
+            String note = "closed " + close.executedQuantity().toPlainString() + " of "
+                    + held.toPlainString() + "; " + residual.toPlainString()
+                    + " still open, keeping the protective orders";
+            alerts.critical("Partial close", symbol + ": " + note);
+            halt.halt("partial close on " + symbol, clock.instant());
+            return new CloseReport(symbol, false, close.executedQuantity(), close.averagePrice(), note);
+        }
+
+        port.cancelAllOpenOrders(symbol);
+        engine.registerClose(symbol);
+        LOG.info("[Coordinator] " + symbol + " closed " + held.toPlainString()
+                + " @ " + close.averagePrice().toPlainString() + "; protective orders cancelled");
+        return new CloseReport(symbol, true, close.executedQuantity(), close.averagePrice(),
+                "closed reduce-only in full");
+    }
+
+    /**
+     * Closes a position reduce-only. Used by the slippage abort, by {@link #closeOut} and by the
      * operator. Deliberately does not consult {@link TradingHalt}: a halt stops opening, never
      * closing.
      */

@@ -59,6 +59,13 @@ public final class SupabaseQueueSource implements SignalSource {
     private static final String STATUS_PENDING = "pending";
     private static final String STATUS_CLAIMED = "sent";
     private static final String STATUS_REJECTED = "rejected";
+    private static final String STATUS_CLOSE_REQUESTED = "close_requested";
+    private static final String STATUS_CLOSE_CLAIMED = "close_sent";
+    private static final String STATUS_CLOSED = "closed";
+
+    /** Prefixes that let a signal or close id be mapped back to its row. */
+    private static final String OPEN_ID_PREFIX = "sbq-";
+    private static final String CLOSE_ID_PREFIX = "sbqc-";
 
     private final String baseUrl;
     private final String apiKey;
@@ -126,7 +133,7 @@ public final class SupabaseQueueSource implements SignalSource {
                     continue;
                 }
                 Signal signal = toSignal(row);
-                if (claim(id)) {
+                if (claim(id, STATUS_PENDING, STATUS_CLAIMED)) {
                     out.add(signal);
                 } else {
                     LOG.fine("[SupabaseQueue] row " + id + " was claimed by someone else");
@@ -197,17 +204,81 @@ public final class SupabaseQueueSource implements SignalSource {
         return new Signal("sbq-" + id, symbol, side, entry, stop, atr, leverage, clock.instant());
     }
 
-    /** Conditional {@code pending -> sent}. Returns false when another poller won the row. */
-    private boolean claim(long id) throws IOException, InterruptedException {
+    /**
+     * Instructions to close, drained before opens. A close is not put through the risk gate — it can
+     * only give risk back — and is not blocked by a trading halt.
+     */
+    @Override public List<CloseRequest> pollCloses() throws IOException, InterruptedException {
+        String path = "/rest/v1/bot_orders"
+                + "?status=eq." + STATUS_CLOSE_REQUESTED
+                + "&testnet=is.true"
+                + "&order=id.asc&limit=" + batchSize
+                + "&select=id,symbol,exec_note";
+
         HttpResponse<String> response = send(HttpRequest.newBuilder()
-                .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id + "&status=eq." + STATUS_PENDING))
+                .uri(URI.create(baseUrl + path))
+                .timeout(Duration.ofSeconds(15))
+                .GET());
+        if (response.statusCode() / 100 != 2) {
+            throw new IOException("close-queue read failed with HTTP " + response.statusCode()
+                    + " — refusing to treat this as 'nothing to close'");
+        }
+
+        JSONArray rows = new JSONArray(response.body());
+        List<CloseRequest> out = new ArrayList<>();
+        for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.getJSONObject(i);
+            long id = row.optLong("id", -1);
+            String symbol = row.optString("symbol", "");
+            if (id < 0 || symbol.isBlank()) continue;
+            if (claim(id, STATUS_CLOSE_REQUESTED, STATUS_CLOSE_CLAIMED)) {
+                String reason = row.optString("exec_note", "");
+                out.add(new CloseRequest(CLOSE_ID_PREFIX + id, symbol.toUpperCase(Locale.ROOT),
+                        reason.isBlank() ? "queue" : reason, clock.instant()));
+            }
+        }
+        return out;
+    }
+
+    @Override public void onClosed(CloseRequest request, ExecutionFeedback feedback)
+            throws IOException, InterruptedException {
+        long id = rowIdOf(request.id(), CLOSE_ID_PREFIX);
+        if (id < 0) return;
+
+        JSONObject body = new JSONObject();
+        body.put("status", STATUS_CLOSED);
+        body.put("closed_at", clock.instant().toString());
+        body.put("filled_qty", feedback.filledQuantity().doubleValue());
+        body.put("filled_price", feedback.averageFillPrice().doubleValue());
+        body.put("exec_note", feedback.note());
+
+        HttpResponse<String> response = send(HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id))
+                .timeout(Duration.ofSeconds(15))
+                .method("PATCH", HttpRequest.BodyPublishers.ofString(body.toString())));
+        if (response.statusCode() / 100 != 2) {
+            LOG.warning("[SupabaseQueue] row " + id + " was closed on the exchange but the row could "
+                    + "not be updated (HTTP " + response.statusCode() + ")");
+        }
+    }
+
+    /**
+     * Conditional status transition. The {@code from} status travels as a predicate, so two pollers
+     * cannot both win the same row.
+     *
+     * @return false when someone else got there first
+     */
+    private boolean claim(long id, String from, String to) throws IOException, InterruptedException {
+        HttpResponse<String> response = send(HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id + "&status=eq." + from))
                 .timeout(Duration.ofSeconds(15))
                 .header("Prefer", "return=representation")
                 .method("PATCH", HttpRequest.BodyPublishers.ofString(
-                        new JSONObject(Map.of("status", STATUS_CLAIMED)).toString())));
+                        new JSONObject(Map.of("status", to)).toString())));
 
         if (response.statusCode() / 100 != 2) {
-            throw new IOException("claim of row " + id + " failed with HTTP " + response.statusCode());
+            throw new IOException("claim of row " + id + " (" + from + " -> " + to
+                    + ") failed with HTTP " + response.statusCode());
         }
         return new JSONArray(response.body()).length() == 1;
     }
@@ -231,10 +302,14 @@ public final class SupabaseQueueSource implements SignalSource {
     }
 
     private static long rowIdOf(Signal signal) {
-        String id = signal.id();
-        if (!id.startsWith("sbq-")) return -1;
+        return rowIdOf(signal.id(), OPEN_ID_PREFIX);
+    }
+
+    /** Maps an id this class minted back to its row, or -1 when it came from somewhere else. */
+    private static long rowIdOf(String id, String prefix) {
+        if (id == null || !id.startsWith(prefix)) return -1;
         try {
-            return Long.parseLong(id.substring(4));
+            return Long.parseLong(id.substring(prefix.length()));
         } catch (NumberFormatException e) {
             return -1;
         }

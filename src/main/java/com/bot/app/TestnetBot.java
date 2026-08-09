@@ -19,6 +19,7 @@ import com.bot.risk.RiskConstants;
 import com.bot.risk.RiskDecision;
 import com.bot.risk.RiskEngine;
 import com.bot.risk.TradeRequest;
+import com.bot.signal.CloseRequest;
 import com.bot.signal.ExecutionFeedback;
 import com.bot.signal.ManualTestnetInput;
 import com.bot.signal.Signal;
@@ -123,6 +124,11 @@ public final class TestnetBot {
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
 
+                // Closes first, always. Giving risk back takes precedence over taking more, and a
+                // halt must never be able to stop an unwind.
+                for (CloseRequest close : signals.pollCloses()) {
+                    handleClose(close, coordinator, signals);
+                }
                 for (Signal signal : signals.poll()) {
                     handle(signal, engine, coordinator, port, signals, now);
                 }
@@ -138,6 +144,24 @@ public final class TestnetBot {
                 }
                 Thread.sleep(250);
             }
+        }
+    }
+
+    private static void handleClose(CloseRequest close, ExecutionCoordinator coordinator,
+                                    SignalSource signals) throws Exception {
+        LOG.info("[Loop] " + close);
+        try {
+            ExecutionCoordinator.CloseReport report = coordinator.closeOut(close.symbol(), close.id());
+            if (report.flat()) {
+                signals.onClosed(close, new ExecutionFeedback(close.id(), report.closedQuantity(),
+                        report.averagePrice(), report.note()));
+            } else {
+                // The coordinator has already alerted and halted; the row stays claimed so the
+                // failure is visible rather than quietly retried into a loop.
+                LOG.severe("[Loop] close of " + close.symbol() + " did not complete: " + report.note());
+            }
+        } catch (RuntimeException e) {
+            LOG.severe("[Loop] close of " + close.symbol() + " failed: " + e.getMessage());
         }
     }
 

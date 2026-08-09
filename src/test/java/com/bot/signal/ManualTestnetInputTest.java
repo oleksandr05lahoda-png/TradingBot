@@ -98,6 +98,37 @@ class ManualTestnetInputTest {
     }
 
     @Test
+    @DisplayName("a CLOSE line becomes a close request, not a signal")
+    void closeLineIsRouted() throws Exception {
+        String script = String.join("\n",
+                "BTCUSDT LONG entry=64000 stop=62800",
+                "CLOSE ETHUSDT reason=time-stop",
+                "SOLUSDT LONG entry=150 stop=145");
+
+        try (ManualTestnetInput input = ManualTestnetInput.fromReader(new StringReader(script), CLOCK, 3)) {
+            List<CloseRequest> closes = input.pollCloses();
+            List<Signal> signals = input.poll();
+
+            assertEquals(1, closes.size());
+            assertEquals("ETHUSDT", closes.get(0).symbol());
+            assertEquals("time-stop", closes.get(0).reason());
+
+            assertEquals(2, signals.size(), "the two open lines are still signals");
+            assertEquals("BTCUSDT", signals.get(0).symbol());
+            assertEquals("SOLUSDT", signals.get(1).symbol());
+        }
+    }
+
+    @Test
+    @DisplayName("a CLOSE line with no symbol is refused")
+    void closeNeedsASymbol() {
+        assertThrows(IllegalArgumentException.class,
+                () -> ManualTestnetInput.parseClose("CLOSE", CLOCK, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> ManualTestnetInput.parseClose("CLOSE BTCUSDT wat=1", CLOCK, 1));
+    }
+
+    @Test
     @DisplayName("generated ids are distinct per line so two identical trades stay two trades")
     void generatedIdsAreDistinctPerLine() throws Exception {
         String script = "BTCUSDT LONG entry=64000 stop=62800\nBTCUSDT LONG entry=64000 stop=62800";

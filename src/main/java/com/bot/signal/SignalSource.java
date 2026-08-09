@@ -27,6 +27,16 @@ public interface SignalSource extends AutoCloseable {
     List<Signal> poll() throws Exception;
 
     /**
+     * Instructions to close positions, oldest first. Drained <b>before</b> {@link #poll()} on every
+     * cycle: giving risk back always takes precedence over taking more, and a source that is
+     * temporarily producing nothing but closes must still be able to unwind.
+     */
+    default List<CloseRequest> pollCloses() throws Exception { return List.of(); }
+
+    /** Called once a close has been executed, with what the exchange actually did. */
+    default void onClosed(CloseRequest request, ExecutionFeedback feedback) throws Exception {}
+
+    /**
      * Called once a signal became a position, carrying what the exchange actually did. The feedback
      * is the only place the realised execution cost is recorded — see {@link ExecutionFeedback}.
      */
