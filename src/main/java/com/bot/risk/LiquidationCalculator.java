@@ -9,44 +9,24 @@ import java.util.Set;
 /**
  * Liquidation price for a single <b>isolated</b> USDⓈ-M position, from Binance's published formula.
  *
- * <h2>The formula</h2>
- * Binance's general form is
- *
- * <pre>{@code
- *   liq = (WB - TMM1 + UPNL1 + cumB - SUM(Position_i * EP_i * Side_i))
- *       / (SUM(Position_i * MMR_i) - SUM(Position_i * Side_i))
- * }</pre>
- *
- * with, per Binance, <i>"In isolated margin mode, WB is isolatedWalletBalance of the isolated
- * position, TMM = 0, UPNL = 0"</i>. One isolated position therefore collapses the sums to a single
- * term and leaves
- *
  * <pre>{@code   liq = (WB + cum - side * q * EP) / (q * MMR - side * q) }</pre>
  *
- * where {@code side} is +1 long / -1 short, {@code q} the position size in base units, {@code EP}
- * the entry price, {@code MMR} the maintenance margin rate of the governing bracket and {@code cum}
- * that bracket's maintenance amount.
+ * side = +1 long / -1 short, q = size in base units, EP = entry, MMR/cum = the governing bracket's
+ * maintenance rate and maintenance amount, WB = isolated wallet balance. (Binance's general form
+ * carries TMM and UPNL terms for other contracts; per its own note they are 0 in isolated mode.)
  *
- * <h2>Why it is that, derived rather than copied</h2>
- * Liquidation is the price at which equity meets the maintenance requirement:
- * {@code WB + uPnL = MM}. For a long, {@code uPnL = q(P - EP)} and {@code MM = q*P*MMR - cum}, so
- * {@code WB + q(P - EP) = q*P*MMR - cum}, which rearranges to
- * {@code P = (WB + cum - q*EP) / (q(MMR - 1))}. For a short, {@code uPnL = q(EP - P)} gives
- * {@code P = (WB + cum + q*EP) / (q(MMR + 1))}. Both are the single expression above. The
- * derivation is written out because a formula that is only copied cannot be checked.
+ * <p><b>Derived, not copied</b>, because a copied formula cannot be checked. Liquidation is where
+ * equity meets the maintenance requirement, {@code WB + uPnL = MM}, with {@code MM = q*P*MMR - cum}:
+ * a long has {@code uPnL = q(P - EP)} giving {@code P = (WB + cum - q*EP) / (q(MMR - 1))}, a short
+ * has {@code uPnL = q(EP - P)} giving {@code P = (WB + cum + q*EP) / (q(MMR + 1))}. Both are the
+ * expression above.
  *
- * <h2>This is not 1/leverage</h2>
- * The naive {@code entry * (1 - 1/leverage)} ignores maintenance margin entirely and therefore puts
- * liquidation <i>further</i> from entry than it is — for a long, it is always the more optimistic
- * number. Being optimistic about liquidation distance is the one direction that costs the whole
- * isolated margin rather than the planned R.
+ * <p>Not {@code entry * (1 - 1/leverage)}: that ignores maintenance margin and always puts
+ * liquidation further from entry than it is, which is the expensive direction to be wrong in.
  *
- * <h2>Bracket selection</h2>
- * The governing bracket depends on notional, and notional depends on price, so the bracket at entry
- * is not necessarily the bracket at liquidation. The solver iterates: solve with the entry bracket,
- * re-select the bracket at the resulting price, solve again, until it stops moving. If it oscillates
- * between two brackets it settles on the one with the higher maintenance rate — the answer nearer to
- * entry, which is the conservative side to land on.
+ * <p>The governing bracket depends on notional and notional depends on price, so the bracket at
+ * entry need not be the bracket at liquidation. The solver iterates to a fixed point; if it
+ * oscillates it takes whichever solved price is nearer to entry.
  */
 public final class LiquidationCalculator {
 
@@ -55,12 +35,9 @@ public final class LiquidationCalculator {
     private LiquidationCalculator() {}
 
     /**
-     * Isolated wallet balance for a freshly opened position: the initial margin, minus the entry fee,
-     * which on an isolated position is deducted from that same isolated margin.
-     *
-     * <p>Ignoring the fee inflates the wallet balance and pushes the projected liquidation price
-     * away from entry. The correction is small — 0.05% of notional — but it is small in the
-     * dangerous direction, so it is applied rather than waved away.
+     * Initial margin minus the entry fee, which on an isolated position comes out of that same
+     * margin. Ignoring the fee would push the projected liquidation price away from entry — small,
+     * but small in the dangerous direction.
      */
     public static double isolatedWalletBalanceAtOpen(double notional, int leverage, double takerFeeFraction) {
         Preconditions.positiveFinite(notional, "notional");
@@ -106,13 +83,9 @@ public final class LiquidationCalculator {
             MarginTier atLiquidation = tiers.tierFor(Math.max(0.0, price) * quantity);
             if (atLiquidation.equals(tier)) return clampToReachable(side, entryPrice, price);
             if (visited.contains(atLiquidation)) {
-                // Oscillating between two brackets. Settle on whichever SOLVED PRICE is nearer the
-                // entry — for a long the higher of the two, for a short the lower. Comparing the
-                // maintenance RATES instead would be wrong: because the maintenance amount is
-                // calibrated for continuity, the higher-rate bracket demands *less* maintenance
-                // margin below its own floor, which puts liquidation further away. Being wrong
-                // towards "closer" only ever rejects a trade; being wrong towards "further" lets a
-                // bad one through.
+                // Oscillating. Take whichever solved PRICE is nearer entry, not the higher
+                // maintenance rate: with continuity-calibrated maintenance amounts the higher-rate
+                // bracket demands less margin below its own floor, so it lands further away.
                 double a = solve(side, entryPrice, quantity, walletBalance, tier);
                 double b = solve(side, entryPrice, quantity, walletBalance, atLiquidation);
                 double nearer = side == Side.LONG ? Math.max(a, b) : Math.min(a, b);
@@ -128,25 +101,19 @@ public final class LiquidationCalculator {
     private static double solve(Side side, double entryPrice, double quantity, double walletBalance, MarginTier tier) {
         int s = side.sign();
         double numerator = walletBalance + tier.maintenanceAmount() - s * quantity * entryPrice;
+        // q*(MMR - 1) for a long, q*(MMR + 1) for a short; MarginTier bounds MMR to (0, 1), so
+        // neither can be zero.
         double denominator = quantity * tier.maintenanceMarginRate() - s * quantity;
-        // denominator is q*(MMR - 1) < 0 for a long and q*(MMR + 1) > 0 for a short. MarginTier
-        // requires MMR strictly inside (0, 1), so neither form can be zero for a positive quantity.
         return numerator / denominator;
     }
 
     /**
-     * Two ends of the range need naming.
-     *
-     * <p>A long's liquidation price comes out at or below zero when the margin is large enough that
-     * price would hit zero first — the ordinary case at 1x. That is reported as {@code 0.0},
-     * "not reachable", rather than as a negative price.
-     *
-     * <p>At the other end, the solved price can land on the wrong side of entry. That is not a bug
-     * in the arithmetic: it says the initial margin is already at or below the maintenance
-     * requirement, i.e. the position would be liquidatable the moment it opened. It is clamped to
-     * the entry price, which drives the liquidation buffer to zero and makes
-     * {@link LiquidationSafety} refuse the trade with a reason the operator can read — far better
-     * than an exception thrown from inside a pricing routine.
+     * Both ends of the range. A long solving to zero or below means price would hit zero first (the
+     * ordinary case at 1x): reported as {@code 0.0}, "not reachable". A price on the wrong side of
+     * entry means the initial margin is already at or below the maintenance requirement — the
+     * position would be liquidatable at open — and is clamped to entry, which drives the buffer to
+     * zero so {@link LiquidationSafety} refuses the trade with a readable reason instead of an
+     * exception thrown from inside a pricing routine.
      */
     private static double clampToReachable(Side side, double entryPrice, double price) {
         Preconditions.require(Double.isFinite(price) || side == Side.LONG,

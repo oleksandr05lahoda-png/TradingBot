@@ -11,14 +11,10 @@ import java.util.OptionalDouble;
  * one, and every implementation validates its own geometry, so an "empty" stop cannot be smuggled
  * in as a null, a zero or a NaN.
  *
- * <p>Two origins exist and no more:
- * <ul>
- *   <li>{@link Structural} — a level that arrived with the signal. Preferred, because it means
- *       something outside the bot picked it.</li>
- *   <li>{@link AtrFallback} — a volatility-derived distance, used only when the signal carried no
- *       structural level. It is a fallback, not a strategy: it does not decide direction, entry or
- *       whether to trade at all.</li>
- * </ul>
+ * <p>Two origins, no more: {@link Structural}, a level that arrived with the signal (preferred —
+ * something outside the bot picked it), and {@link AtrFallback}, a volatility distance used only
+ * when no structural level came. The fallback is not a strategy: it decides no direction, no entry
+ * and not whether to trade.
  */
 public sealed interface StopLoss permits StopLoss.Structural, StopLoss.AtrFallback {
 

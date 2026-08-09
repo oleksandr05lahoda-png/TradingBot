@@ -21,26 +21,19 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * Turns an approved {@link TradePlan} into orders on the exchange, and does not leave a filled
- * position unprotected at any point in between.
+ * Turns an approved {@link TradePlan} into orders, and never leaves a filled position unprotected in
+ * between. Three rules carry that:
  *
- * <h2>The ordering is the safety property</h2>
- * The protective stop goes on <b>immediately</b> after the entry reports a fill — before slippage is
- * assessed, before take-profit legs are computed, before the book is updated. Every one of those is
- * arithmetic that takes milliseconds, and milliseconds are enough: a leveraged position with no stop
- * is the one state this system is built to never be in, so nothing is allowed between the fill and
- * the stop. If the stop cannot be placed, the position is closed reduce-only and trading halts.
- *
- * <h2>The filled quantity is the only quantity</h2>
- * Stops and exits are sized from what the exchange says filled, never from what was requested. A
- * partial fill is a different position from the approved one — smaller, and at a different average
- * price — and a stop sized for the intended quantity would leave the difference exposed while
- * appearing, in every log line, to be correct.
- *
- * <h2>Slippage can void a trade after it opens</h2>
- * The plan's risk was computed against an intended entry. If the fill lands far enough away that the
- * real distance to the stop puts more than the budgeted money at risk, the position is not the one
- * that was approved — it is closed reduce-only rather than kept and hoped about.
+ * <ol>
+ *   <li><b>The ordering.</b> The stop goes on immediately after the fill — before slippage is
+ *       assessed, before exits are computed, before the book is updated. If it cannot be placed, the
+ *       position is closed reduce-only and trading halts.</li>
+ *   <li><b>The filled quantity is the only quantity.</b> A partial fill is a different position from
+ *       the approved one; a stop sized for the intended quantity leaves the difference exposed while
+ *       every log line reads as covered.</li>
+ *   <li><b>Slippage can void a trade after it opens.</b> If the real distance to the stop risks more
+ *       than the budget, the position is closed rather than kept.</li>
+ * </ol>
  */
 public final class ExecutionCoordinator {
 
@@ -183,10 +176,9 @@ public final class ExecutionCoordinator {
                 // landed, so there is nothing to clean up and no reason to stop trading.
                 return refused(plan, "entry refused by the exchange: " + e.getMessage());
             }
-            // The placer exhausted its probes and resends without ever establishing what happened.
-            // The order may be live. This is the one state that must not be swallowed as "the
-            // signal failed": the loop would open the next position on top of a position it does
-            // not know exists, sized against an exposure book that omits it.
+            // The placer never established what happened, so the order may be live. Not swallowable
+            // as "the signal failed": the loop would open the next position on top of one it does
+            // not know exists, sized against a book that omits it.
             return unknownAfterSend(plan, e);
         }
 

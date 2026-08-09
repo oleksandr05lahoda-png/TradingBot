@@ -10,24 +10,21 @@ import java.util.logging.Logger;
 /**
  * Sends orders in a way that a lost response cannot turn into a second position.
  *
- * <p>The dangerous case is not an order that fails. It is an order whose <i>outcome is unknown</i>:
- * the request left, the response did not come back, and the exchange may be holding a live order the
- * bot has no record of. Retrying that blindly is how one intended position becomes two, at double
- * the risk, with one of them completely unmanaged.
+ * <p>The dangerous case is not a failed order but one whose <i>outcome is unknown</i>: the request
+ * left, the response did not come back, and the exchange may be holding a live order the bot has no
+ * record of. Retrying that blindly turns one intended position into two, one of them unmanaged.
  *
- * <p>The protocol, in order:
+ * <p>The protocol:
  * <ol>
- *   <li><b>Ask before sending.</b> The client order id is deterministic
- *       ({@link ClientOrderIdFactory}), so if the exchange already knows it — from a previous
- *       attempt, or from before a restart — that order <i>is</i> the answer, and nothing is sent.</li>
+ *   <li><b>Ask before sending.</b> The client order id is deterministic, so an order the exchange
+ *       already knows <i>is</i> the answer and nothing is sent.</li>
  *   <li><b>Send.</b></li>
- *   <li><b>A definite refusal is final.</b> An error code means the exchange evaluated and declined:
- *       it is propagated, never retried, because retrying a refusal just collects another one.</li>
- *   <li><b>{@code -4116 DUPLICATED_CLIENT_ORDER_ID} is a success in disguise.</b> The exchange is
- *       saying it already has this order. Fetch it and return it.</li>
- *   <li><b>An ambiguous failure means ask, not resend.</b> Query by client order id a few times —
- *       an order can take a moment to become visible — and only if the exchange still has never
- *       heard of it, send again <i>with the same id</i>, which keeps step 4 as the backstop.</li>
+ *   <li><b>A definite refusal is final</b> — propagated, never retried.</li>
+ *   <li><b>{@code -4116 DUPLICATED_CLIENT_ORDER_ID} is a success in disguise</b>: fetch and return
+ *       the existing order.</li>
+ *   <li><b>Ambiguous means ask, not resend.</b> Probe by id a few times, and only if the exchange
+ *       still has never heard of it, send again <i>with the same id</i> — which keeps step 4 as the
+ *       backstop.</li>
  * </ol>
  */
 public final class IdempotentOrderPlacer {

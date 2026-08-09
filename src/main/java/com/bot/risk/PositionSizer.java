@@ -7,20 +7,17 @@ import com.bot.core.Preconditions;
  *
  * <pre>{@code   qty = balance * riskFraction / |entry - stop| }</pre>
  *
- * <p>The direction of that arrow is the whole point. The stop is chosen first — by the signal's
- * structure or by volatility — and the size is whatever makes the loss at that stop equal the
- * budgeted risk. Deriving the stop from a desired size is the inverse operation, and it is how a
- * position ends up with a stop placed where it happens to be affordable rather than where it means
- * something. There is no method in this class that takes a size and returns a stop.
+ * <p>The direction of that arrow is the point: the stop is chosen first, and the size is whatever
+ * makes the loss at that stop equal the budget. Deriving the stop from a desired size is how a
+ * position ends up with a stop where it is affordable rather than where it means something — so no
+ * method here takes a size and returns a stop.
  *
- * <p>This class is pure and unclamped: the quantity it returns always puts exactly
- * {@code balance * riskFraction} at risk, for every input. Ceilings — per-trade notional, aggregate
- * exposure, exchange lot filters — are applied by {@link RiskEngine} afterwards, and can only ever
- * reduce the size. Keeping the two apart is what lets the risk-is-constant property be tested as an
- * absolute rather than as a property that holds "unless some cap bit".
+ * <p>Pure and <b>unclamped</b>: the result always risks exactly {@code balance * riskFraction}.
+ * Ceilings are {@link RiskEngine}'s job and only ever reduce. Keeping them apart is what lets
+ * risk-is-constant be tested as an absolute rather than "unless some cap bit".
  *
- * <p>Leverage is not an input. It does not appear in the formula and does not change the answer; it
- * changes only how much margin the position locks up, and therefore where it liquidates.
+ * <p>Leverage is not an input. It changes only how much margin is locked up, and therefore where the
+ * position liquidates.
  */
 public final class PositionSizer {
 

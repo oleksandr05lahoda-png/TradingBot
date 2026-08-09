@@ -15,10 +15,10 @@ import java.util.Optional;
  * limit headers and Binance's error codes all live behind it in
  * {@code com.bot.exec.binance}.
  *
- * <p>That is what makes the whole execution path testable without a network: the tests in this
- * repository drive a fake that implements exactly these methods, including its failure modes —
- * duplicate client order ids, partial fills, lost responses — which are the cases that are almost
- * impossible to provoke on demand against a real endpoint.
+ * <p>That is what makes the execution path testable without a network: the tests drive a fake that
+ * implements exactly these methods including their failure modes — duplicate client order ids,
+ * partial fills, lost responses — which are near-impossible to provoke on demand against a real
+ * endpoint.
  *
  * <p>Every method may throw {@link ExchangeException}. Callers must distinguish
  * {@link ExchangeException#ambiguous()} from a plain refusal before deciding to retry.

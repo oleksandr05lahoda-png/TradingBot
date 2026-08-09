@@ -19,29 +19,13 @@ import java.util.logging.Logger;
  * is what makes a refusal reproducible from its log line — and what lets the whole of it be tested
  * without an exchange.
  *
- * <h2>Order of the checks</h2>
- * Cheapest and most fatal first, so an expensive computation is never performed for a trade that a
- * latched kill switch was going to refuse anyway:
- * <ol>
- *   <li>inputs are usable at all (fail-closed — an unreadable balance is not a balance of zero);</li>
- *   <li>the daily loss kill switch;</li>
- *   <li>leverage against the hard cap;</li>
- *   <li>position slots: one per symbol, and a limit on how many at once;</li>
- *   <li>a stop exists — structural if the signal carried one, ATR otherwise, refusal if neither;</li>
- *   <li>tick alignment of entry and stop, and the geometry that survives it;</li>
- *   <li>size from the stop;</li>
- *   <li>ceilings — per-trade notional, per-side exposure, margin utilisation, exchange lot caps;</li>
- *   <li>lot alignment, minimum quantity and minimum notional;</li>
- *   <li>leverage against the exchange's own bracket at the final notional;</li>
- *   <li>the liquidation buffer;</li>
- *   <li>the reduce-only exits.</li>
- * </ol>
+ * <p>The numbered steps in {@link #evaluate} run cheapest-and-most-fatal first, so nothing expensive
+ * is computed for a trade a latched kill switch was going to refuse anyway.
  *
- * <h2>Ceilings only ever reduce</h2>
- * Steps 7 and 8 are separate on purpose. {@link PositionSizer} is unclamped and always risks exactly
- * the budgeted amount; the ceilings applied here can lower the size and therefore lower the risk,
- * never raise either. Nothing in this class can enlarge a position, and nothing in it moves the stop
- * — which is the invariant that makes "size is derived from the stop" true rather than aspirational.
+ * <p><b>Ceilings only ever reduce.</b> Sizing (step 7) and the ceilings (step 8) are separate on
+ * purpose: {@link PositionSizer} is unclamped and always risks exactly the budget, and nothing here
+ * can enlarge a position or move the stop. That is what makes "size is derived from the stop" true
+ * rather than aspirational.
  */
 public final class RiskEngine {
 

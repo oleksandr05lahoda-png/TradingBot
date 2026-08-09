@@ -5,18 +5,12 @@ import java.util.List;
 /**
  * The <b>only</b> way a trade idea enters this system.
  *
- * <p>There are exactly two implementations and there is no third:
- * {@link ManualTestnetInput} (an operator typing) and {@link SupabaseQueueSource} (an external
- * queue). No implementation of this interface computes an indicator, reads a candle or decides a
- * direction — a source transports a decision that was made elsewhere. If a future implementation
- * would need market data to answer {@link #poll()}, it is a strategy wearing this interface as a
- * costume, and it does not belong here.
- *
- * <p>Why the constraint is structural rather than a comment: with sizing, stops, liquidation and
- * exposure all downstream of the gate, a strategy added here would inherit every safety property
- * automatically and would look, to the rest of the system, exactly like an operator typing. That is
- * precisely the disguise this project cannot afford, because no strategy in it has ever passed its
- * own validation gates.
+ * <p>Exactly two implementations, no third: {@link ManualTestnetInput} (an operator typing) and
+ * {@link SupabaseQueueSource} (an external queue). A source transports a decision made elsewhere; it
+ * does not compute an indicator, read a candle or pick a direction. One that needed market data to
+ * answer {@link #poll()} would be a strategy wearing this interface as a costume — and since sizing,
+ * stops and exposure all sit downstream, it would inherit every safety property and look exactly
+ * like an operator typing. {@code SignalSourceImplementationsTest} enforces the count.
  */
 public interface SignalSource extends AutoCloseable {
 

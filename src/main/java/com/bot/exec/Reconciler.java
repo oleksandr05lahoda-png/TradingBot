@@ -26,19 +26,16 @@ import java.util.logging.Logger;
 /**
  * Brings local belief back in line with the exchange, and stops trading when the two disagree.
  *
- * <p>Local state drifts for reasons that have nothing to do with bugs: a fill delivered while the
- * process was restarting, a position closed by hand from the same account, a stop that triggered
- * during a network partition. So the question this class answers is never "is the local state
- * right?" — it is "what does the exchange say?", and whatever it says wins.
+ * <p>Local state drifts for reasons that are not bugs — a fill delivered during a restart, a
+ * position closed by hand, a stop that triggered during a partition — so the question is never "is
+ * local state right?" but "what does the exchange say?".
  *
- * <p>Drift is treated as a defect, not as a number to correct and forget. The book is realigned
- * <i>and</i> {@link TradingHalt} is tripped, because a disagreement means some assumption in this
- * system was wrong, and continuing to open positions on top of a wrong assumption is how a small
- * bug becomes an expensive one. Closing stays available — a halt never seals a position in.
+ * <p>Drift is a defect, not a number to correct and forget: the book is realigned <i>and</i>
+ * {@link TradingHalt} is tripped, because opening more positions on top of a wrong assumption is how
+ * a small bug becomes an expensive one. Closing stays available — a halt never seals a position in.
  *
- * <p>The check with the sharpest teeth is {@link Drift.Kind#POSITION_WITHOUT_STOP}: an open position
- * with no working protective order on the exchange. That is the state this whole system exists to
- * prevent, and it is the one that a crash between "entry filled" and "stop placed" would produce.
+ * <p>{@link Drift.Kind#POSITION_WITHOUT_STOP} has the sharpest teeth: it is what a crash between
+ * "entry filled" and "stop placed" leaves behind.
  */
 public final class Reconciler {
 
@@ -164,12 +161,10 @@ public final class Reconciler {
                 }
             }
 
-            // The exchange's own numbers rebuild the entry. The stop distance comes from whatever the
-            // local record believed, because the exchange does not store an intended stop. When
-            // there is no local record the recorded risk is 0 — which is a KNOWN understatement, not
-            // a measurement: an adopted position's real risk is unknown, and the only thing this
-            // pass does about it is refuse to invent a number. The UNKNOWN_POSITION drift raised
-            // above is what stops trading, so the understated figure is never sized against.
+            // The exchange does not store an intended stop, so the distance comes from the local
+            // record. With no local record the risk is recorded as 0 — a known understatement
+            // rather than a measurement; the UNKNOWN_POSITION drift above is what stops trading,
+            // so it is never sized against.
             double stopDistance = local != null && local.quantity().signum() > 0
                     ? local.riskUsd() / local.quantity().doubleValue()
                     : 0.0;
@@ -190,11 +185,9 @@ public final class Reconciler {
         // Exchange wins, always and immediately, before any of the checks below act on the book.
         book.replaceAll(truth);
 
-        // Symbols carried over from the previous pass. Without this, a symbol whose position closed
-        // is inspected exactly once — it is in neither the book nor the exchange's positions on the
-        // pass after that — so any working order younger than the grace window at that single
-        // moment would never be looked at again. With the default 60s grace and a 30s reconcile
-        // interval, that was the likely outcome rather than the rare one.
+        // Carried over from the previous pass. Otherwise a symbol whose position closed is inspected
+        // exactly once, and an order younger than the grace window at that single moment is never
+        // looked at again — the likely outcome with a 60s grace and a 30s reconcile interval.
         symbolsToInspect.addAll(carriedOverSymbols);
         Set<String> stillInteresting = new HashSet<>();
 

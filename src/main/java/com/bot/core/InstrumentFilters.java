@@ -7,20 +7,16 @@ import java.util.Objects;
 /**
  * Precision and size filters for one symbol, as published by the exchange.
  *
- * <p>These values are <b>fetched</b>, never guessed: a hardcoded tick size is the classic cause of
- * silent {@code REJECTED} orders. The type itself is pure — it does no I/O — so the risk core can
- * depend on it while the adapter is what fills it in from {@code /fapi/v1/exchangeInfo}.
+ * <p>Fetched, never guessed — a hardcoded tick size is the classic cause of silent {@code REJECTED}
+ * orders. Pure (no I/O), so the risk core can depend on it while the adapter fills it from
+ * {@code /fapi/v1/exchangeInfo}.
  *
- * <p>All arithmetic here is {@link BigDecimal}. Quantising with {@code double} produces values like
- * {@code 0.30000000000000004}, which the exchange rejects on precision even though the number
- * "looks" like a multiple of the step.
+ * <p>{@link BigDecimal} throughout: quantising with {@code double} produces values like
+ * {@code 0.30000000000000004}, which the exchange rejects on precision.
  *
- * <h2>Rounding direction</h2>
- * Quantity always rounds <b>down</b>: rounding a size up would exceed the risk the sizer computed.
- * Prices round in the direction supplied by the caller, because the safe direction depends on what
- * the price means — see {@link #quantizeStopPrice} and {@link #quantizeTakeProfitPrice}, which both
- * round <i>towards</i> the entry so the realised risk can only be smaller than the planned risk,
- * never larger.
+ * <p>Quantity always rounds <b>down</b> — rounding up would exceed the computed risk. Prices round
+ * in the caller's direction; {@link #quantizeStopPrice} and {@link #quantizeTakeProfitPrice} both
+ * round <i>towards</i> entry, so realised risk can only be smaller than planned.
  *
  * @param symbol            exchange symbol, e.g. {@code BTCUSDT}
  * @param tickSize          PRICE_FILTER.tickSize — price must be an integer multiple of this

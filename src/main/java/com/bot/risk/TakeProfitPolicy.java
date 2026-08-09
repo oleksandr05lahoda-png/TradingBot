@@ -9,16 +9,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Where the exits sit, expressed in R — multiples of the distance from entry to stop — and never in
- * absolute prices. R is the only unit in which a target is comparable across symbols and volatility
- * regimes; "take profit at +2%" means something different on BTC and on a fresh listing, "take
- * profit at 2R" does not.
+ * Where the exits sit, in R — multiples of the entry-to-stop distance — never in absolute prices.
+ * "Take profit at +2%" means different things on BTC and on a fresh listing; "at 2R" does not.
+ * Default: half at 1.5R, half at 2R.
  *
- * <p>The default is the one the brief specifies: half the position at 1.5R, the rest at 2R.
- *
- * <p>Every leg produced here is a <b>reduce-only</b> close. That is not a preference — an exit order
- * that is not reduce-only will open a position in the opposite direction if it races a stop that has
- * already flattened the book.
+ * <p>Every leg is <b>reduce-only</b>. An exit that is not will open an opposite position if it races
+ * a stop that already flattened the book.
  */
 public record TakeProfitPolicy(List<Leg> legs) {
 

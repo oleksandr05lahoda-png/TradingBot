@@ -188,11 +188,9 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
             if (!symbol.equals(entry.optString("symbol"))) continue;
             JSONArray brackets = entry.getJSONArray("brackets");
 
-            // The topmost bracket carries a large finite cap; it is the "and everything above"
-            // bracket, so it is widened to infinity to satisfy the table's coverage invariant.
-            // Which one is topmost is decided by the highest notionalFloor rather than by array
-            // position: relying on the response's ordering would silently widen the wrong bracket
-            // if it ever arrived descending.
+            // The topmost bracket is widened to infinity for the table's coverage invariant, and is
+            // picked by highest notionalFloor rather than array position — a descending response
+            // would otherwise widen the wrong one.
             double highestFloor = Double.NEGATIVE_INFINITY;
             for (int b = 0; b < brackets.length(); b++) {
                 highestFloor = Math.max(highestFloor, brackets.getJSONObject(b).getDouble("notionalFloor"));
@@ -213,13 +211,9 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     }
 
     @Override public double fetchRealizedPnlSince(long sinceEpochMs) {
-        // Realised PnL alone understates the day: commissions and funding are money that left the
-        // account just as surely, and the daily loss limit is about the account, not about a
-        // bookkeeping category.
-        //
-        // Paged rather than a single limit=1000 call. Income rows come back ascending from
-        // startTime, so a single truncated page silently drops the MOST RECENT entries — i.e. the
-        // ones a bad day is made of — and hands the kill switch a number that is too kind.
+        // Commissions and funding count too: the daily loss limit is about the account, not about a
+        // bookkeeping category. Paged, because income comes back ascending from startTime and a
+        // truncated page would drop the MOST RECENT rows — the ones a bad day is made of.
         final int pageSize = 1000;
         final int maxPages = 20;
 
@@ -282,10 +276,8 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     }
 
     @Override public List<PositionSnapshot> openPositions() {
-        // positionRisk rather than the account endpoint: it is the one that carries liquidationPrice,
-        // which Reconciler.checkLiquidationBuffer measures the resting stop against. The pre-trade
-        // buffer uses a liquidation price this system computes; this is the exchange's own figure,
-        // and it moves afterwards for reasons the pre-trade calculation cannot see.
+        // positionRisk rather than the account endpoint: it is the one carrying liquidationPrice,
+        // which Reconciler.checkLiquidationBuffer measures the resting stop against.
         JSONArray rows = new JSONArray(signedGet("/fapi/v2/positionRisk", Map.of(), 5));
         List<PositionSnapshot> out = new ArrayList<>();
         for (int i = 0; i < rows.length(); i++) {

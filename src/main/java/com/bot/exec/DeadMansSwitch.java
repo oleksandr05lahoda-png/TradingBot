@@ -17,40 +17,22 @@ import java.util.stream.Collectors;
  * Makes sure a bot that stops running does not leave <b>exposure-increasing</b> orders behind it —
  * and, just as importantly, does not take its own protection down with it.
  *
- * <h2>Why "cancel all working orders" is the wrong rule here</h2>
- * The obvious reading of a dead-man's switch is "if the bot goes quiet, cancel everything it left
- * on the book". For this system that reading is actively harmful, and the reason is worth being
- * explicit about.
+ * <p><b>"Cancel all working orders" is the wrong rule here.</b> A resting <i>entry</i> is
+ * exposure-increasing: if it fills while the process is dead it creates a leveraged position with
+ * nothing protecting it, and cancelling it is right. The protective <i>stop</i> and the reduce-only
+ * exits can only shrink a position; cancelling them strips the protection off an open position at
+ * the moment nobody is watching.
  *
- * <p>The orders this bot leaves resting fall into two categories with opposite risk signs:
- * <ul>
- *   <li>a resting <b>entry</b> order is exposure-increasing. If it fills while the process is dead,
- *       it creates a leveraged position with nothing protecting it. Cancelling it is exactly right.</li>
- *   <li>the protective <b>stop</b> and the reduce-only exits can only ever shrink a position. If they
- *       fill while the process is dead, they do the job they were placed for. Cancelling them strips
- *       the protection off an open position at the precise moment nobody is watching it — which is
- *       the opposite of what a safety mechanism should do.</li>
- * </ul>
+ * <p>Binance's {@code countdownCancelAll} cancels every open order on the symbol and cannot tell the
+ * two apart, so it is armed only for a symbol with a resting entry and <b>no position</b>, and a
+ * symbol holding a position is explicitly disarmed. Server-side is the point: a watchdog thread
+ * inside this process dies in the same crash that stranded the order.
  *
- * <p>Binance's {@code countdownCancelAll} cannot tell the two apart: it cancels every open order on
- * the symbol. So it is armed only for a symbol that has a resting entry and <b>no position</b>, and
- * a symbol that holds a position is explicitly <b>disarmed</b>. Arming it over an open position
- * would schedule the deletion of that position's stop.
+ * <p>The local half covers "alive but cannot reach the exchange": halt after
+ * {@code maxSilenceMillis}, alert, and a best-effort pass that cancels only the non-reducing orders.
  *
- * <p>Server-side is still the point where it does apply: a watchdog thread inside this process dies
- * in the same crash, OOM or container eviction that stranded the order. The countdown keeps running
- * on the exchange's machine, which is the one place a local failure cannot reach.
- *
- * <h2>The local half</h2>
- * A different failure is "the process is alive but cannot reach the exchange". There is nothing to
- * cancel with in that state, so what it does instead is stop taking new risk —
- * {@link TradingHalt} after {@code maxSilenceMillis} without contact — and say so loudly. It also
- * makes a best-effort pass to cancel <b>only the non-reducing</b> working orders, for the same
- * reason as above.
- *
- * <h2>Choosing the countdown</h2>
- * Arm with roughly twice the heartbeat interval. A 30s heartbeat with a 120s countdown survives
- * three consecutive failed heartbeats before the exchange acts.
+ * <p>Arm with roughly twice the heartbeat interval — a 30s heartbeat with a 120s countdown survives
+ * three consecutive failures before the exchange acts.
  */
 public final class DeadMansSwitch {
 

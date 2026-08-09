@@ -10,23 +10,18 @@ import java.util.logging.Logger;
 /**
  * The daily loss limit, and the latch it trips.
  *
- * <p>Two design decisions carry the safety here.
- *
  * <p><b>It latches.</b> Once the day's loss crosses the limit, trading stops until the next UTC day
- * begins — it does not resume because the next mark tick made the number look better. A limit that
- * un-trips is a limit that gets tested repeatedly by the same losing session, which is precisely the
- * session it exists to end.
+ * — it does not resume because the next mark tick made the number look better. A limit that un-trips
+ * is one the same losing session tests repeatedly.
  *
- * <p><b>Open drawdown counts, but only against you.</b> The effective day PnL is
- * {@code realised + min(0, unrealised)}. A position sitting at -8% must block new entries before it
- * closes, otherwise the cap only ever notices losses that have already been taken. The
- * {@code min(0, ...)} is the other half: an open <i>winner</i> must not offset a realised loss.
- * Paper gains evaporate; a realised -3% is -3% whatever the screen says. So the unrealised term can
- * only tighten the gate, never loosen it.
+ * <p><b>Open drawdown counts, but only against you.</b> Effective day PnL is
+ * {@code realised + min(0, unrealised)}: a position at -8% blocks new entries before it closes,
+ * while an open <i>winner</i> cannot offset a realised loss. So the unrealised term can only tighten
+ * the gate.
  *
- * <p>State is in memory and is <b>seeded from the exchange</b> at start-up rather than from a local
- * file — see {@link #seedRealizedPnl}. A restart mid-drawdown must not clear the day's loss, and the
- * exchange's income ledger is the only account of it that a crashed process cannot have corrupted.
+ * <p>State is in memory and <b>seeded from the exchange</b> at start-up, not from a local file — see
+ * {@link #seedRealizedPnl}. A restart mid-drawdown must not clear the day's loss, and the exchange's
+ * income ledger is the one account of it a crashed process cannot have corrupted.
  */
 public final class DailyLossKillSwitch {
 

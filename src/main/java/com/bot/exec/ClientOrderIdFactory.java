@@ -11,21 +11,18 @@ import java.util.Base64;
 /**
  * Client order ids that are a pure function of what the order <i>is</i>.
  *
- * <p>This is the whole of the idempotency story. A network timeout is ambiguous — the order may have
- * reached the exchange with only the response lost — and a retry that invents a fresh id turns that
- * ambiguity into two positions. An id derived from {@code (signalId, purpose, index)} is the same on
- * the retry, so the exchange itself refuses the duplicate ({@code -4116}), and
- * {@link IdempotentOrderPlacer} can simply ask what happened to that id instead of guessing.
+ * <p>This is the whole of the idempotency story. A retry that invents a fresh id turns an ambiguous
+ * timeout into two positions; an id derived from {@code (signalId, purpose, index)} is the same on
+ * the retry, so the exchange refuses the duplicate ({@code -4116}) and
+ * {@link IdempotentOrderPlacer} can ask what happened instead of guessing.
  *
- * <p>Nothing that varies between attempts may enter the hash: no timestamp, no random suffix, no
- * attempt counter — because a well-meaning "make ids unique" change is exactly how this property
- * gets lost. {@code IdempotentResubmitTest.clientOrderIdsAreDeterministic} pins the equality, and
- * {@code IdempotentResubmitTest.reExecutingAPlanIsSafe} pins what it buys: replaying a whole plan
- * does not open a second position.
+ * <p>Nothing that varies between attempts may enter the hash — no timestamp, no random suffix, no
+ * attempt counter — because a well-meaning "make ids unique" change is how this property gets lost.
+ * Pinned by {@code IdempotentResubmitTest.clientOrderIdsAreDeterministic} and
+ * {@code reExecutingAPlanIsSafe}.
  *
- * <p>Format: {@code bt-<purpose letter><index>-<22 chars of base64url(sha-256)>}, always inside
- * Binance's 36-character {@code ^[\.A-Z\:/a-z0-9_-]{1,36}$}. The digest is truncated to 22 base64url
- * characters — 132 bits — so a collision between two distinct signals is not a thing that happens.
+ * <p>Format {@code bt-<purpose letter><index>-<22 chars of base64url(sha-256)>}, inside Binance's
+ * {@code ^[\.A-Z\:/a-z0-9_-]{1,36}$}. 22 base64url characters is 132 bits of digest.
  */
 public final class ClientOrderIdFactory {
 

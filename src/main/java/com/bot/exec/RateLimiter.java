@@ -11,20 +11,14 @@ import java.util.logging.Logger;
  * Keeps this process inside Binance's two independent budgets: request <b>weight</b> per minute per
  * IP, and <b>order count</b> per 10 seconds and per minute per account.
  *
- * <p>Being banned is not an inconvenience here, it is a risk event. A {@code 418} while a position is
- * open means the bot cannot place a stop, cannot amend one, and cannot close — it holds leveraged
- * exposure it has no way to act on, for as long as the ban lasts (Binance escalates repeat offences
- * from two minutes to three days). So the budgets are enforced <i>before</i> sending rather than
- * discovered from the response.
+ * <p>A ban is a risk event, not an inconvenience: a {@code 418} while a position is open means the
+ * bot cannot place a stop, amend one or close, for as long as the ban lasts (Binance escalates from
+ * two minutes to three days). So the budgets are enforced <i>before</i> sending.
  *
- * <p>Both budgets are sliding windows rather than fixed buckets: a fixed bucket that resets on the
- * minute lets a burst spend a full minute's budget in the last second of one window and the first of
- * the next, which is exactly the pattern that trips the limiter it was meant to respect.
- *
- * <p>The exchange's own accounting wins over the local estimate: {@link #observeUsedWeight} folds in
- * the {@code X-MBX-USED-WEIGHT-1M} header, because other processes may share the IP.
- *
- * <p>Time and sleeping are injected so the whole class is testable without waiting.
+ * <p>Sliding windows, not fixed buckets — a bucket that resets on the minute lets a burst spend a
+ * full minute's budget across the boundary, which is the pattern that trips the limit it respects.
+ * {@link #observeUsedWeight} folds in {@code X-MBX-USED-WEIGHT-1M}, since other processes may share
+ * the IP. Time and sleeping are injected, so the class is testable without waiting.
  */
 public final class RateLimiter {
 
@@ -73,10 +67,9 @@ public final class RateLimiter {
         Preconditions.positive(weight, "weight");
         while (true) {
             long waitMs;
-            // The wait is computed under the lock; the waiting itself happens outside it. Sleeping
-            // while holding the monitor would block observeBan and observeUsedWeight for the whole
-            // wait — up to a full ban — so a thread that had just learned of a 418 could not record
-            // it, and the waiting thread would wake up and send anyway.
+            // Wait computed under the lock, waiting done outside it. Sleeping while holding the
+            // monitor would block observeBan for the whole wait, so a thread that had just seen a
+            // 418 could not record it and this one would wake up and send anyway.
             synchronized (this) {
                 long now = nowMs.getAsLong();
                 prune(now);

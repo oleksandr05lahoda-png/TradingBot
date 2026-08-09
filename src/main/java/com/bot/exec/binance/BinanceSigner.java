@@ -14,18 +14,12 @@ import java.util.StringJoiner;
 /**
  * HMAC-SHA256 request signing, and the credentials it needs.
  *
- * <p>Two rules are enforced by construction rather than by convention:
- * <ul>
- *   <li><b>Keys come from the environment only.</b> {@link #fromEnvironment()} is the only way to
- *       build one outside of a test, and there is no constant, config file or default in this
- *       repository that could hold a key.</li>
- *   <li><b>Nothing here is loggable.</b> {@link #toString()} is overridden to reveal nothing, and the
- *       signature is never returned as part of any message. A secret that reaches a log file is a
- *       leaked secret, and log files travel.</li>
- * </ul>
+ * <p>Keys come from the environment only — {@link #fromEnvironment()} is the only way to build one
+ * outside a test, and no constant, config file or default in this repository can hold a key. Nothing
+ * here is loggable: {@link #toString()} reveals nothing and the signature never appears in a message.
  *
  * <p>Binance validates {@code serverTime - timestamp <= recvWindow && timestamp < serverTime + 1000},
- * so the timestamp is taken from an exchange-synchronised clock rather than the local one — see
+ * so the timestamp comes from an exchange-synchronised clock — see
  * {@link BinanceFuturesTestnetAdapter}'s drift correction.
  */
 public final class BinanceSigner {
@@ -83,10 +77,8 @@ public final class BinanceSigner {
         StringJoiner joiner = new StringJoiner("&");
         for (Map.Entry<String, String> e : parameters.entrySet()) {
             if (e.getValue() == null) continue;
-            // Binance signs the literal query string it receives, so the value that is signed and the
-            // value that is sent must be byte-identical. Every parameter this system sends is a
-            // symbol, an enum or a decimal number, none of which contain characters that need
-            // percent-encoding; anything else would have to be encoded on both sides consistently.
+            // Binance signs the literal query string, so signed and sent must be byte-identical.
+            // Every parameter here is a symbol, an enum or a decimal — nothing needing encoding.
             String value = e.getValue();
             Preconditions.require(value.chars().noneMatch(c -> c == '&' || c == '=' || c == '?' || c == ' '),
                     "parameter " + e.getKey() + " contains a character that would corrupt the signed "

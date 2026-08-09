@@ -42,14 +42,12 @@ import java.util.logging.Logger;
  *   created_at  timestamptz
  * </pre>
  *
- * <h2>Two safety properties worth stating</h2>
- * <b>Claim before act.</b> A row moves {@code pending -> sent} with a conditional PATCH that carries
- * {@code status=eq.pending} as a predicate. Two processes polling the same queue cannot both win that
- * write, so a row becomes at most one order even with a duplicate deployment running.
+ * <p><b>Claim before act.</b> A row moves {@code pending -> sent} with a conditional PATCH carrying
+ * {@code status=eq.pending} as a predicate, so two processes polling the same queue cannot both win
+ * it and a row becomes at most one order.
  *
- * <p><b>A failed read throws.</b> It does not return an empty list. "The queue looked empty" and
- * "the queue was unreachable" have to be distinguishable, because only one of them means there is
- * nothing to do.
+ * <p><b>A failed read throws</b> rather than returning an empty list: "the queue looked empty" and
+ * "the queue was unreachable" have to stay distinguishable.
  *
  * <p>Credentials come from the environment and are never logged. Configure {@code SUPABASE_URL} and
  * {@code SUPABASE_QUEUE_KEY} (falling back to {@code SUPABASE_KEY}).
@@ -160,10 +158,8 @@ public final class SupabaseQueueSource implements SignalSource {
         int leverage = row.has("leverage") && !row.isNull("leverage")
                 ? row.getInt("leverage") : defaultLeverage;
 
-        // Refused, not clamped. Silently lowering the number would let a queue keep publishing rows
-        // asking for 20x forever, with nothing in the logs to say the request was ever made — and
-        // the manual input path refuses the same mistake, so the two sources would disagree about
-        // what a bad row means.
+        // Refused, not clamped. Silently lowering it would let a queue publish 20x rows forever with
+        // nothing in the logs, and would disagree with the manual path, which refuses the same row.
         Preconditions.require(leverage >= 1 && leverage <= RiskConstants.MAX_LEVERAGE,
                 "row " + id + " asks for " + leverage + "x, outside [1, " + RiskConstants.MAX_LEVERAGE + "]");
 
