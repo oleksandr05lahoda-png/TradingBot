@@ -1,0 +1,310 @@
+package com.bot.risk;
+
+import com.bot.core.InstrumentFilters;
+import com.bot.core.Preconditions;
+import com.bot.core.Side;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Instant;
+import java.util.List;
+import java.util.logging.Logger;
+
+/**
+ * The gate. Every position this system opens passes through {@link #evaluate}, and nothing that does
+ * not pass it can be constructed downstream, because {@link TradePlan} has no public constructor.
+ *
+ * <p>The engine is pure in the sense that matters: it performs no I/O, opens no sockets and reads no
+ * clock of its own. Balance, filters, margin brackets and the current time are all arguments. That
+ * is what makes a refusal reproducible from its log line — and what lets the whole of it be tested
+ * without an exchange.
+ *
+ * <h2>Order of the checks</h2>
+ * Cheapest and most fatal first, so an expensive computation is never performed for a trade that a
+ * latched kill switch was going to refuse anyway:
+ * <ol>
+ *   <li>inputs are usable at all (fail-closed — an unreadable balance is not a balance of zero);</li>
+ *   <li>the daily loss kill switch;</li>
+ *   <li>leverage against the hard cap;</li>
+ *   <li>position slots: one per symbol, and a limit on how many at once;</li>
+ *   <li>a stop exists — structural if the signal carried one, ATR otherwise, refusal if neither;</li>
+ *   <li>tick alignment of entry and stop, and the geometry that survives it;</li>
+ *   <li>size from the stop;</li>
+ *   <li>ceilings — per-trade notional, per-side exposure, margin utilisation, exchange lot caps;</li>
+ *   <li>lot alignment, minimum quantity and minimum notional;</li>
+ *   <li>leverage against the exchange's own bracket at the final notional;</li>
+ *   <li>the liquidation buffer;</li>
+ *   <li>the reduce-only exits.</li>
+ * </ol>
+ *
+ * <h2>Ceilings only ever reduce</h2>
+ * Steps 7 and 8 are separate on purpose. {@link PositionSizer} is unclamped and always risks exactly
+ * the budgeted amount; the ceilings applied here can lower the size and therefore lower the risk,
+ * never raise either. Nothing in this class can enlarge a position, and nothing in it moves the stop
+ * — which is the invariant that makes "size is derived from the stop" true rather than aspirational.
+ */
+public final class RiskEngine {
+
+    private static final Logger LOG = Logger.getLogger(RiskEngine.class.getName());
+
+    private final RiskConfig config;
+    private final ExposureBook book;
+    private final DailyLossKillSwitch killSwitch;
+
+    public RiskEngine(RiskConfig config, ExposureBook book, DailyLossKillSwitch killSwitch) {
+        this.config = Preconditions.notNull(config, "config");
+        this.book = Preconditions.notNull(book, "book");
+        this.killSwitch = Preconditions.notNull(killSwitch, "killSwitch");
+    }
+
+    public static RiskEngine withDefaults() {
+        RiskConfig cfg = RiskConfig.defaults();
+        return new RiskEngine(cfg, new ExposureBook(), new DailyLossKillSwitch(cfg.dailyLossFractionLimit()));
+    }
+
+    public RiskConfig config() { return config; }
+    public ExposureBook book() { return book; }
+    public DailyLossKillSwitch killSwitch() { return killSwitch; }
+
+    /**
+     * Decides whether {@code request} may become a position, and if so exactly which one.
+     *
+     * @param balanceUsd account balance the risk budget applies to, read from the exchange
+     * @param now        current time; used only for the UTC-day boundary of the loss limit
+     */
+    public RiskDecision evaluate(TradeRequest request, double balanceUsd, Instant now) {
+        Preconditions.notNull(request, "request");
+        Preconditions.notNull(now, "now");
+
+        // 1 ─ Fail-closed inputs. A balance that could not be read is not a balance of zero, and a
+        //     NaN is not a small number: both refuse rather than propagate.
+        if (!Double.isFinite(balanceUsd) || balanceUsd <= 0) {
+            return RiskDecision.reject(RejectReason.INVALID_INPUT,
+                    "balance is not a usable number: " + balanceUsd
+                            + " — refusing rather than assuming a value");
+        }
+
+        // 2 ─ Kill switch. Latched for the rest of the UTC day once the daily loss limit is crossed.
+        killSwitch.observeBalance(balanceUsd, now);
+        DailyLossKillSwitch.Status halt = killSwitch.evaluate(now);
+        if (halt.tripped()) {
+            return RiskDecision.reject(RejectReason.TRADING_HALTED, halt.reason());
+        }
+
+        // 3 ─ Leverage. RiskConfig cannot hold a value above RiskConstants.MAX_LEVERAGE, so this
+        //     check is against both ceilings at once.
+        if (request.leverage() > config.maxLeverage()) {
+            return RiskDecision.reject(RejectReason.LEVERAGE_ABOVE_MAX,
+                    "requested " + request.leverage() + "x, ceiling is " + config.maxLeverage()
+                            + "x (hard limit " + RiskConstants.MAX_LEVERAGE + "x)");
+        }
+
+        // 4 ─ Position slots.
+        if (book.hasPosition(request.symbol())) {
+            return RiskDecision.reject(RejectReason.POSITION_ALREADY_OPEN,
+                    "already holding " + request.symbol());
+        }
+        if (book.openCount() >= config.maxConcurrentPositions()) {
+            return RiskDecision.reject(RejectReason.MAX_CONCURRENT_POSITIONS,
+                    book.openCount() + " open, limit is " + config.maxConcurrentPositions());
+        }
+
+        // 5 ─ The stop. Structural if the signal carried one, ATR otherwise, refusal if neither.
+        StopLoss stop;
+        try {
+            stop = StopLoss.resolve(request.side(), request.entryPrice(),
+                    request.structuralStopPrice(), request.atr(), config.atrStopMultiplier());
+        } catch (IllegalArgumentException e) {
+            boolean nothingToUse = request.structuralStopPrice().isEmpty() && request.atr().isEmpty();
+            return RiskDecision.reject(
+                    nothingToUse ? RejectReason.NO_STOP_AVAILABLE : RejectReason.STOP_GEOMETRY,
+                    e.getMessage());
+        }
+
+        // 6 ─ Tick alignment, then re-check the geometry against the aligned prices. The entry moves
+        //     to the tick that is not worse than the one requested; the stop moves towards the entry
+        //     so the realised risk can only shrink.
+        InstrumentFilters filters = request.filters();
+        BigDecimal entryTick;
+        BigDecimal stopTick;
+        try {
+            entryTick = filters.quantizePrice(request.entryPrice(),
+                    request.side() == Side.LONG ? RoundingMode.FLOOR : RoundingMode.CEILING);
+            stopTick = filters.quantizeStopPrice(request.side(), stop.price());
+        } catch (ArithmeticException | IllegalArgumentException e) {
+            return RiskDecision.reject(RejectReason.PRICE_OUT_OF_RANGE,
+                    "entry/stop could not be aligned to tickSize " + filters.tickSize() + ": " + e.getMessage());
+        }
+        double entry = entryTick.doubleValue();
+        double stopPrice = stopTick.doubleValue();
+
+        if (!filters.isPriceInRange(entryTick) || !filters.isPriceInRange(stopTick)) {
+            return RiskDecision.reject(RejectReason.PRICE_OUT_OF_RANGE,
+                    "entry " + entryTick + " or stop " + stopTick + " is outside PRICE_FILTER ["
+                            + filters.minPrice() + ", " + filters.maxPrice() + "]");
+        }
+        if (!request.side().isValidStopGeometry(entry, stopPrice)) {
+            return RiskDecision.reject(RejectReason.STOP_GEOMETRY,
+                    "after tick alignment the stop " + stopTick + " is no longer on the losing side of "
+                            + entryTick + " for a " + request.side()
+                            + " — the stop distance is smaller than one tick");
+        }
+
+        // 7 ─ Size from the stop. Unclamped: this quantity risks exactly the budget.
+        double budgetedRiskUsd = balanceUsd * config.riskFractionPerTrade();
+        double idealQty = PositionSizer.quantityForRisk(
+                balanceUsd, config.riskFractionPerTrade(), entry, stopPrice);
+
+        // 8 ─ Ceilings. Each is expressed as a maximum notional; the tightest one wins, and the
+        //     binding one is recorded so an unexpectedly small position can be explained.
+        double perTradeCap = Math.min(balanceUsd * config.maxNotionalFractionPerTrade(),
+                config.maxNotionalUsdPerTrade());
+        double sideCapFraction = request.side() == Side.LONG
+                ? config.maxLongExposureFraction() : config.maxShortExposureFraction();
+        double sideUsed = book.exposureUsd(request.side());
+        double sideHeadroom = balanceUsd * sideCapFraction - sideUsed;
+        if (sideHeadroom <= 0) {
+            return RiskDecision.reject(
+                    request.side() == Side.LONG ? RejectReason.LONG_EXPOSURE_CAP : RejectReason.SHORT_EXPOSURE_CAP,
+                    String.format("%s exposure $%.2f already at the cap %.0f%% of $%.2f",
+                            request.side(), sideUsed, sideCapFraction * 100, balanceUsd));
+        }
+        double marginCap = balanceUsd * config.maxMarginUtilizationFraction() * request.leverage();
+        double lotCap = filters.marketMaxQty().min(filters.maxQty()).doubleValue() * entry;
+
+        double notionalCap = Math.min(Math.min(perTradeCap, sideHeadroom), Math.min(marginCap, lotCap));
+        double idealNotional = idealQty * entry;
+        double cappedQty = idealNotional <= notionalCap ? idealQty : notionalCap / entry;
+        String sizingNote = describeBinding(idealNotional, perTradeCap, sideHeadroom, marginCap, lotCap, request.side());
+
+        // 9 ─ Lot alignment, always downwards, then the exchange's minimums.
+        BigDecimal quantity = filters.quantizeQuantityDown(cappedQty);
+        if (quantity.signum() <= 0 || !filters.isQuantityInRange(quantity, true)) {
+            BigDecimal smallest = filters.smallestTradableQuantity(entry);
+            double balanceNeeded = smallest.doubleValue() * Math.abs(entry - stopPrice)
+                    / config.riskFractionPerTrade();
+            return RiskDecision.reject(RejectReason.BELOW_MIN_QUANTITY,
+                    String.format("sized to %s, below the exchange minimum %s. At this stop distance "
+                                    + "(%.4f%% of price) a balance of about $%.2f is needed before %.2f%% "
+                                    + "risk buys one tradable lot.",
+                            quantity.toPlainString(), smallest.toPlainString(),
+                            100.0 * Math.abs(entry - stopPrice) / entry, balanceNeeded,
+                            config.riskFractionPerTrade() * 100));
+        }
+        if (!filters.meetsMinNotional(entryTick, quantity)) {
+            return RiskDecision.reject(RejectReason.BELOW_MIN_NOTIONAL,
+                    String.format("notional $%.4f is below the exchange minimum $%s",
+                            quantity.doubleValue() * entry, filters.minNotional().toPlainString()));
+        }
+
+        // 10 ─ Everything from here is computed from the FINAL quantity, never the intended one.
+        double qty = quantity.doubleValue();
+        double notionalUsd = qty * entry;
+        double riskUsd = PositionSizer.riskUsd(qty, entry, stopPrice);
+        double riskFraction = riskUsd / balanceUsd;
+
+        if (riskUsd > budgetedRiskUsd * (1 + 1e-9)) {
+            // Unreachable while steps 7-9 only ever shrink the size. Checked anyway: this is the
+            // last place the number can be caught before it becomes an order.
+            return RiskDecision.reject(RejectReason.RISK_BUDGET_OVERRUN,
+                    String.format("final size risks $%.6f against a budget of $%.6f", riskUsd, budgetedRiskUsd));
+        }
+
+        int bracketMaxLeverage = request.marginTiers().maxLeverageAt(notionalUsd);
+        if (request.leverage() > bracketMaxLeverage) {
+            return RiskDecision.reject(RejectReason.LEVERAGE_ABOVE_EXCHANGE_BRACKET,
+                    String.format("%dx requested, but the exchange allows at most %dx at a notional of $%.2f",
+                            request.leverage(), bracketMaxLeverage, notionalUsd));
+        }
+
+        double initialMarginUsd = notionalUsd / request.leverage();
+        if (initialMarginUsd > balanceUsd * config.maxMarginUtilizationFraction() * (1 + 1e-9)) {
+            return RiskDecision.reject(RejectReason.INSUFFICIENT_MARGIN,
+                    String.format("initial margin $%.2f exceeds the %.0f%% of $%.2f this config will lock up",
+                            initialMarginUsd, config.maxMarginUtilizationFraction() * 100, balanceUsd));
+        }
+
+        // 11 ─ The liquidation buffer. The one check that can refuse a trade whose sizing is perfect.
+        LiquidationSafety.Buffer buffer;
+        try {
+            buffer = LiquidationSafety.evaluateForPosition(request.side(), entry, stopPrice, qty,
+                    request.leverage(), request.marginTiers(), config.takerFeeFraction());
+        } catch (IllegalArgumentException e) {
+            return RiskDecision.reject(RejectReason.LIQUIDATION_BUFFER,
+                    "liquidation price could not be established: " + e.getMessage());
+        }
+        if (!buffer.satisfies(config.minLiquidationBufferFraction())) {
+            int safeLeverage = LiquidationSafety.highestSafeLeverage(request.side(), entry, stopPrice, qty,
+                    config.maxLeverage(), request.marginTiers(), config.takerFeeFraction(),
+                    config.minLiquidationBufferFraction());
+            String remedy = safeLeverage > 0
+                    ? "the same trade passes at " + safeLeverage + "x or lower"
+                    : "no leverage from 1x to " + config.maxLeverage() + "x passes; the stop is too wide "
+                            + "for this instrument's maintenance margin";
+            return RiskDecision.reject(RejectReason.LIQUIDATION_BUFFER,
+                    String.format("stop %s leaves %.1f%% of the entry-to-liquidation distance (liq %.8g, "
+                                    + "minimum %.0f%%) at %dx — %s",
+                            stopTick.toPlainString(), buffer.fraction() * 100, buffer.liquidationPrice(),
+                            config.minLiquidationBufferFraction() * 100, request.leverage(), remedy));
+        }
+
+        // 12 ─ Reduce-only exits, in R.
+        List<TakeProfitPolicy.ProjectedLeg> takeProfits =
+                config.takeProfitPolicy().project(request.side(), entry, stopPrice, quantity, filters);
+        if (takeProfits.isEmpty()) {
+            sizingNote += "; no take-profit leg is large enough to be sendable — the stop is the only exit";
+        }
+
+        TradePlan plan = new TradePlan(request.signalId(), request.symbol(), request.side(),
+                entryTick, stopTick, stop, quantity, request.leverage(), notionalUsd, initialMarginUsd,
+                riskUsd, riskFraction, buffer.liquidationPrice(), buffer.fraction(), takeProfits,
+                filters, sizingNote);
+
+        LOG.info("[RiskEngine] approved " + plan);
+        return RiskDecision.approve(plan);
+    }
+
+    /**
+     * Records that a plan actually became a position. Called with the <b>filled</b> quantity and the
+     * average fill price, never with the plan's intended numbers: a partial fill is a different
+     * position from the one that was approved, and the book has to hold what exists.
+     */
+    public void registerFill(TradePlan plan, BigDecimal filledQuantity, double averageFillPrice) {
+        Preconditions.notNull(plan, "plan");
+        Preconditions.notNull(filledQuantity, "filledQuantity");
+        Preconditions.require(filledQuantity.signum() > 0, "filledQuantity must be positive");
+        Preconditions.positiveFinite(averageFillPrice, "averageFillPrice");
+
+        double qty = filledQuantity.doubleValue();
+        book.open(new ExposureBook.OpenPosition(
+                plan.symbol(), plan.side(), filledQuantity, averageFillPrice,
+                qty * averageFillPrice,
+                PositionSizer.riskUsd(qty, averageFillPrice, plan.stopPrice().doubleValue())));
+    }
+
+    /**
+     * Drops a symbol from the exposure book.
+     *
+     * <p>It deliberately does not book a realised PnL. That number comes from the exchange's income
+     * ledger during reconciliation — see {@link DailyLossKillSwitch#seedRealizedPnl} — because a
+     * locally computed PnL misses fees and funding, and because a value accumulated here plus a
+     * value seeded there is the same number counted twice.
+     */
+    public void registerClose(String symbol) {
+        book.close(symbol);
+    }
+
+    private static String describeBinding(double idealNotional,
+                                          double perTradeCap,
+                                          double sideHeadroom,
+                                          double marginCap,
+                                          double lotCap,
+                                          Side side) {
+        double tightest = Math.min(Math.min(perTradeCap, sideHeadroom), Math.min(marginCap, lotCap));
+        if (idealNotional <= tightest) return "sized by the stop, no ceiling bound";
+        if (tightest == perTradeCap) return "reduced by the per-trade notional cap";
+        if (tightest == sideHeadroom) return "reduced by remaining " + side + " exposure headroom";
+        if (tightest == marginCap) return "reduced by the margin utilisation cap";
+        return "reduced by the exchange lot ceiling";
+    }
+}

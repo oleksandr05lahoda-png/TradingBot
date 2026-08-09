@@ -54,3 +54,15 @@ bin/
 
 ### Offline analysis scratch (data, not code) ###
 /analysis/
+# Same category as /analysis/: 1.4MB of backtest result CSVs, untracked since it was created.
+/archive/
+# Local MCP server configuration, per-machine.
+/.ai/
+
+### Secrets ###
+# local.env carries a Supabase service key. Its own header claimed it was already ignored;
+# it was not, and it sat untracked-but-committable from 2026-07-28 until this commit.
+# API keys are read from the environment only — see README, "Keys".
+local.env
+*.env
+!example.env
