@@ -8,6 +8,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -64,7 +65,7 @@ class ReconciliationDriftTest {
     @DisplayName("a position the book holds but the exchange has closed is drift")
     void ghostPositionIsDrift() {
         engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
-                new BigDecimal("0.041"), 64_000, 2_624, 49.2));
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
 
         Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
 
@@ -77,7 +78,7 @@ class ReconciliationDriftTest {
     @DisplayName("the same symbol in the opposite direction is a side mismatch, not a size difference")
     void sideMismatchIsItsOwnKind() {
         engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.SHORT,
-                new BigDecimal("0.041"), 64_000, 2_624, 49.2));
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
         exchange.plantPosition("BTCUSDT", "0.041", "64000");
 
         Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
@@ -91,7 +92,7 @@ class ReconciliationDriftTest {
     @DisplayName("a size difference beyond tolerance is drift")
     void quantityMismatchIsDrift() {
         engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
-                new BigDecimal("0.041"), 64_000, 2_624, 49.2));
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
         exchange.plantPosition("BTCUSDT", "0.082", "64000");
 
         Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
@@ -183,6 +184,92 @@ class ReconciliationDriftTest {
     }
 
     @Test
+    @DisplayName("a venue that cannot list conditional orders still confirms the stop by name")
+    void stopIsConfirmedByNameWhenItCannotBeListed() throws Exception {
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecutionCoordinator.Report execution =
+                ExecFixtures.coordinator(exchange, engine, halt, alerts).execute(plan);
+        String stopId = execution.protectiveStop().orElseThrow().clientOrderId();
+        exchange.listsConditionalOrders = false;   // demo-fapi: accepted, resting, invisible to the listing
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.converged(), report.describe());
+        assertFalse(halt.isHalted());
+        assertEquals(Optional.of(stopId), engine.book().get("BTCUSDT").orElseThrow().protectiveStopId(),
+                "the id must survive the pass, or the next one has nothing to ask about");
+    }
+
+    @Test
+    @DisplayName("a stop cancelled behind the bot's back is caught by name, not by the listing")
+    void cancelledStopIsCaughtByName() throws Exception {
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecutionCoordinator.Report execution =
+                ExecFixtures.coordinator(exchange, engine, halt, alerts).execute(plan);
+        exchange.cancelOrder("BTCUSDT", execution.protectiveStop().orElseThrow().clientOrderId());
+        exchange.listsConditionalOrders = false;
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.drifts().stream()
+                        .anyMatch(d -> d.kind() == Reconciler.Drift.Kind.POSITION_WITHOUT_STOP),
+                "this is the gap the named check exists to close: " + report.describe());
+        assertTrue(halt.isHalted());
+    }
+
+    @Test
+    @DisplayName("a stop that has just triggered gets one pass of grace, then counts as naked")
+    void triggeredStopIsGivenOnePassThenReported() throws Exception {
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecutionCoordinator.Report execution =
+                ExecFixtures.coordinator(exchange, engine, halt, alerts).execute(plan);
+        exchange.listsConditionalOrders = false;
+        // Fired, but the position is still there: normal for a second, an emergency if it persists.
+        exchange.setOrderState(execution.protectiveStop().orElseThrow().clientOrderId(),
+                OrderTypes.OrderState.FILLED);
+
+        Reconciler.Report first = reconciler.reconcile(ExecFixtures.NOON);
+        assertTrue(first.converged(),
+                "a stop-out in flight must not raise a critical alert: " + first.describe());
+
+        Reconciler.Report second = reconciler.reconcile(ExecFixtures.NOON.plusSeconds(30));
+        assertTrue(second.drifts().stream()
+                        .anyMatch(d -> d.kind() == Reconciler.Drift.Kind.POSITION_WITHOUT_STOP),
+                "a trigger whose close never landed leaves a naked position: " + second.describe());
+        assertTrue(halt.isHalted());
+    }
+
+    @Test
+    @DisplayName("a stop status this build cannot parse is ignorance, not a naked position")
+    void unreadableStopStatusIsNotReportedAsNaked() throws Exception {
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecutionCoordinator.Report execution =
+                ExecFixtures.coordinator(exchange, engine, halt, alerts).execute(plan);
+        exchange.listsConditionalOrders = false;
+        exchange.setOrderState(execution.protectiveStop().orElseThrow().clientOrderId(),
+                OrderTypes.OrderState.UNKNOWN);
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.converged(), "a vocabulary change must not become a false emergency: "
+                + report.describe());
+    }
+
+    @Test
+    @DisplayName("with no stop id on record the reconciler stays quiet rather than crying wolf")
+    void positionWithNoRecordedStopIsNotDeclaredNaked() {
+        engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
+        exchange.plantPosition("BTCUSDT", "0.041", "64000");
+        exchange.listsConditionalOrders = false;
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.converged(),
+                "nothing is known either way, so nothing is claimed: " + report.describe());
+    }
+
+    @Test
     @DisplayName("a working order still inside the grace window is re-inspected on the next pass")
     void orphanGraceWindowIsRevisited() throws Exception {
         // An order young enough to be a race on this pass. Its symbol holds no position, so without
@@ -192,7 +279,7 @@ class ReconciliationDriftTest {
                 com.bot.exec.OrderTypes.TimeInForce.GTC,
                 ClientOrderIdFactory.create("stale-signal", com.bot.exec.OrderTypes.OrderPurpose.ENTRY, 0)));
         engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
-                new BigDecimal("0.041"), 64_000, 2_624, 49.2));
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
 
         // Pass 1: the book knows the symbol, so it is inspected; the order is younger than the grace.
         reconciler.reconcile(ExecFixtures.NOON);

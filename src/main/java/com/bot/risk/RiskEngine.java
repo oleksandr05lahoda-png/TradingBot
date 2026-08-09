@@ -8,6 +8,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
@@ -230,18 +231,25 @@ public final class RiskEngine {
     /**
      * Takes the <b>filled</b> quantity and average fill price, never the plan's intended numbers:
      * a partial fill is a different position from the approved one.
+     *
+     * @param protectiveStopId client order id of the stop already resting on the exchange. Required,
+     *                         not optional: a filled position is only ever booked here after its stop
+     *                         is placed, and reconciliation later asks the exchange about it by name.
      */
-    public void registerFill(TradePlan plan, BigDecimal filledQuantity, double averageFillPrice) {
+    public void registerFill(TradePlan plan, BigDecimal filledQuantity, double averageFillPrice,
+                             String protectiveStopId) {
         Preconditions.notNull(plan, "plan");
         Preconditions.notNull(filledQuantity, "filledQuantity");
         Preconditions.require(filledQuantity.signum() > 0, "filledQuantity must be positive");
         Preconditions.positiveFinite(averageFillPrice, "averageFillPrice");
+        Preconditions.notBlank(protectiveStopId, "protectiveStopId");
 
         double qty = filledQuantity.doubleValue();
         book.open(new ExposureBook.OpenPosition(
                 plan.symbol(), plan.side(), filledQuantity, averageFillPrice,
                 qty * averageFillPrice,
-                PositionSizer.riskUsd(qty, averageFillPrice, plan.stopPrice().doubleValue())));
+                PositionSizer.riskUsd(qty, averageFillPrice, plan.stopPrice().doubleValue()),
+                Optional.of(protectiveStopId)));
     }
 
     /**

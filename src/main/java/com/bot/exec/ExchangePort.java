@@ -60,7 +60,8 @@ public interface ExchangePort extends AutoCloseable {
      * <p>False means a protective stop may exist and not appear in the list, so the absence of one
      * proves nothing. The reconciler must not call a position naked on that basis — a check that
      * cries wolf on every healthy position is worse than no check, because it trains the operator to
-     * ignore the one that matters.
+     * ignore the one that matters. It asks {@link #queryOrder} for the stop by name instead, which
+     * these venues do answer.
      */
     default boolean canListConditionalOrders() { return true; }
 

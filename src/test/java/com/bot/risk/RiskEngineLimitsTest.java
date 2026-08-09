@@ -64,7 +64,7 @@ class RiskEngineLimitsTest {
         RiskEngine engine = RiskFixtures.engine();
         TradePlan first = approve(engine.evaluate(
                 RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON));
-        engine.registerFill(first, first.quantity(), 64_000);
+        engine.registerFill(first, first.quantity(), 64_000, "bt-s0-fixture");
 
         assertEquals(RejectReason.POSITION_ALREADY_OPEN, reject(engine.evaluate(
                 RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON)).reason());
@@ -76,7 +76,7 @@ class RiskEngineLimitsTest {
         RiskEngine engine = RiskFixtures.engine(RiskConfig.defaults().withMaxConcurrentPositions(1));
         TradePlan first = approve(engine.evaluate(
                 RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON));
-        engine.registerFill(first, first.quantity(), 64_000);
+        engine.registerFill(first, first.quantity(), 64_000, "bt-s0-fixture");
 
         TradeRequest other = new TradeRequest("sig-2", "COARSEUSDT", Side.LONG, 1_000,
                 OptionalDouble.of(950), OptionalDouble.empty(), 3,
@@ -95,7 +95,7 @@ class RiskEngineLimitsTest {
 
         TradePlan first = approve(engine.evaluate(
                 RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON));
-        engine.registerFill(first, first.quantity(), 64_000);
+        engine.registerFill(first, first.quantity(), 64_000, "bt-s0-fixture");
         assertEquals(2624.0, engine.book().longExposureUsd(), 1e-9);
         assertEquals(0.0, engine.book().shortExposureUsd(), 1e-9);
 

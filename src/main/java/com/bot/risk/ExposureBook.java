@@ -18,15 +18,23 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class ExposureBook {
 
-    /** {@code quantity} is always positive — direction lives in {@code side}; {@code riskUsd} is
-     *  the entry-to-stop money as planned at open. */
+    /**
+     * {@code quantity} is always positive — direction lives in {@code side}; {@code riskUsd} is the
+     * entry-to-stop money as planned at open.
+     *
+     * @param protectiveStopId client order id of the stop guarding this position. Empty only for a
+     *                         position adopted from the exchange, whose stop this process never
+     *                         named; reconciliation needs it to confirm the stop on a venue that
+     *                         will not list conditional orders.
+     */
     public record OpenPosition(
             String symbol,
             Side side,
             BigDecimal quantity,
             double entryPrice,
             double notionalUsd,
-            double riskUsd) {
+            double riskUsd,
+            Optional<String> protectiveStopId) {
 
         public OpenPosition {
             Preconditions.notBlank(symbol, "symbol");
@@ -36,6 +44,7 @@ public final class ExposureBook {
             Preconditions.positiveFinite(entryPrice, "entryPrice");
             Preconditions.positiveFinite(notionalUsd, "notionalUsd");
             Preconditions.nonNegativeFinite(riskUsd, "riskUsd");
+            Preconditions.notNull(protectiveStopId, "protectiveStopId");
         }
     }
 

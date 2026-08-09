@@ -176,7 +176,7 @@ public final class ExecutionCoordinator {
             return abandonUnprotectedPosition(plan, entry, filled, avgPrice, e);
         }
 
-        engine.registerFill(plan, filled, avgPrice.doubleValue());
+        engine.registerFill(plan, filled, avgPrice.doubleValue(), stop.clientOrderId());
 
         // ── Only now is it safe to do arithmetic. ───────────────────────────────────────────────
         double realisedRisk = filled.doubleValue()

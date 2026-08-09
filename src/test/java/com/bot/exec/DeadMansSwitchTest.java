@@ -38,7 +38,7 @@ class DeadMansSwitchTest {
 
     private void openBook(String symbol) {
         engine.book().open(new ExposureBook.OpenPosition(symbol, Side.LONG,
-                new BigDecimal("0.041"), 64_000, 2_624, 49.2));
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, java.util.Optional.empty()));
     }
 
     @Test

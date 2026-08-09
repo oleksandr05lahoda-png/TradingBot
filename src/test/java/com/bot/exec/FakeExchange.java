@@ -51,6 +51,8 @@ final class FakeExchange implements ExchangePort {
     ExchangeException cancelFailure = null;
     /** Liquidation price the exchange reports for every position. ZERO means "not reachable". */
     BigDecimal reportedLiquidationPrice = BigDecimal.ZERO;
+    /** False mirrors demo-fapi: conditional orders rest and answer a query by id, but never list. */
+    boolean listsConditionalOrders = true;
 
     int placeOrderCalls = 0;
     int queryOrderCalls = 0;
@@ -78,6 +80,20 @@ final class FakeExchange implements ExchangePort {
     void clearPosition(String symbol) {
         positions.remove(symbol);
         entryPrices.remove(symbol);
+    }
+
+    /**
+     * Moves an order to a state without touching the position — how a stop looks in the seconds
+     * between triggering and the market order behind it settling, and how one looks when the venue
+     * reports a status this build cannot parse.
+     */
+    void setOrderState(String clientOrderId, OrderState state) {
+        OrderStatus existing = ordersByClientId.get(clientOrderId);
+        if (existing == null) return;
+        ordersByClientId.put(clientOrderId, new OrderStatus(existing.clientOrderId(),
+                existing.exchangeOrderId(), existing.symbol(), state, existing.type(),
+                existing.originalQuantity(), existing.executedQuantity(), existing.averagePrice(),
+                existing.stopPrice(), existing.reduceOnly(), existing.closePosition(), serverTimeMillis()));
     }
 
     Long deadMansCountdownFor(String symbol) { return deadMansCountdowns.get(symbol); }
@@ -184,10 +200,14 @@ final class FakeExchange implements ExchangePort {
     @Override public List<OrderStatus> openOrders(String symbol) {
         List<OrderStatus> out = new ArrayList<>();
         for (OrderStatus o : ordersByClientId.values()) {
-            if (o.symbol().equals(symbol) && o.isWorking()) out.add(o);
+            if (!o.symbol().equals(symbol) || !o.isWorking()) continue;
+            if (!listsConditionalOrders && o.type().isConditional()) continue;
+            out.add(o);
         }
         return out;
     }
+
+    @Override public boolean canListConditionalOrders() { return listsConditionalOrders; }
 
     @Override public List<PositionSnapshot> openPositions() {
         List<PositionSnapshot> out = new ArrayList<>();
