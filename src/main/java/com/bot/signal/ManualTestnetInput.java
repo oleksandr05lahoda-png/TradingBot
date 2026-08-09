@@ -95,8 +95,12 @@ public final class ManualTestnetInput implements SignalSource {
         return out;
     }
 
-    @Override public void onAccepted(Signal signal, String clientOrderId) {
-        LOG.info("[ManualInput] accepted " + signal.id() + " -> clientOrderId " + clientOrderId);
+    @Override public void onAccepted(Signal signal, ExecutionFeedback feedback) {
+        LOG.info(String.format("[ManualInput] %s filled %s @ %s (%.1f bp vs the %s asked for) — %s",
+                signal.id(), feedback.filledQuantity().toPlainString(),
+                feedback.averageFillPrice().toPlainString(),
+                feedback.slippageBpAgainst(signal.entryPrice(), signal.side() == com.bot.core.Side.LONG),
+                signal.entryPrice(), feedback.note()));
     }
 
     @Override public void onRejected(Signal signal, String reason) {

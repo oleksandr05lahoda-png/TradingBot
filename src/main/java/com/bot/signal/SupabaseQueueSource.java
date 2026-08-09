@@ -139,6 +139,37 @@ public final class SupabaseQueueSource implements SignalSource {
         return out;
     }
 
+    /**
+     * Writes back what the exchange did. This is the row's whole point beyond routing: {@code entry}
+     * is what a sleeve assumed and {@code filled_price} is what it got, and the gap between them is
+     * the execution cost the lab has so far had to guess at.
+     */
+    @Override public void onAccepted(Signal signal, ExecutionFeedback feedback)
+            throws IOException, InterruptedException {
+        long id = rowIdOf(signal);
+        if (id < 0) return;
+
+        JSONObject body = new JSONObject();
+        body.put("client_order_id", feedback.clientOrderId());
+        body.put("filled_qty", feedback.filledQuantity().doubleValue());
+        body.put("filled_price", feedback.averageFillPrice().doubleValue());
+        body.put("executed_at", clock.instant().toString());
+        body.put("exec_note", feedback.note());
+
+        HttpResponse<String> response = send(HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id))
+                .timeout(Duration.ofSeconds(15))
+                .method("PATCH", HttpRequest.BodyPublishers.ofString(body.toString())));
+
+        if (response.statusCode() / 100 != 2) {
+            // Loud, but not fatal: the position exists and is protected either way. What is lost is
+            // the measurement, and a lost measurement must not read as a lost trade.
+            LOG.warning("[SupabaseQueue] row " + id + " executed but the fill could not be written "
+                    + "back (HTTP " + response.statusCode() + ") — this trade is missing from the "
+                    + "execution-cost sample");
+        }
+    }
+
     @Override public void onRejected(Signal signal, String reason) throws IOException, InterruptedException {
         long id = rowIdOf(signal);
         if (id >= 0) reject(id, reason);
@@ -185,6 +216,9 @@ public final class SupabaseQueueSource implements SignalSource {
         if (id < 0) return;
         JSONObject body = new JSONObject();
         body.put("status", STATUS_REJECTED);
+        // The reason matters as much as the refusal: a gate that rejects everything for one reason
+        // is a defect, and it is invisible if the row only records that something was refused.
+        body.put("exec_note", reason == null ? "" : reason);
         HttpResponse<String> response = send(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id))
                 .timeout(Duration.ofSeconds(15))

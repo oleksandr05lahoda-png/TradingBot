@@ -26,8 +26,11 @@ public interface SignalSource extends AutoCloseable {
      */
     List<Signal> poll() throws Exception;
 
-    /** Called once the gate approved a signal and an order carrying {@code clientOrderId} was sent. */
-    default void onAccepted(Signal signal, String clientOrderId) throws Exception {}
+    /**
+     * Called once a signal became a position, carrying what the exchange actually did. The feedback
+     * is the only place the realised execution cost is recorded — see {@link ExecutionFeedback}.
+     */
+    default void onAccepted(Signal signal, ExecutionFeedback feedback) throws Exception {}
 
     /** Called when the gate refused a signal, with the reason. */
     default void onRejected(Signal signal, String reason) throws Exception {}

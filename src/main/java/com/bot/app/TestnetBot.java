@@ -19,6 +19,7 @@ import com.bot.risk.RiskConstants;
 import com.bot.risk.RiskDecision;
 import com.bot.risk.RiskEngine;
 import com.bot.risk.TradeRequest;
+import com.bot.signal.ExecutionFeedback;
 import com.bot.signal.ManualTestnetInput;
 import com.bot.signal.Signal;
 import com.bot.signal.SignalSource;
@@ -172,8 +173,11 @@ public final class TestnetBot {
                         LOG.info("[Loop] " + report.outcome() + " — " + report.note());
                     }
                     if (report.opened()) {
-                        signals.onAccepted(signal,
-                                report.entryOrder().map(o -> o.clientOrderId()).orElse("unknown"));
+                        signals.onAccepted(signal, new ExecutionFeedback(
+                                report.entryOrder().map(o -> o.clientOrderId()).orElse("unknown"),
+                                report.filledQuantity(),
+                                report.averageFillPrice(),
+                                report.outcome() + ": " + report.note()));
                     } else {
                         signals.onRejected(signal, report.outcome() + ": " + report.note());
                     }
