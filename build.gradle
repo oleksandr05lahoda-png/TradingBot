@@ -41,6 +41,32 @@ application {
     mainClass = 'com.bot.app.TestnetBot'
 }
 
+run {
+    // Credentials come from local.env, which is git-ignored and never committed. Loading them here
+    // rather than asking the operator to type `export` has two points: the keys never touch a shell
+    // history, and the command is identical on Git Bash, PowerShell and the IDE's green arrow —
+    // which is one fewer way to end up wondering why the bot says the key is missing.
+    //
+    // A real environment variable still wins, so a deployment can set them the usual way.
+    def secrets = file('local.env')
+    if (secrets.exists()) {
+        secrets.eachLine { rawLine ->
+            def line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith('#')) return
+            def split = line.indexOf('=')
+            if (split <= 0) return
+            def key = line.substring(0, split).trim()
+            def value = line.substring(split + 1).trim().replaceAll(/^["']|["']$/, '')
+            if (System.getenv(key) == null && !value.isEmpty()) {
+                environment key, value
+            }
+        }
+    }
+    // Without this the manual console source reads an empty stream: Gradle does not connect stdin
+    // to the application by default, so typing a signal would go nowhere.
+    standardInput = System.in
+}
+
 shadowJar {
     archiveFileName = 'bot.jar'
     mergeServiceFiles()

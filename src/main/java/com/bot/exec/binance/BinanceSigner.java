@@ -49,9 +49,13 @@ public final class BinanceSigner {
         String secret = System.getenv("BINANCE_TESTNET_API_SECRET");
         if (key == null || key.isBlank() || secret == null || secret.isBlank()) {
             throw new IllegalStateException(
-                    "testnet credentials are not set. Export BINANCE_TESTNET_API_KEY and "
-                            + "BINANCE_TESTNET_API_SECRET, from a key created with withdrawals DISABLED. "
-                            + "See the README section \"Testnet keys\".");
+                    "testnet credentials are not set.\n"
+                            + "  Put them in local.env (git-ignored) as two lines:\n"
+                            + "      BINANCE_TESTNET_API_KEY=...\n"
+                            + "      BINANCE_TESTNET_API_SECRET=...\n"
+                            + "  Copy example.env if the file does not exist yet. The key must come\n"
+                            + "  from the demo/testnet site and must have WITHDRAWALS DISABLED.\n"
+                            + "  Real environment variables work too and take precedence.");
         }
         return new BinanceSigner(key.trim(), secret.trim());
     }

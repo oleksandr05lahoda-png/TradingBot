@@ -33,11 +33,15 @@ first matters.
 
 ## Quick start
 
+Copy `example.env` to `local.env`, fill in the two testnet keys, then:
+
 ```bash
-export BINANCE_TESTNET_API_KEY=...
-export BINANCE_TESTNET_API_SECRET=...
 ./gradlew run
 ```
+
+`local.env` is git-ignored and has never been committed. The `run` task loads it, so the keys never
+go into a shell history, a source file or the command line. Real environment variables still take
+precedence, which is how a deployment supplies them.
 
 Then type a signal at the prompt:
 
@@ -87,12 +91,13 @@ typo must not take down a loop that is currently holding positions.
    else. This is the cheapest and strongest safety measure available: a leaked trading key without
    withdrawal rights cannot move your money off the exchange. Add an IP allowlist as well if the
    bot runs from a fixed address.
-4. Export the key and secret as environment variables. **Never** put them in a source file, a
-   config file under version control, or a command that lands in your shell history:
+4. Put the key and secret in `local.env` — copy `example.env` if it does not exist yet. That file is
+   git-ignored. **Never** put them in a source file, in a file under version control, or in a
+   command that lands in your shell history:
 
-```bash
-export BINANCE_TESTNET_API_KEY=...
-export BINANCE_TESTNET_API_SECRET=...
+```
+BINANCE_TESTNET_API_KEY=...
+BINANCE_TESTNET_API_SECRET=...
 ```
 
 `BinanceSigner.fromEnvironment()` is the only way credentials enter this program, its `toString()`
