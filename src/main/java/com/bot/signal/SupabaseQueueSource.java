@@ -91,12 +91,24 @@ public final class SupabaseQueueSource implements SignalSource {
      */
     public static SupabaseQueueSource fromEnvironmentOrNull(int defaultLeverage) {
         String url = System.getenv("SUPABASE_URL");
-        String key = System.getenv("SUPABASE_QUEUE_KEY");
-        if (key == null || key.isBlank()) key = System.getenv("SUPABASE_KEY");
-        if (url == null || url.isBlank() || key == null || key.isBlank()) {
+        // In name order of preference, but any of them may hold it. bot_orders has RLS enabled and
+        // no policies, so a publishable key can do nothing with it at all — this has to be a secret
+        // key, and accepting the name the operator already uses saves a duplicated line and the
+        // "which one did I put where" mistake that comes with it.
+        String key = firstPresent(System.getenv("SUPABASE_QUEUE_KEY"),
+                System.getenv("SUPABASE_KEY"),
+                System.getenv("SUPABASE_SERVICE_KEY"));
+        if (url == null || url.isBlank() || key == null) {
             return null;
         }
         return new SupabaseQueueSource(url, key, 20, defaultLeverage, Clock.systemUTC());
+    }
+
+    private static String firstPresent(String... candidates) {
+        for (String candidate : candidates) {
+            if (candidate != null && !candidate.isBlank()) return candidate;
+        }
+        return null;
     }
 
     @Override public String name() { return "supabase-queue"; }
