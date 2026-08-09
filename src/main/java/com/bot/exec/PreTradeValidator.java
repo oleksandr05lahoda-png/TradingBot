@@ -11,15 +11,12 @@ import java.util.List;
 /**
  * Checks an order against the symbol's filters <b>before</b> it is sent.
  *
- * <p>Precision rejections are cheap to prevent and expensive to discover. A stop that comes back
- * {@code -1111 BAD_PRECISION} was not placed, and the position it was supposed to protect is open
- * either way — so the failure that matters is not "the order was rejected" but "the position spent
- * the next few seconds naked while the code worked out why". Everything checkable locally is checked
- * locally.
+ * <p>A stop that comes back {@code -1111 BAD_PRECISION} was not placed, and the position it was to
+ * protect is open either way — so the failure that matters is not "rejected" but "naked for the
+ * seconds it took to work out why". Everything checkable locally is checked locally.
  *
- * <p>The last rule has nothing to do with precision and is here because this is the single gate every
- * order passes through: an order whose purpose is closing must be strictly reducing. That is
- * enforced by {@link OrderRequest} too. Twice is deliberate.
+ * <p>The reduce-only rule is here rather than only in {@link OrderRequest} because this is the one
+ * gate every order passes through. Twice is deliberate.
  */
 public final class PreTradeValidator {
 

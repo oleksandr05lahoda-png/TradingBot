@@ -18,19 +18,12 @@ import com.bot.core.Preconditions;
  * {@link RiskConstants#MAX_RISK_FRACTION_PER_TRADE} or
  * {@link RiskConstants#MIN_LIQUIDATION_BUFFER_FRACTION}, and a config may only be stricter.
  *
- * @param riskFractionPerTrade        fraction of balance risked per trade, capped at 1%
- * @param maxLeverage                 leverage ceiling, capped at {@link RiskConstants#MAX_LEVERAGE}
- * @param maxNotionalFractionPerTrade per-trade notional as a fraction of balance
- * @param maxNotionalUsdPerTrade      absolute per-trade notional ceiling; {@code +Infinity} = unbounded
- * @param maxLongExposureFraction     sum of LONG notional as a fraction of balance
- * @param maxShortExposureFraction    sum of SHORT notional as a fraction of balance
- * @param maxConcurrentPositions      how many symbols may be open at once
- * @param dailyLossFractionLimit      realised + open drawdown that trips the kill switch for the UTC day
+ * <p>Every {@code ...Fraction} is a share of balance. The rest:
+ *
+ * @param maxNotionalUsdPerTrade       absolute ceiling on top of the fractional one; {@code +Infinity} = none
+ * @param dailyLossFractionLimit       realised + open drawdown that trips the kill switch for the UTC day
  * @param minLiquidationBufferFraction may be raised above 30%, never lowered
- * @param maxMarginUtilizationFraction initial margin of a new position as a fraction of balance
- * @param takerFeeFraction            used to discount isolated margin when projecting liquidation
- * @param atrStopMultiplier           multiplier applied to ATR when no structural stop arrived
- * @param takeProfitPolicy            where the reduce-only exits sit, in R
+ * @param takerFeeFraction             discounts isolated margin when projecting liquidation
  */
 public record RiskConfig(
         double riskFractionPerTrade,

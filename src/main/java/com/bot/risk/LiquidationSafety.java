@@ -10,12 +10,11 @@ import com.bot.core.Side;
  *
  * <pre>{@code   buffer = |stop - liq| / |entry - liq|   >=  0.30 }</pre>
  *
- * <p>Equivalently, the stop may travel at most 70% of the way to liquidation. The reason for a
- * margin this wide is that the stop and the liquidation are triggered by different prices: the stop
- * fires on the trigger price the order carries, liquidation fires on the exchange's mark price, and
- * on a thin book those two disagree by more than people expect. A stop that is merely "before"
- * liquidation gets overtaken by a mark excursion, and the position closes at the exchange's terms —
- * the whole isolated margin, not the planned R.
+ * <p>The stop may travel at most 70% of the way to liquidation. The margin is this wide because the
+ * two fire on <i>different prices</i> — the stop on its own trigger price, liquidation on the
+ * exchange's mark — and on a thin book those disagree by more than people expect. A stop that is
+ * merely "before" liquidation gets overtaken by a mark excursion, and the position closes on the
+ * exchange's terms: the whole isolated margin, not the planned R.
  */
 public final class LiquidationSafety {
 

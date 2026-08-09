@@ -18,17 +18,11 @@ import java.util.Objects;
  * in the caller's direction; {@link #quantizeStopPrice} and {@link #quantizeTakeProfitPrice} both
  * round <i>towards</i> entry, so realised risk can only be smaller than planned.
  *
- * @param symbol            exchange symbol, e.g. {@code BTCUSDT}
- * @param tickSize          PRICE_FILTER.tickSize — price must be an integer multiple of this
- * @param minPrice          PRICE_FILTER.minPrice
- * @param maxPrice          PRICE_FILTER.maxPrice
- * @param stepSize          LOT_SIZE.stepSize — quantity must be an integer multiple of this
- * @param minQty            LOT_SIZE.minQty
- * @param maxQty            LOT_SIZE.maxQty
- * @param marketMaxQty      MARKET_LOT_SIZE.maxQty — a separate, usually smaller cap for MARKET orders
- * @param minNotional       MIN_NOTIONAL.notional — price x quantity floor
- * @param pricePrecision    symbol.pricePrecision, the decimal places the exchange will accept
- * @param quantityPrecision symbol.quantityPrecision
+ * <p>Fields map to Binance's own filters: {@code tickSize}/{@code minPrice}/{@code maxPrice} from
+ * PRICE_FILTER, {@code stepSize}/{@code minQty}/{@code maxQty} from LOT_SIZE, and the two below.
+ *
+ * @param marketMaxQty MARKET_LOT_SIZE.maxQty — a separate, usually smaller cap for MARKET orders
+ * @param minNotional  MIN_NOTIONAL.notional — the price x quantity floor
  */
 public record InstrumentFilters(
         String symbol,

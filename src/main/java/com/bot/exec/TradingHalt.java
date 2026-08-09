@@ -10,15 +10,14 @@ import java.util.logging.Logger;
 /**
  * A one-way latch that stops new risk being taken.
  *
- * <p>Tripped by anything that means the bot no longer knows what is true: a reconciliation
- * disagreement, a dead-man's switch firing, a rate-limit ban, an unreadable account. Clearing it is
- * an explicit operator act — {@link #clear()} is never called from a retry, a timer or a recovery
- * path, because a halt that heals itself is a halt that hides the thing it was raised about.
+ * <p>Tripped by anything meaning the bot no longer knows what is true: reconciliation drift, a fired
+ * dead-man's switch, an unestablishable order. Clearing it is an explicit operator act —
+ * {@link #clear()} is never called from a retry or a timer, because a halt that heals itself hides
+ * what it was raised about.
  *
- * <p>Note the asymmetry it enforces, which is the same one the previous generation of this codebase
- * got wrong and paid for: a halt stops <b>opening</b>. It does not stop closing. A lock that seals
- * positions in is not a safety feature — it is a way to be unable to exit a losing trade — so the
- * close path never consults this latch.
+ * <p>The asymmetry matters, and the previous generation got it wrong: a halt stops <b>opening</b>,
+ * never closing. A lock that seals positions in is not a safety feature, it is a way to be unable to
+ * exit a losing trade — so the close path never consults this latch.
  */
 public final class TradingHalt {
 

@@ -9,16 +9,14 @@ import java.util.List;
 /**
  * The maintenance-margin brackets for one symbol, validated as a whole.
  *
- * <p>The constructor rejects a table that is not a usable maintenance-margin function: brackets must
- * start at zero, be contiguous, cover every notional up to infinity, have non-decreasing rates, and
- * — the check that actually catches bad data — produce a <b>continuous</b> maintenance margin where
- * consecutive brackets meet. If {@code cap * rate_i - cum_i} does not equal
- * {@code cap * rate_(i+1) - cum_(i+1)}, one of the numbers is wrong, and a wrong maintenance margin
- * is a wrong liquidation price.
+ * <p>The constructor rejects anything that is not a usable maintenance-margin function: brackets
+ * starting at zero, contiguous, covering every notional, rates non-decreasing — and the check that
+ * actually catches bad data, a <b>continuous</b> margin at every boundary. If
+ * {@code cap * rate_i - cum_i} differs from {@code cap * rate_(i+1) - cum_(i+1)}, a number is wrong,
+ * and a wrong maintenance margin is a wrong liquidation price.
  *
- * <p>Instances are normally built from {@code GET /fapi/v1/leverageBracket}. The bundled
- * {@link #conservativeDefault()} exists so the risk core can be exercised without a network call;
- * it is deliberately stricter than BTCUSDT's real brackets, and the adapter overwrites it.
+ * <p>Normally built from {@code GET /fapi/v1/leverageBracket}; {@link #conservativeDefault()} lets
+ * the risk core run without a network call and is stricter than BTCUSDT's real brackets.
  */
 public final class MarginTierTable {
 

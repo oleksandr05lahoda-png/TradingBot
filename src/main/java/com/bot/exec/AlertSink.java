@@ -18,10 +18,9 @@ import java.util.logging.Logger;
 /**
  * Where "something is wrong" goes.
  *
- * <p>Reconciliation drift and a fired dead-man's switch are the two events this system is least able
- * to resolve on its own, and both are useless as a log line nobody reads. The interface exists so
- * that the loud channel is a wiring decision rather than a rewrite; the default writes to the log,
- * and {@link Telegram} adds a push notification when the environment supplies credentials.
+ * <p>Reconciliation drift and a fired dead-man's switch are the events this system is least able to
+ * resolve on its own, and both are useless as a log line nobody reads. The default writes to the
+ * log; {@link Telegram} adds a push when the environment supplies credentials.
  */
 public interface AlertSink {
 

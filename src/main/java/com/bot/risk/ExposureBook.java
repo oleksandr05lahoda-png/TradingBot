@@ -14,14 +14,11 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * What the bot currently believes is open, and therefore what a new position would be added to.
  *
- * <p>This is a <b>cache</b>, not a record of truth. The exchange decides what is open; the reconciler
- * calls {@link #replaceAll} to overwrite this from the exchange's own answer, and any disagreement
- * between the two is a defect worth halting for rather than a number to average.
+ * <p>A <b>cache</b>, not a record of truth: the exchange decides what is open, the reconciler
+ * overwrites this via {@link #replaceAll}, and a disagreement is a defect worth halting for.
  *
- * <p>Long and short exposure are tracked separately and never netted. A 100k long and a 100k short
- * are not a flat book — they are two positions, two liquidation prices, two funding payments and
- * two ways to be wrong. Netting them to zero is how a book that looks flat blows up on a move that
- * goes through both stops.
+ * <p>Long and short are tracked separately and never netted. A 100k long and a 100k short are not a
+ * flat book — two positions, two liquidation prices, two funding payments, two ways to be wrong.
  */
 public final class ExposureBook {
 

@@ -9,20 +9,15 @@ import java.util.Locale;
 /**
  * The only place in this repository where a Binance base URL exists.
  *
- * <p>There is no production endpoint here, no flag that selects one, and no environment variable
- * that could introduce one. The previous generation of this codebase had exactly such a flag —
- * {@code BINANCE_USE_TESTNET}, defaulting to {@code 0} — which meant an unset variable on a fresh
- * deployment silently selected the real exchange. Absence of configuration selected real money. That
- * shape is not reproduced here: the mainnet host is not reachable because it is not written down.
+ * <p>No production endpoint, no flag selecting one, no environment variable that could introduce
+ * one. The previous generation had exactly such a flag — {@code BINANCE_USE_TESTNET} defaulting to
+ * {@code 0} — so an unset variable on a fresh deployment silently selected the real exchange:
+ * absence of configuration selected real money. The mainnet host is unreachable here because it is
+ * not written down, and {@code NoProductionEndpointTest} fails the build if it ever is.
  *
- * <p>{@code NoProductionEndpointTest} scans the entire source tree and fails the build if a
- * production host, or any of its usual spellings, appears anywhere — including in a comment, a
- * string, or a test fixture.
- *
- * <p>The host is Binance's documented USDⓈ-M futures testnet REST base. The older
- * {@code testnet.binancefuture.com} address redirects, and a redirect breaks signed requests, so the
- * current host is used directly. Both are testnet; {@link #ALLOWED_HOSTS} exists so that a future
- * migration is a one-line change that still cannot land on production.
+ * <p>{@link #ALLOWED_HOSTS} exists so a future host migration stays a one-line change that still
+ * cannot land on production. (The older {@code testnet.binancefuture.com} redirects, and a redirect
+ * breaks signed requests.)
  */
 public final class BinanceTestnetEndpoint {
 
