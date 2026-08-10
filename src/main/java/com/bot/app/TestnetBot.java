@@ -27,6 +27,7 @@ import com.bot.signal.SignalSource;
 import com.bot.signal.SupabaseQueueSource;
 
 import java.io.FileReader;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
@@ -105,16 +106,38 @@ public final class TestnetBot {
 
             long lastReconcileMs = System.currentTimeMillis();
             long lastHeartbeatMs = System.currentTimeMillis();
+            int sourceFailures = 0;
 
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
 
-                // Closes first, always: a halt must never be able to stop an unwind.
-                for (CloseRequest close : signals.pollCloses()) {
-                    handleClose(close, coordinator, signals);
-                }
-                for (Signal signal : signals.poll()) {
-                    handle(signal, engine, coordinator, port, signals, now);
+                // An unreachable signal source must not kill the process. The queue refusing to
+                // answer says nothing about the exchange, and a dead bot cannot close the position
+                // it is holding — the same reasoning that already protects the housekeeping below.
+                // Backing off keeps a hard-down queue from spinning the loop at full speed.
+                try {
+                    // Closes first, always: a halt must never be able to stop an unwind.
+                    for (CloseRequest close : signals.pollCloses()) {
+                        handleClose(close, coordinator, signals);
+                    }
+                    for (Signal signal : signals.poll()) {
+                        handle(signal, engine, coordinator, port, signals, now);
+                    }
+                    if (sourceFailures > 0) {
+                        LOG.info("[Loop] signal source is answering again after " + sourceFailures + " failure(s)");
+                        sourceFailures = 0;
+                    }
+                } catch (IOException e) {
+                    sourceFailures++;
+                    // Loud once, then quiet: an outage lasting hours must not bury the log.
+                    if (sourceFailures == 1 || sourceFailures % 240 == 0) {
+                        LOG.severe("[Loop] signal source unreachable (" + sourceFailures + " in a row): "
+                                + e.getMessage() + " — the loop stays up so open positions can still be closed");
+                    }
+                    if (sourceFailures == 1) {
+                        alerts.warning("Signal source unreachable", e.getMessage());
+                    }
+                    Thread.sleep(Math.min(30_000L, 1_000L * sourceFailures));
                 }
 
                 long nowMs = System.currentTimeMillis();
