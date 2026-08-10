@@ -7,6 +7,18 @@
 Продолжаем работу над `C:\Users\Asus_F15\IdeaProjects\TradingTelegramBot`, ветка
 `feature/testnet-risk-core` (main НЕ трогать до ревью). Прочитай `README.md` и `CLEANUP.md` в корне.
 
+## 🔴 Первым делом: боевой путь снаружи проекта жив
+
+Наш бот testnet-only, но **старый контур никто не выключал**, и он вооружён на реальные деньги:
+`sleeve_gates.long_v2.live = true` → крон `long-v2-scan` (ежечасно :41) → `long_v2_label_one` при
+свежем пробое → `enqueue_live_order` (цена с боевого `fapi.binance.com`) → строка `testnet=false` в
+`bot_orders` → сервис **`TradingBot` на Railway** опрашивает `testnet=eq.false` каждые 30 с и
+исполняет боевыми ключами. Уже стрелял: `bot_orders` id 1 — реальный XRPUSDT $5.17 от 08.07,
+закрыт оператором вручную. Ограничители: ≤8/сутки, size_mult 0.3, стоп 9.8%.
+
+Снять (решение владельца, само не делать):
+`update sleeve_gates set criteria = jsonb_set(criteria,'{live}','false') where sleeve='long_v2';`
+
 ## Что построено
 
 Фундамент под крипто-фьючерсы: **риск-движок** (сколько брать и можно ли вообще) + **слой
