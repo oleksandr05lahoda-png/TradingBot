@@ -12,6 +12,8 @@ import java.net.URLEncoder;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.UnaryOperator;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -33,7 +35,11 @@ public interface AlertSink {
 
     /** The always-available floor. */
     final class Logging implements AlertSink {
-        private static final Logger LOG = Logger.getLogger("Alert");
+
+        /** Named rather than inlined so a test can listen to exactly this logger. */
+        static final String LOGGER_NAME = "Alert";
+
+        private static final Logger LOG = Logger.getLogger(LOGGER_NAME);
 
         @Override public void alert(Severity severity, String title, String message) {
             Level level = switch (severity) {
@@ -51,7 +57,21 @@ public interface AlertSink {
      * the trading path it is reporting on.
      */
     final class Telegram implements AlertSink {
-        private static final Logger LOG = Logger.getLogger("Alert.Telegram");
+
+        /** Named rather than inlined so a test can listen to exactly this logger. */
+        static final String LOGGER_NAME = "Alert.Telegram";
+
+        /** The two variables that turn pushes on; the warning below points at them by name. */
+        static final String TOKEN_VAR = "TELEGRAM_BOT_TOKEN";
+        static final String CHAT_ID_VAR = "TELEGRAM_CHAT_ID";
+
+        private static final Logger LOG = Logger.getLogger(LOGGER_NAME);
+
+        /**
+         * Set the first time the "pushes are off" warning is logged. Static because the fact is about
+         * the process, not about one sink: whoever asks second must not repeat it.
+         */
+        private static final AtomicBoolean DISABLED_WARNING_LOGGED = new AtomicBoolean();
 
         private final String token;
         private final String chatId;
@@ -64,10 +84,46 @@ public interface AlertSink {
 
         /** Returns null when the environment does not configure Telegram. */
         public static Telegram fromEnvironmentOrNull() {
-            String token = System.getenv("TELEGRAM_BOT_TOKEN");
-            String chat = System.getenv("TELEGRAM_CHAT_ID");
-            if (token == null || token.isBlank() || chat == null || chat.isBlank()) return null;
+            return fromEnvironmentOrNull(System::getenv, DISABLED_WARNING_LOGGED);
+        }
+
+        /**
+         * Same, but reading the environment through {@code environment} and tracking the one-shot
+         * warning in {@code warned}. Both are seams for the tests: the disabled path can then be
+         * exercised without the process environment, and without depending on whether an earlier
+         * caller in the same JVM already spent the warning.
+         */
+        static Telegram fromEnvironmentOrNull(UnaryOperator<String> environment, AtomicBoolean warned) {
+            String token = environment.apply(TOKEN_VAR);
+            String chat = environment.apply(CHAT_ID_VAR);
+            if (isBlank(token) || isBlank(chat)) {
+                // Unconfigured used to look exactly like configured-and-quiet, which is the worst way
+                // for an alert path to fail. Say it out loud. Today the only caller asks once at
+                // startup, so the latch buys nothing yet — it is here so that moving this call into
+                // the poll loop cannot quietly turn one warning into one every thirty seconds.
+                if (warned.compareAndSet(false, true)) {
+                    LOG.warning(disabledWarning(token, chat));
+                }
+                // Still null, and still no exception: a missing push channel must not stop the bot,
+                // which can close positions perfectly well with nobody watching.
+                return null;
+            }
             return new Telegram(token.trim(), chat.trim());
+        }
+
+        /** Names what is missing and what it costs, so the line stands on its own in the log. */
+        private static String disabledWarning(String token, String chatId) {
+            List<String> missing = new ArrayList<>();
+            if (isBlank(token)) missing.add(TOKEN_VAR);
+            if (isBlank(chatId)) missing.add(CHAT_ID_VAR);
+            return "Telegram alerts are OFF: " + String.join(" and ", missing)
+                    + (missing.size() == 1 ? " is not set" : " are not set")
+                    + " — CRITICAL events and trading halts will reach this log file and nothing else. "
+                    + "Set both variables (see example.env) to be told when the bot stops itself.";
+        }
+
+        private static boolean isBlank(String value) {
+            return value == null || value.isBlank();
         }
 
         @Override public void alert(Severity severity, String title, String message) {
@@ -115,14 +171,23 @@ public interface AlertSink {
                 }
             }
         }
+
+        /**
+         * The assembly itself, through the same seams {@link Telegram#fromEnvironmentOrNull} takes.
+         * Package-private rather than a second public factory: a test needs to assemble without
+         * touching the real environment, but nothing outside this package should.
+         */
+        static AlertSink assemble(UnaryOperator<String> environment, AtomicBoolean warned) {
+            List<AlertSink> sinks = new ArrayList<>();
+            sinks.add(new Logging());
+            Telegram telegram = Telegram.fromEnvironmentOrNull(environment, warned);
+            if (telegram != null) sinks.add(telegram);
+            return new Composite(sinks);
+        }
     }
 
-    /** Log always, plus Telegram when the environment configures it. */
+    /** Log always, plus Telegram when the environment configures it — and a warning when it does not. */
     static AlertSink fromEnvironment() {
-        List<AlertSink> sinks = new ArrayList<>();
-        sinks.add(new Logging());
-        Telegram telegram = Telegram.fromEnvironmentOrNull();
-        if (telegram != null) sinks.add(telegram);
-        return new Composite(sinks);
+        return Composite.assemble(System::getenv, Telegram.DISABLED_WARNING_LOGGED);
     }
 }
