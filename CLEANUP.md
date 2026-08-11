@@ -94,7 +94,9 @@ local.env` if you want that confirmed independently.
 | `src/test/java/com/bot/**` | 24 | 3,160 |
 
 13,628 lines removed, 8,702 added, and the test directory went from 190 lines covering one unwired
-class to 156 tests covering the gate, the execution protocol and the frames themselves.
+class to a suite covering the gate, the execution protocol and the frames themselves. The figures in
+the table above are the state at this cleanup; as of 11.08.2026 the tree is 44 main files and
+**199 tests in 28 files**.
 
 ## Not touched
 

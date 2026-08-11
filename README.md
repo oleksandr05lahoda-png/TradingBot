@@ -474,8 +474,8 @@ column must accept `rejected`, or refused rows will be polled again.
 ./gradlew test
 ```
 
-178 tests. The property-based ones draw thousands of cases from a seeded PRNG so a failure is
-reproducible; override the seed with `-Dbot.test.seed=123456`.
+199 tests across 28 files (counted 11.08.2026). The property-based ones draw thousands of cases from
+a seeded PRNG so a failure is reproducible; override the seed with `-Dbot.test.seed=123456`.
 
 | requirement from the brief | test |
 |---|---|
