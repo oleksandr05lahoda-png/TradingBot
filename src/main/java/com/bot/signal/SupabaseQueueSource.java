@@ -299,12 +299,26 @@ public final class SupabaseQueueSource implements SignalSource {
         }
     }
 
+    /**
+     * Supabase's newer keys ({@code sb_secret_…}, {@code sb_publishable_…}) are not JWTs, and
+     * PostgREST rejects the whole request when one arrives as a bearer token — it tries to decode it
+     * and fails. They belong in {@code apikey} alone. Legacy JWT keys want both headers.
+     *
+     * <p>Sending both unconditionally cost nothing while the project still issued legacy keys, and
+     * would have turned into HTTP 401 on every single poll the moment it did not — a failure that
+     * reads as "the queue is unreachable" rather than "the key is in the wrong header".
+     */
     private HttpResponse<String> send(HttpRequest.Builder builder) throws IOException, InterruptedException {
+        builder.header("apikey", apiKey);
+        if (!isNonJwtKey(apiKey)) builder.header("Authorization", "Bearer " + apiKey);
         HttpRequest request = builder
-                .header("apikey", apiKey)
-                .header("Authorization", "Bearer " + apiKey)
                 .header("Content-Type", "application/json")
                 .build();
         return http.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** True for the {@code sb_}-prefixed key formats, which are opaque rather than JWTs. */
+    static boolean isNonJwtKey(String key) {
+        return key != null && key.startsWith("sb_");
     }
 }

@@ -11,6 +11,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -87,5 +88,17 @@ class SupabaseQueueSourceTest {
         assertThrows(IllegalArgumentException.class,
                 () -> source.toSignal(row("""
                         {"id": 13, "symbol": "BTCUSDT", "side": "SIDEWAYS", "entry": 1, "sl": 0.5}""")));
+    }
+
+    @Test
+    @DisplayName("a modern sb_ key never goes out as a bearer token, a legacy JWT still does")
+    void onlyJwtKeysAreSentAsBearer() {
+        // PostgREST tries to decode the bearer token; an sb_ key is not a JWT, so the whole request
+        // is rejected and every poll returns 401 — which reads as "the queue is unreachable".
+        assertTrue(SupabaseQueueSource.isNonJwtKey("sb_secret_not-a-real-key"));
+        assertTrue(SupabaseQueueSource.isNonJwtKey("sb_publishable_not-a-real-key"));
+
+        assertFalse(SupabaseQueueSource.isNonJwtKey("eyJhbGciOiJIUzI1NiJ9.not-a-real-key"));
+        assertFalse(SupabaseQueueSource.isNonJwtKey(null));
     }
 }
