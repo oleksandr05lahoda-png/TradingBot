@@ -29,4 +29,14 @@ public final class RiskConstants {
      * wallet balance when projecting liquidation — the entry fee comes out of that same margin.
      */
     public static final double DEFAULT_TAKER_FEE_FRACTION = 0.0005;
+
+    /**
+     * Daily volatility the vol-targeting overlay ({@link VolTargetOverlay}) aims positions at: 2%.
+     * Deliberately at the calm end of crypto's range — BTC realized daily vol spends most of its
+     * time between roughly 1.5% and 5%, so a 2% target means the overlay starts trimming as soon as
+     * the market is merely ordinary, not only in panics. Erring low is the safe direction here: the
+     * multiplier is capped at 1.0, so a target that is "too conservative" can only ever make
+     * positions smaller, never larger.
+     */
+    public static final double DEFAULT_TARGET_DAILY_VOL_FRACTION = 0.02;
 }

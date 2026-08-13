@@ -9,6 +9,7 @@ import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.logging.Logger;
 
 /**
@@ -24,11 +25,19 @@ public final class RiskEngine {
     private final RiskConfig config;
     private final ExposureBook book;
     private final DailyLossKillSwitch killSwitch;
+    private final VolatilitySource volSource;
 
+    /** No volatility feed: the vol-targeting overlay multiplies by 1.0 and sizing is unchanged. */
     public RiskEngine(RiskConfig config, ExposureBook book, DailyLossKillSwitch killSwitch) {
+        this(config, book, killSwitch, VolatilitySource.none());
+    }
+
+    public RiskEngine(RiskConfig config, ExposureBook book, DailyLossKillSwitch killSwitch,
+                      VolatilitySource volSource) {
         this.config = Preconditions.notNull(config, "config");
         this.book = Preconditions.notNull(book, "book");
         this.killSwitch = Preconditions.notNull(killSwitch, "killSwitch");
+        this.volSource = Preconditions.notNull(volSource, "volSource");
     }
 
     public static RiskEngine withDefaults() {
@@ -116,10 +125,16 @@ public final class RiskEngine {
                             + " — the stop distance is smaller than one tick");
         }
 
-        // 7 ─ Size from the stop. Unclamped: this quantity risks exactly the budget.
-        double budgetedRiskUsd = balanceUsd * config.riskFractionPerTrade();
+        // 7 ─ Size from the stop, scaled by the vol-targeting overlay (Moreira-Muir): when realized
+        //     vol runs above the target, the risk fraction shrinks by min(1, target/realized) BEFORE
+        //     sizing, so every downstream number — budget, ceilings, margin — sees the reduced risk.
+        //     With no vol data the multiplier is exactly 1.0 and this step is the pre-overlay bot.
+        double volMultiplier = VolTargetOverlay.multiplier(
+                config.targetDailyVolFraction(), realizedVolOrEmpty(request.symbol()));
+        double effectiveRiskFraction = config.riskFractionPerTrade() * volMultiplier;
+        double budgetedRiskUsd = balanceUsd * effectiveRiskFraction;
         double idealQty = PositionSizer.quantityForRisk(
-                balanceUsd, config.riskFractionPerTrade(), entry, stopPrice);
+                balanceUsd, effectiveRiskFraction, entry, stopPrice);
 
         // 8 ─ Ceilings, each a maximum notional; the tightest wins and the binding one is recorded.
         double perTradeCap = Math.min(balanceUsd * config.maxNotionalFractionPerTrade(),
@@ -141,20 +156,27 @@ public final class RiskEngine {
         double idealNotional = idealQty * entry;
         double cappedQty = idealNotional <= notionalCap ? idealQty : notionalCap / entry;
         String sizingNote = describeBinding(idealNotional, perTradeCap, sideHeadroom, marginCap, lotCap, request.side());
+        if (volMultiplier < 1.0) {
+            // Recorded so a smaller-than-usual position is explainable from its log line alone.
+            sizingNote += String.format("; vol overlay x%.3f (realized vol above the %.1f%% daily target)"
+                            + " cut the risk fraction to %.3f%%",
+                    volMultiplier, config.targetDailyVolFraction() * 100, effectiveRiskFraction * 100);
+        }
 
         // 9 ─ Lot alignment, always downwards, then the exchange's minimums.
         BigDecimal quantity = filters.quantizeQuantityDown(cappedQty);
         if (quantity.signum() <= 0 || !filters.isQuantityInRange(quantity, true)) {
             BigDecimal smallest = filters.smallestTradableQuantity(entry);
+            // The effective (overlay-scaled) fraction, so the advice matches the sizing that failed.
             double balanceNeeded = smallest.doubleValue() * Math.abs(entry - stopPrice)
-                    / config.riskFractionPerTrade();
+                    / effectiveRiskFraction;
             return RiskDecision.reject(RejectReason.BELOW_MIN_QUANTITY,
                     String.format("sized to %s, below the exchange minimum %s. At this stop distance "
                                     + "(%.4f%% of price) a balance of about $%.2f is needed before %.2f%% "
                                     + "risk buys one tradable lot.",
                             quantity.toPlainString(), smallest.toPlainString(),
                             100.0 * Math.abs(entry - stopPrice) / entry, balanceNeeded,
-                            config.riskFractionPerTrade() * 100));
+                            effectiveRiskFraction * 100));
         }
         if (!filters.meetsMinNotional(entryTick, quantity)) {
             return RiskDecision.reject(RejectReason.BELOW_MIN_NOTIONAL,
@@ -258,6 +280,24 @@ public final class RiskEngine {
      */
     public void registerClose(String symbol) {
         book.close(symbol);
+    }
+
+    /**
+     * A throwing volatility source is treated exactly like one that answered "I do not know". The
+     * overlay is advisory: it may only ever shrink an already-budgeted size, so a broken feed must
+     * degrade the bot to its pre-overlay behaviour — it must never grow into a new reason to refuse
+     * a trade or crash the gate. A null return is the same contract violation as a throw and gets
+     * the same treatment; without this line it would surface later as an NPE inside the gate.
+     */
+    private OptionalDouble realizedVolOrEmpty(String symbol) {
+        try {
+            OptionalDouble vol = volSource.realizedDailyVolFraction(symbol);
+            return vol != null ? vol : OptionalDouble.empty();
+        } catch (RuntimeException e) {
+            LOG.warning("[RiskEngine] volatility source failed for " + symbol
+                    + " — overlay disabled for this decision: " + e);
+            return OptionalDouble.empty();
+        }
     }
 
     private static String describeBinding(double idealNotional,

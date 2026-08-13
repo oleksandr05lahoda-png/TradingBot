@@ -5,6 +5,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.OptionalDouble;
 import java.util.Random;
 
@@ -200,6 +201,48 @@ class RiskEngineLimitsTest {
         assertTrue(plan.initialMarginUsd() <= 10_000 * 0.50,
                 "initial margin " + plan.initialMarginUsd() + " exceeds half the balance");
         assertEquals(plan.notionalUsd() / 3, plan.initialMarginUsd(), 1e-9);
+    }
+
+    @Test
+    @DisplayName("vol overlay: a hot market shrinks the approved size and nothing else")
+    void volOverlayShrinksSizeInHotMarkets() {
+        // Realized 4% daily vol against the 2% default target halves the risk fraction: the $50
+        // budget of healthyTradeIsApproved becomes $25, so 25/1200 = 0.0208, floored to 0.020.
+        TradePlan calm = approve(RiskFixtures.engine()
+                .evaluate(RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON));
+        TradePlan hot = approve(RiskFixtures.engine(RiskConfig.defaults(), symbol -> OptionalDouble.of(0.04))
+                .evaluate(RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON));
+
+        assertEquals(0, hot.quantity().compareTo(new BigDecimal("0.020")), "quantity " + hot.quantity());
+        assertTrue(hot.quantity().compareTo(calm.quantity()) < 0,
+                "the overlay did not shrink the position: " + hot.quantity() + " vs " + calm.quantity());
+        assertTrue(hot.riskUsd() <= 25.0 + 1e-9,
+                "risk $" + hot.riskUsd() + " exceeds the overlay-halved budget of $25");
+        assertEquals(0, hot.stopPrice().compareTo(calm.stopPrice()),
+                "the overlay must only ever scale the size — never move the stop");
+        assertTrue(hot.sizingNote().contains("vol overlay"), hot.sizingNote());
+    }
+
+    @Test
+    @DisplayName("vol overlay fail-open: no data, a calm market, or a dead feed changes NOTHING")
+    void volOverlayFailsOpen() {
+        TradePlan baseline = approve(RiskFixtures.engine()
+                .evaluate(RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON));
+
+        List<VolatilitySource> harmless = List.of(
+                VolatilitySource.none(),                     // no feed wired at all
+                symbol -> OptionalDouble.of(0.01),           // calmer than the target: no levering UP
+                symbol -> OptionalDouble.of(0.0),            // broken feed reporting an impossible calm
+                symbol -> { throw new IllegalStateException("feed down"); },
+                symbol -> null);                             // contract violation, same as a throw
+        for (VolatilitySource source : harmless) {
+            TradePlan plan = approve(RiskFixtures.engine(RiskConfig.defaults(), source)
+                    .evaluate(RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, RiskFixtures.NOON));
+            assertEquals(0, plan.quantity().compareTo(baseline.quantity()),
+                    "a harmless source changed the size: " + plan.quantity() + " vs " + baseline.quantity());
+            assertEquals(baseline.riskUsd(), plan.riskUsd(), 1e-12,
+                    "a harmless source changed the risk");
+        }
     }
 
     @Test

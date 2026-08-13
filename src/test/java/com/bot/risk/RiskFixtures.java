@@ -37,6 +37,11 @@ final class RiskFixtures {
         return new RiskEngine(config, new ExposureBook(), new DailyLossKillSwitch(config.dailyLossFractionLimit()));
     }
 
+    static RiskEngine engine(RiskConfig config, VolatilitySource volSource) {
+        return new RiskEngine(config, new ExposureBook(),
+                new DailyLossKillSwitch(config.dailyLossFractionLimit()), volSource);
+    }
+
     static RiskEngine engine() {
         return engine(RiskConfig.defaults());
     }

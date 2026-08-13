@@ -14,6 +14,9 @@ import com.bot.core.Preconditions;
  * @param dailyLossFractionLimit       realised + open drawdown that trips the kill switch for the UTC day
  * @param minLiquidationBufferFraction may be raised above 30%, never lowered
  * @param takerFeeFraction             discounts isolated margin when projecting liquidation
+ * @param targetDailyVolFraction       daily vol the {@link VolTargetOverlay} scales positions towards;
+ *                                     a fraction of price, not of balance — 0.02 means "size as if
+ *                                     the market moved 2% a day"
  */
 public record RiskConfig(
         double riskFractionPerTrade,
@@ -28,6 +31,7 @@ public record RiskConfig(
         double maxMarginUtilizationFraction,
         double takerFeeFraction,
         double atrStopMultiplier,
+        double targetDailyVolFraction,
         TakeProfitPolicy takeProfitPolicy) {
 
     public RiskConfig {
@@ -54,6 +58,9 @@ public record RiskConfig(
                 "maxMarginUtilizationFraction must be in (0, 1]");
         Preconditions.inClosedRange(takerFeeFraction, 0.0, 0.01, "takerFeeFraction");
         Preconditions.positiveFinite(atrStopMultiplier, "atrStopMultiplier");
+        // A daily vol target of 100%+ would make the overlay decorative; well before that it is a typo.
+        Preconditions.require(targetDailyVolFraction > 0 && targetDailyVolFraction < 1.0,
+                "targetDailyVolFraction must be in (0, 1), got " + targetDailyVolFraction);
         Preconditions.notNull(takeProfitPolicy, "takeProfitPolicy");
     }
 
@@ -72,6 +79,7 @@ public record RiskConfig(
                 0.50,                      // a new position may lock up at most half the balance as margin
                 RiskConstants.DEFAULT_TAKER_FEE_FRACTION,
                 2.0,
+                RiskConstants.DEFAULT_TARGET_DAILY_VOL_FRACTION,
                 TakeProfitPolicy.standard());
     }
 
@@ -79,48 +87,55 @@ public record RiskConfig(
         return new RiskConfig(v, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
                 maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
                 dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, takeProfitPolicy);
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
     }
 
     public RiskConfig withMaxLeverage(int v) {
         return new RiskConfig(riskFractionPerTrade, v, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
                 maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
                 dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, takeProfitPolicy);
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
     }
 
     public RiskConfig withMaxConcurrentPositions(int v) {
         return new RiskConfig(riskFractionPerTrade, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
                 maxLongExposureFraction, maxShortExposureFraction, v,
                 dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, takeProfitPolicy);
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
     }
 
     public RiskConfig withExposureFractions(double longFraction, double shortFraction) {
         return new RiskConfig(riskFractionPerTrade, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
                 longFraction, shortFraction, maxConcurrentPositions,
                 dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, takeProfitPolicy);
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
     }
 
     public RiskConfig withMaxNotionalPerTrade(double fractionOfBalance, double absoluteUsd) {
         return new RiskConfig(riskFractionPerTrade, maxLeverage, fractionOfBalance, absoluteUsd,
                 maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
                 dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, takeProfitPolicy);
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
     }
 
     public RiskConfig withDailyLossFractionLimit(double v) {
         return new RiskConfig(riskFractionPerTrade, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
                 maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
                 v, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, takeProfitPolicy);
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
+    }
+
+    public RiskConfig withTargetDailyVolFraction(double v) {
+        return new RiskConfig(riskFractionPerTrade, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
+                maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
+                dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
+                takerFeeFraction, atrStopMultiplier, v, takeProfitPolicy);
     }
 
     public RiskConfig withTakeProfitPolicy(TakeProfitPolicy v) {
         return new RiskConfig(riskFractionPerTrade, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
                 maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
                 dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, v);
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, v);
     }
 }

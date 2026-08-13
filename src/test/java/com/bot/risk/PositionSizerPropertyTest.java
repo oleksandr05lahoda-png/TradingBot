@@ -4,6 +4,7 @@ import com.bot.core.Side;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.OptionalDouble;
 import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -150,5 +151,88 @@ class PositionSizerPropertyTest {
         double qty = PositionSizer.quantityForRisk(10_000, 0.005, 64_000, 62_800);
         assertEquals(0.0416666667, qty, 1e-9);
         assertEquals(50.0, PositionSizer.riskUsd(qty, 64_000, 62_800), 1e-9);
+    }
+
+    // ── The vol-targeting overlay: min(1, target/realized) applied to the risk fraction ─────────
+    // Tested here, next to the sizer, because the multiplier IS part of sizing: it scales the
+    // riskFraction the properties above hold for, and those properties must survive the scaling.
+
+    @Test
+    @DisplayName("property: above the target, higher realized vol always means a smaller size")
+    void higherVolMeansSmallerSize() {
+        Random random = new Random(RiskFixtures.seed() + 4);
+        for (int i = 0; i < CASES; i++) {
+            double target = 0.005 + random.nextDouble() * 0.05;
+            double hotVol = target * (1.0001 + random.nextDouble() * 3);
+            double hotterVol = hotVol * (1.0001 + random.nextDouble() * 5);
+
+            double hotMult = VolTargetOverlay.multiplier(target, OptionalDouble.of(hotVol));
+            double hotterMult = VolTargetOverlay.multiplier(target, OptionalDouble.of(hotterVol));
+            assertTrue(hotterMult < hotMult,
+                    "hotter vol did not shrink the multiplier at case " + i + " (seed " + RiskFixtures.seed()
+                            + "): target=" + target + " hot=" + hotVol + " hotter=" + hotterVol);
+
+            // Through the sizer the multiplier is exactly proportional: the risk-in-dollars
+            // invariant above keeps holding, just against the scaled budget.
+            double base = PositionSizer.quantityForRisk(10_000, 0.005, 100, 95);
+            double scaled = PositionSizer.quantityForRisk(10_000, 0.005 * hotterMult, 100, 95);
+            assertEquals(base * hotterMult, scaled, base * hotterMult * 1e-9,
+                    "the overlay did not scale the size proportionally at case " + i);
+        }
+    }
+
+    @Test
+    @DisplayName("property: the overlay never scales UP — a calm market gets exactly 1.0")
+    void overlayIsCappedAtOne() {
+        Random random = new Random(RiskFixtures.seed() + 5);
+        for (int i = 0; i < CASES; i++) {
+            double target = 0.005 + random.nextDouble() * 0.05;
+            double vol = 1e-6 + random.nextDouble() * 0.5;
+
+            double mult = VolTargetOverlay.multiplier(target, OptionalDouble.of(vol));
+            assertTrue(mult <= 1.0, "multiplier " + mult + " above 1.0 at case " + i
+                    + " (seed " + RiskFixtures.seed() + "): target=" + target + " vol=" + vol);
+            assertTrue(mult > 0, "multiplier collapsed to zero at case " + i + ": vol=" + vol);
+            if (vol <= target) {
+                assertEquals(1.0, mult,
+                        "vol at or below target must be EXACTLY 1.0, not merely close, at case " + i);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("fail-open: no volatility data means multiplier exactly 1.0 — the bot as it was")
+    void noVolDataMeansExactlyOne() {
+        assertEquals(1.0, VolTargetOverlay.multiplier(0.02, OptionalDouble.empty()));
+    }
+
+    @Test
+    @DisplayName("fail-open: zero, negative or non-finite vol is a broken feed, not a calm market")
+    void unusableVolFailsOpenWithoutDividingByZero() {
+        for (double garbage : new double[]{0.0, -0.0, -1.0, Double.NaN,
+                Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY}) {
+            assertEquals(1.0, VolTargetOverlay.multiplier(0.02, OptionalDouble.of(garbage)),
+                    "realized vol " + garbage + " must fail open to exactly 1.0");
+        }
+    }
+
+    @Test
+    @DisplayName("the config side stays fail-closed: an unusable TARGET is refused, not coerced")
+    void unusableTargetIsRefused() {
+        // Fail-open is only for the measured side. The target is code, and broken code should throw.
+        assertThrows(IllegalArgumentException.class,
+                () -> VolTargetOverlay.multiplier(0.0, OptionalDouble.empty()));
+        assertThrows(IllegalArgumentException.class,
+                () -> VolTargetOverlay.multiplier(Double.NaN, OptionalDouble.of(0.03)));
+        assertThrows(IllegalArgumentException.class,
+                () -> VolTargetOverlay.multiplier(-0.02, OptionalDouble.of(0.03)));
+    }
+
+    @Test
+    @DisplayName("worked example: realized vol at twice the target halves the size")
+    void volOverlayWorkedExample() {
+        assertEquals(0.5, VolTargetOverlay.multiplier(0.02, OptionalDouble.of(0.04)), 1e-12);
+        double qty = PositionSizer.quantityForRisk(10_000, 0.005 * 0.5, 64_000, 62_800);
+        assertEquals(0.0416666667 / 2, qty, 1e-9);
     }
 }

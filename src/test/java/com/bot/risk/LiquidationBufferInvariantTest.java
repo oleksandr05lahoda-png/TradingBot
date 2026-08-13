@@ -81,13 +81,13 @@ class LiquidationBufferInvariantTest {
     @DisplayName("a config may tighten the buffer above 30% but never below it")
     void bufferFloorCannotBeLowered() {
         RiskConfig tighter = new RiskConfig(0.005, 5, 1.0, Double.POSITIVE_INFINITY, 2.0, 2.0, 3, 0.03,
-                0.50, 0.5, 0.0005, 2.0, TakeProfitPolicy.standard());
+                0.50, 0.5, 0.0005, 2.0, 0.02, TakeProfitPolicy.standard());
         assertEquals(0.50, tighter.minLiquidationBufferFraction());
 
         IllegalArgumentException thrown = org.junit.jupiter.api.Assertions.assertThrows(
                 IllegalArgumentException.class,
                 () -> new RiskConfig(0.005, 5, 1.0, Double.POSITIVE_INFINITY, 2.0, 2.0, 3, 0.03,
-                        0.29, 0.5, 0.0005, 2.0, TakeProfitPolicy.standard()));
+                        0.29, 0.5, 0.0005, 2.0, 0.02, TakeProfitPolicy.standard()));
         assertTrue(thrown.getMessage().contains("below the hard floor"), thrown.getMessage());
     }
 
