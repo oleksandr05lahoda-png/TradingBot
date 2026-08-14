@@ -96,6 +96,8 @@ def main():
                     help="scan at most this many coins, by 24h turnover")
     ap.add_argument("--min-volume", type=float, default=5e6)
     ap.add_argument("--leverage", type=int, default=2)
+    ap.add_argument("--side", choices=("long", "short", "both"), default="both",
+                    help="restrict the book to one side (owner's call; the header records it)")
     ap.add_argument("--max-signals", type=int, default=0,
                     help="emit at most N lines (0 = no limit); use a small N for a smoke run")
     args = ap.parse_args()
@@ -132,6 +134,8 @@ def main():
             skipped += 1
             continue
         side = "LONG" if ret > 0 else "SHORT"
+        if args.side != "both" and side.lower() != args.side:
+            continue
         longs += side == "LONG"
         shorts += side == "SHORT"
         lines.append("%s %s entry=%.10g atr=%.10g lev=%d id=tsmom-%s-%s"
@@ -157,8 +161,12 @@ def main():
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("# generated %s by tools/scanner/scan.py\n" % stamp)
-        f.write("# rule: sign of trailing %dd return; measured t=0.94 on holdout, DID NOT PASS\n"
+        f.write("# rule: sign of trailing %dd return; both sides holdout t=0.94, DID NOT PASS\n"
                 % LOOKBACK_DAYS)
+        if args.side != "both":
+            f.write("# %s-ONLY book by the owner's decision; measured one-side holdout hedged "
+                    "alpha: long -14.0%%/y (t=-0.44), short +63.8%%/y (t=2.13, post-hoc cell)\n"
+                    % args.side.upper())
         f.write("# the bot still sizes from the stop, caps leverage and may refuse any line\n")
         for ln in lines:
             f.write(ln + "\n")
