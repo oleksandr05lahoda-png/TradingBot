@@ -74,6 +74,44 @@ def universe(min_volume):
     return picked
 
 
+CG_MARKETS = ("https://api.coingecko.com/api/v3/coins/markets"
+              "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1")
+STABLECOINS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
+               "USD1", "BUSD", "USDP", "USDD", "USDF", "RLUSD"}
+
+
+def universe_by_cap(min_volume):
+    """Top of the market by CoinGecko market cap, mapped onto tradable perps.
+
+    Order is cap rank, not turnover; the liquidity floor still applies, because
+    a cap-ranked coin nobody trades is not executable. Forward use only:
+    today's cap list applied to past data bakes survivorship into a backtest
+    (LUNA sat in the cap top-5 before going to zero).
+    """
+    req = urllib.request.Request(CG_MARKETS, headers={"User-Agent": "scanner/1.0"})
+    with urllib.request.urlopen(req, timeout=45) as r:
+        cg = json.loads(r.read().decode("utf-8"))
+    info = get("/fapi/v1/exchangeInfo", {}, gap=0.5)
+    tradable = {s["symbol"] for s in info["symbols"]
+                if s.get("quoteAsset") == "USDT"
+                and s.get("contractType") == "PERPETUAL"
+                and s.get("status") == "TRADING"
+                and s.get("underlyingType") == "COIN"}
+    tickers = get("/fapi/v1/ticker/24hr", {}, gap=0.5)
+    vol = {t["symbol"]: float(t.get("quoteVolume", 0)) for t in tickers}
+    picked, seen = [], set()
+    for c in cg:
+        sym = (c.get("symbol") or "").upper()
+        if not sym or sym in STABLECOINS or sym in seen:
+            continue
+        seen.add(sym)
+        for cand in (sym + "USDT", "1000" + sym + "USDT", "1000000" + sym + "USDT"):
+            if cand in tradable and vol.get(cand, 0.0) >= min_volume:
+                picked.append((cand, vol.get(cand, 0.0)))
+                break
+    return picked
+
+
 def atr(bars, period):
     """Wilder-style ATR on daily bars: [openTime, o, h, l, c, ...]."""
     trs = []
@@ -98,6 +136,8 @@ def main():
     ap.add_argument("--leverage", type=int, default=2)
     ap.add_argument("--side", choices=("long", "short", "both"), default="both",
                     help="restrict the book to one side (owner's call; the header records it)")
+    ap.add_argument("--universe", choices=("turnover", "cap"), default="turnover",
+                    help="rank coins by 24h turnover (default) or by market cap (CoinGecko)")
     ap.add_argument("--max-signals", type=int, default=0,
                     help="emit at most N lines (0 = no limit); use a small N for a smoke run")
     args = ap.parse_args()
@@ -106,8 +146,11 @@ def main():
         print("leverage must be 1..5 (the bot's hard cap is 5)")
         return 1
 
-    pool = universe(args.min_volume)[:args.top]
-    print("universe: %d coins above $%.0fM/24h" % (len(pool), args.min_volume / 1e6))
+    ranked = universe_by_cap(args.min_volume) if args.universe == "cap" \
+        else universe(args.min_volume)
+    pool = ranked[:args.top]
+    print("universe (%s): %d coins above $%.0fM/24h"
+          % (args.universe, len(pool), args.min_volume / 1e6))
 
     lines, longs, shorts, skipped = [], 0, 0, 0
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -160,7 +203,8 @@ def main():
     shorts = len(lines) - longs
 
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write("# generated %s by tools/scanner/scan.py\n" % stamp)
+        f.write("# generated %s by tools/scanner/scan.py (universe: %s, top %d)\n"
+                % (stamp, args.universe, args.top))
         f.write("# rule: sign of trailing %dd return; both sides holdout t=0.94, DID NOT PASS\n"
                 % LOOKBACK_DAYS)
         if args.side != "both":
