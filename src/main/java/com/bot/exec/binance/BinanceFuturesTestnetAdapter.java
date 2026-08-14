@@ -239,6 +239,16 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     // ─── Position and margin settings ────────────────────────────────────────────────────────
 
     @Override public void ensureIsolatedMargin(String symbol) {
+        // Ask before telling. Binance refuses a marginType POST outright when the symbol carries
+        // stale working orders ("Position side cannot be changed if there exists open orders"),
+        // and that refusal is NOT in the benign set below — rightly so, because trading a symbol
+        // under cross margin while the risk engine sized it for isolated would be silent damage.
+        // But the common case is a symbol that is already isolated from an earlier session and
+        // merely has leftover orders: there is nothing to change, so there is nothing to refuse.
+        if (isAlreadyIsolated(symbol)) {
+            LOG.fine("[Binance] " + symbol + " is already isolated; no marginType call needed");
+            return;
+        }
         try {
             signedPost("/fapi/v1/marginType",
                     new LinkedHashMap<>(Map.of("symbol", symbol, "marginType", "ISOLATED")), 1, false);
@@ -246,6 +256,27 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
             if (!BinanceErrorCodes.isBenignAlreadyInDesiredState(e.exchangeCode())) throw e;
             LOG.fine("[Binance] " + symbol + " is already isolated");
         }
+    }
+
+    /**
+     * True only when the exchange itself says the symbol is on isolated margin. Any doubt — an
+     * empty answer, a shape we do not recognise — returns false so the caller still attempts the
+     * change and any real refusal still surfaces.
+     */
+    private boolean isAlreadyIsolated(String symbol) {
+        try {
+            JSONArray rows = new JSONArray(
+                    signedGet("/fapi/v2/positionRisk", Map.of("symbol", symbol), 5));
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject row = rows.getJSONObject(i);
+                if (symbol.equals(row.optString("symbol", ""))) {
+                    return "isolated".equalsIgnoreCase(row.optString("marginType", ""));
+                }
+            }
+        } catch (RuntimeException e) {
+            LOG.fine("[Binance] could not read margin type for " + symbol + ": " + e.getMessage());
+        }
+        return false;
     }
 
     /** Any refusal propagates, {@link BinanceErrorCodes#INVALID_LEVERAGE} included. */
