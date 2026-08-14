@@ -61,6 +61,12 @@ public final class TestnetBot {
 
         AlertSink alerts = AlertSink.fromEnvironment();
         RiskConfig config = RiskConfig.defaults();
+        // Book width is an operational choice, not a risk limit — every hard ceiling (risk per
+        // trade, leverage, daily loss, liquidation buffer) still binds per position, and the
+        // daily kill switch is what actually bounds a correlated book. Left at the tight default
+        // unless the operator says otherwise.
+        int maxPositions = intProperty("MAX_POSITIONS", 0);
+        if (maxPositions > 0) config = config.withMaxConcurrentPositions(maxPositions);
         RiskEngine engine = new RiskEngine(config, new ExposureBook(),
                 new DailyLossKillSwitch(config.dailyLossFractionLimit()));
         TradingHalt halt = new TradingHalt();
