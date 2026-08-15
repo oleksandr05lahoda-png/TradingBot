@@ -68,6 +68,17 @@ if (-not (Test-Path $script)) {
     Set-Content -Path $script -Encoding ascii -Value "# live forward book - autoscan appends, the bot executes"
 }
 
+# Start-Process truncates a redirect target, so without this every restart destroys the evidence
+# of why the previous run stopped. It cost one diagnosis already: the bot halted at 16:05 on 15.08
+# and the reason was gone by the time anyone looked. Keep the last ten runs.
+if ((Test-Path $botLog) -and (Get-Item $botLog).Length -gt 0) {
+    $stamp = (Get-Item $botLog).LastWriteTime.ToString('yyyyMMdd-HHmmss')
+    Move-Item $botLog (Join-Path $fwd "bot_live.$stamp.err.log") -Force
+    Get-ChildItem (Join-Path $fwd 'bot_live.*.err.log') |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 Say "starting the bot..."
 Start-Process -FilePath (Join-Path $root 'gradlew.bat') -WorkingDirectory $root -WindowStyle Hidden `
     -ArgumentList 'run','-q','--console=plain',"`"--args=--source manual --script $script`"" `
