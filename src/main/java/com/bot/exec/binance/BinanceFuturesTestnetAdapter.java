@@ -399,21 +399,25 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
         JSONArray plain = new JSONArray(signedGet("/fapi/v1/openOrders", Map.of("symbol", symbol), 1));
         for (int i = 0; i < plain.length(); i++) out.add(parseOrder(plain.getJSONObject(i)));
 
-        // The demo host accepts conditional orders but does not implement the endpoint that lists
-        // them, though the production reference documents it. Losing the listing must not lose the
-        // plain orders too, and it must not be mistaken for "there are no stops" — see
-        // canListConditionalOrders.
+        // Listing conditional orders is {@code openAlgoOrders}, NOT {@code algoOpenOrders}: the two
+        // words are transposed and the wrong one 404s. That typo was expensive. Because listing
+        // silently returned nothing, cancelAllOpenOrders below had nothing to cancel, so every
+        // closed position left its stop and takes resting on the venue; 64 dead orders had piled
+        // up by 15.08, the account hit Binance's conditional-order cap, and new positions began
+        // failing to place stops at all. Losing the listing must still not lose the plain orders,
+        // and must not be mistaken for "there are no stops" — see canListConditionalOrders.
         try {
-            JSONArray algo = new JSONArray(signedGet("/fapi/v1/algoOpenOrders", Map.of("symbol", symbol), 1));
+            JSONArray algo = new JSONArray(signedGet("/fapi/v1/openAlgoOrders", Map.of("symbol", symbol), 1));
             for (int i = 0; i < algo.length(); i++) out.add(parseAlgoOrder(algo.getJSONObject(i), symbol));
             conditionalListingAvailable = true;
         } catch (ExchangeException e) {
             if (e.httpStatus() != 404) throw e;
             if (conditionalListingAvailable) {
                 conditionalListingAvailable = false;
-                LOG.warning("[Binance] " + endpointHost() + " does not implement /fapi/v1/algoOpenOrders. "
+                LOG.warning("[Binance] " + endpointHost() + " does not implement /fapi/v1/openAlgoOrders. "
                         + "Conditional orders cannot be enumerated, so reconciliation cannot verify "
-                        + "that a position still has its stop.");
+                        + "that a position still has its stop, and closed positions will leave their "
+                        + "stops resting until something cancels them by name.");
             }
         }
         return out;
