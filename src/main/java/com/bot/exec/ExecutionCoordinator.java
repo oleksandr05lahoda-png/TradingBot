@@ -309,6 +309,16 @@ public final class ExecutionCoordinator {
                         plan.symbol() + " leg " + i + " at " + leg.rMultiple() + "R: " + e.getMessage());
             }
         }
+        // Losing one leg of several thins the exit; losing all of them removes the profit target
+        // entirely, and the position then rides to its stop or waits for the scanner to close it
+        // on signal. That is a different animal and must not hide inside a per-leg warning —
+        // seen live 14.08, when the venue's conditional-order cap silently swallowed both legs.
+        if (placed.isEmpty() && !legs.isEmpty()) {
+            alerts.warning("Position has NO take-profit",
+                    plan.symbol() + ": every take-profit leg was refused. The stop still protects it, "
+                            + "but nothing will bank a win automatically — only the stop or a "
+                            + "signal-driven close will end this position.");
+        }
         return placed;
     }
 
