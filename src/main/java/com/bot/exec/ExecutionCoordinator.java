@@ -348,22 +348,33 @@ public final class ExecutionCoordinator {
         alerts.critical("Protective stop could not be placed",
                 plan.symbol() + " filled " + filled.toPlainString() + " @ " + avgPrice.toPlainString()
                         + " but the stop was refused (" + cause.getMessage()
-                        + "). Closing the position and halting.");
-        halt.halt("protective stop could not be placed on " + plan.symbol(), clock.instant());
+                        + "). Closing the position.");
 
+        // The invariant is "no position lives without a stop", and the unwind below is what
+        // enforces it. Whether trading HALTS depends on whether the unwind succeeds: a clean
+        // reduce-only close leaves the account exactly as if the signal had been refused
+        // outright, and one symbol with unplaceable stops (measured live 14.08: stale conditional
+        // orders on a venue that cannot list them) must not stop every other symbol. Anything
+        // short of a confirmed-flat close halts, exactly as before.
         String note;
         try {
             OrderStatus close = flatten(plan.symbol(), plan.side(), filled, plan.signalId());
             BigDecimal residual = filled.subtract(close.executedQuantity());
             if (residual.signum() > 0) {
+                halt.halt("protective stop could not be placed on " + plan.symbol()
+                        + " and the unwind left a remainder", clock.instant());
                 note = "stop refused; the reduce-only close only filled " + close.executedQuantity()
                         .toPlainString() + " of " + filled.toPlainString()
                         + " — " + residual.toPlainString() + " REMAINS OPEN AND UNPROTECTED";
                 alerts.critical("Naked position", plan.symbol() + ": " + note);
             } else {
-                note = "stop refused; position closed reduce-only in full";
+                note = "stop refused; position closed reduce-only in full — trading continues, "
+                        + "but this symbol should be left alone until its conditional orders are cleaned up";
+                LOG.warning("[Coordinator] " + plan.symbol() + ": " + note);
             }
         } catch (RuntimeException e) {
+            halt.halt("protective stop could not be placed on " + plan.symbol()
+                    + " and the unwind failed", clock.instant());
             note = "stop refused AND the reduce-only close also failed (" + e.getMessage()
                     + ") — MANUAL INTERVENTION REQUIRED";
             alerts.critical("Naked position", plan.symbol() + ": " + note);

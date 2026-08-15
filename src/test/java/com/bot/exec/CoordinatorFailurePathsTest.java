@@ -34,8 +34,8 @@ class CoordinatorFailurePathsTest {
     }
 
     @Test
-    @DisplayName("a refused protective stop closes the position, halts, and reports it as unprotected")
-    void refusedStopClosesAndHalts() throws Exception {
+    @DisplayName("a refused protective stop with a clean unwind refuses the symbol without halting")
+    void refusedStopWithCleanUnwindDoesNotHalt() throws Exception {
         TradePlan plan = plan();
         exchange.placementFailure = request -> request.purpose() == OrderPurpose.STOP_LOSS
                 ? ExchangeException.refused("Precision is over the maximum defined for this asset.",
@@ -47,13 +47,17 @@ class CoordinatorFailurePathsTest {
         assertEquals(ExecutionCoordinator.Outcome.ABORTED_UNPROTECTED, report.outcome());
         assertTrue(report.mayHaveOpenedUnknownRisk());
         assertTrue(alerts.sawCritical("Protective stop could not be placed"), alerts.messages.toString());
-        assertTrue(halt.isHalted());
         assertTrue(exchange.openPositions().isEmpty(),
                 "a position that cannot be protected must be closed, not kept");
+        // The unwind is confirmed flat, so the account is exactly as if the signal had been
+        // refused outright. One symbol with unplaceable stops must not stop every other symbol
+        // (seen live 14.08: stale conditional orders on a venue that cannot enumerate them).
+        assertFalse(halt.isHalted(),
+                "a clean unwind leaves nothing at risk, so the machine keeps trading other symbols");
     }
 
     @Test
-    @DisplayName("a stop refusal whose close only partly fills is reported as still open, not as closed")
+    @DisplayName("a stop refusal whose close only partly fills is reported as still open, and halts")
     void refusedStopWithPartialCloseIsReportedHonestly() throws Exception {
         TradePlan plan = plan();
         exchange.placementFailure = request -> request.purpose() == OrderPurpose.STOP_LOSS
@@ -68,6 +72,8 @@ class CoordinatorFailurePathsTest {
         assertTrue(report.note().contains("REMAINS OPEN AND UNPROTECTED"), report.note());
         assertFalse(exchange.openPositions().isEmpty(),
                 "the residual really is there — the point is that the report says so");
+        assertTrue(halt.isHalted(),
+                "an unprotected remainder on the exchange is exactly what the halt latch is for");
     }
 
     @Test

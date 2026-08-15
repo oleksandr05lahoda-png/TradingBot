@@ -18,6 +18,7 @@ import com.bot.risk.RiskConfig;
 import com.bot.risk.RiskConstants;
 import com.bot.risk.RiskDecision;
 import com.bot.risk.RiskEngine;
+import com.bot.risk.TakeProfitPolicy;
 import com.bot.risk.TradeRequest;
 import com.bot.signal.CloseRequest;
 import com.bot.signal.ExecutionFeedback;
@@ -67,6 +68,12 @@ public final class TestnetBot {
         // unless the operator says otherwise.
         int maxPositions = intProperty("MAX_POSITIONS", 0);
         if (maxPositions > 0) config = config.withMaxConcurrentPositions(maxPositions);
+        // One take instead of two frees a conditional-order slot per position. The exchange caps
+        // conditional orders per account (measured live 14.08: the cap arrived near 33), so with
+        // stop + 2 takes the book tops out around ten protected positions; stop + 1 take buys
+        // roughly fifteen. The R-multiple is the operator's, the split never was measured edge.
+        double tpR = doubleProperty("TP_R_MULTIPLE", 0.0);
+        if (tpR > 0) config = config.withTakeProfitPolicy(TakeProfitPolicy.single(tpR));
         RiskEngine engine = new RiskEngine(config, new ExposureBook(),
                 new DailyLossKillSwitch(config.dailyLossFractionLimit()));
         TradingHalt halt = new TradingHalt();
@@ -93,6 +100,17 @@ public final class TestnetBot {
                     DEAD_MANS_COUNTDOWN_MS, DEAD_MANS_MAX_SILENCE_MS);
 
             banner(port, signals, config, defaultLeverage);
+
+            // Re-arm the book from the last run's snapshot BEFORE reconciling: the venue cannot
+            // name resting stops, so without this every restart with open positions ended in a
+            // halt and a forced flatten. Positions the ledger does not know stay unknown and
+            // still halt opening — that is the honest outcome for a genuinely unaccounted position.
+            Path ledgerPath = Path.of(System.getenv().getOrDefault("BOOK_LEDGER_PATH", "book-ledger.json"));
+            String[] lastLedgerBody = {""};
+            int seeded = BookLedger.seed(engine.book(), port.openPositions(), ledgerPath);
+            if (seeded > 0) {
+                LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
+            }
 
             // A start-up disagreement stops OPENING and nothing else. Exiting here would have been
             // the same mistake in a third place: the operator would be left with a position on the
@@ -145,6 +163,10 @@ public final class TestnetBot {
                     }
                     Thread.sleep(Math.min(30_000L, 1_000L * sourceFailures));
                 }
+
+                // The snapshot is what lets the NEXT process confirm stops by name; a no-change
+                // pass costs a string compare and nothing else.
+                BookLedger.save(engine.book(), ledgerPath, lastLedgerBody);
 
                 long nowMs = System.currentTimeMillis();
                 // Housekeeping never kills the loop. A dead bot cannot close the position it is
@@ -278,6 +300,17 @@ public final class TestnetBot {
 
     private static String pct(double fraction) {
         return String.format("%.2f%%", fraction * 100);
+    }
+
+    private static double doubleProperty(String env, double fallback) {
+        String raw = System.getenv(env);
+        if (raw == null || raw.isBlank()) return fallback;
+        try {
+            return Double.parseDouble(raw.trim());
+        } catch (NumberFormatException e) {
+            LOG.warning("[Boot] " + env + "=\"" + raw + "\" is not a number; using " + fallback);
+            return fallback;
+        }
     }
 
     private static int intProperty(String env, int fallback) {
