@@ -63,10 +63,20 @@ $env:DEFAULT_LEVERAGE = '2'
 $env:TP_R_MULTIPLE    = '1.75'
 $env:BOOK_LEDGER_PATH = Join-Path $fwd 'book-ledger.json'
 
+# The bot replays the whole book at boot. Replayed entries are harmless (the ledger re-arms
+# open positions, the scanner re-issues wanted entries within the hour), but a stale CLOSE
+# from a previous run replays against whatever holds that symbol NOW: on 17.08 a close from
+# 15.08 was matched against a since-reopened ADAUSDT and halted the machine on a false
+# "partial close" — at every restart. Each run therefore starts with a fresh book.
 $script = Join-Path $fwd 'book_live.txt'
-if (-not (Test-Path $script)) {
-    Set-Content -Path $script -Encoding ascii -Value "# live forward book - autoscan appends, the bot executes"
+if ((Test-Path $script) -and (Get-Item $script).Length -gt 0) {
+    $stamp = (Get-Item $script).LastWriteTime.ToString('yyyyMMdd-HHmmss')
+    Move-Item $script (Join-Path $fwd "book_live.$stamp.txt") -Force
+    Get-ChildItem (Join-Path $fwd 'book_live.*.txt') |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 }
+Set-Content -Path $script -Encoding ascii -Value "# live forward book - autoscan appends, the bot executes"
 
 # Start-Process truncates a redirect target, so without this every restart destroys the evidence
 # of why the previous run stopped. It cost one diagnosis already: the bot halted at 16:05 on 15.08

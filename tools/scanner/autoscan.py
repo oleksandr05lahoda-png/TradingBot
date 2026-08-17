@@ -292,7 +292,10 @@ def main():
                 with io.open(args.script, "a", encoding="ascii") as f:
                     f.write("\n# autoscan %s\n" % stamp)
                     for s in to_close:
-                        f.write("CLOSE %s reason=trend-exited\n" % s)
+                        # an explicit id keeps a crash-replay idempotent without colliding
+                        # with a close of the same symbol from an earlier scan
+                        f.write("CLOSE %s id=auto-close-%s-%s reason=trend-exited\n"
+                                % (s, s, stamp))
                         cooldown[s] = now
                         entered.pop(s, None)
                     for s in to_open:
