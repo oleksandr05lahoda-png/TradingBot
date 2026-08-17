@@ -47,6 +47,7 @@ STABLECOINS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
                "USD1", "BUSD", "USDP", "USDD", "USDF", "RLUSD"}
 
 ATR_PERIOD = 14
+STOP_ATR_MULT = 2.0    # mirrors the bot's ATR-fallback stop; keep in sync with RiskEngine
 _last = [0.0]
 
 
@@ -81,13 +82,27 @@ def get(path, params, base=FAPI, gap=0.25, tries=5):
     return None
 
 
+_skew = [None]    # local clock minus exchange clock, ms
+
+
 def signed_get(path, env):
-    q = "timestamp=%d" % (time.time() * 1000)
+    # The laptop's clock drifts seconds away from the exchange (3.8s and growing on
+    # 17.08), which starves the default 5s recvWindow and fails every scan. Sign with
+    # the exchange's own clock, as the bot does; resync after any failure so a
+    # sleep/resume jump heals on the next call instead of poisoning every scan.
+    if _skew[0] is None:
+        srv = get("/fapi/v1/time", {}, base=DEMO, gap=0.5)
+        _skew[0] = (int(time.time() * 1000) - int(srv["serverTime"])) if srv else 0
+    q = "timestamp=%d&recvWindow=10000" % (int(time.time() * 1000) - _skew[0])
     sig = hmac.new(env["BINANCE_TESTNET_API_SECRET"].encode(), q.encode(), hashlib.sha256).hexdigest()
     req = urllib.request.Request("%s%s?%s&signature=%s" % (DEMO, path, q, sig),
                                  headers={"X-MBX-APIKEY": env["BINANCE_TESTNET_API_KEY"]})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        _skew[0] = None
+        raise
 
 
 def read_env(repo):
@@ -107,6 +122,13 @@ def universe(top, min_volume, by_cap):
     tradable = {s["symbol"] for s in info["symbols"]
                 if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
                 and s.get("status") == "TRADING" and s.get("underlyingType") == "COIN"}
+    # The bot executes on the demo exchange, which lists a smaller universe than the
+    # live one; a candidate absent there is refused every scan and wastes an open slot.
+    # If demo is unreachable this scan, fall back to the live list rather than stall.
+    demo_info = get("/fapi/v1/exchangeInfo", {}, base=DEMO, gap=0.5)
+    if demo_info:
+        tradable &= {s["symbol"] for s in demo_info["symbols"]
+                     if s.get("status") == "TRADING"}
     tick = get("/fapi/v1/ticker/24hr", {}, gap=0.5) or []
     vol = {t["symbol"]: float(t.get("quoteVolume", 0)) for t in tick}
     if not by_cap:
@@ -265,8 +287,13 @@ def main():
                 # Hysteresis: enter above +band, hold anything above -band. A coin wobbling
                 # around zero neither enters nor exits — churn is pure cost, measured at 10bp
                 # a round trip.
+                # The bot puts its stop at entry - ATR x STOP_ATR_MULT; when that lands at
+                # or below zero it auto-rejects, so nominating the coin only burns a slot
+                # (BEAT: atr 0.95 on price 0.44). Gate ONLY the entry side - a held coin
+                # must stay hold-eligible, this filter must never force a close.
                 if m["ret"] > args.entry_band or m["dip"]:
-                    entry_ok.add(sym)
+                    if m["price"] > STOP_ATR_MULT * m["atr"]:
+                        entry_ok.add(sym)
                 if m["ret"] > -args.exit_band or m["dip"]:
                     hold_ok.add(sym)
 
