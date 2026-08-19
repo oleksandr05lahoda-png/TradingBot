@@ -47,7 +47,7 @@ if (-not $acquired) {
 # scanner is a frozen book that looks identical to a working one from outside.
 function Test-ScannerAlive {
     @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*autoscan*' }).Count -ge 1
+        Where-Object { $_.CommandLine -like '*autoscan*' -and $_.CommandLine -like '*book_live*' }).Count -ge 1
 }
 if (-not $Force -and (Test-Path $botLog) -and (Test-ScannerAlive)) {
     $age = (Get-Date) - (Get-Item $botLog).LastWriteTime
@@ -59,10 +59,14 @@ if (-not $Force -and (Test-Path $botLog) -and (Test-ScannerAlive)) {
 
 Say "--- start-forward ---"
 Say "stopping anything still running..."
+# Scoped kills: this launcher owns ONLY the demo machine (book_live). A real-venue bot
+# and its scanner run under book_real and must never be touched from here.
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*autoscan*' } |
+    Where-Object { $_.CommandLine -like '*autoscan*' -and $_.CommandLine -like '*book_live*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }
-Get-Process java -ErrorAction SilentlyContinue | Stop-Process -Force -Confirm:$false
+Get-CimInstance Win32_Process -Filter "Name='java.exe'" |
+    Where-Object { $_.CommandLine -like '*book_live*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }
 Start-Sleep -Seconds 4
 
 # Credentials and settings. Keys stay in local.env and are never printed.

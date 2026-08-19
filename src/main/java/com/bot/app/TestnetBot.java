@@ -9,8 +9,8 @@ import com.bot.exec.ExecutionCoordinator;
 import com.bot.exec.IdempotentOrderPlacer;
 import com.bot.exec.Reconciler;
 import com.bot.exec.TradingHalt;
-import com.bot.exec.binance.BinanceFuturesTestnetAdapter;
-import com.bot.exec.binance.BinanceTestnetEndpoint;
+import com.bot.exec.binance.BinanceFuturesAdapter;
+import com.bot.exec.binance.BinanceVenue;
 import com.bot.risk.DailyLossKillSwitch;
 import com.bot.risk.ExposureBook;
 import com.bot.risk.MarginTierTable;
@@ -78,11 +78,14 @@ public final class TestnetBot {
                 new DailyLossKillSwitch(config.dailyLossFractionLimit()));
         TradingHalt halt = new TradingHalt();
 
+        BinanceVenue venue;
         ExchangePort port;
         try {
-            port = BinanceFuturesTestnetAdapter.fromEnvironment();
+            venue = BinanceVenue.resolveFromEnvironment();
+            port = BinanceFuturesAdapter.fromEnvironment(venue);
         } catch (IllegalStateException e) {
-            // A missing credential is an operator mistake: print the fix, not a stack trace.
+            // A missing credential or a mis-set arming flag is an operator mistake:
+            // print the fix, not a stack trace.
             System.err.println(e.getMessage());
             System.exit(2);
             return;
@@ -99,7 +102,18 @@ public final class TestnetBot {
             DeadMansSwitch deadMansSwitch = new DeadMansSwitch(port, engine, halt, alerts,
                     DEAD_MANS_COUNTDOWN_MS, DEAD_MANS_MAX_SILENCE_MS);
 
-            banner(port, signals, config, defaultLeverage);
+            banner(venue, port, signals, config, defaultLeverage);
+
+            // Observation is a pre-latched halt, not a separate mechanism: entries are refused
+            // through the same gate every other halt uses, closes and reconciliation keep working,
+            // and the only way out is the operator restarting with REAL_MODE=trade — the same
+            // "operator clears it" contract as any other halt.
+            if (venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE) {
+                halt.halt("REAL_MODE=observe — reading the account, accepting closes, opening "
+                        + "nothing. Set REAL_MODE=trade and restart to enable entries.", Instant.now());
+                alerts.warning("Real venue in OBSERVE mode",
+                        "the bot reads the account and accepts closes; no position will be opened");
+            }
 
             // Re-arm the book from the last run's snapshot BEFORE reconciling: the venue cannot
             // name resting stops, so without this every restart with open positions ended in a
@@ -277,14 +291,19 @@ public final class TestnetBot {
         return ManualTestnetInput.fromConsole(defaultLeverage);
     }
 
-    private static void banner(ExchangePort port, SignalSource signals, RiskConfig config, int defaultLeverage) {
+    private static void banner(BinanceVenue venue, ExchangePort port, SignalSource signals,
+                               RiskConfig config, int defaultLeverage) {
+        String headline = venue.isReal()
+                ? (venue.realMode() == BinanceVenue.RealMode.OBSERVE
+                        ? "  │  REAL EXCHANGE — REAL MONEY. Mode: OBSERVE (no entries).             │"
+                        : "  │  REAL EXCHANGE — REAL MONEY. Mode: TRADE. Armed by the operator.     │")
+                : "  │  DEMO venue. The real exchange needs REAL_TRADING=ARMED + real keys. │";
         LOG.info(String.join("\n",
                 "",
                 "  ┌──────────────────────────────────────────────────────────────────────┐",
-                "  │  TESTNET ONLY. No production endpoint exists in this build.          │",
+                headline,
                 "  └──────────────────────────────────────────────────────────────────────┘",
-                "  endpoint        : " + port.endpointHost() + "  (allowed: "
-                        + BinanceTestnetEndpoint.ALLOWED_HOSTS + ")",
+                "  endpoint        : " + port.endpointHost() + "  (venue: " + venue.name() + ")",
                 "  signal source   : " + signals.name(),
                 "  risk per trade  : " + pct(config.riskFractionPerTrade())
                         + "  (hard cap " + pct(RiskConstants.MAX_RISK_FRACTION_PER_TRADE) + ")",
@@ -333,15 +352,20 @@ public final class TestnetBot {
 
     private static String usage() {
         return String.join("\n",
-                "Binance USDⓈ-M futures testnet risk and execution harness.",
+                "Binance USDⓈ-M futures risk and execution harness. Demo venue by default.",
                 "",
                 "  --source manual|supabase   where signals come from (default: manual)",
                 "  --script <file>            feed manual signals from a file instead of the console",
                 "  --help                     this text",
                 "",
                 "Environment:",
-                "  BINANCE_TESTNET_API_KEY     testnet key, created with withdrawals DISABLED",
-                "  BINANCE_TESTNET_API_SECRET  testnet secret",
+                "  BINANCE_TESTNET_API_KEY     demo key, created with withdrawals DISABLED",
+                "  BINANCE_TESTNET_API_SECRET  demo secret",
+                "  REAL_TRADING                exactly ARMED selects the real exchange; anything",
+                "                              else set here refuses to start. Unset = demo.",
+                "  REAL_MODE                   observe (default) reads and closes only; trade opens.",
+                "  BINANCE_REAL_API_KEY        real key: WITHDRAWALS DISABLED + IP whitelist",
+                "  BINANCE_REAL_API_SECRET     real secret",
                 "  DEFAULT_LEVERAGE            default leverage when a signal does not specify (max "
                         + RiskConstants.MAX_LEVERAGE + ")",
                 "  SUPABASE_URL / SUPABASE_QUEUE_KEY   only for --source supabase",

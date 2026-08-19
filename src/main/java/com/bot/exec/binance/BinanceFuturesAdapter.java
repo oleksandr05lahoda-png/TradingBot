@@ -21,7 +21,6 @@ import org.json.JSONObject;
 
 import java.io.IOException;
 import java.math.BigDecimal;
-import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -37,21 +36,24 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 /**
- * {@link ExchangePort} over Binance USDⓈ-M futures <b>testnet</b> REST. Everything exchange-specific
- * lives here, so nothing above this class knows Binance exists.
+ * {@link ExchangePort} over Binance USDⓈ-M futures REST, demo or real depending on the
+ * {@link BinanceVenue} it was built with. Everything exchange-specific lives here, so nothing above
+ * this class knows Binance exists; every request URL passes {@link BinanceVenue#require}, so a
+ * request aimed at the wrong venue dies inside this process.
  *
  * <p>Ambiguity is preserved rather than flattened: a timeout or a 503 becomes
  * {@link ExchangeException#ambiguous()}, an error code becomes a refusal, and
  * {@code IdempotentOrderPlacer} decides differently in each case.
  */
-public final class BinanceFuturesTestnetAdapter implements ExchangePort {
+public final class BinanceFuturesAdapter implements ExchangePort {
 
-    private static final Logger LOG = Logger.getLogger(BinanceFuturesTestnetAdapter.class.getName());
+    private static final Logger LOG = Logger.getLogger(BinanceFuturesAdapter.class.getName());
 
     private static final long FILTER_CACHE_TTL_MS = 6 * 60 * 60 * 1000L;
 
     private record CachedFilters(InstrumentFilters filters, long fetchedAtMs) {}
 
+    private final BinanceVenue venue;
     private final HttpClient http;
     private final BinanceSigner signer;
     private final RateLimiter rateLimiter;
@@ -61,16 +63,18 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     private volatile long clockOffsetMs = 0;
     private volatile boolean conditionalListingAvailable = true;
 
-    public static BinanceFuturesTestnetAdapter fromEnvironment() {
-        return new BinanceFuturesTestnetAdapter(
+    public static BinanceFuturesAdapter fromEnvironment(BinanceVenue venue) {
+        return new BinanceFuturesAdapter(
+                venue,
                 HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(),
-                BinanceSigner.fromEnvironment(),
+                BinanceSigner.fromEnvironment(venue),
                 RateLimiter.binanceDefaults(),
                 BinanceSigner.DEFAULT_RECV_WINDOW_MS);
     }
 
-    public BinanceFuturesTestnetAdapter(HttpClient http, BinanceSigner signer,
-                                        RateLimiter rateLimiter, long recvWindowMs) {
+    public BinanceFuturesAdapter(BinanceVenue venue, HttpClient http, BinanceSigner signer,
+                                 RateLimiter rateLimiter, long recvWindowMs) {
+        this.venue = Preconditions.notNull(venue, "venue");
         this.http = Preconditions.notNull(http, "http");
         this.signer = Preconditions.notNull(signer, "signer");
         this.rateLimiter = Preconditions.notNull(rateLimiter, "rateLimiter");
@@ -79,7 +83,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     }
 
     @Override public String endpointHost() {
-        return BinanceTestnetEndpoint.restHost();
+        return venue.restHost();
     }
 
     /** Fetches server time and records the offset every signed request will be stamped with. */
@@ -558,15 +562,15 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     private String publicGet(String path, Map<String, String> params, int weight) {
         String query = BinanceSigner.encode(new LinkedHashMap<>(params));
         return send(HttpRequest.newBuilder()
-                .uri(BinanceTestnetEndpoint.requireTestnet(
-                        BinanceTestnetEndpoint.REST_BASE_URL + path + (query.isEmpty() ? "" : "?" + query)))
+                .uri(venue.require(
+                        venue.restBaseUrl() + path + (query.isEmpty() ? "" : "?" + query)))
                 .GET(), weight, false);
     }
 
     private String signedGet(String path, Map<String, String> params, int weight) {
         String query = signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs);
         return send(HttpRequest.newBuilder()
-                .uri(BinanceTestnetEndpoint.requireTestnet(BinanceTestnetEndpoint.REST_BASE_URL + path + "?" + query))
+                .uri(venue.require(venue.restBaseUrl() + path + "?" + query))
                 .header("X-MBX-APIKEY", signer.apiKey())
                 .GET(), weight, false);
     }
@@ -574,7 +578,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     private String signedPost(String path, Map<String, String> params, int weight, boolean isOrder) {
         String query = signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs);
         return send(HttpRequest.newBuilder()
-                .uri(BinanceTestnetEndpoint.requireTestnet(BinanceTestnetEndpoint.REST_BASE_URL + path + "?" + query))
+                .uri(venue.require(venue.restBaseUrl() + path + "?" + query))
                 .header("X-MBX-APIKEY", signer.apiKey())
                 .POST(HttpRequest.BodyPublishers.noBody()), weight, isOrder);
     }
@@ -582,7 +586,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
     private String signedDelete(String path, Map<String, String> params, int weight) {
         String query = signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs);
         return send(HttpRequest.newBuilder()
-                .uri(BinanceTestnetEndpoint.requireTestnet(BinanceTestnetEndpoint.REST_BASE_URL + path + "?" + query))
+                .uri(venue.require(venue.restBaseUrl() + path + "?" + query))
                 .header("X-MBX-APIKEY", signer.apiKey())
                 .DELETE(), weight, false);
     }
@@ -652,12 +656,7 @@ public final class BinanceFuturesTestnetAdapter implements ExchangePort {
                 });
     }
 
-    /** Base URI, exposed for the boot banner. Always a testnet host. */
-    public static URI baseUri() {
-        return BinanceTestnetEndpoint.requireTestnet(BinanceTestnetEndpoint.REST_BASE_URL);
-    }
-
     @Override public String toString() {
-        return "BinanceFuturesTestnetAdapter[" + endpointHost().toLowerCase(Locale.ROOT) + "]";
+        return "BinanceFuturesAdapter[" + venue.name() + " " + endpointHost().toLowerCase(Locale.ROOT) + "]";
     }
 }

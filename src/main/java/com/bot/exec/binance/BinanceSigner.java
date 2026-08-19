@@ -16,7 +16,7 @@ import java.util.StringJoiner;
  *
  * <p>Binance validates {@code serverTime - timestamp <= recvWindow && timestamp < serverTime + 1000},
  * so timestamps must come from an exchange-synchronised clock — see
- * {@link BinanceFuturesTestnetAdapter}'s drift correction.
+ * {@link BinanceFuturesAdapter}'s drift correction.
  */
 public final class BinanceSigner {
 
@@ -32,20 +32,23 @@ public final class BinanceSigner {
     }
 
     /**
-     * Reads {@code BINANCE_TESTNET_API_KEY} and {@code BINANCE_TESTNET_API_SECRET}. The names are
-     * testnet-specific on purpose: a generic name invites a real key to be pasted in.
+     * Reads the venue's own key names ({@code BINANCE_TESTNET_API_*} for demo,
+     * {@code BINANCE_REAL_API_*} for real). Venue-specific names on purpose: a generic name
+     * invites the wrong key to be pasted in, and the two venues must never share credentials.
      */
-    public static BinanceSigner fromEnvironment() {
-        String key = System.getenv("BINANCE_TESTNET_API_KEY");
-        String secret = System.getenv("BINANCE_TESTNET_API_SECRET");
+    public static BinanceSigner fromEnvironment(BinanceVenue venue) {
+        Preconditions.notNull(venue, "venue");
+        String key = System.getenv(venue.keyEnv());
+        String secret = System.getenv(venue.secretEnv());
         if (key == null || key.isBlank() || secret == null || secret.isBlank()) {
             throw new IllegalStateException(
-                    "testnet credentials are not set.\n"
+                    venue.name() + " credentials are not set.\n"
                             + "  Put them in local.env (git-ignored) as two lines:\n"
-                            + "      BINANCE_TESTNET_API_KEY=...\n"
-                            + "      BINANCE_TESTNET_API_SECRET=...\n"
-                            + "  Copy example.env if the file does not exist yet. The key must come\n"
-                            + "  from the demo/testnet site and must have WITHDRAWALS DISABLED.\n"
+                            + "      " + venue.keyEnv() + "=...\n"
+                            + "      " + venue.secretEnv() + "=...\n"
+                            + "  Copy example.env if the file does not exist yet. The key MUST be\n"
+                            + "  created with WITHDRAWALS DISABLED"
+                            + (venue.isReal() ? " and an IP whitelist" : "") + ".\n"
                             + "  Real environment variables work too and take precedence.");
         }
         return new BinanceSigner(key.trim(), secret.trim());

@@ -41,6 +41,13 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 FAPI = "https://fapi.binance.com"
 DEMO = "https://demo-fapi.binance.com"
 
+# Which exchange the RUNNING BOT executes on. Market data always comes from the live
+# exchange (deeper universe, same prices); signed account calls and the tradability
+# filter follow the venue. Set once in main() from --venue.
+SIGNED_BASE = [DEMO]
+KEY_ENV = ["BINANCE_TESTNET_API_KEY"]
+SECRET_ENV = ["BINANCE_TESTNET_API_SECRET"]
+
 CG_MARKETS = ("https://api.coingecko.com/api/v3/coins/markets"
               "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1")
 STABLECOINS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
@@ -91,12 +98,12 @@ def signed_get(path, env):
     # the exchange's own clock, as the bot does; resync after any failure so a
     # sleep/resume jump heals on the next call instead of poisoning every scan.
     if _skew[0] is None:
-        srv = get("/fapi/v1/time", {}, base=DEMO, gap=0.5)
+        srv = get("/fapi/v1/time", {}, base=SIGNED_BASE[0], gap=0.5)
         _skew[0] = (int(time.time() * 1000) - int(srv["serverTime"])) if srv else 0
     q = "timestamp=%d&recvWindow=10000" % (int(time.time() * 1000) - _skew[0])
-    sig = hmac.new(env["BINANCE_TESTNET_API_SECRET"].encode(), q.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request("%s%s?%s&signature=%s" % (DEMO, path, q, sig),
-                                 headers={"X-MBX-APIKEY": env["BINANCE_TESTNET_API_KEY"]})
+    sig = hmac.new(env[SECRET_ENV[0]].encode(), q.encode(), hashlib.sha256).hexdigest()
+    req = urllib.request.Request("%s%s?%s&signature=%s" % (SIGNED_BASE[0], path, q, sig),
+                                 headers={"X-MBX-APIKEY": env[KEY_ENV[0]]})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode("utf-8"))
@@ -122,13 +129,15 @@ def universe(top, min_volume, by_cap):
     tradable = {s["symbol"] for s in info["symbols"]
                 if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
                 and s.get("status") == "TRADING" and s.get("underlyingType") == "COIN"}
-    # The bot executes on the demo exchange, which lists a smaller universe than the
-    # live one; a candidate absent there is refused every scan and wastes an open slot.
+    # When the bot executes on the demo exchange, which lists a smaller universe than
+    # the live one, a candidate absent there is refused every scan and wastes an open
+    # slot. On the real venue the live list IS the tradable list, so no intersection.
     # If demo is unreachable this scan, fall back to the live list rather than stall.
-    demo_info = get("/fapi/v1/exchangeInfo", {}, base=DEMO, gap=0.5)
-    if demo_info:
-        tradable &= {s["symbol"] for s in demo_info["symbols"]
-                     if s.get("status") == "TRADING"}
+    if SIGNED_BASE[0] == DEMO:
+        demo_info = get("/fapi/v1/exchangeInfo", {}, base=DEMO, gap=0.5)
+        if demo_info:
+            tradable &= {s["symbol"] for s in demo_info["symbols"]
+                         if s.get("status") == "TRADING"}
     tick = get("/fapi/v1/ticker/24hr", {}, gap=0.5) or []
     vol = {t["symbol"]: float(t.get("quoteVolume", 0)) for t in tick}
     if not by_cap:
@@ -240,15 +249,30 @@ def main():
                     help="a held position is closed only below -this (hysteresis)")
     ap.add_argument("--min-hold-hours", type=float, default=24.0,
                     help="a freshly opened position is not closed by signal churn before this")
+    ap.add_argument("--venue", choices=("demo", "real"), default="demo",
+                    help="which exchange the RUNNING BOT executes on; signed calls, the key "
+                         "names and the tradability filter follow it")
+    ap.add_argument("--workdir", default=None,
+                    help="where this scanner's log and state live (default: analysis/forward); "
+                         "a demo and a real scanner must never share state")
     args = ap.parse_args()
 
-    logpath = os.path.join(args.repo, "analysis", "forward", "autoscan.log")
-    statepath = os.path.join(args.repo, "analysis", "forward", "autoscan_state.json")
+    if args.venue == "real":
+        SIGNED_BASE[0] = FAPI
+        KEY_ENV[0] = "BINANCE_REAL_API_KEY"
+        SECRET_ENV[0] = "BINANCE_REAL_API_SECRET"
+
+    workdir = args.workdir or os.path.join(args.repo, "analysis", "forward")
+    logpath = os.path.join(workdir, "autoscan.log")
+    statepath = os.path.join(workdir, "autoscan_state.json")
     env = read_env(args.repo)
+    if not env.get(KEY_ENV[0]) or not env.get(SECRET_ENV[0]):
+        raise SystemExit("missing %s/%s in local.env for --venue %s"
+                         % (KEY_ENV[0], SECRET_ENV[0], args.venue))
     state = load_state(statepath)
-    log("autoscan start: top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
+    log("autoscan start: venue=%s top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
         "interval=%ds max_pos=%d min_hold=%.0fh"
-        % (args.top, args.by_cap, args.lookback, args.dip_depth * 100,
+        % (args.venue, args.top, args.by_cap, args.lookback, args.dip_depth * 100,
            args.entry_band * 100, args.exit_band * 100, args.interval,
            args.max_positions, args.min_hold_hours), logpath)
 
