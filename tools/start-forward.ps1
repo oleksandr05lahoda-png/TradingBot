@@ -29,6 +29,19 @@ function Say([string]$msg, [string]$colour = 'Gray') {
     Add-Content -Path $launcherLog -Value $line -Encoding utf8
 }
 
+# Two triggers (unlock + the 15-minute repetition) can fire this twice within seconds;
+# two launchers then kill each other's bot mid-boot, and on 19.08 that wiped the stop
+# ids out of book-ledger.json — 14 positions went "unknown" and the machine halted.
+# One launcher at a time, system-wide; the mutex dies with the process.
+try {
+    $script:launcherMutex = New-Object System.Threading.Mutex($false, 'Global\TradingBotForwardLauncher')
+    $acquired = $script:launcherMutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] { $acquired = $true }
+if (-not $acquired) {
+    Say "another launcher instance is already running - exiting." 'Yellow'
+    exit 0
+}
+
 # "Already running" needs BOTH halves alive. The bot's log is fresh for a minute or so after the
 # bot is killed, so the log alone would report a stopped machine as healthy — and a bot with no
 # scanner is a frozen book that looks identical to a working one from outside.
