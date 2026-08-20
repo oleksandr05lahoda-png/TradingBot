@@ -2,6 +2,12 @@
 #
 #   powershell -ExecutionPolicy Bypass -File tools\start-real.ps1              # observe: no entries
 #   powershell -ExecutionPolicy Bypass -File tools\start-real.ps1 -Mode trade  # full operation
+#   ... -Mode trade -Force                                                     # restart even if alive
+#
+# Safe to schedule: without -Force it is a no-op when the machine is already up, which
+# is what lets it be wired to "at logon", "on unlock" and a repeating trigger at once.
+# Without that check a repeating trigger would tear down and rebuild a live real-money
+# bot every fifteen minutes.
 #
 # Deliberately separate from start-forward.ps1: the demo machine (book_live) and the
 # real machine (book_real) own disjoint processes, books, ledgers, logs and scanner
@@ -13,7 +19,9 @@
 
 param(
     [ValidateSet('observe', 'trade')]
-    [string]$Mode = 'observe'
+    [string]$Mode = 'observe',
+    # Restart even if the machine already looks alive.
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +45,24 @@ try {
 } catch [System.Threading.AbandonedMutexException] { $acquired = $true }
 if (-not $acquired) {
     Say "another real-venue launcher is already running - exiting." 'Yellow'
+    exit 0
+}
+
+# "Already running" needs BOTH halves alive AND a fresh log: the bot's log stays
+# readable for a minute after the process dies, so the log alone would call a dead
+# machine healthy, and a bot with no scanner is a frozen book that looks identical
+# to a working one from outside.
+function Test-RealMachineAlive {
+    $bot = @(Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*book_real*' }).Count -ge 1
+    $scanner = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*autoscan*' -and $_.CommandLine -like '*book_real*' }).Count -ge 1
+    if (-not ($bot -and $scanner)) { return $false }
+    if (-not (Test-Path $botLog)) { return $false }
+    ((Get-Date) - (Get-Item $botLog).LastWriteTime).TotalSeconds -lt 90
+}
+if (-not $Force -and (Test-RealMachineAlive)) {
+    Say "already running (bot + scanner alive, log fresh) - nothing to do." 'Green'
     exit 0
 }
 
