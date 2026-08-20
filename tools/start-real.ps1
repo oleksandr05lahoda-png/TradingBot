@@ -58,11 +58,11 @@ if (-not $env:BINANCE_REAL_API_KEY -or -not $env:BINANCE_REAL_API_SECRET) {
 $env:JAVA_HOME        = 'C:\Users\Asus_F15\.jdks\ms-21.0.9'
 $env:REAL_TRADING     = 'ARMED'
 $env:REAL_MODE        = $Mode
-# 6, not 14: the daily kill switch blocks NEW entries after -3% but closes nothing, so the
-# real bound on a correlated gap night is book width x risk. 6 x 0.5% keeps a worst
-# all-stops day near the advertised 3% (plus gap slippage); 14 would allow ~7-9% in one
-# night against the -8% experiment stop (audit 19.08).
-$env:MAX_POSITIONS    = '6'
+# Book width IS the real daily bound: the kill switch blocks new entries after -3% but
+# closes nothing, so a correlated gap night costs width x 0.5% plus gap slippage.
+# 10 is the operator's choice (20.08), knowing it puts a worst all-stops night near -5%
+# rather than the -3% the kill switch advertises. The -8% experiment stop still binds.
+$env:MAX_POSITIONS    = '10'
 $env:DEFAULT_LEVERAGE = '2'
 $env:TP_R_MULTIPLE    = '1.75'
 $env:BOOK_LEDGER_PATH = Join-Path $dir 'book-ledger-real.json'
