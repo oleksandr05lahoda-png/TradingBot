@@ -104,17 +104,6 @@ public final class TestnetBot {
 
             banner(venue, port, signals, config, defaultLeverage);
 
-            // Observation is a pre-latched halt, not a separate mechanism: entries are refused
-            // through the same gate every other halt uses, closes and reconciliation keep working,
-            // and the only way out is the operator restarting with REAL_MODE=trade — the same
-            // "operator clears it" contract as any other halt.
-            if (venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE) {
-                halt.halt("REAL_MODE=observe — reading the account, accepting closes, opening "
-                        + "nothing. Set REAL_MODE=trade and restart to enable entries.", Instant.now());
-                alerts.warning("Real venue in OBSERVE mode",
-                        "the bot reads the account and accepts closes; no position will be opened");
-            }
-
             // Re-arm the book from the last run's snapshot BEFORE reconciling: the venue cannot
             // name resting stops, so without this every restart with open positions ended in a
             // halt and a forced flatten. Positions the ledger does not know stay unknown and
@@ -129,12 +118,35 @@ public final class TestnetBot {
             // A start-up disagreement stops OPENING and nothing else. Exiting here would have been
             // the same mistake in a third place: the operator would be left with a position on the
             // exchange and no way to unwind it through the bot, which is precisely the state a
-            // trading halt must never create. The loop stays up so closes are still processed.
-            if (!reconciler.bootstrap(Instant.now())) {
+            // trading halt must never create. The loop stays up so closes are still processed —
+            // including when bootstrap itself blows up on an exchange blip.
+            boolean bootstrapped;
+            try {
+                bootstrapped = reconciler.bootstrap(Instant.now());
+            } catch (RuntimeException e) {
+                bootstrapped = false;
+                halt.halt("start-up reconciliation threw: " + e.getMessage(), Instant.now());
+            }
+            if (!bootstrapped) {
                 LOG.severe("[Boot] start-up reconciliation did not converge — trading is halted. "
                         + "Closes are still accepted; inspect the account, then restart to resume.");
                 alerts.critical("Start-up reconciliation failed",
                         "no new positions will be opened; the bot stays up so positions can still be closed");
+            }
+
+            // Observation is a pre-latched halt, not a separate mechanism: entries are refused
+            // through the same gate every other halt uses, closes and reconciliation keep working,
+            // and the only way out is the operator restarting with REAL_MODE=trade — the same
+            // "operator clears it" contract as any other halt. Latched AFTER bootstrap so a clean
+            // observe boot does not read as a failed reconciliation (the loop has not started yet,
+            // so nothing can open in between), and only when no genuine halt already holds the
+            // latch — a drift reason must not be overwritten by the routine observe notice.
+            if (venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE
+                    && !halt.isHalted()) {
+                halt.halt("REAL_MODE=observe — reading the account, accepting closes, opening "
+                        + "nothing. Set REAL_MODE=trade and restart to enable entries.", Instant.now());
+                alerts.warning("Real venue in OBSERVE mode",
+                        "the bot reads the account and accepts closes; no position will be opened");
             }
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {

@@ -74,6 +74,15 @@ Get-Content (Join-Path $root 'local.env') | ForEach-Object {
     $l = $_.Trim()
     if ($l -match '^([A-Z_]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
 }
+# The DEMO launcher must never carry an arming flag — not from an uncommented line in
+# local.env, and not inherited from a console that ran start-real.ps1 earlier (its $env:
+# assignments outlive the script). One stale flag here would arm the real venue on the
+# demo machine (audit 19.08). Arming belongs to start-real.ps1 and nowhere else.
+if ($env:REAL_TRADING -or $env:REAL_MODE) {
+    Say "REAL_TRADING/REAL_MODE found in the environment - stripped; the demo machine never arms." 'Yellow'
+}
+Remove-Item Env:REAL_TRADING -ErrorAction SilentlyContinue
+Remove-Item Env:REAL_MODE -ErrorAction SilentlyContinue
 $env:JAVA_HOME        = 'C:\Users\Asus_F15\.jdks\ms-21.0.9'
 $env:MAX_POSITIONS    = '14'    # the exchange caps conditional orders; 14 x 2 stays under it
 $env:DEFAULT_LEVERAGE = '2'
@@ -146,6 +155,19 @@ if (-not $python) {
 if (-not $python) {
     Say "PYTHON NOT FOUND - the bot is up but the scanner is NOT, so nothing new will open." 'Red'
     exit 1
+}
+
+# Start-Process truncates its redirect targets — same evidence-destruction class already
+# fixed for the bot log. Keep the last ten scanner runs too.
+foreach ($base in @('autoscan.err.log', 'autoscan.out.log')) {
+    $p = Join-Path $fwd $base
+    if ((Test-Path $p) -and (Get-Item $p).Length -gt 0) {
+        $stamp = (Get-Item $p).LastWriteTime.ToString('yyyyMMdd-HHmmss')
+        Move-Item $p (Join-Path $fwd ($base -replace '\.log$', ".$stamp.log")) -Force
+        Get-ChildItem (Join-Path $fwd ($base -replace '\.log$', '.*.log')) |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Say "starting the scanner ($python)..."

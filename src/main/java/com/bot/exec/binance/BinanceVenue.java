@@ -8,8 +8,10 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * The only place in this repository where a Binance base URL exists — demo or production.
- * {@code VenueContainmentTest} fails the build if a production host appears in any other file.
+ * The only place in the bot's sources where a Binance base URL exists — demo or production.
+ * The read-only scanner tool under {@code tools/scanner} also names the live host, for market
+ * data and account reads; it places no orders. {@code VenueContainmentTest} scans Java, Python
+ * and PowerShell alike and fails the build if a production host appears anywhere else.
  *
  * <p>The demo venue is the default and needs no configuration. The production venue is reachable
  * through exactly one gate, {@link #resolve(Map)}: {@code REAL_TRADING} must be the exact string
@@ -69,7 +71,8 @@ public final class BinanceVenue {
      * The single gate to the production venue. Fail-closed on every edge:
      * <ul>
      *   <li>{@code REAL_TRADING} unset or blank → demo, exactly as before this class existed;</li>
-     *   <li>{@code REAL_TRADING=ARMED} (exact, case-sensitive) → real, requiring
+     *   <li>{@code REAL_TRADING=ARMED} (exact after trimming surrounding whitespace,
+     *       case-sensitive) → real, requiring
      *       {@code BINANCE_REAL_API_KEY}/{@code BINANCE_REAL_API_SECRET};</li>
      *   <li>any other value → refuse to start: the operator reached for the switch and missed,
      *       and a missed switch must never quietly fall back to either venue;</li>

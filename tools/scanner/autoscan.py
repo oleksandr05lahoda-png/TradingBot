@@ -290,7 +290,11 @@ def main():
                 rows = signed_get("/fapi/v2/positionRisk", env)
                 held = {r["symbol"] for r in rows if float(r["positionAmt"]) != 0}
             except Exception as e:
-                log("exchange unreachable (%s); skipping this scan" % type(e).__name__, logpath)
+                # str(e) matters: an IP-whitelist rejection or a revoked key looks identical to
+                # a network blip by type name alone, and only the detail tells the operator
+                # which of the two ate the whole scan hour.
+                log("exchange unreachable (%s: %.160s); skipping this scan"
+                    % (type(e).__name__, e), logpath)
                 time.sleep(args.interval)
                 continue
 

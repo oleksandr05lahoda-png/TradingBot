@@ -139,7 +139,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
     private static InstrumentFilters parseFilters(JSONObject symbolInfo) {
         BigDecimal tickSize = null, minPrice = null, maxPrice = null;
         BigDecimal stepSize = null, minQty = null, maxQty = null, marketMaxQty = null;
-        BigDecimal minNotional = BigDecimal.ZERO;
+        BigDecimal minNotional = null;
 
         JSONArray filters = symbolInfo.getJSONArray("filters");
         for (int i = 0; i < filters.length(); i++) {
@@ -164,6 +164,10 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                 "exchangeInfo for " + symbolInfo.getString("symbol")
                         + " is missing PRICE_FILTER or LOT_SIZE — refusing to guess them");
         if (marketMaxQty == null) marketMaxQty = maxQty;
+        // An absent MIN_NOTIONAL filter must not silently disable the notional gate: fall back
+        // to the exchange-wide 5 USDT floor rather than zero (audit 19.08, latent on all
+        // current symbols but the gate must fail toward rejecting, not toward passing).
+        if (minNotional == null) minNotional = new BigDecimal("5");
 
         return new InstrumentFilters(
                 symbolInfo.getString("symbol"),
@@ -600,16 +604,27 @@ public final class BinanceFuturesAdapter implements ExchangePort {
 
             int status = response.statusCode();
             if (status == 429 || status == 418) {
-                long retryAfterMs = response.headers().firstValue("Retry-After")
-                        .map(v -> Long.parseLong(v.trim()) * 1000L).orElse(60_000L);
+                // The ban MUST be recorded whatever shape the header takes: RFC 7231 allows an
+                // HTTP-date here, and an edge proxy that sends one must not turn into "keep
+                // retrying while banned" — the exact pattern that escalates a 429 into a 418.
+                long retryAfterMs = 60_000L;
+                try {
+                    retryAfterMs = response.headers().firstValue("Retry-After")
+                            .map(v -> Long.parseLong(v.trim()) * 1000L).orElse(60_000L);
+                } catch (NumberFormatException ignored) {
+                    // Unparseable header: the default stands.
+                }
                 rateLimiter.observeBan(retryAfterMs);
                 throw ExchangeException.refused("rate limited (HTTP " + status + "), backing off "
                         + (retryAfterMs / 1000) + "s", status, 0);
             }
-            if (status == 503) {
-                // Binance documents 503 as "unknown execution status": the request may have executed.
+            if (status >= 500) {
+                // Binance documents EVERY 5xx as "execution status unknown" (504 explicitly:
+                // submitted, no timely answer). Refusing here would let a filled-but-502 entry
+                // become an untracked position; ambiguity makes the idempotent placer probe by
+                // client order id instead.
                 throw ExchangeException.ambiguous(
-                        "HTTP 503 from the exchange — execution status is unknown", null);
+                        "HTTP " + status + " from the exchange — execution status is unknown", null);
             }
             if (status / 100 != 2) {
                 int code = 0;

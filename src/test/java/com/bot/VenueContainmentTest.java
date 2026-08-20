@@ -24,12 +24,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * The production endpoint exists in exactly one file, {@code BinanceVenue}, and is reachable
- * through exactly one gate, {@code BinanceVenue.resolve}. This test holds both halves: it scans
- * every source for production hostnames outside the venue class, and it drives the gate through
- * each of its fail-closed edges. The predecessor of this test forbade production hosts outright;
- * the invariant it protected — that missing or mistyped configuration can never reach the real
- * exchange — is unchanged.
+ * The production endpoint is reachable through exactly one gate, {@code BinanceVenue.resolve},
+ * and may be NAMED only by the venue class and the two read-only scanner tools (which fetch
+ * market data and account reads, and place no orders). This test holds both halves: it scans
+ * Java, Python and PowerShell sources for production hostnames outside that allowlist, and it
+ * drives the gate through each of its fail-closed edges. The predecessor of this test forbade
+ * production hosts outright; the invariant it protected — that missing or mistyped configuration
+ * can never reach the real exchange — is unchanged.
  *
  * <p>Hostnames are assembled at runtime from fragments, including in this javadoc, so this file
  * has no self-exclusion and is scanned like any other. The names nest — testnet
@@ -42,8 +43,16 @@ class VenueContainmentTest {
     /** Assembled at runtime: this string never appears as a literal in this file. */
     private static final String BINANCE_DOMAIN = "binance" + '.' + "com";
 
-    /** The single file allowed to name production hosts. */
+    /** The single file allowed to REACH production hosts. */
     private static final String VENUE_FILE = "BinanceVenue.java";
+
+    /**
+     * Files allowed to NAME production hosts: the venue class, plus the scanner tools that read
+     * market data and positions from the live exchange and have no order-placing path. Adding a
+     * file here is a review decision, not a convenience.
+     */
+    private static final Set<String> REAL_HOST_ALLOWED_FILES = Set.of(
+            VENUE_FILE, "autoscan.py", "scan.py");
 
     private static final Set<String> DEMO_HOSTS = Set.of(
             "demo-fapi." + BINANCE_DOMAIN,
@@ -73,8 +82,8 @@ class VenueContainmentTest {
     // ─── Containment: the scan half ─────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("production hosts appear in BinanceVenue.java and nowhere else")
-    void productionHostsOnlyInVenueClass() throws IOException {
+    @DisplayName("production hosts appear only in the venue class and the read-only scanner tools")
+    void productionHostsOnlyInAllowlistedFiles() throws IOException {
         List<Path> sources = sourceFiles();
         assertFalse(sources.isEmpty(), "found no source files to scan — the scan root is wrong");
 
@@ -82,13 +91,14 @@ class VenueContainmentTest {
         boolean venueFileNamesProduction = false;
         for (Path file : sources) {
             String content = Files.readString(file, StandardCharsets.UTF_8);
-            boolean isVenueFile = file.getFileName().toString().equals(VENUE_FILE);
+            String name = file.getFileName().toString();
+            boolean allowed = REAL_HOST_ALLOWED_FILES.contains(name);
             for (String label : PRODUCTION_LABELS) {
                 Matcher matcher = hostPattern(label).matcher(content);
                 while (matcher.find()) {
                     String host = matcher.group().toLowerCase(Locale.ROOT);
-                    if (isVenueFile && REAL_HOSTS.contains(host)) {
-                        venueFileNamesProduction = true;
+                    if (allowed && REAL_HOSTS.contains(host)) {
+                        if (name.equals(VENUE_FILE)) venueFileNamesProduction = true;
                         continue;
                     }
                     offences.add(file + " line " + lineOf(content, matcher.start())
@@ -97,8 +107,8 @@ class VenueContainmentTest {
             }
         }
         if (!offences.isEmpty()) {
-            fail("Production endpoints may exist only inside " + VENUE_FILE + ", behind the arming "
-                    + "gate. Found elsewhere:\n  " + String.join("\n  ", offences));
+            fail("Production endpoints may exist only inside " + REAL_HOST_ALLOWED_FILES
+                    + ". Found elsewhere:\n  " + String.join("\n  ", offences));
         }
         assertTrue(venueFileNamesProduction,
                 VENUE_FILE + " no longer names the production hosts this test expects — "
@@ -106,11 +116,11 @@ class VenueContainmentTest {
     }
 
     @Test
-    @DisplayName("every Binance hostname outside the venue class is a demo host")
-    void onlyDemoHostsOutsideVenueClass() throws IOException {
+    @DisplayName("every Binance hostname outside the allowlist is a demo host")
+    void onlyDemoHostsOutsideAllowlistedFiles() throws IOException {
         List<String> offences = new ArrayList<>();
         for (Path file : sourceFiles()) {
-            if (file.getFileName().toString().equals(VENUE_FILE)) continue;
+            if (REAL_HOST_ALLOWED_FILES.contains(file.getFileName().toString())) continue;
             Matcher matcher = ANY_BINANCE_HOST.matcher(Files.readString(file, StandardCharsets.UTF_8));
             while (matcher.find()) {
                 String host = matcher.group().toLowerCase(Locale.ROOT);
@@ -122,7 +132,7 @@ class VenueContainmentTest {
         }
         assertTrue(offences.isEmpty(),
                 "hostnames outside the demo allowlist " + DEMO_HOSTS + " appear outside "
-                        + VENUE_FILE + ": " + offences);
+                        + REAL_HOST_ALLOWED_FILES + ": " + offences);
     }
 
     // ─── The gate: fail-closed on every edge ────────────────────────────────────────────────
@@ -158,16 +168,21 @@ class VenueContainmentTest {
     }
 
     @Test
-    @DisplayName("any REAL_TRADING value other than exactly ARMED refuses to start")
+    @DisplayName("any REAL_TRADING value other than ARMED (whitespace-trimmed) refuses to start")
     void mistypedArmingRefusesToStart() {
-        for (String almost : List.of("armed", "Armed", "ARMED ", "true", "1", "yes")) {
+        for (String almost : List.of("armed", "Armed", "true", "1", "yes")) {
             Map<String, String> env = Map.of(
                     "REAL_TRADING", almost,
                     "BINANCE_REAL_API_KEY", "k", "BINANCE_REAL_API_SECRET", "s");
-            if (almost.trim().equals("ARMED")) continue; // trimmed exact match is the armed case
             assertThrows(IllegalStateException.class, () -> BinanceVenue.resolve(env),
                     "REAL_TRADING=\"" + almost + "\" must refuse to start, not guess a venue");
         }
+        // The trim is deliberate and documented: padding is plausibly line-ending noise from a
+        // Windows env file, and only an operator who already typed ARMED can produce it. The
+        // contract is "exactly ARMED after trimming surrounding whitespace" — asserted, not skipped.
+        assertTrue(BinanceVenue.resolve(Map.of(
+                "REAL_TRADING", "ARMED ",
+                "BINANCE_REAL_API_KEY", "k", "BINANCE_REAL_API_SECRET", "s")).isReal());
     }
 
     @Test
@@ -223,6 +238,20 @@ class VenueContainmentTest {
             walk.filter(Files::isRegularFile)
                     .filter(p -> p.toString().endsWith(".gradle"))
                     .forEach(files::add);
+        }
+        // The operational layer can reach the exchange too: scanner tools and launchers are
+        // scanned like the Java sources, so a production host cannot drift in through them.
+        Path tools = root.resolve("tools");
+        if (Files.isDirectory(tools)) {
+            try (Stream<Path> walk = Files.walk(tools)) {
+                walk.filter(Files::isRegularFile)
+                        .filter(p -> {
+                            String s = p.toString();
+                            return (s.endsWith(".py") || s.endsWith(".ps1") || s.endsWith(".vbs"))
+                                    && !s.contains("__pycache__");
+                        })
+                        .forEach(files::add);
+            }
         }
         return files;
     }
