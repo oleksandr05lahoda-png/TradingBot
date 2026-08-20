@@ -66,3 +66,4 @@ bin/
 local.env
 *.env
 !example.env
+tools/scanner/__pycache__/
