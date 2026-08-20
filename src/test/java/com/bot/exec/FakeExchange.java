@@ -55,19 +55,14 @@ final class FakeExchange implements ExchangePort {
     boolean listsConditionalOrders = true;
 
     int placeOrderCalls = 0;
-    int queryOrderCalls = 0;
-    int cancelAllCalls = 0;
     long orderIdSequence = 1;
 
     // ─── Test controls ───────────────────────────────────────────────────────────────────────
 
-    void setFilters(InstrumentFilters filters) { this.filters = filters; }
 
-    void setTiers(MarginTierTable tiers) { this.tiers = tiers; }
 
     void setWalletBalance(String balance) { this.walletBalance = new BigDecimal(balance); }
 
-    void setUnrealizedPnl(String pnl) { this.unrealizedPnl = new BigDecimal(pnl); }
 
     void setRealizedPnlToday(double pnl) { this.realizedPnlToday = pnl; }
 
@@ -98,7 +93,6 @@ final class FakeExchange implements ExchangePort {
 
     Long deadMansCountdownFor(String symbol) { return deadMansCountdowns.get(symbol); }
 
-    List<OrderStatus> allOrders() { return List.copyOf(ordersByClientId.values()); }
 
     Optional<OrderStatus> order(String clientOrderId) {
         return Optional.ofNullable(ordersByClientId.get(clientOrderId));
@@ -189,7 +183,6 @@ final class FakeExchange implements ExchangePort {
     }
 
     @Override public Optional<OrderStatus> queryOrder(String symbol, String clientOrderId) {
-        queryOrderCalls++;
         if (hideNextQueries > 0) {
             hideNextQueries--;
             return Optional.empty();
@@ -231,7 +224,6 @@ final class FakeExchange implements ExchangePort {
     }
 
     @Override public void cancelAllOpenOrders(String symbol) {
-        cancelAllCalls++;
         for (OrderStatus o : List.copyOf(ordersByClientId.values())) {
             if (o.symbol().equals(symbol)) cancelOrder(symbol, o.clientOrderId());
         }

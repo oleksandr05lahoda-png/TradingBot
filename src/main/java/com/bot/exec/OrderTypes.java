@@ -48,9 +48,7 @@ public final class OrderTypes {
         /** Rests until cancelled. */
         GTC,
         /** Fills what it can immediately, cancels the rest. */
-        IOC,
-        /** All or nothing, immediately. */
-        FOK
+        IOC
     }
 
     /**

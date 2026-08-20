@@ -349,10 +349,4 @@ public final class Reconciler {
         }
         return false;
     }
-
-    /** Risk currently open according to the book, for status lines. */
-    public Optional<Double> openRiskUsd() {
-        double risk = engine.book().totalRiskUsd();
-        return risk > 0 ? Optional.of(risk) : Optional.empty();
-    }
 }

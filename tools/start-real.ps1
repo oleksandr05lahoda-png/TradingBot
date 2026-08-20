@@ -13,8 +13,7 @@
 
 param(
     [ValidateSet('observe', 'trade')]
-    [string]$Mode = 'observe',
-    [switch]$Force
+    [string]$Mode = 'observe'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -216,7 +215,7 @@ try {
         '--venue', 'real',
         '--workdir', $dir,
         '--by-cap','--top','100','--lookback','30','--interval','3600',
-        '--max-positions','14','--leverage','2' `
+        '--max-positions','10','--leverage','2' `
         -RedirectStandardOutput (Join-Path $dir 'autoscan.out.log') `
         -RedirectStandardError  (Join-Path $dir 'autoscan.err.log')
 } catch {

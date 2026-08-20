@@ -134,8 +134,6 @@ public final class RateLimiter {
         return headerFresh ? Math.max(local, exchangeReportedWeight) : local;
     }
 
-    public synchronized int ordersInLast10s() { return count(orderWindow, nowMs.getAsLong(), 10_000L); }
-
     public synchronized int ordersInLastMinute() { return count(orderWindow, nowMs.getAsLong(), 60_000L); }
 
     private void prune(long now) {

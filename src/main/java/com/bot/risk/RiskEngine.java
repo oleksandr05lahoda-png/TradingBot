@@ -16,7 +16,7 @@ import java.util.logging.Logger;
  * The gate: every position passes through {@link #evaluate}, and nothing that fails it can be built
  * downstream because {@link TradePlan} has no public constructor. Balance, filters, brackets and time
  * are arguments — no I/O, no clock — so a refusal is reproducible from its log line. Ceilings (step 8)
- * only ever reduce the size sizing (step 7) derived from the stop.
+ * only ever reduce the sizing (step 7) derived from the stop.
  */
 public final class RiskEngine {
 
@@ -38,11 +38,6 @@ public final class RiskEngine {
         this.book = Preconditions.notNull(book, "book");
         this.killSwitch = Preconditions.notNull(killSwitch, "killSwitch");
         this.volSource = Preconditions.notNull(volSource, "volSource");
-    }
-
-    public static RiskEngine withDefaults() {
-        RiskConfig cfg = RiskConfig.defaults();
-        return new RiskEngine(cfg, new ExposureBook(), new DailyLossKillSwitch(cfg.dailyLossFractionLimit()));
     }
 
     public RiskConfig config() { return config; }

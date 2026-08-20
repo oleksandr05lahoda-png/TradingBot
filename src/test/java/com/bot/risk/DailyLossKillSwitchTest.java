@@ -23,7 +23,7 @@ class DailyLossKillSwitchTest {
     void lossBelowLimitDoesNotTrip() {
         DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
         killSwitch.observeBalance(10_000, MORNING);
-        killSwitch.recordRealizedPnl(-200, MORNING);
+        killSwitch.seedRealizedPnl(-200, MORNING);
         assertFalse(killSwitch.isTripped(MORNING));
     }
 
@@ -32,7 +32,7 @@ class DailyLossKillSwitchTest {
     void crossingTheLimitTrips() {
         DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
         killSwitch.observeBalance(10_000, MORNING);
-        killSwitch.recordRealizedPnl(-301, MORNING);
+        killSwitch.seedRealizedPnl(-301, MORNING);
 
         DailyLossKillSwitch.Status status = killSwitch.evaluate(MORNING);
         assertTrue(status.tripped());
@@ -45,10 +45,10 @@ class DailyLossKillSwitchTest {
     void itLatchesForTheRestOfTheDay() {
         DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
         killSwitch.observeBalance(10_000, MORNING);
-        killSwitch.recordRealizedPnl(-400, MORNING);
+        killSwitch.seedRealizedPnl(-400, MORNING);
         assertTrue(killSwitch.isTripped(MORNING));
 
-        killSwitch.recordRealizedPnl(+1_000, EVENING);
+        killSwitch.seedRealizedPnl(+1_000, EVENING);
         assertTrue(killSwitch.isTripped(EVENING),
                 "a limit that un-trips when the number improves is a limit the same losing session "
                         + "will test again and again");
@@ -59,7 +59,7 @@ class DailyLossKillSwitchTest {
     void itResetsAtMidnightUtc() {
         DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
         killSwitch.observeBalance(10_000, MORNING);
-        killSwitch.recordRealizedPnl(-400, MORNING);
+        killSwitch.seedRealizedPnl(-400, MORNING);
         assertTrue(killSwitch.isTripped(EVENING));
 
         killSwitch.observeBalance(9_600, NEXT_DAY);
@@ -86,7 +86,7 @@ class DailyLossKillSwitchTest {
     void openWinnerCannotOffsetARealisedLoss() {
         DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
         killSwitch.observeBalance(10_000, MORNING);
-        killSwitch.recordRealizedPnl(-400, MORNING);
+        killSwitch.seedRealizedPnl(-400, MORNING);
         killSwitch.observeOpenUnrealizedPnl(+5_000, MORNING);
         assertTrue(killSwitch.isTripped(MORNING),
                 "paper gains evaporate; a realised -4% is -4% whatever the screen says");
@@ -120,7 +120,7 @@ class DailyLossKillSwitchTest {
     void engineRefusesWhileTripped() {
         RiskEngine engine = RiskFixtures.engine();
         engine.killSwitch().observeBalance(10_000, MORNING);
-        engine.killSwitch().recordRealizedPnl(-400, MORNING);
+        engine.killSwitch().seedRealizedPnl(-400, MORNING);
 
         RiskDecision decision = engine.evaluate(
                 RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, MORNING);
@@ -133,7 +133,7 @@ class DailyLossKillSwitchTest {
     void engineResumesNextDay() {
         RiskEngine engine = RiskFixtures.engine();
         engine.killSwitch().observeBalance(10_000, MORNING);
-        engine.killSwitch().recordRealizedPnl(-400, MORNING);
+        engine.killSwitch().seedRealizedPnl(-400, MORNING);
         assertInstanceOf(RiskDecision.Rejected.class, engine.evaluate(
                 RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 10_000, EVENING));
 

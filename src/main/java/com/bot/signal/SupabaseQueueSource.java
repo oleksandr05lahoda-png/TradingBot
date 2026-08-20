@@ -28,14 +28,17 @@ import java.util.logging.Logger;
  *
  * <p>Row contract: {@code id, symbol, side, entry, sl, atr, leverage, status, testnet, created_at};
  * {@code sl} and {@code atr} are each optional but one must be present, and {@code testnet} must be
- * true or the row is refused rather than routed. Status runs {@code pending -> sent -> rejected}
- * (closes: {@code close_requested -> close_sent -> closed}), driven by this class.
+ * true or the row is never fetched at all — it sits {@code pending} forever. The flag gates both
+ * venues: the process's venue is chosen by {@code REAL_TRADING}, not by this column, so a row with
+ * {@code testnet=false} is unreachable regardless of where this process trades. Status runs
+ * {@code pending -> sent -> rejected} (closes: {@code close_requested -> close_sent -> closed}),
+ * driven by this class.
  *
  * <p><b>Claim before act.</b> A row is claimed with a conditional PATCH carrying the previous status
  * as a predicate, so two processes polling the same queue cannot both win it.
  *
  * <p>Credentials come from {@code SUPABASE_URL} and {@code SUPABASE_QUEUE_KEY} (falling back to
- * {@code SUPABASE_KEY}) and are never logged.
+ * {@code SUPABASE_KEY}, then {@code SUPABASE_SERVICE_KEY}) and are never logged.
  */
 public final class SupabaseQueueSource implements SignalSource {
 
@@ -188,7 +191,7 @@ public final class SupabaseQueueSource implements SignalSource {
         Preconditions.require(leverage >= 1 && leverage <= RiskConstants.MAX_LEVERAGE,
                 "row " + id + " asks for " + leverage + "x, outside [1, " + RiskConstants.MAX_LEVERAGE + "]");
 
-        return new Signal("sbq-" + id, symbol, side, entry, stop, atr, leverage, clock.instant());
+        return new Signal(OPEN_ID_PREFIX + id, symbol, side, entry, stop, atr, leverage, clock.instant());
     }
 
     @Override public List<CloseRequest> pollCloses() throws IOException, InterruptedException {

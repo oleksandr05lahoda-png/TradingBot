@@ -1,7 +1,7 @@
 package com.bot.risk;
 
 import com.bot.core.Side;
-import com.bot.signal.ManualTestnetInput;
+import com.bot.signal.ManualInput;
 import com.bot.signal.Signal;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -62,7 +62,7 @@ class MaxLeverageTest {
     void manualInputRefusesExcessiveLeverage() {
         Clock clock = Clock.fixed(RiskFixtures.NOON, ZoneOffset.UTC);
         assertThrows(IllegalArgumentException.class,
-                () -> ManualTestnetInput.parse("BTCUSDT LONG entry=64000 stop=62800 lev=20", clock, 3, 1));
+                () -> ManualInput.parse("BTCUSDT LONG entry=64000 stop=62800 lev=20", clock, 3, 1));
     }
 
     @Test

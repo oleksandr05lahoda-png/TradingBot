@@ -11,9 +11,11 @@ layer first means that when something eventually does pass, it inherits machiner
 is already established — rather than being wired to an executor that has to be trusted on the day it
 first matters.
 
-> **Testnet only.** The single base URL in this build is the Binance futures testnet. No production
-> endpoint exists anywhere in the sources, and `NoProductionEndpointTest` fails the build if one
-> appears. See [Testnet-only, structurally](#testnet-only-structurally).
+> **Demo by default; the real exchange sits behind one fail-closed gate.** With no configuration
+> the build talks to the Binance futures demo venue and nothing else. The production endpoint is
+> reachable only when `REAL_TRADING` is exactly `ARMED` and the real keys are present under their
+> own names — any deviation refuses to start. `VenueContainmentTest` fails the build if a
+> production host appears outside the venue class. See [The venue gate](#the-venue-gate).
 
 ---
 
@@ -23,7 +25,7 @@ first matters.
 - [Testnet keys](#testnet-keys)
 - [Code map](#code-map)
 - [The risk formulas, with numbers](#the-risk-formulas-with-numbers)
-- [Testnet-only, structurally](#testnet-only-structurally)
+- [The venue gate](#the-venue-gate)
 - [Execution guarantees](#execution-guarantees)
 - [Configuration](#configuration)
 - [Tests](#tests)
@@ -132,7 +134,7 @@ com.bot.risk            the gate — pure arithmetic, no network, no clock of it
 com.bot.signal          the only way a trade idea enters the system
   Signal                symbol, side, entry, optional structural stop, optional ATR, leverage
   SignalSource          interface — exactly two implementations, enforced by a test
-  ManualTestnetInput      an operator typing
+  ManualInput             an operator typing (or the scanner appending to a book file)
   SupabaseQueueSource     an external PostgREST queue
 
 com.bot.exec            execution — the core knows no HTTP
@@ -150,10 +152,10 @@ com.bot.exec            execution — the core knows no HTTP
   TradingHalt           a one-way latch that stops opening, never closing
   AlertSink             log, optional Telegram push, composite
   binance/
-    BinanceTestnetEndpoint       the only base URL in the repository
-    BinanceSigner                HMAC-SHA256, credentials from the environment only
-    BinanceErrorCodes            the codes that change behaviour
-    BinanceFuturesTestnetAdapter ExchangePort over testnet REST
+    BinanceVenue          demo and real base URLs; the single fail-closed gate to production
+    BinanceSigner         HMAC-SHA256, credentials from the environment only, names per venue
+    BinanceErrorCodes     the codes the system reacts to or simulates
+    BinanceFuturesAdapter ExchangePort over REST, wired to exactly one venue per process
 
 com.bot.app
   TestnetBot            assembly and the loop. No risk arithmetic, no exchange knowledge
@@ -316,25 +318,31 @@ exchange's own income ledger on every reconciliation pass, so a restart mid-draw
 
 ---
 
-## Testnet-only, structurally
+## The venue gate
 
 The previous generation of this codebase selected its endpoint with `BINANCE_USE_TESTNET`, defaulting
 to `0`. An unset variable on a fresh deployment silently selected the real exchange — absence of
-configuration selected real money. That shape is not reproduced here.
+configuration selected real money. That shape is not reproduced here: missing configuration selects
+the demo venue, and mis-typed configuration selects nothing at all.
 
-- `BinanceTestnetEndpoint` holds the only base URL in the repository. The production host is not
-  reachable because it is not written down.
-- Every assembled request URL is re-checked against an allowlist by `requireTestnet(...)`, so a URL
-  built from parts cannot drift off the testnet.
-- `NoProductionEndpointTest` scans every `.java` file and every `*.gradle` file in the tree and fails
-  the build if a production hostname appears — in code, in a string, or in a comment. It builds the
-  forbidden names from fragments at runtime, so no production host is a literal in the test either
-  and the test scans its own source like any other file.
+- `BinanceVenue` holds both base URLs and is the only place the production host is written down.
+  `BinanceVenue.resolve` is the single gate: `REAL_TRADING` unset → demo; exactly `ARMED` plus
+  `BINANCE_REAL_API_KEY`/`BINANCE_REAL_API_SECRET` → real; anything else refuses to start.
+  `REAL_MODE` defaults to `observe` — read the account, accept closes, open nothing — and `trade`
+  must be chosen by hand. Demo and real credentials live under different names on purpose.
+- Every assembled request URL is re-checked against the process's venue by `venue.require(...)`,
+  so a URL built from parts cannot drift onto the other venue.
+- `VenueContainmentTest` scans every `.java`, `*.gradle`, and the operational `.py`/`.ps1`/`.vbs`
+  tools, and fails the build if a production hostname appears outside a three-file allowlist
+  (the venue class and the two read-only scanner tools). It builds the forbidden names from
+  fragments at runtime, so no production host is a literal in the test either, and it drives the
+  arming gate through each of its fail-closed edges.
 - The scan is careful about a trap: `demo-fapi.<domain>` ends with the production `fapi.<domain>`,
   which ends with the spot `api.<domain>`. Naive substring matching would flag the legitimate
-  testnet host, so each pattern is anchored to the start of a hostname label.
+  demo host, so each pattern is anchored to the start of a hostname label.
 
-There is no flag, environment variable or configuration file that can point this build at production.
+The launch procedure and the pre-registered stop conditions for the real venue live in
+[REAL_TRADING.md](REAL_TRADING.md).
 
 ---
 

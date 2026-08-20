@@ -64,7 +64,7 @@ public record RiskConfig(
         Preconditions.notNull(takeProfitPolicy, "takeProfitPolicy");
     }
 
-    /** Starting values for a small testnet account, deliberately tight. */
+    /** Starting values for a small account, deliberately tight. */
     public static RiskConfig defaults() {
         return new RiskConfig(
                 RiskConstants.DEFAULT_RISK_FRACTION_PER_TRADE,
@@ -81,13 +81,6 @@ public record RiskConfig(
                 2.0,
                 RiskConstants.DEFAULT_TARGET_DAILY_VOL_FRACTION,
                 TakeProfitPolicy.standard());
-    }
-
-    public RiskConfig withRiskFractionPerTrade(double v) {
-        return new RiskConfig(v, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
-                maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
-                dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
     }
 
     public RiskConfig withMaxLeverage(int v) {
@@ -116,20 +109,6 @@ public record RiskConfig(
                 maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
                 dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
                 takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
-    }
-
-    public RiskConfig withDailyLossFractionLimit(double v) {
-        return new RiskConfig(riskFractionPerTrade, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
-                maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
-                v, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
-    }
-
-    public RiskConfig withTargetDailyVolFraction(double v) {
-        return new RiskConfig(riskFractionPerTrade, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
-                maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
-                dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
-                takerFeeFraction, atrStopMultiplier, v, takeProfitPolicy);
     }
 
     public RiskConfig withTakeProfitPolicy(TakeProfitPolicy v) {

@@ -44,9 +44,4 @@ public final class PositionSizer {
         Preconditions.positiveFinite(stopPrice, "stopPrice");
         return quantity * Math.abs(entryPrice - stopPrice);
     }
-
-    public static double riskFractionOf(double quantity, double entryPrice, double stopPrice, double balanceUsd) {
-        Preconditions.positiveFinite(balanceUsd, "balanceUsd");
-        return riskUsd(quantity, entryPrice, stopPrice) / balanceUsd;
-    }
 }

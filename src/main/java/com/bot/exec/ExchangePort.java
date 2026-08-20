@@ -18,7 +18,10 @@ import java.util.Optional;
  */
 public interface ExchangePort extends AutoCloseable {
 
-    /** Host this port actually sends to. Used by the boot banner and the testnet assertions. */
+    /**
+     * Host this port actually sends to. Shown in the boot banner and in adapter error messages;
+     * venue/host pinning itself lives in {@code BinanceVenue}.
+     */
     String endpointHost();
 
     /** Exchange clock, in epoch milliseconds. Used to detect the drift that invalidates signatures. */

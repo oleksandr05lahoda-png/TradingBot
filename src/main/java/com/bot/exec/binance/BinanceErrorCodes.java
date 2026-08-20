@@ -1,8 +1,9 @@
 package com.bot.exec.binance;
 
 /**
- * Binance USDⓈ-M futures error codes this system reacts to, from the published error-code reference.
- * Only codes that change behaviour are listed.
+ * Binance USDⓈ-M futures error codes, from the published error-code reference: codes the code
+ * reacts to, codes the test suite simulates, and codes kept for the record because their meaning
+ * was learned the hard way.
  */
 public final class BinanceErrorCodes {
 

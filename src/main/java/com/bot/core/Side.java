@@ -16,8 +16,6 @@ public enum Side {
     /** +1 for LONG, -1 for SHORT. Used directly by the liquidation formula. */
     public int sign() { return sign; }
 
-    public Side opposite() { return this == LONG ? SHORT : LONG; }
-
     /** True when the stop is on the losing side of entry: below for a LONG, above for a SHORT. */
     public boolean isValidStopGeometry(double entryPrice, double stopPrice) {
         return this == LONG ? stopPrice < entryPrice : stopPrice > entryPrice;

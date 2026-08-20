@@ -125,11 +125,6 @@ public final class TradePlan {
     /** Which ceiling, if any, reduced the size below what the stop alone would have allowed. */
     public String sizingNote() { return sizingNote; }
 
-    /** Distance from entry to stop in quote currency — one R. */
-    public double rUsdPerUnit() {
-        return Math.abs(entryPrice.doubleValue() - stopPrice.doubleValue());
-    }
-
     @Override public String toString() {
         return String.format(
                 "TradePlan[%s %s qty=%s @ %s stop=%s (%s) lev=%dx notional=$%.2f margin=$%.2f "

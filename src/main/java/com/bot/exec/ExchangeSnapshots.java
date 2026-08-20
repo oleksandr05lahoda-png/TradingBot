@@ -49,10 +49,6 @@ public final class ExchangeSnapshots {
 
         public boolean hasFill() { return executedQuantity.signum() > 0; }
 
-        /** Filled but not completely. */
-        public boolean isPartial() {
-            return hasFill() && executedQuantity.compareTo(originalQuantity) < 0;
-        }
 
         public boolean isWorking() { return state.isWorking(); }
     }

@@ -37,11 +37,6 @@ public final class TradingHalt {
         return s == null ? Optional.empty() : Optional.of(s.reason());
     }
 
-    public Optional<Instant> haltedAt() {
-        State s = state.get();
-        return s == null ? Optional.empty() : Optional.of(s.at());
-    }
-
     /** Explicit operator reset. Deliberately not called from anywhere else in this codebase. */
     public void clear() {
         State previous = state.getAndSet(null);

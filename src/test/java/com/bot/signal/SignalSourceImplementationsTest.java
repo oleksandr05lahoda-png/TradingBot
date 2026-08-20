@@ -31,7 +31,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 class SignalSourceImplementationsTest {
 
-    private static final Set<String> EXPECTED = Set.of("ManualTestnetInput", "SupabaseQueueSource");
+    private static final Set<String> EXPECTED = Set.of("ManualInput", "SupabaseQueueSource");
 
     /** class, record, enum and interface — every form that can carry {@code implements}. */
     private static final Pattern IMPLEMENTS_SIGNAL_SOURCE = Pattern.compile(

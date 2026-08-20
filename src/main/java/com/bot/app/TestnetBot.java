@@ -22,7 +22,7 @@ import com.bot.risk.TakeProfitPolicy;
 import com.bot.risk.TradeRequest;
 import com.bot.signal.CloseRequest;
 import com.bot.signal.ExecutionFeedback;
-import com.bot.signal.ManualTestnetInput;
+import com.bot.signal.ManualInput;
 import com.bot.signal.Signal;
 import com.bot.signal.SignalSource;
 import com.bot.signal.SupabaseQueueSource;
@@ -308,11 +308,11 @@ public final class TestnetBot {
             return source;
         }
         if (scriptPath != null) {
-            return ManualTestnetInput.fromReader(
+            return ManualInput.fromReader(
                     new FileReader(Path.of(scriptPath).toFile(), java.nio.charset.StandardCharsets.UTF_8),
                     Clock.systemUTC(), defaultLeverage);
         }
-        return ManualTestnetInput.fromConsole(defaultLeverage);
+        return ManualInput.fromConsole(defaultLeverage);
     }
 
     private static void banner(BinanceVenue venue, ExchangePort port, SignalSource signals,

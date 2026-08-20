@@ -26,9 +26,9 @@ import java.util.logging.Logger;
  * or {@code CLOSE SYMBOL [id=<text>] [reason=<text>]}; blank lines and {@code #} lines are ignored.
  * Ids are stable per line, so a scripted line replayed after a crash is one trade, not two.
  */
-public final class ManualTestnetInput implements SignalSource {
+public final class ManualInput implements SignalSource {
 
-    private static final Logger LOG = Logger.getLogger(ManualTestnetInput.class.getName());
+    private static final Logger LOG = Logger.getLogger(ManualInput.class.getName());
 
     private final BufferedReader reader;
     private final Clock clock;
@@ -38,16 +38,16 @@ public final class ManualTestnetInput implements SignalSource {
     private final Deque<Signal> pendingSignals = new ArrayDeque<>();
     private final Deque<CloseRequest> pendingCloses = new ArrayDeque<>();
 
-    public static ManualTestnetInput fromConsole(int defaultLeverage) {
-        return new ManualTestnetInput(
+    public static ManualInput fromConsole(int defaultLeverage) {
+        return new ManualInput(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8), Clock.systemUTC(), defaultLeverage, true);
     }
 
-    public static ManualTestnetInput fromReader(Reader reader, Clock clock, int defaultLeverage) {
-        return new ManualTestnetInput(reader, clock, defaultLeverage, false);
+    public static ManualInput fromReader(Reader reader, Clock clock, int defaultLeverage) {
+        return new ManualInput(reader, clock, defaultLeverage, false);
     }
 
-    private ManualTestnetInput(Reader reader, Clock clock, int defaultLeverage, boolean blocking) {
+    private ManualInput(Reader reader, Clock clock, int defaultLeverage, boolean blocking) {
         this.reader = new BufferedReader(Preconditions.notNull(reader, "reader"));
         this.clock = Preconditions.notNull(clock, "clock");
         this.defaultLeverage = Preconditions.positive(defaultLeverage, "defaultLeverage");
@@ -56,7 +56,7 @@ public final class ManualTestnetInput implements SignalSource {
         this.blocking = blocking;
     }
 
-    @Override public String name() { return "manual-testnet-input"; }
+    @Override public String name() { return "manual-input"; }
 
     /**
      * On the console this blocks for one line at a time; from a reader it drains what is buffered.

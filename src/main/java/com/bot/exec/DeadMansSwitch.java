@@ -126,10 +126,17 @@ public final class DeadMansSwitch {
         long silentFor = nowMs - lastSuccessMs;
         if (silentFor > maxSilenceMillis && !degraded) {
             degraded = true;
+            // The countdown clause is conditional on purpose: with market entries (the only kind
+            // today) nothing is ever armed, and an alert promising an exchange-side countdown
+            // that does not exist would misdirect the operator during an outage.
             String message = "no successful contact with the exchange for " + (silentFor / 1000)
-                    + "s while holding " + held.size() + " position(s). New risk is stopped. Any "
-                    + "resting entry order is covered by the exchange-side countdown, which fires "
-                    + "within " + (countdownMillis / 1000) + "s of the last successful arm. "
+                    + "s while holding " + held.size() + " position(s). New risk is stopped. "
+                    + (armed.isEmpty()
+                            ? "No resting entry orders were armed, so there is nothing for the "
+                                    + "exchange-side countdown to cancel. "
+                            : "Resting entry orders are covered by the exchange-side countdown, "
+                                    + "which fires within " + (countdownMillis / 1000)
+                                    + "s of the last successful arm. ")
                     + "Protective stops and positions are deliberately left alone.";
             LOG.severe("[DeadMansSwitch] " + message);
             alerts.critical("Dead-man's switch: contact lost", message);

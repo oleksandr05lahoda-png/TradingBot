@@ -55,12 +55,6 @@ public final class DailyLossKillSwitch {
         if (dayStartBalance <= 0) dayStartBalance = balanceUsd;
     }
 
-    public synchronized void recordRealizedPnl(double pnlUsd, Instant now) {
-        Preconditions.finite(pnlUsd, "pnlUsd");
-        rolloverIfNewDay(now, 0);
-        realizedPnl += pnlUsd;
-    }
-
     /** Replaces today's realised PnL from the exchange's own ledger since UTC midnight. */
     public synchronized void seedRealizedPnl(double realizedPnlToday, Instant now) {
         Preconditions.finite(realizedPnlToday, "realizedPnlToday");
@@ -77,7 +71,11 @@ public final class DailyLossKillSwitch {
         this.openUnrealizedPnl = pnlUsd;
     }
 
-    /** Trips the latch by hand — used by the reconciler on drift and by the operator. */
+    /**
+     * Trips the latch by hand — an operator hook. Production drift goes through
+     * {@code exec.TradingHalt}, which an operator must clear; THIS latch self-clears at the UTC
+     * day rollover, and confusing the two would make a drift halt look like it expires overnight.
+     */
     public synchronized void trip(String why, Instant now) {
         rolloverIfNewDay(now, 0);
         if (!tripped) {

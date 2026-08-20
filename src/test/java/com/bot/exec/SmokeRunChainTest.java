@@ -9,7 +9,7 @@ import com.bot.risk.RiskDecision;
 import com.bot.risk.RiskEngine;
 import com.bot.risk.TradePlan;
 import com.bot.risk.TradeRequest;
-import com.bot.signal.ManualTestnetInput;
+import com.bot.signal.ManualInput;
 import com.bot.signal.Signal;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -40,9 +40,9 @@ class SmokeRunChainTest {
     @Test
     @DisplayName("a typed line becomes a sized, stopped, targeted position and the state reconciles")
     void manualSignalToReconciledPosition() throws Exception {
-        // 1 ─ A signal arrives the only way one can: somebody typed it.
+        // 1 ─ A signal arrives as a typed line — one of the two permitted sources (the other is the Supabase queue).
         Signal signal;
-        try (ManualTestnetInput input = ManualTestnetInput.fromReader(
+        try (ManualInput input = ManualInput.fromReader(
                 new StringReader("BTCUSDT LONG entry=64000 stop=62800 lev=3 id=smoke-1"),
                 Clock.fixed(ExecFixtures.NOON, java.time.ZoneOffset.UTC), 3)) {
             List<Signal> polled = input.poll();
@@ -50,7 +50,7 @@ class SmokeRunChainTest {
             signal = polled.get(0);
         }
 
-        // 2 ─ The gate sizes it from the stop and nothing else.
+        // 2 в”Ђ The gate sizes it from the stop and nothing else.
         InstrumentFilters filters = exchange.fetchFilters(signal.symbol());
         MarginTierTable tiers = exchange.fetchMarginTiers(signal.symbol());
         double equity = exchange.fetchAccount().equityUsd();
@@ -66,7 +66,7 @@ class SmokeRunChainTest {
         assertTrue(plan.riskFractionOfBalance() <= 0.005 + 1e-12, "risk is within the 0.5% budget");
         assertTrue(plan.liquidationBufferFraction() >= 0.30, "the stop is inside liquidation with room");
 
-        // 3 ─ Execution: entry, then the protective stop, then the reduce-only exits.
+        // 3 в”Ђ Execution: entry, then the protective stop, then the reduce-only exits.
         ExecutionCoordinator coordinator = ExecFixtures.coordinator(exchange, engine, halt, alerts);
         ExecutionCoordinator.Report report = coordinator.execute(plan);
 
@@ -87,12 +87,12 @@ class SmokeRunChainTest {
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
         assertEquals(0, exitTotal.compareTo(report.filledQuantity()), "the exits close the whole position");
 
-        // 4 ─ No exchange-side countdown on a symbol that now holds a position: countdownCancelAll
+        // 4 в”Ђ No exchange-side countdown on a symbol that now holds a position: countdownCancelAll
         //     would cancel the very stop that was just placed.
         assertNull(exchange.deadMansCountdownFor("BTCUSDT"),
                 "arming the dead-man's switch over an open position schedules the deletion of its stop");
 
-        // 5 ─ Reconciliation converges: the exchange and the book agree, nothing is halted.
+        // 5 в”Ђ Reconciliation converges: the exchange and the book agree, nothing is halted.
         Reconciler reconciler = new Reconciler(exchange, engine, halt, alerts,
                 new IdempotentOrderPlacer(exchange, 1, 1, 0, ExecFixtures.NO_SLEEP));
         Reconciler.Report reconciliation = reconciler.reconcile(ExecFixtures.NOON);

@@ -13,7 +13,7 @@ import java.util.OptionalDouble;
  * <p>Two deliberate asymmetries, both towards less risk:
  * <ul>
  *   <li><b>Capped at 1.0.</b> Calm markets never lever the position UP. The academic form scales
- *       both ways; an automated bot on a testnet account gets the de-risking half only, because the
+ *       both ways; an automated bot gets the de-risking half only, because the
  *       cost of the cap is forgone size while the cost of its absence is a levered position sized
  *       off a vol estimate that may simply be stale.</li>
  *   <li><b>Fail-open to 1.0.</b> No estimate, a zero, a negative number, NaN, infinity — anything

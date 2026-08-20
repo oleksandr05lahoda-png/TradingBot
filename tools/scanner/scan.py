@@ -152,7 +152,7 @@ def main():
     print("universe (%s): %d coins above $%.0fM/24h"
           % (args.universe, len(pool), args.min_volume / 1e6))
 
-    lines, longs, shorts, skipped = [], 0, 0, 0
+    lines, skipped = [], 0
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     for i, (sym, _) in enumerate(pool):
         bars = get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": BARS_NEEDED})
@@ -179,8 +179,6 @@ def main():
         side = "LONG" if ret > 0 else "SHORT"
         if args.side != "both" and side.lower() != args.side:
             continue
-        longs += side == "LONG"
-        shorts += side == "SHORT"
         lines.append("%s %s entry=%.10g atr=%.10g lev=%d id=tsmom-%s-%s"
                      % (sym, side, last, a, args.leverage, sym, stamp))
         if (i + 1) % 25 == 0:

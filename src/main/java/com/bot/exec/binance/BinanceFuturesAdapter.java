@@ -133,7 +133,9 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         }
         throw ExchangeException.refused(
                 symbol + " is not listed on " + endpointHost()
-                        + " — the testnet lists a different, smaller universe than the live exchange", 200, 0);
+                        + (venue.isReal() ? ""
+                                : " — the testnet lists a different, smaller universe than the live exchange"),
+                200, 0);
     }
 
     private static InstrumentFilters parseFilters(JSONObject symbolInfo) {
