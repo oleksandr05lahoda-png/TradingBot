@@ -110,22 +110,23 @@ public final class TestnetBot {
             // still halt opening — that is the honest outcome for a genuinely unaccounted position.
             Path ledgerPath = Path.of(System.getenv().getOrDefault("BOOK_LEDGER_PATH", "book-ledger.json"));
             String[] lastLedgerBody = {""};
-            int seeded = BookLedger.seed(engine.book(), port.openPositions(), ledgerPath);
-            if (seeded > 0) {
-                LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
-            }
 
             // A start-up disagreement stops OPENING and nothing else. Exiting here would have been
             // the same mistake in a third place: the operator would be left with a position on the
             // exchange and no way to unwind it through the bot, which is precisely the state a
             // trading halt must never create. The loop stays up so closes are still processed —
-            // including when bootstrap itself blows up on an exchange blip.
+            // including when the very first exchange read (the ledger re-arm) blows up on a blip
+            // or a bad credential: dying here was measured with an invalid key on 20.08.
             boolean bootstrapped;
             try {
+                int seeded = BookLedger.seed(engine.book(), port.openPositions(), ledgerPath);
+                if (seeded > 0) {
+                    LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
+                }
                 bootstrapped = reconciler.bootstrap(Instant.now());
             } catch (RuntimeException e) {
                 bootstrapped = false;
-                halt.halt("start-up reconciliation threw: " + e.getMessage(), Instant.now());
+                halt.halt("boot could not read the exchange: " + e.getMessage(), Instant.now());
             }
             if (!bootstrapped) {
                 LOG.severe("[Boot] start-up reconciliation did not converge — trading is halted. "
