@@ -153,6 +153,25 @@ public interface AlertSink {
         }
     }
 
+    /**
+     * Stamps every alert with which machine sent it. Two bots — the demo forward and the real
+     * one — share one Telegram chat, and an unlabelled "trading halted" from either is the same
+     * message: the operator cannot tell play money from real money at the moment it matters most.
+     */
+    final class Tagged implements AlertSink {
+        private final String tag;
+        private final AlertSink delegate;
+
+        public Tagged(String tag, AlertSink delegate) {
+            this.tag = Preconditions.notBlank(tag, "tag");
+            this.delegate = Preconditions.notNull(delegate, "delegate");
+        }
+
+        @Override public void alert(Severity severity, String title, String message) {
+            delegate.alert(severity, "[" + tag + "] " + title, message);
+        }
+    }
+
     /** Sends to several sinks; one failing sink never prevents the others from being tried. */
     final class Composite implements AlertSink {
         private static final Logger LOG = Logger.getLogger("Alert.Composite");
@@ -189,5 +208,10 @@ public interface AlertSink {
     /** Log always, plus Telegram when the environment configures it — and a warning when it does not. */
     static AlertSink fromEnvironment() {
         return Composite.assemble(System::getenv, Telegram.DISABLED_WARNING_LOGGED);
+    }
+
+    /** Same, with every alert stamped {@code [tag]} so the sender is never in doubt. */
+    static AlertSink fromEnvironment(String tag) {
+        return new Tagged(tag, fromEnvironment());
     }
 }

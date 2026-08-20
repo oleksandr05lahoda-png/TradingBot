@@ -60,7 +60,21 @@ public final class TestnetBot {
         String sourceName = argValue(args, "--source", "manual");
         String scriptPath = argValue(args, "--script", null);
 
-        AlertSink alerts = AlertSink.fromEnvironment();
+        // The venue is resolved first so every alert can carry it: the demo forward and the real
+        // bot share one Telegram chat, and "trading halted" must never be ambiguous about whose
+        // money stopped. A mis-set arming flag also has to be refused before anything else runs.
+        BinanceVenue venue;
+        try {
+            venue = BinanceVenue.resolveFromEnvironment();
+        } catch (IllegalStateException e) {
+            // An operator mistake: print the fix, not a stack trace.
+            System.err.println(e.getMessage());
+            System.exit(2);
+            return;
+        }
+
+        AlertSink alerts = AlertSink.fromEnvironment(
+                venue.isReal() ? "REAL " + venue.realMode() : "DEMO");
         RiskConfig config = RiskConfig.defaults();
         // Book width is an operational choice, not a risk limit — every hard ceiling (risk per
         // trade, leverage, daily loss, liquidation buffer) still binds per position, and the
@@ -78,14 +92,11 @@ public final class TestnetBot {
                 new DailyLossKillSwitch(config.dailyLossFractionLimit()));
         TradingHalt halt = new TradingHalt();
 
-        BinanceVenue venue;
         ExchangePort port;
         try {
-            venue = BinanceVenue.resolveFromEnvironment();
             port = BinanceFuturesAdapter.fromEnvironment(venue);
         } catch (IllegalStateException e) {
-            // A missing credential or a mis-set arming flag is an operator mistake:
-            // print the fix, not a stack trace.
+            // A missing credential is an operator mistake: print the fix, not a stack trace.
             System.err.println(e.getMessage());
             System.exit(2);
             return;
