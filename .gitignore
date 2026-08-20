@@ -64,6 +64,7 @@ bin/
 # it was not, and it sat untracked-but-committable from 2026-07-28 until this commit.
 # API keys are read from the environment only — see README, "Keys".
 local.env
+local.env.*
 *.env
 !example.env
 tools/scanner/__pycache__/
