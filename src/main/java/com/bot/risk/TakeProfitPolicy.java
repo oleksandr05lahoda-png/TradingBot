@@ -9,9 +9,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Where the exits sit, in R — multiples of the entry-to-stop distance — never in absolute prices,
- * because "+2%" means different things on BTC and on a fresh listing. Every leg is <b>reduce-only</b>:
- * an exit that is not would open an opposite position if it raced a stop that already flattened.
+ * Where the exits sit, in R (multiples of entry-to-stop), never absolute prices — "+2%" means
+ * different things on BTC and on a fresh listing. Every leg is <b>reduce-only</b>: one that is not
+ * would open an opposite position if it raced a stop that already flattened.
  */
 public record TakeProfitPolicy(List<Leg> legs) {
 
@@ -60,14 +60,11 @@ public record TakeProfitPolicy(List<Leg> legs) {
 
     /**
      * Orders the exchange will accept for {@code totalQuantity} (the filled size, never the intended
-     * one). Quantities are floored to the lot step with the <b>last</b> leg absorbing the remainder —
-     * dust left unclosed is a position the bot believes is flat. If any leg falls below the minimum
-     * lot the split is abandoned rather than patched, because patching pushes the unsendable share
-     * into a later leg and quietly moves size <i>further out</i>; the fallback is one leg at the
-     * <b>nearest</b> R, which reduces exposure sooner. Empty means the stop is the only exit.
-     *
-     * <p>Minimum <i>notional</i> is deliberately not applied: Binance exempts reduce-only orders from
-     * it ({@code -4164}, "unless you choose reduce only") and every leg here is reduce-only.
+     * one), floored to the lot step with the <b>last</b> leg absorbing the remainder — dust left
+     * unclosed is a position the bot believes is flat. A leg below the minimum lot abandons the split
+     * rather than patching it, since patching moves size <i>further out</i>; the fallback is one leg
+     * at the <b>nearest</b> R, and empty means the stop is the only exit. Minimum <i>notional</i> is
+     * deliberately not applied — Binance exempts reduce-only orders ({@code -4164}), as all of these are.
      */
     public List<ProjectedLeg> project(Side side,
                                       double entryPrice,

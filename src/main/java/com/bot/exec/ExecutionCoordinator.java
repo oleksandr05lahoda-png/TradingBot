@@ -22,20 +22,17 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * Turns an approved {@link TradePlan} into orders without ever leaving a filled position unprotected.
- * The stop goes on immediately after the fill and is sized to the <i>filled</i> quantity; if it
- * cannot be placed, or slippage pushed realised risk past the budget, the position is closed again.
+ * Turns an approved {@link TradePlan} into orders, never leaving a filled position unprotected: the
+ * stop goes on right after the fill sized to what <i>filled</i>, or the position is closed again.
  */
 public final class ExecutionCoordinator {
 
     private static final Logger LOG = Logger.getLogger(ExecutionCoordinator.class.getName());
 
     public enum Outcome {
-        /** Entry filled completely; stop and exits are on the exchange. */
         FILLED,
-        /** Entry filled partially; stop and exits cover the filled quantity. */
+        /** Stop and exits cover the filled quantity, not the intended one. */
         PARTIALLY_FILLED,
-        /** Nothing filled. No stop, no exits, no position, nothing to clean up. */
         NOT_FILLED,
         /** Filled, then closed again because the fill price broke the risk budget. */
         ABORTED_ON_SLIPPAGE,
@@ -61,7 +58,6 @@ public final class ExecutionCoordinator {
             takeProfitOrders = List.copyOf(takeProfitOrders);
         }
 
-        /** True when a position is known to exist as a result of this execution. */
         public boolean opened() {
             return outcome == Outcome.FILLED || outcome == Outcome.PARTIALLY_FILLED;
         }
@@ -72,10 +68,7 @@ public final class ExecutionCoordinator {
         }
     }
 
-    /**
-     * @param maxAdverseRiskOverrun how far realised risk may exceed planned risk before the position
-     *                              is closed again; 0.20 = 20%
-     */
+    /** @param maxAdverseRiskOverrun realised-risk overshoot tolerated before closing again; 0.20 = 20% */
     public record Settings(
             OrderType entryType,
             TimeInForce entryTimeInForce,
@@ -168,7 +161,7 @@ public final class ExecutionCoordinator {
 
         BigDecimal avgPrice = entry.averagePrice().signum() > 0 ? entry.averagePrice() : plan.entryPrice();
 
-        // ── The stop goes on now. Nothing between the fill and this. ────────────────────────────
+        // The stop goes on now. Nothing between the fill and this.
         OrderStatus stop;
         try {
             stop = placer.place(stopRequest);
@@ -178,7 +171,6 @@ public final class ExecutionCoordinator {
 
         engine.registerFill(plan, filled, avgPrice.doubleValue(), stop.clientOrderId());
 
-        // ── Only now is it safe to do arithmetic. ───────────────────────────────────────────────
         double realisedRisk = filled.doubleValue()
                 * Math.abs(avgPrice.doubleValue() - plan.stopPrice().doubleValue());
         boolean stopCrossed = !plan.side().isValidStopGeometry(avgPrice.doubleValue(), plan.stopPrice().doubleValue());
@@ -194,7 +186,6 @@ public final class ExecutionCoordinator {
             return closeOnSlippage(plan, entry, stop, filled, avgPrice, why);
         }
 
-        // ── Reduce-only exits, re-projected from the price that actually filled. ────────────────
         List<OrderStatus> takeProfits = placeTakeProfits(plan, closeSide, filled, avgPrice, filters);
 
         boolean partial = filled.compareTo(plan.quantity()) < 0;
@@ -218,10 +209,8 @@ public final class ExecutionCoordinator {
             String note) {}
 
     /**
-     * Flattens a symbol reduce-only, confirms, then cancels the protective orders left behind — in
-     * that order, since cancelling first would leave the position naked for as long as the close
-     * takes. A partial close therefore keeps its stop and halts rather than reporting success. The
-     * position is read from the exchange, not from the local book.
+     * Flattens reduce-only, confirms, then cancels the protective orders — in that order, or the
+     * position rides naked while the close runs. A partial close keeps its stop and halts instead.
      */
     public CloseReport closeOut(String symbol, String requestId) throws InterruptedException {
         Preconditions.notBlank(symbol, "symbol");
@@ -272,10 +261,7 @@ public final class ExecutionCoordinator {
                 "closed reduce-only in full");
     }
 
-    /**
-     * Closes a position reduce-only. Deliberately does not consult {@link TradingHalt}: a halt stops
-     * opening, never closing.
-     */
+    /** Closes reduce-only. Deliberately ignores {@link TradingHalt}: a halt stops opening, never closing. */
     public OrderStatus flatten(String symbol, Side direction, BigDecimal quantity, String signalId)
             throws InterruptedException {
         OrderRequest close = OrderRequest.emergencyClose(symbol, OrderSide.toClose(direction), quantity,
@@ -309,10 +295,8 @@ public final class ExecutionCoordinator {
                         plan.symbol() + " leg " + i + " at " + leg.rMultiple() + "R: " + e.getMessage());
             }
         }
-        // Losing one leg of several thins the exit; losing all of them removes the profit target
-        // entirely, and the position then rides to its stop or waits for the scanner to close it
-        // on signal. That is a different animal and must not hide inside a per-leg warning —
-        // seen live 14.08, when the venue's conditional-order cap silently swallowed both legs.
+        // Losing every leg is not a thinner exit but no exit at all, so it must not hide inside a
+        // per-leg warning — seen live 14.08, the venue's conditional-order cap swallowed both legs.
         if (placed.isEmpty() && !legs.isEmpty()) {
             alerts.warning("Position has NO take-profit",
                     plan.symbol() + ": every take-profit leg was refused. The stop still protects it, "
@@ -322,7 +306,6 @@ public final class ExecutionCoordinator {
         return placed;
     }
 
-    /** Polls until the entry reaches a state worth acting on, cancelling a stale remainder. */
     private OrderStatus awaitEntryResolution(OrderStatus initial, OrderRequest request) throws InterruptedException {
         OrderStatus current = initial;
         for (int attempt = 0; attempt < settings.fillPollAttempts(); attempt++) {
@@ -360,12 +343,9 @@ public final class ExecutionCoordinator {
                         + " but the stop was refused (" + cause.getMessage()
                         + "). Closing the position.");
 
-        // The invariant is "no position lives without a stop", and the unwind below is what
-        // enforces it. Whether trading HALTS depends on whether the unwind succeeds: a clean
-        // reduce-only close leaves the account exactly as if the signal had been refused
-        // outright, and one symbol with unplaceable stops (measured live 14.08: stale conditional
-        // orders on a venue that cannot list them) must not stop every other symbol. Anything
-        // short of a confirmed-flat close halts, exactly as before.
+        // Invariant: no position lives without a stop; the unwind below enforces it. Only a
+        // confirmed-flat close avoids the halt — one symbol with unplaceable stops (live 14.08: stale
+        // conditional orders on a venue that cannot list them) must not stop every other symbol.
         String note;
         try {
             OrderStatus close = flatten(plan.symbol(), plan.side(), filled, plan.signalId());
@@ -414,8 +394,7 @@ public final class ExecutionCoordinator {
             } else {
                 closedCompletely = true;
                 note = why + "; closed reduce-only";
-                // Realised PnL is not invented here: it arrives from the exchange's income ledger
-                // on the next reconciliation pass, net of slippage and fees.
+                // Realised PnL is not invented here; it arrives from the exchange ledger next pass.
                 engine.registerClose(plan.symbol());
             }
         } catch (RuntimeException e) {

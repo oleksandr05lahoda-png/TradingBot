@@ -5,11 +5,9 @@ import com.bot.core.Preconditions;
 import java.math.BigDecimal;
 
 /**
- * What actually happened to a signal, sent back to the source that produced it. The gap between the
- * intended entry and {@code averageFillPrice} is the only measurement of realised execution cost.
- *
- * <p>A plain value type rather than a reference to the execution layer's report: a source must not
- * need to know that {@code com.bot.exec} exists.
+ * What happened to a signal, reported back to its source. The gap between intended entry and
+ * {@code averageFillPrice} is the only measurement of realised execution cost. A plain value type,
+ * not the execution layer's report: a source must not need to know {@code com.bot.exec} exists.
  */
 public record ExecutionFeedback(
         String clientOrderId,

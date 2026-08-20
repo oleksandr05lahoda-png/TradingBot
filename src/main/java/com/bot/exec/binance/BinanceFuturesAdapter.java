@@ -36,14 +36,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 /**
- * {@link ExchangePort} over Binance USDⓈ-M futures REST, demo or real depending on the
- * {@link BinanceVenue} it was built with. Everything exchange-specific lives here, so nothing above
- * this class knows Binance exists; every request URL passes {@link BinanceVenue#require}, so a
- * request aimed at the wrong venue dies inside this process.
- *
- * <p>Ambiguity is preserved rather than flattened: a timeout or a 503 becomes
- * {@link ExchangeException#ambiguous()}, an error code becomes a refusal, and
- * {@code IdempotentOrderPlacer} decides differently in each case.
+ * {@link ExchangePort} over Binance USDⓈ-M futures REST, demo or real per its {@link BinanceVenue};
+ * every request URL passes {@link BinanceVenue#require}, so a request aimed at the wrong venue dies
+ * inside this process. A timeout or a 5xx stays {@link ExchangeException#ambiguous()} and never
+ * becomes a refusal — {@code IdempotentOrderPlacer} handles the two differently.
  */
 public final class BinanceFuturesAdapter implements ExchangePort {
 
@@ -86,7 +82,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         return venue.restHost();
     }
 
-    /** Fetches server time and records the offset every signed request will be stamped with. */
+    /** Records the offset every signed request is stamped with. */
     public void synchronizeClock() {
         try {
             JSONObject time = new JSONObject(publicGet("/fapi/v1/time", Map.of(), 1));
@@ -166,9 +162,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                 "exchangeInfo for " + symbolInfo.getString("symbol")
                         + " is missing PRICE_FILTER or LOT_SIZE — refusing to guess them");
         if (marketMaxQty == null) marketMaxQty = maxQty;
-        // An absent MIN_NOTIONAL filter must not silently disable the notional gate: fall back
-        // to the exchange-wide 5 USDT floor rather than zero (audit 19.08, latent on all
-        // current symbols but the gate must fail toward rejecting, not toward passing).
+        // Absent MIN_NOTIONAL falls back to the 5 USDT floor, not zero: fail toward rejecting (19.08).
         if (minNotional == null) minNotional = new BigDecimal("5");
 
         return new InstrumentFilters(
@@ -187,8 +181,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
             if (!symbol.equals(entry.optString("symbol"))) continue;
             JSONArray brackets = entry.getJSONArray("brackets");
 
-            // The topmost bracket is widened to infinity, and picked by highest notionalFloor rather
-            // than array position — a descending response would otherwise widen the wrong one.
+            // Widen the highest notionalFloor to infinity, not the last index: the response may descend.
             double highestFloor = Double.NEGATIVE_INFINITY;
             for (int b = 0; b < brackets.length(); b++) {
                 highestFloor = Math.max(highestFloor, brackets.getJSONObject(b).getDouble("notionalFloor"));
@@ -209,8 +202,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
     }
 
     @Override public double fetchRealizedPnlSince(long sinceEpochMs) {
-        // Commissions and funding count too: the daily loss limit is about the account. Paged because
-        // income comes back ascending from startTime, so a truncated page drops the most recent rows.
+        // Commissions and funding count too. Income ascends from startTime, so pages must be walked.
         final int pageSize = 1000;
         final int maxPages = 20;
 
@@ -249,12 +241,8 @@ public final class BinanceFuturesAdapter implements ExchangePort {
     // ─── Position and margin settings ────────────────────────────────────────────────────────
 
     @Override public void ensureIsolatedMargin(String symbol) {
-        // Ask before telling. Binance refuses a marginType POST outright when the symbol carries
-        // stale working orders ("Position side cannot be changed if there exists open orders"),
-        // and that refusal is NOT in the benign set below — rightly so, because trading a symbol
-        // under cross margin while the risk engine sized it for isolated would be silent damage.
-        // But the common case is a symbol that is already isolated from an earlier session and
-        // merely has leftover orders: there is nothing to change, so there is nothing to refuse.
+        // Ask before telling: Binance refuses a marginType POST while the symbol carries working
+        // orders, and that refusal must stay non-benign — cross margin under isolated sizing is damage.
         if (isAlreadyIsolated(symbol)) {
             LOG.fine("[Binance] " + symbol + " is already isolated; no marginType call needed");
             return;
@@ -268,11 +256,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         }
     }
 
-    /**
-     * True only when the exchange itself says the symbol is on isolated margin. Any doubt — an
-     * empty answer, a shape we do not recognise — returns false so the caller still attempts the
-     * change and any real refusal still surfaces.
-     */
+    /** Any doubt returns false, so the caller still attempts the change and a real refusal surfaces. */
     private boolean isAlreadyIsolated(String symbol) {
         try {
             JSONArray rows = new JSONArray(
@@ -321,10 +305,8 @@ public final class BinanceFuturesAdapter implements ExchangePort {
     // ─── Orders ──────────────────────────────────────────────────────────────────────────────
 
     /**
-     * Conditional orders go to {@code /fapi/v1/algoOrder}; everything else to {@code /fapi/v1/order}.
-     * Binance split them in December 2025 and the plain endpoint now answers {@code -4120} for a
-     * trigger type. The two use different parameter names ({@code clientAlgoId} vs
-     * {@code newClientOrderId}, {@code triggerPrice} vs {@code stopPrice}) and separate id spaces.
+     * Conditional orders go to {@code /fapi/v1/algoOrder}, the rest to {@code /fapi/v1/order}: Binance
+     * split them in December 2025, and the plain endpoint answers {@code -4120} for a trigger type.
      */
     @Override public OrderStatus placeOrder(OrderRequest request) {
         return request.type().isConditional() ? placeAlgoOrder(request) : placePlainOrder(request);
@@ -346,10 +328,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
 
         OrderStatus placed = parseOrder(new JSONObject(signedPost("/fapi/v1/order", params, 1, true)));
 
-        // RESULT is supposed to carry the average fill price, and for an entry it does — but a
-        // reduce-only market close came back with a filled quantity and a price of zero. A missing
-        // price is not a price: it silently corrupts the execution-cost measurement the whole
-        // exercise exists for, so it is fetched rather than accepted.
+        // RESULT should carry the average fill price; a reduce-only market close came back with zero.
         if (placed.hasFill() && placed.averagePrice().signum() == 0) {
             Optional<OrderStatus> settled = queryOrder(request.symbol(), request.clientOrderId());
             if (settled.isPresent() && settled.get().averagePrice().signum() > 0) return settled.get();
@@ -363,8 +342,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("symbol", request.symbol());
         params.put("side", request.side().name());
-        // Names are verbatim from the endpoint's parameter table: the order type stays `type` as on
-        // the plain endpoint, but the id becomes `clientAlgoId` and the trigger `triggerPrice`.
+        // The endpoint's own names: `type` as on the plain one, but `clientAlgoId` and `triggerPrice`.
         params.put("algoType", "CONDITIONAL");
         params.put("type", request.type().name());
         params.put("clientAlgoId", request.clientOrderId());
@@ -382,8 +360,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
     @Override public Optional<OrderStatus> queryOrder(String symbol, String clientOrderId) {
         boolean algo = isAlgoId(clientOrderId);
         Map<String, String> params = new LinkedHashMap<>();
-        // The algo endpoint identifies an order by id alone and rejects nothing else; the plain one
-        // requires the symbol.
+        // The algo endpoint identifies an order by id alone; the plain one requires the symbol.
         if (!algo) params.put("symbol", symbol);
         params.put(algo ? "clientAlgoId" : "origClientOrderId", clientOrderId);
         try {
@@ -399,23 +376,15 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         }
     }
 
-    /**
-     * Plain and conditional working orders together. They live on separate endpoints, and the
-     * reconciler's "position without a stop" check reads this list — omitting the algo half would
-     * report every protected position as naked.
-     */
+    /** Both endpoints: the reconciler reads this list, so omitting the algo half reports stops missing. */
     @Override public List<OrderStatus> openOrders(String symbol) {
         List<OrderStatus> out = new ArrayList<>();
         JSONArray plain = new JSONArray(signedGet("/fapi/v1/openOrders", Map.of("symbol", symbol), 1));
         for (int i = 0; i < plain.length(); i++) out.add(parseOrder(plain.getJSONObject(i)));
 
-        // Listing conditional orders is {@code openAlgoOrders}, NOT {@code algoOpenOrders}: the two
-        // words are transposed and the wrong one 404s. That typo was expensive. Because listing
-        // silently returned nothing, cancelAllOpenOrders below had nothing to cancel, so every
-        // closed position left its stop and takes resting on the venue; 64 dead orders had piled
-        // up by 15.08, the account hit Binance's conditional-order cap, and new positions began
-        // failing to place stops at all. Losing the listing must still not lose the plain orders,
-        // and must not be mistaken for "there are no stops" — see canListConditionalOrders.
+        // The path is openAlgoOrders, NOT algoOpenOrders: the transposed spelling 404s, listing then
+        // returned nothing, and every closed position left its stop resting — 64 dead orders by 15.08,
+        // against the conditional cap. A lost listing must not read as "no stops": canListConditionalOrders.
         try {
             JSONArray algo = new JSONArray(signedGet("/fapi/v1/openAlgoOrders", Map.of("symbol", symbol), 1));
             for (int i = 0; i < algo.length(); i++) out.add(parseAlgoOrder(algo.getJSONObject(i), symbol));
@@ -455,10 +424,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         }
     }
 
-    /**
-     * Whether an id belongs to the conditional endpoint, read from the purpose letter the factory
-     * encoded. An id from elsewhere is treated as plain — the worst case is one "no such order".
-     */
+    /** Read from the purpose letter in the id; a foreign id reads as plain, costing one "no such order". */
     private static boolean isAlgoId(String clientOrderId) {
         return ClientOrderIdFactory.purposeOf(clientOrderId)
                 .map(p -> p == OrderPurpose.STOP_LOSS || p == OrderPurpose.TAKE_PROFIT)
@@ -495,11 +461,8 @@ public final class BinanceFuturesAdapter implements ExchangePort {
     }
 
     /**
-     * An algo order in the shape the rest of the system expects. The payload names differ
-     * throughout: {@code algoId}/{@code clientAlgoId}/{@code algoStatus}/{@code triggerPrice} rather
-     * than {@code orderId}/{@code clientOrderId}/{@code status}/{@code stopPrice}. A conditional
-     * order has no fill of its own — once it triggers, a separate order carries the execution — so
-     * executed quantity and average price are reported as zero rather than invented.
+     * The payload renames everything ({@code algoId}/{@code clientAlgoId}/{@code algoStatus}/
+     * {@code triggerPrice}); a conditional order has no fill, so quantity filled and price stay zero.
      */
     private static OrderStatus parseAlgoOrder(JSONObject o, String fallbackSymbol) {
         BigDecimal quantity = decimal(o, "quantity");
@@ -518,11 +481,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                 o.optLong("updateTime", o.optLong("createTime", 0)));
     }
 
-    /**
-     * Algo status vocabulary. The distinction that matters downstream is working versus not: the
-     * reconciler asks whether a stop is still protecting the position, so anything that is no longer
-     * armed must not read as working. An unrecognised value becomes UNKNOWN, never a guess.
-     */
+    /** Working versus not is what the reconciler reads; an unrecognised value is UNKNOWN, not a guess. */
     private static OrderState parseAlgoState(String raw) {
         return switch (raw.toUpperCase(Locale.ROOT)) {
             case "NEW", "WORKING", "ACTIVE" -> OrderState.NEW;
@@ -541,8 +500,8 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         try {
             return OrderState.valueOf(raw);
         } catch (IllegalArgumentException e) {
-            // NEW_INSURANCE / NEW_ADL and future additions: never guess FILLED, that decides
-            // whether a position is believed to exist.
+            // NEW_INSURANCE / NEW_ADL and future additions: never guess FILLED — it decides whether
+            // a position is believed to exist.
             LOG.warning("[Binance] unrecognised order status \"" + raw + "\"");
             return OrderState.UNKNOWN;
         }
@@ -606,9 +565,8 @@ public final class BinanceFuturesAdapter implements ExchangePort {
 
             int status = response.statusCode();
             if (status == 429 || status == 418) {
-                // The ban MUST be recorded whatever shape the header takes: RFC 7231 allows an
-                // HTTP-date here, and an edge proxy that sends one must not turn into "keep
-                // retrying while banned" — the exact pattern that escalates a 429 into a 418.
+                // Record the ban whatever Retry-After holds (RFC 7231 allows an HTTP-date): retrying
+                // while banned escalates a 429 into a 418.
                 long retryAfterMs = 60_000L;
                 try {
                     retryAfterMs = response.headers().firstValue("Retry-After")
@@ -621,10 +579,8 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                         + (retryAfterMs / 1000) + "s", status, 0);
             }
             if (status >= 500) {
-                // Binance documents EVERY 5xx as "execution status unknown" (504 explicitly:
-                // submitted, no timely answer). Refusing here would let a filled-but-502 entry
-                // become an untracked position; ambiguity makes the idempotent placer probe by
-                // client order id instead.
+                // Binance calls EVERY 5xx "execution status unknown": a filled-but-502 entry must not
+                // become an untracked position, so the placer probes instead of retrying blind.
                 throw ExchangeException.ambiguous(
                         "HTTP " + status + " from the exchange — execution status is unknown", null);
             }

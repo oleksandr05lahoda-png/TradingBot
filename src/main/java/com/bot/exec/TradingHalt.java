@@ -8,9 +8,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
 /**
- * A one-way latch that stops new risk being taken, tripped by anything meaning the bot no longer
- * knows what is true. It stops <b>opening</b>, never closing — the close path never consults it, so
- * a halt can never seal a losing position in. Clearing it is an explicit operator act.
+ * One-way latch that stops new risk being taken. It stops <b>opening</b>, never closing — the close
+ * path never consults it, so a halt can never seal a losing position in. Only an operator clears it.
  */
 public final class TradingHalt {
 

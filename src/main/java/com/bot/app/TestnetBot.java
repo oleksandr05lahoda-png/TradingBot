@@ -35,10 +35,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.logging.Logger;
 
-/**
- * Entry point: wires the pieces together and runs the loop. Deliberately thin — assembly only, no
- * risk arithmetic and no exchange knowledge. Run with {@code --help} for options.
- */
+/** Entry point: assembly and the main loop only — no risk arithmetic, no exchange knowledge. */
 public final class TestnetBot {
 
     private static final Logger LOG = Logger.getLogger(TestnetBot.class.getName());
@@ -60,9 +57,8 @@ public final class TestnetBot {
         String sourceName = argValue(args, "--source", "manual");
         String scriptPath = argValue(args, "--script", null);
 
-        // The venue is resolved first so every alert can carry it: the demo forward and the real
-        // bot share one Telegram chat, and "trading halted" must never be ambiguous about whose
-        // money stopped. A mis-set arming flag also has to be refused before anything else runs.
+        // Venue first so every alert names it: demo and real share one Telegram chat, and a
+        // mis-set arming flag must be refused before anything else runs.
         BinanceVenue venue;
         try {
             venue = BinanceVenue.resolveFromEnvironment();
@@ -76,16 +72,12 @@ public final class TestnetBot {
         AlertSink alerts = AlertSink.fromEnvironment(
                 venue.isReal() ? "REAL " + venue.realMode() : "DEMO");
         RiskConfig config = RiskConfig.defaults();
-        // Book width is an operational choice, not a risk limit — every hard ceiling (risk per
-        // trade, leverage, daily loss, liquidation buffer) still binds per position, and the
-        // daily kill switch is what actually bounds a correlated book. Left at the tight default
-        // unless the operator says otherwise.
+        // Book width is operational, not a risk limit: the per-position ceilings and the daily kill
+        // switch are what bound a correlated book. Tight default unless the operator says otherwise.
         int maxPositions = intProperty("MAX_POSITIONS", 0);
         if (maxPositions > 0) config = config.withMaxConcurrentPositions(maxPositions);
-        // One take instead of two frees a conditional-order slot per position. The exchange caps
-        // conditional orders per account (measured live 14.08: the cap arrived near 33), so with
-        // stop + 2 takes the book tops out around ten protected positions; stop + 1 take buys
-        // roughly fifteen. The R-multiple is the operator's, the split never was measured edge.
+        // One take frees a conditional-order slot. Binance caps conditional orders per account (cap
+        // arrived near 33, measured live 14.08): stop+2 takes protects ~10 positions, stop+1 ~15.
         double tpR = doubleProperty("TP_R_MULTIPLE", 0.0);
         if (tpR > 0) config = config.withTakeProfitPolicy(TakeProfitPolicy.single(tpR));
         RiskEngine engine = new RiskEngine(config, new ExposureBook(),
@@ -96,7 +88,6 @@ public final class TestnetBot {
         try {
             port = BinanceFuturesAdapter.fromEnvironment(venue);
         } catch (IllegalStateException e) {
-            // A missing credential is an operator mistake: print the fix, not a stack trace.
             System.err.println(e.getMessage());
             System.exit(2);
             return;
@@ -115,19 +106,14 @@ public final class TestnetBot {
 
             banner(venue, port, signals, config, defaultLeverage);
 
-            // Re-arm the book from the last run's snapshot BEFORE reconciling: the venue cannot
-            // name resting stops, so without this every restart with open positions ended in a
-            // halt and a forced flatten. Positions the ledger does not know stay unknown and
-            // still halt opening — that is the honest outcome for a genuinely unaccounted position.
+            // Re-arm the book from the last snapshot BEFORE reconciling: the venue cannot name
+            // resting stops, so otherwise a restart with open positions halts and forces a flatten.
             Path ledgerPath = Path.of(System.getenv().getOrDefault("BOOK_LEDGER_PATH", "book-ledger.json"));
             String[] lastLedgerBody = {""};
 
-            // A start-up disagreement stops OPENING and nothing else. Exiting here would have been
-            // the same mistake in a third place: the operator would be left with a position on the
-            // exchange and no way to unwind it through the bot, which is precisely the state a
-            // trading halt must never create. The loop stays up so closes are still processed —
-            // including when the very first exchange read (the ledger re-arm) blows up on a blip
-            // or a bad credential: dying here was measured with an invalid key on 20.08.
+            // A start-up disagreement stops OPENING only — exiting would strand a position with no
+            // way to unwind it through the bot. Covers the first exchange read too: dying there was
+            // measured with an invalid key on 20.08.
             boolean bootstrapped;
             try {
                 int seeded = BookLedger.seed(engine.book(), port.openPositions(), ledgerPath);
@@ -146,13 +132,10 @@ public final class TestnetBot {
                         "no new positions will be opened; the bot stays up so positions can still be closed");
             }
 
-            // Observation is a pre-latched halt, not a separate mechanism: entries are refused
-            // through the same gate every other halt uses, closes and reconciliation keep working,
-            // and the only way out is the operator restarting with REAL_MODE=trade — the same
-            // "operator clears it" contract as any other halt. Latched AFTER bootstrap so a clean
-            // observe boot does not read as a failed reconciliation (the loop has not started yet,
-            // so nothing can open in between), and only when no genuine halt already holds the
-            // latch — a drift reason must not be overwritten by the routine observe notice.
+            // Observe is a pre-latched halt, not a separate mechanism: same entry gate, closes and
+            // reconciliation keep working, only an operator restart with REAL_MODE=trade clears it.
+            // Latched AFTER bootstrap (a clean observe boot is not a failed reconcile) and only if
+            // no genuine halt holds the latch — a drift reason must not be overwritten by it.
             if (venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE
                     && !halt.isHalted()) {
                 halt.halt("REAL_MODE=observe — reading the account, accepting closes, opening "
@@ -173,10 +156,8 @@ public final class TestnetBot {
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
 
-                // An unreachable signal source must not kill the process. The queue refusing to
-                // answer says nothing about the exchange, and a dead bot cannot close the position
-                // it is holding — the same reasoning that already protects the housekeeping below.
-                // Backing off keeps a hard-down queue from spinning the loop at full speed.
+                // An unreachable signal source must not kill the process: a dead bot cannot close
+                // the position it holds. Backing off keeps a hard-down queue from spinning the loop.
                 try {
                     // Closes first, always: a halt must never be able to stop an unwind.
                     for (CloseRequest close : signals.pollCloses()) {
@@ -202,15 +183,12 @@ public final class TestnetBot {
                     Thread.sleep(Math.min(30_000L, 1_000L * sourceFailures));
                 }
 
-                // The snapshot is what lets the NEXT process confirm stops by name; a no-change
-                // pass costs a string compare and nothing else.
+                // The snapshot is what lets the NEXT process confirm stops by name.
                 BookLedger.save(engine.book(), ledgerPath, lastLedgerBody);
 
                 long nowMs = System.currentTimeMillis();
-                // Housekeeping never kills the loop. A dead bot cannot close the position it is
-                // holding, so a transient exchange error during a reconcile or a heartbeat must
-                // leave the process alive and supervising — the halt latch is how a real problem
-                // stops trading, not process death.
+                // Housekeeping never kills the loop: a dead bot cannot close the position it holds.
+                // The halt latch is how a real problem stops trading, not process death.
                 if (nowMs - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
                     try {
                         deadMansSwitch.heartbeat(Instant.now());

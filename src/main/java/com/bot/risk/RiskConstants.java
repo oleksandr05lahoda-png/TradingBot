@@ -1,9 +1,8 @@
 package com.bot.risk;
 
 /**
- * Hard ceilings of the risk core, {@code static final} on purpose: a limit an environment variable
- * can move is a suggestion. Configurable values live in {@link RiskConfig}, which cannot be built
- * with anything exceeding the constants here.
+ * Hard ceilings, {@code static final} on purpose: a limit an environment variable can move is a
+ * suggestion. Configurable values live in {@link RiskConfig}, which cannot be built exceeding these.
  */
 public final class RiskConstants {
 
@@ -18,25 +17,12 @@ public final class RiskConstants {
     /** Ceiling on risk per trade as a fraction of balance: 1%. {@link RiskConfig} refuses more. */
     public static final double MAX_RISK_FRACTION_PER_TRADE = 0.01;
 
-    /**
-     * {@code |stop - liq| >= 0.30 * |entry - liq|}, with the stop strictly between entry and
-     * liquidation. Rationale in {@link LiquidationSafety}, which enforces it.
-     */
+    /** {@code |stop-liq| >= 0.30*|entry-liq|}, stop strictly between; rationale in {@link LiquidationSafety}. */
     public static final double MIN_LIQUIDATION_BUFFER_FRACTION = 0.30;
 
-    /**
-     * Binance USDⓈ-M taker fee at VIP 0, as a fraction of notional. Used to discount the isolated
-     * wallet balance when projecting liquidation — the entry fee comes out of that same margin.
-     */
+    /** Binance USDⓈ-M taker fee at VIP 0; discounts isolated margin when projecting liquidation. */
     public static final double DEFAULT_TAKER_FEE_FRACTION = 0.0005;
 
-    /**
-     * Daily volatility the vol-targeting overlay ({@link VolTargetOverlay}) aims positions at: 2%.
-     * Deliberately at the calm end of crypto's range — BTC realized daily vol spends most of its
-     * time between roughly 1.5% and 5%, so a 2% target means the overlay starts trimming as soon as
-     * the market is merely ordinary, not only in panics. Erring low is the safe direction here: the
-     * multiplier is capped at 1.0, so a target that is "too conservative" can only ever make
-     * positions smaller, never larger.
-     */
+    /** Daily vol the {@link VolTargetOverlay} aims at: 2%, the calm end of BTC's ~1.5-5% range. */
     public static final double DEFAULT_TARGET_DAILY_VOL_FRACTION = 0.02;
 }

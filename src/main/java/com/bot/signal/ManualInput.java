@@ -20,11 +20,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 /**
- * An operator typing trades, one line at a time — the source the smoke run uses.
- *
- * <p>Format: {@code SYMBOL SIDE entry=<price> [stop=<price>] [atr=<value>] [lev=<1..5>] [id=<text>]}
- * or {@code CLOSE SYMBOL [id=<text>] [reason=<text>]}; blank lines and {@code #} lines are ignored.
- * Ids are stable per line, so a scripted line replayed after a crash is one trade, not two.
+ * An operator typing trades, one line at a time — the source the smoke run uses. Blank and
+ * {@code #} lines are ignored; ids are stable per line, so a replayed line is one trade, not two.
+ * Format: {@code SYMBOL SIDE entry=<price> [stop=<price>] [atr=<value>] [lev=<1..5>] [id=<text>]}
+ * or {@code CLOSE SYMBOL [id=<text>] [reason=<text>]}.
  */
 public final class ManualInput implements SignalSource {
 
@@ -59,9 +58,8 @@ public final class ManualInput implements SignalSource {
     @Override public String name() { return "manual-input"; }
 
     /**
-     * On the console this blocks for one line at a time; from a reader it drains what is buffered.
-     * A malformed line is logged and skipped, not thrown: a typo must not take down a loop that is
-     * currently holding positions.
+     * Blocks for one line on the console; drains what is buffered from a reader. A malformed line
+     * is logged and skipped, never thrown — a typo must not kill a loop that is holding positions.
      */
     @Override public List<Signal> poll() throws IOException {
         readAvailableLines();

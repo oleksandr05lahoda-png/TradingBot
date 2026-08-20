@@ -9,12 +9,9 @@ import java.util.logging.Logger;
 
 /**
  * Keeps this process inside Binance's two independent budgets: request <b>weight</b> per minute per
- * IP, and <b>order count</b> per 10 seconds and per minute per account. Enforced before sending,
- * because a ban leaves the bot unable to place or amend a stop for as long as it lasts (Binance
- * escalates from two minutes to three days).
- *
- * <p>Sliding windows, not fixed buckets: a bucket resetting on the minute lets a burst spend a full
- * minute's budget across the boundary, which trips the limit it is meant to respect.
+ * IP, and <b>order count</b> per 10s and per minute per account. Enforced before sending — a ban
+ * blocks placing or amending a stop while it lasts (Binance escalates 2 minutes → 3 days). Sliding
+ * windows, not fixed buckets, or a burst spends a full minute's budget across a bucket boundary.
  */
 public final class RateLimiter {
 
@@ -54,11 +51,7 @@ public final class RateLimiter {
         this.sleeper = Preconditions.notNull(sleeper, "sleeper");
     }
 
-    /**
-     * Reserves {@code weight} of request budget, waiting if the window is full.
-     *
-     * @param isOrder true for endpoints that also consume the separate order-rate budget
-     */
+    /** Reserves {@code weight}, waiting if the window is full; {@code isOrder} also spends order-rate. */
     public void acquire(int weight, boolean isOrder) throws InterruptedException {
         Preconditions.positive(weight, "weight");
         while (true) {
@@ -100,20 +93,14 @@ public final class RateLimiter {
         return waitMs;
     }
 
-    /**
-     * Folds in {@code X-MBX-USED-WEIGHT-1M}, which supersedes the local estimate whenever it is
-     * higher: the IP may be shared with a process whose requests this limiter never saw.
-     */
+    /** Folds in {@code X-MBX-USED-WEIGHT-1M}, which wins when higher: the IP may be shared. */
     public synchronized void observeUsedWeight(int usedWeight1m) {
         if (usedWeight1m <= 0) return;
         this.exchangeReportedWeight = usedWeight1m;
         this.exchangeReportedAtMs = nowMs.getAsLong();
     }
 
-    /**
-     * Records a {@code 429} or {@code 418}. Everything stops until the ban expires, retries included
-     * — retries are what turn a 429 into a 418.
-     */
+    /** Records a {@code 429}/{@code 418}; everything stops until it expires — retries turn a 429 into a 418. */
     public synchronized void observeBan(long retryAfterMillis) {
         long until = nowMs.getAsLong() + Math.max(1_000L, retryAfterMillis);
         if (until > bannedUntilMs) {
@@ -153,7 +140,6 @@ public final class RateLimiter {
         return sum(window, now, spanMs);
     }
 
-    /** How long until the oldest entry inside {@code spanMs} falls out of the window. */
     private static long millisUntilRoomInWindow(Deque<Entry> window, long now, long spanMs) {
         for (Entry e : window) {
             if (now - e.atMs() < spanMs) return spanMs - (now - e.atMs()) + 1;

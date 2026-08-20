@@ -1,9 +1,8 @@
 package com.bot.exec;
 
 /**
- * A failure that came from, or on the way to, the exchange. A refusal with an error code definitely
- * did not execute; an {@link #ambiguous} failure may have, so callers must ask the exchange what
- * happened rather than retry blindly.
+ * A failure from, or on the way to, the exchange. A coded refusal definitely did not execute; an
+ * {@link #ambiguous} failure may have, so callers must ask the exchange rather than retry blindly.
  */
 public class ExchangeException extends RuntimeException {
 
@@ -24,7 +23,6 @@ public class ExchangeException extends RuntimeException {
         return new ExchangeException(message, httpStatus, exchangeCode, false, null);
     }
 
-    /** The outcome is unknown: the request may or may not have been executed. */
     public static ExchangeException ambiguous(String message, Throwable cause) {
         return new ExchangeException(message, 0, 0, true, cause);
     }
@@ -34,7 +32,6 @@ public class ExchangeException extends RuntimeException {
     /** Binance's numeric error code, or 0 when the failure never reached it. */
     public int exchangeCode() { return exchangeCode; }
 
-    /** True when the request may have taken effect despite the failure. */
     public boolean ambiguous() { return ambiguous; }
 
     @Override public String toString() {

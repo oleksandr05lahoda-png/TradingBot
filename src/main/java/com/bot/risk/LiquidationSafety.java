@@ -5,22 +5,15 @@ import com.bot.core.Side;
 
 /**
  * The stop must sit strictly between entry and liquidation, leaving at least
- * {@link RiskConstants#MIN_LIQUIDATION_BUFFER_FRACTION} of the entry-to-liquidation distance unused.
- *
- * <pre>{@code   buffer = |stop - liq| / |entry - liq|   >=  0.30 }</pre>
- *
- * <p>This wide because the two fire on <i>different prices</i> — the stop on its own trigger,
- * liquidation on the exchange's mark. A stop merely "before" liquidation is overtaken by a mark
- * excursion, closing the position for the whole isolated margin rather than the planned R.
+ * {@link RiskConstants#MIN_LIQUIDATION_BUFFER_FRACTION} of {@code |entry - liq|} unused. This wide
+ * because the two fire on <i>different prices</i> — the stop on its own trigger, liquidation on the
+ * exchange's mark — so a stop merely "before" liquidation is overtaken and costs the whole margin.
  */
 public final class LiquidationSafety {
 
     private LiquidationSafety() {}
 
-    /**
-     * {@code liquidationPrice} of {@code 0.0} means unreachable;
-     * {@code fraction = |stop - liq| / |entry - liq|}, and 0 when that distance is degenerate.
-     */
+    /** {@code liquidationPrice} 0.0 = unreachable; {@code fraction = |stop-liq|/|entry-liq|}, 0 if degenerate. */
     public record Buffer(double liquidationPrice, double fraction, boolean stopInsideLiquidation) {
 
         public boolean satisfies(double minFraction) {
@@ -61,9 +54,8 @@ public final class LiquidationSafety {
     }
 
     /**
-     * The highest leverage from 1 to {@code maxLeverage} at which this exact position still satisfies
-     * the buffer, or 0 if none does. Leverage does not change size — it only moves the liquidation
-     * price — and this is diagnostics for the rejection message, not an automatic retry.
+     * Highest leverage in [1, {@code maxLeverage}] at which this position still satisfies the buffer,
+     * or 0 — leverage moves liquidation without changing size. Diagnostics, not an automatic retry.
      */
     public static int highestSafeLeverage(Side side,
                                           double entryPrice,

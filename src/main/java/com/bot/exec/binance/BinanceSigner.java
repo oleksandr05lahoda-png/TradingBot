@@ -12,15 +12,13 @@ import java.util.Map;
 import java.util.StringJoiner;
 
 /**
- * HMAC-SHA256 request signing, and the credentials it needs. Keys come from the environment only.
- *
- * <p>Binance validates {@code serverTime - timestamp <= recvWindow && timestamp < serverTime + 1000},
- * so timestamps must come from an exchange-synchronised clock — see
- * {@link BinanceFuturesAdapter}'s drift correction.
+ * HMAC-SHA256 request signing and the credentials it needs; keys come from the environment only.
+ * Binance validates {@code serverTime - timestamp <= recvWindow && timestamp < serverTime + 1000},
+ * so timestamps must come from {@link BinanceFuturesAdapter}'s drift-corrected clock.
  */
 public final class BinanceSigner {
 
-    /** Default {@code recvWindow}: how much clock skew the exchange will tolerate, in milliseconds. */
+    /** Clock skew the exchange tolerates on a signed request. */
     public static final long DEFAULT_RECV_WINDOW_MS = 5_000L;
 
     private final String apiKey;
@@ -31,11 +29,7 @@ public final class BinanceSigner {
         this.apiSecret = Preconditions.notBlank(apiSecret, "apiSecret").getBytes(StandardCharsets.UTF_8);
     }
 
-    /**
-     * Reads the venue's own key names ({@code BINANCE_TESTNET_API_*} for demo,
-     * {@code BINANCE_REAL_API_*} for real). Venue-specific names on purpose: a generic name
-     * invites the wrong key to be pasted in, and the two venues must never share credentials.
-     */
+    /** Venue-specific key names on purpose: the two venues must never share credentials. */
     public static BinanceSigner fromEnvironment(BinanceVenue venue) {
         Preconditions.notNull(venue, "venue");
         String key = System.getenv(venue.keyEnv());
@@ -56,7 +50,7 @@ public final class BinanceSigner {
 
     public String apiKey() { return apiKey; }
 
-    /** Parameters in insertion order, then recvWindow and timestamp, then a signature over all of it. */
+    /** Insertion order, then recvWindow and timestamp, then a signature over all of it. */
     public String signedQuery(Map<String, String> parameters, long timestampMs, long recvWindowMs) {
         Preconditions.notNull(parameters, "parameters");
         Map<String, String> all = new LinkedHashMap<>(parameters);

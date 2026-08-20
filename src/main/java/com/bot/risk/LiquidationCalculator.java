@@ -7,22 +7,13 @@ import java.util.LinkedHashSet;
 import java.util.Set;
 
 /**
- * Liquidation price for a single <b>isolated</b> USDⓈ-M position, from Binance's published formula.
- *
- * <pre>{@code   liq = (WB + cum - side * q * EP) / (q * MMR - side * q) }</pre>
- *
- * side = +1 long / -1 short, q = base units, EP = entry, MMR/cum = the governing bracket's
- * maintenance rate and amount, WB = isolated wallet balance. (Binance's general form carries TMM and
- * UPNL terms; per its own note they are 0 in isolated mode.)
- *
- * <p>Derivation: liquidation is where equity meets the maintenance requirement,
- * {@code WB + uPnL = MM} with {@code MM = q*P*MMR - cum}. A long has {@code uPnL = q(P - EP)} giving
- * {@code P = (WB + cum - q*EP) / (q(MMR - 1))}; a short has {@code uPnL = q(EP - P)} giving
- * {@code P = (WB + cum + q*EP) / (q(MMR + 1))}. Both are the expression above.
- *
- * <p>Not {@code entry * (1 - 1/leverage)}: that ignores maintenance margin and puts liquidation
- * further from entry than it is. The governing bracket depends on notional and notional on price, so
- * the solver iterates to a fixed point, taking the price nearer entry if it oscillates.
+ * Liquidation price for a single <b>isolated</b> USDⓈ-M position, from Binance's published formula
+ * {@code liq = (WB + cum - side*q*EP) / (q*MMR - side*q)} — side = +1 long / -1 short, q = base
+ * units, EP = entry, MMR/cum = the governing bracket's maintenance rate and amount, WB = isolated
+ * wallet balance (Binance's TMM and UPNL terms are 0 in isolated mode). Not
+ * {@code entry * (1 - 1/leverage)}, which ignores maintenance margin. The bracket depends on
+ * notional and notional on price, so the solver iterates to a fixed point, taking the price nearer
+ * entry if it oscillates.
  */
 public final class LiquidationCalculator {
 
@@ -30,10 +21,7 @@ public final class LiquidationCalculator {
 
     private LiquidationCalculator() {}
 
-    /**
-     * Initial margin minus the entry fee, which on an isolated position comes out of that same
-     * margin. Ignoring it would push the projected liquidation away from entry — the wrong direction.
-     */
+    /** Initial margin minus the entry fee, which on an isolated position comes out of that same margin. */
     public static double isolatedWalletBalanceAtOpen(double notional, int leverage, double takerFeeFraction) {
         Preconditions.positiveFinite(notional, "notional");
         Preconditions.positive(leverage, "leverage");
@@ -47,13 +35,7 @@ public final class LiquidationCalculator {
         return wb;
     }
 
-    /**
-     * Liquidation price for an isolated position, re-selecting the maintenance bracket until it
-     * stops moving.
-     *
-     * @return the mark price at which the position liquidates, or {@code 0.0} for a long whose
-     *         liquidation price is not reachable above zero (which happens at 1x)
-     */
+    /** Liquidation mark price, re-solving the bracket until it settles; {@code 0.0} = unreachable long (1x). */
     public static double isolatedLiquidationPrice(Side side,
                                                   double entryPrice,
                                                   double quantity,
@@ -78,8 +60,8 @@ public final class LiquidationCalculator {
             MarginTier atLiquidation = tiers.tierFor(Math.max(0.0, price) * quantity);
             if (atLiquidation.equals(tier)) return clampToReachable(side, entryPrice, price);
             if (visited.contains(atLiquidation)) {
-                // Oscillating: take the solved PRICE nearer entry, not the higher maintenance rate —
-                // with calibrated maintenance amounts that bracket lands further away.
+                // Oscillating: take the solved PRICE nearer entry — with calibrated maintenance
+                // amounts the higher-rate bracket is not the safer one.
                 double a = solve(side, entryPrice, quantity, walletBalance, tier);
                 double b = solve(side, entryPrice, quantity, walletBalance, atLiquidation);
                 double nearer = side == Side.LONG ? Math.max(a, b) : Math.min(a, b);
@@ -91,7 +73,6 @@ public final class LiquidationCalculator {
         return clampToReachable(side, entryPrice, price);
     }
 
-    /** {@code liq = (WB + cum - side*q*EP) / (q*MMR - side*q)}. */
     private static double solve(Side side, double entryPrice, double quantity, double walletBalance, MarginTier tier) {
         int s = side.sign();
         double numerator = walletBalance + tier.maintenanceAmount() - s * quantity * entryPrice;
@@ -101,9 +82,8 @@ public final class LiquidationCalculator {
     }
 
     /**
-     * A long solving at or below zero means price hits zero first (ordinary at 1x), reported as
-     * {@code 0.0}. A price on the wrong side of entry means the position is liquidatable at open;
-     * clamping to entry zeroes the buffer so {@link LiquidationSafety} refuses it readably.
+     * A long solving at or below zero reports {@code 0.0} (ordinary at 1x). A price on the wrong side
+     * of entry is liquidatable at open; clamping to entry zeroes the buffer so it is refused readably.
      */
     private static double clampToReachable(Side side, double entryPrice, double price) {
         Preconditions.require(Double.isFinite(price) || side == Side.LONG,

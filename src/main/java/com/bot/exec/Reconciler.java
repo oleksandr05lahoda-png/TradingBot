@@ -25,10 +25,9 @@ import java.util.Set;
 import java.util.logging.Logger;
 
 /**
- * Brings local belief back in line with the exchange, and stops trading when the two disagree: the
+ * Brings local belief back in line with the exchange and stops trading when the two disagree: the
  * book is realigned <i>and</i> {@link TradingHalt} is tripped, since drift is a defect rather than a
- * number to correct and forget. {@link Drift.Kind#POSITION_WITHOUT_STOP} is what a crash between
- * "entry filled" and "stop placed" leaves behind.
+ * number to correct and forget.
  */
 public final class Reconciler {
 
@@ -41,18 +40,13 @@ public final class Reconciler {
             UNKNOWN_POSITION,
             /** The book holds a position the exchange says is flat. */
             GHOST_POSITION,
-            /** Same symbol, different size. */
             QUANTITY_MISMATCH,
-            /** Same symbol, opposite direction. */
             SIDE_MISMATCH,
-            /** An open position with no working stop on the exchange. */
+            /** An open position with no working stop — what a crash between fill and stop leaves. */
             POSITION_WITHOUT_STOP,
             /** A working order on a symbol with no position, old enough not to be a race. */
             ORPHAN_ORDER,
-            /**
-             * The resting stop no longer sits far enough inside the liquidation price the exchange
-             * itself reports.
-             */
+            /** The resting stop no longer sits far enough inside the exchange's liquidation price. */
             LIQUIDATION_BUFFER_BREACHED
         }
 
@@ -91,7 +85,7 @@ public final class Reconciler {
     /** Symbols whose working orders were still inside the grace window on the previous pass. */
     private volatile Set<String> carriedOverSymbols = Set.of();
 
-    /** Symbols whose stop already read "triggered" on the previous pass, with the position still open. */
+    /** Symbols whose stop read "triggered" last pass, with the position still open. */
     private volatile Set<String> triggeredStops = Set.of();
 
     public Reconciler(ExchangePort port, RiskEngine engine, TradingHalt halt, AlertSink alerts,
@@ -110,12 +104,7 @@ public final class Reconciler {
         this.orphanGraceMillis = orphanGraceMillis;
     }
 
-    /**
-     * One reconciliation pass: reads the exchange, realigns local state and cancels provably
-     * unmanaged orders. Idempotent, and never opens anything.
-     *
-     * @param now used for the UTC-day boundary of the realised-PnL reseed and the orphan grace window
-     */
+    /** One pass: realigns local state and cancels provably unmanaged orders. Never opens anything. */
     public Report reconcile(Instant now) {
         Preconditions.notNull(now, "now");
 
@@ -155,14 +144,12 @@ public final class Reconciler {
                 }
             }
 
-            // The exchange does not store an intended stop, so the distance comes from the local
-            // record; with none, risk is 0 — a known understatement never sized against, because
-            // the UNKNOWN_POSITION drift above halts trading.
+            // The exchange stores no intended stop, so the distance comes from the local record; with
+            // none, risk is 0 — an understatement never sized against, since UNKNOWN_POSITION halts.
             double stopDistance = local != null && local.quantity().signum() > 0
                     ? local.riskUsd() / local.quantity().doubleValue()
                     : 0.0;
-            // The stop id is carried across passes: the exchange cannot supply it, so losing it here
-            // would mean the named check below works once and never again.
+            // The stop id must be carried across passes; the exchange cannot supply it again.
             truth.add(new ExposureBook.OpenPosition(position.symbol(), direction, quantity, entryPrice,
                     quantity.doubleValue() * entryPrice, quantity.doubleValue() * stopDistance,
                     local == null ? Optional.empty() : local.protectiveStopId()));
@@ -181,8 +168,7 @@ public final class Reconciler {
         // Exchange wins, always and immediately, before any of the checks below act on the book.
         book.replaceAll(truth);
 
-        // Carried over, otherwise a closed symbol is inspected once and an order still inside the
-        // grace window at that single moment is never looked at again.
+        // Carried over, or an order inside the grace window at that one moment is never re-inspected.
         symbolsToInspect.addAll(carriedOverSymbols);
         Set<String> stillInteresting = new HashSet<>();
         Set<String> stillTriggered = new HashSet<>();
@@ -246,14 +232,9 @@ public final class Reconciler {
     }
 
     /**
-     * Confirms the protective stop by name, for a venue that accepts conditional orders and answers a
-     * query for one but has no endpoint that enumerates them — {@code demo-fapi} is exactly that. The
-     * id comes from the book, where it was recorded the moment the stop was placed.
-     *
-     * <p>No id on record, or a lookup that fails, leaves the question open rather than declaring the
-     * position naked: an alert that fires on healthy positions is one the operator learns to ignore.
-     *
-     * @return the stop when it is confirmed working; the states that are not add their own drift here
+     * Confirms the stop by name, for a venue that answers a query for a conditional order but has no
+     * endpoint enumerating them ({@code demo-fapi}). A missing id or a failed lookup leaves the
+     * question open rather than declaring the position naked; other states add their own drift.
      */
     private Optional<OrderStatus> confirmStopByName(String symbol, ExposureBook.OpenPosition local,
                                                     List<Drift> drifts, Set<String> stillTriggered) {
@@ -277,17 +258,15 @@ public final class Reconciler {
         if (stop.isPresent() && stop.get().isWorking()) return stop;
 
         if (stop.isPresent() && stop.get().state() == OrderState.UNKNOWN) {
-            // A vocabulary this build does not recognise is ignorance, not an absent stop. Reporting
-            // it as a naked position would turn a payload change into a false emergency.
+            // A state this build cannot read is ignorance, not an absent stop — no false emergency.
             LOG.warning("[Reconciler] " + symbol + ": stop " + stopId + " came back in a state this "
                     + "build cannot read — not confirming it either way");
             return Optional.empty();
         }
 
         if (stop.isPresent() && stop.get().state() == OrderState.FILLED) {
-            // A stop that fired takes the position with it within seconds, so one pass of grace. Not
-            // two: a trigger whose market order never landed looks exactly like this from here, and
-            // that is a naked position wearing the costume of a normal exit.
+            // A fired stop takes the position within seconds, so exactly one pass of grace — not two:
+            // a trigger whose market order never landed looks identical from here.
             if (!triggeredStops.contains(symbol)) {
                 stillTriggered.add(symbol);
                 LOG.warning("[Reconciler] " + symbol + ": stop " + stopId
@@ -308,10 +287,8 @@ public final class Reconciler {
 
     /**
      * Runtime counterpart to the pre-trade check, against the liquidation price the <b>exchange</b>
-     * reports: that number moves after approval — manual margin changes, funding, a
-     * maintenance-bracket change — for reasons this system does not model, so a stop can drift
-     * outside liquidation with no order changing. A reported liquidation price of zero means "not
-     * reachable" and is skipped.
+     * reports: it moves after approval (margin changes, funding, a bracket change), so a stop can
+     * drift outside it with no order changing. Zero means "not reachable" and is skipped.
      */
     private void checkLiquidationBuffer(String symbol, List<PositionSnapshot> positions,
                                         OrderStatus stop, List<Drift> drifts) {

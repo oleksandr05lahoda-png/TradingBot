@@ -8,20 +8,16 @@ import com.bot.exec.OrderTypes.OrderType;
 import java.math.BigDecimal;
 import java.util.Optional;
 
-/**
- * What the exchange says is true. These types are read-only views of the exchange's own state, and
- * they are the authority whenever they disagree with anything the bot remembers.
- */
+/** Read-only views of the exchange's own state; the authority whenever the bot's memory disagrees. */
 public final class ExchangeSnapshots {
 
     private ExchangeSnapshots() {}
 
     /**
-     * The state of one order as the exchange reports it. {@code executedQuantity} is not implied by
-     * {@code state} — a {@link OrderState#CANCELED} order may still have filled part of the way —
-     * and protective stops must be sized off it, not off the intended quantity.
-     *
-     * @param averagePrice weighted average fill price, {@code ZERO} while nothing has filled
+     * One order as the exchange reports it. {@code executedQuantity} is not implied by {@code state}
+     * — a {@link OrderState#CANCELED} order may still have filled part of the way — and protective
+     * stops must be sized off it, not off the intended quantity. {@code averagePrice} is
+     * {@code ZERO} until something fills.
      */
     public record OrderStatus(
             String clientOrderId,
@@ -53,11 +49,7 @@ public final class ExchangeSnapshots {
         public boolean isWorking() { return state.isWorking(); }
     }
 
-    /**
-     * A position as the exchange reports it.
-     *
-     * @param signedQuantity positive for a long, negative for a short, zero when flat
-     */
+    /** A position as the exchange reports it; {@code signedQuantity} is negative for a short. */
     public record PositionSnapshot(
             String symbol,
             BigDecimal signedQuantity,
@@ -87,12 +79,7 @@ public final class ExchangeSnapshots {
         }
     }
 
-    /**
-     * Account-level margin state.
-     *
-     * @param availableBalance what may still be committed as margin
-     * @param walletBalance    total, including margin already locked
-     */
+    /** {@code availableBalance} excludes margin already locked; {@code walletBalance} includes it. */
     public record AccountSnapshot(
             BigDecimal walletBalance,
             BigDecimal availableBalance,
@@ -105,10 +92,7 @@ public final class ExchangeSnapshots {
             Preconditions.notNull(totalUnrealizedPnl, "totalUnrealizedPnl");
         }
 
-        /**
-         * The balance the risk budget is a percentage of. Wallet balance alone would let a losing
-         * open position keep sizing new trades as if the loss had not happened.
-         */
+        /** The balance the risk budget is a fraction of; wallet alone ignores an open loss. */
         public double equityUsd() {
             return walletBalance.add(totalUnrealizedPnl).doubleValue();
         }

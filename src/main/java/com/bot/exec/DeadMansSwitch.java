@@ -15,12 +15,9 @@ import java.util.stream.Collectors;
 
 /**
  * Cancels exposure-increasing orders left behind by a dead process, without stripping protection off
- * open positions.
- *
- * <p>Binance's {@code countdownCancelAll} cancels every open order on the symbol and cannot tell a
- * resting entry from a protective stop, so it is armed only for a symbol with a resting entry and
- * <b>no position</b>; a symbol holding a position is explicitly disarmed. Arm with roughly twice the
- * heartbeat interval, so a few consecutive failures do not trip it.
+ * open positions. Binance's {@code countdownCancelAll} cancels every open order on the symbol and
+ * cannot tell a resting entry from a protective stop, so it is armed only for a symbol with a resting
+ * entry and <b>no position</b>. Arm with roughly twice the heartbeat interval.
  */
 public final class DeadMansSwitch {
 
@@ -60,11 +57,7 @@ public final class DeadMansSwitch {
         heartbeat(now, Set.of());
     }
 
-    /**
-     * @param symbolsWithRestingEntries symbols carrying an unfilled exposure-increasing order. These
-     *                                  get the exchange-side countdown; symbols holding a position
-     *                                  never do.
-     */
+    /** @param symbolsWithRestingEntries unfilled entry orders; a symbol holding a position never arms */
     public void heartbeat(Instant now, Set<String> symbolsWithRestingEntries) {
         Preconditions.notNull(now, "now");
         Preconditions.notNull(symbolsWithRestingEntries, "symbolsWithRestingEntries");
@@ -126,9 +119,8 @@ public final class DeadMansSwitch {
         long silentFor = nowMs - lastSuccessMs;
         if (silentFor > maxSilenceMillis && !degraded) {
             degraded = true;
-            // The countdown clause is conditional on purpose: with market entries (the only kind
-            // today) nothing is ever armed, and an alert promising an exchange-side countdown
-            // that does not exist would misdirect the operator during an outage.
+            // Conditional on purpose: with market entries (the only kind today) nothing is ever armed,
+            // and promising a countdown that does not exist misdirects the operator during an outage.
             String message = "no successful contact with the exchange for " + (silentFor / 1000)
                     + "s while holding " + held.size() + " position(s). New risk is stopped. "
                     + (armed.isEmpty()
@@ -159,13 +151,9 @@ public final class DeadMansSwitch {
 
     public boolean isDegraded() { return degraded; }
 
-    /** Symbols currently carrying an exchange-side countdown. */
     public Set<String> armedSymbols() { return Set.copyOf(armed); }
 
-    /**
-     * Best effort, and deliberately selective: cancelling reduce-only stops would strip an open
-     * position of the protection keeping it survivable.
-     */
+    /** Deliberately selective: cancelling reduce-only stops would strip an open position of cover. */
     private void cancelNonReducingOrdersWhereStillPossible(Set<String> symbols) {
         for (String symbol : symbols) {
             try {

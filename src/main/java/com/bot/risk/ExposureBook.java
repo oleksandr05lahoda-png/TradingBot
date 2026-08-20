@@ -12,20 +12,16 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * What the bot believes is open. A cache, not truth: the exchange decides, and the reconciler
- * overwrites this via {@link #replaceAll}. Long and short are tracked separately and never netted —
- * a 100k long plus a 100k short is two positions with two liquidation prices, not a flat book.
+ * What the bot believes is open. A cache, not truth: the exchange decides and the reconciler
+ * overwrites this via {@link #replaceAll}. Long and short are never netted — a 100k long plus a 100k
+ * short is two positions with two liquidation prices, not a flat book.
  */
 public final class ExposureBook {
 
     /**
-     * {@code quantity} is always positive — direction lives in {@code side}; {@code riskUsd} is the
-     * entry-to-stop money as planned at open.
-     *
-     * @param protectiveStopId client order id of the stop guarding this position. Empty only for a
-     *                         position adopted from the exchange, whose stop this process never
-     *                         named; reconciliation needs it to confirm the stop on a venue that
-     *                         will not list conditional orders.
+     * {@code quantity} is always positive — direction lives in {@code side}. {@code protectiveStopId}
+     * is empty only for a position adopted from the exchange, whose stop this process never named;
+     * reconciliation needs it on a venue that will not list conditional orders.
      */
     public record OpenPosition(
             String symbol,

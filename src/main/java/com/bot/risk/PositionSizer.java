@@ -3,22 +3,16 @@ package com.bot.risk;
 import com.bot.core.Preconditions;
 
 /**
- * Position size from the stop distance, and nothing else.
- *
- * <pre>{@code   qty = balance * riskFraction / |entry - stop| }</pre>
- *
- * <p>No method here takes a size and returns a stop: that puts the stop where it is affordable
- * rather than where it means something. Unclamped — the result risks exactly the budget and ceilings
- * are {@link RiskEngine}'s job. Leverage is not an input; it only moves the liquidation price.
+ * Position size from the stop distance and nothing else:
+ * {@code qty = balance * riskFraction / |entry - stop|}. No method here takes a size and returns a
+ * stop — that puts the stop where it is affordable rather than where it means something. Unclamped:
+ * ceilings are {@link RiskEngine}'s job. Leverage is not an input; it only moves liquidation.
  */
 public final class PositionSizer {
 
     private PositionSizer() {}
 
-    /**
-     * @param riskFraction fraction of balance to put at risk, e.g. 0.005 for 0.5%
-     * @return quantity in base units; exactly {@code balanceUsd * riskFraction} is lost if the stop fills
-     */
+    /** Quantity in base units that loses exactly {@code balanceUsd * riskFraction} if the stop fills. */
     public static double quantityForRisk(double balanceUsd, double riskFraction, double entryPrice, double stopPrice) {
         Preconditions.positiveFinite(balanceUsd, "balanceUsd");
         Preconditions.inClosedRange(riskFraction, 0.0, RiskConstants.MAX_RISK_FRACTION_PER_TRADE, "riskFraction");

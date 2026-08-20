@@ -1,9 +1,8 @@
 package com.bot.core;
 
 /**
- * Direction of a position. Deliberately separate from the exchange's BUY/SELL order side:
- * a LONG position is opened with BUY and closed with SELL, so conflating the two is how a
- * close ends up opening the opposite side.
+ * Position direction, deliberately not the exchange's BUY/SELL order side — a LONG opens with BUY
+ * and closes with SELL, and conflating the two is how a close opens the opposite position.
  */
 public enum Side {
     LONG(+1),
@@ -13,7 +12,7 @@ public enum Side {
 
     Side(int sign) { this.sign = sign; }
 
-    /** +1 for LONG, -1 for SHORT. Used directly by the liquidation formula. */
+    /** +1 for LONG, -1 for SHORT; the liquidation formula uses it directly. */
     public int sign() { return sign; }
 
     /** True when the stop is on the losing side of entry: below for a LONG, above for a SHORT. */

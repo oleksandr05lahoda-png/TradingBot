@@ -7,9 +7,8 @@ import com.bot.core.Side;
 import java.util.OptionalDouble;
 
 /**
- * What the risk engine is asked to approve. Everything the decision depends on is in here, so
- * {@link RiskEngine#evaluate} is reproducible from a log line. Note the absence of any size: quantity
- * is derived from the stop and the balance and is not open to negotiation.
+ * What the risk engine is asked to approve, and all {@link RiskEngine#evaluate} depends on. Note the
+ * absence of any size: quantity is derived from the stop and the balance, not negotiated.
  *
  * @param signalId            stable identity of the signal; the client order id derives from it
  * @param structuralStopPrice level that arrived with the signal, if any — preferred over ATR

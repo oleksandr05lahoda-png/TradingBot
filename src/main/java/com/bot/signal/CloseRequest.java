@@ -5,10 +5,9 @@ import com.bot.core.Preconditions;
 import java.time.Instant;
 
 /**
- * An instruction to close whatever is open on a symbol; its id derives the closing order's client
- * order id. Separate from {@link Signal} because a close only gives risk back: it skips the risk
- * gate entirely and is <b>not</b> blocked by a trading halt, which would otherwise seal positions
- * in and silently break time stops.
+ * Instruction to close whatever is open on a symbol; its id derives the closing client order id.
+ * A close only gives risk back, so it skips the risk gate and is <b>not</b> blocked by a trading
+ * halt — blocking it would seal positions in and silently break time stops.
  */
 public record CloseRequest(String id, String symbol, String reason, Instant createdAt) {
 

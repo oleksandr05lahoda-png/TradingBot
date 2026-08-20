@@ -7,10 +7,9 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * The maintenance-margin brackets for one symbol, normally from {@code GET /fapi/v1/leverageBracket},
- * validated as a whole by the constructor: contiguous from zero, full coverage, non-decreasing rates,
- * and a <b>continuous</b> margin at every boundary. Discontinuity means a number in the payload is
- * wrong, and a wrong maintenance margin is a wrong liquidation price.
+ * Maintenance-margin brackets for one symbol, from {@code GET /fapi/v1/leverageBracket}, validated
+ * as a whole: contiguous from zero, full coverage, non-decreasing rates, <b>continuous</b> margin at
+ * every boundary. A discontinuity is a wrong payload number, hence a wrong liquidation price.
  */
 public final class MarginTierTable {
 
@@ -70,10 +69,7 @@ public final class MarginTierTable {
         return tierFor(notional).maxLeverage();
     }
 
-    /**
-     * A generic USDⓈ-M table for when the real brackets have not been fetched. Stricter than the real
-     * ones for majors, so a plan approved against it stays approved against the exchange's numbers.
-     */
+    /** Generic USDⓈ-M fallback, stricter than the real brackets for majors, so approvals stay valid. */
     public static MarginTierTable conservativeDefault() {
         return new MarginTierTable(List.of(
                 new MarginTier(0,          5_000,             0.010,       0,       25),

@@ -22,23 +22,16 @@ import java.util.OptionalDouble;
 import java.util.logging.Logger;
 
 /**
- * Reads trade requests from an external PostgREST queue (Supabase table {@code public.bot_orders}).
- * Whatever fills that table is outside this system's trust boundary, so every row still goes through
- * {@link com.bot.risk.RiskEngine} exactly like a typed line does.
- *
- * <p>Row contract: {@code id, symbol, side, entry, sl, atr, leverage, status, testnet, created_at};
- * {@code sl} and {@code atr} are each optional but one must be present, and {@code testnet} must be
- * true or the row is never fetched at all — it sits {@code pending} forever. The flag gates both
- * venues: the process's venue is chosen by {@code REAL_TRADING}, not by this column, so a row with
- * {@code testnet=false} is unreachable regardless of where this process trades. Status runs
- * {@code pending -> sent -> rejected} (closes: {@code close_requested -> close_sent -> closed}),
- * driven by this class.
- *
- * <p><b>Claim before act.</b> A row is claimed with a conditional PATCH carrying the previous status
- * as a predicate, so two processes polling the same queue cannot both win it.
- *
- * <p>Credentials come from {@code SUPABASE_URL} and {@code SUPABASE_QUEUE_KEY} (falling back to
- * {@code SUPABASE_KEY}, then {@code SUPABASE_SERVICE_KEY}) and are never logged.
+ * Reads trade requests from an external PostgREST queue (table {@code public.bot_orders}), outside
+ * this system's trust boundary — every row still goes through {@link com.bot.risk.RiskEngine}
+ * exactly like a typed line. Row contract: {@code id, symbol, side, entry, sl, atr, leverage,
+ * status, testnet, created_at}; one of {@code sl}/{@code atr} required; {@code testnet=false} rows
+ * are never fetched and sit pending forever (venue comes from {@code REAL_TRADING}, not this
+ * column). Status {@code pending -> sent -> rejected}, closes
+ * {@code close_requested -> close_sent -> closed}.
+ * <p>Claim before act: the PATCH carries the previous status as a predicate, so two pollers cannot
+ * both win a row. Credentials from {@code SUPABASE_URL} plus {@code SUPABASE_QUEUE_KEY} (falling
+ * back to {@code SUPABASE_KEY}, then {@code SUPABASE_SERVICE_KEY}); never logged.
  */
 public final class SupabaseQueueSource implements SignalSource {
 
@@ -76,8 +69,7 @@ public final class SupabaseQueueSource implements SignalSource {
     /** Returns {@code null} when not configured; absence is not an error. */
     public static SupabaseQueueSource fromEnvironmentOrNull(int defaultLeverage) {
         String url = System.getenv("SUPABASE_URL");
-        // bot_orders has RLS on with no policies, so a publishable key can do nothing with it: this
-        // must be a secret key, under whichever of the three names the operator already uses.
+        // bot_orders has RLS on with no policies: a publishable key can do nothing, must be a secret key.
         String key = firstPresent(System.getenv("SUPABASE_QUEUE_KEY"),
                 System.getenv("SUPABASE_KEY"),
                 System.getenv("SUPABASE_SERVICE_KEY"));
@@ -139,10 +131,7 @@ public final class SupabaseQueueSource implements SignalSource {
         return out;
     }
 
-    /**
-     * Writes back what the exchange did: {@code entry} is what was assumed, {@code filled_price}
-     * what was got, and the gap between them is the execution cost.
-     */
+    /** Writes the fill back; the gap between {@code entry} and {@code filled_price} is the execution cost. */
     @Override public void onAccepted(Signal signal, ExecutionFeedback feedback)
             throws IOException, InterruptedException {
         long id = rowIdOf(signal);
@@ -234,8 +223,7 @@ public final class SupabaseQueueSource implements SignalSource {
         JSONObject body = new JSONObject();
         body.put("status", STATUS_CLOSED);
         body.put("closed_at", clock.instant().toString());
-        // close_*, not filled_*: overwriting filled_price (the ENTRY fill) would destroy the
-        // entry-slippage measurement the row exists to carry.
+        // close_*, not filled_*: overwriting filled_price (the ENTRY fill) destroys the slippage sample.
         body.put("close_qty", feedback.filledQuantity().doubleValue());
         body.put("close_price", feedback.averageFillPrice().doubleValue());
         body.put("exec_note", feedback.note());
@@ -250,11 +238,7 @@ public final class SupabaseQueueSource implements SignalSource {
         }
     }
 
-    /**
-     * Conditional status transition; {@code from} travels as a predicate.
-     *
-     * @return false when another poller got there first
-     */
+    /** Conditional status transition, {@code from} travelling as a predicate; false = another poller won. */
     private boolean claim(long id, String from, String to) throws IOException, InterruptedException {
         HttpResponse<String> response = send(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id + "&status=eq." + from))
@@ -274,8 +258,7 @@ public final class SupabaseQueueSource implements SignalSource {
         if (id < 0) return;
         JSONObject body = new JSONObject();
         body.put("status", STATUS_REJECTED);
-        // The reason matters as much as the refusal: a gate rejecting everything for one reason is
-        // a defect, and invisible if the row only records that something was refused.
+        // Record the reason: a gate refusing everything for one reason is a defect, invisible otherwise.
         body.put("exec_note", reason == null ? "" : reason);
         HttpResponse<String> response = send(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/rest/v1/bot_orders?id=eq." + id))
@@ -303,13 +286,9 @@ public final class SupabaseQueueSource implements SignalSource {
     }
 
     /**
-     * Supabase's newer keys ({@code sb_secret_…}, {@code sb_publishable_…}) are not JWTs, and
-     * PostgREST rejects the whole request when one arrives as a bearer token — it tries to decode it
-     * and fails. They belong in {@code apikey} alone. Legacy JWT keys want both headers.
-     *
-     * <p>Sending both unconditionally cost nothing while the project still issued legacy keys, and
-     * would have turned into HTTP 401 on every single poll the moment it did not — a failure that
-     * reads as "the queue is unreachable" rather than "the key is in the wrong header".
+     * Supabase {@code sb_*} keys are not JWTs: PostgREST fails to decode one sent as a bearer token
+     * and 401s the whole request (reading as "queue unreachable"), so they go in {@code apikey}
+     * alone. Legacy JWT keys want both headers.
      */
     private HttpResponse<String> send(HttpRequest.Builder builder) throws IOException, InterruptedException {
         builder.header("apikey", apiKey);

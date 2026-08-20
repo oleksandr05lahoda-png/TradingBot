@@ -18,8 +18,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Destination for operator alerts such as reconciliation drift or a fired dead-man's switch. The
- * default writes to the log; {@link Telegram} adds a push when the environment supplies credentials.
+ * Destination for operator alerts — reconciliation drift, a fired dead-man's switch. The default
+ * writes to the log; {@link Telegram} adds a push when the environment supplies credentials.
  */
 public interface AlertSink {
 
@@ -36,7 +36,6 @@ public interface AlertSink {
     /** The always-available floor. */
     final class Logging implements AlertSink {
 
-        /** Named rather than inlined so a test can listen to exactly this logger. */
         static final String LOGGER_NAME = "Alert";
 
         private static final Logger LOG = Logger.getLogger(LOGGER_NAME);
@@ -52,25 +51,19 @@ public interface AlertSink {
     }
 
     /**
-     * Telegram push, configured from {@code TELEGRAM_BOT_TOKEN} and {@code TELEGRAM_CHAT_ID}.
-     * Delivery failures are logged and swallowed on purpose: the alert path must never throw into
-     * the trading path it is reporting on.
+     * Telegram push, from {@code TELEGRAM_BOT_TOKEN} and {@code TELEGRAM_CHAT_ID}. Delivery failures
+     * are swallowed on purpose: the alert path must never throw into the trading path it reports on.
      */
     final class Telegram implements AlertSink {
 
-        /** Named rather than inlined so a test can listen to exactly this logger. */
         static final String LOGGER_NAME = "Alert.Telegram";
 
-        /** The two variables that turn pushes on; the warning below points at them by name. */
         static final String TOKEN_VAR = "TELEGRAM_BOT_TOKEN";
         static final String CHAT_ID_VAR = "TELEGRAM_CHAT_ID";
 
         private static final Logger LOG = Logger.getLogger(LOGGER_NAME);
 
-        /**
-         * Set the first time the "pushes are off" warning is logged. Static because the fact is about
-         * the process, not about one sink: whoever asks second must not repeat it.
-         */
+        /** One-shot: "pushes are off" is a fact about the process, not about one sink. */
         private static final AtomicBoolean DISABLED_WARNING_LOGGED = new AtomicBoolean();
 
         private final String token;
@@ -87,31 +80,22 @@ public interface AlertSink {
             return fromEnvironmentOrNull(System::getenv, DISABLED_WARNING_LOGGED);
         }
 
-        /**
-         * Same, but reading the environment through {@code environment} and tracking the one-shot
-         * warning in {@code warned}. Both are seams for the tests: the disabled path can then be
-         * exercised without the process environment, and without depending on whether an earlier
-         * caller in the same JVM already spent the warning.
-         */
+        /** Same, with the environment and the one-shot latch injected — the seams the tests use. */
         static Telegram fromEnvironmentOrNull(UnaryOperator<String> environment, AtomicBoolean warned) {
             String token = environment.apply(TOKEN_VAR);
             String chat = environment.apply(CHAT_ID_VAR);
             if (isBlank(token) || isBlank(chat)) {
-                // Unconfigured used to look exactly like configured-and-quiet, which is the worst way
-                // for an alert path to fail. Say it out loud. Today the only caller asks once at
-                // startup, so the latch buys nothing yet — it is here so that moving this call into
-                // the poll loop cannot quietly turn one warning into one every thirty seconds.
+                // Unconfigured used to look exactly like configured-and-quiet, the worst way for an
+                // alert path to fail. The latch keeps it to one line if this moves into a loop.
                 if (warned.compareAndSet(false, true)) {
                     LOG.warning(disabledWarning(token, chat));
                 }
-                // Still null, and still no exception: a missing push channel must not stop the bot,
-                // which can close positions perfectly well with nobody watching.
+                // Null, not an exception: a missing push channel must not stop the bot.
                 return null;
             }
             return new Telegram(token.trim(), chat.trim());
         }
 
-        /** Names what is missing and what it costs, so the line stands on its own in the log. */
         private static String disabledWarning(String token, String chatId) {
             List<String> missing = new ArrayList<>();
             if (isBlank(token)) missing.add(TOKEN_VAR);
@@ -153,11 +137,7 @@ public interface AlertSink {
         }
     }
 
-    /**
-     * Stamps every alert with which machine sent it. Two bots — the demo forward and the real
-     * one — share one Telegram chat, and an unlabelled "trading halted" from either is the same
-     * message: the operator cannot tell play money from real money at the moment it matters most.
-     */
+    /** Stamps the sending machine: demo and real share one chat, where "halted" reads identically. */
     final class Tagged implements AlertSink {
         private final String tag;
         private final AlertSink delegate;
@@ -191,11 +171,7 @@ public interface AlertSink {
             }
         }
 
-        /**
-         * The assembly itself, through the same seams {@link Telegram#fromEnvironmentOrNull} takes.
-         * Package-private rather than a second public factory: a test needs to assemble without
-         * touching the real environment, but nothing outside this package should.
-         */
+        /** Package-private so a test can assemble without touching the real environment. */
         static AlertSink assemble(UnaryOperator<String> environment, AtomicBoolean warned) {
             List<AlertSink> sinks = new ArrayList<>();
             sinks.add(new Logging());

@@ -8,12 +8,11 @@ import java.time.Instant;
 import java.util.OptionalDouble;
 
 /**
- * A request to consider a trade, from outside this system; {@link com.bot.risk.RiskEngine} decides.
- * It carries no size — that is derived from the stop by {@link com.bot.risk.PositionSizer} — and no
- * confidence, score or urgency, because nothing downstream would be allowed to act on those.
- *
- * @param id stable identity; the client order id derives from it, so a signal replayed after a
- *           crash produces the same order rather than a second one
+ * A request to consider a trade; {@link com.bot.risk.RiskEngine} decides. Carries no size (derived
+ * from the stop by {@link com.bot.risk.PositionSizer}) and no confidence, score or urgency —
+ * nothing downstream would be allowed to act on those.
+ * @param id stable identity the client order id derives from, so a signal replayed after a crash
+ *           produces the same order rather than a second one
  */
 public record Signal(
         String id,

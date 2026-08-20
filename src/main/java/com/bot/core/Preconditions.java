@@ -1,9 +1,6 @@
 package com.bot.core;
 
-/**
- * Argument checks used across the risk core. Fail-closed: a value that cannot be validated throws
- * rather than being coerced to a safe-looking default.
- */
+/** Fail-closed argument checks for the risk core: an unvalidatable value throws, never coerces to a default. */
 public final class Preconditions {
 
     private Preconditions() {}

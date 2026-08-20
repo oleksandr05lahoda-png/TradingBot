@@ -8,11 +8,10 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * Sends orders so that a lost response cannot become a second position: query first by the
- * deterministic client order id, treat {@code -4116 DUPLICATED_CLIENT_ORDER_ID} as a success and
- * adopt the existing order, and after an ambiguous failure probe by id before resending — always
- * with the same id, which keeps the duplicate rejection as the backstop. A definite refusal is
- * propagated, never retried.
+ * Sends orders so a lost response cannot become a second position: query first by the deterministic
+ * client order id, treat {@code -4116 DUPLICATED_CLIENT_ORDER_ID} as success and adopt the existing
+ * order, probe by id before resending after an ambiguous failure — always with the same id, which
+ * keeps the duplicate rejection as the backstop. A definite refusal propagates, never retried.
  */
 public final class IdempotentOrderPlacer {
 
@@ -38,11 +37,9 @@ public final class IdempotentOrderPlacer {
     }
 
     /**
-     * Places {@code request}, or returns the order the exchange already holds under the same client
-     * order id. Calling this repeatedly with the same request is safe by construction.
-     *
-     * @throws ExchangeException on a definite refusal, or when the outcome is still unknown after
-     *         every probe and resend — which the caller must treat as "halt and reconcile"
+     * Places {@code request}, or returns what the exchange already holds under the same id; safe to
+     * call repeatedly. Throws on a definite refusal, and on an outcome still unknown after every
+     * probe and resend — which the caller must treat as "halt and reconcile".
      */
     public OrderStatus place(OrderRequest request) throws InterruptedException {
         Preconditions.notNull(request, "request");
@@ -87,10 +84,8 @@ public final class IdempotentOrderPlacer {
     }
 
     /**
-     * Cancels by client order id without throwing.
-     *
-     * @return {@code true} when the order is known not to be working any more (cancelled, or no such
-     *         order); {@code false} when the cancel failed and it may still be live
+     * @return {@code true} when the order is known not to be working (cancelled, or no such order);
+     *         {@code false} when the cancel failed and it may still be live
      */
     public boolean cancelQuietly(String symbol, String clientOrderId) {
         try {

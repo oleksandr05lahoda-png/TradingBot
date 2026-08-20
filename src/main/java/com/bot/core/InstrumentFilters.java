@@ -5,15 +5,11 @@ import java.math.RoundingMode;
 import java.util.Objects;
 
 /**
- * Precision and size filters for one symbol, filled by the adapter from
- * {@code /fapi/v1/exchangeInfo} and never guessed — a hardcoded tick size is the classic cause of
- * silent {@code REJECTED} orders. {@link BigDecimal} throughout: quantising with {@code double}
- * yields values like {@code 0.30000000000000004}, which the exchange rejects on precision. Fields map
- * to Binance's own filters — PRICE_FILTER for {@code tickSize}/{@code minPrice}/{@code maxPrice},
- * LOT_SIZE for {@code stepSize}/{@code minQty}/{@code maxQty}, and the two below.
- *
- * @param marketMaxQty MARKET_LOT_SIZE.maxQty — a separate, usually smaller cap for MARKET orders
- * @param minNotional  MIN_NOTIONAL.notional — the price x quantity floor
+ * Per-symbol precision and size filters from {@code /fapi/v1/exchangeInfo}, never guessed — a
+ * hardcoded tick size is the classic cause of silent {@code REJECTED} orders. BigDecimal, not
+ * double, whose artefacts ({@code 0.30000000000000004}) fail exchange precision checks. Mirrors
+ * Binance PRICE_FILTER (tick/min/max price), LOT_SIZE (step/min/max qty), MARKET_LOT_SIZE.maxQty
+ * ({@code marketMaxQty}, a separate smaller MARKET cap) and MIN_NOTIONAL.notional (price x qty floor).
  */
 public record InstrumentFilters(
         String symbol,
@@ -42,8 +38,7 @@ public record InstrumentFilters(
         Preconditions.require(quantityPrecision >= 0, "quantityPrecision must be >= 0");
         Preconditions.require(maxPrice.compareTo(minPrice) > 0, "maxPrice must exceed minPrice");
         Preconditions.require(maxQty.compareTo(minQty) >= 0, "maxQty must be >= minQty");
-        // A tick finer than the accepted decimal places is self-contradictory exchange data: every
-        // tick-aligned price would be unrepresentable, so fail here rather than per order.
+        // A tick finer than the accepted decimals is contradictory exchange data — fail once, not per order.
         Preconditions.require(pricePrecision >= Math.max(0, tickSize.stripTrailingZeros().scale()),
                 "pricePrecision " + pricePrecision + " cannot represent tickSize " + tickSize);
         Preconditions.require(quantityPrecision >= Math.max(0, stepSize.stripTrailingZeros().scale()),
@@ -65,10 +60,7 @@ public record InstrumentFilters(
         return quantize(BigDecimal.valueOf(price), tickSize, mode).setScale(pricePrecision, RoundingMode.UNNECESSARY);
     }
 
-    /**
-     * Rounds a stop <i>towards</i> entry: the quantity came from the unrounded stop distance, so
-     * shrinking it keeps {@code risk <= R} true. Rounding away from entry would quietly break it.
-     */
+    /** Rounds a stop <i>towards</i> entry: shrinking the distance size was computed from keeps {@code risk <= R}. */
     public BigDecimal quantizeStopPrice(Side side, double stopPrice) {
         return quantizePrice(stopPrice, side == Side.LONG ? RoundingMode.CEILING : RoundingMode.FLOOR);
     }
@@ -115,7 +107,6 @@ public record InstrumentFilters(
         Preconditions.positiveFinite(price, "price");
         BigDecimal byNotional = minNotional.divide(BigDecimal.valueOf(price), quantityPrecision + 8, RoundingMode.CEILING);
         BigDecimal raw = byNotional.max(minQty);
-        // ceil to the step, so the result really is tradable rather than one step short of it
         return quantize(raw, stepSize, RoundingMode.CEILING).setScale(quantityPrecision, RoundingMode.CEILING);
     }
 

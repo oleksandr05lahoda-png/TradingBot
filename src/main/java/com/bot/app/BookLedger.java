@@ -17,18 +17,12 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * Persists the exposure book across restarts, because the venue cannot.
- *
- * <p>{@code demo-fapi} does not list conditional orders, so the id of the protective stop exists in
- * exactly one place: the book of the process that placed it. Before this class, a restart lost the
- * ids, reconciliation could not confirm any stop by name, and the only safe answer was a trading
- * halt — every restart with open positions demanded flattening the whole book first.
- *
- * <p>This is an app-layer concern kept out of the risk core on purpose: the book stays a pure
- * in-memory structure, and this class only snapshots it to disk and re-seeds it at boot. Seeding
- * takes the exchange's numbers (side, quantity, entry) and only borrows what the exchange cannot
- * know from the file (stop id, risked dollars). A symbol on the exchange but absent from the file
- * still surfaces as UNKNOWN_POSITION and halts opening — that position really is unaccounted for.
+ * Persists the exposure book across restarts, because the venue cannot: {@code demo-fapi} does not
+ * list conditional orders, so a protective stop's id lives only in the book of the process that
+ * placed it, and without this snapshot every restart with open positions ended in a halt and a
+ * forced flatten. Seeding takes side/quantity/entry from the exchange and borrows from the file only
+ * what the exchange cannot know (stop id, risked dollars); a symbol on the exchange but absent from
+ * the file still surfaces as UNKNOWN_POSITION and halts opening.
  */
 final class BookLedger {
 
@@ -61,11 +55,7 @@ final class BookLedger {
         }
     }
 
-    /**
-     * Seeds an empty book from the ledger file and the exchange's current positions.
-     *
-     * @return how many positions were seeded with a stop id on record
-     */
+    /** Seeds an empty book from the ledger file plus live positions; returns how many got a stop id. */
     static int seed(ExposureBook book, List<PositionSnapshot> exchange, Path path) {
         if (!Files.exists(path)) return 0;
         JSONObject root;

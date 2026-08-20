@@ -10,13 +10,10 @@ import java.util.Base64;
 import java.util.Optional;
 
 /**
- * Client order ids derived purely from {@code (signalId, purpose, index)}, so a retry reproduces the
- * same id and the exchange rejects the duplicate ({@code -4116}) instead of opening a second
- * position. Nothing that varies between attempts may enter the hash — no timestamp, no random
- * suffix, no attempt counter.
- *
- * <p>Format {@code bt-<purpose letter><index>-<22 chars of base64url(sha-256)>}, inside Binance's
- * {@code ^[\.A-Z\:/a-z0-9_-]{1,36}$}.
+ * Client order ids derived purely from {@code (signalId, purpose, index)} — nothing that varies
+ * between attempts may enter the hash — so a retry reproduces the same id and the exchange rejects
+ * the duplicate ({@code -4116}) instead of opening a second position. Format
+ * {@code bt-<letter><index>-<22 base64url chars>}, inside {@code ^[\.A-Z\:/a-z0-9_-]{1,36}$}.
  */
 public final class ClientOrderIdFactory {
 
@@ -26,12 +23,8 @@ public final class ClientOrderIdFactory {
     private ClientOrderIdFactory() {}
 
     /**
-     * 22 base64url characters is 132 bits of digest, so distinct signals do not collide inside
-     * Binance's 36-character limit. Determinism is pinned by
-     * {@code IdempotentResubmitTest.clientOrderIdsAreDeterministic} and {@code reExecutingAPlanIsSafe}.
-     *
-     * @param purpose an entry and its stop must not share an id
-     * @param index   distinguishes several orders of the same purpose, e.g. take-profit legs
+     * 22 base64url characters is 132 bits, so distinct signals do not collide inside Binance's
+     * 36-character limit; {@code index} separates orders of one purpose (take-profit legs).
      */
     public static String create(String signalId, OrderPurpose purpose, int index) {
         Preconditions.notBlank(signalId, "signalId");
@@ -50,11 +43,9 @@ public final class ClientOrderIdFactory {
     }
 
     /**
-     * The purpose an id was minted for, read back from its letter. The adapter needs this to route a
-     * query or a cancel: conditional orders live on a different endpoint with a separate id space,
-     * and asking the wrong one returns "no such order" rather than an error.
-     *
-     * @return empty for an id this factory did not produce
+     * The purpose an id was minted for, read back from its letter; the adapter routes queries and
+     * cancels on it, since conditional orders have a separate id space that answers "no such order"
+     * rather than an error for the rest. Empty for a foreign id.
      */
     public static Optional<OrderPurpose> purposeOf(String clientOrderId) {
         if (clientOrderId == null || !clientOrderId.startsWith(PREFIX) || clientOrderId.length() <= PREFIX.length()) {

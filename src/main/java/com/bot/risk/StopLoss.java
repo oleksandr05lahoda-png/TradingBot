@@ -6,10 +6,9 @@ import com.bot.core.Side;
 import java.util.OptionalDouble;
 
 /**
- * A stop price together with where it came from. {@link TradePlan} takes one and has no overload
- * without it, and every implementation validates its own geometry, so a position without a stop
- * cannot be constructed. Two origins only: {@link Structural}, preferred, from the signal, and
- * {@link AtrFallback}, used only when no structural level came.
+ * A stop price and where it came from. {@link TradePlan} has no overload without one and every
+ * implementation validates its own geometry, so a position without a stop cannot be constructed.
+ * {@link Structural} (from the signal) is preferred; {@link AtrFallback} only when none came.
  */
 public sealed interface StopLoss permits StopLoss.Structural, StopLoss.AtrFallback {
 
@@ -31,7 +30,6 @@ public sealed interface StopLoss permits StopLoss.Structural, StopLoss.AtrFallba
         return distance() / entryPrice();
     }
 
-    /** A level supplied by the signal. */
     static StopLoss structural(Side side, double entryPrice, double stopPrice) {
         return new Structural(side, entryPrice, stopPrice);
     }
@@ -42,11 +40,8 @@ public sealed interface StopLoss permits StopLoss.Structural, StopLoss.AtrFallba
     }
 
     /**
-     * The structural level if the signal supplied one, otherwise the ATR fallback. A structural level
-     * on the wrong side of entry throws rather than falling back — that is a broken signal producer,
-     * not a stop to be repaired.
-     *
-     * @throws IllegalArgumentException if neither a structural level nor an ATR value is present
+     * The structural level if the signal supplied one, else the ATR fallback, else throws. A level on
+     * the wrong side of entry throws rather than falling back — that is a broken signal producer.
      */
     static StopLoss resolve(Side side,
                             double entryPrice,
@@ -95,8 +90,7 @@ public sealed interface StopLoss permits StopLoss.Structural, StopLoss.AtrFallba
             Preconditions.require(side.isValidStopGeometry(entryPrice, price),
                     "ATR fallback stop " + price + " is on the wrong side of entry " + entryPrice
                             + " for a " + side + " position");
-            // The canonical constructor is reachable directly, so the stored price is re-derived
-            // rather than trusted: an "ATR stop" that is not the ATR distance would mislead the log.
+            // Canonical ctor is reachable directly, so re-derive: a mislabelled "ATR stop" misleads the log.
             double expected = computePrice(side, entryPrice, atr, multiplier);
             Preconditions.require(Math.abs(price - expected) <= 1e-9 * Math.max(1.0, expected),
                     "ATR fallback price " + price + " does not match the ATR distance " + expected);

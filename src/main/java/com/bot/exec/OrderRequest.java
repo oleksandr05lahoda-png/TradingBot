@@ -15,11 +15,6 @@ import java.util.regex.Pattern;
  * An order whose {@link OrderPurpose#isClosing()} is true must carry {@code reduceOnly} or
  * {@code closePosition} (mutually exclusive at Binance): without either, a close that races an
  * already-triggered stop opens a fresh position in the opposite direction.
- *
- * @param quantity      base units; must be {@code null} exactly when {@code closePosition} is true
- * @param price         limit price; required for {@link OrderType#LIMIT}, null otherwise
- * @param stopPrice     trigger price; required for the conditional types, null otherwise
- * @param closePosition Binance's close-all flag, inherently reduce-only
  */
 public record OrderRequest(
         String symbol,
@@ -92,8 +87,6 @@ public record OrderRequest(
         return reduceOnly || closePosition;
     }
 
-    // ─── Builders for the four shapes this system actually sends ─────────────────────────────
-
     public static OrderRequest marketEntry(String symbol, OrderSide side, BigDecimal quantity, String clientOrderId) {
         return new OrderRequest(symbol, side, OrderType.MARKET, quantity, null, null,
                 false, false, null, null, clientOrderId, OrderPurpose.ENTRY);
@@ -105,10 +98,7 @@ public record OrderRequest(
                 false, false, tif, null, clientOrderId, OrderPurpose.ENTRY);
     }
 
-    /**
-     * The protective stop, as {@code closePosition=true}: it stays correct after a take-profit leg
-     * has shrunk the position, where a fixed-quantity stop would protect a size that no longer exists.
-     */
+    /** {@code closePosition=true} so it stays correct after a take-profit leg shrinks the position. */
     public static OrderRequest protectiveStop(String symbol, OrderSide closingSide,
                                               BigDecimal stopPrice, String clientOrderId) {
         return new OrderRequest(symbol, closingSide, OrderType.STOP_MARKET, null, null, stopPrice,

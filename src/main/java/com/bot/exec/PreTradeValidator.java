@@ -9,9 +9,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Checks an order against the symbol's filters before it is sent, so a stop is never rejected for
- * {@code -1111 BAD_PRECISION} while the position it protects is already open. The reduce-only rule
- * is re-checked here as well as in {@link OrderRequest}: this is the one gate every order passes.
+ * Checks an order against the symbol's filters before sending, so a stop is never rejected for
+ * {@code -1111 BAD_PRECISION} while the position it protects is already open. The one gate every
+ * order passes, hence the reduce-only re-check that {@link OrderRequest} also makes.
  */
 public final class PreTradeValidator {
 
@@ -27,10 +27,7 @@ public final class PreTradeValidator {
         public String describe() { return String.join("; ", violations); }
     }
 
-    /**
-     * @param referencePrice price used for the minimum-notional check on orders that carry no price
-     *                       of their own (a MARKET entry); typically the intended entry
-     */
+    /** @param referencePrice for the min-notional check on an order carrying no price of its own */
     public static Result validate(OrderRequest order, InstrumentFilters filters, BigDecimal referencePrice) {
         Preconditions.notNull(order, "order");
         Preconditions.notNull(filters, "filters");

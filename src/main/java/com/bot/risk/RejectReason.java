@@ -1,7 +1,7 @@
 package com.bot.risk;
 
 /**
- * Why a trade was refused. Enumerated rather than free text so refusals can be counted — a gate that
+ * Why a trade was refused. Enumerated, not free text, so refusals can be counted — a gate that
  * rejects everything for one reason is a bug, and invisible if every refusal is a string.
  */
 public enum RejectReason {
@@ -14,7 +14,6 @@ public enum RejectReason {
     /** Above the configured ceiling, which cannot itself exceed {@link RiskConstants#MAX_LEVERAGE}. */
     LEVERAGE_ABOVE_MAX,
 
-    /** Requested leverage is above what the exchange itself permits at this notional. */
     LEVERAGE_ABOVE_EXCHANGE_BRACKET,
 
     /** No structural stop and no ATR: nothing to size from, so nothing to trade. */
@@ -34,7 +33,6 @@ public enum RejectReason {
 
     SHORT_EXPOSURE_CAP,
 
-    /** Size after every ceiling is below the exchange's minimum lot. */
     BELOW_MIN_QUANTITY,
 
     BELOW_MIN_NOTIONAL,

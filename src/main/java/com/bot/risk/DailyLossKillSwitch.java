@@ -9,16 +9,14 @@ import java.util.logging.Logger;
 
 /**
  * The daily loss limit, latched: once crossed, trading stops until the next UTC day rather than
- * resuming on a friendlier mark tick. Effective day PnL is {@code realised + min(0, unrealised)},
- * so an open loser tightens the gate but an open winner cannot offset a realised loss. State is
- * seeded from the exchange at start-up ({@link #seedRealizedPnl}), never from a local file, so a
- * restart mid-drawdown cannot clear the day's loss.
+ * resuming on a friendlier mark tick. Effective PnL is {@code realised + min(0, unrealised)}, so an
+ * open loser tightens the gate but an open winner cannot offset a realised loss. Seeded from the
+ * exchange at start-up, never a local file, so a restart mid-drawdown cannot clear the day's loss.
  */
 public final class DailyLossKillSwitch {
 
     private static final Logger LOG = Logger.getLogger(DailyLossKillSwitch.class.getName());
 
-    /** {@code effectivePnl = realizedPnl + min(0, openUnrealizedPnl)}, as a share of dayStartBalance. */
     public record Status(
             boolean tripped,
             String reason,
@@ -71,11 +69,7 @@ public final class DailyLossKillSwitch {
         this.openUnrealizedPnl = pnlUsd;
     }
 
-    /**
-     * Trips the latch by hand — an operator hook. Production drift goes through
-     * {@code exec.TradingHalt}, which an operator must clear; THIS latch self-clears at the UTC
-     * day rollover, and confusing the two would make a drift halt look like it expires overnight.
-     */
+    /** Operator hook. Unlike {@code exec.TradingHalt} (drift, operator-cleared) this self-clears at UTC rollover. */
     public synchronized void trip(String why, Instant now) {
         rolloverIfNewDay(now, 0);
         if (!tripped) {

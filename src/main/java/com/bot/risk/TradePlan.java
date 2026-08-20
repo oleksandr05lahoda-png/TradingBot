@@ -8,11 +8,11 @@ import java.math.BigDecimal;
 import java.util.List;
 
 /**
- * An approved trade: direction, size, the exact prices that will be sent, and the stop the size was
- * derived from. The only constructor is package-private and reachable from {@link RiskEngine} alone,
- * so a plan without a stop is not a state the execution layer has to defend against. It carries both
- * the source {@link StopLoss} and {@link #stopPrice()}, the tick-aligned price actually sent; they
- * can differ by a tick, and every risk number here comes from the price that will be sent.
+ * An approved trade: direction, size, the exact prices that will be sent, and the stop the size came
+ * from. The only constructor is package-private and reachable from {@link RiskEngine} alone, so a
+ * plan without a stop is not a state execution must defend against. The source {@link StopLoss} and
+ * the tick-aligned {@link #stopPrice()} can differ by a tick; every risk number here comes from the
+ * price that will be sent.
  */
 public final class TradePlan {
 
@@ -104,7 +104,6 @@ public final class TradePlan {
     public String signalId() { return signalId; }
     public String symbol() { return symbol; }
     public Side side() { return side; }
-    /** Tick-aligned entry; all risk numbers in this plan are computed against it. */
     public BigDecimal entryPrice() { return entryPrice; }
     public BigDecimal stopPrice() { return stopPrice; }
     /** The source stop, structural or ATR fallback. */
@@ -113,7 +112,6 @@ public final class TradePlan {
     public int leverage() { return leverage; }
     public double notionalUsd() { return notionalUsd; }
     public double initialMarginUsd() { return initialMarginUsd; }
-    /** Money between entry and stop for this exact size. */
     public double riskUsd() { return riskUsd; }
     public double riskFractionOfBalance() { return riskFractionOfBalance; }
     /** 0.0 means liquidation is not reachable above zero (only possible for a long at low leverage). */

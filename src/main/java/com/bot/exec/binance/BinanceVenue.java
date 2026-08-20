@@ -8,19 +8,10 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * The only place in the bot's sources where a Binance base URL exists — demo or production.
- * The read-only scanner tool under {@code tools/scanner} also names the live host, for market
- * data and account reads; it places no orders. {@code VenueContainmentTest} scans Java, Python
- * and PowerShell alike and fails the build if a production host appears anywhere else.
- *
- * <p>The demo venue is the default and needs no configuration. The production venue is reachable
- * through exactly one gate, {@link #resolve(Map)}: {@code REAL_TRADING} must be the exact string
- * {@code ARMED} and the real credentials must be present under their own names. Every deviation —
- * a typo in the flag, missing keys, keys under the testnet names — refuses to start rather than
- * silently picking a venue. Missing configuration can therefore never select the real exchange,
- * and mis-configuration can never trade at all.
- *
- * <p>The older {@code testnet.binancefuture.com} redirects, and a redirect breaks signed requests.
+ * The only place in the bot's sources holding a Binance base URL ({@code VenueContainmentTest} fails
+ * the build if a production host appears elsewhere; the read-only {@code tools/scanner} is the one
+ * exception). Demo is the default; production only through {@link #resolve(Map)}. The older
+ * {@code testnet.binancefuture.com} redirects, and a redirect breaks signed requests.
  */
 public final class BinanceVenue {
 
@@ -68,17 +59,9 @@ public final class BinanceVenue {
     }
 
     /**
-     * The single gate to the production venue. Fail-closed on every edge:
-     * <ul>
-     *   <li>{@code REAL_TRADING} unset or blank → demo, exactly as before this class existed;</li>
-     *   <li>{@code REAL_TRADING=ARMED} (exact after trimming surrounding whitespace,
-     *       case-sensitive) → real, requiring
-     *       {@code BINANCE_REAL_API_KEY}/{@code BINANCE_REAL_API_SECRET};</li>
-     *   <li>any other value → refuse to start: the operator reached for the switch and missed,
-     *       and a missed switch must never quietly fall back to either venue;</li>
-     *   <li>{@code REAL_MODE}: unset or {@code observe} → OBSERVE; {@code trade} → TRADE;
-     *       anything else → refuse to start.</li>
-     * </ul>
+     * The single gate to the production venue, fail-closed on every edge: unset {@code REAL_TRADING}
+     * → demo; exactly {@code ARMED} (case-sensitive) plus real credentials → real; anything else
+     * refuses to start, because a missed switch must never quietly fall back to either venue.
      */
     public static BinanceVenue resolve(Map<String, String> env) {
         Preconditions.notNull(env, "env");
@@ -123,21 +106,15 @@ public final class BinanceVenue {
     /** Meaningful only when {@link #isReal()}; demo is always TRADE. */
     public RealMode realMode() { return realMode; }
 
-    /** Environment variable holding this venue's API key. */
     public String keyEnv() { return keyEnv; }
 
-    /** Environment variable holding this venue's API secret. */
     public String secretEnv() { return secretEnv; }
 
-    /** Host of {@link #restBaseUrl()}, for logs and boot banners. */
     public String restHost() {
         return URI.create(restBaseUrl).getHost();
     }
 
-    /**
-     * Throws unless {@code url} points at one of THIS venue's hosts. Called on every request the
-     * adapter builds, so a request built for the wrong venue dies before it leaves the process.
-     */
+    /** Throws unless {@code url} is one of THIS venue's hosts; a wrong-venue request dies in-process. */
     public URI require(String url) {
         Preconditions.notBlank(url, "url");
         URI uri = URI.create(url);

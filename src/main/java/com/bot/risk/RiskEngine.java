@@ -13,10 +13,8 @@ import java.util.OptionalDouble;
 import java.util.logging.Logger;
 
 /**
- * The gate: every position passes through {@link #evaluate}, and nothing that fails it can be built
- * downstream because {@link TradePlan} has no public constructor. Balance, filters, brackets and time
- * are arguments — no I/O, no clock — so a refusal is reproducible from its log line. Ceilings (step 8)
- * only ever reduce the sizing (step 7) derived from the stop.
+ * The gate: nothing that fails {@link #evaluate} is buildable downstream, since {@link TradePlan}
+ * has no public constructor. No I/O, no clock; step 8's ceilings only reduce step 7's sizing.
  */
 public final class RiskEngine {
 
@@ -49,14 +47,14 @@ public final class RiskEngine {
         Preconditions.notNull(request, "request");
         Preconditions.notNull(now, "now");
 
-        // 1 ─ Fail-closed inputs: an unreadable balance is not zero, and NaN is not a small number.
+        // 1 ─ Fail closed: an unreadable balance is not zero, and NaN is not a small number.
         if (!Double.isFinite(balanceUsd) || balanceUsd <= 0) {
             return RiskDecision.reject(RejectReason.INVALID_INPUT,
                     "balance is not a usable number: " + balanceUsd
                             + " — refusing rather than assuming a value");
         }
 
-        // 2 ─ Kill switch. Latched for the rest of the UTC day once the daily loss limit is crossed.
+        // 2 ─ Kill switch, latched for the rest of the UTC day once the daily loss limit is crossed.
         killSwitch.observeBalance(balanceUsd, now);
         DailyLossKillSwitch.Status halt = killSwitch.evaluate(now);
         if (halt.tripped()) {
@@ -80,7 +78,7 @@ public final class RiskEngine {
                     book.openCount() + " open, limit is " + config.maxConcurrentPositions());
         }
 
-        // 5 ─ The stop. Structural if the signal carried one, ATR otherwise, refusal if neither.
+        // 5 ─ The stop: structural, else ATR, else refuse.
         StopLoss stop;
         try {
             stop = StopLoss.resolve(request.side(), request.entryPrice(),
@@ -92,8 +90,7 @@ public final class RiskEngine {
                     e.getMessage());
         }
 
-        // 6 ─ Tick alignment, then re-check the geometry: entry moves to a tick no worse than
-        //     requested, the stop moves towards entry, so realised risk can only shrink.
+        // 6 ─ Tick alignment moves entry and stop towards each other, so realised risk only shrinks.
         InstrumentFilters filters = request.filters();
         BigDecimal entryTick;
         BigDecimal stopTick;
@@ -120,10 +117,8 @@ public final class RiskEngine {
                             + " — the stop distance is smaller than one tick");
         }
 
-        // 7 ─ Size from the stop, scaled by the vol-targeting overlay (Moreira-Muir): when realized
-        //     vol runs above the target, the risk fraction shrinks by min(1, target/realized) BEFORE
-        //     sizing, so every downstream number — budget, ceilings, margin — sees the reduced risk.
-        //     With no vol data the multiplier is exactly 1.0 and this step is the pre-overlay bot.
+        // 7 ─ Size from the stop. The overlay cuts the risk fraction BEFORE sizing, so every ceiling
+        //     and margin number below sees the reduced figure.
         double volMultiplier = VolTargetOverlay.multiplier(
                 config.targetDailyVolFraction(), realizedVolOrEmpty(request.symbol()));
         double effectiveRiskFraction = config.riskFractionPerTrade() * volMultiplier;
@@ -152,7 +147,6 @@ public final class RiskEngine {
         double cappedQty = idealNotional <= notionalCap ? idealQty : notionalCap / entry;
         String sizingNote = describeBinding(idealNotional, perTradeCap, sideHeadroom, marginCap, lotCap, request.side());
         if (volMultiplier < 1.0) {
-            // Recorded so a smaller-than-usual position is explainable from its log line alone.
             sizingNote += String.format("; vol overlay x%.3f (realized vol above the %.1f%% daily target)"
                             + " cut the risk fraction to %.3f%%",
                     volMultiplier, config.targetDailyVolFraction() * 100, effectiveRiskFraction * 100);
@@ -162,7 +156,7 @@ public final class RiskEngine {
         BigDecimal quantity = filters.quantizeQuantityDown(cappedQty);
         if (quantity.signum() <= 0 || !filters.isQuantityInRange(quantity, true)) {
             BigDecimal smallest = filters.smallestTradableQuantity(entry);
-            // The effective (overlay-scaled) fraction, so the advice matches the sizing that failed.
+            // Effective (overlay-scaled) fraction, so the advice matches the sizing that failed.
             double balanceNeeded = smallest.doubleValue() * Math.abs(entry - stopPrice)
                     / effectiveRiskFraction;
             return RiskDecision.reject(RejectReason.BELOW_MIN_QUANTITY,
@@ -205,7 +199,7 @@ public final class RiskEngine {
                             initialMarginUsd, config.maxMarginUtilizationFraction() * 100, balanceUsd));
         }
 
-        // 11 ─ The liquidation buffer. The one check that can refuse a trade whose sizing is perfect.
+        // 11 ─ Liquidation buffer: the one check that refuses a trade whose sizing is perfect.
         LiquidationSafety.Buffer buffer;
         try {
             buffer = LiquidationSafety.evaluateForPosition(request.side(), entry, stopPrice, qty,
@@ -246,12 +240,8 @@ public final class RiskEngine {
     }
 
     /**
-     * Takes the <b>filled</b> quantity and average fill price, never the plan's intended numbers:
-     * a partial fill is a different position from the approved one.
-     *
-     * @param protectiveStopId client order id of the stop already resting on the exchange. Required,
-     *                         not optional: a filled position is only ever booked here after its stop
-     *                         is placed, and reconciliation later asks the exchange about it by name.
+     * Takes the <b>filled</b> quantity and price, not the plan's intended numbers — a partial fill is
+     * a different position. {@code protectiveStopId} is required: reconciliation asks for it by name.
      */
     public void registerFill(TradePlan plan, BigDecimal filledQuantity, double averageFillPrice,
                              String protectiveStopId) {
@@ -269,20 +259,14 @@ public final class RiskEngine {
                 Optional.of(protectiveStopId)));
     }
 
-    /**
-     * Books no realised PnL: that comes from the exchange income ledger via
-     * {@link DailyLossKillSwitch#seedRealizedPnl}, and doing both would count it twice.
-     */
+    /** Books no realised PnL: {@link DailyLossKillSwitch#seedRealizedPnl} does, and both double-counts. */
     public void registerClose(String symbol) {
         book.close(symbol);
     }
 
     /**
-     * A throwing volatility source is treated exactly like one that answered "I do not know". The
-     * overlay is advisory: it may only ever shrink an already-budgeted size, so a broken feed must
-     * degrade the bot to its pre-overlay behaviour — it must never grow into a new reason to refuse
-     * a trade or crash the gate. A null return is the same contract violation as a throw and gets
-     * the same treatment; without this line it would surface later as an NPE inside the gate.
+     * A throwing or null-returning source is treated as "I do not know": a broken feed must degrade
+     * to pre-overlay behaviour, never become a new reason to refuse a trade or an NPE in the gate.
      */
     private OptionalDouble realizedVolOrEmpty(String symbol) {
         try {
