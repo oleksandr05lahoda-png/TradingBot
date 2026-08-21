@@ -128,12 +128,22 @@ if ((Test-Path $botLog) -and (Get-Item $botLog).Length -gt 0) {
 # and a compile error must surface here, before anything touches the exchange.
 # Start-Process instead of `& gradlew 2>&1`: under ErrorActionPreference=Stop, PS 5.1
 # throws on any native stderr line, which killed this script's own failure diagnostics.
+# --no-daemon on purpose: a stale or cold Gradle daemon hung this step twice on 21.08,
+# leaving the operator staring at "building..." with no bot and no error. A fresh JVM is
+# a few seconds slower and always finishes. The timeout is the backstop: an unbounded
+# wait here is indistinguishable from a crash, and it blocks the trading start.
 Say "building..."
 $buildOut = Join-Path $dir 'build.out.log'
 $buildErr = Join-Path $dir 'build.err.log'
 $build = Start-Process -FilePath (Join-Path $root 'gradlew.bat') -WorkingDirectory $root `
-    -ArgumentList '-q', 'classes', '--console=plain' -WindowStyle Hidden -Wait -PassThru `
+    -ArgumentList '-q', '--no-daemon', 'classes', '--console=plain' -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput $buildOut -RedirectStandardError $buildErr
+if (-not $build.WaitForExit(300000)) {
+    Say "BUILD TIMED OUT after 5 minutes - killing it, nothing was started." 'Red'
+    try { $build.Kill() } catch {}
+    Say "Run it again; if it times out twice, the Gradle cache is wedged." 'Red'
+    exit 1
+}
 if ($build.ExitCode -ne 0) {
     Say "BUILD FAILED - nothing was started. Last compiler lines:" 'Red'
     Get-Content $buildErr -Tail 12 -ErrorAction SilentlyContinue | ForEach-Object { Say ("  " + $_) 'Red' }
