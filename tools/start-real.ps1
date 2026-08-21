@@ -138,6 +138,9 @@ $buildErr = Join-Path $dir 'build.err.log'
 $build = Start-Process -FilePath (Join-Path $root 'gradlew.bat') -WorkingDirectory $root `
     -ArgumentList '-q', '--no-daemon', 'classes', '--console=plain' -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput $buildOut -RedirectStandardError $buildErr
+# Touching .Handle caches it; without that PS 5.1 leaves .ExitCode null on a
+# -PassThru process, null -ne 0 is true, and a SUCCESSFUL build reports as failed.
+$null = $build.Handle
 if (-not $build.WaitForExit(300000)) {
     Say "BUILD TIMED OUT after 5 minutes - killing it, nothing was started." 'Red'
     try { $build.Kill() } catch {}
