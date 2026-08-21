@@ -113,11 +113,21 @@ def signed_get(path, env):
 
 
 def read_env(repo):
+    """Real environment first, local.env second. A container has no local.env - the
+    secrets arrive as environment variables - and hard-reading the file there is a
+    hard stop before the first scan."""
     env = {}
-    for ln in io.open(os.path.join(repo, "local.env"), encoding="utf-8", errors="ignore"):
-        ln = ln.strip()
-        if "=" in ln and not ln.startswith("#"):
-            k, v = ln.split("=", 1)
+    path = os.path.join(repo, "local.env")
+    if os.path.exists(path):
+        for ln in io.open(path, encoding="utf-8", errors="ignore"):
+            ln = ln.strip()
+            if "=" in ln and not ln.startswith("#"):
+                k, v = ln.split("=", 1)
+                env[k] = v.strip()
+    for k in ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
+              "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET"):
+        v = os.environ.get(k)
+        if v:
             env[k] = v.strip()
     return env
 

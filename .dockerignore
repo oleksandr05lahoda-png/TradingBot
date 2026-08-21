@@ -1,0 +1,12 @@
+# Secrets must never enter an image layer.
+local.env
+local.env.*
+
+.git
+.gradle
+build
+analysis
+archive
+sql
+tools/scanner/__pycache__
+*.md
