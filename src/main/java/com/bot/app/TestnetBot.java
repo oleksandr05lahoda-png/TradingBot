@@ -5,6 +5,7 @@ import com.bot.exec.AlertSink;
 import com.bot.exec.DeadMansSwitch;
 import com.bot.exec.ExchangePort;
 import com.bot.exec.ExchangeSnapshots.AccountSnapshot;
+import com.bot.exec.ExchangeSnapshots.PositionSnapshot;
 import com.bot.exec.ExecutionCoordinator;
 import com.bot.exec.IdempotentOrderPlacer;
 import com.bot.exec.Reconciler;
@@ -116,9 +117,16 @@ public final class TestnetBot {
             // measured with an invalid key on 20.08.
             boolean bootstrapped;
             try {
-                int seeded = BookLedger.seed(engine.book(), port.openPositions(), ledgerPath);
+                List<PositionSnapshot> live = port.openPositions();
+                int seeded = BookLedger.seed(engine.book(), live, ledgerPath);
                 if (seeded > 0) {
                     LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
+                }
+                // The file is not the only record on a venue that lists conditional orders: without
+                // this a fresh container halted on positions whose stops the exchange could name.
+                int adopted = BookLedger.adopt(engine.book(), port, live);
+                if (adopted > 0) {
+                    LOG.info("[Boot] adopted " + adopted + " position(s) with stops read from the exchange");
                 }
                 bootstrapped = reconciler.bootstrap(Instant.now());
             } catch (RuntimeException e) {
@@ -152,6 +160,7 @@ public final class TestnetBot {
             long lastReconcileMs = System.currentTimeMillis();
             long lastHeartbeatMs = System.currentTimeMillis();
             int sourceFailures = 0;
+            boolean bookAgreesWithExchange = bootstrapped;
 
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
@@ -183,8 +192,12 @@ public final class TestnetBot {
                     Thread.sleep(Math.min(30_000L, 1_000L * sourceFailures));
                 }
 
-                // The snapshot is what lets the NEXT process confirm stops by name.
-                BookLedger.save(engine.book(), ledgerPath, lastLedgerBody);
+                // The snapshot is what lets the NEXT process confirm stops by name — but only a book
+                // the exchange has agreed with may overwrite it. A boot that failed to adopt holds an
+                // empty book, and writing that erased the very record that could clear the halt.
+                if (bookAgreesWithExchange) {
+                    BookLedger.save(engine.book(), ledgerPath, lastLedgerBody);
+                }
 
                 long nowMs = System.currentTimeMillis();
                 // Housekeeping never kills the loop: a dead bot cannot close the position it holds.
@@ -199,7 +212,9 @@ public final class TestnetBot {
                 }
                 if (nowMs - lastReconcileMs >= RECONCILE_INTERVAL_MS) {
                     try {
-                        reconciler.reconcile(Instant.now());
+                        // One agreed pass earns the right to persist; drift after that is realigned
+                        // against the exchange, so the book stays truthful rather than going blank.
+                        bookAgreesWithExchange |= reconciler.reconcile(Instant.now()).converged();
                     } catch (RuntimeException e) {
                         LOG.severe("[Loop] reconciliation failed: " + e.getMessage()
                                 + " — halting; local state can no longer be trusted");
