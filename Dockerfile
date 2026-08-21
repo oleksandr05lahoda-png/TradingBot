@@ -20,10 +20,10 @@ COPY tools/scanner/autoscan.py /app/scanner/autoscan.py
 COPY tools/docker-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Everything that must survive a restart lives here; Railway mounts a volume on it.
-# Without persistence the stop-id ledger is lost, reconciliation reports every open
-# position as unknown, and the bot boots halted and never recovers.
+# Everything that must survive a restart lives here. The mount itself is declared in
+# Railway (a VOLUME instruction is rejected by its builder), so this is only the path
+# both processes agree on. Without persistence the stop-id ledger is lost,
+# reconciliation reports every open position as unknown, and the bot boots halted.
 ENV DATA_DIR=/app/data
-VOLUME /app/data
 
 ENTRYPOINT ["/app/entrypoint.sh"]
