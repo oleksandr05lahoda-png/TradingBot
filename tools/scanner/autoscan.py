@@ -126,7 +126,8 @@ def read_env(repo):
                 env[k] = v.strip()
     for k in ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
               "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
-              "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE"):
+              "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE",
+              "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
@@ -357,15 +358,30 @@ def main():
     gate = args.regime_gate or env.get("REGIME_GATE", "off").lower()
     if gate not in ("off", "cash"):
         gate = "off"
+
+    # The selector switches measured 22.08 (lab_selector_hypotheses_measured). All OFF unless the
+    # operator sets them; the scanner keeps shadow-logging what they would do either way.
+    #   ENTRY_NEAR_HIGH=0.05  enter only within 5% of the 20d high
+    #   ENTRY_VOL_MULT=1.5    and only on a day whose quote volume is >= 1.5x the prior-20d mean
+    #   MAX_HOLD_HOURS=48     close a position the scanner opened once it is this old
+    def _float_env(name):
+        v = env.get(name, "").strip()
+        try:
+            return float(v) if v else None
+        except ValueError:
+            return None
+    near_high_max = _float_env("ENTRY_NEAR_HIGH")
+    vol_mult_min = _float_env("ENTRY_VOL_MULT")
+    max_hold_hours = _float_env("MAX_HOLD_HOURS")
     if not env.get(KEY_ENV[0]) or not env.get(SECRET_ENV[0]):
         raise SystemExit("missing %s/%s in local.env for --venue %s"
                          % (KEY_ENV[0], SECRET_ENV[0], args.venue))
     state = load_state(statepath)
     log("autoscan start: venue=%s top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
-        "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s"
+        "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s near_high=%s vol_mult=%s max_hold=%s"
         % (args.venue, args.top, args.by_cap, args.lookback, args.dip_depth * 100,
            args.entry_band * 100, args.exit_band * 100, args.interval,
-           args.max_positions, args.min_hold_hours, gate), logpath)
+           args.max_positions, args.min_hold_hours, gate, near_high_max, vol_mult_min, max_hold_hours), logpath)
 
     while True:
         try:
@@ -391,9 +407,12 @@ def main():
                 time.sleep(min(args.interval, 300))
                 continue
 
+            reasons = {}
             try:
                 rows = signed_get("/fapi/v2/positionRisk", env)
                 held = {r["symbol"] for r in rows if float(r["positionAmt"]) != 0}
+                held_since = {r["symbol"]: float(r.get("updateTime", 0)) / 1000.0
+                              for r in rows if float(r["positionAmt"]) != 0 and r.get("updateTime")}
             except Exception as e:
                 # str(e) matters: an IP-whitelist rejection or a revoked key looks identical to
                 # a network blip by type name alone, and only the detail tells the operator
@@ -481,7 +500,15 @@ def main():
                 # must stay hold-eligible, this filter must never force a close.
                 if m["ret"] > args.entry_band or m["dip"]:
                     if m["price"] > STOP_ATR_MULT * m["atr"]:
-                        entry_ok.add(sym)
+                        passes = True
+                        if near_high_max is not None and m["ret"] > args.entry_band and not m["dip"]:
+                            fh = m.get("from_high")
+                            passes = fh is not None and fh <= near_high_max
+                        if passes and vol_mult_min is not None and m["ret"] > args.entry_band and not m["dip"]:
+                            vr = m.get("vol_ratio")
+                            passes = vr is not None and vr >= vol_mult_min
+                        if passes:
+                            entry_ok.add(sym)
                 if m["ret"] > -args.exit_band or m["dip"]:
                     hold_ok.add(sym)
 
@@ -494,6 +521,17 @@ def main():
                 if now - entered.get(s, 0) < args.min_hold_hours * 3600:
                     continue           # the exchange-side stop still guards it meanwhile
                 to_close.append(s)
+            if max_hold_hours is not None:
+                # Measured 22.08: a near-high entry held at most ~2 days kept 49% winners and cut
+                # the drawdown in half; the same cap without the near-high entry was worse than
+                # the base rule, so the switch is meant to travel with ENTRY_NEAR_HIGH.
+                for s in sorted(held):
+                    if s in to_close:
+                        continue
+                    since = entered.get(s) or held_since.get(s)
+                    if since and now - since >= max_hold_hours * 3600:
+                        to_close.append(s)
+                        reasons[s] = "max-hold"
             room = max(0, args.max_positions - (len(held) - len(to_close)))
             # Strongest trend first. The old sorted() here took the first N ALPHABETICALLY,
             # which filled every book with 1000*/A* coins - the highest-beta names by
@@ -545,8 +583,8 @@ def main():
                     for s in to_close:
                         # an explicit id keeps a crash-replay idempotent without colliding
                         # with a close of the same symbol from an earlier scan
-                        f.write("CLOSE %s id=auto-close-%s-%s reason=trend-exited\n"
-                                % (s, s, stamp))
+                        f.write("CLOSE %s id=auto-close-%s-%s reason=%s\n"
+                                % (s, s, stamp, reasons.get(s, "trend-exited")))
                         cooldown[s] = now
                         entered.pop(s, None)
                     for s in to_open:
