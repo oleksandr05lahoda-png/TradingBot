@@ -345,7 +345,12 @@ def main():
                     continue           # the exchange-side stop still guards it meanwhile
                 to_close.append(s)
             room = max(0, args.max_positions - (len(held) - len(to_close)))
-            fresh = [s for s in sorted(entry_ok - held)
+            # Strongest trend first. The old sorted() here took the first N ALPHABETICALLY,
+            # which filled every book with 1000*/A* coins - the highest-beta names by
+            # accident. Measured 2024-26 as a 10-slot portfolio: alphabet -3.0% (worse than
+            # random +5%), momentum-first +21% with a smaller drawdown, better in 5 of 5
+            # half-years. This removes a handicap; it does not create an edge.
+            fresh = [s for s in sorted(entry_ok - held, key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
             to_open = fresh[:room]
 
