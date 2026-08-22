@@ -268,8 +268,14 @@ def evaluate(sym, lookback, dip_depth, live_price):
     # Shadow-forward inputs for the two entry filters measured 22.08 (brain_study2): distance
     # below the 20d high, and today's quote volume against the prior 20 days' mean. Reported,
     # never acted on, until the forward log earns them a place.
+    # Today's bar is partial when the scanner runs mid-day; compare its volume PROJECTED to a
+    # full day (volume so far / fraction of the UTC day elapsed, floored at 10%) against the
+    # prior-20d mean. The history measurement used full days; without this the live filter
+    # would be far stricter at 08:00 UTC than at 23:00 and pass almost nothing in the morning.
     prior = [float(b[7]) for b in bars[-21:-1]]
-    vol_ratio = (float(bars[-1][7]) / (sum(prior) / len(prior))) if prior and sum(prior) > 0 else None
+    elapsed = max(0.10, min(1.0, (time.time() * 1000 - float(bars[-1][0])) / 86_400_000.0))
+    projected = float(bars[-1][7]) / elapsed
+    vol_ratio = (projected / (sum(prior) / len(prior))) if prior and sum(prior) > 0 else None
     return {"ret": ret, "dip": dip, "price": price, "atr": a,
             "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio}
 
