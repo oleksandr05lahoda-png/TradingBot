@@ -264,7 +264,13 @@ def evaluate(sym, lookback, dip_depth, live_price):
     lo5 = min(float(b[3]) for b in bars[-5:])
     dip = (hi20 > 0 and lo5 > 0
            and price <= hi20 * (1 - dip_depth) and price >= lo5 * 1.03)
-    return {"ret": ret, "dip": dip, "price": price, "atr": a}
+    # Shadow-forward inputs for the two entry filters measured 22.08 (brain_study2): distance
+    # below the 20d high, and today's quote volume against the prior 20 days' mean. Reported,
+    # never acted on, until the forward log earns them a place.
+    prior = [float(b[7]) for b in bars[-21:-1]]
+    vol_ratio = (float(bars[-1][7]) / (sum(prior) / len(prior))) if prior and sum(prior) > 0 else None
+    return {"ret": ret, "dip": dip, "price": price, "atr": a,
+            "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio}
 
 
 def load_state(path):
@@ -507,6 +513,19 @@ def main():
                         % (len(infeasible), risk_usd, ",".join(infeasible[:12])), logpath)
                 fresh = [sym for sym in fresh if sym not in set(infeasible)]
             to_open = fresh[:room]
+            if to_open:
+                def near_high(sym):
+                    fh = details[sym].get("from_high")
+                    return fh is not None and fh <= 0.05
+                def on_volume(sym):
+                    vr = details[sym].get("vol_ratio")
+                    return vr is not None and vr >= 1.5
+                kept_nh = [x for x in to_open if near_high(x)]
+                kept_nv = [x for x in to_open if near_high(x) and on_volume(x)]
+                log("shadow filters on %d entry(ies): near-high would keep %d (%s); "
+                    "near-high+volume would keep %d (%s)"
+                    % (len(to_open), len(kept_nh), ",".join(kept_nh) or "-",
+                       len(kept_nv), ",".join(kept_nv) or "-"), logpath)
             if regime == "BEAR" and to_open:
                 if gate == "cash":
                     log("regime BEAR, gate cash: suppressing %d entry(ies) (%s)"
