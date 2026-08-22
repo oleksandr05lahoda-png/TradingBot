@@ -125,17 +125,44 @@ def read_env(repo):
                 k, v = ln.split("=", 1)
                 env[k] = v.strip()
     for k in ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
-              "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET"):
+              "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
+              "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
     return env
 
 
+def notify(env, text, logpath):
+    """One Telegram line, plain text, never raised. The scanner had no voice at all: every
+    failure burned an hour in a file nobody reads (audit 22.08). Used only on state changes -
+    a streak starting, a streak ending, a regime flip - never per scan."""
+    token, chat = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    try:
+        body = urllib.parse.urlencode({"chat_id": chat, "text": "[scanner] " + text}).encode()
+        req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % token, data=body)
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        log("telegram notify failed: %r" % (e,), logpath)
+
+
+def btc_regime(lookback, live):
+    """BULL when BTC's trailing return over the lookback is >= 0, BEAR below. Measured 2024-26:
+    the long rule earns +0.69%/day with t=1.10 in BULL and -0.46%/day in BEAR; staying out of
+    BEAR was the cheapest of three machines (lab_regime_switch_measured). The scanner only
+    REPORTS the regime unless REGIME_GATE=cash; the bot never sees this flag."""
+    m = evaluate("BTCUSDT", lookback, 0.10, live.get("BTCUSDT", 0.0))
+    if not m:
+        return None, None
+    return ("BULL" if m["ret"] >= 0 else "BEAR"), m["ret"]
+
+
 def universe(top, min_volume, by_cap):
     info = get("/fapi/v1/exchangeInfo", {}, gap=0.5)
     if not info:
-        return []
+        return [], "none"
     tradable = {s["symbol"] for s in info["symbols"]
                 if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
                 and s.get("status") == "TRADING" and s.get("underlyingType") == "COIN"}
@@ -153,13 +180,23 @@ def universe(top, min_volume, by_cap):
     if not by_cap:
         out = [(s, vol.get(s, 0.0)) for s in tradable if vol.get(s, 0.0) >= min_volume]
         out.sort(key=lambda x: -x[1])
-        return out[:top]
-    try:
-        req = urllib.request.Request(CG_MARKETS, headers={"User-Agent": "autoscan/1.0"})
-        with urllib.request.urlopen(req, timeout=45) as r:
-            cg = json.loads(r.read().decode("utf-8"))
-    except Exception:
-        return []
+        return out[:top], "volume"
+    cg = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(CG_MARKETS, headers={"User-Agent": "autoscan/1.0"})
+            with urllib.request.urlopen(req, timeout=45) as r:
+                cg = json.loads(r.read().decode("utf-8"))
+            break
+        except Exception:
+            time.sleep(5 * (attempt + 1))
+    if not cg:
+        # The free CoinGecko tier throttles datacenter IPs; one refusal used to skip the whole
+        # hour, exits included. Rank by volume instead and say so - a slightly different list
+        # beats no list.
+        out = [(s, vol.get(s, 0.0)) for s in tradable if vol.get(s, 0.0) >= min_volume]
+        out.sort(key=lambda x: -x[1])
+        return out[:top], "volume-fallback"
     out, seen = [], set()
     for c in cg:
         sym = (c.get("symbol") or "").upper()
@@ -172,7 +209,7 @@ def universe(top, min_volume, by_cap):
                 break
         if len(out) >= top:
             break
-    return out
+    return out, "cap"
 
 
 def atr(bars, period):
@@ -273,6 +310,10 @@ def main():
     ap.add_argument("--venue", choices=("demo", "real"), default="demo",
                     help="which exchange the RUNNING BOT executes on; signed calls, the key "
                          "names and the tradability filter follow it")
+    ap.add_argument("--regime-gate", choices=("off", "cash"), default=None,
+                    help="off: report the BTC regime and what a gate WOULD do (shadow forward); "
+                         "cash: open nothing while BTC's 30d return is negative. Default from "
+                         "REGIME_GATE in the environment, else off")
     ap.add_argument("--workdir", default=None,
                     help="where this scanner's log and state live (default: analysis/forward); "
                          "a demo and a real scanner must never share state")
@@ -287,15 +328,18 @@ def main():
     logpath = os.path.join(workdir, "autoscan.log")
     statepath = os.path.join(workdir, "autoscan_state.json")
     env = read_env(args.repo)
+    gate = args.regime_gate or env.get("REGIME_GATE", "off").lower()
+    if gate not in ("off", "cash"):
+        gate = "off"
     if not env.get(KEY_ENV[0]) or not env.get(SECRET_ENV[0]):
         raise SystemExit("missing %s/%s in local.env for --venue %s"
                          % (KEY_ENV[0], SECRET_ENV[0], args.venue))
     state = load_state(statepath)
     log("autoscan start: venue=%s top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
-        "interval=%ds max_pos=%d min_hold=%.0fh"
+        "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s"
         % (args.venue, args.top, args.by_cap, args.lookback, args.dip_depth * 100,
            args.entry_band * 100, args.exit_band * 100, args.interval,
-           args.max_positions, args.min_hold_hours), logpath)
+           args.max_positions, args.min_hold_hours, gate), logpath)
 
     while True:
         try:
@@ -304,8 +348,16 @@ def main():
                 # while opening nothing back. Stand down completely and say so, loudly.
                 log("BOT IS HALTED — standing down; no closes, no opens, book frozen under its "
                     "stops until the operator restarts the bot", logpath)
+                if not state.get("told_halted"):
+                    notify(env, "bot is HALTED - standing down; the book is frozen under its "
+                                "stops until the operator clears the halt", logpath)
+                    state["told_halted"] = True
+                    save_state(statepath, state)
                 time.sleep(args.interval)
                 continue
+            if state.get("told_halted"):
+                state["told_halted"] = False
+                save_state(statepath, state)
             if not bot_is_ready(args.bot_log):
                 # Short sleep: the moment the bot adopts the account the next pass should feed it.
                 log("bot not ready (booting, or held by the exchange) - writing nothing this pass",
@@ -322,19 +374,54 @@ def main():
                 # which of the two ate the whole scan hour.
                 log("exchange unreachable (%s: %.160s); skipping this scan"
                     % (type(e).__name__, e), logpath)
+                if state.get("fail_streak", 0) == 0:
+                    notify(env, "exchange unreachable (%s: %.120s) - scans are being skipped "
+                                "until it answers; resting stops still protect the book"
+                           % (type(e).__name__, e), logpath)
+                state["fail_streak"] = state.get("fail_streak", 0) + 1
+                save_state(statepath, state)
                 time.sleep(args.interval)
                 continue
+            if state.get("fail_streak", 0) > 0:
+                notify(env, "exchange is answering again after %d skipped scan(s)"
+                       % state["fail_streak"], logpath)
+                state["fail_streak"] = 0
+                save_state(statepath, state)
 
-            pool = universe(args.top, args.min_volume, args.by_cap)
+            pool, pool_source = universe(args.top, args.min_volume, args.by_cap)
             if not pool:
                 log("universe empty; skipping", logpath)
+                notify(env, "universe empty - even the volume fallback returned nothing; "
+                            "this scan is skipped", logpath)
                 time.sleep(args.interval)
                 continue
+            if pool_source == "volume-fallback" and state.get("pool_source") != "volume-fallback":
+                log("CoinGecko unavailable - ranking by volume this scan", logpath)
+            state["pool_source"] = pool_source
             tick = get("/fapi/v1/ticker/price", {}, gap=0.5) or []
             live = {t["symbol"]: float(t["price"]) for t in tick}
 
+            # The regime is reported every scan and announced on a flip. Under the default
+            # gate ("off") it changes nothing - the log records what a cash gate WOULD have
+            # suppressed, which is the paper forward of that gate, for free.
+            regime, btc_ret = btc_regime(args.lookback, live)
+            if regime and regime != state.get("regime"):
+                msg = ("BTC regime is now %s (30d %+.1f%%)%s" % (regime, (btc_ret or 0) * 100,
+                       "" if state.get("regime") is None else " - was " + state["regime"]))
+                if regime == "BEAR":
+                    msg += (". Gate %s: %s" % (gate, "no new entries while it lasts"
+                            if gate == "cash" else "observing only, entries continue"))
+                log(msg, logpath)
+                notify(env, msg, logpath)
+                state["regime"] = regime
+                save_state(statepath, state)
+
             entry_ok, hold_ok, details = set(), set(), {}
-            for sym, _ in pool:
+            # A held coin that drops out of the top list must still be judged by the rule,
+            # never by list membership: to_close = held - hold_ok, so leaving it unevaluated
+            # would close it for falling off CoinGecko's page.
+            to_evaluate = [sym for sym, _ in pool] + sorted(held - {sym for sym, _ in pool})
+            for sym in to_evaluate:
                 m = evaluate(sym, args.lookback, args.dip_depth, live.get(sym, 0.0))
                 if not m:
                     continue
@@ -370,6 +457,14 @@ def main():
             fresh = [s for s in sorted(entry_ok - held, key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
             to_open = fresh[:room]
+            if regime == "BEAR" and to_open:
+                if gate == "cash":
+                    log("regime BEAR, gate cash: suppressing %d entry(ies) (%s)"
+                        % (len(to_open), ",".join(to_open)), logpath)
+                    to_open = []
+                else:
+                    log("regime BEAR, gate off: a cash gate would have suppressed %d entry(ies) (%s)"
+                        % (len(to_open), ",".join(to_open)), logpath)
 
             if not to_close and not to_open:
                 log("scan: %d held, %d hold-ok, %d entry-ok, nothing to do"
@@ -397,6 +492,17 @@ def main():
                        len(to_open), ",".join(to_open) or "-"), logpath)
         except Exception as e:
             log("scan error %r; continuing" % (e,), logpath)
+            if not state.get("error_streak"):
+                notify(env, "scan error %.160r - continuing next hour" % (e,), logpath)
+            state["error_streak"] = state.get("error_streak", 0) + 1
+            try:
+                save_state(statepath, state)
+            except Exception:
+                pass
+        else:
+            if state.get("error_streak"):
+                state["error_streak"] = 0
+                save_state(statepath, state)
         time.sleep(args.interval)
 
 
