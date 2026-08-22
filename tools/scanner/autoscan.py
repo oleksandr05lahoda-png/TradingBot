@@ -126,7 +126,7 @@ def read_env(repo):
                 env[k] = v.strip()
     for k in ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
               "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
-              "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE"):
+              "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
@@ -159,13 +159,29 @@ def btc_regime(lookback, live):
     return ("BULL" if m["ret"] >= 0 else "BEAR"), m["ret"]
 
 
-def universe(top, min_volume, by_cap):
+MIN_NOTIONAL = {}    # symbol -> exchange minimum notional in USDT, refreshed with the universe
+
+
+def universe(top, min_volume, by_cap, cached_cap=None):
+    """Returns (pool, source). Source 'cap' is the live CoinGecko list; 'cap-cached' is the last
+    good one when CoinGecko refuses; 'none' when neither exists. There is deliberately no
+    volume fallback for a cap universe: top-100 by volume is where the pumps live, and on
+    22.08 06:52 that list plus momentum ranking nominated BTW/AKE/ACE/BOME/MUBARAK/PUMP/HEMI -
+    all refused by the risk core, none of them anything the owner would hold."""
     info = get("/fapi/v1/exchangeInfo", {}, gap=0.5)
     if not info:
         return [], "none"
     tradable = {s["symbol"] for s in info["symbols"]
                 if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
                 and s.get("status") == "TRADING" and s.get("underlyingType") == "COIN"}
+    for s in info["symbols"]:
+        if s["symbol"] in tradable:
+            for f in s.get("filters", []):
+                if f.get("filterType") == "MIN_NOTIONAL":
+                    try:
+                        MIN_NOTIONAL[s["symbol"]] = float(f.get("notional", 5))
+                    except (TypeError, ValueError):
+                        pass
     # When the bot executes on the demo exchange, which lists a smaller universe than
     # the live one, a candidate absent there is refused every scan and wastes an open
     # slot. On the real venue the live list IS the tradable list, so no intersection.
@@ -191,12 +207,13 @@ def universe(top, min_volume, by_cap):
         except Exception:
             time.sleep(5 * (attempt + 1))
     if not cg:
-        # The free CoinGecko tier throttles datacenter IPs; one refusal used to skip the whole
-        # hour, exits included. Rank by volume instead and say so - a slightly different list
-        # beats no list.
-        out = [(s, vol.get(s, 0.0)) for s in tradable if vol.get(s, 0.0) >= min_volume]
-        out.sort(key=lambda x: -x[1])
-        return out[:top], "volume-fallback"
+        # The free CoinGecko tier throttles datacenter IPs. The last good cap list is the
+        # right stand-in: same coins, an hour or a day stale. With no cache at all there is
+        # no pool - exits are still managed, nothing new is proposed.
+        if cached_cap:
+            out = [(s, vol.get(s, 0.0)) for s in cached_cap if s in tradable]
+            return out[:top], "cap-cached"
+        return [], "none"
     out, seen = [], set()
     for c in cg:
         sym = (c.get("symbol") or "").upper()
@@ -391,16 +408,36 @@ def main():
                 state["fail_streak"] = 0
                 save_state(statepath, state)
 
-            pool, pool_source = universe(args.top, args.min_volume, args.by_cap)
+            pool, pool_source = universe(args.top, args.min_volume, args.by_cap,
+                                         cached_cap=state.get("cap_pool"))
             if not pool:
-                log("universe empty; skipping", logpath)
-                notify(env, "universe empty - even the volume fallback returned nothing; "
+                log("universe empty (no CoinGecko answer and no cached list); skipping", logpath)
+                notify(env, "universe empty - no CoinGecko answer and no cached top-100 yet; "
                             "this scan is skipped", logpath)
                 time.sleep(args.interval)
                 continue
-            if pool_source == "volume-fallback" and state.get("pool_source") != "volume-fallback":
-                log("CoinGecko unavailable - ranking by volume this scan", logpath)
+            if pool_source == "cap":
+                state["cap_pool"] = [sym for sym, _ in pool]
+                state["cap_pool_at"] = time.time()
+            elif pool_source == "cap-cached" and state.get("pool_source") != "cap-cached":
+                age_h = (time.time() - state.get("cap_pool_at", time.time())) / 3600
+                log("CoinGecko unavailable - using the cached top-100 (%.0fh old)" % age_h, logpath)
             state["pool_source"] = pool_source
+            save_state(statepath, state)
+
+            # What this account can actually size: risk = balance x fraction, notional = risk /
+            # stop distance, and the exchange refuses anything under its minimum. Nominating
+            # the infeasible burns the room - seven refused lines at 06:54 while feasible coins
+            # further down the ranking went unproposed. Best effort: a failed balance read
+            # simply turns the filter off and the risk core refuses as before.
+            risk_usd = None
+            try:
+                bal = signed_get("/fapi/v2/balance", env)
+                usdt = next((float(b["balance"]) for b in bal if b.get("asset") == "USDT"), None)
+                if usdt:
+                    risk_usd = usdt * float(env.get("RISK_PER_TRADE", "0.005"))
+            except Exception as e:
+                log("balance unreadable (%s) - feasibility filter off this pass" % type(e).__name__, logpath)
             tick = get("/fapi/v1/ticker/price", {}, gap=0.5) or []
             live = {t["symbol"]: float(t["price"]) for t in tick}
 
@@ -459,6 +496,16 @@ def main():
             # half-years. This removes a handicap; it does not create an edge.
             fresh = [s for s in sorted(entry_ok - held, key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
+            if risk_usd:
+                def feasible(sym):
+                    m = details[sym]
+                    stop_frac = STOP_ATR_MULT * m["atr"] / m["price"]
+                    return stop_frac > 0 and risk_usd / stop_frac >= MIN_NOTIONAL.get(sym, 5.0)
+                infeasible = [sym for sym in fresh if not feasible(sym)]
+                if infeasible:
+                    log("%d candidate(s) too wide to size at this equity (risk $%.2f vs min notional): %s"
+                        % (len(infeasible), risk_usd, ",".join(infeasible[:12])), logpath)
+                fresh = [sym for sym in fresh if sym not in set(infeasible)]
             to_open = fresh[:room]
             if regime == "BEAR" and to_open:
                 if gate == "cash":
