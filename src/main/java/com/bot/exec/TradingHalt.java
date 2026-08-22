@@ -36,11 +36,16 @@ public final class TradingHalt {
         return s == null ? Optional.empty() : Optional.of(s.reason());
     }
 
-    /** Explicit operator reset. Deliberately not called from anywhere else in this codebase. */
+    /**
+     * Explicit operator reset — the Telegram {@code /resume} command is its only caller. The
+     * "HALT CLEARED at" wording is read by the scanner, which otherwise stands down on the
+     * "HALTED at" line for the rest of the process's life.
+     */
     public void clear() {
         State previous = state.getAndSet(null);
         if (previous != null) {
-            LOG.warning("[TradingHalt] cleared by operator; previous halt was: " + previous.reason());
+            LOG.warning("[TradingHalt] HALT CLEARED at " + Instant.now()
+                    + " by operator; previous halt was: " + previous.reason());
         }
     }
 }

@@ -277,12 +277,15 @@ def bot_is_ready(bot_log):
 
 
 def bot_is_halted(bot_log):
-    """The halt latch clears only with an operator restart, which starts a new log file."""
+    """Halted while the last halt line in the bot's log is newer than the last clear. The
+    operator can lift a halt over Telegram (/resume) without a restart, and the scanner must
+    follow that within one pass rather than stand down for the rest of the process's life."""
     try:
         with io.open(bot_log, "r", encoding="utf-8", errors="ignore") as f:
-            return "HALTED at" in f.read()
+            text = f.read()
     except OSError:
         return False
+    return text.rfind("HALTED at") > text.rfind("HALT CLEARED at")
 
 
 def main():

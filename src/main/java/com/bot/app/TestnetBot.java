@@ -108,9 +108,15 @@ public final class TestnetBot {
                             + " min. The bot waits it out and then boots normally.");
         }
 
+        // The operator's hands: /status, /halt, /resume over the alert chat. Null when Telegram
+        // is not configured, and nothing here can open a position.
+        OperatorChannel operator = OperatorChannel.fromEnvironmentOrNull(halt);
+
         // `closedOnExit` only releases the port on the way out; components are wired to `port`.
         try (ExchangePort closedOnExit = port;
-             SignalSource signals = openSource(sourceName, scriptPath, defaultLeverage)) {
+             SignalSource signals = openSource(sourceName, scriptPath, defaultLeverage);
+             AutoCloseable operatorChannel = operator == null ? () -> { } : operator) {
+            if (operator != null) operator.start();
 
             IdempotentOrderPlacer placer = new IdempotentOrderPlacer(port);
             ExecutionCoordinator coordinator = new ExecutionCoordinator(port, engine, placer, halt, alerts,
@@ -225,6 +231,9 @@ public final class TestnetBot {
                     lastHeartbeatMs = nowMs;
                 }
                 if (nowMs - lastReconcileMs >= RECONCILE_INTERVAL_MS) {
+                    if (operator != null) {
+                        operator.publishStatus(statusLine(venue, engine, halt, port), Instant.now());
+                    }
                     try {
                         // Any completed pass earns the right to persist — reconcile realigns the book
                         // to the exchange before returning, so what follows is truthful even when the
@@ -242,6 +251,25 @@ public final class TestnetBot {
                 Thread.sleep(250);
             }
         }
+    }
+
+    /** One line the operator can read on a phone; built on the loop thread from the loop's own state. */
+    private static String statusLine(BinanceVenue venue, RiskEngine engine, TradingHalt halt, ExchangePort port) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(venue.isReal() ? "REAL " + venue.realMode() : "DEMO").append(" | ");
+        List<ExposureBook.OpenPosition> open = engine.book().all();
+        sb.append(open.size()).append(" position(s)");
+        for (ExposureBook.OpenPosition p : open) {
+            sb.append("\n  ").append(p.symbol()).append(' ').append(p.side())
+                    .append(" qty ").append(p.quantity().stripTrailingZeros().toPlainString())
+                    .append(" risk $").append(String.format(java.util.Locale.ROOT, "%.2f", p.riskUsd()))
+                    .append(p.protectiveStopId().isPresent() ? " stop ok" : " NO STOP ID");
+        }
+        sb.append("\nhalt: ").append(halt.isHalted() ? halt.reason().orElse("yes") : "none");
+        long held = port.heldByExchangeForMillis();
+        if (held > 0) sb.append("\nexchange hold: ").append(held / 60_000).append(" min left");
+        sb.append("\nkill switch: ").append(engine.killSwitch().isTripped(Instant.now()) ? "TRIPPED" : "armed");
+        return sb.toString();
     }
 
     private static void handleClose(CloseRequest close, ExecutionCoordinator coordinator,
