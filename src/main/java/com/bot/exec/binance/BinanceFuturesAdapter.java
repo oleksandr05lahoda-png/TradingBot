@@ -404,6 +404,10 @@ public final class BinanceFuturesAdapter implements ExchangePort {
 
     @Override public boolean canListConditionalOrders() { return conditionalListingAvailable; }
 
+    @Override public long heldByExchangeForMillis() { return rateLimiter.heldForMillis(); }
+
+    @Override public void onExchangeHold(java.util.function.LongConsumer listener) { rateLimiter.onHold(listener); }
+
     @Override public void cancelOrder(String symbol, String clientOrderId) {
         boolean algo = isAlgoId(clientOrderId);
         Map<String, String> params = new LinkedHashMap<>();

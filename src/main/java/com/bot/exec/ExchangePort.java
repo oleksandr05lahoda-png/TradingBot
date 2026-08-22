@@ -68,5 +68,11 @@ public interface ExchangePort extends AutoCloseable {
      */
     void armDeadMansSwitch(String symbol, long countdownMillis);
 
+    /** Milliseconds the venue has told this process to stay silent (a 429/418 hold); 0 when free. */
+    default long heldByExchangeForMillis() { return 0L; }
+
+    /** Hears the length of any hold long enough to count as an incident. No-op by default. */
+    default void onExchangeHold(java.util.function.LongConsumer listener) { }
+
     @Override void close();
 }

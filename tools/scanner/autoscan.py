@@ -228,6 +228,17 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
+def bot_is_ready(bot_log):
+    """True once the bot has adopted the account (its first agreed reconcile). Before that it
+    may still be booting or sitting out an exchange-side hold, and a line written now would be
+    executed at stale prices whenever it finally reads the book (22.08: a 6h IP ban at boot)."""
+    try:
+        with io.open(bot_log, "r", encoding="utf-8", errors="replace") as f:
+            return "adopted from the exchange" in f.read()
+    except OSError:
+        return False
+
+
 def bot_is_halted(bot_log):
     """The halt latch clears only with an operator restart, which starts a new log file."""
     try:
@@ -294,6 +305,12 @@ def main():
                 log("BOT IS HALTED — standing down; no closes, no opens, book frozen under its "
                     "stops until the operator restarts the bot", logpath)
                 time.sleep(args.interval)
+                continue
+            if not bot_is_ready(args.bot_log):
+                # Short sleep: the moment the bot adopts the account the next pass should feed it.
+                log("bot not ready (booting, or held by the exchange) - writing nothing this pass",
+                    logpath)
+                time.sleep(min(args.interval, 300))
                 continue
 
             try:

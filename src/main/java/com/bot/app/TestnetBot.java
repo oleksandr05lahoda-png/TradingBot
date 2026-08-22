@@ -94,6 +94,20 @@ public final class TestnetBot {
             return;
         }
 
+        // A long hold is an incident the operator must hear about: positions stay under their
+        // exchange-side stops, but the bot is blind and opens nothing until it lifts. Railway's
+        // egress IPs are shared, so another tenant's traffic can earn this bot the ban (22.08).
+        port.onExchangeHold(ms -> alerts.critical("Exchange is refusing this IP",
+                "Binance answered 429/418 - all requests held for " + (ms / 60_000) + " min. "
+                        + "Open positions stay protected by their resting stops; nothing will be "
+                        + "opened or closed by the bot until the hold ends, then it resumes by itself."));
+        long heldAtBoot = port.heldByExchangeForMillis();
+        if (heldAtBoot > 0) {
+            alerts.critical("Exchange is refusing this IP",
+                    "the first request after boot was refused - held for " + (heldAtBoot / 60_000)
+                            + " min. The bot waits it out and then boots normally.");
+        }
+
         // `closedOnExit` only releases the port on the way out; components are wired to `port`.
         try (ExchangePort closedOnExit = port;
              SignalSource signals = openSource(sourceName, scriptPath, defaultLeverage)) {

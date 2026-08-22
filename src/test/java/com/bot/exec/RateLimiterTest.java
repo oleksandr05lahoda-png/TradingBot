@@ -15,6 +15,31 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RateLimiterTest {
 
+    @Test
+    @DisplayName("a long exchange hold reaches the listener once; a short 429 throttle does not")
+    void longHoldIsAnIncidentShortThrottleIsNot() {
+        FakeTime time = new FakeTime();
+        RateLimiter limiter = new RateLimiter(100, 10, 50, time.nowMs::get, time.sleeper());
+        java.util.List<Long> heard = new java.util.ArrayList<>();
+        limiter.onHold(heard::add);
+
+        limiter.observeBan(30_000L);                       // a 429 with Retry-After 30s
+        assertTrue(heard.isEmpty(), "a throttle is routine, not an incident");
+        assertEquals(30_000L, limiter.heldForMillis());
+
+        limiter.observeBan(21_947_000L);                   // the 418 of 22.08: ~6h
+        assertEquals(1, heard.size());
+        assertEquals(21_947_000L, heard.get(0));
+        assertEquals(21_947_000L, limiter.heldForMillis());
+
+        limiter.observeBan(10_000L);                       // a shorter one must not shrink or re-page
+        assertEquals(1, heard.size());
+        assertEquals(21_947_000L, limiter.heldForMillis());
+
+        time.nowMs.addAndGet(21_947_000L);
+        assertEquals(0L, limiter.heldForMillis(), "free to send once the hold has lapsed");
+    }
+
     /** A clock the test advances by hand; sleeping simply moves it forward. */
     private static final class FakeTime {
         final AtomicLong nowMs = new AtomicLong(1_000_000);

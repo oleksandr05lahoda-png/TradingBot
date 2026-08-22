@@ -100,18 +100,48 @@ public final class RateLimiter {
         this.exchangeReportedAtMs = nowMs.getAsLong();
     }
 
+    /** A hold at least this long is an incident, not a throttle: the operator is told. */
+    static final long HOLD_ALERT_THRESHOLD_MS = 5 * 60_000L;
+
+    private volatile java.util.function.LongConsumer holdListener;
+
+    /** Called with the hold length when the exchange imposes one of {@link #HOLD_ALERT_THRESHOLD_MS} or more. */
+    public void onHold(java.util.function.LongConsumer listener) {
+        this.holdListener = listener;
+    }
+
     /** Records a {@code 429}/{@code 418}; everything stops until it expires — retries turn a 429 into a 418. */
-    public synchronized void observeBan(long retryAfterMillis) {
-        long until = nowMs.getAsLong() + Math.max(1_000L, retryAfterMillis);
-        if (until > bannedUntilMs) {
-            bannedUntilMs = until;
-            LOG.warning("[RateLimiter] rate limited by the exchange — holding all requests for "
-                    + (retryAfterMillis / 1000) + "s");
+    public void observeBan(long retryAfterMillis) {
+        boolean longer;
+        synchronized (this) {
+            long until = nowMs.getAsLong() + Math.max(1_000L, retryAfterMillis);
+            longer = until > bannedUntilMs;
+            if (longer) {
+                bannedUntilMs = until;
+                LOG.warning("[RateLimiter] rate limited by the exchange — holding all requests for "
+                        + (retryAfterMillis / 1000) + "s");
+            }
+        }
+        // Outside the monitor: the listener sends a Telegram message, and a blocked monitor would
+        // stall every thread waiting to send. A 6-hour IP ban at boot (22.08) was a WARNING in a
+        // log nobody was reading; the operator found out from the exchange, not from the bot.
+        java.util.function.LongConsumer l = holdListener;
+        if (longer && l != null && retryAfterMillis >= HOLD_ALERT_THRESHOLD_MS) {
+            try {
+                l.accept(retryAfterMillis);
+            } catch (RuntimeException e) {
+                LOG.warning("[RateLimiter] hold listener failed: " + e.getMessage());
+            }
         }
     }
 
     public synchronized boolean isBanned() {
         return nowMs.getAsLong() < bannedUntilMs;
+    }
+
+    /** Milliseconds the exchange has told us to stay silent; 0 when free to send. */
+    public synchronized long heldForMillis() {
+        return Math.max(0L, bannedUntilMs - nowMs.getAsLong());
     }
 
     /** Weight used in the trailing minute: the larger of the local tally and the exchange's. */
