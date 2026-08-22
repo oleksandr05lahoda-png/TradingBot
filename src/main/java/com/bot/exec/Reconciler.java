@@ -199,11 +199,20 @@ public final class Reconciler {
                 Optional<OrderStatus> protectiveStop = working.stream()
                         .filter(o -> o.type() == OrderType.STOP_MARKET && (o.reduceOnly() || o.closePosition()))
                         .findFirst();
-                if (protectiveStop.isEmpty() && !port.canListConditionalOrders()) {
-                    protectiveStop = confirmStopByName(symbol, localBySymbol.get(symbol), drifts, stillTriggered);
-                } else if (protectiveStop.isEmpty()) {
-                    drifts.add(new Drift(Drift.Kind.POSITION_WITHOUT_STOP, symbol,
-                            "an open position has no working reduce-only stop on the exchange"));
+                if (protectiveStop.isEmpty()) {
+                    ExposureBook.OpenPosition local = localBySymbol.get(symbol);
+                    boolean recorded = local != null && local.protectiveStopId().isPresent();
+                    if (!port.canListConditionalOrders() || recorded) {
+                        // The listing is the normal proof. When it shows nothing but an id is on
+                        // record, one look by name comes before the alarm: positions are read at
+                        // the top of the pass and orders seconds later, so a stop that fires in
+                        // between looks exactly like a naked position - on the most volatile
+                        // minute of the day, when a false emergency costs the most trust.
+                        protectiveStop = confirmStopByName(symbol, local, drifts, stillTriggered);
+                    } else {
+                        drifts.add(new Drift(Drift.Kind.POSITION_WITHOUT_STOP, symbol,
+                                "an open position has no working reduce-only stop on the exchange"));
+                    }
                 }
                 protectiveStop.ifPresent(stop -> checkLiquidationBuffer(symbol, exchangePositions, stop, drifts));
             } else {

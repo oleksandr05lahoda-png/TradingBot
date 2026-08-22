@@ -250,6 +250,42 @@ class ReconciliationDriftTest {
     }
 
     @Test
+    @DisplayName("on a listing venue, a stop the listing missed but the name confirms is not an emergency")
+    void listingLagIsCheckedByNameBeforeAlarming() throws Exception {
+        // The race of 22.08's audit: positions read first, orders seconds later, and the stop
+        // is momentarily absent from the listing while still answering by name.
+        DelegatingExchange lagging = new DelegatingExchange() {
+            @Override public java.util.List<ExchangeSnapshots.OrderStatus> openOrders(String symbol) {
+                return delegate.openOrders(symbol).stream()
+                        .filter(o -> o.type() != OrderTypes.OrderType.STOP_MARKET).toList();
+            }
+        };
+        TradePlan plan = ExecFixtures.approvedPlan(engine, lagging.delegate.fetchFilters("BTCUSDT"));
+        ExecFixtures.coordinator(lagging.delegate, engine, halt, alerts).execute(plan);
+        Reconciler viaLagging = new Reconciler(lagging, engine, halt, alerts,
+                new IdempotentOrderPlacer(lagging, 1, 1, 0, ExecFixtures.NO_SLEEP));
+
+        Reconciler.Report report = viaLagging.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.converged(), report.describe());
+        assertFalse(halt.isHalted(), "a stop that answers by name is protection, whatever the listing says");
+    }
+
+    @Test
+    @DisplayName("on a listing venue, a position with no recorded stop id and no listed stop is still naked")
+    void listingVenueWithoutAnyEvidenceStillAlarms() {
+        engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
+        exchange.plantPosition("BTCUSDT", "0.041", "64000");
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.drifts().stream().anyMatch(d -> d.kind() == Reconciler.Drift.Kind.POSITION_WITHOUT_STOP),
+                report.describe());
+        assertTrue(halt.isHalted());
+    }
+
+    @Test
     @DisplayName("a stop that has just triggered gets one pass of grace, then counts as naked")
     void triggeredStopIsGivenOnePassThenReported() throws Exception {
         TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));

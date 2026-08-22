@@ -39,7 +39,9 @@ fi
 export BOOK_LEDGER_PATH="${BOOK_LEDGER_PATH:-$DATA_DIR/book-ledger-real.json}"
 
 say "starting the risk core..."
-java -jar /app/bot.jar --source manual --script "$BOOK" 2>&1 | tee -a "$BOT_LOG" &
+# Process substitution, not a pipe: after `java | tee &`, $! is tee's PID, so TERM on shutdown
+# reached tee and the JVM was orphaned and killed hard - its shutdown hook never ran (22.08).
+java -jar /app/bot.jar --source manual --script "$BOOK" > >(tee -a "$BOT_LOG") 2>&1 &
 BOT_PID=$!
 
 # The scanner stands down when it sees a halt in the bot's log, so it must not start
