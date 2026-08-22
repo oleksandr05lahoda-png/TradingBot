@@ -38,9 +38,12 @@ public final class Reconciler {
         public enum Kind {
             /** The exchange holds a position the book does not know about. */
             UNKNOWN_POSITION,
-            /** The book holds a position the exchange says is flat. */
+            /** The book holds a position the exchange says is flat — how a stop-out or TP fill looks. */
             GHOST_POSITION,
+            /** The position shrank — a partial exit filled on the exchange; the stop still covers the rest. */
             QUANTITY_MISMATCH,
+            /** The position GREW without this bot's doing — something else is trading this symbol. */
+            POSITION_GREW,
             SIDE_MISMATCH,
             /** An open position with no working stop — what a crash between fill and stop leaves. */
             POSITION_WITHOUT_STOP,
@@ -50,9 +53,16 @@ public final class Reconciler {
             LIQUIDATION_BUFFER_BREACHED
         }
 
+        /**
+         * Critical means the account holds risk this process cannot vouch for; only that halts.
+         * A ghost, a shrink or an orphan is the normal wake of an exchange-side exit — realigned and
+         * announced, never halted on: the first live day proved that freezing after every take-profit
+         * turns a 24/7 machine into one that trades from boot to first winner.
+         */
         public boolean isCritical() {
             return kind == Kind.POSITION_WITHOUT_STOP || kind == Kind.SIDE_MISMATCH
-                    || kind == Kind.UNKNOWN_POSITION || kind == Kind.LIQUIDATION_BUFFER_BREACHED;
+                    || kind == Kind.UNKNOWN_POSITION || kind == Kind.POSITION_GREW
+                    || kind == Kind.LIQUIDATION_BUFFER_BREACHED;
         }
     }
 
@@ -63,6 +73,9 @@ public final class Reconciler {
         }
 
         public boolean converged() { return drifts.isEmpty(); }
+
+        /** True when nothing here calls for a halt — clean, or only exchange-side exits to absorb. */
+        public boolean healthy() { return drifts.stream().noneMatch(Drift::isCritical); }
 
         public String describe() {
             if (drifts.isEmpty()) return "converged";
@@ -137,8 +150,13 @@ public final class Reconciler {
                     drifts.add(new Drift(Drift.Kind.SIDE_MISMATCH, position.symbol(),
                             "book says " + local.side() + ", exchange says " + direction));
                 }
-                if (local.quantity().subtract(quantity).abs().compareTo(quantityTolerance) > 0) {
-                    drifts.add(new Drift(Drift.Kind.QUANTITY_MISMATCH, position.symbol(),
+                BigDecimal delta = quantity.subtract(local.quantity());
+                if (delta.abs().compareTo(quantityTolerance) > 0) {
+                    // Direction decides severity: shrinking is a partial exit the closePosition stop
+                    // still covers; growing means another actor holds risk under this bot's name.
+                    drifts.add(new Drift(
+                            delta.signum() > 0 ? Drift.Kind.POSITION_GREW : Drift.Kind.QUANTITY_MISMATCH,
+                            position.symbol(),
                             "book says " + local.quantity().toPlainString()
                                     + ", exchange says " + quantity.toPlainString()));
                 }
@@ -161,7 +179,7 @@ public final class Reconciler {
             if (!exchangeSymbols.contains(local.symbol())) {
                 drifts.add(new Drift(Drift.Kind.GHOST_POSITION, local.symbol(),
                         "the book holds " + local.side() + " " + local.quantity().toPlainString()
-                                + ", the exchange is flat — it closed without this process noticing"));
+                                + ", the exchange is flat — " + describeExit(local)));
             }
         }
 
@@ -219,16 +237,45 @@ public final class Reconciler {
         engine.killSwitch().observeBalance(Math.max(1e-9, account.equityUsd()), now);
 
         Report report = new Report(now, drifts, exchangePositions.size(), before.size());
-        if (!report.converged()) {
+        if (!report.healthy()) {
+            Drift first = drifts.stream().filter(Drift::isCritical).findFirst().orElseThrow();
             String summary = "reconciliation found " + drifts.size() + " disagreement(s):" + report.describe();
             LOG.severe("[Reconciler] " + summary);
             alerts.critical("Reconciliation drift", summary);
-            halt.halt("reconciliation drift: "
-                    + drifts.get(0).kind() + " on " + drifts.get(0).symbol(), now);
+            halt.halt("reconciliation drift: " + first.kind() + " on " + first.symbol(), now);
+        } else if (!report.converged()) {
+            // The exchange finished trades on its own — stops and takes doing their job. The book is
+            // realigned above; the operator hears about it, the machine keeps trading.
+            String summary = "the exchange closed or trimmed position(s) while this process watched:"
+                    + report.describe();
+            LOG.info("[Reconciler] " + summary);
+            alerts.warning("Exchange-side exit", summary);
         } else {
             LOG.fine("[Reconciler] converged: " + exchangePositions.size() + " position(s)");
         }
         return report;
+    }
+
+    /**
+     * Names what took the position out, so the exit alert reads as a fact instead of a mystery.
+     * Best-effort: the answer changes the wording, never the verdict.
+     */
+    private String describeExit(ExposureBook.OpenPosition local) {
+        Optional<String> stopId = local.protectiveStopId();
+        if (stopId.isEmpty()) return "it closed without this process noticing";
+        try {
+            Optional<OrderStatus> stop = port.queryOrder(local.symbol(), stopId.get());
+            if (stop.isPresent() && stop.get().state() == OrderState.FILLED) {
+                return "its protective stop " + stopId.get() + " filled";
+            }
+            if (stop.isPresent() && stop.get().isWorking()) {
+                return "closed past its still-resting stop (a take-profit fill or a manual close); "
+                        + "leftover orders will be swept as orphans";
+            }
+        } catch (RuntimeException e) {
+            LOG.fine("[Reconciler] could not name the exit on " + local.symbol() + ": " + e.getMessage());
+        }
+        return "it closed without this process noticing";
     }
 
     /**
@@ -316,10 +363,14 @@ public final class Reconciler {
         }
     }
 
-    /** Convenience for the boot path: reconcile and return whether it is safe to start trading. */
+    /**
+     * Convenience for the boot path: reconcile and return whether it is safe to start trading.
+     * Benign leftovers — a stop that fired while the process was down, orphan legs awaiting their
+     * sweep — do not fail a boot; only risk this process cannot vouch for does.
+     */
     public boolean bootstrap(Instant now) {
         Report report = reconcile(now);
-        if (report.converged()) {
+        if (report.healthy()) {
             LOG.info("[Reconciler] start-up state adopted from the exchange: "
                     + engine.book());
             return !halt.isHalted();

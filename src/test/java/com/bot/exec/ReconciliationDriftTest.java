@@ -62,7 +62,7 @@ class ReconciliationDriftTest {
     }
 
     @Test
-    @DisplayName("a position the book holds but the exchange has closed is drift")
+    @DisplayName("a stop-out is absorbed and announced, never halted on — 24/7 depends on this")
     void ghostPositionIsDrift() {
         engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
                 new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
@@ -71,7 +71,9 @@ class ReconciliationDriftTest {
 
         assertEquals(Reconciler.Drift.Kind.GHOST_POSITION, report.drifts().get(0).kind());
         assertEquals(0, engine.book().openCount(), "the book must follow the exchange, which is flat");
-        assertTrue(halt.isHalted());
+        assertFalse(halt.isHalted(),
+                "an exchange-side exit is the machine WORKING; halting on it froze the bot on 21.08");
+        assertFalse(report.healthy() && report.converged(), "the exit must still be reported");
     }
 
     @Test
@@ -89,18 +91,48 @@ class ReconciliationDriftTest {
     }
 
     @Test
-    @DisplayName("a size difference beyond tolerance is drift")
-    void quantityMismatchIsDrift() {
+    @DisplayName("a position that GREW behind the bot's back is critical: someone else is trading here")
+    void positionThatGrewHalts() {
         engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
                 new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
         exchange.plantPosition("BTCUSDT", "0.082", "64000");
 
         Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
 
-        assertTrue(report.drifts().stream().anyMatch(d -> d.kind() == Reconciler.Drift.Kind.QUANTITY_MISMATCH),
+        assertTrue(report.drifts().stream().anyMatch(d -> d.kind() == Reconciler.Drift.Kind.POSITION_GREW),
                 report.describe());
+        assertTrue(halt.isHalted(), "risk this process did not take must stop new entries");
         assertEquals(0, engine.book().get("BTCUSDT").orElseThrow().quantity()
                 .compareTo(new BigDecimal("0.082")));
+    }
+
+    @Test
+    @DisplayName("a position that shrank is a partial exit: realigned and announced, not halted on")
+    void partialExitDoesNotHalt() throws Exception {
+        // A properly protected position whose TP leg then fills half of it on the exchange.
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecFixtures.coordinator(exchange, engine, halt, alerts).execute(plan);
+        BigDecimal half = engine.book().get("BTCUSDT").orElseThrow()
+                .quantity().divide(new BigDecimal("2"));
+        exchange.plantPosition("BTCUSDT", half.toPlainString(), "64000");
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.drifts().stream().anyMatch(d -> d.kind() == Reconciler.Drift.Kind.QUANTITY_MISMATCH),
+                report.describe());
+        assertFalse(halt.isHalted(), "the closePosition stop still covers the remainder");
+        assertEquals(0, engine.book().get("BTCUSDT").orElseThrow().quantity().compareTo(half));
+    }
+
+    @Test
+    @DisplayName("a boot over a stop-out that happened while the process was down still starts")
+    void bootstrapSurvivesAnExchangeSideExit() {
+        engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
+        // Exchange is flat: the stop fired overnight. Boot must absorb this, not refuse to trade.
+        assertTrue(reconciler.bootstrap(ExecFixtures.NOON),
+                "a finished trade while the process was down is history, not danger");
+        assertFalse(halt.isHalted());
     }
 
     @Test

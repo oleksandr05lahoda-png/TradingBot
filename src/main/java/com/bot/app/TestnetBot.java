@@ -170,7 +170,7 @@ public final class TestnetBot {
                 try {
                     // Closes first, always: a halt must never be able to stop an unwind.
                     for (CloseRequest close : signals.pollCloses()) {
-                        handleClose(close, coordinator, signals);
+                        handleClose(close, coordinator, signals, alerts);
                     }
                     for (Signal signal : signals.poll()) {
                         handle(signal, engine, coordinator, port, signals, now);
@@ -212,9 +212,11 @@ public final class TestnetBot {
                 }
                 if (nowMs - lastReconcileMs >= RECONCILE_INTERVAL_MS) {
                     try {
-                        // One agreed pass earns the right to persist; drift after that is realigned
-                        // against the exchange, so the book stays truthful rather than going blank.
-                        bookAgreesWithExchange |= reconciler.reconcile(Instant.now()).converged();
+                        // Any completed pass earns the right to persist — reconcile realigns the book
+                        // to the exchange before returning, so what follows is truthful even when the
+                        // pass also found drift. Only a pass that THREW leaves the flag untouched.
+                        reconciler.reconcile(Instant.now());
+                        bookAgreesWithExchange = true;
                     } catch (RuntimeException e) {
                         LOG.severe("[Loop] reconciliation failed: " + e.getMessage()
                                 + " — halting; local state can no longer be trusted");
@@ -229,7 +231,7 @@ public final class TestnetBot {
     }
 
     private static void handleClose(CloseRequest close, ExecutionCoordinator coordinator,
-                                    SignalSource signals) throws Exception {
+                                    SignalSource signals, AlertSink alerts) throws Exception {
         LOG.info("[Loop] " + close);
         try {
             ExecutionCoordinator.CloseReport report = coordinator.closeOut(close.symbol(), close.id());
@@ -241,7 +243,13 @@ public final class TestnetBot {
                 LOG.severe("[Loop] close of " + close.symbol() + " did not complete: " + report.note());
             }
         } catch (RuntimeException e) {
+            // The source consumed the request before this throw, so nothing will retry it: the
+            // position rides its exchange stop unless someone acts. A log line is not enough.
             LOG.severe("[Loop] close of " + close.symbol() + " failed: " + e.getMessage());
+            alerts.critical("Close request lost",
+                    close.symbol() + ": " + e.getMessage() + " — the request was consumed and will "
+                            + "not retry; the position remains protected only by its resting stop. "
+                            + "Close it by hand or re-issue the close.");
         }
     }
 
