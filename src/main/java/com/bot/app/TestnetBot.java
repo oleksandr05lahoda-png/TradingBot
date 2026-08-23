@@ -42,6 +42,10 @@ public final class TestnetBot {
     private static final Logger LOG = Logger.getLogger(TestnetBot.class.getName());
 
     private static final long RECONCILE_INTERVAL_MS = 30_000L;
+    /** Consecutive failed reconcile passes before the operator hears about it (~90s). */
+    private static final int RECONCILE_WARN_AFTER = 3;
+    /** ...and before entries are refused until a pass succeeds (~5 min). Closes keep working. */
+    private static final int RECONCILE_BLIND_AFTER = 10;
     private static final long HEARTBEAT_INTERVAL_MS = 30_000L;
     private static final long DEAD_MANS_COUNTDOWN_MS = 120_000L;
     private static final long DEAD_MANS_MAX_SILENCE_MS = 90_000L;
@@ -181,6 +185,9 @@ public final class TestnetBot {
             long lastHeartbeatMs = System.currentTimeMillis();
             int sourceFailures = 0;
             boolean bookAgreesWithExchange = bootstrapped;
+            int reconcileFailures = 0;
+            boolean blind = false;
+            boolean outageAlerted = false;
 
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
@@ -193,6 +200,14 @@ public final class TestnetBot {
                         handleClose(close, coordinator, signals, alerts);
                     }
                     for (Signal signal : signals.poll()) {
+                        if (blind) {
+                            // The book may be stale; the scanner re-nominates next hour anyway.
+                            LOG.warning("[Loop] refusing " + signal.symbol() + ": reconciliation has failed "
+                                    + reconcileFailures + " passes in a row, the book cannot be trusted");
+                            signals.onRejected(signal, "RECONCILE_BLIND: exchange state unverified for "
+                                    + reconcileFailures + " passes");
+                            continue;
+                        }
                         handle(signal, engine, coordinator, port, signals, now);
                     }
                     if (sourceFailures > 0) {
@@ -240,11 +255,38 @@ public final class TestnetBot {
                         // pass also found drift. Only a pass that THREW leaves the flag untouched.
                         reconciler.reconcile(Instant.now());
                         bookAgreesWithExchange = true;
+                        if (reconcileFailures > 0) {
+                            LOG.info("[Loop] reconciliation is back after " + reconcileFailures + " failed pass(es)");
+                            if (outageAlerted) {
+                                alerts.info("Reconciliation is back", "after " + reconcileFailures
+                                        + " failed pass(es)" + (blind ? "; entries resume" : ""));
+                            }
+                            reconcileFailures = 0;
+                            blind = false;
+                            outageAlerted = false;
+                        }
                     } catch (RuntimeException e) {
-                        LOG.severe("[Loop] reconciliation failed: " + e.getMessage()
-                                + " — halting; local state can no longer be trusted");
-                        alerts.critical("Reconciliation could not run", e.getMessage());
-                        halt.halt("reconciliation failed: " + e.getMessage(), Instant.now());
+                        // A pass that could not run is blindness, not drift: the book was not touched,
+                        // the resting stops still guard every position, and the next pass is 30s away.
+                        // One 429 with "retry in 3s" used to halt the bot until an operator typed
+                        // /resume (23.08 02:18). Now: quiet, then a warning, then - only if it
+                        // persists - entries are refused until sight returns. Never the latch.
+                        reconcileFailures++;
+                        LOG.warning("[Loop] reconciliation failed (" + reconcileFailures + " in a row): "
+                                + e.getMessage());
+                        if (reconcileFailures == RECONCILE_WARN_AFTER) {
+                            alerts.warning("Reconciliation failing",
+                                    reconcileFailures + " passes in a row: " + e.getMessage()
+                                            + ". Positions stay under their exchange stops.");
+                            outageAlerted = true;
+                        }
+                        if (reconcileFailures >= RECONCILE_BLIND_AFTER && !blind) {
+                            blind = true;
+                            alerts.critical("Reconciliation blind",
+                                    "no successful pass for " + reconcileFailures + " attempts: "
+                                            + e.getMessage() + ". New entries are refused until a pass "
+                                            + "succeeds; closes, stops and takes keep working.");
+                        }
                     }
                     lastReconcileMs = nowMs;
                 }

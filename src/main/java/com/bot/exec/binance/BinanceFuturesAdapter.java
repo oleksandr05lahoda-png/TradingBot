@@ -530,40 +530,51 @@ public final class BinanceFuturesAdapter implements ExchangePort {
 
     private String publicGet(String path, Map<String, String> params, int weight) {
         String query = BinanceSigner.encode(new LinkedHashMap<>(params));
-        return send(HttpRequest.newBuilder()
+        return send(() -> HttpRequest.newBuilder()
                 .uri(venue.require(
                         venue.restBaseUrl() + path + (query.isEmpty() ? "" : "?" + query)))
                 .GET(), weight, false);
     }
 
     private String signedGet(String path, Map<String, String> params, int weight) {
-        String query = signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs);
-        return send(HttpRequest.newBuilder()
-                .uri(venue.require(venue.restBaseUrl() + path + "?" + query))
+        return send(() -> HttpRequest.newBuilder()
+                .uri(venue.require(venue.restBaseUrl() + path + "?"
+                        + signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs)))
                 .header("X-MBX-APIKEY", signer.apiKey())
                 .GET(), weight, false);
     }
 
     private String signedPost(String path, Map<String, String> params, int weight, boolean isOrder) {
-        String query = signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs);
-        return send(HttpRequest.newBuilder()
-                .uri(venue.require(venue.restBaseUrl() + path + "?" + query))
+        return send(() -> HttpRequest.newBuilder()
+                .uri(venue.require(venue.restBaseUrl() + path + "?"
+                        + signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs)))
                 .header("X-MBX-APIKEY", signer.apiKey())
                 .POST(HttpRequest.BodyPublishers.noBody()), weight, isOrder);
     }
 
     private String signedDelete(String path, Map<String, String> params, int weight) {
-        String query = signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs);
-        return send(HttpRequest.newBuilder()
-                .uri(venue.require(venue.restBaseUrl() + path + "?" + query))
+        return send(() -> HttpRequest.newBuilder()
+                .uri(venue.require(venue.restBaseUrl() + path + "?"
+                        + signer.signedQuery(new LinkedHashMap<>(params), serverTimeMillis(), recvWindowMs)))
                 .header("X-MBX-APIKEY", signer.apiKey())
                 .DELETE(), weight, false);
     }
 
-    private String send(HttpRequest.Builder builder, int weight, boolean isOrder) {
-        HttpRequest request = builder.timeout(Duration.ofSeconds(20)).build();
-        try {
-            rateLimiter.acquire(weight, isOrder);
+    private String send(java.util.function.Supplier<HttpRequest.Builder> fresh, int weight, boolean isOrder) {
+        boolean resynced = false;
+        while (true) {
+            HttpRequest request;
+            try {
+                // Acquire BEFORE building the request: the limiter may sleep seconds on a 429
+                // back-off or hours on a 418 ban, and a signature timestamped before that sleep
+                // lands outside recvWindow - the -1021 that followed the 429 at 02:18 on 23.08.
+                rateLimiter.acquire(weight, isOrder);
+                request = fresh.get().timeout(Duration.ofSeconds(20)).build();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw ExchangeException.ambiguous("interrupted while waiting to send", e);
+            }
+            try {
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
             observeLimitHeaders(response);
 
@@ -598,9 +609,13 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                 } catch (RuntimeException ignored) {
                     // Not JSON — keep the raw body.
                 }
-                if (code == BinanceErrorCodes.TIMESTAMP_OUT_OF_RECV_WINDOW) {
-                    LOG.warning("[Binance] signature rejected on clock skew — resynchronising");
+                if (code == BinanceErrorCodes.TIMESTAMP_OUT_OF_RECV_WINDOW && !resynced) {
+                    // -1021 is refused before anything executes, so re-signing is safe for every
+                    // method. Once: a second refusal means the clock, not the timing.
+                    LOG.warning("[Binance] signature rejected on clock skew — resynchronising and retrying once");
                     synchronizeClock();
+                    resynced = true;
+                    continue;
                 }
                 throw ExchangeException.refused(
                         request.method() + " " + request.uri().getPath() + " -> " + message, status, code);
@@ -618,6 +633,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw ExchangeException.ambiguous("interrupted while sending " + request.uri().getPath(), e);
+        }
         }
     }
 

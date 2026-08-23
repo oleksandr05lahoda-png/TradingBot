@@ -19,7 +19,7 @@ import java.util.StringJoiner;
 public final class BinanceSigner {
 
     /** Clock skew the exchange tolerates on a signed request. */
-    public static final long DEFAULT_RECV_WINDOW_MS = 5_000L;
+    public static final long DEFAULT_RECV_WINDOW_MS = 10_000L;
 
     private final String apiKey;
     private final byte[] apiSecret;
