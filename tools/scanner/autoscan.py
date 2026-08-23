@@ -495,6 +495,12 @@ def main():
             for sym in to_evaluate:
                 m = evaluate(sym, args.lookback, args.dip_depth, live.get(sym, 0.0))
                 if not m:
+                    # No data is not a signal. to_close = held - hold_ok, so a held coin whose
+                    # klines request failed this pass would otherwise be closed for a network
+                    # blip; keep it and say so.
+                    if sym in held:
+                        hold_ok.add(sym)
+                        log("%s: no data this pass - holding, not judging" % sym, logpath)
                     continue
                 details[sym] = m
                 # Hysteresis: enter above +band, hold anything above -band. A coin wobbling
