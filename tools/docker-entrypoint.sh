@@ -41,6 +41,8 @@ fi
 # The ledger is what lets a restart confirm resting stops by name. On an ephemeral
 # disk it is lost, reconciliation calls every position unknown, and the bot halts.
 export BOOK_LEDGER_PATH="${BOOK_LEDGER_PATH:-$DATA_DIR/book-ledger-real.json}"
+# One JSONL row per trading event; the lab judges live entries with the same arithmetic as history.
+export TRADE_JOURNAL_PATH="${TRADE_JOURNAL_PATH:-$DATA_DIR/trades.jsonl}"
 
 say "starting the risk core..."
 # Process substitution, not a pipe: after `java | tee &`, $! is tee's PID, so TERM on shutdown

@@ -95,6 +95,9 @@ public final class Reconciler {
     private final BigDecimal quantityTolerance;
     private final long orphanGraceMillis;
 
+    /** Hears benign exchange-side exits (ghost/shrink), for the trade journal. Never trading logic. */
+    private volatile java.util.function.BiConsumer<String, String> exchangeExitListener;
+
     /** Symbols whose working orders were still inside the grace window on the previous pass. */
     private volatile Set<String> carriedOverSymbols = Set.of();
 
@@ -104,6 +107,11 @@ public final class Reconciler {
     public Reconciler(ExchangePort port, RiskEngine engine, TradingHalt halt, AlertSink alerts,
                       IdempotentOrderPlacer placer) {
         this(port, engine, halt, alerts, placer, new BigDecimal("0.0000001"), 60_000L);
+    }
+
+    /** (symbol, detail) for each ghost or shrink the pass absorbed. */
+    public void onExchangeExit(java.util.function.BiConsumer<String, String> listener) {
+        this.exchangeExitListener = listener;
     }
 
     public Reconciler(ExchangePort port, RiskEngine engine, TradingHalt halt, AlertSink alerts,
@@ -259,6 +267,18 @@ public final class Reconciler {
                     + report.describe();
             LOG.info("[Reconciler] " + summary);
             alerts.warning("Exchange-side exit", summary);
+            java.util.function.BiConsumer<String, String> listener = exchangeExitListener;
+            if (listener != null) {
+                for (Drift d : drifts) {
+                    if (d.kind() == Drift.Kind.GHOST_POSITION || d.kind() == Drift.Kind.QUANTITY_MISMATCH) {
+                        try {
+                            listener.accept(d.symbol(), d.detail());
+                        } catch (RuntimeException e) {
+                            LOG.fine("[Reconciler] exit listener failed: " + e.getMessage());
+                        }
+                    }
+                }
+            }
         } else {
             LOG.fine("[Reconciler] converged: " + exchangePositions.size() + " position(s)");
         }

@@ -9,6 +9,7 @@ import com.bot.exec.ExchangeSnapshots.PositionSnapshot;
 import com.bot.exec.ExecutionCoordinator;
 import com.bot.exec.IdempotentOrderPlacer;
 import com.bot.exec.Reconciler;
+import com.bot.exec.OrderTypes;
 import com.bot.exec.TradingHalt;
 import com.bot.exec.binance.BinanceFuturesAdapter;
 import com.bot.exec.binance.BinanceVenue;
@@ -122,6 +123,9 @@ public final class TestnetBot {
         // exists so the scanner stands down, but a latch can be cleared and a mode cannot.
         final boolean observeOnly = venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE;
 
+        // The raw material for honest learning: one JSONL row per event, on the volume.
+        TradeJournal journal = TradeJournal.fromEnvironmentOrNull();
+
         // `closedOnExit` only releases the port on the way out; components are wired to `port`.
         try (ExchangePort closedOnExit = port;
              SignalSource signals = openSource(sourceName, scriptPath, defaultLeverage);
@@ -130,8 +134,11 @@ public final class TestnetBot {
 
             IdempotentOrderPlacer placer = new IdempotentOrderPlacer(port);
             ExecutionCoordinator coordinator = new ExecutionCoordinator(port, engine, placer, halt, alerts,
-                    ExecutionCoordinator.Settings.defaults(), Clock.systemUTC(), Thread::sleep);
+                    entrySettings(), Clock.systemUTC(), Thread::sleep);
             Reconciler reconciler = new Reconciler(port, engine, halt, alerts, placer);
+            if (journal != null) {
+                reconciler.onExchangeExit(journal::exchangeExit);
+            }
             DeadMansSwitch deadMansSwitch = new DeadMansSwitch(port, engine, halt, alerts,
                     DEAD_MANS_COUNTDOWN_MS, DEAD_MANS_MAX_SILENCE_MS);
 
@@ -206,8 +213,13 @@ public final class TestnetBot {
                 // the position it holds. Backing off keeps a hard-down queue from spinning the loop.
                 try {
                     // Closes first, always: a halt must never be able to stop an unwind.
+                    if (operator != null) {
+                        for (CloseRequest close : operator.drainCloses()) {
+                            handleClose(close, coordinator, signals, alerts, journal);
+                        }
+                    }
                     for (CloseRequest close : signals.pollCloses()) {
-                        handleClose(close, coordinator, signals, alerts);
+                        handleClose(close, coordinator, signals, alerts, journal);
                     }
                     for (Signal signal : signals.poll()) {
                         if (observeOnly) {
@@ -223,7 +235,7 @@ public final class TestnetBot {
                                     + reconcileFailures + " passes");
                             continue;
                         }
-                        handle(signal, engine, coordinator, port, signals, now);
+                        handle(signal, engine, coordinator, port, signals, now, journal);
                     }
                     if (sourceFailures > 0) {
                         LOG.info("[Loop] signal source is answering again after " + sourceFailures + " failure(s)");
@@ -322,6 +334,28 @@ public final class TestnetBot {
         }
     }
 
+    /**
+     * Entry execution from the environment. ENTRY_TYPE=limit places the entry at the signal price
+     * (caps slippage; taker fee only if it crosses) with ENTRY_TIF (GTC default) and a ~10s window
+     * before the unfilled remainder is cancelled - a missed fill costs nothing, the scanner
+     * re-nominates within the hour. Default stays MARKET: switching execution is measured with the
+     * cost probe, not assumed.
+     */
+    private static ExecutionCoordinator.Settings entrySettings() {
+        String type = System.getenv().getOrDefault("ENTRY_TYPE", "market").trim().toLowerCase(java.util.Locale.ROOT);
+        if (!type.equals("limit")) return ExecutionCoordinator.Settings.defaults();
+        String tif = System.getenv().getOrDefault("ENTRY_TIF", "GTC").trim().toUpperCase(java.util.Locale.ROOT);
+        OrderTypes.TimeInForce inForce;
+        try {
+            inForce = OrderTypes.TimeInForce.valueOf(tif);
+        } catch (IllegalArgumentException e) {
+            LOG.warning("[Boot] unknown ENTRY_TIF '" + tif + "' - using GTC");
+            inForce = OrderTypes.TimeInForce.GTC;
+        }
+        LOG.info("[Boot] limit entries enabled (tif " + inForce + ", ~10s fill window)");
+        return new ExecutionCoordinator.Settings(OrderTypes.OrderType.LIMIT, inForce, 20, 500, 0.20);
+    }
+
     private static List<PositionSnapshot> readPositionsWithRetry(ExchangePort port, int attempts)
             throws InterruptedException {
         RuntimeException last = null;
@@ -357,11 +391,17 @@ public final class TestnetBot {
     }
 
     private static void handleClose(CloseRequest close, ExecutionCoordinator coordinator,
-                                    SignalSource signals, AlertSink alerts) throws Exception {
+                                    SignalSource signals, AlertSink alerts, TradeJournal journal)
+            throws Exception {
         LOG.info("[Loop] " + close);
         try {
             ExecutionCoordinator.CloseReport report = coordinator.closeOut(close.symbol(), close.id());
             if (report.flat()) {
+                if (journal != null) {
+                    journal.closed(close.id(), close.symbol(), close.reason(),
+                            report.closedQuantity().toPlainString(),
+                            report.averagePrice().toPlainString(), report.note());
+                }
                 signals.onClosed(close, new ExecutionFeedback(close.id(), report.closedQuantity(),
                         report.averagePrice(), report.note()));
             } else {
@@ -380,7 +420,7 @@ public final class TestnetBot {
     }
 
     private static void handle(Signal signal, RiskEngine engine, ExecutionCoordinator coordinator,
-                               ExchangePort port, SignalSource signals, Instant now)
+                               ExchangePort port, SignalSource signals, Instant now, TradeJournal journal)
             throws Exception {
         LOG.info("[Loop] " + signal);
         try {
@@ -397,6 +437,10 @@ public final class TestnetBot {
             switch (decision) {
                 case RiskDecision.Rejected rejected -> {
                     LOG.warning("[Loop] " + rejected);
+                    if (journal != null) {
+                        journal.entryRejected(signal.id(), signal.symbol(),
+                                rejected.reason() + ": " + rejected.detail());
+                    }
                     signals.onRejected(signal, rejected.reason() + ": " + rejected.detail());
                 }
                 case RiskDecision.Approved approved -> {
@@ -409,6 +453,15 @@ public final class TestnetBot {
                         LOG.info("[Loop] " + report.outcome() + " — " + report.note());
                     }
                     if (report.opened()) {
+                        if (journal != null) {
+                            journal.entryOpened(signal.id(), signal.symbol(), signal.side().name(),
+                                    String.valueOf(signal.entryPrice()),
+                                    report.averageFillPrice().toPlainString(),
+                                    report.filledQuantity().toPlainString(),
+                                    report.protectiveStop()
+                                            .map(o -> o.clientOrderId()).orElse(null),
+                                    report.outcome() + ": " + report.note());
+                        }
                         signals.onAccepted(signal, new ExecutionFeedback(
                                 report.entryOrder().map(o -> o.clientOrderId()).orElse("unknown"),
                                 report.filledQuantity(),

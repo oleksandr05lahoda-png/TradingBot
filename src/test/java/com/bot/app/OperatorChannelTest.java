@@ -141,6 +141,26 @@ class OperatorChannelTest {
     }
 
     @Test
+    @DisplayName("/close queues a reduce-only close for the loop; garbage symbols are refused")
+    void closeQueuesForTheLoop() throws Exception {
+        FakeTelegram tg = new FakeTelegram();
+        OperatorChannel ops = new OperatorChannel(tg, "42", new TradingHalt());
+
+        ops.handleUpdates(update(1, "42", "/close adausdt"));
+        var queued = ops.drainCloses();
+        assertEquals(1, queued.size());
+        assertEquals("ADAUSDT", queued.get(0).symbol());
+        assertEquals("operator via Telegram", queued.get(0).reason());
+        assertTrue(tg.sent.get(0).startsWith("queued: closing ADAUSDT"), tg.sent.get(0));
+        assertTrue(ops.drainCloses().isEmpty(), "drained once, gone");
+
+        ops.handleUpdates(update(2, "42", "/close"));
+        ops.handleUpdates(update(3, "42", "/close $$$"));
+        assertTrue(ops.drainCloses().isEmpty(), "garbage must queue nothing");
+        assertTrue(tg.sent.get(1).startsWith("usage:"), tg.sent.get(1));
+    }
+
+    @Test
     @DisplayName("the channel only exists when Telegram is configured")
     void absentWithoutCredentials() {
         assertEquals(null, OperatorChannel.fromEnvironmentOrNull(k -> null, new TradingHalt()));

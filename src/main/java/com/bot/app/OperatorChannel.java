@@ -2,6 +2,7 @@ package com.bot.app;
 
 import com.bot.core.Preconditions;
 import com.bot.exec.TradingHalt;
+import com.bot.signal.CloseRequest;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -54,6 +55,8 @@ public final class OperatorChannel implements AutoCloseable {
     private volatile long startedAtEpochSec;
     private volatile String venueTag = "";
     private volatile com.bot.exec.AlertSink alerts;
+    private final java.util.concurrent.ConcurrentLinkedQueue<CloseRequest> closes =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
     private int pollFailures;
     private Thread thread;
 
@@ -90,6 +93,15 @@ public final class OperatorChannel implements AutoCloseable {
         String chat = env.apply("TELEGRAM_CHAT_ID");
         if (token == null || token.isBlank() || chat == null || chat.isBlank()) return null;
         return new OperatorChannel(new HttpTransport(token.trim(), chat.trim()), chat.trim(), halt);
+    }
+
+    /** Closes queued by /close; the main loop drains and executes them — never this thread. */
+    public java.util.List<CloseRequest> drainCloses() {
+        if (closes.isEmpty()) return java.util.List.of();
+        java.util.List<CloseRequest> out = new java.util.ArrayList<>();
+        CloseRequest c;
+        while ((c = closes.poll()) != null) out.add(c);
+        return out;
     }
 
     /** The main loop calls this; the command thread never touches the book itself. */
@@ -209,10 +221,24 @@ public final class OperatorChannel implements AutoCloseable {
                 halt.clear();
                 return "halt cleared. It was: " + was + "\nEntries resume at the next signal; the scanner re-checks within 5 min.";
             }
+            case "/close": {
+                String symbol = text.split("\\s+", 3).length > 1
+                        ? text.split("\\s+", 3)[1].toUpperCase(Locale.ROOT) : "";
+                if (!symbol.matches("[A-Z0-9]{5,20}")) {
+                    return "usage: /close SYMBOL   (e.g. /close ADAUSDT)";
+                }
+                closes.add(new CloseRequest("tg-close-" + symbol + "-" + now.getEpochSecond(),
+                        symbol, "operator via Telegram", now));
+                return "queued: closing " + symbol + " reduce-only. The loop executes it within a "
+                        + "second and cancels its stop and take; if there is no such position you "
+                        + "will see 'already flat' in the log.";
+            }
             case "/help":
                 return "/status - what the bot holds and whether it is halted\n"
                         + "/halt - stop opening new positions (closes keep working)\n"
-                        + "/resume - lift a halt after you have looked at the reason";
+                        + "/resume - lift a halt after you have looked at the reason\n"
+                        + "/close SYMBOL - flatten one position through the bot (better than the app: "
+                        + "the stop and take are cancelled with it)";
             default:
                 return "unknown command. /help";
         }
