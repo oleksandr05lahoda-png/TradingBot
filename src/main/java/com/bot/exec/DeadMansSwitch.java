@@ -95,9 +95,10 @@ public final class DeadMansSwitch {
         }
 
         // Probe even with nothing to arm, otherwise an idle heartbeat never notices a lost exchange.
+        // ping() crosses the network; serverTimeMillis() is a local clock read and proved nothing.
         if (shouldBeArmed.isEmpty() && armed.isEmpty()) {
             try {
-                port.serverTimeMillis();
+                port.ping();
             } catch (RuntimeException e) {
                 allContacted = false;
                 LOG.warning("[DeadMansSwitch] liveness probe failed: " + e.getMessage());

@@ -115,6 +115,12 @@ public final class TestnetBot {
         // The operator's hands: /status, /halt, /resume over the alert chat. Null when Telegram
         // is not configured, and nothing here can open a position.
         OperatorChannel operator = OperatorChannel.fromEnvironmentOrNull(halt);
+        if (operator != null) {
+            operator.withVenueTag(venue.isReal() ? "REAL " + venue.realMode() : "DEMO").withAlerts(alerts);
+        }
+        // Observe is enforced here, on every signal, independent of any latch: the latch below
+        // exists so the scanner stands down, but a latch can be cleared and a mode cannot.
+        final boolean observeOnly = venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE;
 
         // `closedOnExit` only releases the port on the way out; components are wired to `port`.
         try (ExchangePort closedOnExit = port;
@@ -141,7 +147,10 @@ public final class TestnetBot {
             // measured with an invalid key on 20.08.
             boolean bootstrapped;
             try {
-                List<PositionSnapshot> live = port.openPositions();
+                // One 5xx or timeout here used to leave the book empty for the life of the process
+                // and every later pass flagging UNKNOWN_POSITION. Three tries, then the loop retries
+                // adoption itself after its first successful reconcile.
+                List<PositionSnapshot> live = readPositionsWithRetry(port, 3);
                 int seeded = BookLedger.seed(engine.book(), live, ledgerPath);
                 if (seeded > 0) {
                     LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
@@ -188,6 +197,7 @@ public final class TestnetBot {
             int reconcileFailures = 0;
             boolean blind = false;
             boolean outageAlerted = false;
+            boolean adoptionDone = bootstrapped;
 
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
@@ -200,6 +210,11 @@ public final class TestnetBot {
                         handleClose(close, coordinator, signals, alerts);
                     }
                     for (Signal signal : signals.poll()) {
+                        if (observeOnly) {
+                            LOG.info("[Loop] REAL_MODE=observe - refusing " + signal.symbol());
+                            signals.onRejected(signal, "REAL_MODE=observe: entries are disabled by the environment");
+                            continue;
+                        }
                         if (blind) {
                             // The book may be stale; the scanner re-nominates next hour anyway.
                             LOG.warning("[Loop] refusing " + signal.symbol() + ": reconciliation has failed "
@@ -255,6 +270,18 @@ public final class TestnetBot {
                         // pass also found drift. Only a pass that THREW leaves the flag untouched.
                         reconciler.reconcile(Instant.now());
                         bookAgreesWithExchange = true;
+                        if (!adoptionDone) {
+                            // The boot read failed; the book was realigned from the exchange but
+                            // carries no stop ids. Read them back now that the exchange answers.
+                            try {
+                                int adopted = BookLedger.adopt(engine.book(), port, port.openPositions());
+                                LOG.info("[Loop] late adoption after a failed boot read: " + adopted
+                                        + " position(s) now carry their stop ids");
+                                adoptionDone = true;
+                            } catch (RuntimeException e) {
+                                LOG.warning("[Loop] late adoption failed, will retry: " + e.getMessage());
+                            }
+                        }
                         if (reconcileFailures > 0) {
                             LOG.info("[Loop] reconciliation is back after " + reconcileFailures + " failed pass(es)");
                             if (outageAlerted) {
@@ -293,6 +320,21 @@ public final class TestnetBot {
                 Thread.sleep(250);
             }
         }
+    }
+
+    private static List<PositionSnapshot> readPositionsWithRetry(ExchangePort port, int attempts)
+            throws InterruptedException {
+        RuntimeException last = null;
+        for (int i = 1; i <= attempts; i++) {
+            try {
+                return port.openPositions();
+            } catch (RuntimeException e) {
+                last = e;
+                LOG.warning("[Boot] position read failed (" + i + "/" + attempts + "): " + e.getMessage());
+                if (i < attempts) Thread.sleep(5_000L);
+            }
+        }
+        throw last;
     }
 
     /** One line the operator can read on a phone; built on the loop thread from the loop's own state. */

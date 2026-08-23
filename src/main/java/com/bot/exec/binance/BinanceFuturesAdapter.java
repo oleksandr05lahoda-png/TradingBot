@@ -417,6 +417,28 @@ public final class BinanceFuturesAdapter implements ExchangePort {
             signedDelete(algo ? "/fapi/v1/algoOrder" : "/fapi/v1/order", params, 1);
         } catch (ExchangeException e) {
             if (!BinanceErrorCodes.isOrderAbsent(e.exchangeCode())) throw e;
+            if (algo) return;
+            // A foreign id (a stop placed from the Binance app) carries no purpose letter and
+            // reads as plain; if the plain endpoint has never heard of it, try it as a conditional
+            // one before accepting "absent" - otherwise such a stop could never be swept.
+            Map<String, String> asAlgo = new LinkedHashMap<>();
+            asAlgo.put("clientAlgoId", clientOrderId);
+            try {
+                signedDelete("/fapi/v1/algoOrder", asAlgo, 1);
+            } catch (ExchangeException second) {
+                if (!BinanceErrorCodes.isOrderAbsent(second.exchangeCode())) throw second;
+            }
+        }
+    }
+
+    /** Cancels one conditional order by the exchange's own id, whoever placed it. */
+    private void cancelAlgoById(long algoId) {
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("algoId", Long.toString(algoId));
+        try {
+            signedDelete("/fapi/v1/algoOrder", params, 1);
+        } catch (ExchangeException e) {
+            if (!BinanceErrorCodes.isOrderAbsent(e.exchangeCode())) throw e;
         }
     }
 
@@ -424,8 +446,20 @@ public final class BinanceFuturesAdapter implements ExchangePort {
     @Override public void cancelAllOpenOrders(String symbol) {
         signedDelete("/fapi/v1/allOpenOrders", new LinkedHashMap<>(Map.of("symbol", symbol)), 1);
         for (OrderStatus order : openOrders(symbol)) {
-            if (order.isWorking()) cancelOrder(symbol, order.clientOrderId());
+            if (!order.isWorking()) continue;
+            // The listing knows what it listed: conditional rows go by algoId, so a stop placed by
+            // hand in the app (no purpose letter in its id) is cancelled like any other.
+            if (order.type().isConditional() && order.exchangeOrderId() > 0) {
+                cancelAlgoById(order.exchangeOrderId());
+            } else {
+                cancelOrder(symbol, order.clientOrderId());
+            }
         }
+    }
+
+    /** A request that actually crosses the network, for liveness probes. */
+    @Override public void ping() {
+        publicGet("/fapi/v1/ping", Map.of(), 1);
     }
 
     /** Read from the purpose letter in the id; a foreign id reads as plain, costing one "no such order". */

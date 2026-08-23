@@ -68,6 +68,9 @@ public interface ExchangePort extends AutoCloseable {
      */
     void armDeadMansSwitch(String symbol, long countdownMillis);
 
+    /** Touches the venue and throws if it cannot be reached. Defaults to the clock read. */
+    default void ping() { serverTimeMillis(); }
+
     /** Milliseconds the venue has told this process to stay silent (a 429/418 hold); 0 when free. */
     default long heldByExchangeForMillis() { return 0L; }
 

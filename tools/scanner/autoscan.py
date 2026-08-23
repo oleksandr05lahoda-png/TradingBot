@@ -194,8 +194,11 @@ def universe(top, min_volume, by_cap, cached_cap=None):
                          if s.get("status") == "TRADING"}
     tick = get("/fapi/v1/ticker/24hr", {}, gap=0.5) or []
     vol = {t["symbol"]: float(t.get("quoteVolume", 0)) for t in tick}
+    # With no ticker answer every candidate would fail the volume floor and the pass would be
+    # skipped, exits included, under a log blaming CoinGecko. Without volumes, do not filter on it.
+    floor = min_volume if vol else 0.0
     if not by_cap:
-        out = [(s, vol.get(s, 0.0)) for s in tradable if vol.get(s, 0.0) >= min_volume]
+        out = [(s, vol.get(s, 0.0)) for s in tradable if vol.get(s, 0.0) >= floor]
         out.sort(key=lambda x: -x[1])
         return out[:top], "volume"
     cg = None
@@ -222,7 +225,7 @@ def universe(top, min_volume, by_cap, cached_cap=None):
             continue
         seen.add(sym)
         for cand in (sym + "USDT", "1000" + sym + "USDT", "1000000" + sym + "USDT"):
-            if cand in tradable and vol.get(cand, 0.0) >= min_volume:
+            if cand in tradable and vol.get(cand, 0.0) >= floor:
                 out.append((cand, vol.get(cand, 0.0)))
                 break
         if len(out) >= top:
@@ -273,8 +276,13 @@ def evaluate(sym, lookback, dip_depth, live_price):
     # prior-20d mean. The history measurement used full days; without this the live filter
     # would be far stricter at 08:00 UTC than at 23:00 and pass almost nothing in the morning.
     prior = [float(b[7]) for b in bars[-21:-1]]
-    elapsed = max(0.10, min(1.0, (time.time() * 1000 - float(bars[-1][0])) / 86_400_000.0))
-    projected = float(bars[-1][7]) / elapsed
+    elapsed = (time.time() * 1000 - float(bars[-1][0])) / 86_400_000.0
+    if elapsed < 0.10:
+        # Minutes into the UTC day a projection from today's trickle is noise (29x too low at
+        # 00:05); yesterday's full day is the honest stand-in until ~02:24.
+        projected = float(bars[-2][7]) if len(bars) >= 2 else 0.0
+    else:
+        projected = float(bars[-1][7]) / min(1.0, elapsed)
     vol_ratio = (projected / (sum(prior) / len(prior))) if prior and sum(prior) > 0 else None
     return {"ret": ret, "dip": dip, "price": price, "atr": a,
             "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio}
@@ -301,9 +309,13 @@ def bot_is_ready(bot_log):
     executed at stale prices whenever it finally reads the book (22.08: a 6h IP ban at boot)."""
     try:
         with io.open(bot_log, "r", encoding="utf-8", errors="replace") as f:
-            return "adopted from the exchange" in f.read()
+            text = f.read()
     except OSError:
         return False
+    # "adopted" is only logged by a healthy bootstrap; a boot that halted on drift and was then
+    # /resume'd, or a reconcile that came back after an outage, is just as ready.
+    return ("adopted from the exchange" in text or "HALT CLEARED at" in text
+            or "reconciliation is back" in text)
 
 
 def bot_is_halted(bot_log):
@@ -401,7 +413,8 @@ def main():
                                 "stops until the operator clears the halt", logpath)
                     state["told_halted"] = True
                     save_state(statepath, state)
-                time.sleep(args.interval)
+                # /resume promises the scanner follows within minutes, not within the hour.
+                time.sleep(min(args.interval, 300))
                 continue
             if state.get("told_halted"):
                 state["told_halted"] = False
@@ -476,6 +489,10 @@ def main():
             # gate ("off") it changes nothing - the log records what a cash gate WOULD have
             # suppressed, which is the paper forward of that gate, for free.
             regime, btc_ret = btc_regime(args.lookback, live)
+            if regime is None and state.get("regime"):
+                # One failed klines call must not switch a cash gate off for an hour.
+                regime = state["regime"]
+                log("BTC regime unreadable this pass - using last known %s" % regime, logpath)
             if regime and regime != state.get("regime"):
                 msg = ("BTC regime is now %s (30d %+.1f%%)%s" % (regime, (btc_ret or 0) * 100,
                        "" if state.get("regime") is None else " - was " + state["regime"]))
@@ -510,13 +527,16 @@ def main():
                 # or below zero it auto-rejects, so nominating the coin only burns a slot
                 # (BEAT: atr 0.95 on price 0.44). Gate ONLY the entry side - a held coin
                 # must stay hold-eligible, this filter must never force a close.
-                if m["ret"] > args.entry_band or m["dip"]:
+                # One trigger per coin, decided here and used everywhere: the entry filters, the
+                # id label on the book line and the max-hold rule must agree on what this entry IS.
+                m["trig"] = "trend" if m["ret"] > args.entry_band else ("dip" if m["dip"] else None)
+                if m["trig"]:
                     if m["price"] > STOP_ATR_MULT * m["atr"]:
                         passes = True
-                        if near_high_max is not None and m["ret"] > args.entry_band and not m["dip"]:
+                        if m["trig"] == "trend" and near_high_max is not None:
                             fh = m.get("from_high")
                             passes = fh is not None and fh <= near_high_max
-                        if passes and vol_mult_min is not None and m["ret"] > args.entry_band and not m["dip"]:
+                        if passes and m["trig"] == "trend" and vol_mult_min is not None:
                             vr = m.get("vol_ratio")
                             passes = vr is not None and vr >= vol_mult_min
                         if passes:
@@ -527,6 +547,16 @@ def main():
             now = time.time()
             entered = state.setdefault("entered", {})
             cooldown = state.setdefault("cooldown", {})
+            entered_trig = state.setdefault("entered_trig", {})
+            # A stop or take that fired on the exchange leaves no CLOSE line, so without this the
+            # coin was re-proposed at the very next pass while still top of the momentum list.
+            for s in [x for x in entered if x not in held]:
+                cooldown[s] = now
+                entered.pop(s, None)
+                entered_trig.pop(s, None)
+            # The state file must not grow forever: a week-old cooldown is long expired.
+            for s in [x for x, t in cooldown.items() if now - t > 7 * 86400]:
+                cooldown.pop(s, None)
 
             to_close = []
             for s in sorted(held - hold_ok):
@@ -536,12 +566,15 @@ def main():
             if max_hold_hours is not None:
                 # Measured 22.08: a near-high entry held at most ~2 days kept 49% winners and cut
                 # the drawdown in half; the same cap without the near-high entry was worse than
-                # the base rule, so the switch is meant to travel with ENTRY_NEAR_HIGH.
+                # the base rule, so the switch is meant to travel with ENTRY_NEAR_HIGH. Only the
+                # scanner's own trend entries: an adopted or manual position has no open time the
+                # scanner can trust (the exchange's updateTime moves on every partial fill).
                 for s in sorted(held):
-                    if s in to_close:
+                    if s in to_close or s not in entered:
                         continue
-                    since = entered.get(s) or held_since.get(s)
-                    if since and now - since >= max_hold_hours * 3600:
+                    if entered_trig.get(s, "trend") != "trend":
+                        continue
+                    if now - entered[s] >= max_hold_hours * 3600:
                         to_close.append(s)
                         reasons[s] = "max-hold"
             room = max(0, args.max_positions - (len(held) - len(to_close)))
@@ -601,10 +634,11 @@ def main():
                         entered.pop(s, None)
                     for s in to_open:
                         m = details[s]
-                        trig = "trend" if m["ret"] > args.entry_band else "dip"
+                        trig = m.get("trig") or "trend"
                         f.write("%s LONG entry=%.10g atr=%.10g lev=%d id=auto-%s-%s-%s\n"
                                 % (s, m["price"], m["atr"], args.leverage, trig, s, stamp))
                         entered[s] = now
+                        entered_trig[s] = trig
                 save_state(statepath, state)
                 log("scan: %d held -> closing %d (%s), opening %d (%s)"
                     % (len(held), len(to_close), ",".join(to_close) or "-",

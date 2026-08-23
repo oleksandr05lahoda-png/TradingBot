@@ -4,7 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File tools\start-real.ps1 -Mode trade  # full operation
 #   ... -Mode trade -Force                                                     # restart even if alive
 #
-# Safe to schedule: without -Force it is a no-op when the machine is already up, which
+# ONE BOT PER ACCOUNT. The real bot normally runs on Railway (RAILWAY_SETUP.md); this launcher is the fallback for when that service is STOPPED. Two bots on one account overwrite each other's stop ids (18.08). Not safe to schedule: without -Force it is a no-op when the machine is already up, which
 # is what lets it be wired to "at logon", "on unlock" and a repeating trigger at once.
 # Without that check a repeating trigger would tear down and rebuild a live real-money
 # bot every fifteen minutes.

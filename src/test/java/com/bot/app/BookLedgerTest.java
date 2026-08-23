@@ -212,6 +212,21 @@ class BookLedgerTest {
     }
 
     @Test
+    void aNamelessEntryIsGivenItsStopId() {
+        // A reconcile pass after a failed boot read leaves the position in the book with no stop id;
+        // late adoption must fill it in rather than skip the symbol as "already known".
+        RestingOrders exchange = new RestingOrders(Map.of(
+                "ADAUSDT", List.of(stop("ADAUSDT", "bt-s0-late", "0.188"))), true);
+        ExposureBook book = new ExposureBook();
+        book.open(new ExposureBook.OpenPosition("ADAUSDT", Side.LONG, new BigDecimal("37"), 0.2058,
+                7.6, 0.0, Optional.empty()));
+
+        assertEquals(1, BookLedger.adopt(book, exchange, List.of(snap("ADAUSDT", "37", "0.2058"))));
+        assertEquals(Optional.of("bt-s0-late"), book.get("ADAUSDT").orElseThrow().protectiveStopId());
+        assertEquals(1, book.openCount());
+    }
+
+    @Test
     void aFlatPositionIsNotAdopted() {
         RestingOrders exchange = new RestingOrders(Map.of(
                 "AAAUSDT", List.of(stop("AAAUSDT", "bt-s0-orphan", "1.5"))), true);

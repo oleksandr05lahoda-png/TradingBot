@@ -107,7 +107,9 @@ final class BookLedger {
         if (!port.canListConditionalOrders()) return 0;
         int adopted = 0;
         for (PositionSnapshot position : exchange) {
-            if (position.isFlat() || book.hasPosition(position.symbol())) continue;
+            if (position.isFlat()) continue;
+            ExposureBook.OpenPosition existing = book.get(position.symbol()).orElse(null);
+            if (existing != null && existing.protectiveStopId().isPresent()) continue;
             Optional<OrderStatus> stop;
             try {
                 stop = port.openOrders(position.symbol()).stream()
@@ -127,6 +129,8 @@ final class BookLedger {
             // closePosition stops carry quantity 0, so the size comes from the position itself.
             double risk = stop.get().stopPrice().subtract(position.entryPrice()).abs().doubleValue()
                     * quantity.doubleValue();
+            // A realigned-but-nameless entry (a reconcile pass after a failed boot read) is replaced.
+            if (existing != null) book.close(position.symbol());
             book.open(new ExposureBook.OpenPosition(position.symbol(), position.direction().orElseThrow(),
                     quantity, entry, quantity.doubleValue() * entry, risk,
                     Optional.of(stop.get().clientOrderId())));

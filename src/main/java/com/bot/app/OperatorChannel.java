@@ -39,6 +39,11 @@ public final class OperatorChannel implements AutoCloseable {
         void send(String text) throws IOException, InterruptedException;
     }
 
+    /** A halt whose reason starts with this is a venue mode, not an incident; /resume must not lift it. */
+    static final String OBSERVE_REASON_PREFIX = "REAL_MODE=observe";
+    /** Consecutive failed polls (5s apart) before the operator is told the channel is dead. */
+    static final int POLL_FAILURES_BEFORE_ALERT = 12;
+
     private final Transport transport;
     private final String chatId;
     private final TradingHalt halt;
@@ -46,12 +51,33 @@ public final class OperatorChannel implements AutoCloseable {
     private final AtomicReference<Instant> statusAt = new AtomicReference<>();
     private final AtomicBoolean running = new AtomicBoolean();
     private volatile long offset;
+    private volatile long startedAtEpochSec;
+    private volatile String venueTag = "";
+    private volatile com.bot.exec.AlertSink alerts;
+    private int pollFailures;
     private Thread thread;
 
     OperatorChannel(Transport transport, String chatId, TradingHalt halt) {
         this.transport = Preconditions.notNull(transport, "transport");
         this.chatId = Preconditions.notBlank(chatId, "chatId");
         this.halt = Preconditions.notNull(halt, "halt");
+    }
+
+    /** Replies carry the venue, because demo and real share one chat and may share one token. */
+    public OperatorChannel withVenueTag(String tag) {
+        this.venueTag = tag == null ? "" : tag;
+        return this;
+    }
+
+    /** Lets the channel say so when it cannot hear commands (409 from a second poller, 401, ...). */
+    public OperatorChannel withAlerts(com.bot.exec.AlertSink sink) {
+        this.alerts = sink;
+        return this;
+    }
+
+    /** Commands older than this process are replayed by Telegram for up to 24h; they are ignored. */
+    void markStarted(Instant at) {
+        this.startedAtEpochSec = at.getEpochSecond();
     }
 
     /** Null when Telegram is not configured — alerts are off then too, so nobody is listening. */
@@ -74,6 +100,7 @@ public final class OperatorChannel implements AutoCloseable {
 
     public void start() {
         if (!running.compareAndSet(false, true)) return;
+        markStarted(Instant.now());
         thread = new Thread(this::loop, "operator-channel");
         thread.setDaemon(true);
         thread.start();
@@ -90,11 +117,30 @@ public final class OperatorChannel implements AutoCloseable {
             try {
                 String body = transport.poll(offset);
                 if (body != null) handleUpdates(body);
+                if (pollFailures > 0) {
+                    LOG.info("[Operator] Telegram polling is back after " + pollFailures + " failure(s)");
+                    pollFailures = 0;
+                }
             } catch (InterruptedException e) {
                 return;
             } catch (Exception e) {
-                // Telegram being down must never matter to trading; try again after a pause.
-                LOG.fine("[Operator] poll failed: " + e.getMessage());
+                // Telegram being down must never matter to trading - but a dead channel must not be
+                // silent either: /halt typed at 3am into a 409 (another poller on this token) or a
+                // 401 (rotated token) would simply vanish. Loud on the first failure and every
+                // minute after, and once to the alert chat (sendMessage works even when getUpdates
+                // does not).
+                pollFailures++;
+                if (pollFailures == 1 || pollFailures % POLL_FAILURES_BEFORE_ALERT == 0) {
+                    LOG.warning("[Operator] poll failed (" + pollFailures + " in a row): " + e.getMessage()
+                            + " - /status /halt /resume are NOT being heard");
+                }
+                com.bot.exec.AlertSink sink = alerts;
+                if (pollFailures == POLL_FAILURES_BEFORE_ALERT && sink != null) {
+                    sink.warning("Operator commands unavailable",
+                            "Telegram getUpdates has failed " + pollFailures + " times: " + e.getMessage()
+                                    + ". A second bot polling this token (409) or a rotated token (401) "
+                                    + "are the usual causes. Alerts still arrive; commands do not.");
+                }
                 try { Thread.sleep(5_000L); } catch (InterruptedException ie) { return; }
             }
         }
@@ -113,12 +159,23 @@ public final class OperatorChannel implements AutoCloseable {
             JSONObject chat = msg.optJSONObject("chat");
             String from = chat == null ? "" : String.valueOf(chat.opt("id"));
             String text = msg.optString("text", "").trim();
+            long sentAt = msg.optLong("date", 0L);
+            if (startedAtEpochSec > 0 && sentAt > 0 && sentAt < startedAtEpochSec - 5) {
+                // Telegram redelivers unconfirmed updates for 24h. A /resume typed while the bot was
+                // down must not clear the halt the NEW boot just latched. Offset advanced above.
+                LOG.warning("[Operator] ignored a command sent " + (startedAtEpochSec - sentAt)
+                        + "s before this process started: " + text);
+                continue;
+            }
             if (!from.equals(chatId)) {
                 // Not the operator. Say nothing back — a reply would confirm the bot exists.
                 LOG.warning("[Operator] ignored a command from chat " + from + ": " + text);
                 continue;
             }
-            if (text.startsWith("/")) transport.send(execute(text, Instant.now()));
+            if (text.startsWith("/")) {
+                String reply = execute(text, Instant.now());
+                transport.send(venueTag.isEmpty() ? reply : "[" + venueTag + "] " + reply);
+            }
         }
     }
 
@@ -143,6 +200,12 @@ public final class OperatorChannel implements AutoCloseable {
             case "/resume": {
                 if (!halt.isHalted()) return "not halted - nothing to clear.";
                 String was = halt.reason().orElse("?");
+                if (was.startsWith(OBSERVE_REASON_PREFIX)) {
+                    // Observe is a venue mode set by the operator's environment, not an incident a
+                    // command may wave away: clearing it here would arm real entries from a phone.
+                    return "this is REAL_MODE=observe, not a halt. Set REAL_MODE=trade in the "
+                            + "environment and restart to enable entries.";
+                }
                 halt.clear();
                 return "halt cleared. It was: " + was + "\nEntries resume at the next signal; the scanner re-checks within 5 min.";
             }

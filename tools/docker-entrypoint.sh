@@ -52,13 +52,21 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 
+# The scanner's venue follows the bot's: with REAL_TRADING unset the bot is demo, and a scanner
+# still reading the real account would write real CLOSE lines into a demo book.
+if [ "${REAL_TRADING:-}" = "ARMED" ]; then WANT_VENUE=real; else WANT_VENUE=demo; fi
+if [ -n "${SCAN_VENUE:-}" ] && [ "$SCAN_VENUE" != "$WANT_VENUE" ]; then
+  say "SCAN_VENUE=$SCAN_VENUE contradicts REAL_TRADING=${REAL_TRADING:-unset} (bot venue: $WANT_VENUE) - refusing to start."
+  exit 1
+fi
+
 say "starting the scanner..."
 python3 /app/scanner/autoscan.py \
   --repo /app \
   --script "$BOOK" \
   --bot-log "$BOT_LOG" \
   --workdir "$DATA_DIR" \
-  --venue "${SCAN_VENUE:-real}" \
+  --venue "$WANT_VENUE" \
   --by-cap --top "${SCAN_TOP:-100}" --lookback 30 --interval "${SCAN_INTERVAL:-3600}" \
   --max-positions "${MAX_POSITIONS:-10}" --leverage "${DEFAULT_LEVERAGE:-2}" &
 SCANNER_PID=$!
@@ -68,7 +76,16 @@ SCANNER_PID=$!
 # restarts both together rather than leaving a half-machine that looks healthy.
 term() { say "shutting down"; kill "$BOT_PID" "$SCANNER_PID" 2>/dev/null || true; }
 trap term TERM INT
+# `wait -n` returns the child's status (143 on TERM); under set -e that would end the script
+# here and the kernel would SIGKILL a JVM that had just been asked to stop - no shutdown hook.
+set +e
 wait -n "$BOT_PID" "$SCANNER_PID"
 say "one half exited - stopping the container so both restart together"
 term
-wait || true
+# Give the JVM a bounded moment to finish its shutdown hook before PID 1 exits.
+for _ in $(seq 1 20); do
+  kill -0 "$BOT_PID" 2>/dev/null || break
+  sleep 0.5
+done
+wait 2>/dev/null
+exit 0

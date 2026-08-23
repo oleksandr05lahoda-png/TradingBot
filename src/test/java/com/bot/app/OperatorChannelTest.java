@@ -96,6 +96,51 @@ class OperatorChannelTest {
     }
 
     @Test
+    @DisplayName("/resume does not lift REAL_MODE=observe: a mode is not an incident")
+    void observeIsNotClearable() throws Exception {
+        TradingHalt halt = new TradingHalt();
+        halt.halt("REAL_MODE=observe - reading the account, opening nothing", NOON);
+        FakeTelegram tg = new FakeTelegram();
+        OperatorChannel ops = new OperatorChannel(tg, "42", halt);
+
+        ops.handleUpdates(update(1, "42", "/resume"));
+
+        assertTrue(halt.isHalted(), "observe must survive /resume; only the environment ends it");
+        assertTrue(tg.sent.get(0).contains("REAL_MODE=trade"), tg.sent.get(0));
+    }
+
+    @Test
+    @DisplayName("a command Telegram replays from before this process started is ignored")
+    void staleCommandsAreIgnored() throws Exception {
+        TradingHalt halt = new TradingHalt();
+        halt.halt("boot drift", NOON);
+        FakeTelegram tg = new FakeTelegram();
+        OperatorChannel ops = new OperatorChannel(tg, "42", halt);
+        ops.markStarted(NOON);
+
+        long beforeBoot = NOON.getEpochSecond() - 120;
+        ops.handleUpdates("{\"ok\":true,\"result\":[{\"update_id\":7,\"message\":{\"date\":" + beforeBoot
+                + ",\"chat\":{\"id\":42},\"text\":\"/resume\"}}]}");
+
+        assertTrue(halt.isHalted(), "a /resume typed while the bot was down must not clear the new boot's halt");
+        assertTrue(tg.sent.isEmpty());
+
+        long afterBoot = NOON.getEpochSecond() + 10;
+        ops.handleUpdates("{\"ok\":true,\"result\":[{\"update_id\":8,\"message\":{\"date\":" + afterBoot
+                + ",\"chat\":{\"id\":42},\"text\":\"/resume\"}}]}");
+        assertFalse(halt.isHalted(), "a live command still works");
+    }
+
+    @Test
+    @DisplayName("replies name the venue, because demo and real share one chat")
+    void repliesCarryTheVenue() throws Exception {
+        FakeTelegram tg = new FakeTelegram();
+        OperatorChannel ops = new OperatorChannel(tg, "42", new TradingHalt()).withVenueTag("REAL TRADE");
+        ops.handleUpdates(update(1, "42", "/help"));
+        assertTrue(tg.sent.get(0).startsWith("[REAL TRADE] "), tg.sent.get(0));
+    }
+
+    @Test
     @DisplayName("the channel only exists when Telegram is configured")
     void absentWithoutCredentials() {
         assertEquals(null, OperatorChannel.fromEnvironmentOrNull(k -> null, new TradingHalt()));
