@@ -14,8 +14,12 @@ say() { printf '%s %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*"; }
 # The venue gate is fail-closed by design: REAL_TRADING must be exactly ARMED and the
 # real keys must be present, or the bot refuses to start. Say plainly which venue this
 # container is about to become, because the log is the only place anyone will look.
-say "venue: ${REAL_TRADING:-unset} / mode: ${REAL_MODE:-observe}"
-if [ "${REAL_TRADING:-}" = "ARMED" ] && [ -z "${BINANCE_REAL_API_KEY:-}" ]; then
+# Values pasted into a hosting UI arrive with trailing spaces; the Java side trims, so this
+# script must too, or "ARMED   " reads as demo here and as real there (crash loop, 23.08 13:40).
+ARMING=$(printf '%s' "${REAL_TRADING:-}" | tr -d '[:space:]')
+MODE=$(printf '%s' "${REAL_MODE:-observe}" | tr -d '[:space:]')
+say "venue: ${ARMING:-unset} / mode: ${MODE}"
+if [ "$ARMING" = "ARMED" ] && [ -z "${BINANCE_REAL_API_KEY:-}" ]; then
   say "REAL_TRADING=ARMED but BINANCE_REAL_API_KEY is empty - refusing to start."
   exit 1
 fi
@@ -54,9 +58,10 @@ done
 
 # The scanner's venue follows the bot's: with REAL_TRADING unset the bot is demo, and a scanner
 # still reading the real account would write real CLOSE lines into a demo book.
-if [ "${REAL_TRADING:-}" = "ARMED" ]; then WANT_VENUE=real; else WANT_VENUE=demo; fi
-if [ -n "${SCAN_VENUE:-}" ] && [ "$SCAN_VENUE" != "$WANT_VENUE" ]; then
-  say "SCAN_VENUE=$SCAN_VENUE contradicts REAL_TRADING=${REAL_TRADING:-unset} (bot venue: $WANT_VENUE) - refusing to start."
+if [ "$ARMING" = "ARMED" ]; then WANT_VENUE=real; else WANT_VENUE=demo; fi
+SCAN_WANT=$(printf '%s' "${SCAN_VENUE:-}" | tr -d '[:space:]')
+if [ -n "$SCAN_WANT" ] && [ "$SCAN_WANT" != "$WANT_VENUE" ]; then
+  say "SCAN_VENUE=$SCAN_WANT contradicts REAL_TRADING=${ARMING:-unset} (bot venue: $WANT_VENUE) - refusing to start."
   exit 1
 fi
 
