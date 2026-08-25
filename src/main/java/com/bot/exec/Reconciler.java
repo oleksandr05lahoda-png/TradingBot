@@ -340,17 +340,23 @@ public final class Reconciler {
             return Optional.empty();
         }
 
-        if (stop.isPresent() && stop.get().state() == OrderState.FILLED) {
-            // A fired stop takes the position within seconds, so exactly one pass of grace — not two:
-            // a trigger whose market order never landed looks identical from here.
+        // FILLED: the stop itself fired. EXPIRED: the venue retired it because the position is on
+        // its way out - which is what Binance does the instant a take-profit triggers, seconds
+        // before the closing market order lands. Both mean "this position is leaving", and both
+        // looked identical to a naked position: STXUSDT halted the bot for nine hours on 25.08,
+        // sixteen seconds before its take filled for +$1.19. One pass of grace for each - not two,
+        // because a trigger whose market order never landed reads the same from here.
+        OrderState state = stop.map(OrderStatus::state).orElse(OrderState.UNKNOWN);
+        if (state == OrderState.FILLED || state == OrderState.EXPIRED) {
+            String what = state == OrderState.FILLED ? "triggered" : "was retired by the venue";
             if (!triggeredStops.contains(symbol)) {
                 stillTriggered.add(symbol);
-                LOG.warning("[Reconciler] " + symbol + ": stop " + stopId
-                        + " has triggered; expecting the position to be gone by the next pass");
+                LOG.warning("[Reconciler] " + symbol + ": stop " + stopId + " " + what
+                        + "; expecting the position to be gone by the next pass");
                 return Optional.empty();
             }
             drifts.add(new Drift(Drift.Kind.POSITION_WITHOUT_STOP, symbol,
-                    "stop " + stopId + " triggered, yet the position is still open a pass later"));
+                    "stop " + stopId + " " + what + ", yet the position is still open a pass later"));
             return Optional.empty();
         }
 

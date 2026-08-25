@@ -286,6 +286,30 @@ class ReconciliationDriftTest {
     }
 
     @Test
+    @DisplayName("a stop the venue retired while a take-profit fills gets the same one pass of grace")
+    void expiredStopBehindATakeProfitIsGivenOnePass() throws Exception {
+        // STXUSDT, 25.08 06:08:58: the take triggered, Binance retired the stop the same instant,
+        // and the reconciler read the gap sixteen seconds before the close landed for +$1.19.
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        ExecutionCoordinator.Report execution =
+                ExecFixtures.coordinator(exchange, engine, halt, alerts).execute(plan);
+        exchange.listsConditionalOrders = false;
+        exchange.setOrderState(execution.protectiveStop().orElseThrow().clientOrderId(),
+                OrderTypes.OrderState.EXPIRED);
+
+        Reconciler.Report first = reconciler.reconcile(ExecFixtures.NOON);
+        assertTrue(first.converged(), "one pass of grace: the position is on its way out — " + first.describe());
+        assertFalse(halt.isHalted(), "a winning take-profit must not freeze the machine");
+
+        // Still open a pass later with no stop: that IS the emergency.
+        Reconciler.Report second = reconciler.reconcile(ExecFixtures.NOON);
+        assertTrue(second.drifts().stream()
+                        .anyMatch(d -> d.kind() == Reconciler.Drift.Kind.POSITION_WITHOUT_STOP),
+                second.describe());
+        assertTrue(halt.isHalted());
+    }
+
+    @Test
     @DisplayName("a stop that has just triggered gets one pass of grace, then counts as naked")
     void triggeredStopIsGivenOnePassThenReported() throws Exception {
         TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
