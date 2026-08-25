@@ -116,7 +116,7 @@ public final class OperatorChannel implements AutoCloseable {
         thread = new Thread(this::loop, "operator-channel");
         thread.setDaemon(true);
         thread.start();
-        LOG.info("[Operator] Telegram commands armed: /status /halt /resume /help");
+        LOG.info("[Operator] Telegram commands armed: /status /halt /resume /close /help");
     }
 
     @Override public void close() {
