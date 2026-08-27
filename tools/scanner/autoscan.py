@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -250,7 +251,10 @@ def atr(bars, period):
 def evaluate(sym, lookback, dip_depth, live_price):
     """Return raw metrics; entry/hold decisions belong to the caller's bands."""
     need = max(lookback, 20) + ATR_PERIOD + 5
-    bars = get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": need})
+    # 61 closes feed the 60d correlation filter - same request weight (limit < 100). The
+    # eligibility guard stays on the OLD minimum so young coins keep exactly the universe
+    # membership they had before the filter existed.
+    bars = get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": max(need, 61)})
     if not bars or len(bars) < need - 3:
         return None
     a = atr(bars[-(ATR_PERIOD + 2):], ATR_PERIOD)
@@ -285,7 +289,29 @@ def evaluate(sym, lookback, dip_depth, live_price):
         projected = float(bars[-1][7]) / min(1.0, elapsed)
     vol_ratio = (projected / (sum(prior) / len(prior))) if prior and sum(prior) > 0 else None
     return {"ret": ret, "dip": dip, "price": price, "atr": a,
-            "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio}
+            "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio,
+            "closes": [float(b[4]) for b in bars[-61:]]}
+
+
+def corr60(a, b, n=60):
+    """Pearson correlation of the last n aligned daily returns. 0.0 when either side is too
+    short (<30 points) - fail-open, exactly how the 26.08 measurement treated missing data:
+    an unmeasurable pair must not block an entry."""
+    if not a or not b:
+        return 0.0
+    ra = [a[i] / a[i - 1] - 1 for i in range(1, len(a)) if a[i - 1] > 0]
+    rb = [b[i] / b[i - 1] - 1 for i in range(1, len(b)) if b[i - 1] > 0]
+    m = min(len(ra), len(rb), n)
+    if m < 30:
+        return 0.0
+    ra, rb = ra[-m:], rb[-m:]
+    ma, mb = sum(ra) / m, sum(rb) / m
+    va = sum((x - ma) ** 2 for x in ra)
+    vb = sum((x - mb) ** 2 for x in rb)
+    if va <= 0 or vb <= 0:
+        return 0.0
+    cov = sum((ra[i] - ma) * (rb[i] - mb) for i in range(m))
+    return cov / math.sqrt(va * vb)
 
 
 def load_state(path):
@@ -391,15 +417,21 @@ def main():
     near_high_max = _float_env("ENTRY_NEAR_HIGH")
     vol_mult_min = _float_env("ENTRY_VOL_MULT")
     max_hold_hours = _float_env("MAX_HOLD_HOURS")
+    # MAX_CORR=0.75: skip a candidate whose 60d correlation with an open position exceeds this.
+    # Measured 26.08 on 651 days: worst day -5.4% -> -2.5%, drawdown 11% -> 7%, t 2.18 -> 2.68,
+    # cost ~8pp of total return. A plateau, not a spike: 0.65 / 0.75 / 0.85 all improve t.
+    max_corr = _float_env("MAX_CORR")
     if not env.get(KEY_ENV[0]) or not env.get(SECRET_ENV[0]):
         raise SystemExit("missing %s/%s in local.env for --venue %s"
                          % (KEY_ENV[0], SECRET_ENV[0], args.venue))
     state = load_state(statepath)
     log("autoscan start: venue=%s top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
-        "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s near_high=%s vol_mult=%s max_hold=%s"
+        "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s near_high=%s vol_mult=%s max_hold=%s "
+        "max_corr=%s"
         % (args.venue, args.top, args.by_cap, args.lookback, args.dip_depth * 100,
            args.entry_band * 100, args.exit_band * 100, args.interval,
-           args.max_positions, args.min_hold_hours, gate, near_high_max, vol_mult_min, max_hold_hours), logpath)
+           args.max_positions, args.min_hold_hours, gate, near_high_max, vol_mult_min, max_hold_hours,
+           max_corr), logpath)
 
     while True:
         try:
@@ -595,6 +627,38 @@ def main():
                     log("%d candidate(s) too wide to size at this equity (risk $%.2f vs min notional): %s"
                         % (len(infeasible), risk_usd, ",".join(infeasible[:12])), logpath)
                 fresh = [sym for sym in fresh if sym not in set(infeasible)]
+            # Fifteen versions of the same bet is how a red day costs -5%: the correlation
+            # filter keeps a candidate out while it moves in lockstep with something already
+            # held. Off (MAX_CORR unset) it only reports; the shadow line below is forward
+            # evidence for the 14.09 decision.
+            if fresh and room > 0:
+                basket = [s for s in held if s in details]
+                def _worst_corr(sym, others):
+                    worst = 0.0
+                    for b in others:
+                        c = corr60(details[sym].get("closes"), details[b].get("closes"))
+                        if c > worst:
+                            worst = c
+                    return worst
+                if max_corr is not None:
+                    kept, skipped = [], []
+                    for sym in fresh:
+                        c = _worst_corr(sym, basket + kept)
+                        if c > max_corr:
+                            skipped.append("%s(%.2f)" % (sym, c))
+                        else:
+                            kept.append(sym)
+                        if len(kept) >= room:
+                            break
+                    if skipped:
+                        log("corr-filter >%.2f: skipped %s" % (max_corr, ",".join(skipped)), logpath)
+                    fresh = kept
+                else:
+                    shadow = ["%s(%.2f)" % (s, _worst_corr(s, basket)) for s in fresh[:room]
+                              if _worst_corr(s, basket) > 0.75]
+                    if shadow:
+                        log("shadow corr-filter 0.75 would skip %d of %d entr(ies): %s"
+                            % (len(shadow), min(room, len(fresh)), ",".join(shadow)), logpath)
             to_open = fresh[:room]
             if to_open:
                 def near_high(sym):
