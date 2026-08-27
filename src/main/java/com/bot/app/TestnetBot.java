@@ -153,25 +153,41 @@ public final class TestnetBot {
             // way to unwind it through the bot. Covers the first exchange read too: dying there was
             // measured with an invalid key on 20.08.
             boolean bootstrapped;
-            try {
-                // One 5xx or timeout here used to leave the book empty for the life of the process
-                // and every later pass flagging UNKNOWN_POSITION. Three tries, then the loop retries
-                // adoption itself after its first successful reconcile.
-                List<PositionSnapshot> live = readPositionsWithRetry(port, 3);
-                int seeded = BookLedger.seed(engine.book(), live, ledgerPath);
-                if (seeded > 0) {
-                    LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
+            while (true) {
+                try {
+                    // One 5xx or timeout here used to leave the book empty for the life of the process
+                    // and every later pass flagging UNKNOWN_POSITION. Three tries, then the loop retries
+                    // adoption itself after its first successful reconcile.
+                    List<PositionSnapshot> live = readPositionsWithRetry(port, 3);
+                    int seeded = BookLedger.seed(engine.book(), live, ledgerPath);
+                    if (seeded > 0) {
+                        LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
+                    }
+                    // The file is not the only record on a venue that lists conditional orders: without
+                    // this a fresh container halted on positions whose stops the exchange could name.
+                    int adopted = BookLedger.adopt(engine.book(), port, live);
+                    if (adopted > 0) {
+                        LOG.info("[Boot] adopted " + adopted + " position(s) with stops read from the exchange");
+                    }
+                    bootstrapped = reconciler.bootstrap(Instant.now());
+                } catch (RuntimeException e) {
+                    // An exchange-side hold (a 429/418 IP ban) is a wait, not a disagreement. On
+                    // 27.08 the overnight ban expired at 16:51, the very first request earned a
+                    // fresh 1028-minute one, and this catch latched a halt only a restart could
+                    // clear - a day of dead bot over an IP that was never ours to fix. Sleep the
+                    // hold out and read the account again; the halt latch is for books that do
+                    // not match, never for a venue that is not answering.
+                    long heldMs = port.heldByExchangeForMillis();
+                    if (heldMs > 0) {
+                        LOG.warning("[Boot] exchange hold in effect (" + (heldMs / 60_000)
+                                + " min left) - waiting it out, then reading the account again");
+                        Thread.sleep(heldMs + 15_000L);
+                        continue;
+                    }
+                    bootstrapped = false;
+                    halt.halt("boot could not read the exchange: " + e.getMessage(), Instant.now());
                 }
-                // The file is not the only record on a venue that lists conditional orders: without
-                // this a fresh container halted on positions whose stops the exchange could name.
-                int adopted = BookLedger.adopt(engine.book(), port, live);
-                if (adopted > 0) {
-                    LOG.info("[Boot] adopted " + adopted + " position(s) with stops read from the exchange");
-                }
-                bootstrapped = reconciler.bootstrap(Instant.now());
-            } catch (RuntimeException e) {
-                bootstrapped = false;
-                halt.halt("boot could not read the exchange: " + e.getMessage(), Instant.now());
+                break;
             }
             if (!bootstrapped) {
                 LOG.severe("[Boot] start-up reconciliation did not converge — trading is halted. "
