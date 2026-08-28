@@ -40,6 +40,15 @@ final class ExecFixtures {
         boolean sawCritical(String fragment) {
             return messages.stream().anyMatch(m -> m.startsWith("CRITICAL") && m.contains(fragment));
         }
+
+        boolean saw(Severity severity, String fragment) {
+            return messages.stream()
+                    .anyMatch(m -> m.startsWith(severity.name()) && m.contains(fragment));
+        }
+
+        boolean sawInfo(String fragment) { return saw(Severity.INFO, fragment); }
+
+        boolean sawWarning(String fragment) { return saw(Severity.WARNING, fragment); }
     }
 
     static RiskEngine engine() {

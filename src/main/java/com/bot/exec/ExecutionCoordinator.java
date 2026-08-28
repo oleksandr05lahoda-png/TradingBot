@@ -141,13 +141,23 @@ public final class ExecutionCoordinator {
         OrderStatus entry;
         try {
             entry = placer.place(entryRequest);
-            entry = awaitEntryResolution(entry, entryRequest);
         } catch (ExchangeException e) {
             if (!e.ambiguous()) {
                 // A definite refusal never landed, so there is nothing to clean up.
                 return refused(plan, "entry refused by the exchange: " + e.getMessage());
             }
             // Outcome never established, so the order may be live; not swallowable as "signal failed".
+            return unknownAfterSend(plan, e);
+        } catch (RuntimeException e) {
+            // A parse error mid-response is not a refusal: the request may well have executed.
+            return unknownAfterSend(plan, e);
+        }
+        try {
+            entry = awaitEntryResolution(entry, entryRequest);
+        } catch (RuntimeException e) {
+            // The order EXISTS by now. Any failure to READ it — a 429 on the poll, a body the
+            // parser chokes on — is ignorance about a live order, never "the entry never landed".
+            // Reported as refused, this was a filled position living outside the book (28.08 audit).
             return unknownAfterSend(plan, e);
         }
 
@@ -244,10 +254,18 @@ public final class ExecutionCoordinator {
         }
 
         BigDecimal residual = held.subtract(close.executedQuantity());
-        if (residual.signum() > 0) {
-            String note = "closed " + close.executedQuantity().toPlainString() + " of "
-                    + held.toPlainString() + "; " + residual.toPlainString()
-                    + " still open, keeping the protective orders";
+        if (residual.signum() != 0) {
+            // Negative means the order under this id reports MORE filled than the position holds:
+            // the placer adopted a terminal order from an earlier close under a repeated id, so it
+            // describes a different close than this one. Reading that as "flat" would cancel the
+            // protective orders off a position that is still open (28.08 review).
+            String note = residual.signum() > 0
+                    ? "closed " + close.executedQuantity().toPlainString() + " of "
+                            + held.toPlainString() + "; " + residual.toPlainString()
+                            + " still open, keeping the protective orders"
+                    : "the order under this id reports " + close.executedQuantity().toPlainString()
+                            + " filled against " + held.toPlainString() + " held — it describes an "
+                            + "earlier close, not this one; keeping the protective orders";
             alerts.critical("Partial close", symbol + ": " + note);
             halt.halt("partial close on " + symbol, clock.instant());
             return new CloseReport(symbol, false, close.executedQuantity(), close.averagePrice(), note);
@@ -325,7 +343,7 @@ public final class ExecutionCoordinator {
     }
 
     /** Halts and alerts rather than refusing: "unknown" is not "did not happen". */
-    private Report unknownAfterSend(TradePlan plan, ExchangeException cause) {
+    private Report unknownAfterSend(TradePlan plan, RuntimeException cause) {
         String note = "the fate of the entry order is unknown (" + cause.getMessage()
                 + "). A position may be open and unprotected. Trading is halted until an operator "
                 + "reconciles the account.";

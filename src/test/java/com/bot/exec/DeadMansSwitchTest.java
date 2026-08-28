@@ -33,7 +33,7 @@ class DeadMansSwitchTest {
     private final RiskEngine engine = ExecFixtures.engine();
 
     private DeadMansSwitch switchWith(long countdownMs, long silenceMs) {
-        return new DeadMansSwitch(exchange, engine, halt, alerts, countdownMs, silenceMs);
+        return new DeadMansSwitch(exchange, engine, alerts, countdownMs, silenceMs);
     }
 
     private void openBook(String symbol) {
@@ -86,21 +86,42 @@ class DeadMansSwitchTest {
     }
 
     @Test
-    @DisplayName("prolonged loss of contact halts new risk and alerts")
-    void lostContactHaltsAndAlerts() {
+    @DisplayName("prolonged loss of contact degrades and alerts, but never latches the halt")
+    void lostContactDegradesAndAlerts() {
         openBook("BTCUSDT");
         UnreachableExchange unreachable = new UnreachableExchange();
-        DeadMansSwitch deadMansSwitch = new DeadMansSwitch(unreachable, engine, halt, alerts, 120_000, 90_000);
+        DeadMansSwitch deadMansSwitch = new DeadMansSwitch(unreachable, engine, alerts, 120_000, 90_000);
 
         Instant start = ExecFixtures.NOON;
         deadMansSwitch.heartbeat(start);                      // first failure starts the clock
-        assertFalse(halt.isHalted(), "one failed heartbeat is not a lost connection");
+        assertFalse(deadMansSwitch.isDegraded(), "one failed heartbeat is not a lost connection");
 
         deadMansSwitch.heartbeat(start.plusSeconds(120));      // beyond the 90s tolerance
 
         assertTrue(deadMansSwitch.isDegraded());
-        assertTrue(halt.isHalted());
+        assertFalse(halt.isHalted(),
+                "a connectivity blip must degrade, not latch: the latch needed a human /resume "
+                + "and stood the whole machine down (28.08 audit)");
         assertTrue(alerts.sawCritical("contact lost"), alerts.messages.toString());
+    }
+
+    @Test
+    @DisplayName("contact returning clears the degraded state by itself and says so")
+    void contactReturningSelfClears() {
+        openBook("BTCUSDT");
+        FlakyExchange flaky = new FlakyExchange(exchange);
+        DeadMansSwitch deadMansSwitch = new DeadMansSwitch(flaky, engine, alerts, 120_000, 90_000);
+
+        flaky.reachable = false;
+        deadMansSwitch.heartbeat(ExecFixtures.NOON);
+        deadMansSwitch.heartbeat(ExecFixtures.NOON.plusSeconds(120));
+        assertTrue(deadMansSwitch.isDegraded());
+
+        flaky.reachable = true;
+        deadMansSwitch.heartbeat(ExecFixtures.NOON.plusSeconds(150));
+
+        assertFalse(deadMansSwitch.isDegraded(), "contact is back; nothing needs an operator");
+        assertTrue(alerts.sawInfo("contact restored"), alerts.messages.toString());
     }
 
     @Test
@@ -122,7 +143,7 @@ class DeadMansSwitchTest {
         assertTrue(exchange.order(restingEntryId).orElseThrow().isWorking());
 
         ArmFailingExchange armFails = new ArmFailingExchange(exchange);
-        DeadMansSwitch deadMansSwitch = new DeadMansSwitch(armFails, liveEngine, halt, alerts, 120_000, 90_000);
+        DeadMansSwitch deadMansSwitch = new DeadMansSwitch(armFails, liveEngine, alerts, 120_000, 90_000);
         deadMansSwitch.heartbeat(ExecFixtures.NOON, Set.of("ETHUSDT"));
         deadMansSwitch.heartbeat(ExecFixtures.NOON.plusSeconds(120), Set.of("ETHUSDT"));
 
@@ -145,7 +166,7 @@ class DeadMansSwitchTest {
         BigDecimal before = exchange.openPositions().get(0).signedQuantity();
 
         ArmFailingExchange armFails = new ArmFailingExchange(exchange);
-        DeadMansSwitch deadMansSwitch = new DeadMansSwitch(armFails, liveEngine, halt, alerts, 120_000, 90_000);
+        DeadMansSwitch deadMansSwitch = new DeadMansSwitch(armFails, liveEngine, alerts, 120_000, 90_000);
         deadMansSwitch.heartbeat(ExecFixtures.NOON, Set.of("BTCUSDT"));
         deadMansSwitch.heartbeat(ExecFixtures.NOON.plusSeconds(120), Set.of("BTCUSDT"));
 
@@ -179,6 +200,23 @@ class DeadMansSwitchTest {
 
         @Override public long serverTimeMillis() {
             throw ExchangeException.ambiguous("no route to host", null);
+        }
+    }
+
+    /** Reachability the test flips: down for the outage, back up for the recovery. */
+    private static final class FlakyExchange extends DelegatingExchange {
+        private final FakeExchange shared;
+        boolean reachable = true;
+
+        FlakyExchange(FakeExchange shared) { this.shared = shared; }
+
+        @Override public void ping() {
+            if (!reachable) throw ExchangeException.ambiguous("no route to host", null);
+        }
+
+        @Override public void armDeadMansSwitch(String symbol, long countdownMillis) {
+            if (!reachable) throw ExchangeException.ambiguous("no route to host", null);
+            shared.armDeadMansSwitch(symbol, countdownMillis);
         }
     }
 

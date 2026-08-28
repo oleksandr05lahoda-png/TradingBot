@@ -93,6 +93,21 @@ public final class ExposureBook {
         return Optional.ofNullable(positions.remove(symbol));
     }
 
+    /**
+     * Records the stop id now guarding {@code symbol} — the reconciler calls this after re-placing a
+     * stop the exchange lost, so the NEXT pass can confirm it by name. Everything else is unchanged.
+     * @return false when the symbol holds no position (nothing to guard)
+     */
+    public boolean recordStop(String symbol, String stopId) {
+        Preconditions.notBlank(symbol, "symbol");
+        Preconditions.notBlank(stopId, "stopId");
+        OpenPosition current = positions.get(symbol);
+        if (current == null) return false;
+        positions.put(symbol, new OpenPosition(current.symbol(), current.side(), current.quantity(),
+                current.entryPrice(), current.notionalUsd(), current.riskUsd(), Optional.of(stopId)));
+        return true;
+    }
+
     /** Overwrites the book from the exchange; reconciliation is the only caller allowed to do this. */
     public void replaceAll(Collection<OpenPosition> truth) {
         Preconditions.notNull(truth, "truth");

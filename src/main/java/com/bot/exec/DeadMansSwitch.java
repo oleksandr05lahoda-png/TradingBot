@@ -25,7 +25,6 @@ public final class DeadMansSwitch {
 
     private final ExchangePort port;
     private final RiskEngine engine;
-    private final TradingHalt halt;
     private final AlertSink alerts;
     private final long countdownMillis;
     private final long maxSilenceMillis;
@@ -36,11 +35,10 @@ public final class DeadMansSwitch {
     private volatile long lastSuccessMs = 0;
     private volatile boolean degraded = false;
 
-    public DeadMansSwitch(ExchangePort port, RiskEngine engine, TradingHalt halt, AlertSink alerts,
+    public DeadMansSwitch(ExchangePort port, RiskEngine engine, AlertSink alerts,
                           long countdownMillis, long maxSilenceMillis) {
         this.port = Preconditions.notNull(port, "port");
         this.engine = Preconditions.notNull(engine, "engine");
-        this.halt = Preconditions.notNull(halt, "halt");
         this.alerts = Preconditions.notNull(alerts, "alerts");
         Preconditions.require(countdownMillis > 0, "countdownMillis must be positive");
         Preconditions.require(maxSilenceMillis > 0, "maxSilenceMillis must be positive");
@@ -110,8 +108,7 @@ public final class DeadMansSwitch {
             if (degraded) {
                 degraded = false;
                 alerts.info("Exchange contact restored",
-                        "dead-man's switch heartbeat is succeeding again; the trading halt still "
-                                + "needs an explicit operator reset");
+                        "dead-man's switch heartbeat is succeeding again; entries resume by themselves");
             }
             return;
         }
@@ -120,10 +117,14 @@ public final class DeadMansSwitch {
         long silentFor = nowMs - lastSuccessMs;
         if (silentFor > maxSilenceMillis && !degraded) {
             degraded = true;
+            // Degraded, not latched: a two-minute egress blip on a shared IP used to stand the whole
+            // machine down until a human typed /resume (28.08 audit). Contact returning clears this
+            // by itself; the reconciler's own drift latch still exists for books that do not match.
             // Conditional on purpose: with market entries (the only kind today) nothing is ever armed,
             // and promising a countdown that does not exist misdirects the operator during an outage.
             String message = "no successful contact with the exchange for " + (silentFor / 1000)
-                    + "s while holding " + held.size() + " position(s). New risk is stopped. "
+                    + "s while holding " + held.size() + " position(s). New entries pause until "
+                    + "contact returns — no operator action needed. "
                     + (armed.isEmpty()
                             ? "No resting entry orders were armed, so there is nothing for the "
                                     + "exchange-side countdown to cancel. "
@@ -133,7 +134,6 @@ public final class DeadMansSwitch {
                     + "Protective stops and positions are deliberately left alone.";
             LOG.severe("[DeadMansSwitch] " + message);
             alerts.critical("Dead-man's switch: contact lost", message);
-            halt.halt("exchange contact lost for " + (silentFor / 1000) + "s", now);
             cancelNonReducingOrdersWhereStillPossible(shouldBeArmed);
         }
     }

@@ -8,6 +8,7 @@ import com.bot.exec.ExchangeSnapshots.AccountSnapshot;
 import com.bot.exec.ExchangeSnapshots.PositionSnapshot;
 import com.bot.exec.ExecutionCoordinator;
 import com.bot.exec.IdempotentOrderPlacer;
+import com.bot.exec.KillSwitchEnforcer;
 import com.bot.exec.Reconciler;
 import com.bot.exec.OrderTypes;
 import com.bot.exec.TradingHalt;
@@ -48,8 +49,22 @@ public final class TestnetBot {
     /** ...and before entries are refused until a pass succeeds (~5 min). Closes keep working. */
     private static final int RECONCILE_BLIND_AFTER = 10;
     private static final long HEARTBEAT_INTERVAL_MS = 30_000L;
-    private static final long DEAD_MANS_COUNTDOWN_MS = 120_000L;
-    private static final long DEAD_MANS_MAX_SILENCE_MS = 90_000L;
+    /**
+     * 300s of silence before entries pause, matching {@link #RECONCILE_BLIND_AFTER}'s ~5 min: the
+     * old 90s latched a permanent halt on a two-minute egress blip (28.08 audit). The exchange-side
+     * countdown must outlast the silence tolerance, so it moves with it.
+     */
+    private static final long DEAD_MANS_COUNTDOWN_MS = 600_000L;
+    private static final long DEAD_MANS_MAX_SILENCE_MS = 300_000L;
+    /** A failed close retries with backoff this many times before the operator is told to act. */
+    private static final int CLOSE_MAX_ATTEMPTS = 8;
+    private static final long CLOSE_RETRY_BASE_MS = 5_000L;
+    private static final long CLOSE_RETRY_CAP_MS = 300_000L;
+    /** Repeat the exchange-hold alert this often while the hold lasts; one alert was silence for 17h. */
+    private static final long HOLD_REMINDER_INTERVAL_MS = 3_600_000L;
+
+    /** A close that did not confirm flat, waiting for its next attempt. */
+    private record PendingClose(CloseRequest close, int attempts, long notBeforeMs) {}
 
     private TestnetBot() {}
 
@@ -136,11 +151,27 @@ public final class TestnetBot {
             ExecutionCoordinator coordinator = new ExecutionCoordinator(port, engine, placer, halt, alerts,
                     entrySettings(), Clock.systemUTC(), Thread::sleep);
             Reconciler reconciler = new Reconciler(port, engine, halt, alerts, placer);
+            // A booked position found without a stop is repaired — stop re-placed from the book's
+            // record, or closed reduce-only — instead of only halted on (28.08 audit, finding #1).
+            reconciler.withStopRepair(coordinator::closeOut);
             if (journal != null) {
                 reconciler.onExchangeExit(journal::exchangeExit);
+                reconciler.onRepairClose((requestId, symbol, closeReport) ->
+                        journal.closed(requestId, symbol, "stop-repair",
+                                closeReport.closedQuantity().toPlainString(),
+                                closeReport.averagePrice().toPlainString(), closeReport.note()));
             }
-            DeadMansSwitch deadMansSwitch = new DeadMansSwitch(port, engine, halt, alerts,
+            DeadMansSwitch deadMansSwitch = new DeadMansSwitch(port, engine, alerts,
                     DEAD_MANS_COUNTDOWN_MS, DEAD_MANS_MAX_SILENCE_MS);
+            // The daily loss limit closes the book on the trip (KILL_SWITCH_ACTION=halt-only opts
+            // out): -3% must mean -3%, not "-3% plus whatever the open losers still give back".
+            TradeJournal journalRef = journal;
+            KillSwitchEnforcer killSwitchEnforcer = new KillSwitchEnforcer(engine,
+                    coordinator::closeOut, alerts, killSwitchAction(),
+                    journalRef == null ? null : (requestId, symbol, closeReport) ->
+                            journalRef.closed(requestId, symbol, "daily-loss-kill-switch",
+                                    closeReport.closedQuantity().toPlainString(),
+                                    closeReport.averagePrice().toPlainString(), closeReport.note()));
 
             banner(venue, port, signals, config, defaultLeverage);
 
@@ -208,6 +239,60 @@ public final class TestnetBot {
                         "the bot reads the account and accepts closes; no position will be opened");
             }
 
+            if (venue.isReal() && venue.realMode() == BinanceVenue.RealMode.TRADE) {
+                // Proof of life for the alert channel itself: a rotated token or a chat id gone
+                // stale fails silently, and the first message the operator would miss is an
+                // incident. Every TRADE boot sends this line; its absence IS the alarm.
+                alerts.info("Bot is up", "REAL TRADE armed; " + engine.book().openCount()
+                        + " position(s) on the book. Every boot sends this line — a deploy with no "
+                        + "such message means the alert channel is broken.");
+            }
+
+            int tpLegs = config.takeProfitPolicy().legs().size();
+            int conditionalBudget = config.maxConcurrentPositions() * (1 + tpLegs);
+            if (conditionalBudget > 30) {
+                String text = "MAX_POSITIONS=" + config.maxConcurrentPositions() + " with " + tpLegs
+                        + " take-profit leg(s) needs up to " + conditionalBudget + " conditional "
+                        + "orders; the venue cap measured live on 14.08 was ~33. Positions past the "
+                        + "cap will have stops or takes refused. Set TP_R_MULTIPLE for a single "
+                        + "take, or lower MAX_POSITIONS.";
+                LOG.warning("[Boot] " + text);
+                alerts.warning("Conditional-order budget above the venue cap", text);
+            }
+
+            // The loop thread parks inside the rate limiter for the length of an exchange hold, so
+            // it cannot repeat its own alert: 17 hours of sleep used to be one Telegram line at the
+            // start and then silence. This thread exists only to keep telling the truth meanwhile.
+            Thread holdWatchdog = new Thread(() -> {
+                long lastReminderMs = 0;
+                while (true) {
+                    try {
+                        Thread.sleep(60_000L);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    long held = port.heldByExchangeForMillis();
+                    if (held < 300_000L) {
+                        lastReminderMs = 0;
+                        continue;
+                    }
+                    long nowWatchMs = System.currentTimeMillis();
+                    if (lastReminderMs == 0) {
+                        // The onExchangeHold alert already announced the hold; remind hourly after.
+                        lastReminderMs = nowWatchMs;
+                        continue;
+                    }
+                    if (nowWatchMs - lastReminderMs >= HOLD_REMINDER_INTERVAL_MS) {
+                        alerts.critical("Exchange hold continues", (held / 60_000) + " min left. The "
+                                + "bot sleeps the hold out and resumes by itself; resting stops keep "
+                                + "guarding every position. A /close executes after the hold ends.");
+                        lastReminderMs = nowWatchMs;
+                    }
+                }
+            }, "hold-watchdog");
+            holdWatchdog.setDaemon(true);
+            holdWatchdog.start();
+
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 LOG.info("[Shutdown] disarming the dead-man's switch");
                 deadMansSwitch.disarmAll();
@@ -221,6 +306,10 @@ public final class TestnetBot {
             boolean blind = false;
             boolean outageAlerted = false;
             boolean adoptionDone = bootstrapped;
+            // Closes that did not confirm flat, waiting for their next attempt with backoff. A
+            // close used to be single-shot: one 429 destroyed the request forever (28.08 audit).
+            java.util.ArrayDeque<PendingClose> pendingCloses = new java.util.ArrayDeque<>();
+            long signalMaxAgeMs = Math.max(0, intProperty("SIGNAL_MAX_AGE_MIN", 90)) * 60_000L;
 
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
@@ -228,14 +317,26 @@ public final class TestnetBot {
                 // An unreachable signal source must not kill the process: a dead bot cannot close
                 // the position it holds. Backing off keeps a hard-down queue from spinning the loop.
                 try {
-                    // Closes first, always: a halt must never be able to stop an unwind.
+                    // Closes first, always: a halt must never be able to stop an unwind. Retries
+                    // before fresh requests, so a backlog cannot starve a close already in flight.
+                    int duePending = pendingCloses.size();
+                    for (int i = 0; i < duePending; i++) {
+                        PendingClose pending = pendingCloses.poll();
+                        if (pending == null) break;
+                        if (pending.notBeforeMs() > System.currentTimeMillis()) {
+                            pendingCloses.add(pending);   // not due yet; rotate to the back
+                            continue;
+                        }
+                        attemptClose(pending.close(), pending.attempts() + 1,
+                                coordinator, signals, alerts, journal, pendingCloses);
+                    }
                     if (operator != null) {
                         for (CloseRequest close : operator.drainCloses()) {
-                            handleClose(close, coordinator, signals, alerts, journal);
+                            attemptClose(close, 1, coordinator, signals, alerts, journal, pendingCloses);
                         }
                     }
                     for (CloseRequest close : signals.pollCloses()) {
-                        handleClose(close, coordinator, signals, alerts, journal);
+                        attemptClose(close, 1, coordinator, signals, alerts, journal, pendingCloses);
                     }
                     for (Signal signal : signals.poll()) {
                         if (observeOnly) {
@@ -251,7 +352,40 @@ public final class TestnetBot {
                                     + reconcileFailures + " passes");
                             continue;
                         }
-                        handle(signal, engine, coordinator, port, signals, now, journal);
+                        if (deadMansSwitch.isDegraded()) {
+                            // Soft and self-clearing, exactly like blind: contact returning lifts it.
+                            LOG.warning("[Loop] refusing " + signal.symbol()
+                                    + ": no exchange contact (dead-man's switch degraded)");
+                            signals.onRejected(signal, "EXCHANGE_CONTACT_LOST: entries pause until "
+                                    + "the heartbeat succeeds again");
+                            continue;
+                        }
+                        // Read the clock HERE, not at the top of the tick: the closes above can park
+                        // inside the rate limiter for the length of an exchange hold, and an age
+                        // measured against a `now` from before that reads as fresh no matter how
+                        // long the wait was — which is the exact backlog this gate exists to stop.
+                        Instant atSignal = Instant.now();
+                        long ageMs = atSignal.toEpochMilli() - signal.createdAt().toEpochMilli();
+                        if (signalMaxAgeMs > 0 && ageMs > signalMaxAgeMs) {
+                            // A backlog written during a stall must not execute at market on prices
+                            // from another market. Closes are exempt above: an exit is never stale.
+                            LOG.warning("[Loop] refusing " + signal.symbol() + ": the signal is "
+                                    + (ageMs / 60_000) + " min old (limit SIGNAL_MAX_AGE_MIN="
+                                    + signalMaxAgeMs / 60_000 + ")");
+                            signals.onRejected(signal, "STALE_SIGNAL: " + (ageMs / 60_000)
+                                    + " min old, priced on a market that no longer exists");
+                            continue;
+                        }
+                        if (ageMs < -60_000L) {
+                            // Dated in the future: a writer's clock is wrong, and an age that reads
+                            // negative would sail through the gate above for as long as the skew.
+                            LOG.warning("[Loop] refusing " + signal.symbol() + ": dated "
+                                    + (-ageMs / 60_000) + " min in the future");
+                            signals.onRejected(signal, "STALE_SIGNAL: dated in the future — the "
+                                    + "writer's clock disagrees with this process's");
+                            continue;
+                        }
+                        handle(signal, engine, coordinator, port, signals, atSignal, journal);
                     }
                     if (sourceFailures > 0) {
                         LOG.info("[Loop] signal source is answering again after " + sourceFailures + " failure(s)");
@@ -290,7 +424,9 @@ public final class TestnetBot {
                 }
                 if (nowMs - lastReconcileMs >= RECONCILE_INTERVAL_MS) {
                     if (operator != null) {
-                        operator.publishStatus(statusLine(venue, engine, halt, port), Instant.now());
+                        operator.publishStatus(
+                                statusLine(venue, engine, halt, port, deadMansSwitch, pendingCloses.size()),
+                                Instant.now());
                     }
                     try {
                         // Any completed pass earns the right to persist — reconcile realigns the book
@@ -320,6 +456,9 @@ public final class TestnetBot {
                             blind = false;
                             outageAlerted = false;
                         }
+                        // The pass above fed the switch fresh numbers; a trip now closes the book
+                        // reduce-only so the daily limit is a ceiling, not a commentary.
+                        killSwitchEnforcer.enforce(Instant.now());
                     } catch (RuntimeException e) {
                         // A pass that could not run is blindness, not drift: the book was not touched,
                         // the resting stops still guard every position, and the next pass is 30s away.
@@ -357,6 +496,20 @@ public final class TestnetBot {
      * re-nominates within the hour. Default stays MARKET: switching execution is measured with the
      * cost probe, not assumed.
      */
+    /**
+     * What a tripped daily loss limit DOES. The default closes the whole book reduce-only;
+     * {@code KILL_SWITCH_ACTION=halt-only} restores the old block-entries-only behaviour.
+     */
+    private static KillSwitchEnforcer.Action killSwitchAction() {
+        String raw = System.getenv().getOrDefault("KILL_SWITCH_ACTION", "flatten")
+                .trim().toLowerCase(java.util.Locale.ROOT);
+        if (raw.equals("halt-only") || raw.equals("halt_only")) return KillSwitchEnforcer.Action.HALT_ONLY;
+        if (!raw.equals("flatten") && !raw.isEmpty()) {
+            LOG.warning("[Boot] unknown KILL_SWITCH_ACTION '" + raw + "' - using flatten");
+        }
+        return KillSwitchEnforcer.Action.FLATTEN;
+    }
+
     private static ExecutionCoordinator.Settings entrySettings() {
         String type = System.getenv().getOrDefault("ENTRY_TYPE", "market").trim().toLowerCase(java.util.Locale.ROOT);
         if (!type.equals("limit")) return ExecutionCoordinator.Settings.defaults();
@@ -388,7 +541,8 @@ public final class TestnetBot {
     }
 
     /** One line the operator can read on a phone; built on the loop thread from the loop's own state. */
-    private static String statusLine(BinanceVenue venue, RiskEngine engine, TradingHalt halt, ExchangePort port) {
+    private static String statusLine(BinanceVenue venue, RiskEngine engine, TradingHalt halt,
+                                     ExchangePort port, DeadMansSwitch deadMansSwitch, int pendingCloses) {
         StringBuilder sb = new StringBuilder();
         sb.append(venue.isReal() ? "REAL " + venue.realMode() : "DEMO").append(" | ");
         List<ExposureBook.OpenPosition> open = engine.book().all();
@@ -402,16 +556,29 @@ public final class TestnetBot {
         sb.append("\nhalt: ").append(halt.isHalted() ? halt.reason().orElse("yes") : "none");
         long held = port.heldByExchangeForMillis();
         if (held > 0) sb.append("\nexchange hold: ").append(held / 60_000).append(" min left");
+        if (deadMansSwitch.isDegraded()) sb.append("\nentries: PAUSED (exchange contact lost)");
+        if (pendingCloses > 0) sb.append("\ncloses retrying: ").append(pendingCloses);
         sb.append("\nkill switch: ").append(engine.killSwitch().isTripped(Instant.now()) ? "TRIPPED" : "armed");
         return sb.toString();
     }
 
-    private static void handleClose(CloseRequest close, ExecutionCoordinator coordinator,
-                                    SignalSource signals, AlertSink alerts, TradeJournal journal)
+    /**
+     * One attempt at a close. Anything short of a confirmed flat re-queues with exponential backoff
+     * — a close used to be single-shot, and one 429 on the position read destroyed the request
+     * forever while a halt stood the scanner down behind it (28.08 audit, finding #3). Retries get
+     * a fresh id suffix so a partially-filled earlier attempt is not adopted as "already done";
+     * reduce-only makes any duplicate harmless.
+     */
+    private static void attemptClose(CloseRequest close, int attempt, ExecutionCoordinator coordinator,
+                                     SignalSource signals, AlertSink alerts, TradeJournal journal,
+                                     java.util.ArrayDeque<PendingClose> pendingCloses)
             throws Exception {
-        LOG.info("[Loop] " + close);
+        LOG.info("[Loop] " + close
+                + (attempt > 1 ? " (attempt " + attempt + "/" + CLOSE_MAX_ATTEMPTS + ")" : ""));
+        String requestId = attempt == 1 ? close.id() : close.id() + "-r" + attempt;
+        String failure;
         try {
-            ExecutionCoordinator.CloseReport report = coordinator.closeOut(close.symbol(), close.id());
+            ExecutionCoordinator.CloseReport report = coordinator.closeOut(close.symbol(), requestId);
             if (report.flat()) {
                 if (journal != null) {
                     journal.closed(close.id(), close.symbol(), close.reason(),
@@ -420,19 +587,37 @@ public final class TestnetBot {
                 }
                 signals.onClosed(close, new ExecutionFeedback(close.id(), report.closedQuantity(),
                         report.averagePrice(), report.note()));
-            } else {
-                // Already alerted and halted; the row stays claimed rather than retried into a loop.
-                LOG.severe("[Loop] close of " + close.symbol() + " did not complete: " + report.note());
+                if (attempt > 1) {
+                    alerts.info("Close succeeded on retry", close.symbol() + " closed on attempt "
+                            + attempt + "; a halt latched by the earlier failure still needs /resume");
+                }
+                return;
             }
+            failure = report.note();
         } catch (RuntimeException e) {
-            // The source consumed the request before this throw, so nothing will retry it: the
-            // position rides its exchange stop unless someone acts. A log line is not enough.
-            LOG.severe("[Loop] close of " + close.symbol() + " failed: " + e.getMessage());
-            alerts.critical("Close request lost",
-                    close.symbol() + ": " + e.getMessage() + " — the request was consumed and will "
-                            + "not retry; the position remains protected only by its resting stop. "
-                            + "Close it by hand or re-issue the close.");
+            failure = e.getMessage();
         }
+        if (attempt >= CLOSE_MAX_ATTEMPTS) {
+            LOG.severe("[Loop] close of " + close.symbol() + " abandoned after " + attempt
+                    + " attempts: " + failure);
+            alerts.critical("Close abandoned after retries",
+                    close.symbol() + ": " + failure + " — " + CLOSE_MAX_ATTEMPTS + " attempts "
+                            + "failed. The position keeps its resting stop; close it by hand "
+                            + "or re-issue /close.");
+            return;
+        }
+        long delay = Math.min(CLOSE_RETRY_CAP_MS, CLOSE_RETRY_BASE_MS << (attempt - 1));
+        LOG.warning("[Loop] close of " + close.symbol() + " did not complete (" + failure
+                + ") — retrying in " + (delay / 1000) + "s");
+        if (attempt == 1) {
+            // The queue is in memory: a restart before the retries land drops the request, so the
+            // operator must hear about the FIRST failure, not only about abandonment ten minutes on.
+            alerts.warning("Close failed — retrying",
+                    close.symbol() + ": " + failure + ". Up to " + CLOSE_MAX_ATTEMPTS
+                            + " attempts over ~10 min. The retry queue does not survive a restart — "
+                            + "re-issue /close if the bot restarts meanwhile.");
+        }
+        pendingCloses.add(new PendingClose(close, attempt, System.currentTimeMillis() + delay));
     }
 
     private static void handle(Signal signal, RiskEngine engine, ExecutionCoordinator coordinator,

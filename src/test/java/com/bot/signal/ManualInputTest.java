@@ -46,6 +46,30 @@ class ManualInputTest {
     }
 
     @Test
+    @DisplayName("ts= dates the signal at when it was WRITTEN, not when this process read it")
+    void tsStampsTheSignalWithTheWritersClock() {
+        long writtenAt = Instant.parse("2026-08-09T09:00:00Z").getEpochSecond();
+        Signal signal = ManualInput.parse(
+                "BTCUSDT LONG entry=64000 atr=600 ts=" + writtenAt, CLOCK, 2, 1);
+
+        assertEquals(Instant.ofEpochSecond(writtenAt), signal.createdAt(),
+                "a backlog replayed after a stall must look as old as it is");
+
+        Signal unstamped = ManualInput.parse("BTCUSDT LONG entry=64000 atr=600", CLOCK, 2, 2);
+        assertEquals(CLOCK.instant(), unstamped.createdAt(), "no ts= keeps the old behaviour");
+    }
+
+    @Test
+    @DisplayName("ts= in milliseconds or garbage is refused, not silently mis-dated")
+    void tsRefusesMillisecondsAndGarbage() {
+        assertThrows(IllegalArgumentException.class, () -> ManualInput.parse(
+                "BTCUSDT LONG entry=64000 atr=600 ts=1785300000000", CLOCK, 2, 1),
+                "epoch milliseconds would read as year 58,000 — refuse at the point of writing");
+        assertThrows(IllegalArgumentException.class, () -> ManualInput.parse(
+                "BTCUSDT LONG entry=64000 atr=600 ts=yesterday", CLOCK, 2, 1));
+    }
+
+    @Test
     @DisplayName("a line with neither a stop nor an ATR is refused at the point of typing")
     void refusesALineWithNoStopSource() {
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,

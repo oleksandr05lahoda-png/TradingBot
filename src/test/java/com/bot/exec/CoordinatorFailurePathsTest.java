@@ -98,6 +98,41 @@ class CoordinatorFailurePathsTest {
     }
 
     @Test
+    @DisplayName("a definite refusal while READING a live entry is unknown-after-send, never 'refused'")
+    void refusalDuringResolutionIsUnknownNotRefused() throws Exception {
+        TradePlan plan = plan();
+        // The market entry half-fills, so resolution has to poll — and the poll is answered with a
+        // definite 429. Before 28.08 that took the `!ambiguous` branch and reported REFUSED: a
+        // half-filled position living on the exchange with no stop, no book entry and no alert.
+        exchange.fillRatio = 0.5;
+        DelegatingExchange pollRefused = new DelegatingExchange() {
+            private int queries = 0;
+            { /* the shared state lives in the outer test's exchange */ }
+            @Override public OrderStatus placeOrder(OrderRequest request) {
+                return exchange.placeOrder(request);
+            }
+            @Override public java.util.Optional<OrderStatus> queryOrder(String symbol, String clientOrderId) {
+                if (++queries == 1) return java.util.Optional.empty();   // the placer's pre-check
+                throw ExchangeException.refused("rate limited", 429, 0);
+            }
+            @Override public com.bot.core.InstrumentFilters fetchFilters(String symbol) {
+                return exchange.fetchFilters(symbol);
+            }
+            @Override public void ensureIsolatedMargin(String symbol) { }
+            @Override public void setLeverage(String symbol, int leverage) { }
+        };
+        IdempotentOrderPlacer placer = new IdempotentOrderPlacer(pollRefused, 1, 1, 0, ExecFixtures.NO_SLEEP);
+        ExecutionCoordinator coordinator = new ExecutionCoordinator(pollRefused, engine, placer, halt,
+                alerts, ExecutionCoordinator.Settings.defaults(), ExecFixtures.CLOCK, ExecFixtures.NO_SLEEP);
+
+        ExecutionCoordinator.Report report = coordinator.execute(plan);
+
+        assertEquals(ExecutionCoordinator.Outcome.UNKNOWN_AFTER_SEND, report.outcome());
+        assertTrue(halt.isHalted(), "a live order this process cannot read is unknown risk");
+        assertTrue(alerts.sawCritical("Entry outcome unknown"), alerts.messages.toString());
+    }
+
+    @Test
     @DisplayName("an entry the exchange definitely refused is an ordinary refusal, not a halt")
     void definitelyRefusedEntryDoesNotHalt() throws Exception {
         TradePlan plan = plan();

@@ -22,7 +22,7 @@ import java.util.logging.Logger;
 /**
  * An operator typing trades, one line at a time — the source the smoke run uses. Blank and
  * {@code #} lines are ignored; ids are stable per line, so a replayed line is one trade, not two.
- * Format: {@code SYMBOL SIDE entry=<price> [stop=<price>] [atr=<value>] [lev=<1..5>] [id=<text>]}
+ * Format: {@code SYMBOL SIDE entry=<price> [stop=<price>] [atr=<value>] [lev=<1..5>] [id=<text>] [ts=<epoch-seconds>]}
  * or {@code CLOSE SYMBOL [id=<text>] [reason=<text>]}.
  */
 public final class ManualInput implements SignalSource {
@@ -166,6 +166,7 @@ public final class ManualInput implements SignalSource {
         Double atr = null;
         Integer leverage = null;
         String id = null;
+        Long tsEpochSeconds = null;
 
         for (int i = 2; i < parts.length; i++) {
             String token = parts[i];
@@ -179,6 +180,10 @@ public final class ManualInput implements SignalSource {
                 case "atr" -> atr = parseDouble(key, value);
                 case "lev", "leverage" -> leverage = parseInt(key, value);
                 case "id" -> id = value;
+                // When the writer stamps the line, the signal's age is when it was WRITTEN, not
+                // when this process got around to reading it — a backlog replayed after a stall
+                // must look as old as it is, or it executes at market on another market's prices.
+                case "ts" -> tsEpochSeconds = parseEpochSeconds(value);
                 default -> throw new IllegalArgumentException("unknown key \"" + key + "\"");
             }
         }
@@ -200,7 +205,21 @@ public final class ManualInput implements SignalSource {
                 stop == null ? OptionalDouble.empty() : OptionalDouble.of(stop),
                 atr == null ? OptionalDouble.empty() : OptionalDouble.of(atr),
                 leverage == null ? defaultLeverage : leverage,
-                clock.instant());
+                tsEpochSeconds == null ? clock.instant() : java.time.Instant.ofEpochSecond(tsEpochSeconds));
+    }
+
+    private static long parseEpochSeconds(String value) {
+        long ts;
+        try {
+            ts = Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("ts= is not an epoch-seconds integer: \"" + value + "\"");
+        }
+        // Outside [2001, 2286] the writer sent milliseconds or garbage; refusing beats a signal
+        // that reads as 55 years old and is silently discarded as stale.
+        Preconditions.require(ts > 1_000_000_000L && ts < 9_999_999_999L,
+                "ts= must be epoch SECONDS, got " + value);
+        return ts;
     }
 
     private static double parseDouble(String key, String value) {

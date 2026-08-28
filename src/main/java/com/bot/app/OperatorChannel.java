@@ -219,7 +219,9 @@ public final class OperatorChannel implements AutoCloseable {
                             + "environment and restart to enable entries.";
                 }
                 halt.clear();
-                return "halt cleared. It was: " + was + "\nEntries resume at the next signal; the scanner re-checks within 5 min.";
+                return "halt cleared. It was: " + was + "\nEntries resume at the next signal; the "
+                        + "scanner proposes entries again on its next hourly pass (its exits were "
+                        + "never stopped by the halt).";
             }
             case "/close": {
                 String symbol = text.split("\\s+", 3).length > 1
@@ -229,9 +231,11 @@ public final class OperatorChannel implements AutoCloseable {
                 }
                 closes.add(new CloseRequest("tg-close-" + symbol + "-" + now.getEpochSecond(),
                         symbol, "operator via Telegram", now));
-                return "queued: closing " + symbol + " reduce-only. The loop executes it within a "
-                        + "second and cancels its stop and take; if there is no such position you "
-                        + "will see 'already flat' in the log.";
+                return "queued: closing " + symbol + " reduce-only; its stop and take are cancelled "
+                        + "with it. Normally executed within a second — but during an exchange hold "
+                        + "(429/418, see /status) only after the hold ends. A failed attempt retries "
+                        + "for ~10 min; a bot RESTART drops the queue, so re-issue it then. No such "
+                        + "position reads 'already flat' in the log.";
             }
             case "/help":
                 return "/status - what the bot holds and whether it is halted\n"

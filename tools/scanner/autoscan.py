@@ -79,8 +79,12 @@ def get(path, params, base=FAPI, gap=0.25, tries=5):
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code in (429, 418):
-                time.sleep(float(e.headers.get("Retry-After") or 30) + 5)
-                continue
+                # Capped AND once: a 1028-minute ban header would otherwise park this
+                # single-threaded loop inside one data call, exits included — and retrying five
+                # times multiplies the cap back into ~25 minutes. Wait the capped moment, then let
+                # the pass fail so the outer loop reaches its own sleep and the next pass (28.08).
+                time.sleep(min(float(e.headers.get("Retry-After") or 30), 300.0) + 5)
+                return None
             if e.code >= 500:
                 time.sleep(3 * (attempt + 1))
                 continue
@@ -128,7 +132,7 @@ def read_env(repo):
     for k in ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
               "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
               "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE",
-              "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS"):
+              "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
@@ -356,6 +360,19 @@ def bot_is_halted(bot_log):
     return text.rfind("HALTED at") > text.rfind("HALT CLEARED at")
 
 
+def halt_reason_is_observe(bot_log):
+    """True when the latest halt is the REAL_MODE=observe latch: the operator asked for a
+    read-only bot, so the scanner must not drive closes either. Every other halt is an
+    incident latch, where exits must keep working - see the halted branch in main()."""
+    try:
+        with io.open(bot_log, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return False
+    i = text.rfind("HALTED at")
+    return i >= 0 and "REAL_MODE=observe" in text[i:i + 400]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=os.path.abspath(os.path.join(ROOT, "..", "..")))
@@ -435,21 +452,35 @@ def main():
 
     while True:
         try:
-            if bot_is_halted(args.bot_log):
-                # Closes still work during a halt, so feeding the file would slowly eat the book
-                # while opening nothing back. Stand down completely and say so, loudly.
-                log("BOT IS HALTED — standing down; no closes, no opens, book frozen under its "
-                    "stops until the operator restarts the bot", logpath)
-                if not state.get("told_halted"):
-                    notify(env, "bot is HALTED - standing down; the book is frozen under its "
-                                "stops until the operator clears the halt", logpath)
-                    state["told_halted"] = True
+            halted = bot_is_halted(args.bot_log)
+            if halted and halt_reason_is_observe(args.bot_log):
+                # REAL_MODE=observe is the operator's own choice of a read-only bot; the scanner
+                # must not drive closes into it. Stand down completely, as before.
+                log("BOT IS HALTED (REAL_MODE=observe) — standing down; the book is frozen "
+                    "until the operator switches to trade", logpath)
+                # The KIND is stored, not a boolean: observe->incident and back are different
+                # facts, and one flag made the second transition silent.
+                if state.get("told_halted") != "observe":
+                    notify(env, "bot is in OBSERVE mode - scanner stands down; nothing is "
+                                "opened or closed until REAL_MODE=trade", logpath)
+                    state["told_halted"] = "observe"
                     save_state(statepath, state)
-                # /resume promises the scanner follows within minutes, not within the hour.
                 time.sleep(min(args.interval, 300))
                 continue
-            if state.get("told_halted"):
-                state["told_halted"] = False
+            if halted:
+                # An incident halt stops ENTRIES only. Standing down entirely deleted the one
+                # automatic exit exactly when something had already gone wrong - the halt that
+                # follows a missing stop used to strip the trend-exit and max-hold closes with it
+                # (28.08 audit). Exits keep flowing; to_open is emptied below.
+                log("bot is HALTED — entries suppressed, exits continue (closes ignore the halt)",
+                    logpath)
+                if state.get("told_halted") != "incident":
+                    notify(env, "bot is HALTED - the scanner keeps managing exits and proposes "
+                                "no entries; /resume lifts the halt", logpath)
+                    state["told_halted"] = "incident"
+                    save_state(statepath, state)
+            elif state.get("told_halted"):
+                state["told_halted"] = None
                 save_state(statepath, state)
             if not bot_is_ready(args.bot_log):
                 # Short sleep: the moment the bot adopts the account the next pass should feed it.
@@ -516,6 +547,10 @@ def main():
                 log("balance unreadable (%s) - feasibility filter off this pass" % type(e).__name__, logpath)
             tick = get("/fapi/v1/ticker/price", {}, gap=0.5) or []
             live = {t["symbol"]: float(t["price"]) for t in tick}
+            # Every entry this pass writes is priced from THIS snapshot, so this is the moment the
+            # bot's staleness gate must measure against. Stamping at file-append time instead would
+            # call a line fresh after a pass that spent 25 minutes inside a throttled kline call.
+            snapshot_at = int(time.time())
 
             # The regime is reported every scan and announced on a flip. Under the default
             # gate ("off") it changes nothing - the log records what a cash gate WOULD have
@@ -681,6 +716,10 @@ def main():
                 else:
                     log("regime BEAR, gate off: a cash gate would have suppressed %d entry(ies) (%s)"
                         % (len(to_open), ",".join(to_open)), logpath)
+            if halted and to_open:
+                log("halt: suppressing %d entry(ies) (%s); exits keep working"
+                    % (len(to_open), ",".join(to_open)), logpath)
+                to_open = []
 
             if not to_close and not to_open:
                 log("scan: %d held, %d hold-ok, %d entry-ok, nothing to do"
@@ -699,8 +738,12 @@ def main():
                     for s in to_open:
                         m = details[s]
                         trig = m.get("trig") or "trend"
-                        f.write("%s LONG entry=%.10g atr=%.10g lev=%d id=auto-%s-%s-%s\n"
-                                % (s, m["price"], m["atr"], args.leverage, trig, s, stamp))
+                        # ts= dates the line at the moment its PRICE was read, not at append time:
+                        # the bot refuses an entry older than SIGNAL_MAX_AGE_MIN instead of
+                        # executing a stall's backlog at market on prices from another market.
+                        f.write("%s LONG entry=%.10g atr=%.10g lev=%d id=auto-%s-%s-%s ts=%d\n"
+                                % (s, m["price"], m["atr"], args.leverage, trig, s, stamp,
+                                   snapshot_at))
                         entered[s] = now
                         entered_trig[s] = trig
                 save_state(statepath, state)
