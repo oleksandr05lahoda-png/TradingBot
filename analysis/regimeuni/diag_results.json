@@ -1,0 +1,86 @@
+{
+ "H3": {
+  "design_BEAR": {
+   "alpha_ann_pct": -9.527703371800085,
+   "beta": 0.3447657953623067,
+   "days": 677,
+   "gross_ann_pct": -30.29307514036981,
+   "label": "H3/design/BEAR",
+   "net_ann_pct": -17.435846260027525,
+   "sharpe": -0.1919904160884596,
+   "t": -0.1695139891968507
+  },
+  "design_BULL": {
+   "alpha_ann_pct": 23.536421826514378,
+   "beta": 0.7301708496499834,
+   "days": 844,
+   "gross_ann_pct": 152.19325636714927,
+   "label": "H3/design/BULL",
+   "net_ann_pct": 115.7979026306706,
+   "sharpe": 1.1347748701144655,
+   "t": 0.40526947413113323
+  },
+  "holdout_BEAR": {
+   "alpha_ann_pct": 236.01933636067528,
+   "beta": 0.323295948457821,
+   "days": 439,
+   "gross_ann_pct": 186.7851471364743,
+   "label": "H3/holdout/BEAR",
+   "net_ann_pct": 246.72326799299253,
+   "sharpe": 1.6176057712056382,
+   "t": 1.6539768514435542
+  },
+  "holdout_BULL": {
+   "alpha_ann_pct": -68.88269708886429,
+   "beta": 0.8277201673239526,
+   "days": 517,
+   "gross_ann_pct": -48.048237987956554,
+   "label": "H3/holdout/BULL",
+   "net_ann_pct": -51.40867406582608,
+   "sharpe": -0.502623318934234,
+   "t": -0.827267589324651
+  }
+ },
+ "base": {
+  "design_BEAR": {
+   "alpha_ann_pct": -63.455227899307445,
+   "beta": 0.4102607385294313,
+   "days": 677,
+   "gross_ann_pct": -78.17736384306814,
+   "label": "base/design/BEAR",
+   "net_ann_pct": -72.86567576090866,
+   "sharpe": -0.749142962439418,
+   "t": -1.0436367629218741
+  },
+  "design_BULL": {
+   "alpha_ann_pct": 25.236684589429757,
+   "beta": 0.7249827464886167,
+   "days": 844,
+   "gross_ann_pct": 153.34258516093985,
+   "label": "base/design/BULL",
+   "net_ann_pct": 116.84261733868644,
+   "sharpe": 1.1464252637974461,
+   "t": 0.43955095434340224
+  },
+  "holdout_BEAR": {
+   "alpha_ann_pct": 188.02879409646224,
+   "beta": 0.39373574015656043,
+   "days": 439,
+   "gross_ann_pct": 189.62238357611557,
+   "label": "base/holdout/BEAR",
+   "net_ann_pct": 201.0649006853003,
+   "sharpe": 1.5434505153329388,
+   "t": 1.4844008565027798
+  },
+  "holdout_BULL": {
+   "alpha_ann_pct": -51.79813552077908,
+   "beta": 0.8122428347756043,
+   "days": 517,
+   "gross_ann_pct": -32.30625585425902,
+   "label": "base/holdout/BULL",
+   "net_ann_pct": -34.65085488721221,
+   "sharpe": -0.3424266388888672,
+   "t": -0.633665899860057
+  }
+ }
+}

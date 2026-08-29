@@ -1,0 +1,112 @@
+{
+ "control: no switch (base)": {
+  "design": {
+   "alpha_ann_pct": -0.5137409971859211,
+   "beta": 0.5494831289334227,
+   "days": 1521,
+   "gross_ann_pct": 50.29261443397508,
+   "label": "control: no switch (base)",
+   "net_ann_pct": 32.40309437456686,
+   "sharpe": 0.3241478437666788,
+   "t": -0.011746694919958986
+  },
+  "holdout": {
+   "alpha_ann_pct": 57.849636819462326,
+   "beta": 0.5913260604090799,
+   "days": 956,
+   "gross_ann_pct": 69.6044896582247,
+   "label": "control: no switch (base)",
+   "net_ann_pct": 73.59100358175536,
+   "sharpe": 0.6368291128325828,
+   "t": 0.766475552806924
+  }
+ },
+ "switch on BTC 30d < 0 (H3)": {
+  "design": {
+   "alpha_ann_pct": 25.72952678696533,
+   "beta": 0.5135754080987937,
+   "days": 1521,
+   "gross_ann_pct": 70.96824227734623,
+   "label": "switch on BTC 30d < 0 (H3)",
+   "net_ann_pct": 56.495306970576834,
+   "sharpe": 0.5810008186569657,
+   "t": 0.6105359503741468
+  },
+  "holdout": {
+   "alpha_ann_pct": 70.54740764762889,
+   "beta": 0.5615082422172119,
+   "days": 956,
+   "gross_ann_pct": 59.78843154094003,
+   "label": "switch on BTC 30d < 0 (H3)",
+   "net_ann_pct": 85.49501062436366,
+   "sharpe": 0.6679606224943155,
+   "t": 0.8753409002853508
+  }
+ },
+ "switch on BTC < -1% today": {
+  "design": {
+   "alpha_ann_pct": 32.91903853133362,
+   "beta": 0.4893559552628932,
+   "days": 1521,
+   "gross_ann_pct": 77.23064931574977,
+   "label": "switch on BTC < -1% today",
+   "net_ann_pct": 62.2339502536318,
+   "sharpe": 0.6129288006907703,
+   "t": 0.7134603690647849
+  },
+  "holdout": {
+   "alpha_ann_pct": 78.85919991650067,
+   "beta": 0.5853514626765842,
+   "days": 956,
+   "gross_ann_pct": 83.3115129893399,
+   "label": "switch on BTC < -1% today",
+   "net_ann_pct": 94.44152018911369,
+   "sharpe": 0.7795386706070319,
+   "t": 1.0032862975027363
+  }
+ },
+ "switch on BTC < -2% today": {
+  "design": {
+   "alpha_ann_pct": -4.780278687020774,
+   "beta": 0.5262016971928863,
+   "days": 1521,
+   "gross_ann_pct": 43.92655831026772,
+   "label": "switch on BTC < -2% today",
+   "net_ann_pct": 26.741880459987012,
+   "sharpe": 0.2681814648228087,
+   "t": -0.10898568524964518
+  },
+  "holdout": {
+   "alpha_ann_pct": 49.29098444681457,
+   "beta": 0.5812588553455827,
+   "days": 956,
+   "gross_ann_pct": 57.311538316882626,
+   "label": "switch on BTC < -2% today",
+   "net_ann_pct": 64.7643576641147,
+   "sharpe": 0.5579640843962266,
+   "t": 0.6667389567086034
+  }
+ },
+ "switch on BTC red today": {
+  "design": {
+   "alpha_ann_pct": 67.01507970137574,
+   "beta": 0.48343347294447153,
+   "days": 1521,
+   "gross_ann_pct": 107.30694339174607,
+   "label": "switch on BTC red today",
+   "net_ann_pct": 95.9752045972867,
+   "sharpe": 0.9310264260508563,
+   "t": 1.4193196877350107
+  },
+  "holdout": {
+   "alpha_ann_pct": 34.02995845136768,
+   "beta": 0.5655724114015991,
+   "days": 956,
+   "gross_ann_pct": 38.32557902444527,
+   "label": "switch on BTC red today",
+   "net_ann_pct": 49.08575144711021,
+   "sharpe": 0.4264662286350222,
+   "t": 0.47397259985017526
+  }
+ }
+}

@@ -1,0 +1,132 @@
+{
+ "BTC 30d < 0   (my old flag)": {
+  "bear_days": 1117,
+  "design": {
+   "alpha_ann_pct": 242.35303818252487,
+   "beta": 0.4566374323342333,
+   "days": 677,
+   "gross_ann_pct": 200.2442064513095,
+   "label": "d",
+   "net_ann_pct": 231.87881448751614,
+   "sharpe": 0.632449343912585,
+   "t": 1.0090294277077336
+  },
+  "design_usd_per_year_at_fixed_size": 13.912728869250968,
+  "holdout": {
+   "alpha_ann_pct": 293.5874179756222,
+   "beta": 0.8770821551991457,
+   "days": 439,
+   "gross_ann_pct": 131.78314581766998,
+   "label": "h",
+   "net_ann_pct": 322.6265304976338,
+   "sharpe": 1.211169972346165,
+   "t": 1.133782012570084
+  },
+  "holdout_usd_per_year_at_fixed_size": 19.357591829858023,
+  "signals_bear": 710
+ },
+ "BTC today < -1%": {
+  "bear_days": 727,
+  "design": {
+   "alpha_ann_pct": -22.422745315550905,
+   "beta": 0.4883871501084033,
+   "days": 450,
+   "gross_ann_pct": 46.32155591374765,
+   "label": "d",
+   "net_ann_pct": 37.28287823941143,
+   "sharpe": 0.22320036919099992,
+   "t": -0.15942411147471275
+  },
+  "design_usd_per_year_at_fixed_size": 2.236972694364686,
+  "holdout": {
+   "alpha_ann_pct": 128.53555930383806,
+   "beta": 1.0260040267032198,
+   "days": 277,
+   "gross_ann_pct": 3.650086485973398,
+   "label": "h",
+   "net_ann_pct": 135.64998663721585,
+   "sharpe": 0.548529315896374,
+   "t": 0.4739814267583752
+  },
+  "holdout_usd_per_year_at_fixed_size": 8.13899919823295,
+  "signals_bear": 397
+ },
+ "BTC today < -2%": {
+  "bear_days": 433,
+  "design": {
+   "alpha_ann_pct": -37.82324809863501,
+   "beta": 0.33908979690948254,
+   "days": 283,
+   "gross_ann_pct": 55.814394984351566,
+   "label": "d",
+   "net_ann_pct": 45.8123550629314,
+   "sharpe": 0.2747628942325013,
+   "t": -0.2193878811282955
+  },
+  "design_usd_per_year_at_fixed_size": 2.7487413037758843,
+  "holdout": {
+   "alpha_ann_pct": 43.16385023272113,
+   "beta": 0.6680866974807419,
+   "days": 150,
+   "gross_ann_pct": -102.29202396562565,
+   "label": "h",
+   "net_ann_pct": 40.80487737148837,
+   "sharpe": 0.1581571330433404,
+   "t": 0.11421160242789662
+  },
+  "holdout_usd_per_year_at_fixed_size": 2.448292642289302,
+  "signals_bear": 207
+ },
+ "BTC today < -3%": {
+  "bear_days": 260,
+  "design": {
+   "alpha_ann_pct": -39.19237052493835,
+   "beta": 0.22034902720689767,
+   "days": 179,
+   "gross_ann_pct": 45.84446975369457,
+   "label": "d",
+   "net_ann_pct": 36.92747277171796,
+   "sharpe": 0.2153271427292564,
+   "t": -0.17657656860709212
+  },
+  "design_usd_per_year_at_fixed_size": 2.2156483663030775,
+  "holdout": {
+   "alpha_ann_pct": 44.90552627209385,
+   "beta": 0.6838077145066788,
+   "days": 81,
+   "gross_ann_pct": -181.0059446941429,
+   "label": "h",
+   "net_ann_pct": 27.207153646098227,
+   "sharpe": 0.08603791366066729,
+   "t": 0.06717711865737554
+  },
+  "holdout_usd_per_year_at_fixed_size": 1.6324292187658935,
+  "signals_bear": 116
+ },
+ "BTC today < 0     (any red)": {
+  "bear_days": 1220,
+  "design": {
+   "alpha_ann_pct": -102.80742116799624,
+   "beta": 0.46780306985061393,
+   "days": 749,
+   "gross_ann_pct": -42.58547327520996,
+   "label": "d",
+   "net_ann_pct": -45.70989679856434,
+   "sharpe": -0.2917279318340949,
+   "t": -0.9505879307795886
+  },
+  "design_usd_per_year_at_fixed_size": -2.74259380791386,
+  "holdout": {
+   "alpha_ann_pct": 91.49510532996554,
+   "beta": 1.0255968002873117,
+   "days": 471,
+   "gross_ann_pct": -36.910242778430735,
+   "label": "h",
+   "net_ann_pct": 114.13670993593965,
+   "sharpe": 0.49950833146967166,
+   "t": 0.5053171309251097
+  },
+  "holdout_usd_per_year_at_fixed_size": 6.84820259615638,
+  "signals_bear": 722
+ }
+}

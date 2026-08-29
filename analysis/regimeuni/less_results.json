@@ -1,0 +1,192 @@
+{
+ "A cash gate, 30d flag": {
+  "design": {
+   "pain": {
+    "bear_day_mean_bp": 0.8936387156033062,
+    "invested_fraction": 0.4741727199354318,
+    "worst_5d_pct": -40.15436307004644,
+    "worst_day_pct": -21.27569802537105
+   },
+   "stats": {
+    "alpha_ann_pct": 45.560572807138136,
+    "beta": 0.38478674978687205,
+    "days": 1521,
+    "gross_ann_pct": 83.50753672265147,
+    "label": "A cash gate, 30d flag",
+    "net_ann_pct": 68.61125703933946,
+    "sharpe": 0.8438494421680295,
+    "t": 1.2748439418463875
+   }
+  },
+  "holdout": {
+   "pain": {
+    "bear_day_mean_bp": 4.357495281813943,
+    "invested_fraction": 0.4741727199354318,
+    "worst_5d_pct": -53.69535008388959,
+    "worst_day_pct": -25.563677198600733
+   },
+   "stats": {
+    "alpha_ann_pct": -24.577041127187734,
+    "beta": 0.41115071870094844,
+    "days": 956,
+    "gross_ann_pct": -24.142175886133522,
+    "label": "A cash gate, 30d flag",
+    "net_ann_pct": -13.6320233257152,
+    "sharpe": -0.16491614385602257,
+    "t": -0.4591493382790495
+   }
+  }
+ },
+ "B cash gate, daily flag": {
+  "design": {
+   "pain": {
+    "bear_day_mean_bp": -2.2117242252405966,
+    "invested_fraction": 0.5238095238095238,
+    "worst_5d_pct": -36.355082967008045,
+    "worst_day_pct": -23.219518861531522
+   },
+   "stats": {
+    "alpha_ann_pct": 77.33545170775258,
+    "beta": 0.3642362557934513,
+    "days": 1521,
+    "gross_ann_pct": 108.2164337365398,
+    "label": "B cash gate, daily flag",
+    "net_ann_pct": 99.15505678215945,
+    "sharpe": 1.1294489628535853,
+    "t": 1.962064543768645
+   }
+  },
+  "holdout": {
+   "pain": {
+    "bear_day_mean_bp": -1.1259443096365236,
+    "invested_fraction": 0.5238095238095238,
+    "worst_5d_pct": -45.13269779867067,
+    "worst_day_pct": -41.16744405526575
+   },
+   "stats": {
+    "alpha_ann_pct": -5.859500178936851,
+    "beta": 0.4592591728976209,
+    "days": 956,
+    "gross_ann_pct": 5.086413175390471,
+    "label": "B cash gate, daily flag",
+    "net_ann_pct": 6.3661863983256435,
+    "sharpe": 0.0722328288821728,
+    "t": -0.10924502844771841
+   }
+  }
+ },
+ "C fast exit 24h in bear": {
+  "design": {
+   "pain": {
+    "bear_day_mean_bp": -32.83643388164127,
+    "invested_fraction": 0.6214689265536724,
+    "worst_5d_pct": -43.90230001739721,
+    "worst_day_pct": -37.89167395760347
+   },
+   "stats": {
+    "alpha_ann_pct": -13.012981333431009,
+    "beta": 0.4676720955716896,
+    "days": 1521,
+    "gross_ann_pct": 26.697054041302152,
+    "label": "C fast exit 24h in bear",
+    "net_ann_pct": 15.002956858842706,
+    "sharpe": 0.16022281587144493,
+    "t": -0.31355049602098567
+   }
+  },
+  "holdout": {
+   "pain": {
+    "bear_day_mean_bp": 43.54970001318241,
+    "invested_fraction": 0.6214689265536724,
+    "worst_5d_pct": -53.69535008388959,
+    "worst_day_pct": -41.16744405526575
+   },
+   "stats": {
+    "alpha_ann_pct": 43.215967342809705,
+    "beta": 0.4939550831873778,
+    "days": 956,
+    "gross_ann_pct": 46.21754018578025,
+    "label": "C fast exit 24h in bear",
+    "net_ann_pct": 56.365274720151334,
+    "sharpe": 0.48730129499114105,
+    "t": 0.5902394170851715
+   }
+  }
+ },
+ "D A + C": {
+  "design": {
+   "pain": {
+    "bear_day_mean_bp": 0.0,
+    "invested_fraction": 0.45117029862792574,
+    "worst_5d_pct": -30.77303308774253,
+    "worst_day_pct": -21.27569802537105
+   },
+   "stats": {
+    "alpha_ann_pct": 47.77232272176903,
+    "beta": 0.3205821793518024,
+    "days": 1521,
+    "gross_ann_pct": 81.5221099761834,
+    "label": "D A + C",
+    "net_ann_pct": 66.97682649120065,
+    "sharpe": 0.8824653729123408,
+    "t": 1.443090599765679
+   }
+  },
+  "holdout": {
+   "pain": {
+    "bear_day_mean_bp": 0.0,
+    "invested_fraction": 0.45117029862792574,
+    "worst_5d_pct": -53.69535008388959,
+    "worst_day_pct": -25.563677198600733
+   },
+   "stats": {
+    "alpha_ann_pct": -30.810732271094537,
+    "beta": 0.38805449529703434,
+    "days": 956,
+    "gross_ann_pct": -25.968612531168972,
+    "label": "D A + C",
+    "net_ann_pct": -20.480546366551007,
+    "sharpe": -0.26660070741477276,
+    "t": -0.6559546281309945
+   }
+  }
+ },
+ "base (as the bot runs now)": {
+  "design": {
+   "pain": {
+    "bear_day_mean_bp": -18.226542116078747,
+    "invested_fraction": 0.6900726392251816,
+    "worst_5d_pct": -48.940964093414394,
+    "worst_day_pct": -37.89167395760347
+   },
+   "stats": {
+    "alpha_ann_pct": 8.04836547155916,
+    "beta": 0.5494180187788612,
+    "days": 1521,
+    "gross_ann_pct": 50.29261443397508,
+    "label": "base (as the bot runs now)",
+    "net_ann_pct": 40.96130041375209,
+    "sharpe": 0.4098516811870879,
+    "t": 0.18404041905972976
+   }
+  },
+  "holdout": {
+   "pain": {
+    "bear_day_mean_bp": 57.097595094354276,
+    "invested_fraction": 0.6900726392251816,
+    "worst_5d_pct": -53.69535008388959,
+    "worst_day_pct": -41.16744405526575
+   },
+   "stats": {
+    "alpha_ann_pct": 67.2483912534855,
+    "beta": 0.5909713776213844,
+    "days": 956,
+    "gross_ann_pct": 69.6044896582247,
+    "label": "base (as the bot runs now)",
+    "net_ann_pct": 82.98031619980051,
+    "sharpe": 0.7179768517977848,
+    "t": 0.8910349639928549
+   }
+  }
+ }
+}

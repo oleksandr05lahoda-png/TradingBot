@@ -132,7 +132,8 @@ def read_env(repo):
     for k in ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
               "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
               "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE",
-              "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR"):
+              "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR",
+              "BEAR_UNIVERSE", "BEAR_DAY_PCT"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
@@ -158,11 +159,19 @@ def btc_regime(lookback, live):
     """BULL when BTC's trailing return over the lookback is >= 0, BEAR below. Measured 2024-26:
     the long rule earns +0.69%/day with t=1.10 in BULL and -0.46%/day in BEAR; staying out of
     BEAR was the cheapest of three machines (lab_regime_switch_measured). The scanner only
-    REPORTS the regime unless REGIME_GATE=cash; the bot never sees this flag."""
+    REPORTS the regime unless REGIME_GATE=cash; the bot never sees this flag.
+
+    Also returns TODAY's move, which is a different clock and drives a different switch:
+    BEAR_UNIVERSE reacts to the day, the cash gate to the month. Measured 29.08 (regimeuni):
+    swapping the entry pool on a red BTC day beat the unswitched base on the clean window
+    (+67.0% vs -0.5%, t 1.42) - short of the t>=2.0 bar, so it ships as an opt-in switch."""
     m = evaluate("BTCUSDT", lookback, 0.10, live.get("BTCUSDT", 0.0))
     if not m:
-        return None, None
-    return ("BULL" if m["ret"] >= 0 else "BEAR"), m["ret"]
+        return None, None, None
+    closes = m.get("closes") or []
+    # closes[-1] is today's partial bar; yesterday's close is the honest base for "today".
+    ret1 = (m["price"] / closes[-2] - 1.0) if len(closes) >= 2 and closes[-2] > 0 else None
+    return ("BULL" if m["ret"] >= 0 else "BEAR"), m["ret"], ret1
 
 
 MIN_NOTIONAL = {}    # symbol -> exchange minimum notional in USDT, refreshed with the universe
@@ -402,6 +411,9 @@ def main():
                     help="off: report the BTC regime and what a gate WOULD do (shadow forward); "
                          "cash: open nothing while BTC's 30d return is negative. Default from "
                          "REGIME_GATE in the environment, else off")
+    ap.add_argument("--bear-top", type=int, default=250,
+                    help="how deep the cap list goes on a bear day when BEAR_UNIVERSE=on; "
+                         "CoinGecko's page caps this at 250")
     ap.add_argument("--workdir", default=None,
                     help="where this scanner's log and state live (default: analysis/forward); "
                          "a demo and a real scanner must never share state")
@@ -438,17 +450,30 @@ def main():
     # Measured 26.08 on 651 days: worst day -5.4% -> -2.5%, drawdown 11% -> 7%, t 2.18 -> 2.68,
     # cost ~8pp of total return. A plateau, not a spike: 0.65 / 0.75 / 0.85 all improve t.
     max_corr = _float_env("MAX_CORR")
+    # BEAR_UNIVERSE=on: on a day BTC closed red, draw NEW entries from the coins that do not
+    # follow it - the lowest-correlation fifth of a deeper cap list - instead of the top-100.
+    # Exits, stops, takes, leverage and the 48h cap are untouched: same rules, different pool.
+    # Measured 29.08 on 2019-26 (analysis/regimeuni/h5.py): on the clean window the switch
+    # earns +67.0%/y against the unswitched base's -0.5%/y, t 1.42 against a t>=2.0 bar. Below
+    # the bar, so it is opt-in and the owner armed it knowing that. Off => shadow log only.
+    bear_universe = env.get("BEAR_UNIVERSE", "").strip().lower() in ("on", "1", "true", "yes")
+    bear_day_pct = _float_env("BEAR_DAY_PCT")
+    if bear_day_pct is None:
+        bear_day_pct = 0.0                      # any red BTC day; the measured primary
+    bear_top = max(args.top, args.bear_top)
     if not env.get(KEY_ENV[0]) or not env.get(SECRET_ENV[0]):
         raise SystemExit("missing %s/%s in local.env for --venue %s"
                          % (KEY_ENV[0], SECRET_ENV[0], args.venue))
     state = load_state(statepath)
     log("autoscan start: venue=%s top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
         "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s near_high=%s vol_mult=%s max_hold=%s "
-        "max_corr=%s"
+        "max_corr=%s bear_universe=%s"
         % (args.venue, args.top, args.by_cap, args.lookback, args.dip_depth * 100,
            args.entry_band * 100, args.exit_band * 100, args.interval,
            args.max_positions, args.min_hold_hours, gate, near_high_max, vol_mult_min, max_hold_hours,
-           max_corr), logpath)
+           max_corr,
+           ("on top-%d @ %+.1f%%" % (bear_top, bear_day_pct * 100)) if bear_universe else "off"),
+        logpath)
 
     while True:
         try:
@@ -515,8 +540,13 @@ def main():
                 state["fail_streak"] = 0
                 save_state(statepath, state)
 
-            pool, pool_source = universe(args.top, args.min_volume, args.by_cap,
-                                         cached_cap=state.get("cap_pool"))
+            # One call, sliced twice: the bull pool is the head of the same ranked list the
+            # bear pool is drawn from, so a bear day costs no extra CoinGecko or exchangeInfo
+            # request - only the deeper klines sweep below, and only when the switch is armed.
+            wide_pool, pool_source = universe(bear_top if bear_universe else args.top,
+                                              args.min_volume, args.by_cap,
+                                              cached_cap=state.get("cap_pool"))
+            pool = wide_pool[:args.top]
             if not pool:
                 log("universe empty (no CoinGecko answer and no cached list); skipping", logpath)
                 notify(env, "universe empty - no CoinGecko answer and no cached top-100 yet; "
@@ -555,7 +585,11 @@ def main():
             # The regime is reported every scan and announced on a flip. Under the default
             # gate ("off") it changes nothing - the log records what a cash gate WOULD have
             # suppressed, which is the paper forward of that gate, for free.
-            regime, btc_ret = btc_regime(args.lookback, live)
+            regime, btc_ret, btc_ret1 = btc_regime(args.lookback, live)
+            # A red BTC day is a different fact from a bear month and drives a different
+            # switch. Unreadable => not a bear day: the pool stays where it is rather than
+            # swinging on a failed request.
+            bear_day = bear_universe and btc_ret1 is not None and btc_ret1 < bear_day_pct
             if regime is None and state.get("regime"):
                 # One failed klines call must not switch a cash gate off for an hour.
                 regime = state["regime"]
@@ -575,7 +609,12 @@ def main():
             # A held coin that drops out of the top list must still be judged by the rule,
             # never by list membership: to_close = held - hold_ok, so leaving it unevaluated
             # would close it for falling off CoinGecko's page.
-            to_evaluate = [sym for sym, _ in pool] + sorted(held - {sym for sym, _ in pool})
+            # On a bear day the deeper list is swept too, because the entry pool is chosen from
+            # it below. Held coins are always evaluated whichever pool is active - the switch
+            # must never be able to close a position by changing what the scanner looks at.
+            scan_pool = wide_pool if bear_day else pool
+            to_evaluate = ([sym for sym, _ in scan_pool]
+                           + sorted(held - {sym for sym, _ in scan_pool}))
             for sym in to_evaluate:
                 m = evaluate(sym, args.lookback, args.dip_depth, live.get(sym, 0.0))
                 if not m:
@@ -610,6 +649,28 @@ def main():
                             entry_ok.add(sym)
                 if m["ret"] > -args.exit_band or m["dip"]:
                     hold_ok.add(sym)
+
+            # Which pool may supply a NEW entry this pass. Normally the top-100. On a red BTC
+            # day with BEAR_UNIVERSE=on, the fifth of the deeper list least correlated with BTC
+            # - the coins that are not simply BTC with a multiplier. Exits never consult this.
+            # No shadow line when the switch is off: the deeper list is not fetched then, so
+            # any "would have" would be computed from the top-100 and would be a lie.
+            entry_pool = {sym for sym, _ in pool}
+            if bear_day:
+                btc_closes = (details.get("BTCUSDT") or {}).get("closes")
+                scored = [(corr60(details[sym].get("closes"), btc_closes), sym)
+                          for sym, _ in wide_pool if sym in details]
+                scored.sort()
+                keep = max(1, len(scored) // 5)
+                if scored:
+                    entry_pool = {sym for _, sym in scored[:keep]}
+                    log("bear day (BTC %+.2f%% today): entries from the %d least "
+                        "BTC-correlated of %d coins (corr %.2f..%.2f), not the top-%d"
+                        % ((btc_ret1 or 0) * 100, keep, len(scored), scored[0][0],
+                           scored[keep - 1][0], args.top), logpath)
+                else:
+                    log("bear day, but no coin had readable history - entry pool unchanged",
+                        logpath)
 
             now = time.time()
             entered = state.setdefault("entered", {})
@@ -650,7 +711,8 @@ def main():
             # accident. Measured 2024-26 as a 10-slot portfolio: alphabet -3.0% (worse than
             # random +5%), momentum-first +21% with a smaller drawdown, better in 5 of 5
             # half-years. This removes a handicap; it does not create an edge.
-            fresh = [s for s in sorted(entry_ok - held, key=lambda s: -details[s]["ret"])
+            fresh = [s for s in sorted((entry_ok & entry_pool) - held,
+                                       key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
             if risk_usd:
                 def feasible(sym):
