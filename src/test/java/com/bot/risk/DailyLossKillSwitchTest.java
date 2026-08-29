@@ -75,10 +75,43 @@ class DailyLossKillSwitchTest {
     void openDrawdownCountsAgainstTheLimit() {
         DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
         killSwitch.observeBalance(10_000, MORNING);
-        killSwitch.observeOpenUnrealizedPnl(-350, MORNING);
+        killSwitch.observeOpenUnrealizedPnl(0, MORNING);        // the day starts flat
+        killSwitch.observeOpenUnrealizedPnl(-350, MORNING);     // and moves against us today
         assertTrue(killSwitch.isTripped(MORNING),
                 "a position sitting at a loss larger than the daily cap must stop new entries now, "
                         + "not once it closes");
+    }
+
+    @Test
+    @DisplayName("a loss carried in from yesterday is not today's loss")
+    void carriedOverOpenLossDoesNotTripToday() {
+        DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
+        killSwitch.observeBalance(10_000, MORNING);
+        // The book was already deep under water when this day - or this process - began.
+        killSwitch.observeOpenUnrealizedPnl(-900, MORNING);
+        assertFalse(killSwitch.isTripped(MORNING),
+                "yesterday's paper loss is not today's; counting it would market-close the whole "
+                        + "book seconds after a restart, on a day that has not moved yet");
+
+        killSwitch.observeOpenUnrealizedPnl(-1_250, MORNING);   // -350 more, made today
+        assertTrue(killSwitch.isTripped(MORNING),
+                "the move made TODAY still counts, measured from where the day started");
+    }
+
+    @Test
+    @DisplayName("the baseline is re-taken at the UTC rollover, not carried across it")
+    void baselineResetsWithTheDay() {
+        DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
+        killSwitch.observeBalance(10_000, MORNING);
+        killSwitch.observeOpenUnrealizedPnl(-900, MORNING);
+
+        killSwitch.observeBalance(10_000, NEXT_DAY);
+        killSwitch.observeOpenUnrealizedPnl(-900, NEXT_DAY);    // unchanged: the new day's zero
+        assertFalse(killSwitch.isTripped(NEXT_DAY));
+
+        killSwitch.observeOpenUnrealizedPnl(-1_260, NEXT_DAY);
+        assertTrue(killSwitch.isTripped(NEXT_DAY),
+                "each day measures from its own start, so the same book can trip on a later day");
     }
 
     @Test

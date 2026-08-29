@@ -122,6 +122,15 @@ public final class Reconciler {
     /** Passes an unconfirmable stop is tolerated before it is treated as missing. */
     static final int UNCONFIRMABLE_PASSES_LIMIT = 3;
 
+    /**
+     * When each (kind, symbol) drift was last pushed to the operator. A drift the machine cannot
+     * repair — a naked position it may not touch, a book that will not converge — re-raises on
+     * every pass, and at a 30s interval that is 120 identical CRITICAL messages an hour. The one
+     * that matters is the first; the rest bury it. Mirrors the hold watchdog's hourly reminder.
+     */
+    private final Map<String, Instant> driftAnnouncedAt = new java.util.concurrent.ConcurrentHashMap<>();
+    static final long DRIFT_REANNOUNCE_MS = 3_600_000L;
+
     /** Consecutive passes the realised-PnL seed failed; at the threshold the operator hears about it. */
     private int pnlSeedFailures = 0;
     private boolean pnlSeedAlerted = false;
@@ -281,6 +290,9 @@ public final class Reconciler {
         }
         carriedOverSymbols = stillInteresting;
         triggeredStops = stillTriggered;
+        // A drift that cleared may announce itself immediately if it ever comes back.
+        driftAnnouncedAt.keySet().removeIf(sig ->
+                drifts.stream().noneMatch(d -> (d.kind() + "|" + d.symbol()).equals(sig)));
         // A symbol no longer held has nothing to confirm; a stale count must not ambush a re-entry.
         unconfirmablePasses.keySet().retainAll(exchangeSymbols);
 
@@ -320,7 +332,17 @@ public final class Reconciler {
             Drift first = drifts.stream().filter(Drift::isCritical).findFirst().orElseThrow();
             String summary = "reconciliation found " + drifts.size() + " disagreement(s):" + report.describe();
             LOG.severe("[Reconciler] " + summary);
-            alerts.critical("Reconciliation drift", summary);
+            // The halt latches every pass as before; only the PUSH is throttled per drift, so a
+            // condition that cannot clear itself does not bury the next real alert under itself.
+            String signature = first.kind() + "|" + first.symbol();
+            Instant lastAnnounced = driftAnnouncedAt.get(signature);
+            if (lastAnnounced == null
+                    || now.toEpochMilli() - lastAnnounced.toEpochMilli() >= DRIFT_REANNOUNCE_MS) {
+                driftAnnouncedAt.put(signature, now);
+                alerts.critical("Reconciliation drift", summary
+                        + (lastAnnounced == null ? "" : "\n(still unresolved since "
+                                + lastAnnounced + "; repeated hourly)"));
+            }
             halt.halt("reconciliation drift: " + first.kind() + " on " + first.symbol(), now);
         } else if (!report.converged()) {
             // The exchange finished trades on its own — stops and takes doing their job. The book is

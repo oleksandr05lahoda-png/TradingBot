@@ -36,9 +36,14 @@ class KillSwitchEnforcerTest {
         }
     }
 
-    /** Down 10% of the day's opening balance — far past the 3% default limit. */
+    /**
+     * Down 10% of the day's opening balance — far past the 3% default limit. The flat observation
+     * first is what makes it TODAY's loss: the switch measures the move from where the day began,
+     * so a book that was already under water when the day started does not trip on its own.
+     */
     private void tripTheDay(Instant now) {
         engine.killSwitch().observeBalance(1_000, now);
+        engine.killSwitch().observeOpenUnrealizedPnl(0, now);
         engine.killSwitch().observeOpenUnrealizedPnl(-100, now);
     }
 
@@ -200,6 +205,7 @@ class KillSwitchEnforcerTest {
                 new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.of("stop-BTCUSDT")));
         Instant later = ExecFixtures.NOON.plusSeconds(240);
         restarted.killSwitch().observeBalance(1_000, later);
+        restarted.killSwitch().observeOpenUnrealizedPnl(0, later);
         restarted.killSwitch().observeOpenUnrealizedPnl(-100, later);
         List<String> afterRestart = new ArrayList<>();
         new KillSwitchEnforcer(restarted, (symbol, requestId) -> {
@@ -232,6 +238,7 @@ class KillSwitchEnforcerTest {
         assertFalse(engine.killSwitch().isTripped(tomorrow));
 
         openBook("ETHUSDT");
+        engine.killSwitch().observeOpenUnrealizedPnl(0, tomorrow);
         engine.killSwitch().observeOpenUnrealizedPnl(-100, tomorrow);
         enforcer.enforce(tomorrow.plusSeconds(30));
         assertEquals(2, closed.size(), "a fresh trip on a fresh day closes again: " + closed);

@@ -68,6 +68,9 @@ public interface AlertSink {
 
         private final String token;
         private final String chatId;
+        /** WARNING and CRITICAL get two more tries; the alert path is what replaces the log nobody reads. */
+        private static final int RETRIES_FOR_SERIOUS = 3;
+
         private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
         private Telegram(String token, String chatId) {
@@ -116,23 +119,45 @@ public interface AlertSink {
                 case WARNING -> "⚠ ";
                 case INFO -> "";
             } + title + "\n" + message;
-            try {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create("https://api.telegram.org/bot" + token + "/sendMessage"))
-                        .timeout(Duration.ofSeconds(8))
-                        .header("Content-Type", "application/x-www-form-urlencoded")
-                        .POST(HttpRequest.BodyPublishers.ofString(
-                                "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
-                                        + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8)))
-                        .build();
-                HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() / 100 != 2) {
-                    LOG.warning("Telegram alert not delivered, HTTP " + response.statusCode());
+            // One dropped packet used to lose the message outright, and the only record of a lost
+            // CRITICAL was the log the alert exists to replace. Serious alerts get three tries.
+            int attempts = severity == Severity.INFO ? 1 : RETRIES_FOR_SERIOUS;
+            for (int attempt = 1; attempt <= attempts; attempt++) {
+                try {
+                    HttpRequest request = HttpRequest.newBuilder()
+                            .uri(URI.create("https://api.telegram.org/bot" + token + "/sendMessage"))
+                            .timeout(Duration.ofSeconds(8))
+                            .header("Content-Type", "application/x-www-form-urlencoded")
+                            .POST(HttpRequest.BodyPublishers.ofString(
+                                    "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
+                                            + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8)))
+                            .build();
+                    HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+                    if (response.statusCode() / 100 == 2) return;
+                    // 4xx is the chat id or the token — retrying cannot fix it, and a rotated token
+                    // must not cost three timeouts on the loop thread for every alert.
+                    if (response.statusCode() / 100 == 4) {
+                        LOG.warning("Telegram alert REFUSED, HTTP " + response.statusCode()
+                                + " — check TELEGRAM_CHAT_ID and TELEGRAM_BOT_TOKEN");
+                        return;
+                    }
+                    LOG.warning("Telegram alert not delivered, HTTP " + response.statusCode()
+                            + " (attempt " + attempt + "/" + attempts + ")");
+                } catch (IOException e) {
+                    LOG.warning("Telegram alert not delivered: " + e.getMessage()
+                            + " (attempt " + attempt + "/" + attempts + ")");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
-            } catch (IOException e) {
-                LOG.warning("Telegram alert not delivered: " + e.getMessage());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                if (attempt < attempts) {
+                    try {
+                        Thread.sleep(2000L * attempt);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
             }
         }
     }

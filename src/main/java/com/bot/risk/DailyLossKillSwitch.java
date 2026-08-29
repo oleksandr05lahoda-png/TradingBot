@@ -37,6 +37,15 @@ public final class DailyLossKillSwitch {
     private double dayStartBalance;
     private double realizedPnl;
     private double openUnrealizedPnl;
+    /**
+     * Open PnL as it stood when this day began, so only TODAY's movement counts against the limit.
+     * Without it a book carried into a new day brings yesterday's paper loss with it: realised
+     * resets at midnight but unrealised does not, and the switch reads an old loss as a fresh one.
+     * Harmless while the trip only blocked entries; with KILL_SWITCH_ACTION=flatten it would
+     * market-close the whole book seconds after a restart (29.08 audit, before first deploy).
+     */
+    private double openUnrealizedAtDayStart;
+    private boolean baselineSet;
     private boolean tripped;
     private String reason = "";
 
@@ -67,6 +76,15 @@ public final class DailyLossKillSwitch {
         Preconditions.finite(pnlUsd, "pnlUsd");
         rolloverIfNewDay(now, 0);
         this.openUnrealizedPnl = pnlUsd;
+        if (!baselineSet) {
+            // First sight this day - or this process. Whatever is open right now is where the day
+            // starts from. After a mid-day restart that forgives damage done before the restart;
+            // the realised half still carries it, read from the exchange ledger since midnight.
+            openUnrealizedAtDayStart = pnlUsd;
+            baselineSet = true;
+            LOG.info(String.format("[KillSwitch] day-start open PnL baseline for %s: $%+.2f",
+                    utcDay, pnlUsd));
+        }
     }
 
     /** Operator hook. Unlike {@code exec.TradingHalt} (drift, operator-cleared) this self-clears at UTC rollover. */
@@ -82,16 +100,18 @@ public final class DailyLossKillSwitch {
     /** Evaluates the limit and latches if breached; this call is also what rolls the UTC day over. */
     public synchronized Status evaluate(Instant now) {
         rolloverIfNewDay(now, 0);
-        double effective = realizedPnl + Math.min(0.0, openUnrealizedPnl);
+        // Only the move made SINCE the day began counts; a book carried in brings its own history.
+        double openToday = openUnrealizedPnl - openUnrealizedAtDayStart;
+        double effective = realizedPnl + Math.min(0.0, openToday);
         if (!tripped && dayStartBalance > 0) {
             double drawdown = -effective / dayStartBalance;
             if (drawdown >= dailyLossFractionLimit) {
                 tripped = true;
                 reason = String.format(
-                        "daily loss %.2f%% of the day's starting balance $%.2f (realised $%+.2f, open $%+.2f) "
-                                + "reached the %.2f%% limit",
+                        "daily loss %.2f%% of the day's starting balance $%.2f (realised $%+.2f, open "
+                                + "$%+.2f against $%+.2f at the day's start) reached the %.2f%% limit",
                         drawdown * 100, dayStartBalance, realizedPnl, openUnrealizedPnl,
-                        dailyLossFractionLimit * 100);
+                        openUnrealizedAtDayStart, dailyLossFractionLimit * 100);
                 LOG.warning("[KillSwitch] TRIPPED: " + reason + " — no new positions until 00:00 UTC");
             }
         }
@@ -116,6 +136,9 @@ public final class DailyLossKillSwitch {
             utcDay = today;
             realizedPnl = 0;
             openUnrealizedPnl = 0;
+            // The new day inherits whatever is open; the next observation re-fixes the baseline.
+            openUnrealizedAtDayStart = 0;
+            baselineSet = false;
             tripped = false;
             reason = "";
             dayStartBalance = balanceForNewDay;

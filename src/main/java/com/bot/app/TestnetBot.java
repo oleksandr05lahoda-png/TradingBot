@@ -226,6 +226,11 @@ public final class TestnetBot {
                 alerts.critical("Start-up reconciliation failed",
                         "no new positions will be opened; the bot stays up so positions can still be closed");
             }
+            // Readiness is not health. The scanner waits for this line before it writes anything,
+            // and it used to wait for one only a HEALTHY bootstrap logged - so a boot that halted
+            // on drift left the scanner permanently not-ready and its EXITS never ran, on exactly
+            // the book that had just gone wrong (29.08 audit). Logged on both paths, once.
+            LOG.info("[Boot] account read complete — the loop is accepting closes");
 
             // Observe is a pre-latched halt, not a separate mechanism: same entry gate, closes and
             // reconciliation keep working, only an operator restart with REAL_MODE=trade clears it.
@@ -425,7 +430,8 @@ public final class TestnetBot {
                 if (nowMs - lastReconcileMs >= RECONCILE_INTERVAL_MS) {
                     if (operator != null) {
                         operator.publishStatus(
-                                statusLine(venue, engine, halt, port, deadMansSwitch, pendingCloses.size()),
+                                statusLine(venue, engine, halt, port, deadMansSwitch,
+                                        pendingCloses.size(), blind, reconcileFailures),
                                 Instant.now());
                     }
                     try {
@@ -542,7 +548,8 @@ public final class TestnetBot {
 
     /** One line the operator can read on a phone; built on the loop thread from the loop's own state. */
     private static String statusLine(BinanceVenue venue, RiskEngine engine, TradingHalt halt,
-                                     ExchangePort port, DeadMansSwitch deadMansSwitch, int pendingCloses) {
+                                     ExchangePort port, DeadMansSwitch deadMansSwitch,
+                                     int pendingCloses, boolean blind, int reconcileFailures) {
         StringBuilder sb = new StringBuilder();
         sb.append(venue.isReal() ? "REAL " + venue.realMode() : "DEMO").append(" | ");
         List<ExposureBook.OpenPosition> open = engine.book().all();
@@ -556,7 +563,11 @@ public final class TestnetBot {
         sb.append("\nhalt: ").append(halt.isHalted() ? halt.reason().orElse("yes") : "none");
         long held = port.heldByExchangeForMillis();
         if (held > 0) sb.append("\nexchange hold: ").append(held / 60_000).append(" min left");
+        // Every state that pauses entries must be visible here, or /status says "none" while the
+        // bot quietly refuses every signal.
         if (deadMansSwitch.isDegraded()) sb.append("\nentries: PAUSED (exchange contact lost)");
+        if (blind) sb.append("\nentries: PAUSED (reconciliation blind, ")
+                .append(reconcileFailures).append(" failed passes)");
         if (pendingCloses > 0) sb.append("\ncloses retrying: ").append(pendingCloses);
         sb.append("\nkill switch: ").append(engine.killSwitch().isTripped(Instant.now()) ? "TRIPPED" : "armed");
         return sb.toString();
@@ -580,7 +591,9 @@ public final class TestnetBot {
         try {
             ExecutionCoordinator.CloseReport report = coordinator.closeOut(close.symbol(), requestId);
             if (report.flat()) {
-                if (journal != null) {
+                // "Already flat" is a confirmed outcome but not a fill. Journalling it would put an
+                // exit at price 0 into the record the lab judges live trades by.
+                if (journal != null && report.closedQuantity().signum() > 0) {
                     journal.closed(close.id(), close.symbol(), close.reason(),
                             report.closedQuantity().toPlainString(),
                             report.averagePrice().toPlainString(), report.note());

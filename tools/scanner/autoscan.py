@@ -167,11 +167,14 @@ def btc_regime(lookback, live):
     (+67.0% vs -0.5%, t 1.42) - short of the t>=2.0 bar, so it ships as an opt-in switch."""
     m = evaluate("BTCUSDT", lookback, 0.10, live.get("BTCUSDT", 0.0))
     if not m:
-        return None, None, None
+        return None, None, None, None
     closes = m.get("closes") or []
-    # closes[-1] is today's partial bar; yesterday's close is the honest base for "today".
-    ret1 = (m["price"] / closes[-2] - 1.0) if len(closes) >= 2 and closes[-2] > 0 else None
-    return ("BULL" if m["ret"] >= 0 else "BEAR"), m["ret"], ret1
+    # The LAST COMPLETED day, not today's part-formed bar. h5.py measured completed daily closes,
+    # and a live flag built from a partial bar is a different signal: it flips as the day fills in,
+    # is pure noise minutes after midnight, and would swap the pool back and forth inside one day.
+    # closes[-1] is today (partial), closes[-2] yesterday's close, closes[-3] the day before.
+    ret1 = (closes[-2] / closes[-3] - 1.0) if len(closes) >= 3 and closes[-3] > 0 else None
+    return ("BULL" if m["ret"] >= 0 else "BEAR"), m["ret"], ret1, closes
 
 
 MIN_NOTIONAL = {}    # symbol -> exchange minimum notional in USDT, refreshed with the universe
@@ -353,8 +356,11 @@ def bot_is_ready(bot_log):
         return False
     # "adopted" is only logged by a healthy bootstrap; a boot that halted on drift and was then
     # /resume'd, or a reconcile that came back after an outage, is just as ready.
-    return ("adopted from the exchange" in text or "HALT CLEARED at" in text
-            or "reconciliation is back" in text)
+    # "account read complete" is the unconditional marker: the bot logs it on BOTH boot paths, so a
+    # boot that halted on drift no longer leaves this scanner not-ready forever - which used to
+    # silence its EXITS on precisely the book that had just gone wrong (29.08 audit).
+    return ("account read complete" in text or "adopted from the exchange" in text
+            or "HALT CLEARED at" in text or "reconciliation is back" in text)
 
 
 def bot_is_halted(bot_log):
@@ -457,9 +463,17 @@ def main():
     # earns +67.0%/y against the unswitched base's -0.5%/y, t 1.42 against a t>=2.0 bar. Below
     # the bar, so it is opt-in and the owner armed it knowing that. Off => shadow log only.
     bear_universe = env.get("BEAR_UNIVERSE", "").strip().lower() in ("on", "1", "true", "yes")
+    # Named PCT and read as PERCENT: -1 means "BTC closed more than 1% down". Stored as a fraction
+    # internally. A bare fraction like -0.01 would silently mean -0.01%, i.e. any red day, so the
+    # range is checked loudly rather than trusted.
     bear_day_pct = _float_env("BEAR_DAY_PCT")
     if bear_day_pct is None:
         bear_day_pct = 0.0                      # any red BTC day; the measured primary
+    elif not -50.0 <= bear_day_pct <= 0.0:
+        log("BEAR_DAY_PCT=%s is not a percentage in [-50, 0] - using 0 (any red day)"
+            % bear_day_pct, logpath)
+        bear_day_pct = 0.0
+    bear_day_pct = bear_day_pct / 100.0
     bear_top = max(args.top, args.bear_top)
     if not env.get(KEY_ENV[0]) or not env.get(SECRET_ENV[0]):
         raise SystemExit("missing %s/%s in local.env for --venue %s"
@@ -554,7 +568,10 @@ def main():
                 time.sleep(args.interval)
                 continue
             if pool_source == "cap":
-                state["cap_pool"] = [sym for sym, _ in pool]
+                # Cache the WIDE list: every consumer slices it (universe returns out[:top]), so the
+                # bull path is unchanged, but a CoinGecko outage no longer shrinks a bear day's pool
+                # to a fifth of 100 instead of a fifth of 250.
+                state["cap_pool"] = [sym for sym, _ in wide_pool]
                 state["cap_pool_at"] = time.time()
             elif pool_source == "cap-cached" and state.get("pool_source") != "cap-cached":
                 age_h = (time.time() - state.get("cap_pool_at", time.time())) / 3600
@@ -585,7 +602,7 @@ def main():
             # The regime is reported every scan and announced on a flip. Under the default
             # gate ("off") it changes nothing - the log records what a cash gate WOULD have
             # suppressed, which is the paper forward of that gate, for free.
-            regime, btc_ret, btc_ret1 = btc_regime(args.lookback, live)
+            regime, btc_ret, btc_ret1, btc_closes = btc_regime(args.lookback, live)
             # A red BTC day is a different fact from a bear month and drives a different
             # switch. Unreadable => not a bear day: the pool stays where it is rather than
             # swinging on a failed request.
@@ -656,20 +673,40 @@ def main():
             # No shadow line when the switch is off: the deeper list is not fetched then, so
             # any "would have" would be computed from the top-100 and would be a lie.
             entry_pool = {sym for sym, _ in pool}
-            if bear_day:
-                btc_closes = (details.get("BTCUSDT") or {}).get("closes")
-                scored = [(corr60(details[sym].get("closes"), btc_closes), sym)
-                          for sym, _ in wide_pool if sym in details]
-                scored.sort()
+            if bear_day and not btc_closes:
+                # No BTC reference means no correlation. corr60 fails OPEN at 0.0, which in a
+                # ranking sorts an unmeasurable coin FIRST - so a single failed BTC read would
+                # have handed the whole book to whatever sorts first alphabetically, the 1000*
+                # meme tickers. Refuse the swap instead, exactly as an unreadable bar is refused
+                # as a bear day above.
+                log("bear day, but BTC history is unreadable - entry pool stays the top-%d"
+                    % args.top, logpath)
+            elif bear_day:
+                # Score on the correlation only, and drop the ones corr60 could not measure:
+                # a tie must never fall through to alphabetical order, and "unmeasurable" is not
+                # "uncorrelated". Sorting (score, symbol) tuples is what let that happen.
+                scored = []
+                for sym, _ in wide_pool:
+                    m = details.get(sym)
+                    if not m or sym == "BTCUSDT":
+                        continue
+                    series = m.get("closes")
+                    if not series or len(series) < 31:
+                        continue
+                    c = corr60(series, btc_closes)
+                    if c == 0.0:
+                        continue          # corr60's fail-open value; unmeasurable, not independent
+                    scored.append((c, sym))
+                scored.sort(key=lambda t: t[0])
                 keep = max(1, len(scored) // 5)
                 if scored:
                     entry_pool = {sym for _, sym in scored[:keep]}
-                    log("bear day (BTC %+.2f%% today): entries from the %d least "
-                        "BTC-correlated of %d coins (corr %.2f..%.2f), not the top-%d"
+                    log("bear day (BTC %+.2f%% yesterday): entries from the %d least "
+                        "BTC-correlated of %d measurable coins (corr %.2f..%.2f), not the top-%d"
                         % ((btc_ret1 or 0) * 100, keep, len(scored), scored[0][0],
                            scored[keep - 1][0], args.top), logpath)
                 else:
-                    log("bear day, but no coin had readable history - entry pool unchanged",
+                    log("bear day, but no coin had a measurable correlation - entry pool unchanged",
                         logpath)
 
             now = time.time()
