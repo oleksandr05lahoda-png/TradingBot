@@ -152,7 +152,10 @@ def notify(env, text, logpath):
         req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % token, data=body)
         urllib.request.urlopen(req, timeout=15).read()
     except Exception as e:
-        log("telegram notify failed: %r" % (e,), logpath)
+        # The token is a path segment of the URL, and a urllib error can carry the URL in its
+        # repr. These lines go to the hosting console - a different trust boundary from this
+        # process - so the token is stripped before anything is written.
+        log("telegram notify failed: %s" % repr(e).replace(token, "<token>"), logpath)
 
 
 def btc_regime(lookback, live):
@@ -565,7 +568,10 @@ def main():
                 log("universe empty (no CoinGecko answer and no cached list); skipping", logpath)
                 notify(env, "universe empty - no CoinGecko answer and no cached top-100 yet; "
                             "this scan is skipped", logpath)
-                time.sleep(args.interval)
+                # Five minutes, not an hour: a pass that produced no pool also produced no EXITS,
+                # and one transient refusal should not cost the whole hour's exit management.
+                # Matches the not-ready branch above.
+                time.sleep(min(args.interval, 300))
                 continue
             if pool_source == "cap":
                 # Cache the WIDE list: every consumer slices it (universe returns out[:top]), so the
@@ -833,7 +839,11 @@ def main():
                         f.write("CLOSE %s id=auto-close-%s-%s reason=%s\n"
                                 % (s, s, stamp, reasons.get(s, "trend-exited")))
                         cooldown[s] = now
-                        entered.pop(s, None)
+                        # entered is NOT dropped here. Writing a CLOSE is a request, not an exit:
+                        # if it is refused or abandoned the position is still open, and forgetting
+                        # its open time would disable max-hold for it permanently. The prune loop
+                        # above removes it on the first pass where the exchange says it is gone -
+                        # which is the only honest evidence that it actually closed.
                     for s in to_open:
                         m = details[s]
                         trig = m.get("trig") or "trend"

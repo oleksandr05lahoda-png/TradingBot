@@ -109,6 +109,18 @@ public interface AlertSink {
                     + "Set both variables (see example.env) to be told when the bot stops itself.";
         }
 
+        /**
+         * The bot token is a path segment of the Telegram URL, so any message that quotes the URI
+         * carries it. Log lines end up in the hosting console, which is a different trust boundary
+         * from the process; a leaked token lets a stranger post as this bot and read the chat.
+         * Binance's adapter has the same discipline for the opposite reason — it logs
+         * {@code uri.getPath()} only, because the signature rides in the query.
+         */
+        private String redact(String text) {
+            if (text == null) return "null";
+            return token.isEmpty() ? text : text.replace(token, "<token>");
+        }
+
         private static boolean isBlank(String value) {
             return value == null || value.isBlank();
         }
@@ -144,7 +156,7 @@ public interface AlertSink {
                     LOG.warning("Telegram alert not delivered, HTTP " + response.statusCode()
                             + " (attempt " + attempt + "/" + attempts + ")");
                 } catch (IOException e) {
-                    LOG.warning("Telegram alert not delivered: " + e.getMessage()
+                    LOG.warning("Telegram alert not delivered: " + redact(String.valueOf(e.getMessage()))
                             + " (attempt " + attempt + "/" + attempts + ")");
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
