@@ -116,7 +116,23 @@ def main():
     check("the entry pool cannot pick a held coin", "F0" not in fresh_source
           and "ZZZ" not in fresh_source, "got %s" % sorted(fresh_source))
 
-    # --- 5. env parsing ----------------------------------------------------------------
+    # --- 5. a cut-short sweep must not close what it did not judge ----------------------
+    # held is swept FIRST, but a throttle can still land mid-way through it. to_close is
+    # held - hold_ok, so an unjudged holding would be closed for not being reached.
+    held2 = {"AAA", "BBB", "CCC"}
+    hold_ok = {"AAA"}                 # judged and fine
+    details_seen = {"AAA": {}, "BBB": {}}   # BBB evaluated but broke its band -> a real exit
+    unjudged = held2 - hold_ok - set(details_seen)
+    check("an unreached holding is identified", unjudged == {"CCC"},
+          "got %s" % sorted(unjudged))
+    for s in unjudged:
+        hold_ok.add(s)
+    to_close = held2 - hold_ok
+    check("the unreached holding is NOT closed", "CCC" not in to_close)
+    check("a genuinely broken holding still closes", to_close == {"BBB"},
+          "got %s" % sorted(to_close))
+
+    # --- 6. env parsing ----------------------------------------------------------------
     def armed(v):
         return v.strip().lower() in ("on", "1", "true", "yes")
     check("BEAR_UNIVERSE=on arms", armed("on") and armed(" ON ") and armed("true"))

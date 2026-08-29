@@ -57,6 +57,13 @@ STABLECOINS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
 ATR_PERIOD = 14
 STOP_ATR_MULT = 2.0    # mirrors the bot's ATR-fallback stop; keep in sync with RiskEngine
 _last = [0.0]
+# How many times the venue has throttled us since the current pass began. A sweep watches this
+# and gives up rather than paying the back-off once per symbol.
+_throttled = [0]
+# A pass may spend at most this fraction of its interval sweeping klines. Whatever is left
+# unevaluated is simply not judged this hour; held coins are swept first so exits survive it.
+SWEEP_BUDGET_FRACTION = 0.5
+MAX_THROTTLES_PER_SWEEP = 3
 
 
 def log(msg, path):
@@ -83,6 +90,9 @@ def get(path, params, base=FAPI, gap=0.25, tries=5):
                 # single-threaded loop inside one data call, exits included — and retrying five
                 # times multiplies the cap back into ~25 minutes. Wait the capped moment, then let
                 # the pass fail so the outer loop reaches its own sleep and the next pass (28.08).
+                # The counter lets the caller abandon a sweep instead of paying this per symbol:
+                # a 250-coin bear sweep against a throttling venue is 250 x 5 minutes otherwise.
+                _throttled[0] += 1
                 time.sleep(min(float(e.headers.get("Retry-After") or 30), 300.0) + 5)
                 return None
             if e.code >= 500:
@@ -636,9 +646,33 @@ def main():
             # it below. Held coins are always evaluated whichever pool is active - the switch
             # must never be able to close a position by changing what the scanner looks at.
             scan_pool = wide_pool if bear_day else pool
-            to_evaluate = ([sym for sym, _ in scan_pool]
-                           + sorted(held - {sym for sym, _ in scan_pool}))
+            # HELD FIRST. A sweep can be cut short by a throttling venue or by its own time
+            # budget, and what must survive that is the exit decision - a position judged is a
+            # position that can be closed. Candidates for new entries come after; missing some
+            # costs an hour of opportunity, missing an exit costs money.
+            to_evaluate = (sorted(held)
+                           + [sym for sym, _ in scan_pool if sym not in held])
+            _throttled[0] = 0
+            sweep_started = time.time()
+            sweep_budget = args.interval * SWEEP_BUDGET_FRACTION
+            swept = 0
             for sym in to_evaluate:
+                # Two ways to abandon the rest of the sweep, both of which leave the held coins
+                # already judged (they are swept first) so exits are still correct this pass.
+                if _throttled[0] >= MAX_THROTTLES_PER_SWEEP or \
+                        time.time() - sweep_started > sweep_budget:
+                    why = ("the venue throttled us %d times" % _throttled[0]
+                           if _throttled[0] >= MAX_THROTTLES_PER_SWEEP
+                           else "the %.0f min sweep budget ran out" % (sweep_budget / 60))
+                    log("sweep stopped after %d of %d coins: %s - exits are judged, entries "
+                        "wait for the next pass" % (swept, len(to_evaluate), why), logpath)
+                    if not state.get("told_sweep_cut"):
+                        notify(env, "scan cut short (%s); positions are still managed, no new "
+                                    "entries this pass" % why, logpath)
+                        state["told_sweep_cut"] = True
+                        save_state(statepath, state)
+                    break
+                swept += 1
                 m = evaluate(sym, args.lookback, args.dip_depth, live.get(sym, 0.0))
                 if not m:
                     # No data is not a signal. to_close = held - hold_ok, so a held coin whose
@@ -672,6 +706,20 @@ def main():
                             entry_ok.add(sym)
                 if m["ret"] > -args.exit_band or m["dip"]:
                     hold_ok.add(sym)
+
+            # A cut-short sweep must never close a position it simply did not get to. to_close is
+            # held minus hold_ok, so anything held and unjudged is held, exactly as a failed
+            # klines request is treated one branch above.
+            unjudged = held - hold_ok - {s for s in details}
+            for sym in unjudged:
+                hold_ok.add(sym)
+            if unjudged:
+                log("%d held coin(s) not reached this pass - holding, not judging: %s"
+                    % (len(unjudged), ",".join(sorted(unjudged))), logpath)
+
+            if swept >= len(to_evaluate) and state.get("told_sweep_cut"):
+                state["told_sweep_cut"] = False
+                save_state(statepath, state)
 
             # Which pool may supply a NEW entry this pass. Normally the top-100. On a red BTC
             # day with BEAR_UNIVERSE=on, the fifth of the deeper list least correlated with BTC
