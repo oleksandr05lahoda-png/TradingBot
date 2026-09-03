@@ -51,18 +51,20 @@ SECRET_ENV = ["BINANCE_TESTNET_API_SECRET"]
 
 CG_MARKETS = ("https://api.coingecko.com/api/v3/coins/markets"
               "?vs_currency=usd&order=market_cap_desc&per_page=250&page=%d")
-# Roughly 4 of every 10 CoinGecko cap entries map to a tradable Binance USDT perp, so a list of N
-# needs ~2.5N cap entries: one page of 250 for the top-100 (as always), four pages for the top-300
-# a bear day draws from. The single page used to yield ~97 coins whatever --bear-top asked for, so
-# the red-day pool was a quintile of the top-100, not of the top-300 h5.py measured (audit 03.09).
+# Measured live 03.09 18:40: three pages (750 cap entries) mapped to 152 tradable Binance USDT perps
+# with volume over the floor, i.e. one in five, so a list of N needs ~5N cap entries: one page of
+# 250 for the top-100 (as always), six pages for the top-300 a bear day draws from. The single page
+# used to yield ~97 coins whatever --bear-top asked for, so the red-day pool was a quintile of the
+# top-100, not of the top-300 h5.py measured (audit 03.09). Pages are two seconds apart; a page
+# that fails keeps what the earlier ones gave.
 CG_PAGE_SIZE = 250
-CG_MAX_PAGES = 4
+CG_MAX_PAGES = 7
 
 
 def cg_pages_for(top):
     if top <= 100:
         return 1
-    return max(1, min(CG_MAX_PAGES, -(-int(top * 2.5) // CG_PAGE_SIZE)))
+    return max(1, min(CG_MAX_PAGES, -(-int(top * 5) // CG_PAGE_SIZE)))
 STABLECOINS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
                "USD1", "BUSD", "USDP", "USDD", "USDF", "RLUSD"}
 
