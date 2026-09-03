@@ -54,7 +54,13 @@ public final class Reconciler {
             /** A missing stop was re-placed from the book's own record — repaired, not just reported. */
             STOP_REPLACED,
             /** A missing stop could not be re-placed, so the position was closed reduce-only. */
-            UNPROTECTED_CLOSED
+            UNPROTECTED_CLOSED,
+            /**
+             * A position the book did not know matched an entry this process had written down
+             * before sending (crash between fill and stop, or a lost response): booked with its
+             * planned risk so the missing-stop repair can place the stop that was meant.
+             */
+            ADOPTED_BY_INTENT
         }
 
         /**
@@ -139,6 +145,24 @@ public final class Reconciler {
     /** Hears a repair close, for the trade journal — the one real-money exit no operator typed. */
     private volatile CloseObserver closeObserver;
 
+    /** Entries the coordinator wrote down before sending; a stopless position that matches one is ours. */
+    private volatile EntryIntents intents = EntryIntents.inMemory();
+
+    /**
+     * Consecutive passes on which the exchange listed no positions while the book held some. One
+     * such read is not believed: a truncated positionRisk answer used to erase the book, the ledger
+     * and every stop id in one pass, and the next pass halted on the same positions as unknown.
+     */
+    private int emptyReadsInARow = 0;
+    private int passes = 0;
+    /** Account-wide orphan sweep cadence in passes (~10 min at 30 s); the plain listing weighs 40. */
+    static final int ORPHAN_SWEEP_EVERY = 20;
+
+    /** Persistent intents shared with the coordinator instead of this instance's empty default. */
+    public void withEntryIntents(EntryIntents intents) {
+        this.intents = Preconditions.notNull(intents, "intents");
+    }
+
     /** Arms the missing-stop repair: re-place from the book's record, or close reduce-only. */
     public void withStopRepair(PositionCloser closer) {
         this.closer = Preconditions.notNull(closer, "closer");
@@ -183,6 +207,27 @@ public final class Reconciler {
         Map<String, ExposureBook.OpenPosition> localBySymbol = new LinkedHashMap<>();
         for (ExposureBook.OpenPosition p : before) localBySymbol.put(p.symbol(), p);
 
+        // A listing with NO positions against a book that holds some is not believed on sight: the
+        // account's own unrealised PnL says whether anything is open, and a truncated read must not
+        // erase the book, the ledger and every stop id in one pass (audit 03.09). One pass of grace
+        // even when the PnL is silent; a second empty read in a row is accepted as the truth.
+        if (exchangePositions.isEmpty() && !before.isEmpty()) {
+            boolean pnlSaysOpen = account.totalUnrealizedPnl().signum() != 0;
+            emptyReadsInARow++;
+            // One position stopping out is the everyday case and is believed at once (when the PnL
+            // agrees); three or more vanishing in the same 30 s is far rarer than a truncated read.
+            boolean wholeBookGone = before.size() >= 3;
+            if (pnlSaysOpen || (wholeBookGone && emptyReadsInARow < 2)) {
+                throw ExchangeException.ambiguous("positionRisk listed no positions while the book holds "
+                        + before.size() + (pnlSaysOpen ? " and the account reports unrealised PnL "
+                        + account.totalUnrealizedPnl().toPlainString() : "")
+                        + " — treating this read as unconfirmed, not as an exit (pass "
+                        + emptyReadsInARow + ")", null);
+            }
+        } else {
+            emptyReadsInARow = 0;
+        }
+
         List<Drift> drifts = new ArrayList<>();
         List<ExposureBook.OpenPosition> truth = new ArrayList<>();
         Set<String> symbolsToInspect = new HashSet<>(localBySymbol.keySet());
@@ -194,10 +239,33 @@ public final class Reconciler {
             double entryPrice = position.entryPrice().doubleValue();
             ExposureBook.OpenPosition local = localBySymbol.get(position.symbol());
 
+            // The exchange stores no intended stop, so the distance comes from the local record; with
+            // none, risk is 0 — an understatement never sized against, since UNKNOWN_POSITION halts.
+            double stopDistance = local != null && local.quantity().signum() > 0
+                    ? local.riskUsd() / local.quantity().doubleValue()
+                    : 0.0;
+            // The stop id must be carried across passes; the exchange cannot supply it again.
+            Optional<String> stopId = local == null ? Optional.empty() : local.protectiveStopId();
+
             if (local == null) {
-                drifts.add(new Drift(Drift.Kind.UNKNOWN_POSITION, position.symbol(),
-                        "exchange holds " + direction + " " + quantity.toPlainString()
-                                + " @ " + position.entryPrice().toPlainString() + ", the book holds nothing"));
+                Optional<EntryIntents.Intent> intent = intents.get(position.symbol(), now.toEpochMilli());
+                if (intent.isPresent() && intent.get().side() == direction) {
+                    // Not foreign: this process meant to open exactly this, and died (or lost the
+                    // response) between the fill and the stop. Booked with the planned stop distance,
+                    // so the missing-stop repair below can place the stop that was intended instead
+                    // of refusing a position with no risk on record.
+                    stopDistance = intent.get().stopPrice().subtract(position.entryPrice()).abs().doubleValue();
+                    drifts.add(new Drift(Drift.Kind.ADOPTED_BY_INTENT, position.symbol(),
+                            "exchange holds " + direction + " " + quantity.toPlainString() + " @ "
+                                    + position.entryPrice().toPlainString() + " matching the entry this "
+                                    + "process intended (signal " + intent.get().signalId()
+                                    + ") — booked with its planned stop at "
+                                    + intent.get().stopPrice().toPlainString()));
+                } else {
+                    drifts.add(new Drift(Drift.Kind.UNKNOWN_POSITION, position.symbol(),
+                            "exchange holds " + direction + " " + quantity.toPlainString()
+                                    + " @ " + position.entryPrice().toPlainString() + ", the book holds nothing"));
+                }
             } else {
                 if (local.side() != direction) {
                     drifts.add(new Drift(Drift.Kind.SIDE_MISMATCH, position.symbol(),
@@ -215,15 +283,8 @@ public final class Reconciler {
                 }
             }
 
-            // The exchange stores no intended stop, so the distance comes from the local record; with
-            // none, risk is 0 — an understatement never sized against, since UNKNOWN_POSITION halts.
-            double stopDistance = local != null && local.quantity().signum() > 0
-                    ? local.riskUsd() / local.quantity().doubleValue()
-                    : 0.0;
-            // The stop id must be carried across passes; the exchange cannot supply it again.
             truth.add(new ExposureBook.OpenPosition(position.symbol(), direction, quantity, entryPrice,
-                    quantity.doubleValue() * entryPrice, quantity.doubleValue() * stopDistance,
-                    local == null ? Optional.empty() : local.protectiveStopId()));
+                    quantity.doubleValue() * entryPrice, quantity.doubleValue() * stopDistance, stopId));
         }
 
         Set<String> exchangeSymbols = new HashSet<>();
@@ -233,6 +294,7 @@ public final class Reconciler {
                 drifts.add(new Drift(Drift.Kind.GHOST_POSITION, local.symbol(),
                         "the book holds " + local.side() + " " + local.quantity().toPlainString()
                                 + ", the exchange is flat — " + describeExit(local)));
+                intents.clear(local.symbol());
             }
         }
 
@@ -245,8 +307,24 @@ public final class Reconciler {
         Set<String> stillTriggered = new HashSet<>();
 
         for (String symbol : symbolsToInspect) {
-            List<OrderStatus> working = port.openOrders(symbol).stream().filter(OrderStatus::isWorking).toList();
             boolean hasPosition = exchangeSymbols.contains(symbol);
+            List<OrderStatus> working;
+            try {
+                working = port.openOrders(symbol).stream().filter(OrderStatus::isWorking).toList();
+            } catch (RuntimeException e) {
+                // The book is already realigned above. A throw here used to abort the pass with the
+                // ghost/shrink drifts unreported and their journal rows unwritten, while the loop
+                // believed nothing had been touched. One symbol's unreadable orders are one symbol's
+                // ignorance: counted as unconfirmable if it holds a position, revisited if it does not.
+                LOG.warning("[Reconciler] " + symbol + ": working orders could not be read this pass ("
+                        + e.getMessage() + ")");
+                if (hasPosition) {
+                    countUnconfirmable(symbol, "orders unreadable: " + e.getMessage(), drifts, now);
+                } else {
+                    stillInteresting.add(symbol);
+                }
+                continue;
+            }
 
             if (hasPosition) {
                 Optional<OrderStatus> protectiveStop = working.stream()
@@ -290,9 +368,17 @@ public final class Reconciler {
         }
         carriedOverSymbols = stillInteresting;
         triggeredStops = stillTriggered;
-        // A drift that cleared may announce itself immediately if it ever comes back.
-        driftAnnouncedAt.keySet().removeIf(sig ->
-                drifts.stream().noneMatch(d -> (d.kind() + "|" + d.symbol()).equals(sig)));
+        // Orphans on symbols neither booked nor held are invisible to the per-symbol loop above:
+        // a closePosition stop left behind by a close whose cancel failed rests there until it
+        // expires, eating the conditional-order cap (~33 measured). Swept account-wide, rarely.
+        passes++;
+        if (passes % ORPHAN_SWEEP_EVERY == 0) {
+            sweepAccountWideOrphans(exchangeSymbols, book, symbolsToInspect, drifts, now);
+        }
+        // Announcement stamps expire on the clock, not on absence: an intermittent drift that
+        // vanished for one pass and came back used to re-announce every ~90 s.
+        driftAnnouncedAt.entrySet().removeIf(e ->
+                now.toEpochMilli() - e.getValue().toEpochMilli() > DRIFT_REANNOUNCE_MS);
         // A symbol no longer held has nothing to confirm; a stale count must not ambush a re-entry.
         unconfirmablePasses.keySet().retainAll(exchangeSymbols);
 
@@ -301,6 +387,7 @@ public final class Reconciler {
                 .atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli();
         try {
             engine.killSwitch().seedRealizedPnl(port.fetchRealizedPnlSince(utcMidnight), now);
+            engine.killSwitch().markRealizedStale(false);
             if (pnlSeedAlerted) {
                 alerts.info("Daily-loss feed is back",
                         "realised PnL is being read from the exchange again after "
@@ -313,6 +400,9 @@ public final class Reconciler {
             // (zero after a UTC rollover), six stop-outs in a row cannot trip the daily limit.
             // A log line was the only trace of that; now the operator hears when it persists.
             pnlSeedFailures++;
+            // While the realised half is frozen, a stop-out would IMPROVE the measured loss (its open
+            // loss vanishes, its realised loss never arrives); the switch ratchets instead.
+            engine.killSwitch().markRealizedStale(true);
             LOG.warning("[Reconciler] realised PnL could not be re-seeded from the exchange ("
                     + pnlSeedFailures + " in a row): " + e.getMessage());
             if (pnlSeedFailures == PNL_SEED_FAILURES_BEFORE_ALERT && !pnlSeedAlerted) {
@@ -328,20 +418,58 @@ public final class Reconciler {
         engine.killSwitch().observeBalance(Math.max(1e-9, account.equityUsd()), now);
 
         Report report = new Report(now, drifts, exchangePositions.size(), before.size());
+
+        // Exchange-side exits reach the journal whatever else the pass found: a stop-out on one
+        // symbol next to a drift on another used to be lost because only the healthy branch told
+        // the listener.
+        java.util.function.BiConsumer<String, String> listener = exchangeExitListener;
+        if (listener != null) {
+            for (Drift d : drifts) {
+                if (d.kind() == Drift.Kind.GHOST_POSITION || d.kind() == Drift.Kind.QUANTITY_MISMATCH) {
+                    try {
+                        listener.accept(d.symbol(), d.detail());
+                    } catch (RuntimeException e) {
+                        LOG.fine("[Reconciler] exit listener failed: " + e.getMessage());
+                    }
+                }
+            }
+        }
+
         if (!report.healthy()) {
             Drift first = drifts.stream().filter(Drift::isCritical).findFirst().orElseThrow();
             String summary = "reconciliation found " + drifts.size() + " disagreement(s):" + report.describe();
             LOG.severe("[Reconciler] " + summary);
             // The halt latches every pass as before; only the PUSH is throttled per drift, so a
             // condition that cannot clear itself does not bury the next real alert under itself.
-            String signature = first.kind() + "|" + first.symbol();
-            Instant lastAnnounced = driftAnnouncedAt.get(signature);
-            if (lastAnnounced == null
-                    || now.toEpochMilli() - lastAnnounced.toEpochMilli() >= DRIFT_REANNOUNCE_MS) {
-                driftAnnouncedAt.put(signature, now);
+            // Keyed on EVERY critical signature, not the first one: a new naked position must
+            // not sit silent for an hour because an older, unrelated drift is inside its
+            // re-announce window (audit 30.08). Announce when ANY current critical drift is new
+            // or stale; stamp them all so the hourly cadence still holds per condition.
+            // And ALWAYS when this pass is the one latching the halt: after /resume the same drift
+            // used to re-latch inside the throttle window, and the operator who had just cleared
+            // it heard nothing for up to an hour (audit 03.09).
+            boolean newlyHalting = !halt.isHalted();
+            boolean announce = newlyHalting;
+            Instant oldestAnnounced = null;
+            for (Drift d : drifts) {
+                if (!d.isCritical()) continue;
+                Instant seen = driftAnnouncedAt.get(d.kind() + "|" + d.symbol());
+                if (seen == null || now.toEpochMilli() - seen.toEpochMilli() >= DRIFT_REANNOUNCE_MS) {
+                    announce = true;
+                }
+                if (seen != null && (oldestAnnounced == null || seen.isBefore(oldestAnnounced))) {
+                    oldestAnnounced = seen;
+                }
+            }
+            if (announce) {
+                for (Drift d : drifts) {
+                    if (d.isCritical()) driftAnnouncedAt.put(d.kind() + "|" + d.symbol(), now);
+                }
                 alerts.critical("Reconciliation drift", summary
-                        + (lastAnnounced == null ? "" : "\n(still unresolved since "
-                                + lastAnnounced + "; repeated hourly)"));
+                        + (oldestAnnounced == null || newlyHalting ? "" : "\n(unresolved since "
+                                + oldestAnnounced + "; repeated hourly)")
+                        + (newlyHalting && oldestAnnounced != null
+                                ? "\n(the halt was cleared and the same condition is back)" : ""));
             }
             halt.halt("reconciliation drift: " + first.kind() + " on " + first.symbol(), now);
         } else if (!report.converged()) {
@@ -361,22 +489,41 @@ public final class Reconciler {
                 LOG.info("[Reconciler] pass repaired protection without drift to announce:"
                         + report.describe());
             }
-            java.util.function.BiConsumer<String, String> listener = exchangeExitListener;
-            if (listener != null) {
-                for (Drift d : drifts) {
-                    if (d.kind() == Drift.Kind.GHOST_POSITION || d.kind() == Drift.Kind.QUANTITY_MISMATCH) {
-                        try {
-                            listener.accept(d.symbol(), d.detail());
-                        } catch (RuntimeException e) {
-                            LOG.fine("[Reconciler] exit listener failed: " + e.getMessage());
-                        }
-                    }
-                }
-            }
         } else {
             LOG.fine("[Reconciler] converged: " + exchangePositions.size() + " position(s)");
         }
         return report;
+    }
+
+    /**
+     * Cancels protective orders resting on symbols that are flat and unbooked — the leftovers of a
+     * close whose cleanup failed, or of a crash after a flatten. Reduce-only and closePosition
+     * orders only: a hand-placed entry order on a flat symbol is the owner's business. Best effort;
+     * a failed listing costs nothing but the next sweep.
+     */
+    private void sweepAccountWideOrphans(Set<String> exchangeSymbols, ExposureBook book,
+                                         Set<String> alreadyInspected, List<Drift> drifts, Instant now) {
+        List<OrderStatus> all;
+        try {
+            all = port.openOrdersAll();
+        } catch (RuntimeException e) {
+            LOG.fine("[Reconciler] account-wide order listing failed: " + e.getMessage());
+            return;
+        }
+        for (OrderStatus order : all) {
+            if (!order.isWorking() || !(order.reduceOnly() || order.closePosition())) continue;
+            String symbol = order.symbol();
+            if (exchangeSymbols.contains(symbol) || book.hasPosition(symbol) || alreadyInspected.contains(symbol)) {
+                continue;
+            }
+            boolean oldEnough = order.updateTimeMs() > 0
+                    && now.toEpochMilli() - order.updateTimeMs() > orphanGraceMillis;
+            if (!oldEnough) continue;
+            drifts.add(new Drift(Drift.Kind.ORPHAN_ORDER, symbol,
+                    order.type() + " " + order.clientOrderId()
+                            + " rests on a flat, unbooked symbol — cancelling (account-wide sweep)"));
+            placer.cancelQuietly(symbol, order.clientOrderId());
+        }
     }
 
     /**
@@ -506,10 +653,17 @@ public final class Reconciler {
         unconfirmablePasses.remove(symbol);
         PositionCloser close = this.closer;
         ExposureBook.OpenPosition local = engine.book().get(symbol).orElse(null);
-        boolean repairable = close != null && local != null
-                && local.riskUsd() > 0 && local.quantity().signum() > 0;
+        // Ours = sized here and, when a stop id is on record, minted here. A hand trade whose app
+        // stop was adopted carries a risk figure too, and must not be repaired or closed by this
+        // process; a position adopted from an entry intent carries risk and no id yet, and is ours.
+        boolean ours = local != null && local.riskUsd() > 0
+                && local.protectiveStopId().map(ClientOrderIdFactory::isOurs).orElse(true);
+        boolean repairable = close != null && ours && local.quantity().signum() > 0;
         if (!repairable) {
-            drifts.add(new Drift(Drift.Kind.POSITION_WITHOUT_STOP, symbol, detail));
+            drifts.add(new Drift(Drift.Kind.POSITION_WITHOUT_STOP, symbol, detail
+                    + (local != null && local.riskUsd() > 0 && !ours
+                            ? " (adopted from the exchange with a foreign stop id — not this process's to repair)"
+                            : "")));
             return;
         }
 
@@ -531,6 +685,7 @@ public final class Reconciler {
                 if (check.ok()) {
                     OrderStatus placed = placer.place(request);
                     engine.book().recordStop(symbol, placed.clientOrderId());
+                    intents.clear(symbol);
                     // Retire the id on record only AFTER the replacement rests, never before: on the
                     // unconfirmable path the old stop may well be alive, and cancelling first would
                     // open a window with no protection at all. Cancelling second can only leave a

@@ -44,19 +44,30 @@ export BOOK_LEDGER_PATH="${BOOK_LEDGER_PATH:-$DATA_DIR/book-ledger-real.json}"
 # One JSONL row per trading event; the lab judges live entries with the same arithmetic as history.
 export TRADE_JOURNAL_PATH="${TRADE_JOURNAL_PATH:-$DATA_DIR/trades.jsonl}"
 
+say "build: $(cat /app/BUILD_STAMP 2>/dev/null || echo unknown)"
 say "starting the risk core..."
 # Process substitution, not a pipe: after `java | tee &`, $! is tee's PID, so TERM on shutdown
 # reached tee and the JVM was orphaned and killed hard - its shutdown hook never ran (22.08).
-java -jar /app/bot.jar --source manual --script "$BOOK" > >(tee -a "$BOT_LOG") 2>&1 &
+# A bounded heap: the JVM must never be the process the 2 GB host swaps out, and an OOM must be
+# a restart, not a zombie that still holds the book.
+JAVA_OPTS="${JAVA_OPTS:--Xmx384m -XX:+UseSerialGC -XX:+ExitOnOutOfMemoryError}"
+# shellcheck disable=SC2086
+java $JAVA_OPTS -jar /app/bot.jar --source manual --script "$BOOK" > >(tee -a "$BOT_LOG") 2>&1 &
 BOT_PID=$!
 
 # The scanner stands down when it sees a halt in the bot's log, so it must not start
 # before the log exists, and the book must not be fed before the account is adopted.
+READY_MARKERS='adopted from the exchange\|did not converge\|HALTED\|account read complete'
 for _ in $(seq 1 60); do
-  grep -aq 'adopted from the exchange\|did not converge\|HALTED' "$BOT_LOG" 2>/dev/null && break
+  grep -aq "$READY_MARKERS" "$BOT_LOG" 2>/dev/null && break
   kill -0 "$BOT_PID" 2>/dev/null || { say "the bot exited during boot - see the log above."; exit 1; }
   sleep 5
 done
+if ! grep -aq "$READY_MARKERS" "$BOT_LOG" 2>/dev/null; then
+  # Used to fall through in silence. The scanner has its own ready gate and writes nothing
+  # until the bot's line appears, so starting it is safe - but the operator must be told.
+  say "the bot has not finished reading the account after 5 min (an exchange hold at boot?) - starting the scanner anyway; it waits for the bot's own ready line"
+fi
 
 # The scanner's venue follows the bot's: with REAL_TRADING unset the bot is demo, and a scanner
 # still reading the real account would write real CLOSE lines into a demo book.
@@ -75,7 +86,7 @@ python3 /app/scanner/autoscan.py \
   --workdir "$DATA_DIR" \
   --venue "$WANT_VENUE" \
   --by-cap --top "${SCAN_TOP:-100}" --lookback 30 --interval "${SCAN_INTERVAL:-3600}" \
-  --max-positions "${MAX_POSITIONS:-10}" --leverage "${DEFAULT_LEVERAGE:-2}" &
+  --max-positions "${MAX_POSITIONS:-3}" --leverage "${DEFAULT_LEVERAGE:-2}" &
 SCANNER_PID=$!
 
 # If either half dies the machine is broken: a bot with no scanner is a frozen book,

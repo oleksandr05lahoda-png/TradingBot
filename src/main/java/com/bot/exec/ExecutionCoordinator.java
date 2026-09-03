@@ -89,6 +89,17 @@ public final class ExecutionCoordinator {
     private final Settings settings;
     private final Clock clock;
     private final RateLimiter.Sleeper sleeper;
+    /** Where the plan is written down before the entry goes out; see {@link EntryIntents}. */
+    private volatile EntryIntents intents = EntryIntents.inMemory();
+    /** Entries between "sent" and "protected or unwound": a shutdown must wait for zero. */
+    private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
+
+    /** Attempts at the protective stop before the position is unwound; only risk-free failures retry. */
+    static final int STOP_PLACEMENT_ATTEMPTS = 3;
+    static final long STOP_RETRY_DELAY_MS = 1_000L;
+    /** How long an ambiguous entry is probed for a position before the halt is latched. */
+    static final int UNKNOWN_ENTRY_PROBES = 5;
+    static final long UNKNOWN_ENTRY_PROBE_DELAY_MS = 1_000L;
 
     public ExecutionCoordinator(ExchangePort port, RiskEngine engine, IdempotentOrderPlacer placer,
                                 TradingHalt halt, AlertSink alerts, Settings settings,
@@ -103,10 +114,29 @@ public final class ExecutionCoordinator {
         this.sleeper = Preconditions.notNull(sleeper, "sleeper");
     }
 
+    /** Persistent intents (a file beside the ledger) instead of the in-memory default. */
+    public ExecutionCoordinator withEntryIntents(EntryIntents intents) {
+        this.intents = Preconditions.notNull(intents, "intents");
+        return this;
+    }
+
+    public EntryIntents intents() { return intents; }
+
+    /** Entries currently between fill and stop. A shutdown hook waits for this to reach zero. */
+    public int inFlight() { return inFlight.get(); }
+
     /** Executes an approved plan. Never throws for an ordinary refusal — that comes back as a report. */
     public Report execute(TradePlan plan) throws InterruptedException {
         Preconditions.notNull(plan, "plan");
+        inFlight.incrementAndGet();
+        try {
+            return executeGuarded(plan);
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
 
+    private Report executeGuarded(TradePlan plan) throws InterruptedException {
         if (halt.isHalted()) {
             return refused(plan, "trading is halted: " + halt.reason().orElse("unknown"));
         }
@@ -138,19 +168,25 @@ public final class ExecutionCoordinator {
         port.ensureIsolatedMargin(plan.symbol());
         port.setLeverage(plan.symbol(), plan.leverage());
 
+        // The plan goes on record BEFORE the send. Between a market fill and its stop the book
+        // knows nothing; if this process dies there, or the response is lost and the fill happened
+        // anyway, the reconciler reads the intent and places the stop that was meant.
+        intents.record(plan, clock.millis());
+
         OrderStatus entry;
         try {
             entry = placer.place(entryRequest);
         } catch (ExchangeException e) {
             if (!e.ambiguous()) {
                 // A definite refusal never landed, so there is nothing to clean up.
+                intents.clear(plan.symbol());
                 return refused(plan, "entry refused by the exchange: " + e.getMessage());
             }
             // Outcome never established, so the order may be live; not swallowable as "signal failed".
-            return unknownAfterSend(plan, e);
+            return unknownAfterSend(plan, stopRequest, e);
         } catch (RuntimeException e) {
             // A parse error mid-response is not a refusal: the request may well have executed.
-            return unknownAfterSend(plan, e);
+            return unknownAfterSend(plan, stopRequest, e);
         }
         try {
             entry = awaitEntryResolution(entry, entryRequest);
@@ -158,11 +194,12 @@ public final class ExecutionCoordinator {
             // The order EXISTS by now. Any failure to READ it — a 429 on the poll, a body the
             // parser chokes on — is ignorance about a live order, never "the entry never landed".
             // Reported as refused, this was a filled position living outside the book (28.08 audit).
-            return unknownAfterSend(plan, e);
+            return unknownAfterSend(plan, stopRequest, e);
         }
 
         BigDecimal filled = entry.executedQuantity();
         if (filled.signum() <= 0) {
+            intents.clear(plan.symbol());
             LOG.info("[Coordinator] " + plan.symbol() + " entry did not fill (" + entry.state()
                     + ") — nothing to protect, nothing to clean up");
             return new Report(Outcome.NOT_FILLED, plan, BigDecimal.ZERO, BigDecimal.ZERO,
@@ -170,16 +207,26 @@ public final class ExecutionCoordinator {
         }
 
         BigDecimal avgPrice = entry.averagePrice().signum() > 0 ? entry.averagePrice() : plan.entryPrice();
+        return protect(plan, stopRequest, Optional.of(entry), filled, avgPrice);
+    }
 
+    /**
+     * Everything after a confirmed fill: the stop first, then the book, then the exits. Reached from
+     * a normal fill and from an ambiguous send whose position turned up on the exchange anyway.
+     */
+    private Report protect(TradePlan plan, OrderRequest stopRequest, Optional<OrderStatus> entry,
+                           BigDecimal filled, BigDecimal avgPrice) throws InterruptedException {
         // The stop goes on now. Nothing between the fill and this.
         OrderStatus stop;
         try {
-            stop = placer.place(stopRequest);
+            stop = placeStopWithRetries(stopRequest);
         } catch (RuntimeException e) {
             return abandonUnprotectedPosition(plan, entry, filled, avgPrice, e);
         }
 
         engine.registerFill(plan, filled, avgPrice.doubleValue(), stop.clientOrderId());
+        // Protected and on the book: the intent has done its job.
+        intents.clear(plan.symbol());
 
         double realisedRisk = filled.doubleValue()
                 * Math.abs(avgPrice.doubleValue() - plan.stopPrice().doubleValue());
@@ -196,7 +243,8 @@ public final class ExecutionCoordinator {
             return closeOnSlippage(plan, entry, stop, filled, avgPrice, why);
         }
 
-        List<OrderStatus> takeProfits = placeTakeProfits(plan, closeSide, filled, avgPrice, filters);
+        List<OrderStatus> takeProfits = placeTakeProfits(plan, OrderSide.toClose(plan.side()), filled,
+                avgPrice, plan.filters());
 
         boolean partial = filled.compareTo(plan.quantity()) < 0;
         String note = partial
@@ -207,7 +255,27 @@ public final class ExecutionCoordinator {
                 + "; stop " + stop.clientOrderId() + "; " + takeProfits.size() + " exit(s)");
 
         return new Report(partial ? Outcome.PARTIALLY_FILLED : Outcome.FILLED, plan, filled, avgPrice,
-                Optional.of(entry), Optional.of(stop), takeProfits, note);
+                entry, Optional.of(stop), takeProfits, note);
+    }
+
+    /**
+     * The stop is retried only on failures that provably sent nothing — a connection that never
+     * opened, a rate limit the limiter sleeps out before the next send, a pre-send look-up that
+     * failed. A coded refusal or an ambiguous send goes straight to the unwind: retrying those
+     * could double an order. Three attempts a second apart cover the transient case that used to
+     * market-close a fresh position over one 20 s timeout (audit 03.09).
+     */
+    private OrderStatus placeStopWithRetries(OrderRequest stopRequest) throws InterruptedException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return placer.place(stopRequest);
+            } catch (ExchangeException e) {
+                if (!e.retryableWithoutRisk() || attempt >= STOP_PLACEMENT_ATTEMPTS) throw e;
+                LOG.warning("[Coordinator] stop " + stopRequest.clientOrderId() + " was not sent ("
+                        + e.getMessage() + ") — retrying " + (attempt + 1) + "/" + STOP_PLACEMENT_ATTEMPTS);
+                sleeper.sleepMillis(STOP_RETRY_DELAY_MS);
+            }
+        }
     }
 
     /** @param flat whether the symbol is confirmed to hold nothing afterwards */
@@ -233,8 +301,9 @@ public final class ExecutionCoordinator {
 
         if (position == null) {
             // Already flat. Any protective order still resting is an orphan by definition, so it goes.
-            port.cancelAllOpenOrders(symbol);
+            cancelLeftovers(symbol);
             engine.registerClose(symbol);
+            intents.clear(symbol);
             LOG.info("[Coordinator] " + symbol + " was already flat — cancelled leftover orders");
             return new CloseReport(symbol, true, BigDecimal.ZERO, BigDecimal.ZERO, "already flat");
         }
@@ -246,10 +315,12 @@ public final class ExecutionCoordinator {
         try {
             close = flatten(symbol, direction, held, requestId);
         } catch (RuntimeException e) {
+            // Not a latch. The caller retries with backoff and escalates when the retries are spent;
+            // halting here on one 429 stood the scanner down for the life of the process while the
+            // second attempt closed the position seconds later (audit 03.09).
             String note = "reduce-only close was refused (" + e.getMessage()
                     + ") — the position and its stop are still in place";
-            alerts.critical("Close failed", symbol + ": " + note);
-            halt.halt("close failed on " + symbol, clock.instant());
+            LOG.warning("[Coordinator] " + symbol + ": " + note);
             return new CloseReport(symbol, false, BigDecimal.ZERO, BigDecimal.ZERO, note);
         }
 
@@ -271,12 +342,31 @@ public final class ExecutionCoordinator {
             return new CloseReport(symbol, false, close.executedQuantity(), close.averagePrice(), note);
         }
 
-        port.cancelAllOpenOrders(symbol);
+        // The close is confirmed: it must be booked and reported whatever the cleanup does. A 429 on
+        // the cancel used to throw out of here BEFORE registerClose, so a real exit was retried as
+        // a failed close and never reached the journal (audit 03.09). Leftovers are the orphan
+        // sweep's job.
+        boolean cleaned = cancelLeftovers(symbol);
         engine.registerClose(symbol);
+        intents.clear(symbol);
         LOG.info("[Coordinator] " + symbol + " closed " + held.toPlainString()
-                + " @ " + close.averagePrice().toPlainString() + "; protective orders cancelled");
+                + " @ " + close.averagePrice().toPlainString()
+                + (cleaned ? "; protective orders cancelled" : "; protective orders NOT yet cancelled"));
         return new CloseReport(symbol, true, close.executedQuantity(), close.averagePrice(),
-                "closed reduce-only in full");
+                cleaned ? "closed reduce-only in full"
+                        : "closed reduce-only in full; leftover orders await the orphan sweep");
+    }
+
+    /** @return {@code true} when the symbol's working orders are gone; {@code false} leaves them to the sweep */
+    private boolean cancelLeftovers(String symbol) {
+        try {
+            port.cancelAllOpenOrders(symbol);
+            return true;
+        } catch (RuntimeException e) {
+            LOG.warning("[Coordinator] " + symbol + ": could not cancel leftover orders after the close ("
+                    + e.getMessage() + ") — the reconciler sweeps them as orphans");
+            return false;
+        }
     }
 
     /** Closes reduce-only. Deliberately ignores {@link TradingHalt}: a halt stops opening, never closing. */
@@ -342,28 +432,61 @@ public final class ExecutionCoordinator {
         return current;
     }
 
-    /** Halts and alerts rather than refusing: "unknown" is not "did not happen". */
-    private Report unknownAfterSend(TradePlan plan, RuntimeException cause) {
+    /**
+     * "Unknown" is not "did not happen". Before the latch, the exchange is asked whether the
+     * position exists: an entry whose response was lost but that filled is the common case, and it
+     * used to reach the next pass as a foreign position with no risk on record that the stop repair
+     * refused to touch. Found, it is protected exactly like a confirmed fill. Not found (or
+     * unseeable), the halt latches and the intent stays on record for the reconciler.
+     */
+    private Report unknownAfterSend(TradePlan plan, OrderRequest stopRequest, RuntimeException cause)
+            throws InterruptedException {
+        try {
+            for (int probe = 1; probe <= UNKNOWN_ENTRY_PROBES; probe++) {
+                sleeper.sleepMillis(UNKNOWN_ENTRY_PROBE_DELAY_MS);
+                Optional<PositionSnapshot> found = port.openPositions().stream()
+                        .filter(p -> p.symbol().equals(plan.symbol()) && !p.isFlat()
+                                && p.direction().orElse(null) == plan.side())
+                        .findFirst();
+                if (found.isPresent()) {
+                    PositionSnapshot position = found.get();
+                    BigDecimal filled = position.absoluteQuantity();
+                    BigDecimal avgPrice = position.entryPrice().signum() > 0
+                            ? position.entryPrice() : plan.entryPrice();
+                    LOG.warning("[Coordinator] " + plan.symbol() + ": the entry's response was lost ("
+                            + cause.getMessage() + ") but the exchange holds " + filled.toPlainString()
+                            + " @ " + avgPrice.toPlainString() + " — protecting it now");
+                    alerts.warning("Entry landed despite a lost response",
+                            plan.symbol() + ": " + filled.toPlainString() + " @ " + avgPrice.toPlainString()
+                                    + " found on the exchange after " + probe + " probe(s); placing its stop.");
+                    return protect(plan, stopRequest, Optional.empty(), filled, avgPrice);
+                }
+            }
+        } catch (RuntimeException probeFailure) {
+            LOG.warning("[Coordinator] " + plan.symbol() + ": could not probe for the position after the "
+                    + "ambiguous send (" + probeFailure.getMessage() + ")");
+        }
         String note = "the fate of the entry order is unknown (" + cause.getMessage()
-                + "). A position may be open and unprotected. Trading is halted until an operator "
-                + "reconciles the account.";
+                + ") and no position was seen in " + UNKNOWN_ENTRY_PROBES + " probes. A position may "
+                + "still appear; its intended stop is on record and the reconciler will place it. "
+                + "Trading is halted until an operator reconciles the account.";
         alerts.critical("Entry outcome unknown", plan.symbol() + ": " + note);
         halt.halt("entry outcome unknown on " + plan.symbol(), clock.instant());
         return new Report(Outcome.UNKNOWN_AFTER_SEND, plan, BigDecimal.ZERO, BigDecimal.ZERO,
                 Optional.empty(), Optional.empty(), List.of(), note);
     }
 
-    private Report abandonUnprotectedPosition(TradePlan plan, OrderStatus entry, BigDecimal filled,
+    private Report abandonUnprotectedPosition(TradePlan plan, Optional<OrderStatus> entry, BigDecimal filled,
                                               BigDecimal avgPrice, RuntimeException cause)
             throws InterruptedException {
-        alerts.critical("Protective stop could not be placed",
-                plan.symbol() + " filled " + filled.toPlainString() + " @ " + avgPrice.toPlainString()
-                        + " but the stop was refused (" + cause.getMessage()
-                        + "). Closing the position.");
+        LOG.severe("[Coordinator] " + plan.symbol() + " filled " + filled.toPlainString() + " @ "
+                + avgPrice.toPlainString() + " but the stop was refused (" + cause.getMessage()
+                + ") — closing the position");
 
         // Invariant: no position lives without a stop; the unwind below enforces it. Only a
         // confirmed-flat close avoids the halt — one symbol with unplaceable stops (live 14.08: stale
         // conditional orders on a venue that cannot list them) must not stop every other symbol.
+        // Act first, then tell: a Telegram retry cycle must not sit between a naked fill and its unwind.
         String note;
         try {
             OrderStatus close = flatten(plan.symbol(), plan.side(), filled, plan.signalId());
@@ -376,26 +499,28 @@ public final class ExecutionCoordinator {
                         + " — " + residual.toPlainString() + " REMAINS OPEN AND UNPROTECTED";
                 alerts.critical("Naked position", plan.symbol() + ": " + note);
             } else {
-                note = "stop refused; position closed reduce-only in full — trading continues, "
-                        + "but this symbol should be left alone until its conditional orders are cleaned up";
-                LOG.warning("[Coordinator] " + plan.symbol() + ": " + note);
+                intents.clear(plan.symbol());
+                note = "stop refused (" + cause.getMessage() + "); position closed reduce-only in full — "
+                        + "trading continues, but this symbol should be left alone until its conditional "
+                        + "orders are cleaned up";
+                alerts.critical("Protective stop could not be placed — position closed",
+                        plan.symbol() + ": " + note);
             }
         } catch (RuntimeException e) {
             halt.halt("protective stop could not be placed on " + plan.symbol()
                     + " and the unwind failed", clock.instant());
-            note = "stop refused AND the reduce-only close also failed (" + e.getMessage()
-                    + ") — MANUAL INTERVENTION REQUIRED";
+            note = "stop refused (" + cause.getMessage() + ") AND the reduce-only close also failed ("
+                    + e.getMessage() + ") — MANUAL INTERVENTION REQUIRED";
             alerts.critical("Naked position", plan.symbol() + ": " + note);
         }
         return new Report(Outcome.ABORTED_UNPROTECTED, plan, filled, avgPrice,
-                Optional.of(entry), Optional.empty(), List.of(), note);
+                entry, Optional.empty(), List.of(), note);
     }
 
-    private Report closeOnSlippage(TradePlan plan, OrderStatus entry, OrderStatus stop,
+    private Report closeOnSlippage(TradePlan plan, Optional<OrderStatus> entry, OrderStatus stop,
                                    BigDecimal filled, BigDecimal avgPrice, String why)
             throws InterruptedException {
-        alerts.critical("Fill broke the risk budget", plan.symbol() + ": " + why
-                + " — closing the position reduce-only");
+        LOG.warning("[Coordinator] " + plan.symbol() + ": " + why + " — closing the position reduce-only");
 
         String note;
         boolean closedCompletely = false;
@@ -407,19 +532,20 @@ public final class ExecutionCoordinator {
                 note = why + "; the reduce-only close filled only " + close.executedQuantity().toPlainString()
                         + " of " + filled.toPlainString() + " — " + residual.toPlainString()
                         + " is still open. Keeping the protective stop and halting.";
-                alerts.critical("Slippage abort left a residual position", plan.symbol() + ": " + note);
                 halt.halt("partial reduce-only close on " + plan.symbol(), clock.instant());
+                alerts.critical("Slippage abort left a residual position", plan.symbol() + ": " + note);
             } else {
                 closedCompletely = true;
                 note = why + "; closed reduce-only";
                 // Realised PnL is not invented here; it arrives from the exchange ledger next pass.
                 engine.registerClose(plan.symbol());
+                alerts.critical("Fill broke the risk budget — position closed", plan.symbol() + ": " + note);
             }
         } catch (RuntimeException e) {
             note = why + "; the reduce-only close FAILED (" + e.getMessage()
                     + ") — keeping the protective stop and halting; check this position by hand";
-            alerts.critical("Slippage abort could not close", plan.symbol() + ": " + note);
             halt.halt("reduce-only close failed on " + plan.symbol(), clock.instant());
+            alerts.critical("Slippage abort could not close", plan.symbol() + ": " + note);
         }
 
         // Only when confirmed flat: otherwise this strips protection off a still-open position.
@@ -427,7 +553,7 @@ public final class ExecutionCoordinator {
             placer.cancelQuietly(plan.symbol(), stop.clientOrderId());
         }
         return new Report(Outcome.ABORTED_ON_SLIPPAGE, plan, filled, avgPrice,
-                Optional.of(entry), closedCompletely ? Optional.empty() : Optional.of(stop), List.of(), note);
+                entry, closedCompletely ? Optional.empty() : Optional.of(stop), List.of(), note);
     }
 
     private Report refused(TradePlan plan, String note) {

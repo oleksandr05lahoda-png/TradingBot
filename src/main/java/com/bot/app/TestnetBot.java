@@ -3,6 +3,7 @@ package com.bot.app;
 import com.bot.core.InstrumentFilters;
 import com.bot.exec.AlertSink;
 import com.bot.exec.DeadMansSwitch;
+import com.bot.exec.EntryIntents;
 import com.bot.exec.ExchangePort;
 import com.bot.exec.ExchangeSnapshots.AccountSnapshot;
 import com.bot.exec.ExchangeSnapshots.PositionSnapshot;
@@ -17,11 +18,13 @@ import com.bot.exec.binance.BinanceVenue;
 import com.bot.risk.DailyLossKillSwitch;
 import com.bot.risk.ExposureBook;
 import com.bot.risk.MarginTierTable;
+import com.bot.risk.PositionSizer;
 import com.bot.risk.RiskConfig;
 import com.bot.risk.RiskConstants;
 import com.bot.risk.RiskDecision;
 import com.bot.risk.RiskEngine;
 import com.bot.risk.TakeProfitPolicy;
+import com.bot.risk.TradePlan;
 import com.bot.risk.TradeRequest;
 import com.bot.signal.CloseRequest;
 import com.bot.signal.ExecutionFeedback;
@@ -62,6 +65,14 @@ public final class TestnetBot {
     private static final long CLOSE_RETRY_CAP_MS = 300_000L;
     /** Repeat the exchange-hold alert this often while the hold lasts; one alert was silence for 17h. */
     private static final long HOLD_REMINDER_INTERVAL_MS = 3_600_000L;
+    /** A plain "alive" line this often: the only periodic INFO left once the PnL seed line went quiet. */
+    private static final long ALIVE_LOG_INTERVAL_MS = 300_000L;
+    /** A daily-loss breach must persist this long before the book is flattened: one pass, not one wick. */
+    private static final long KILL_SWITCH_CONFIRM_MS = 20_000L;
+    /** How long a shutdown waits for an entry caught between fill and stop; docker stop grants 45 s. */
+    private static final long SHUTDOWN_GRACE_MS = 40_000L;
+    /** The one halt reason the loop may lift by itself, once a converged pass contradicts it. */
+    private static final String BOOT_READ_HALT_PREFIX = "boot could not read the exchange: ";
 
     /** A close that did not confirm flat, waiting for its next attempt. */
     private record PendingClose(CloseRequest close, int attempts, long notBeforeMs) {}
@@ -101,8 +112,14 @@ public final class TestnetBot {
         // arrived near 33, measured live 14.08): stop+2 takes protects ~10 positions, stop+1 ~15.
         double tpR = doubleProperty("TP_R_MULTIPLE", 0.0);
         if (tpR > 0) config = config.withTakeProfitPolicy(TakeProfitPolicy.single(tpR));
-        RiskEngine engine = new RiskEngine(config, new ExposureBook(),
-                new DailyLossKillSwitch(config.dailyLossFractionLimit()));
+        // The ledger's directory is where every persisted safety record lives: the stop-id ledger,
+        // the entry intents and the kill-switch latch. One path, one volume.
+        Path ledgerPath = Path.of(System.getenv().getOrDefault("BOOK_LEDGER_PATH", "book-ledger.json"));
+        Path dataDir = ledgerPath.toAbsolutePath().getParent();
+        DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(config.dailyLossFractionLimit())
+                .withConfirmationWindowMs(KILL_SWITCH_CONFIRM_MS)
+                .withLatchFile(dataDir.resolve("killswitch-latch.json"), Instant.now());
+        RiskEngine engine = new RiskEngine(config, new ExposureBook(), killSwitch);
         TradingHalt halt = new TradingHalt();
 
         ExchangePort port;
@@ -148,9 +165,13 @@ public final class TestnetBot {
             if (operator != null) operator.start();
 
             IdempotentOrderPlacer placer = new IdempotentOrderPlacer(port);
+            // The plan is on disk before the entry goes out: a crash between fill and stop, or an
+            // entry whose response was lost, no longer leaves a position the repair refuses to touch.
+            EntryIntents intents = EntryIntents.at(dataDir.resolve("entry-intents.json"), System.currentTimeMillis());
             ExecutionCoordinator coordinator = new ExecutionCoordinator(port, engine, placer, halt, alerts,
-                    entrySettings(), Clock.systemUTC(), Thread::sleep);
+                    entrySettings(), Clock.systemUTC(), Thread::sleep).withEntryIntents(intents);
             Reconciler reconciler = new Reconciler(port, engine, halt, alerts, placer);
+            reconciler.withEntryIntents(intents);
             // A booked position found without a stop is repaired — stop re-placed from the book's
             // record, or closed reduce-only — instead of only halted on (28.08 audit, finding #1).
             reconciler.withStopRepair(coordinator::closeOut);
@@ -177,19 +198,20 @@ public final class TestnetBot {
 
             // Re-arm the book from the last snapshot BEFORE reconciling: the venue cannot name
             // resting stops, so otherwise a restart with open positions halts and forces a flatten.
-            Path ledgerPath = Path.of(System.getenv().getOrDefault("BOOK_LEDGER_PATH", "book-ledger.json"));
             String[] lastLedgerBody = {""};
 
             // A start-up disagreement stops OPENING only — exiting would strand a position with no
             // way to unwind it through the bot. Covers the first exchange read too: dying there was
             // measured with an invalid key on 20.08.
             boolean bootstrapped;
+            int bootAttempts = 0;
             while (true) {
                 try {
                     // One 5xx or timeout here used to leave the book empty for the life of the process
                     // and every later pass flagging UNKNOWN_POSITION. Three tries, then the loop retries
                     // adoption itself after its first successful reconcile.
                     List<PositionSnapshot> live = readPositionsWithRetry(port, 3);
+                    journalExitsWhileDown(journal, port, live, ledgerPath);
                     int seeded = BookLedger.seed(engine.book(), live, ledgerPath);
                     if (seeded > 0) {
                         LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
@@ -215,8 +237,16 @@ public final class TestnetBot {
                         Thread.sleep(heldMs + 15_000L);
                         continue;
                     }
+                    // fetchAccount and the per-symbol order reads inside bootstrap had no retry at
+                    // all: one 5xx latched this halt for the life of the process (audit 03.09).
+                    if (++bootAttempts < 3) {
+                        LOG.warning("[Boot] start-up read failed (" + bootAttempts + "/3): " + e.getMessage()
+                                + " — retrying in 5 s");
+                        Thread.sleep(5_000L);
+                        continue;
+                    }
                     bootstrapped = false;
-                    halt.halt("boot could not read the exchange: " + e.getMessage(), Instant.now());
+                    halt.halt(BOOT_READ_HALT_PREFIX + e.getMessage(), Instant.now());
                 }
                 break;
             }
@@ -299,12 +329,24 @@ public final class TestnetBot {
             holdWatchdog.start();
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                // An entry caught between its fill and its stop must finish before the JVM goes:
+                // docker stop grants 45 s, and the intent file covers the case where it does not.
+                long deadline = System.currentTimeMillis() + SHUTDOWN_GRACE_MS;
+                while (coordinator.inFlight() > 0 && System.currentTimeMillis() < deadline) {
+                    LOG.warning("[Shutdown] waiting for " + coordinator.inFlight() + " entr(ies) in flight");
+                    try {
+                        Thread.sleep(500L);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
                 LOG.info("[Shutdown] disarming the dead-man's switch");
                 deadMansSwitch.disarmAll();
             }));
 
             long lastReconcileMs = System.currentTimeMillis();
             long lastHeartbeatMs = System.currentTimeMillis();
+            long lastAliveLogMs = System.currentTimeMillis();
             int sourceFailures = 0;
             boolean bookAgreesWithExchange = bootstrapped;
             int reconcileFailures = 0;
@@ -333,15 +375,15 @@ public final class TestnetBot {
                             continue;
                         }
                         attemptClose(pending.close(), pending.attempts() + 1,
-                                coordinator, signals, alerts, journal, pendingCloses);
+                                coordinator, signals, alerts, journal, halt, pendingCloses);
                     }
                     if (operator != null) {
                         for (CloseRequest close : operator.drainCloses()) {
-                            attemptClose(close, 1, coordinator, signals, alerts, journal, pendingCloses);
+                            attemptClose(close, 1, coordinator, signals, alerts, journal, halt, pendingCloses);
                         }
                     }
                     for (CloseRequest close : signals.pollCloses()) {
-                        attemptClose(close, 1, coordinator, signals, alerts, journal, pendingCloses);
+                        attemptClose(close, 1, coordinator, signals, alerts, journal, halt, pendingCloses);
                     }
                     for (Signal signal : signals.poll()) {
                         if (observeOnly) {
@@ -417,6 +459,15 @@ public final class TestnetBot {
                 }
 
                 long nowMs = System.currentTimeMillis();
+                if (nowMs - lastAliveLogMs >= ALIVE_LOG_INTERVAL_MS) {
+                    // The launcher's "already running" guard and the operator's eye both want a
+                    // periodic line; the PnL seed used to supply one every 30 s by accident.
+                    LOG.info("[Loop] alive: " + engine.book().openCount() + " position(s), halt="
+                            + (halt.isHalted() ? "YES" : "none") + ", reconcile failures=" + reconcileFailures
+                            + ", pending closes=" + pendingCloses.size()
+                            + ", entries in flight=" + coordinator.inFlight());
+                    lastAliveLogMs = nowMs;
+                }
                 // Housekeeping never kills the loop: a dead bot cannot close the position it holds.
                 // The halt latch is how a real problem stops trading, not process death.
                 if (nowMs - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
@@ -438,8 +489,14 @@ public final class TestnetBot {
                         // Any completed pass earns the right to persist — reconcile realigns the book
                         // to the exchange before returning, so what follows is truthful even when the
                         // pass also found drift. Only a pass that THREW leaves the flag untouched.
-                        reconciler.reconcile(Instant.now());
+                        Reconciler.Report passReport = reconciler.reconcile(Instant.now());
                         bookAgreesWithExchange = true;
+                        if (passReport.converged()) {
+                            // The only self-clearing latch: a boot that could not READ the exchange,
+                            // now contradicted by a converged pass. Drift latches stay for /resume.
+                            halt.clearIfReasonStartsWith(BOOT_READ_HALT_PREFIX,
+                                    "the exchange answered and the book converged");
+                        }
                         if (!adoptionDone) {
                             // The boot read failed; the book was realigned from the exchange but
                             // carries no stop ids. Read them back now that the exchange answers.
@@ -531,6 +588,37 @@ public final class TestnetBot {
         return new ExecutionCoordinator.Settings(OrderTypes.OrderType.LIMIT, inForce, 20, 500, 0.20);
     }
 
+    /**
+     * Exits that happened while the process was down: the ledger names the positions, the stop
+     * order names the price when the venue still answers for it. Without this row the forward
+     * record simply lost every stop-out and take-profit that fired between two runs.
+     */
+    private static void journalExitsWhileDown(TradeJournal journal, ExchangePort port,
+                                              List<PositionSnapshot> live, Path ledgerPath) {
+        if (journal == null) return;
+        for (BookLedger.ClosedWhileAway gone : BookLedger.closedWhileAway(live, ledgerPath)) {
+            String state = "", price = "", qty = "";
+            if (!gone.stopId().isBlank()) {
+                try {
+                    java.util.Optional<com.bot.exec.ExchangeSnapshots.OrderStatus> stop =
+                            port.queryOrder(gone.symbol(), gone.stopId());
+                    if (stop.isPresent()) {
+                        state = stop.get().state().name();
+                        if (stop.get().averagePrice().signum() > 0) price = stop.get().averagePrice().toPlainString();
+                        if (stop.get().executedQuantity().signum() > 0) qty = stop.get().executedQuantity().toPlainString();
+                    }
+                } catch (RuntimeException e) {
+                    LOG.fine("[Boot] could not read the stop that may have closed " + gone.symbol()
+                            + ": " + e.getMessage());
+                }
+            }
+            LOG.info("[Boot] " + gone.symbol() + " left the book while this process was down (stop "
+                    + gone.stopId() + (state.isEmpty() ? "" : " " + state) + ")");
+            journal.exchangeExit(gone.symbol(), "closed while the process was down; ledger side "
+                    + gone.side(), gone.stopId(), state, price, qty, true);
+        }
+    }
+
     private static List<PositionSnapshot> readPositionsWithRetry(ExchangePort port, int attempts)
             throws InterruptedException {
         RuntimeException last = null;
@@ -582,7 +670,7 @@ public final class TestnetBot {
      */
     private static void attemptClose(CloseRequest close, int attempt, ExecutionCoordinator coordinator,
                                      SignalSource signals, AlertSink alerts, TradeJournal journal,
-                                     java.util.ArrayDeque<PendingClose> pendingCloses)
+                                     TradingHalt halt, java.util.ArrayDeque<PendingClose> pendingCloses)
             throws Exception {
         LOG.info("[Loop] " + close
                 + (attempt > 1 ? " (attempt " + attempt + "/" + CLOSE_MAX_ATTEMPTS + ")" : ""));
@@ -601,8 +689,7 @@ public final class TestnetBot {
                 signals.onClosed(close, new ExecutionFeedback(close.id(), report.closedQuantity(),
                         report.averagePrice(), report.note()));
                 if (attempt > 1) {
-                    alerts.info("Close succeeded on retry", close.symbol() + " closed on attempt "
-                            + attempt + "; a halt latched by the earlier failure still needs /resume");
+                    alerts.info("Close succeeded on retry", close.symbol() + " closed on attempt " + attempt);
                 }
                 return;
             }
@@ -616,7 +703,10 @@ public final class TestnetBot {
             alerts.critical("Close abandoned after retries",
                     close.symbol() + ": " + failure + " — " + CLOSE_MAX_ATTEMPTS + " attempts "
                             + "failed. The position keeps its resting stop; close it by hand "
-                            + "or re-issue /close.");
+                            + "or re-issue /close. Entries are halted until /resume.");
+            // The latch moved here from the first failure: a close that needs eight tries is an
+            // incident, one that needs two is a 429 (audit 03.09).
+            halt.halt("close abandoned on " + close.symbol() + " after " + attempt + " attempts", Instant.now());
             return;
         }
         long delay = Math.min(CLOSE_RETRY_CAP_MS, CLOSE_RETRY_BASE_MS << (attempt - 1));
@@ -668,12 +758,20 @@ public final class TestnetBot {
                     }
                     if (report.opened()) {
                         if (journal != null) {
+                            TradePlan plan = report.plan();
+                            double fill = report.averageFillPrice().doubleValue();
+                            double qty = report.filledQuantity().doubleValue();
                             journal.entryOpened(signal.id(), signal.symbol(), signal.side().name(),
                                     String.valueOf(signal.entryPrice()),
                                     report.averageFillPrice().toPlainString(),
                                     report.filledQuantity().toPlainString(),
-                                    report.protectiveStop()
-                                            .map(o -> o.clientOrderId()).orElse(null),
+                                    report.protectiveStop().map(o -> o.clientOrderId()).orElse(null),
+                                    plan.stopPrice().toPlainString(),
+                                    report.takeProfitOrders().stream()
+                                            .map(o -> o.stopPrice() == null ? "" : o.stopPrice().toPlainString())
+                                            .toList(),
+                                    PositionSizer.riskUsd(qty, fill, plan.stopPrice().doubleValue()),
+                                    plan.leverage(), qty * fill,
                                     report.outcome() + ": " + report.note());
                         }
                         signals.onAccepted(signal, new ExecutionFeedback(
@@ -682,6 +780,13 @@ public final class TestnetBot {
                                 report.averageFillPrice(),
                                 report.outcome() + ": " + report.note()));
                     } else {
+                        if (journal != null && report.filledQuantity().signum() > 0) {
+                            // Filled and unwound at once: a real round trip the record must see.
+                            journal.entryAborted(signal.id(), signal.symbol(), signal.side().name(),
+                                    report.averageFillPrice().toPlainString(),
+                                    report.filledQuantity().toPlainString(),
+                                    report.outcome().name(), report.note());
+                        }
                         signals.onRejected(signal, report.outcome() + ": " + report.note());
                     }
                 }

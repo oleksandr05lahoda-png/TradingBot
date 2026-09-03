@@ -1,0 +1,170 @@
+# Перенос бота на VPS — 24/7 на своём IP
+
+Зачем: Railway помечает даже «статические» адреса как **Shared**, а Binance считает лимит
+запросов на адрес. Соседские боты выжирали лимит — отсюда баны на 9–17 часов 27, 28 и 29.08.
+Свой адрес VPS принадлежит только тебе, а бот, по замеру, ест ~6% лимита 2400/мин — на своём
+адресе бан невозможен.
+
+Ноутбук эту задачу не решает: он выключается.
+
+---
+
+## 1. Сервер (~15 минут, ~€5/мес)
+
+**Hetzner Cloud** — [console.hetzner.cloud](https://console.hetzner.cloud). Регистрация, потом
+New Project → Add Server:
+
+| Параметр | Значение | Почему |
+|---|---|---|
+| Location | **Falkenstein / Nuremberg / Helsinki** | Binance обслуживает; США и UK — нет |
+| Image | **Ubuntu 24.04** | под него написан скрипт |
+| Type | **CX22** (2 vCPU, 4 ГБ) | бот ест ~0.4 ГБ; запас на сборку образа |
+| Networking | **IPv4 включён** | нужен именно IPv4-адрес |
+| SSH key | добавь свой | пароль по SSH — лишний риск |
+
+Цена: ~€3.8 сервер + ~€0.6 за IPv4 ≈ **€4.4/мес**.
+
+Не подошёл Hetzner (бывает проверка личности) — Netcup или Contabo, те же требования.
+Oracle Free Tier бесплатен, но ресурсы отбирают без предупреждения — для 24/7 не годится.
+
+Запиши выданный **IPv4** — он понадобится дважды.
+
+## 2. Код на сервер
+
+Подключение с ноутбука:
+
+```bash
+ssh root@ТВОЙ_IP
+```
+
+Дальше на сервере:
+
+```bash
+apt update && apt install -y git
+git clone https://github.com/oleksandr05lahoda-png/TradingBot.git /opt/tradingbot
+cd /opt/tradingbot && git checkout feature/testnet-risk-core
+```
+
+Если репозиторий приватный и git просит пароль — GitHub → Settings → Developer settings →
+Personal access tokens → Fine-grained → доступ только на чтение этого репозитория; вставь
+токен вместо пароля.
+
+Вариант без GitHub — залить с ноутбука (выполнять **на ноутбуке**, не на сервере):
+
+```bash
+scp -r gradle gradlew build.gradle settings.gradle src tools Dockerfile root@ТВОЙ_IP:/opt/tradingbot/
+```
+
+## 3. Проверка адреса — до всего остального
+
+**На сервере:**
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://fapi.binance.com/fapi/v1/ping
+```
+
+- `200` — адрес чистый, продолжай.
+- `418` или `429` — адрес уже под баном от прошлого владельца. **Не вписывай его в Binance.**
+  Удали сервер, создай новый (получишь другой адрес), проверь снова. Стоит копейки и минуты.
+- `451`/`403` — регион; пересоздай в Германии или Финляндии.
+
+Эту же проверку делает и скрипт деплоя первым шагом.
+
+## 4. Секреты и настройки
+
+На сервере создай `/opt/tradingbot.env`. Значения ключей возьми из `local.env` на ноутбуке —
+в репозиторий они не попадают никогда.
+
+```bash
+nano /opt/tradingbot.env
+```
+
+```
+BINANCE_REAL_API_KEY=<боевой ключ>
+BINANCE_REAL_API_SECRET=<боевой секрет>
+TELEGRAM_BOT_TOKEN=<токен>
+TELEGRAM_CHAT_ID=<chat id>
+
+REAL_TRADING=ARMED
+REAL_MODE=observe          # ПЕРВЫЙ запуск — только наблюдение
+
+DEFAULT_LEVERAGE=2
+MAX_POSITIONS=15
+TP_R_MULTIPLE=1.75
+ENTRY_NEAR_HIGH=0.05
+ENTRY_VOL_MULT=1.5
+MAX_HOLD_HOURS=48
+BEAR_UNIVERSE=on
+```
+
+Это ровно та конфигурация, что крутилась на Railway, вместе с медвежьим пулом. `REAL_MODE`
+на первом запуске **observe**: бот прочитает счёт, покажет позиции и не откроет ничего.
+
+```bash
+chmod 600 /opt/tradingbot.env
+```
+
+## 5. Запуск
+
+```bash
+cd /opt/tradingbot && bash tools/vps-deploy.sh
+```
+
+Скрипт проверит адрес, поставит Docker, соберёт образ и запустит контейнер с
+`--restart unless-stopped` — переживает перезагрузку сервера.
+
+Ожидаемое в логе:
+
+```
+REAL EXCHANGE — REAL MONEY. Mode: OBSERVE
+... adopted from the exchange
+autoscan start: ... bear_universe=on top-250 @ +0.0%
+```
+
+В Telegram придёт `[REAL OBSERVE] Bot is up`.
+
+## 6. Whitelist на Binance — только после успешного observe
+
+Binance → API Management → ключ → Edit restrictions:
+
+1. Добавь **IP сервера**.
+2. Удали три адреса Railway (`208.77.246.240/241/242`) — они чужие и больше не нужны.
+3. Домашний адрес можно оставить: пригодится, если понадобится запустить с ноутбука.
+
+Порядок именно такой: сначала убедиться, что адрес работает, потом запирать на него ключ.
+
+## 7. Боевой режим
+
+```bash
+sed -i 's/^REAL_MODE=observe/REAL_MODE=trade/' /opt/tradingbot.env
+docker restart -t 45 tradingbot
+```
+
+## Дальше: обновление и наблюдение
+
+```bash
+cd /opt/tradingbot && git pull && bash tools/vps-deploy.sh   # обновить
+docker logs -f tradingbot                                    # смотреть живьём
+docker logs --tail 200 tradingbot                            # последние строки
+```
+
+⚠️ **Не перезапускать контейнер, пока в логе висит «Exchange is refusing this IP».** Запрос
+на старте считается стуком во время бана, и Binance продлевает срок — так 29.08 выход
+отодвинулся с 21:00 на 02:42.
+
+### Чтобы я мог читать логи, как читал Railway
+
+На ноутбуке:
+
+```bash
+ssh-keygen -t ed25519 -C tradingbot-vps
+ssh-copy-id root@ТВОЙ_IP
+```
+
+После этого я запускаю `ssh root@ТВОЙ_IP 'docker logs --tail 100 tradingbot'` с твоей машины
+и диагностирую так же, как через панель Railway.
+
+## Что осталось на Railway
+
+На диске проекта лежит `trades.jsonl` — журнал живых сделок за 5 дней. Проект не удаляй,
+пока не решим, забирать его или начинать 90-дневное окно с чистого листа на VPS.

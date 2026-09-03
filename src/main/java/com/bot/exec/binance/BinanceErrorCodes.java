@@ -8,6 +8,21 @@ public final class BinanceErrorCodes {
     /** Timestamp outside {@code recvWindow}: the local clock has drifted. */
     public static final int TIMESTAMP_OUT_OF_RECV_WINDOW = -1021;
 
+    /**
+     * "Timeout waiting for response from backend server. Send status unknown; execution status
+     * unknown." Binance delivers this with a 4xx, so by HTTP status alone it read as a refusal —
+     * and an order that DID execute was dropped as "never landed" (audit 03.09).
+     */
+    public static final int TIMEOUT_EXECUTION_UNKNOWN = -1007;
+
+    /** "An unexpected response was received from the message bus. Execution status unknown." */
+    public static final int UNEXPECTED_RESPONSE = -1006;
+
+    /** The exchange itself says it does not know whether the request executed. Never a refusal. */
+    public static boolean isExecutionStatusUnknown(int code) {
+        return code == TIMEOUT_EXECUTION_UNKNOWN || code == UNEXPECTED_RESPONSE;
+    }
+
     public static final int BAD_PRECISION = -1111;
 
     public static final int NEW_ORDER_REJECTED = -2010;

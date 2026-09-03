@@ -1,4 +1,4 @@
-# Brings the REAL-venue bot up. REAL MONEY — this launcher arms it, you run it.
+﻿# Brings the REAL-venue bot up. REAL MONEY — this launcher arms it, you run it.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\start-real.ps1              # observe: no entries
 #   powershell -ExecutionPolicy Bypass -File tools\start-real.ps1 -Mode trade  # full operation
@@ -59,11 +59,24 @@ function Test-RealMachineAlive {
         Where-Object { $_.CommandLine -like '*autoscan*' -and $_.CommandLine -like '*book_real*' }).Count -ge 1
     if (-not ($bot -and $scanner)) { return $false }
     if (-not (Test-Path $botLog)) { return $false }
-    ((Get-Date) - (Get-Item $botLog).LastWriteTime).TotalSeconds -lt 90
+    # Ten minutes: the bot writes an explicit "[Loop] alive" line every five. The old 90 s window
+    # was only ever satisfied by the PnL seed line that logged every 30 s by accident; once that
+    # line went quiet a healthy bot would have read as dead and been restarted (audit 03.09).
+    ((Get-Date) - (Get-Item $botLog).LastWriteTime).TotalSeconds -lt 600
 }
 if (-not $Force -and (Test-RealMachineAlive)) {
     Say "already running (bot + scanner alive, log fresh) - nothing to do." 'Green'
     exit 0
+}
+
+# The real bot lives on the VPS now. Two instances on one key tear each other's stop ids apart
+# (18.08), so this launcher refuses while the marker file says the machine runs elsewhere.
+# Delete tools\REAL_BOT_LIVES_ELSEWHERE (or pass -Force) only after the VPS container is stopped.
+$elsewhere = Join-Path $root 'tools\REAL_BOT_LIVES_ELSEWHERE'
+if (-not $Force -and (Test-Path $elsewhere)) {
+    Say "REFUSED: $elsewhere says the real bot runs on another machine (the VPS)." 'Red'
+    Say "Stop it there first, delete the marker, then run this again. Nothing was started." 'Red'
+    exit 1
 }
 
 Say "--- start-real (mode: $Mode) ---"
@@ -91,6 +104,10 @@ $env:MAX_POSITIONS    = '10'
 $env:DEFAULT_LEVERAGE = '2'
 $env:TP_R_MULTIPLE    = '1.75'
 $env:BOOK_LEDGER_PATH = Join-Path $dir 'book-ledger-real.json'
+# One JSONL row per trading event. Without this line the journal is silently OFF
+# (TradeJournal.fromEnvironmentOrNull) - found live 29.08: the container always set it,
+# this launcher never did, and the n>=100 forward judgment starves on laptop runs.
+$env:TRADE_JOURNAL_PATH = Join-Path $dir 'trades.jsonl'
 
 Say "stopping anything of ours still running..."
 # Scoped kills: only processes carrying the book_real marker. The demo machine is not ours.

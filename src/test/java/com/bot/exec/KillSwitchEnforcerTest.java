@@ -32,7 +32,7 @@ class KillSwitchEnforcerTest {
     private void openBook(String... symbols) {
         for (String symbol : symbols) {
             engine.book().open(new ExposureBook.OpenPosition(symbol, Side.LONG,
-                    new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.of("stop-" + symbol)));
+                    new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.of("bt-s0-" + symbol)));
         }
     }
 
@@ -202,7 +202,7 @@ class KillSwitchEnforcerTest {
         // so the id cannot collide with the pre-crash attempt 1 and be adopted as already-filled.
         RiskEngine restarted = ExecFixtures.engine();
         restarted.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
-                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.of("stop-BTCUSDT")));
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.of("bt-s0-BTCUSDT")));
         Instant later = ExecFixtures.NOON.plusSeconds(240);
         restarted.killSwitch().observeBalance(1_000, later);
         restarted.killSwitch().observeOpenUnrealizedPnl(0, later);

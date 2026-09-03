@@ -21,7 +21,10 @@ import org.json.JSONObject;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.net.ConnectException;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
@@ -219,7 +222,10 @@ public final class BinanceFuturesAdapter implements ExchangePort {
             for (int i = 0; i < rows.length(); i++) {
                 JSONObject row = rows.getJSONObject(i);
                 String type = row.optString("incomeType", "");
-                if (type.equals("REALIZED_PNL") || type.equals("COMMISSION") || type.equals("FUNDING_FEE")) {
+                // INSURANCE_CLEAR is the liquidation clearance fee: the one day it appears is the
+                // day the limit exists for, so it counts too.
+                if (type.equals("REALIZED_PNL") || type.equals("COMMISSION") || type.equals("FUNDING_FEE")
+                        || type.equals("INSURANCE_CLEAR")) {
                     total += row.optDouble("income", 0);
                 }
                 newestSeen = Math.max(newestSeen, row.optLong("time", cursor));
@@ -398,6 +404,25 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                         + "that a position still has its stop, and closed positions will leave their "
                         + "stops resting until something cancels them by name.");
             }
+        }
+        return out;
+    }
+
+    /** Account-wide, both endpoints; weight 40 for the plain half, so callers keep it rare. */
+    @Override public List<OrderStatus> openOrdersAll() {
+        List<OrderStatus> out = new ArrayList<>();
+        JSONArray plain = new JSONArray(signedGet("/fapi/v1/openOrders", Map.of(), 40));
+        for (int i = 0; i < plain.length(); i++) out.add(parseOrder(plain.getJSONObject(i)));
+        if (!conditionalListingAvailable) return out;
+        try {
+            JSONArray algo = new JSONArray(signedGet("/fapi/v1/openAlgoOrders", Map.of(), 1));
+            for (int i = 0; i < algo.length(); i++) {
+                JSONObject row = algo.getJSONObject(i);
+                out.add(parseAlgoOrder(row, row.optString("symbol", "")));
+            }
+        } catch (ExchangeException e) {
+            if (e.httpStatus() != 404) throw e;
+            conditionalListingAvailable = false;
         }
         return out;
     }
@@ -634,15 +659,7 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                         "HTTP " + status + " from the exchange — execution status is unknown", null);
             }
             if (status / 100 != 2) {
-                int code = 0;
-                String message = response.body();
-                try {
-                    JSONObject error = new JSONObject(response.body());
-                    code = error.optInt("code", 0);
-                    message = error.optString("msg", message);
-                } catch (RuntimeException ignored) {
-                    // Not JSON — keep the raw body.
-                }
+                int code = errorCode(response.body());
                 if (code == BinanceErrorCodes.TIMESTAMP_OUT_OF_RECV_WINDOW && !resynced) {
                     // -1021 is refused before anything executes, so re-signing is safe for every
                     // method. Once: a second refusal means the clock, not the timing.
@@ -651,11 +668,17 @@ public final class BinanceFuturesAdapter implements ExchangePort {
                     resynced = true;
                     continue;
                 }
-                throw ExchangeException.refused(
-                        request.method() + " " + request.uri().getPath() + " -> " + message, status, code);
+                throw classifyError(request.method(), request.uri().getPath(), status, response.body());
             }
             return response.body();
 
+        } catch (HttpConnectTimeoutException | ConnectException | UnknownHostException e) {
+            // The connection was never established, so the request never left this host: a definite
+            // "not sent", not an ambiguity. Reported as ambiguous, a DNS blip on an entry POST latched
+            // an "entry outcome unknown" halt over a position that could not exist (audit 03.09).
+            throw ExchangeException.neverSent(
+                    "could not connect for " + request.method() + " " + request.uri().getPath()
+                            + " — nothing was sent (" + e.getClass().getSimpleName() + ")", e);
         } catch (HttpTimeoutException e) {
             throw ExchangeException.ambiguous(
                     "timeout on " + request.method() + " " + request.uri().getPath()
@@ -669,6 +692,40 @@ public final class BinanceFuturesAdapter implements ExchangePort {
             throw ExchangeException.ambiguous("interrupted while sending " + request.uri().getPath(), e);
         }
         }
+    }
+
+    /** Binance's numeric code from an error body; 0 when the body is not the documented JSON. */
+    static int errorCode(String body) {
+        try {
+            return new JSONObject(body).optInt("code", 0);
+        } catch (RuntimeException ignored) {
+            return 0;
+        }
+    }
+
+    /**
+     * What a non-2xx answer means for the caller. 5xx and the two codes by which the exchange says
+     * "execution status unknown" (-1007, -1006) are ambiguous whatever the HTTP status carried them —
+     * the placer must probe by id, never conclude "did not land". Everything else is a refusal that
+     * definitely did not execute. Package-private so the classification is testable without HTTP.
+     */
+    static ExchangeException classifyError(String method, String path, int status, String body) {
+        int code = 0;
+        String message = body;
+        try {
+            JSONObject error = new JSONObject(body);
+            code = error.optInt("code", 0);
+            message = error.optString("msg", message);
+        } catch (RuntimeException ignored) {
+            // Not JSON — keep the raw body.
+        }
+        if (status >= 500 || BinanceErrorCodes.isExecutionStatusUnknown(code)) {
+            // Binance calls EVERY 5xx "execution status unknown", and says so in words for -1007
+            // and -1006 even on a 4xx: a filled-but-lost entry must not become an untracked position.
+            return ExchangeException.ambiguous("HTTP " + status + (code != 0 ? " code " + code : "")
+                    + " on " + method + " " + path + " — execution status is unknown: " + message, null);
+        }
+        return ExchangeException.refused(method + " " + path + " -> " + message, status, code);
     }
 
     private void observeLimitHeaders(HttpResponse<String> response) {

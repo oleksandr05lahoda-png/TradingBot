@@ -43,6 +43,8 @@ class DelegatingExchange implements ExchangePort {
 
     @Override public List<OrderStatus> openOrders(String symbol) { return delegate.openOrders(symbol); }
 
+    @Override public List<OrderStatus> openOrdersAll() { return delegate.openOrdersAll(); }
+
     @Override public List<PositionSnapshot> openPositions() { return delegate.openPositions(); }
 
     @Override public void cancelOrder(String symbol, String clientOrderId) {

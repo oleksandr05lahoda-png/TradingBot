@@ -73,9 +73,48 @@ public interface AlertSink {
 
         private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
+        /**
+         * Delivery runs on its own thread. Every caller is the loop thread — the one that executes
+         * closes, the heartbeat and reconciliation — and three attempts with 8 s timeouts used to
+         * park it for up to ~35 s per serious alert whenever Telegram was slow (audit 03.09).
+         * Bounded: a Telegram outage must not grow the heap; the log still carries every line.
+         */
+        private final java.util.concurrent.BlockingQueue<Runnable> outbox =
+                new java.util.concurrent.LinkedBlockingQueue<>(256);
+
         private Telegram(String token, String chatId) {
             this.token = token;
             this.chatId = chatId;
+            Thread worker = new Thread(this::drainForever, "telegram-alerts");
+            worker.setDaemon(true);
+            worker.start();
+            // A shutdown must not lose the last CRITICAL: give the outbox a bounded moment.
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> flush(5_000L), "telegram-alerts-flush"));
+        }
+
+        private void drainForever() {
+            while (true) {
+                try {
+                    outbox.take().run();
+                } catch (InterruptedException e) {
+                    return;
+                } catch (RuntimeException e) {
+                    LOG.warning("Telegram delivery failed: " + redact(String.valueOf(e.getMessage())));
+                }
+            }
+        }
+
+        /** Waits until the outbox is empty or the deadline passes; for shutdown and tests. */
+        void flush(long maxWaitMs) {
+            long deadline = System.currentTimeMillis() + maxWaitMs;
+            while (!outbox.isEmpty() && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(50L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
         }
 
         /** Returns null when the environment does not configure Telegram. */
@@ -126,6 +165,12 @@ public interface AlertSink {
         }
 
         @Override public void alert(Severity severity, String title, String message) {
+            if (!outbox.offer(() -> deliver(severity, title, message))) {
+                LOG.warning("Telegram outbox is full — alert dropped (still in this log): " + title);
+            }
+        }
+
+        private void deliver(Severity severity, String title, String message) {
             String text = switch (severity) {
                 case CRITICAL -> "❌ CRITICAL: ";
                 case WARNING -> "⚠ ";
@@ -147,7 +192,7 @@ public interface AlertSink {
                     HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
                     if (response.statusCode() / 100 == 2) return;
                     // 4xx is the chat id or the token — retrying cannot fix it, and a rotated token
-                    // must not cost three timeouts on the loop thread for every alert.
+                    // must not cost three timeouts for every alert.
                     if (response.statusCode() / 100 == 4) {
                         LOG.warning("Telegram alert REFUSED, HTTP " + response.statusCode()
                                 + " — check TELEGRAM_CHAT_ID and TELEGRAM_BOT_TOKEN");
@@ -160,6 +205,10 @@ public interface AlertSink {
                             + " (attempt " + attempt + "/" + attempts + ")");
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    return;
+                } catch (RuntimeException e) {
+                    // URI.create quotes the whole URL — token included — in its exception message.
+                    LOG.warning("Telegram alert not built: " + redact(String.valueOf(e.getMessage())));
                     return;
                 }
                 if (attempt < attempts) {

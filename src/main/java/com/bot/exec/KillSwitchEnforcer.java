@@ -87,13 +87,15 @@ public final class KillSwitchEnforcer {
         }
         if (runStampSeconds == 0) runStampSeconds = now.getEpochSecond();
 
-        // Only what this bot sized. A position with no recorded risk was adopted from the exchange —
-        // the owner's own hand trade or a hedge — and market-closing it is not this process's call,
-        // exactly as Reconciler.handleMissingStop refuses to. They keep their own protection.
+        // Only what this bot opened. On the real venue the ledger adopts ANY stopped position with a
+        // risk figure — the owner's hand trade with a stop from the app included — so risk > 0 is
+        // not ownership; the stop id's prefix is. Market-closing a hand trade is not this
+        // process's call, exactly as Reconciler.handleMissingStop refuses to. They keep their own
+        // protection.
         List<ExposureBook.OpenPosition> book = engine.book().all();
-        List<ExposureBook.OpenPosition> open = book.stream().filter(p -> p.riskUsd() > 0).toList();
+        List<ExposureBook.OpenPosition> open = book.stream().filter(KillSwitchEnforcer::ownedByThisBot).toList();
         List<String> leftAlone = book.stream()
-                .filter(p -> p.riskUsd() <= 0)
+                .filter(p -> !ownedByThisBot(p))
                 .map(ExposureBook.OpenPosition::symbol)
                 .toList();
         if (open.isEmpty()) {
@@ -161,6 +163,16 @@ public final class KillSwitchEnforcer {
             LOG.warning("[KillSwitchEnforcer] " + failed + " close(s) failed on attempt " + attempts
                     + "/" + MAX_FLATTEN_ATTEMPTS + " — retrying next pass");
         }
+    }
+
+    /**
+     * A position is this bot's when its risk was sized here AND its stop carries this machine's id
+     * prefix. A stop-less position with risk on record is one adopted from an entry intent — also
+     * ours. Everything else was adopted from the exchange and stays the owner's.
+     */
+    static boolean ownedByThisBot(ExposureBook.OpenPosition p) {
+        if (p.riskUsd() <= 0) return false;
+        return p.protectiveStopId().map(ClientOrderIdFactory::isOurs).orElse(true);
     }
 
     /** Names what the flatten deliberately did not touch, so silence is never mistaken for coverage. */

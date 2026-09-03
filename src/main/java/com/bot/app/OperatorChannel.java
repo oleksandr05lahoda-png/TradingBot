@@ -38,6 +38,9 @@ public final class OperatorChannel implements AutoCloseable {
         String poll(long offset) throws IOException, InterruptedException;
 
         void send(String text) throws IOException, InterruptedException;
+
+        /** Strips whatever secret the transport carries out of a message bound for a log. */
+        default String redact(String text) { return text; }
     }
 
     /** A halt whose reason starts with this is a venue mode, not an incident; /resume must not lift it. */
@@ -143,13 +146,15 @@ public final class OperatorChannel implements AutoCloseable {
                 // does not).
                 pollFailures++;
                 if (pollFailures == 1 || pollFailures % POLL_FAILURES_BEFORE_ALERT == 0) {
-                    LOG.warning("[Operator] poll failed (" + pollFailures + " in a row): " + e.getMessage()
+                    LOG.warning("[Operator] poll failed (" + pollFailures + " in a row): "
+                            + transport.redact(String.valueOf(e.getMessage()))
                             + " - /status /halt /resume are NOT being heard");
                 }
                 com.bot.exec.AlertSink sink = alerts;
                 if (pollFailures == POLL_FAILURES_BEFORE_ALERT && sink != null) {
                     sink.warning("Operator commands unavailable",
-                            "Telegram getUpdates has failed " + pollFailures + " times: " + e.getMessage()
+                            "Telegram getUpdates has failed " + pollFailures + " times: "
+                                    + transport.redact(String.valueOf(e.getMessage()))
                                     + ". A second bot polling this token (409) or a rotated token (401) "
                                     + "are the usual causes. Alerts still arrive; commands do not.");
                 }
@@ -253,6 +258,12 @@ public final class OperatorChannel implements AutoCloseable {
         private final String token;
         private final String chatId;
         private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+
+        /** The token is a URL path segment; an exception that quotes the URL quotes the token. */
+        @Override public String redact(String text) {
+            if (text == null) return "null";
+            return token.isEmpty() ? text : text.replace(token, "<token>");
+        }
 
         HttpTransport(String token, String chatId) {
             this.token = token;

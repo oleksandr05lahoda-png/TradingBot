@@ -48,4 +48,21 @@ public final class TradingHalt {
                     + " by operator; previous halt was: " + previous.reason());
         }
     }
+
+    /**
+     * The one self-clearing case: a latch whose reason names a condition the machine has since
+     * proven gone (a boot that could not read the exchange, followed by a converged pass). Only a
+     * halt whose reason starts with {@code reasonPrefix} is lifted — a drift latch never is. Same
+     * "HALT CLEARED at" wording, so the scanner follows it too.
+     */
+    public boolean clearIfReasonStartsWith(String reasonPrefix, String why) {
+        State current = state.get();
+        if (current == null || !current.reason().startsWith(reasonPrefix)) return false;
+        if (state.compareAndSet(current, null)) {
+            LOG.warning("[TradingHalt] HALT CLEARED at " + Instant.now() + " automatically: " + why
+                    + "; previous halt was: " + current.reason());
+            return true;
+        }
+        return false;
+    }
 }

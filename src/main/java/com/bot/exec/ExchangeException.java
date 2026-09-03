@@ -27,6 +27,25 @@ public class ExchangeException extends RuntimeException {
         return new ExchangeException(message, 0, 0, true, cause);
     }
 
+    /**
+     * A request that provably never left this host — DNS, connection refused, connect timeout — or
+     * a read this process refused to act on before sending anything. Not ambiguous: nothing can
+     * have executed. {@code httpStatus} 0 and code 0 are the signature callers may retry on.
+     */
+    public static ExchangeException neverSent(String message, Throwable cause) {
+        return new ExchangeException(message, 0, 0, false, cause);
+    }
+
+    /**
+     * True when a plain retry cannot double anything: the request never reached the exchange
+     * (status 0) or the exchange refused to even look at it (429/418, which the limiter now sleeps
+     * out before the next send). A coded refusal such as -2021 or -4164 is not retryable.
+     */
+    public boolean retryableWithoutRisk() {
+        return !ambiguous && exchangeCode == 0
+                && (httpStatus == 0 || httpStatus == 429 || httpStatus == 418);
+    }
+
     public int httpStatus() { return httpStatus; }
 
     /** Binance's numeric error code, or 0 when the failure never reached it. */

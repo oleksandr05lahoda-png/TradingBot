@@ -49,6 +49,13 @@ public interface ExchangePort extends AutoCloseable {
     List<OrderStatus> openOrders(String symbol);
 
     /**
+     * Every working order on the ACCOUNT, both plain and conditional, so orphans on symbols that
+     * are neither booked nor held can be found at all — per-symbol listing never looks there.
+     * Empty when the venue cannot enumerate account-wide; callers treat that as "nothing to sweep".
+     */
+    default List<OrderStatus> openOrdersAll() { return List.of(); }
+
+    /**
      * False means conditional (trigger) orders never appear in {@link #openOrders}, so the absence of
      * a stop proves nothing: the reconciler asks {@link #queryOrder} for it by name instead.
      */

@@ -58,6 +58,17 @@ public final class ClientOrderIdFactory {
         return Optional.empty();
     }
 
+    /**
+     * Whether an id was minted here. The ledger records the stop id of every position it adopts,
+     * including a hand trade protected by a stop placed in the app; only an id with this prefix
+     * proves the position was opened by this machine. "Bot-owned" used to be inferred from
+     * {@code riskUsd > 0}, which {@code BookLedger.adopt} assigns to ANY stopped position (audit 03.09).
+     */
+    public static boolean isOurs(String clientOrderId) {
+        return clientOrderId != null && clientOrderId.startsWith(PREFIX)
+                && clientOrderId.length() > PREFIX.length();
+    }
+
     private static char letterOf(OrderPurpose purpose) {
         return switch (purpose) {
             case ENTRY -> 'e';

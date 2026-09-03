@@ -1,0 +1,8 @@
+The real-venue bot runs on the VPS (Netcup, 24/7) since 30.08.2026.
+
+tools\start-real.ps1 refuses to start while this file exists, because two instances on one
+API key destroy each other's stop ids (18.08 incident). To run the real bot from this laptop:
+  1. stop the VPS container:  ssh root@<vps> 'docker stop -t 45 tradingbot'
+  2. delete this file
+  3. run tools\start-real.ps1
+Recreate the file before starting the VPS container again.

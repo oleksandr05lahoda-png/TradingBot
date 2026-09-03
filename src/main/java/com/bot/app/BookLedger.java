@@ -97,6 +97,36 @@ final class BookLedger {
         return seeded;
     }
 
+    /** A ledger row whose symbol the exchange no longer holds: its exit happened while we were away. */
+    record ClosedWhileAway(String symbol, String side, String stopId) {}
+
+    /**
+     * Rows the last process persisted for positions that are flat now. {@link #seed} skips them
+     * silently, so a stop or take that filled while the process was down produced no journal row
+     * at all and the forward record lost the exit (audit 03.09). Read-only; the caller journals.
+     */
+    static List<ClosedWhileAway> closedWhileAway(List<PositionSnapshot> exchange, Path path) {
+        List<ClosedWhileAway> out = new java.util.ArrayList<>();
+        if (!Files.exists(path)) return out;
+        JSONArray rows;
+        try {
+            rows = new JSONObject(Files.readString(path, StandardCharsets.UTF_8)).optJSONArray("positions");
+        } catch (Exception e) {
+            return out;
+        }
+        if (rows == null) return out;
+        for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.getJSONObject(i);
+            String symbol = row.optString("symbol", "");
+            if (symbol.isBlank()) continue;
+            boolean stillOpen = exchange.stream()
+                    .anyMatch(p -> p.symbol().equals(symbol) && p.signedQuantity().signum() != 0);
+            if (stillOpen) continue;
+            out.add(new ClosedWhileAway(symbol, row.optString("side", ""), row.optString("stopId", "")));
+        }
+        return out;
+    }
+
     /**
      * Restores what the file could not. Where the venue lists conditional orders the resting stop
      * names itself, so a lost ledger — a fresh container, an ephemeral disk — no longer costs a halt.

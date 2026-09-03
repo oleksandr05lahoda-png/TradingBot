@@ -50,7 +50,19 @@ KEY_ENV = ["BINANCE_TESTNET_API_KEY"]
 SECRET_ENV = ["BINANCE_TESTNET_API_SECRET"]
 
 CG_MARKETS = ("https://api.coingecko.com/api/v3/coins/markets"
-              "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1")
+              "?vs_currency=usd&order=market_cap_desc&per_page=250&page=%d")
+# Roughly 4 of every 10 CoinGecko cap entries map to a tradable Binance USDT perp, so a list of N
+# needs ~2.5N cap entries: one page of 250 for the top-100 (as always), four pages for the top-300
+# a bear day draws from. The single page used to yield ~97 coins whatever --bear-top asked for, so
+# the red-day pool was a quintile of the top-100, not of the top-300 h5.py measured (audit 03.09).
+CG_PAGE_SIZE = 250
+CG_MAX_PAGES = 4
+
+
+def cg_pages_for(top):
+    if top <= 100:
+        return 1
+    return max(1, min(CG_MAX_PAGES, -(-int(top * 2.5) // CG_PAGE_SIZE)))
 STABLECOINS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
                "USD1", "BUSD", "USDP", "USDD", "USDF", "RLUSD"}
 
@@ -115,16 +127,32 @@ def signed_get(path, env):
     if _skew[0] is None:
         srv = get("/fapi/v1/time", {}, base=SIGNED_BASE[0], gap=0.5)
         _skew[0] = (int(time.time() * 1000) - int(srv["serverTime"])) if srv else 0
-    q = "timestamp=%d&recvWindow=10000" % (int(time.time() * 1000) - _skew[0])
-    sig = hmac.new(env[SECRET_ENV[0]].encode(), q.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request("%s%s?%s&signature=%s" % (SIGNED_BASE[0], path, q, sig),
-                                 headers={"X-MBX-APIKEY": env[KEY_ENV[0]]})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except Exception:
-        _skew[0] = None
-        raise
+    # Three tries, like the public get(): one transient timeout on positionRisk used to drop the
+    # whole pass, exits included, and the bot's own log shows those timeouts arriving in clusters
+    # (three on /fapi/v2/account inside four minutes on 01.09). A 429/418 is not retried here -
+    # knocking during a hold lengthens it; the caller sleeps and the next pass tries again.
+    last = None
+    for attempt in range(3):
+        q = "timestamp=%d&recvWindow=10000" % (int(time.time() * 1000) - _skew[0])
+        sig = hmac.new(env[SECRET_ENV[0]].encode(), q.encode(), hashlib.sha256).hexdigest()
+        req = urllib.request.Request("%s%s?%s&signature=%s" % (SIGNED_BASE[0], path, q, sig),
+                                     headers={"X-MBX-APIKEY": env[KEY_ENV[0]]})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            _skew[0] = None
+            if e.code in (429, 418) or 400 <= e.code < 500:
+                raise
+            last = e
+        except Exception as e:
+            _skew[0] = None
+            last = e
+        if attempt < 2:
+            time.sleep(3 * (attempt + 1))
+            srv = get("/fapi/v1/time", {}, base=SIGNED_BASE[0], gap=0.5)
+            _skew[0] = (int(time.time() * 1000) - int(srv["serverTime"])) if srv else 0
+    raise last
 
 
 def read_env(repo):
@@ -190,7 +218,89 @@ def btc_regime(lookback, live):
     return ("BULL" if m["ret"] >= 0 else "BEAR"), m["ret"], ret1, closes
 
 
+def bot_owned(workdir):
+    """Symbols the RISK CORE opened itself, from the ledger it keeps on the same data volume.
+    Ownership is the stop id's prefix: every order this machine mints starts with "bt-". riskUsd
+    alone is NOT ownership - on the real venue the ledger adopts ANY position that carries a stop,
+    the owner's hand trade with a stop from the app included, and assigns it a risk figure (audit
+    03.09). A row with risk but no id yet is a position adopted from an entry intent - ours."""
+    for name in ("book-ledger-real.json", "book-ledger.json"):
+        path = os.path.join(workdir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with io.open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            return set()
+        rows = doc.get("positions", doc) if isinstance(doc, dict) else doc
+        out = set()
+        for r in rows or []:
+            try:
+                if not r.get("symbol") or float(r.get("riskUsd") or 0) <= 0:
+                    continue
+                stop_id = r.get("stopId") or ""
+                if stop_id == "" or stop_id.startswith("bt-"):
+                    out.add(r["symbol"])
+            except (TypeError, ValueError):
+                pass
+        return out
+    return set()
+
+
+def read_journal_feedback(workdir, since_ts):
+    """What the risk core did with this scanner's lines, from the trade journal on the same volume:
+    (rejected, filled, newest_ts). rejected maps symbol -> reason for every auto-* line the bot
+    REFUSED since `since_ts`; filled is the set of symbols whose auto-* entry FILLED. The scanner
+    never read this before, so a coin the bot could not size was re-proposed every pass and, on a
+    red day, spent the narrow pool's only slot on a line that could never fill (audit 03.09)."""
+    path = os.path.join(workdir, "trades.jsonl")
+    rejected, filled, newest = {}, set(), since_ts
+    if not os.path.exists(path):
+        return rejected, filled, newest
+    try:
+        with io.open(path, encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                try:
+                    row = json.loads(ln)
+                except ValueError:
+                    continue
+                ts = _journal_ts(row.get("ts"))
+                if ts is None or ts <= since_ts:
+                    continue
+                newest = max(newest, ts)
+                sid = row.get("signalId") or ""
+                if not sid.startswith("auto-"):
+                    continue
+                sym = row.get("symbol") or ""
+                if row.get("kind") == "rejected" and sym:
+                    rejected[sym] = row.get("reason") or "rejected"
+                elif row.get("kind") == "entry" and sym:
+                    filled.add(sym)
+                    rejected.pop(sym, None)
+    except OSError:
+        pass
+    return rejected, filled, newest
+
+
+def _journal_ts(text):
+    """ISO-8601 with nanoseconds -> epoch seconds; None when unparseable."""
+    if not text:
+        return None
+    try:
+        import datetime
+        t = text.rstrip("Z")
+        if "." in t:
+            head, frac = t.split(".", 1)
+            t = head + "." + (frac + "000000")[:6]
+        return datetime.datetime.fromisoformat(t).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 MIN_NOTIONAL = {}    # symbol -> exchange minimum notional in USDT, refreshed with the universe
+STEP_SIZE = {}       # symbol -> LOT_SIZE stepSize; the bot floors quantity to it BEFORE the notional check
+MIN_QTY = {}         # symbol -> LOT_SIZE minQty
 
 
 def universe(top, min_volume, by_cap, cached_cap=None):
@@ -201,6 +311,11 @@ def universe(top, min_volume, by_cap, cached_cap=None):
     all refused by the risk core, none of them anything the owner would hold."""
     info = get("/fapi/v1/exchangeInfo", {}, gap=0.5)
     if not info:
+        # One failed exchangeInfo call used to skip the whole pass, EXITS included, under a log
+        # line blaming CoinGecko (audit 03.09). The last good cap list is the right stand-in; the
+        # filters cached from the last good call stay in force.
+        if cached_cap:
+            return [(s, 0.0) for s in cached_cap][:top], "cap-cached"
         return [], "none"
     tradable = {s["symbol"] for s in info["symbols"]
                 if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
@@ -208,11 +323,14 @@ def universe(top, min_volume, by_cap, cached_cap=None):
     for s in info["symbols"]:
         if s["symbol"] in tradable:
             for f in s.get("filters", []):
-                if f.get("filterType") == "MIN_NOTIONAL":
-                    try:
+                try:
+                    if f.get("filterType") == "MIN_NOTIONAL":
                         MIN_NOTIONAL[s["symbol"]] = float(f.get("notional", 5))
-                    except (TypeError, ValueError):
-                        pass
+                    elif f.get("filterType") == "LOT_SIZE":
+                        STEP_SIZE[s["symbol"]] = float(f.get("stepSize", 0) or 0)
+                        MIN_QTY[s["symbol"]] = float(f.get("minQty", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
     # When the bot executes on the demo exchange, which lists a smaller universe than
     # the live one, a candidate absent there is refused every scan and wastes an open
     # slot. On the real venue the live list IS the tradable list, so no intersection.
@@ -231,15 +349,22 @@ def universe(top, min_volume, by_cap, cached_cap=None):
         out = [(s, vol.get(s, 0.0)) for s in tradable if vol.get(s, 0.0) >= floor]
         out.sort(key=lambda x: -x[1])
         return out[:top], "volume"
-    cg = None
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(CG_MARKETS, headers={"User-Agent": "autoscan/1.0"})
-            with urllib.request.urlopen(req, timeout=45) as r:
-                cg = json.loads(r.read().decode("utf-8"))
-            break
-        except Exception:
-            time.sleep(5 * (attempt + 1))
+    cg = []
+    for page in range(1, cg_pages_for(top) + 1):
+        got = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(CG_MARKETS % page, headers={"User-Agent": "autoscan/1.0"})
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    got = json.loads(r.read().decode("utf-8"))
+                break
+            except Exception:
+                time.sleep(5 * (attempt + 1))
+        if not got:
+            break                      # keep what the earlier pages gave; a shorter list beats none
+        cg.extend(got)
+        if page < cg_pages_for(top):
+            time.sleep(2.0)            # the free tier meters requests per minute
     if not cg:
         # The free CoinGecko tier throttles datacenter IPs. The last good cap list is the
         # right stand-in: same coins, an hour or a day stale. With no cache at all there is
@@ -344,17 +469,40 @@ def corr60(a, b, n=60):
 
 
 def load_state(path):
-    try:
-        with io.open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"entered": {}, "cooldown": {}}
+    """The state file holds the entry clocks, cooldowns and the last good cap list. A corrupt one
+    used to be replaced with an empty state in silence: every trend position was re-clocked from
+    now (+48 h of hold), every cooldown forgotten (audit 03.09). Now the .bak written on every
+    save is tried next, and the loss is said out loud on stdout for the log."""
+    for candidate in (path, path + ".bak"):
+        try:
+            with io.open(candidate, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            if not isinstance(doc, dict):
+                raise ValueError("state is not an object")
+            if candidate != path:
+                print("state file %s unreadable - recovered from %s" % (path, candidate), flush=True)
+            return doc
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            print("state file %s unreadable (%s)" % (candidate, e), flush=True)
+    return {"entered": {}, "cooldown": {}}
 
 
 def save_state(path, state):
     tmp = path + ".tmp"
     with io.open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f)
+        f.flush()
+        try:
+            os.fsync(f.fileno())      # a power loss must not leave a zero-length state file
+        except OSError:
+            pass
+    if os.path.exists(path):
+        try:
+            os.replace(path, path + ".bak")
+        except OSError:
+            pass
     os.replace(tmp, path)
 
 
@@ -430,9 +578,9 @@ def main():
                     help="off: report the BTC regime and what a gate WOULD do (shadow forward); "
                          "cash: open nothing while BTC's 30d return is negative. Default from "
                          "REGIME_GATE in the environment, else off")
-    ap.add_argument("--bear-top", type=int, default=250,
-                    help="how deep the cap list goes on a bear day when BEAR_UNIVERSE=on; "
-                         "CoinGecko's page caps this at 250")
+    ap.add_argument("--bear-top", type=int, default=300,
+                    help="how deep the cap list goes on a bear day when BEAR_UNIVERSE=on; 300 is "
+                         "what analysis/regimeuni/h5.py measured (up to 4 CoinGecko pages)")
     ap.add_argument("--workdir", default=None,
                     help="where this scanner's log and state live (default: analysis/forward); "
                          "a demo and a real scanner must never share state")
@@ -547,6 +695,26 @@ def main():
                 held = {r["symbol"] for r in rows if float(r["positionAmt"]) != 0}
                 held_since = {r["symbol"]: float(r.get("updateTime", 0)) / 1000.0
                               for r in rows if float(r["positionAmt"]) != 0 and r.get("updateTime")}
+                # ADOPTION (30.08). max-hold only ever fired for symbols in `entered`, and that
+                # map lives in this state file - so a move between machines (Railway -> laptop ->
+                # VPS) silently exempted every carried position from the 48h rule FOREVER. The
+                # book then froze: nothing aged out, every slot taken, no new entries for six
+                # days. A position the risk core owns (ledger riskUsd > 0) but this scanner has
+                # no clock for is adopted here, timed from now: a migration costs at most one
+                # extra hold period instead of eternity. Hand trades (absent from the ledger or
+                # riskUsd 0) are deliberately left alone, as everywhere else.
+                _entered = state.setdefault("entered", {})
+                _trig = state.setdefault("entered_trig", {})
+                _orphans = sorted((held & bot_owned(args.workdir)) - set(_entered))
+                if _orphans:
+                    stamp = time.time()
+                    for _s in _orphans:
+                        _entered[_s] = stamp
+                        _trig[_s] = "trend"
+                    save_state(statepath, state)
+                    log("adopted %d position(s) the risk core owns but this scanner had no clock "
+                        "for: %s - max-hold now applies to them from this moment"
+                        % (len(_orphans), ",".join(_orphans)), logpath)
             except Exception as e:
                 # str(e) matters: an IP-whitelist rejection or a revoked key looks identical to
                 # a network blip by type name alone, and only the detail tells the operator
@@ -559,7 +727,9 @@ def main():
                            % (type(e).__name__, e), logpath)
                 state["fail_streak"] = state.get("fail_streak", 0) + 1
                 save_state(statepath, state)
-                time.sleep(args.interval)
+                # Five minutes, not the whole hour: a pass without a position read also managed no
+                # EXITS, and the retry inside signed_get already absorbed the transient case.
+                time.sleep(min(args.interval, 300))
                 continue
             if state.get("fail_streak", 0) > 0:
                 notify(env, "exchange is answering again after %d skipped scan(s)"
@@ -575,14 +745,21 @@ def main():
                                               cached_cap=state.get("cap_pool"))
             pool = wide_pool[:args.top]
             if not pool:
-                log("universe empty (no CoinGecko answer and no cached list); skipping", logpath)
-                notify(env, "universe empty - no CoinGecko answer and no cached top-100 yet; "
-                            "this scan is skipped", logpath)
+                log("universe empty (no exchangeInfo/CoinGecko answer and no cached list); skipping", logpath)
+                if not state.get("told_universe_empty"):
+                    # Once per outage, like every other notify: this one fired every five minutes.
+                    notify(env, "universe empty - no exchange/CoinGecko answer and no cached top-100 yet; "
+                                "scans are skipped until one answers", logpath)
+                    state["told_universe_empty"] = True
+                    save_state(statepath, state)
                 # Five minutes, not an hour: a pass that produced no pool also produced no EXITS,
                 # and one transient refusal should not cost the whole hour's exit management.
                 # Matches the not-ready branch above.
                 time.sleep(min(args.interval, 300))
                 continue
+            if state.get("told_universe_empty"):
+                state["told_universe_empty"] = False
+                save_state(statepath, state)
             if pool_source == "cap":
                 # Cache the WIDE list: every consumer slices it (universe returns out[:top]), so the
                 # bull path is unchanged, but a CoinGecko outage no longer shrinks a bear day's pool
@@ -602,12 +779,15 @@ def main():
             # simply turns the filter off and the risk core refuses as before.
             risk_usd = None
             try:
-                bal = signed_get("/fapi/v2/balance", env)
-                usdt = next((float(b["balance"]) for b in bal if b.get("asset") == "USDT"), None)
-                if usdt:
-                    risk_usd = usdt * float(env.get("RISK_PER_TRADE", "0.005"))
+                # The same figure the risk core sizes from: wallet PLUS unrealised (equityUsd). The
+                # wallet alone disagreed with the bot by the open PnL, one more way the two sizings
+                # drifted apart on the $5 boundary (audit 03.09).
+                acct = signed_get("/fapi/v2/account", env)
+                equity = float(acct.get("totalWalletBalance") or 0) + float(acct.get("totalUnrealizedProfit") or 0)
+                if equity > 0:
+                    risk_usd = equity * float(env.get("RISK_PER_TRADE", "0.005"))
             except Exception as e:
-                log("balance unreadable (%s) - feasibility filter off this pass" % type(e).__name__, logpath)
+                log("account unreadable (%s) - feasibility filter off this pass" % type(e).__name__, logpath)
             tick = get("/fapi/v1/ticker/price", {}, gap=0.5) or []
             live = {t["symbol"]: float(t["price"]) for t in tick}
             # Every entry this pass writes is priced from THIS snapshot, so this is the moment the
@@ -769,8 +949,24 @@ def main():
             entered_trig = state.setdefault("entered_trig", {})
             # A stop or take that fired on the exchange leaves no CLOSE line, so without this the
             # coin was re-proposed at the very next pass while still top of the momentum list.
+            # But only a coin that was actually SEEN HELD earned that cooldown: a proposal the
+            # bot refused (stale, risk, notional) never traded, and punishing it with 24h of
+            # silence was the audit-30.08 finding. Never-held proposals are forgotten without
+            # a cooldown once they are too old to still fill (SIGNAL_MAX_AGE plus one pass).
+            was_held = set(state.setdefault("was_held", []))
+            newly_held = held - was_held
+            if newly_held:
+                was_held |= newly_held
+                state["was_held"] = sorted(was_held)
+                save_state(statepath, state)
+            stale_after = args.interval + 2 * 3600
             for s in [x for x in entered if x not in held]:
-                cooldown[s] = now
+                if s in was_held:
+                    cooldown[s] = now
+                    was_held.discard(s)
+                    state["was_held"] = sorted(was_held)
+                elif now - entered.get(s, 0) < stale_after:
+                    continue          # may still legally fill; judge it next pass
                 entered.pop(s, None)
                 entered_trig.pop(s, None)
             # The state file must not grow forever: a week-old cooldown is long expired.
@@ -779,6 +975,12 @@ def main():
 
             to_close = []
             for s in sorted(held - hold_ok):
+                # Only what this scanner opened (or adopted from the ledger above). `held` is every
+                # position on the account, and a hand-opened long whose 30d return dipped below the
+                # band used to be written as CLOSE and flattened by the bot (audit 03.09). The
+                # owner's positions are not this process's to exit, ever.
+                if s not in entered:
+                    continue
                 if now - entered.get(s, 0) < args.min_hold_hours * 3600:
                     continue           # the exchange-side stop still guards it meanwhile
                 to_close.append(s)
@@ -802,14 +1004,47 @@ def main():
             # accident. Measured 2024-26 as a 10-slot portfolio: alphabet -3.0% (worse than
             # random +5%), momentum-first +21% with a smaller drawdown, better in 5 of 5
             # half-years. This removes a handicap; it does not create an edge.
+            # What the risk core did with the last lines, from the journal on the same volume. A
+            # refusal earns the coin a rest: six hours for a sizing refusal (equity does not change
+            # by the hour), two for anything else. A fill is proof the coin WAS held, which the
+            # hourly sample above can miss when a position opens and closes inside one interval.
+            rejected, filled, newest = read_journal_feedback(
+                args.workdir, float(state.get("journal_seen_ts", 0) or 0))
+            if newest > float(state.get("journal_seen_ts", 0) or 0):
+                state["journal_seen_ts"] = newest
+            if filled:
+                was_held = set(state.setdefault("was_held", []))
+                was_held |= filled
+                state["was_held"] = sorted(was_held)
+            for sym, reason in rejected.items():
+                sizing = reason.startswith("BELOW_MIN_NOTIONAL") or reason.startswith("BELOW_MIN_QUANTITY")
+                rest = (6 if sizing else 2) * 3600
+                cooldown[sym] = max(cooldown.get(sym, 0), now - args.cooldown_hours * 3600 + rest)
+                log("%s: the bot refused the last line (%s) - resting %dh" % (sym, reason[:80], rest // 3600),
+                    logpath)
+            if rejected or filled:
+                save_state(statepath, state)
             fresh = [s for s in sorted((entry_ok & entry_pool) - held,
                                        key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
             if risk_usd:
                 def feasible(sym):
+                    # The bot's arithmetic, not an approximation of it: quantity = risk / stop
+                    # distance, FLOORED to the lot step, then the notional check. The unrounded
+                    # notional cleared $5 for TWTUSDT five passes running while the floored one
+                    # was $4.83, and each of those passes spent its slot on a line that could never
+                    # fill (audit 03.09).
                     m = details[sym]
-                    stop_frac = STOP_ATR_MULT * m["atr"] / m["price"]
-                    return stop_frac > 0 and risk_usd / stop_frac >= MIN_NOTIONAL.get(sym, 5.0)
+                    distance = STOP_ATR_MULT * m["atr"]
+                    if distance <= 0 or m["price"] <= 0:
+                        return False
+                    qty = risk_usd / distance
+                    step = STEP_SIZE.get(sym) or 0.0
+                    if step > 0:
+                        qty = int(qty / step + 1e-9) * step
+                    if qty <= 0 or qty < MIN_QTY.get(sym, 0.0):
+                        return False
+                    return qty * m["price"] >= MIN_NOTIONAL.get(sym, 5.0)
                 infeasible = [sym for sym in fresh if not feasible(sym)]
                 if infeasible:
                     log("%d candidate(s) too wide to size at this equity (risk $%.2f vs min notional): %s"

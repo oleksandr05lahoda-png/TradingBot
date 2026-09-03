@@ -66,6 +66,9 @@ final class FakeExchange implements ExchangePort {
 
     void setRealizedPnlToday(double pnl) { this.realizedPnlToday = pnl; }
 
+    /** What the account endpoint reports as open PnL — independent of the planted positions. */
+    void setUnrealizedPnl(String pnl) { this.unrealizedPnl = new BigDecimal(pnl); }
+
     /** Plants a position the bot does not know about, as a manual trade or a missed fill would. */
     void plantPosition(String symbol, String signedQuantity, String entryPrice) {
         positions.put(symbol, new BigDecimal(signedQuantity));
@@ -89,6 +92,17 @@ final class FakeExchange implements ExchangePort {
                 existing.exchangeOrderId(), existing.symbol(), state, existing.type(),
                 existing.originalQuantity(), existing.executedQuantity(), existing.averagePrice(),
                 existing.stopPrice(), existing.reduceOnly(), existing.closePosition(), serverTimeMillis()));
+    }
+
+    /** Moves an order's update time into the past, as a relic of an earlier process would read. */
+    void ageOrder(String clientOrderId, long byMillis) {
+        OrderStatus existing = ordersByClientId.get(clientOrderId);
+        if (existing == null) return;
+        ordersByClientId.put(clientOrderId, new OrderStatus(existing.clientOrderId(),
+                existing.exchangeOrderId(), existing.symbol(), existing.state(), existing.type(),
+                existing.originalQuantity(), existing.executedQuantity(), existing.averagePrice(),
+                existing.stopPrice(), existing.reduceOnly(), existing.closePosition(),
+                existing.updateTimeMs() - byMillis));
     }
 
     Long deadMansCountdownFor(String symbol) { return deadMansCountdowns.get(symbol); }
@@ -194,6 +208,16 @@ final class FakeExchange implements ExchangePort {
         List<OrderStatus> out = new ArrayList<>();
         for (OrderStatus o : ordersByClientId.values()) {
             if (!o.symbol().equals(symbol) || !o.isWorking()) continue;
+            if (!listsConditionalOrders && o.type().isConditional()) continue;
+            out.add(o);
+        }
+        return out;
+    }
+
+    @Override public List<OrderStatus> openOrdersAll() {
+        List<OrderStatus> out = new ArrayList<>();
+        for (OrderStatus o : ordersByClientId.values()) {
+            if (!o.isWorking()) continue;
             if (!listsConditionalOrders && o.type().isConditional()) continue;
             out.add(o);
         }

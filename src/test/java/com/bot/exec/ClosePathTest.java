@@ -82,7 +82,7 @@ class ClosePathTest {
     }
 
     @Test
-    @DisplayName("a refused close keeps everything in place and halts")
+    @DisplayName("a refused close keeps everything in place and reports it — the latch belongs to the retries")
     void refusedCloseKeepsEverything() throws Exception {
         ExecutionCoordinator.Report opened = openOne();
         String stopId = opened.protectiveStop().orElseThrow().clientOrderId();
@@ -93,10 +93,13 @@ class ClosePathTest {
         ExecutionCoordinator.CloseReport report = coordinator().closeOut("BTCUSDT", "close-4");
 
         assertFalse(report.flat());
+        assertTrue(report.note().contains("refused"), report.note());
         assertFalse(exchange.openPositions().isEmpty(), "the position is still open");
         assertTrue(exchange.order(stopId).orElseThrow().isWorking(), "and still protected");
-        assertTrue(halt.isHalted());
-        assertTrue(alerts.sawCritical("Close failed"), alerts.messages.toString());
+        // One refused attempt is not an incident: the caller retries with backoff and latches the
+        // halt only when the retries are spent (audit 03.09). Halting here stood the scanner down
+        // for the life of the process over a 429 the second attempt sailed through.
+        assertFalse(halt.isHalted(), "a single refusal must not latch the halt");
     }
 
     @Test

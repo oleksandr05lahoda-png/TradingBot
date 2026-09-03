@@ -44,11 +44,27 @@ public final class IdempotentOrderPlacer {
     public OrderStatus place(OrderRequest request) throws InterruptedException {
         Preconditions.notNull(request, "request");
 
-        Optional<OrderStatus> preexisting = port.queryOrder(request.symbol(), request.clientOrderId());
+        // The pre-send look-up is a READ: if it cannot be had, nothing has been sent, and the caller
+        // must hear exactly that. Propagated raw, a 20 s timeout on this GET used to read as an
+        // ambiguous SEND — a halt for an entry, a market close of the fresh position for its stop —
+        // over a request that never left this host (audit 03.09). It is also the only guard against
+        // re-sending a MARKET order whose earlier copy already filled: Binance keeps a client id
+        // unique among OPEN orders only, so a filled entry's id is accepted again. Hence no send
+        // without a successful look-up.
+        Optional<OrderStatus> preexisting = queryBeforeSend(request);
         if (preexisting.isPresent()) {
+            OrderStatus found = preexisting.get();
+            if (!found.isWorking() && isStale(found)) {
+                // A terminal order from an earlier life under this id (a book replayed after a
+                // restart, a reused signal id). Adopting it would report a fill that happened hours
+                // ago as today's; sending again would fill twice. Neither: refuse, definitely.
+                throw ExchangeException.refused("client order id " + request.clientOrderId()
+                        + " already ran to " + found.state() + " at " + found.updateTimeMs()
+                        + " — this signal was executed before; not sending it again", 409, 0);
+            }
             LOG.info("[Placer] " + request.clientOrderId() + " already exists on the exchange ("
-                    + preexisting.get().state() + ") — not sending again");
-            return preexisting.get();
+                    + found.state() + ") — not sending again");
+            return found;
         }
 
         ExchangeException lastAmbiguous = null;
@@ -57,12 +73,16 @@ public final class IdempotentOrderPlacer {
                 return port.placeOrder(request);
             } catch (ExchangeException e) {
                 if (e.exchangeCode() == BinanceErrorCodes.DUPLICATED_CLIENT_ORDER_ID) {
+                    // The exchange just said the order EXISTS. A failed read of it now is ignorance
+                    // about a live order, never "refused": reported as a refusal, a 429 on this
+                    // query turned a landed entry into "nothing happened" — no stop, no book record.
                     LOG.info("[Placer] exchange reports " + request.clientOrderId()
                             + " is a duplicate — adopting the existing order");
-                    return port.queryOrder(request.symbol(), request.clientOrderId())
-                            .orElseThrow(() -> ExchangeException.ambiguous(
-                                    "exchange rejected " + request.clientOrderId() + " as a duplicate but "
-                                            + "then reported no such order — state is inconsistent", e));
+                    Optional<OrderStatus> existing = probeForOrder(request);
+                    if (existing.isPresent()) return existing.get();
+                    throw ExchangeException.ambiguous(
+                            "exchange rejected " + request.clientOrderId() + " as a duplicate but its "
+                                    + "state could not be read afterwards — it may be live and filled", e);
                 }
                 if (!e.ambiguous()) {
                     throw e;
@@ -100,6 +120,36 @@ public final class IdempotentOrderPlacer {
                     + "working: " + e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * The look-up that must succeed before anything is sent. Retried a few times on any failure,
+     * then given up as {@link ExchangeException#neverSent}: the caller may retry the whole placement
+     * (nothing happened) or refuse, but must never treat it as a lost send.
+     */
+    private Optional<OrderStatus> queryBeforeSend(OrderRequest request) throws InterruptedException {
+        RuntimeException last = null;
+        for (int attempt = 1; attempt <= confirmationProbes; attempt++) {
+            try {
+                return port.queryOrder(request.symbol(), request.clientOrderId());
+            } catch (RuntimeException e) {
+                last = e;
+                LOG.warning("[Placer] pre-send look-up of " + request.clientOrderId() + " failed ("
+                        + attempt + "/" + confirmationProbes + "): " + e.getMessage());
+                if (attempt < confirmationProbes) sleeper.sleepMillis(probeIntervalMs);
+            }
+        }
+        throw ExchangeException.neverSent("could not verify " + request.clientOrderId()
+                + " before sending — nothing was sent (" + last.getMessage() + ")", last);
+    }
+
+    /** A terminal order older than this is a relic of an earlier process, not this attempt's fill. */
+    static final long STALE_TERMINAL_MS = 10 * 60_000L;
+
+    private boolean isStale(OrderStatus terminal) {
+        long stamped = terminal.updateTimeMs();
+        if (stamped <= 0) return false;                      // no timestamp: cannot call it old
+        return port.serverTimeMillis() - stamped > STALE_TERMINAL_MS;
     }
 
     private Optional<OrderStatus> probeForOrder(OrderRequest request) throws InterruptedException {

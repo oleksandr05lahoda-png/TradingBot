@@ -9,12 +9,18 @@ COPY gradle gradle
 COPY gradlew build.gradle settings.gradle ./
 RUN chmod +x gradlew && ./gradlew --no-daemon dependencies --quiet || true
 COPY src src
-RUN ./gradlew --no-daemon shadowJar -x test --quiet
+# A bounded build JVM: this image is built on the 2 GB VPS beside the live bot, and an unbounded
+# Gradle daemon is the one thing on that host that could push the trading process into swap.
+RUN ./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx640m shadowJar -x test --quiet
 
 FROM eclipse-temurin:21-jre
 RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+# What code is trading: the deploy script passes the build time, the commit and a -dirty mark,
+# and the entrypoint logs it on every boot. Without it nothing could prove which tree was live.
+ARG BUILD_STAMP=unknown
+RUN echo "$BUILD_STAMP" > /app/BUILD_STAMP
 COPY --from=build /src/build/libs/bot.jar /app/bot.jar
 COPY tools/scanner/autoscan.py /app/scanner/autoscan.py
 COPY tools/docker-entrypoint.sh /app/entrypoint.sh
