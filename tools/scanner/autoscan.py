@@ -1029,6 +1029,17 @@ def main():
             fresh = [s for s in sorted((entry_ok & entry_pool) - held,
                                        key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
+            # The funnel, every pass, so "nothing to do" is never a mystery again. On 03.09 it
+            # took an offline replay to learn that 32 entry-ok coins met a 34-coin bear pool in
+            # 5 names, all of them unsizeable, while every real momentum name sat outside the
+            # pool at BTC-correlation 0.4-0.8 (audit 03.09).
+            _in_pool = entry_ok & entry_pool
+            _outside = sorted(entry_ok - entry_pool, key=lambda s: -details[s]["ret"])
+            log("funnel: entry-ok %d, in pool %d (%s), minus held %d, minus cooldown %d%s"
+                % (len(entry_ok), len(_in_pool), ",".join(sorted(_in_pool)) or "-",
+                   len(_in_pool - held), len(fresh),
+                   ("; strongest OUTSIDE the pool: " + ",".join(_outside[:6])) if _outside else ""),
+                logpath)
             if risk_usd:
                 def feasible(sym):
                     # The bot's arithmetic, not an approximation of it: quantity = risk / stop
