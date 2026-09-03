@@ -172,7 +172,7 @@ def read_env(repo):
     for k in ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
               "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
               "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE",
-              "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR",
+              "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR", "LOT_ROUND_UP",
               "BEAR_UNIVERSE", "BEAR_DAY_PCT"):
         v = os.environ.get(k)
         if v:
@@ -615,6 +615,17 @@ def main():
     near_high_max = _float_env("ENTRY_NEAR_HIGH")
     vol_mult_min = _float_env("ENTRY_VOL_MULT")
     max_hold_hours = _float_env("MAX_HOLD_HOURS")
+    # LOT_ROUND_UP=on (or a fraction): when the lot-floored size is refused by the exchange's $5
+    # minimum, one step UP is allowed inside this risk tolerance - mirrors RiskEngine step 9b, so
+    # the scanner and the bot agree on what is sizeable. 'on' = 0.20; unset/off = never.
+    _ru = env.get("LOT_ROUND_UP", "").strip().lower()
+    if _ru in ("on", "1", "true", "yes"):
+        round_up_tol = 0.20
+    else:
+        try:
+            round_up_tol = min(0.5, max(0.0, float(_ru))) if _ru else 0.0
+        except ValueError:
+            round_up_tol = 0.0
     # MAX_CORR=0.75: skip a candidate whose 60d correlation with an open position exceeds this.
     # Measured 26.08 on 651 days: worst day -5.4% -> -2.5%, drawdown 11% -> 7%, t 2.18 -> 2.68,
     # cost ~8pp of total return. A plateau, not a spike: 0.65 / 0.75 / 0.85 all improve t.
@@ -1055,9 +1066,15 @@ def main():
                     step = STEP_SIZE.get(sym) or 0.0
                     if step > 0:
                         qty = int(qty / step + 1e-9) * step
-                    if qty <= 0 or qty < MIN_QTY.get(sym, 0.0):
-                        return False
-                    return qty * m["price"] >= MIN_NOTIONAL.get(sym, 5.0)
+                    ok = (qty > 0 and qty >= MIN_QTY.get(sym, 0.0)
+                          and qty * m["price"] >= MIN_NOTIONAL.get(sym, 5.0))
+                    if ok or step <= 0 or round_up_tol <= 0:
+                        return ok
+                    # The bot's step 9b: one lot up when the floor is refused, inside the tolerance.
+                    one_up = qty + step
+                    return (one_up * distance <= risk_usd * (1 + round_up_tol)
+                            and one_up >= MIN_QTY.get(sym, 0.0)
+                            and one_up * m["price"] >= MIN_NOTIONAL.get(sym, 5.0))
                 infeasible = [sym for sym in fresh if not feasible(sym)]
                 if infeasible:
                     log("%d candidate(s) too wide to size at this equity (risk $%.2f vs min notional): %s"

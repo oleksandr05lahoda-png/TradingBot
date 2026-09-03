@@ -120,6 +120,11 @@ public final class TestnetBot {
                 .withConfirmationWindowMs(KILL_SWITCH_CONFIRM_MS)
                 .withLatchFile(dataDir.resolve("killswitch-latch.json"), Instant.now());
         RiskEngine engine = new RiskEngine(config, new ExposureBook(), killSwitch);
+        // LOT_ROUND_UP=on: one lot step up when the floored size is refused by the $5 minimum, inside
+        // a 20% risk tolerance (the fill tolerance the coordinator already accepts). Owner's switch:
+        // at $137 it turns "too wide to size" refusals into entries at up to 0.6% risk instead of 0.5%.
+        double lotRoundUp = lotRoundUpTolerance();
+        if (lotRoundUp > 0) engine.withLotRoundUpTolerance(lotRoundUp);
         TradingHalt halt = new TradingHalt();
 
         ExchangePort port;
@@ -563,6 +568,19 @@ public final class TestnetBot {
      * What a tripped daily loss limit DOES. The default closes the whole book reduce-only;
      * {@code KILL_SWITCH_ACTION=halt-only} restores the old block-entries-only behaviour.
      */
+    /** {@code LOT_ROUND_UP}: on = 0.20, a fraction = that fraction (capped at 0.5), unset/off = 0. */
+    private static double lotRoundUpTolerance() {
+        String raw = System.getenv().getOrDefault("LOT_ROUND_UP", "").trim().toLowerCase(java.util.Locale.ROOT);
+        if (raw.isEmpty() || raw.equals("off") || raw.equals("0") || raw.equals("false")) return 0.0;
+        if (raw.equals("on") || raw.equals("1") || raw.equals("true") || raw.equals("yes")) return 0.20;
+        try {
+            return Math.min(0.5, Math.max(0.0, Double.parseDouble(raw)));
+        } catch (NumberFormatException e) {
+            LOG.warning("[Boot] LOT_ROUND_UP=\"" + raw + "\" is neither on/off nor a fraction; leaving it off");
+            return 0.0;
+        }
+    }
+
     private static KillSwitchEnforcer.Action killSwitchAction() {
         String raw = System.getenv().getOrDefault("KILL_SWITCH_ACTION", "flatten")
                 .trim().toLowerCase(java.util.Locale.ROOT);
@@ -837,6 +855,9 @@ public final class TestnetBot {
                 "  exposure caps   : long " + pct(config.maxLongExposureFraction())
                         + ", short " + pct(config.maxShortExposureFraction()) + " of balance",
                 "  max positions   : " + config.maxConcurrentPositions(),
+                "  lot round-up    : " + (lotRoundUpTolerance() > 0
+                        ? "ON, one step up inside +" + pct(lotRoundUpTolerance()) + " of the risk budget"
+                        : "off (floored size or refusal)"),
                 ""));
     }
 

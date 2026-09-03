@@ -38,6 +38,21 @@ public final class RiskEngine {
         this.volSource = Preconditions.notNull(volSource, "volSource");
     }
 
+    /**
+     * How far above the risk budget one lot step UP may go when the floored size would be refused
+     * by the exchange's minimums (step 9b). 0 = never round up, the historical behaviour. Bounded by
+     * the 1% hard cap regardless; 0.20 mirrors the coordinator's fill tolerance.
+     */
+    private volatile double lotRoundUpTolerance = 0.0;
+
+    public RiskEngine withLotRoundUpTolerance(double tolerance) {
+        Preconditions.inClosedRange(tolerance, 0.0, 0.5, "lotRoundUpTolerance");
+        this.lotRoundUpTolerance = tolerance;
+        return this;
+    }
+
+    public double lotRoundUpTolerance() { return lotRoundUpTolerance; }
+
     public RiskConfig config() { return config; }
     public ExposureBook book() { return book; }
     public DailyLossKillSwitch killSwitch() { return killSwitch; }
@@ -154,6 +169,29 @@ public final class RiskEngine {
 
         // 9 ─ Lot alignment, always downwards, then the exchange's minimums.
         BigDecimal quantity = filters.quantizeQuantityDown(cappedQty);
+        // 9b ─ One lot step UP, only when the floored size would be refused by the exchange's
+        //      minimums and only inside an explicit tolerance. At $137 the floor turned TWTUSDT's
+        //      $5.27 ideal notional into $4.83 five passes running (audit 03.09); the coordinator
+        //      already tolerates +20% realised risk on a fill, so a planned +2-8% is not new ground.
+        //      Off (tolerance 0) unless the operator arms it; the 1% hard cap still binds.
+        double budgetOverrunAllowed = 0.0;
+        double tolerance = lotRoundUpTolerance;
+        boolean refusedAsIs = quantity.signum() <= 0 || !filters.isQuantityInRange(quantity, true)
+                || !filters.meetsMinNotional(entryTick, quantity);
+        if (tolerance > 0 && refusedAsIs) {
+            BigDecimal oneUp = quantity.add(filters.stepSize());
+            double riskOneUp = PositionSizer.riskUsd(oneUp.doubleValue(), entry, stopPrice);
+            boolean withinTolerance = riskOneUp <= budgetedRiskUsd * (1 + tolerance)
+                    && riskOneUp / balanceUsd <= RiskConstants.MAX_RISK_FRACTION_PER_TRADE;
+            if (withinTolerance && filters.isQuantityInRange(oneUp, true)
+                    && filters.meetsMinNotional(entryTick, oneUp)) {
+                quantity = oneUp;
+                budgetOverrunAllowed = tolerance;
+                sizingNote += String.format("; rounded UP one lot step to clear the exchange minimum "
+                        + "(risk $%.4f, +%.1f%% over the $%.4f budget, inside the %.0f%% tolerance)",
+                        riskOneUp, (riskOneUp / budgetedRiskUsd - 1) * 100, budgetedRiskUsd, tolerance * 100);
+            }
+        }
         if (quantity.signum() <= 0 || !filters.isQuantityInRange(quantity, true)) {
             BigDecimal smallest = filters.smallestTradableQuantity(entry);
             // Effective (overlay-scaled) fraction, so the advice matches the sizing that failed.
@@ -179,8 +217,9 @@ public final class RiskEngine {
         double riskUsd = PositionSizer.riskUsd(qty, entry, stopPrice);
         double riskFraction = riskUsd / balanceUsd;
 
-        if (riskUsd > budgetedRiskUsd * (1 + 1e-9)) {
-            // Unreachable while steps 7-9 only shrink; the last place to catch it before an order.
+        if (riskUsd > budgetedRiskUsd * (1 + budgetOverrunAllowed + 1e-9)) {
+            // Unreachable while steps 7-9 only shrink (9b may add at most the armed tolerance);
+            // the last place to catch it before an order.
             return RiskDecision.reject(RejectReason.RISK_BUDGET_OVERRUN,
                     String.format("final size risks $%.6f against a budget of $%.6f", riskUsd, budgetedRiskUsd));
         }
