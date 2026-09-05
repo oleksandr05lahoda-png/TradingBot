@@ -100,6 +100,25 @@ class LimitEntryIntentTest {
     }
 
     @Test
+    @DisplayName("an intent whose send never landed is spent after grace, not on the first flat read")
+    void unlandedIntentIsSpentOnlyAfterGrace() {
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        EntryIntents intents = EntryIntents.inMemory();
+        intents.record(plan, ExecFixtures.NOON.toEpochMilli());   // recorded, then the process died
+        reconciler.withEntryIntents(intents);
+
+        Instant early = ExecFixtures.NOON.plusSeconds(20);
+        reconciler.reconcile(early);
+        assertTrue(intents.get("BTCUSDT", early.toEpochMilli()).isPresent(),
+                "a lost market response may still be settling: kept inside grace");
+
+        Instant late = ExecFixtures.NOON.plusSeconds(90);
+        reconciler.reconcile(late);
+        assertTrue(intents.get("BTCUSDT", late.toEpochMilli()).isEmpty(), "spent once out of grace");
+        assertFalse(halt.isHalted());
+    }
+
+    @Test
     @DisplayName("the reconciler cancels the leftover entry out of grace and spends the intent one pass later")
     void reconcilerCancelsTheLeftoverAndSpendsTheIntent() throws Exception {
         ExecutionCoordinator coordinator = coordinator();
@@ -129,10 +148,10 @@ class LimitEntryIntentTest {
         assertTrue(coordinator.intents().get("BTCUSDT", second.toEpochMilli()).isPresent(),
                 "one pass of lag: a fill between the read and the cancel must still find its intent");
 
-        Instant third = second.plusSeconds(30);
+        Instant third = second.plusSeconds(60);
         reconciler.reconcile(third);
         assertTrue(coordinator.intents().get("BTCUSDT", third.toEpochMilli()).isEmpty(),
-                "flat with nothing working: the intent is spent");
+                "flat with nothing working and out of grace: the intent is spent");
         assertFalse(halt.isHalted());
         assertEquals(0, engine.book().openCount());
     }

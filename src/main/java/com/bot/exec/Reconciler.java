@@ -371,11 +371,14 @@ public final class Reconciler {
                                     + " is working with no position behind it — cancelling"));
                     placer.cancelQuietly(symbol, order.clientOrderId());
                 }
-                // The intent is spent only on a pass that read the symbol flat with NOTHING working:
-                // an order cancelled just above may have filled between the read and the cancel, and
-                // that fill must still find its intent on the next pass. One pass of lag, never a
-                // naked position.
-                if (working.isEmpty() && intents.get(symbol, now.toEpochMilli()).isPresent()) {
+                // The intent is spent only on a pass that read the symbol flat with NOTHING working,
+                // and only once the intent itself is out of grace: an order cancelled just above may
+                // have filled between the read and the cancel, and a market send whose response was
+                // lost may still be settling. One pass of lag, never a naked position.
+                Optional<EntryIntents.Intent> intent = intents.get(symbol, now.toEpochMilli());
+                boolean intentOutOfGrace = intent.isPresent()
+                        && now.toEpochMilli() - intent.get().recordedAtMs() > orphanGraceMillis;
+                if (working.isEmpty() && intentOutOfGrace) {
                     LOG.info("[Reconciler] " + symbol + ": flat with no working orders — the recorded "
                             + "entry intent never became a position; clearing it");
                     intents.clear(symbol);
