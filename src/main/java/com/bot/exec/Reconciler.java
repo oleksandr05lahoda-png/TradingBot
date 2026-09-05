@@ -303,6 +303,13 @@ public final class Reconciler {
 
         // Carried over, or an order inside the grace window at that one moment is never re-inspected.
         symbolsToInspect.addAll(carriedOverSymbols);
+        // An entry this process meant to open and could not account for: a limit that rested past
+        // its window with a failed cancel, or a send this process died around. Flat and unbooked,
+        // the symbol would otherwise never be looked at again, and its GTC entry could fill days
+        // later as a foreign position. Inspected until the order is gone or the fill is adopted.
+        for (EntryIntents.Intent intent : intents.all()) {
+            if (!intent.expired(now.toEpochMilli())) symbolsToInspect.add(intent.symbol());
+        }
         Set<String> stillInteresting = new HashSet<>();
         Set<String> stillTriggered = new HashSet<>();
 
@@ -363,6 +370,15 @@ public final class Reconciler {
                             order.type() + " " + order.clientOrderId()
                                     + " is working with no position behind it — cancelling"));
                     placer.cancelQuietly(symbol, order.clientOrderId());
+                }
+                // The intent is spent only on a pass that read the symbol flat with NOTHING working:
+                // an order cancelled just above may have filled between the read and the cancel, and
+                // that fill must still find its intent on the next pass. One pass of lag, never a
+                // naked position.
+                if (working.isEmpty() && intents.get(symbol, now.toEpochMilli()).isPresent()) {
+                    LOG.info("[Reconciler] " + symbol + ": flat with no working orders — the recorded "
+                            + "entry intent never became a position; clearing it");
+                    intents.clear(symbol);
                 }
             }
         }

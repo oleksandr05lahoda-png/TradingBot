@@ -570,13 +570,6 @@ public final class TestnetBot {
     }
 
     /**
-     * Entry execution from the environment. ENTRY_TYPE=limit places the entry at the signal price
-     * (caps slippage; taker fee only if it crosses) with ENTRY_TIF (GTC default) and a ~10s window
-     * before the unfilled remainder is cancelled - a missed fill costs nothing, the scanner
-     * re-nominates within the hour. Default stays MARKET: switching execution is measured with the
-     * cost probe, not assumed.
-     */
-    /**
      * What a tripped daily loss limit DOES. The default closes the whole book reduce-only;
      * {@code KILL_SWITCH_ACTION=halt-only} restores the old block-entries-only behaviour.
      */
@@ -603,6 +596,20 @@ public final class TestnetBot {
         return KillSwitchEnforcer.Action.FLATTEN;
     }
 
+    /** Poll cadence while a limit entry rests; the window below is expressed in these ticks. */
+    private static final long ENTRY_FILL_POLL_MS = 500L;
+    private static final int ENTRY_FILL_WINDOW_DEFAULT_SEC = 60;
+    private static final int ENTRY_FILL_WINDOW_MIN_SEC = 5;
+    private static final int ENTRY_FILL_WINDOW_MAX_SEC = 600;
+
+    /**
+     * Entry execution from the environment. ENTRY_TYPE=limit places the entry at the signal price
+     * (caps slippage; taker fee only if it crosses) with ENTRY_TIF (GTC default) and an
+     * ENTRY_FILL_WINDOW_SEC window (default 60 s, measured 05.09: 16 of 17 signal-price limits fill
+     * inside one minute) before the unfilled remainder is cancelled - a missed fill costs nothing,
+     * the scanner re-nominates within the hour. A cancel that fails leaves the intent on record for
+     * the reconciler. Default stays MARKET: switching execution is the owner's call, not this code's.
+     */
     private static ExecutionCoordinator.Settings entrySettings() {
         String type = System.getenv().getOrDefault("ENTRY_TYPE", "market").trim().toLowerCase(java.util.Locale.ROOT);
         if (!type.equals("limit")) return ExecutionCoordinator.Settings.defaults();
@@ -614,8 +621,28 @@ public final class TestnetBot {
             LOG.warning("[Boot] unknown ENTRY_TIF '" + tif + "' - using GTC");
             inForce = OrderTypes.TimeInForce.GTC;
         }
-        LOG.info("[Boot] limit entries enabled (tif " + inForce + ", ~10s fill window)");
-        return new ExecutionCoordinator.Settings(OrderTypes.OrderType.LIMIT, inForce, 20, 500, 0.20);
+        int windowSec = entryFillWindowSeconds(System.getenv().getOrDefault("ENTRY_FILL_WINDOW_SEC", ""));
+        int polls = (int) Math.max(1, Math.round(windowSec * 1000.0 / ENTRY_FILL_POLL_MS));
+        LOG.info("[Boot] limit entries enabled (tif " + inForce + ", " + windowSec + "s fill window)");
+        return new ExecutionCoordinator.Settings(OrderTypes.OrderType.LIMIT, inForce, polls, ENTRY_FILL_POLL_MS, 0.20);
+    }
+
+    /** {@code ENTRY_FILL_WINDOW_SEC}, clamped to [5, 600]; blank or unparseable falls back to 60. */
+    static int entryFillWindowSeconds(String raw) {
+        raw = raw == null ? "" : raw.trim();
+        if (raw.isEmpty()) return ENTRY_FILL_WINDOW_DEFAULT_SEC;
+        try {
+            int parsed = Integer.parseInt(raw);
+            int clamped = Math.min(ENTRY_FILL_WINDOW_MAX_SEC, Math.max(ENTRY_FILL_WINDOW_MIN_SEC, parsed));
+            if (clamped != parsed) {
+                LOG.warning("[Boot] ENTRY_FILL_WINDOW_SEC=" + parsed + " clamped to " + clamped);
+            }
+            return clamped;
+        } catch (NumberFormatException e) {
+            LOG.warning("[Boot] ENTRY_FILL_WINDOW_SEC=\"" + raw + "\" is not a number; using "
+                    + ENTRY_FILL_WINDOW_DEFAULT_SEC + "s");
+            return ENTRY_FILL_WINDOW_DEFAULT_SEC;
+        }
     }
 
     /**

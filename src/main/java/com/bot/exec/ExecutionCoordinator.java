@@ -199,6 +199,23 @@ public final class ExecutionCoordinator {
 
         BigDecimal filled = entry.executedQuantity();
         if (filled.signum() <= 0) {
+            if (entry.isWorking()) {
+                // The window closed, the cancel did not go through, and the re-read still says the
+                // order rests. A GTC limit that fills after this return would be a position the book
+                // knows nothing about, so the intent is NOT spent: the reconciler inspects intent
+                // symbols every pass, cancels the leftover entry once it is out of grace, adopts a
+                // late fill with the planned stop, and clears the intent only once the symbol is
+                // flat with nothing working (the limit-orphan gap of the 30.08 backlog).
+                LOG.warning("[Coordinator] " + plan.symbol() + " entry " + entry.clientOrderId() + " is still "
+                        + entry.state() + " after the fill window and its cancel failed — intent kept");
+                alerts.warning("Entry still resting after its window",
+                        plan.symbol() + ": the limit entry could not be cancelled and may still fill. "
+                                + "Its planned stop stays on record; the reconciler will cancel the order "
+                                + "or protect the fill, whichever comes first.");
+                return new Report(Outcome.NOT_FILLED, plan, BigDecimal.ZERO, BigDecimal.ZERO,
+                        Optional.of(entry), Optional.empty(), List.of(),
+                        "entry " + entry.state() + " — cancel failed, intent kept for the reconciler");
+            }
             intents.clear(plan.symbol());
             LOG.info("[Coordinator] " + plan.symbol() + " entry did not fill (" + entry.state()
                     + ") — nothing to protect, nothing to clean up");
