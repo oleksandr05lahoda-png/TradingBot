@@ -77,6 +77,19 @@ public record RiskConfig(
                 TakeProfitPolicy.standard());
     }
 
+    /**
+     * Risk per trade as a fraction of balance. The record's own check refuses anything above
+     * {@link RiskConstants#MAX_RISK_FRACTION_PER_TRADE}: this knob can double the default, never
+     * exceed the cap. Doubling it doubles both the expected return and the drawdown, and halves the
+     * number of stop-outs the daily limit tolerates — the owner's call, made with those numbers.
+     */
+    public RiskConfig withRiskFractionPerTrade(double v) {
+        return new RiskConfig(v, maxLeverage, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
+                maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,
+                dailyLossFractionLimit, minLiquidationBufferFraction, maxMarginUtilizationFraction,
+                takerFeeFraction, atrStopMultiplier, targetDailyVolFraction, takeProfitPolicy);
+    }
+
     public RiskConfig withMaxLeverage(int v) {
         return new RiskConfig(riskFractionPerTrade, v, maxNotionalFractionPerTrade, maxNotionalUsdPerTrade,
                 maxLongExposureFraction, maxShortExposureFraction, maxConcurrentPositions,

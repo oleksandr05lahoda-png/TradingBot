@@ -108,6 +108,18 @@ public final class TestnetBot {
         // switch are what bound a correlated book. Tight default unless the operator says otherwise.
         int maxPositions = intProperty("MAX_POSITIONS", 0);
         if (maxPositions > 0) config = config.withMaxConcurrentPositions(maxPositions);
+        // RISK_PER_TRADE as a fraction (0.01 = 1%). The scanner already read this for its
+        // feasibility check while the bot ignored it (audit 03.09, finding 49) — the two must agree.
+        // Clamped to the 1% hard cap with a loud line rather than refusing to boot over a typo.
+        double riskPerTrade = doubleProperty("RISK_PER_TRADE", 0.0);
+        if (riskPerTrade > 0) {
+            if (riskPerTrade > RiskConstants.MAX_RISK_FRACTION_PER_TRADE) {
+                LOG.warning("[Boot] RISK_PER_TRADE=" + riskPerTrade + " exceeds the hard cap "
+                        + RiskConstants.MAX_RISK_FRACTION_PER_TRADE + " - using the cap");
+                riskPerTrade = RiskConstants.MAX_RISK_FRACTION_PER_TRADE;
+            }
+            config = config.withRiskFractionPerTrade(riskPerTrade);
+        }
         // One take frees a conditional-order slot. Binance caps conditional orders per account (cap
         // arrived near 33, measured live 14.08): stop+2 takes protects ~10 positions, stop+1 ~15.
         double tpR = doubleProperty("TP_R_MULTIPLE", 0.0);
