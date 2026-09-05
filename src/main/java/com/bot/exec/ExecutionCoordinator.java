@@ -402,14 +402,28 @@ public final class ExecutionCoordinator {
                 plan.side(), avgPrice.doubleValue(), plan.stopPrice().doubleValue(), filled, filters);
 
         List<OrderStatus> placed = new ArrayList<>();
+        if (legs.isEmpty()) {
+            // The filled size is under the lot minimum for any exit leg: nothing to place, and a
+            // silent log line used to be the only trace. The owner reads Telegram, not the log.
+            alerts.warning("Position has NO take-profit",
+                    plan.symbol() + ": the filled quantity " + filled.toPlainString()
+                            + " is below the lot minimum for any take-profit leg. The stop still protects "
+                            + "it; only the stop or a signal-driven close will end this position.");
+            return placed;
+        }
         for (int i = 0; i < legs.size(); i++) {
             TakeProfitPolicy.ProjectedLeg leg = legs.get(i);
             OrderRequest request = OrderRequest.takeProfit(plan.symbol(), closeSide, leg.quantity(),
                     leg.price(), ClientOrderIdFactory.create(plan.signalId(), OrderPurpose.TAKE_PROFIT, i));
             PreTradeValidator.Result check = PreTradeValidator.validate(request, filters, avgPrice);
             if (!check.ok()) {
+                // Same weight as a leg the venue refused: with two legs one can be missing while the
+                // other rests, and the "NO take-profit" alert below would stay quiet.
                 LOG.warning("[Coordinator] skipping take-profit leg " + i + " at " + leg.rMultiple()
                         + "R: " + check.describe());
+                alerts.warning("Take-profit leg not placed",
+                        plan.symbol() + " leg " + i + " at " + leg.rMultiple() + "R would be rejected: "
+                                + check.describe());
                 continue;
             }
             try {
