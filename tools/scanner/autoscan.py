@@ -623,7 +623,7 @@ def main():
         round_up_tol = 0.20
     else:
         try:
-            round_up_tol = min(0.5, max(0.0, float(_ru))) if _ru else 0.0
+            round_up_tol = min(1.0, max(0.0, float(_ru))) if _ru else 0.0
         except ValueError:
             round_up_tol = 0.0
     # MAX_CORR=0.75: skip a candidate whose 60d correlation with an open position exceeds this.
@@ -1070,11 +1070,14 @@ def main():
                           and qty * m["price"] >= MIN_NOTIONAL.get(sym, 5.0))
                     if ok or step <= 0 or round_up_tol <= 0:
                         return ok
-                    # The bot's step 9b: one lot up when the floor is refused, inside the tolerance.
-                    one_up = qty + step
-                    return (one_up * distance <= risk_usd * (1 + round_up_tol)
-                            and one_up >= MIN_QTY.get(sym, 0.0)
-                            and one_up * m["price"] >= MIN_NOTIONAL.get(sym, 5.0))
+                    # The bot's step 9b (05.09): round UP to the exchange minimum when the floor
+                    # is refused, inside the tolerance; the 1% hard cap binds regardless.
+                    min_notional = MIN_NOTIONAL.get(sym, 5.0)
+                    by_notional = math.ceil(min_notional / m["price"] / step - 1e-9) * step
+                    minimum = max(qty + step, by_notional, MIN_QTY.get(sym, 0.0))
+                    return (minimum * distance <= risk_usd * (1 + round_up_tol) + 1e-9
+                            and minimum * distance <= equity * 0.01 + 1e-9
+                            and minimum * m["price"] >= min_notional)
                 infeasible = [sym for sym in fresh if not feasible(sym)]
                 if infeasible:
                     log("%d candidate(s) too wide to size at this equity (risk $%.2f vs min notional): %s"

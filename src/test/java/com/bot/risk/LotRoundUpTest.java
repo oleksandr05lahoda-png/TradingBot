@@ -44,7 +44,7 @@ class LotRoundUpTest {
         assertEquals(0, plan.quantity().compareTo(new BigDecimal("3")));
         assertEquals(0.54, plan.riskUsd(), 1e-9);
         assertTrue(plan.riskUsd() <= 0.50 * 1.20 + 1e-9, "never more than the armed tolerance");
-        assertTrue(plan.sizingNote().contains("rounded UP one lot step"), plan.sizingNote());
+        assertTrue(plan.sizingNote().contains("rounded UP 1 lot step(s)"), plan.sizingNote());
     }
 
     @Test
@@ -64,6 +64,59 @@ class LotRoundUpTest {
         assertEquals(0, plan.quantity().compareTo(new BigDecimal("4")));
         assertTrue(plan.riskUsd() <= 0.50 + 1e-9, "no round-up means no overrun: " + plan.riskUsd());
         assertTrue(!plan.sizingNote().contains("rounded UP"), plan.sizingNote());
+    }
+
+    /** Lot 1 worth $0.50: $5 needs 10 units, and one step from the floor never gets there. */
+    private static InstrumentFilters cents() {
+        return InstrumentFilters.of("CENTSUSDT", "0.01", "1", "5");
+    }
+
+    private static RiskDecision decideCents(double stop, double tolerance) {
+        RiskEngine engine = RiskFixtures.engine().withLotRoundUpTolerance(tolerance);
+        return engine.evaluate(RiskFixtures.request(Side.LONG, 0.5, stop, 2, cents()), 100, RiskFixtures.NOON);
+    }
+
+    @Test
+    @DisplayName("several lot steps to the minimum: a coin one step could never clear is sized to $5")
+    void roundsAllTheWayToTheMinimum() {
+        // stop 0.44 -> R 0.06 -> ideal 8.33 -> floor 8 ($4.00, refused); one step = 9 ($4.50, still
+        // refused - the rule before 05.09); the minimum is 10 units = $5.00, risk 0.60 = +20%.
+        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decideCents(0.44, 0.20)).plan();
+        assertEquals(0, plan.quantity().compareTo(new BigDecimal("10")));
+        assertEquals(0.60, plan.riskUsd(), 1e-9);
+        assertTrue(plan.sizingNote().contains("rounded UP 2 lot step(s)"), plan.sizingNote());
+    }
+
+    @Test
+    @DisplayName("the minimum beyond the tolerance is still refused, however many steps it is")
+    void minimumBeyondToleranceIsRefused() {
+        // stop 0.43 -> R 0.07 -> ideal 7.14 -> floor 7 ($3.50); minimum 10 units risk 0.70 = +40% > 20%
+        RiskDecision.Rejected rejected = assertInstanceOf(RiskDecision.Rejected.class, decideCents(0.43, 0.20));
+        assertEquals(RejectReason.BELOW_MIN_NOTIONAL, rejected.reason());
+        // ...and approved once the operator widens the dial to 0.5
+        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decideCents(0.43, 0.50)).plan();
+        assertEquals(0, plan.quantity().compareTo(new BigDecimal("10")));
+        assertEquals(0.70, plan.riskUsd(), 1e-9);
+    }
+
+    @Test
+    @DisplayName("a tolerance of 1.0 lets a floor-constrained coin run up to the 1% cap and no further")
+    void fullToleranceStopsAtTheCap() {
+        // coarse: stop 1.70 -> R 0.30 -> ideal 1.67 -> floor 1 ($2); minimum 3 units risk 0.90 = +80%,
+        // inside 1.0 and under the $1.00 cap -> approved
+        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decide(1.70, 1.0)).plan();
+        assertEquals(0, plan.quantity().compareTo(new BigDecimal("3")));
+        assertEquals(0.90, plan.riskUsd(), 1e-9);
+        // stop 1.60 -> R 0.40 -> minimum 3 units risk 1.20 > the $1.00 cap -> refused even at 1.0
+        RiskDecision.Rejected rejected = assertInstanceOf(RiskDecision.Rejected.class, decide(1.60, 1.0));
+        assertEquals(RejectReason.BELOW_MIN_NOTIONAL, rejected.reason());
+    }
+
+    @Test
+    @DisplayName("a tolerance above 1.0 is refused by the engine itself")
+    void toleranceAboveOneIsRefused() {
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> RiskFixtures.engine().withLotRoundUpTolerance(1.5));
     }
 
     @Test

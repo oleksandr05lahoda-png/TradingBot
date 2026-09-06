@@ -573,13 +573,19 @@ public final class TestnetBot {
      * What a tripped daily loss limit DOES. The default closes the whole book reduce-only;
      * {@code KILL_SWITCH_ACTION=halt-only} restores the old block-entries-only behaviour.
      */
-    /** {@code LOT_ROUND_UP}: on = 0.20, a fraction = that fraction (capped at 0.5), unset/off = 0. */
+    /**
+     * {@code LOT_ROUND_UP}: on = 0.20, a fraction = that fraction (capped at 1.0, where the 1% hard cap
+     * is the only limit left), unset/off = 0. The fraction is how far above the risk budget a
+     * floor-constrained coin may be sized so that its lot clears the exchange minimum; coins that
+     * size normally are never touched. Measured 05.09 at $137: 32 too-wide candidates, 6 clear at
+     * 0.20, 20 at 0.50, 31 at 1.00.
+     */
     private static double lotRoundUpTolerance() {
         String raw = System.getenv().getOrDefault("LOT_ROUND_UP", "").trim().toLowerCase(java.util.Locale.ROOT);
         if (raw.isEmpty() || raw.equals("off") || raw.equals("0") || raw.equals("false")) return 0.0;
         if (raw.equals("on") || raw.equals("1") || raw.equals("true") || raw.equals("yes")) return 0.20;
         try {
-            return Math.min(0.5, Math.max(0.0, Double.parseDouble(raw)));
+            return Math.min(1.0, Math.max(0.0, Double.parseDouble(raw)));
         } catch (NumberFormatException e) {
             LOG.warning("[Boot] LOT_ROUND_UP=\"" + raw + "\" is neither on/off nor a fraction; leaving it off");
             return 0.0;
