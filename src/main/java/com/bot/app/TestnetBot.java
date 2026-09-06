@@ -937,7 +937,7 @@ public final class TestnetBot {
                         + ", short " + pct(config.maxShortExposureFraction()) + " of balance",
                 "  max positions   : " + config.maxConcurrentPositions(),
                 "  lot round-up    : " + (lotRoundUpTolerance() > 0
-                        ? "ON, one step up inside +" + pct(lotRoundUpTolerance()) + " of the risk budget"
+                        ? "ON, up to the exchange minimum inside +" + pct(lotRoundUpTolerance()) + " of the risk budget"
                         : "off (floored size or refusal)"),
                 ""));
     }
