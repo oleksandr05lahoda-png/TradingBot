@@ -37,6 +37,8 @@ final class FakeExchange implements ExchangePort {
 
     /** Fraction of a market order that fills. 1.0 = full, 0.5 = half. */
     double fillRatio = 1.0;
+    /** Fraction of a LIMIT order that fills at once; 0 (the default) rests it untouched. */
+    double limitFillRatio = 0.0;
     /** Price a market order fills at; null means "the order's own price or the last set entry". */
     BigDecimal fillPrice = new BigDecimal("64000.0");
     /** When true, the next placeOrder records the order and then throws an ambiguous failure. */
@@ -53,6 +55,12 @@ final class FakeExchange implements ExchangePort {
     BigDecimal reportedLiquidationPrice = BigDecimal.ZERO;
     /** False mirrors demo-fapi: conditional orders rest and answer a query by id, but never list. */
     boolean listsConditionalOrders = true;
+    /**
+     * Binance keeps a client id unique among OPEN orders only: a FILLED market order's id is
+     * accepted again and fills again. Off by default so the older tests keep the -4116-everywhere
+     * fake; on, the duplicate rejection covers resting orders only, as on the real venue.
+     */
+    boolean filledIdsReusable = false;
 
     int placeOrderCalls = 0;
     long orderIdSequence = 1;
@@ -145,7 +153,8 @@ final class FakeExchange implements ExchangePort {
         }
         ExchangeException selective = placementFailure.apply(request);
         if (selective != null) throw selective;
-        if (ordersByClientId.containsKey(request.clientOrderId())) {
+        OrderStatus known = ordersByClientId.get(request.clientOrderId());
+        if (known != null && !(filledIdsReusable && !known.isWorking())) {
             throw ExchangeException.refused("clientOrderId is duplicated", 400,
                     BinanceErrorCodes.DUPLICATED_CLIENT_ORDER_ID);
         }
@@ -173,6 +182,13 @@ final class FakeExchange implements ExchangePort {
                     : (executed.signum() > 0 ? OrderState.PARTIALLY_FILLED : OrderState.EXPIRED);
             return new OrderStatus(request.clientOrderId(), id, request.symbol(), state, request.type(),
                     requested, executed, executed.signum() > 0 ? fillPrice : BigDecimal.ZERO,
+                    BigDecimal.ZERO, request.reduceOnly(), request.closePosition(), serverTimeMillis());
+        }
+        if (request.type() == OrderType.LIMIT && limitFillRatio > 0) {
+            BigDecimal executed = filters.quantizeQuantityDown(requested.doubleValue() * limitFillRatio);
+            OrderState state = executed.compareTo(requested) >= 0 ? OrderState.FILLED : OrderState.PARTIALLY_FILLED;
+            return new OrderStatus(request.clientOrderId(), id, request.symbol(), state, request.type(),
+                    requested, executed, executed.signum() > 0 ? request.price() : BigDecimal.ZERO,
                     BigDecimal.ZERO, request.reduceOnly(), request.closePosition(), serverTimeMillis());
         }
         // LIMIT and the conditional types rest until something triggers them.

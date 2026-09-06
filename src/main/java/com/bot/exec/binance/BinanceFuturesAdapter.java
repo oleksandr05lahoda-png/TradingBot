@@ -104,6 +104,8 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         return System.currentTimeMillis() + clockOffsetMs;
     }
 
+    @Override public long clockSkewMillis() { return clockOffsetMs; }
+
     // ─── Account and instrument data ─────────────────────────────────────────────────────────
 
     @Override public AccountSnapshot fetchAccount() {
@@ -374,11 +376,21 @@ public final class BinanceFuturesAdapter implements ExchangePort {
             JSONObject json = new JSONObject(body);
             return Optional.of(algo ? parseAlgoOrder(json, symbol) : parseOrder(json));
         } catch (ExchangeException e) {
-            if (e.exchangeCode() == BinanceErrorCodes.NO_SUCH_ORDER) {
-                // Documented caveat: cancelled orders with no fills stop being queryable after three days.
-                return Optional.empty();
+            if (e.exchangeCode() != BinanceErrorCodes.NO_SUCH_ORDER) throw e;
+            // Documented caveat: cancelled orders with no fills stop being queryable after three days.
+            if (algo || ClientOrderIdFactory.purposeOf(clientOrderId).isPresent()) return Optional.empty();
+            // A foreign id (a stop placed from the Binance app, adopted by the ledger) carries no
+            // purpose letter and reads as plain; the plain endpoint answers -2013 for a conditional
+            // order and the reconciler read that as "unknown to the exchange" - a naked position
+            // and a halt, for a stop that was resting the whole time. Same fallback as cancelOrder.
+            Map<String, String> asAlgo = new LinkedHashMap<>();
+            asAlgo.put("clientAlgoId", clientOrderId);
+            try {
+                return Optional.of(parseAlgoOrder(new JSONObject(signedGet("/fapi/v1/algoOrder", asAlgo, 1)), symbol));
+            } catch (ExchangeException second) {
+                if (BinanceErrorCodes.isOrderAbsent(second.exchangeCode())) return Optional.empty();
+                throw second;
             }
-            throw e;
         }
     }
 

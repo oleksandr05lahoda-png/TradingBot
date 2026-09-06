@@ -11,6 +11,9 @@ import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.logging.Logger;
 
 /**
@@ -36,7 +39,9 @@ public final class DailyLossKillSwitch {
             double dayStartBalance,
             double realizedPnl,
             double openUnrealizedPnl,
-            double effectivePnl) {
+            double effectivePnl,
+            /** A breach seen but not yet held for the confirmation window: entries stop now, the flatten waits. */
+            boolean confirming) {
 
         public double drawdownFraction() {
             return dayStartBalance > 0 ? Math.max(0.0, -effectivePnl / dayStartBalance) : 0.0;
@@ -58,6 +63,31 @@ public final class DailyLossKillSwitch {
      */
     private double openUnrealizedAtDayStart;
     private boolean baselineSet;
+    /**
+     * The same baseline per symbol, when the caller can supply it. The account-level figure alone
+     * had a hole: a loser carried in from yesterday is excluded from the OPEN channel by the
+     * baseline, but the moment it closes its WHOLE trip arrives through the REALISED channel (the
+     * exchange's income row carries the full trip, not today's part), and the switch could flatten
+     * the book on a day that had barely moved. With the per-symbol record, the pre-day part of a
+     * baselined symbol that is no longer open is credited back — but only when the baseline was
+     * fixed at a true UTC day start in this process ({@link #baselineFromRollover}): after a mid-day
+     * restart the damage before the baseline IS today's, and the credit would forgive it.
+     */
+    private Map<String, Double> baselineBySymbol = new LinkedHashMap<>();
+    /**
+     * Baselined symbols seen closed since, with their pre-day part, credited exactly once: the
+     * baseline entry is dropped the moment the symbol is absent, so a re-entry on the same day
+     * starts from zero instead of being measured against yesterday's open loss (audit 06.09).
+     */
+    private final Map<String, Double> creditedBySymbol = new LinkedHashMap<>();
+    private Map<String, Double> currentOpenBySymbol = null;
+    private boolean baselineFromRollover;
+    /**
+     * Where a rollover baseline is written, so a restart later the same day keeps crediting back
+     * yesterday's part of a carried-in loser. In memory only, one deploy after midnight re-opened
+     * the false flatten the per-symbol baseline was built to close (audit 06.09).
+     */
+    private Path baselineFile;
     private boolean tripped;
     private String reason = "";
     private boolean seededThisDay;
@@ -97,7 +127,9 @@ public final class DailyLossKillSwitch {
      */
     public synchronized DailyLossKillSwitch withLatchFile(Path path, Instant now) {
         this.latchFile = Preconditions.notNull(path, "path");
+        this.baselineFile = path.resolveSibling("killswitch-baseline.json");
         rolloverIfNewDay(now, 0);
+        restoreBaseline();
         if (!Files.exists(path)) return this;
         try {
             JSONObject root = new JSONObject(Files.readString(path, StandardCharsets.UTF_8));
@@ -164,6 +196,39 @@ public final class DailyLossKillSwitch {
         }
     }
 
+    /**
+     * Same as {@link #observeOpenUnrealizedPnl(double, Instant)}, with the open PnL broken down by
+     * symbol, so a baselined symbol that has since closed can have its pre-day part credited back
+     * against the realised figure. Callers without the breakdown keep the account-level overload.
+     */
+    public synchronized void observeOpenUnrealizedPnl(Map<String, Double> pnlBySymbol, Instant now) {
+        Preconditions.notNull(pnlBySymbol, "pnlBySymbol");
+        double total = 0;
+        Map<String, Double> copy = new LinkedHashMap<>();
+        for (Map.Entry<String, Double> e : pnlBySymbol.entrySet()) {
+            double pnl = Preconditions.finite(e.getValue(), "pnl of " + e.getKey());
+            copy.put(e.getKey(), pnl);
+            total += pnl;
+        }
+        rolloverIfNewDay(now, 0);
+        boolean firstThisDay = !baselineSet;
+        observeOpenUnrealizedPnl(total, now);   // fixes the account-level baseline on first sight
+        currentOpenBySymbol = copy;
+        boolean changed = false;
+        if (firstThisDay) {
+            baselineBySymbol = new LinkedHashMap<>(copy);
+            changed = true;
+        }
+        for (Iterator<Map.Entry<String, Double>> it = baselineBySymbol.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, Double> e = it.next();
+            if (copy.containsKey(e.getKey())) continue;
+            creditedBySymbol.merge(e.getKey(), e.getValue(), Double::sum);
+            it.remove();
+            changed = true;
+        }
+        if (changed && baselineFromRollover) persistBaseline();
+    }
+
     /** Operator hook. Unlike {@code exec.TradingHalt} (drift, operator-cleared) this self-clears at UTC rollover. */
     public synchronized void trip(String why, Instant now) {
         rolloverIfNewDay(now, 0);
@@ -180,7 +245,20 @@ public final class DailyLossKillSwitch {
         rolloverIfNewDay(now, 0);
         // Only the move made SINCE the day began counts; a book carried in brings its own history.
         double openToday = openUnrealizedPnl - openUnrealizedAtDayStart;
-        double effective = realizedPnl + Math.min(0.0, openToday);
+        double creditedBack = 0.0;
+        if (currentOpenBySymbol != null) {
+            // Per symbol: a baselined symbol still open contributes its move since the day start; one
+            // that has closed contributes nothing here, and its pre-day part - now inside the
+            // realised figure - is credited back when the baseline was a true day start.
+            openToday = 0.0;
+            for (Map.Entry<String, Double> e : currentOpenBySymbol.entrySet()) {
+                openToday += e.getValue() - baselineBySymbol.getOrDefault(e.getKey(), 0.0);
+            }
+            if (baselineFromRollover) {
+                for (double credited : creditedBySymbol.values()) creditedBack += credited;
+            }
+        }
+        double effective = realizedPnl - creditedBack + Math.min(0.0, openToday);
         if (realizedStale) {
             effective = Math.min(effective, effectiveFloorWhileStale);
             effectiveFloorWhileStale = effective;
@@ -209,11 +287,54 @@ public final class DailyLossKillSwitch {
                 firstBreachAt = null;
             }
         }
-        return new Status(tripped, reason, utcDay, dayStartBalance, realizedPnl, openUnrealizedPnl, effective);
+        return new Status(tripped, reason, utcDay, dayStartBalance, realizedPnl, openUnrealizedPnl, effective,
+                !tripped && firstBreachAt != null);
     }
 
     public synchronized boolean isTripped(Instant now) {
         return evaluate(now).tripped();
+    }
+
+    /** {day, total, baseline, credited}: enough to resume the day's per-symbol arithmetic after a restart. */
+    private void persistBaseline() {
+        if (baselineFile == null) return;
+        try {
+            String body = new JSONObject()
+                    .put("day", utcDay.toString())
+                    .put("total", openUnrealizedAtDayStart)
+                    .put("baseline", new JSONObject(baselineBySymbol))
+                    .put("credited", new JSONObject(creditedBySymbol))
+                    .toString();
+            Path tmp = baselineFile.resolveSibling(baselineFile.getFileName() + ".tmp");
+            Files.writeString(tmp, body, StandardCharsets.UTF_8);
+            Files.move(tmp, baselineFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException | RuntimeException e) {
+            LOG.warning("[KillSwitch] could not persist the day-start baseline to " + baselineFile
+                    + ": " + e.getMessage());
+        }
+    }
+
+    private void restoreBaseline() {
+        if (baselineFile == null || !Files.exists(baselineFile)) return;
+        try {
+            JSONObject root = new JSONObject(Files.readString(baselineFile, StandardCharsets.UTF_8));
+            if (!LocalDate.parse(root.getString("day")).equals(utcDay)) return;
+            Map<String, Double> baseline = new LinkedHashMap<>();
+            JSONObject b = root.optJSONObject("baseline");
+            if (b != null) for (String k : b.keySet()) baseline.put(k, b.getDouble(k));
+            JSONObject c = root.optJSONObject("credited");
+            creditedBySymbol.clear();
+            if (c != null) for (String k : c.keySet()) creditedBySymbol.put(k, c.getDouble(k));
+            baselineBySymbol = baseline;
+            openUnrealizedAtDayStart = root.optDouble("total", 0.0);
+            baselineSet = true;
+            baselineFromRollover = true;
+            LOG.info("[KillSwitch] restored today's day-start baseline from " + baselineFile + ": "
+                    + baseline + (creditedBySymbol.isEmpty() ? "" : ", credited " + creditedBySymbol));
+        } catch (RuntimeException | IOException e) {
+            LOG.warning("[KillSwitch] baseline file " + baselineFile + " is unreadable (" + e.getMessage()
+                    + ") — ignored");
+        }
     }
 
     private void persistLatch(Instant now) {
@@ -249,6 +370,12 @@ public final class DailyLossKillSwitch {
             // The new day inherits whatever is open; the next observation re-fixes the baseline.
             openUnrealizedAtDayStart = 0;
             baselineSet = false;
+            baselineBySymbol = new LinkedHashMap<>();
+            creditedBySymbol.clear();
+            currentOpenBySymbol = null;
+            // A baseline taken after this point is a true day start: what closes later may have
+            // its pre-day part credited back. One fixed at construction (a restart) may not.
+            baselineFromRollover = true;
             seededThisDay = false;
             tripped = false;
             reason = "";
@@ -258,6 +385,7 @@ public final class DailyLossKillSwitch {
             if (latchFile != null) {
                 try {
                     Files.deleteIfExists(latchFile);
+                    if (baselineFile != null) Files.deleteIfExists(baselineFile);
                 } catch (IOException e) {
                     LOG.fine("[KillSwitch] stale latch file not removed: " + e.getMessage());
                 }

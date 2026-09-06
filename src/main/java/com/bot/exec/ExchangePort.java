@@ -22,6 +22,12 @@ public interface ExchangePort extends AutoCloseable {
     /** Exchange clock, in epoch milliseconds. Used to detect the drift that invalidates signatures. */
     long serverTimeMillis();
 
+    /**
+     * Exchange clock minus host clock, in milliseconds, as last measured; 0 when unknown. Order
+     * timestamps are the exchange's, so an age computed against the host clock is off by this.
+     */
+    default long clockSkewMillis() { return 0L; }
+
     AccountSnapshot fetchAccount();
 
     /** Never cached across a run without refreshing. */

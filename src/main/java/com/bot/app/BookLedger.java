@@ -43,6 +43,10 @@ final class BookLedger {
             row.put("symbol", p.symbol());
             row.put("side", p.side().name());
             row.put("riskUsd", p.riskUsd());
+            // riskUsd is a dollar figure for THIS size: a position trimmed while the process is
+            // down (a hand close, a take leg) would otherwise inherit the full figure and the
+            // missing-stop repair would place its stop at an inflated distance (audit 06.09).
+            row.put("quantity", p.quantity().toPlainString());
             p.protectiveStopId().ifPresent(id -> row.put("stopId", id));
             positions.put(row);
         }
@@ -76,11 +80,20 @@ final class BookLedger {
 
         int seeded = 0;
         for (int i = 0; i < rows.length(); i++) {
-            JSONObject row = rows.getJSONObject(i);
+            // A null or string element is a hand edit or a half-repaired file, not a reason to
+            // fail the boot with "could not read the exchange" (audit 06.09).
+            JSONObject row = rows.optJSONObject(i);
+            if (row == null) {
+                LOG.warning("[Ledger] " + path + " positions[" + i + "] is not an object - skipped");
+                continue;
+            }
             String symbol = row.optString("symbol", "");
             String stopId = row.optString("stopId", "");
             double riskUsd = row.optDouble("riskUsd", 0.0);
             if (symbol.isBlank() || stopId.isBlank()) continue;
+            // Seeding must be idempotent: the boot retry loop runs it again after a transient
+            // failure further down, and ExposureBook.open refuses a symbol already booked.
+            if (book.hasPosition(symbol)) continue;
 
             PositionSnapshot live = exchange.stream()
                     .filter(p -> p.symbol().equals(symbol) && p.signedQuantity().signum() != 0)
@@ -90,8 +103,24 @@ final class BookLedger {
             BigDecimal quantity = live.signedQuantity().abs();
             double entry = live.entryPrice().doubleValue();
             Side side = live.signedQuantity().signum() > 0 ? Side.LONG : Side.SHORT;
+            String savedSide = row.optString("side", "");
+            if (!savedSide.isBlank() && !savedSide.equals(side.name())) {
+                // The recorded position is gone and a hand-opened one in the other direction
+                // took its symbol: its stop id and risk figure belong to a trade that no longer
+                // exists. Left for adopt() or UNKNOWN_POSITION rather than booked as ours.
+                LOG.warning("[Ledger] " + symbol + " is " + side + " on the exchange but " + savedSide
+                        + " in the ledger - the recorded stop belongs to a position that no longer "
+                        + "exists; not seeded");
+                continue;
+            }
+            // Risk is a dollar figure for the size that was persisted; scale it to the size that
+            // is live so a partial exit while down does not inflate the implied stop distance.
+            BigDecimal savedQty = row.has("quantity") ? new BigDecimal(row.getString("quantity")) : null;
+            double risk = savedQty != null && savedQty.signum() > 0
+                    ? riskUsd * quantity.doubleValue() / savedQty.doubleValue()
+                    : riskUsd;
             book.open(new ExposureBook.OpenPosition(symbol, side, quantity, entry,
-                    quantity.doubleValue() * entry, Math.max(0.0, riskUsd), Optional.of(stopId)));
+                    quantity.doubleValue() * entry, Math.max(0.0, risk), Optional.of(stopId)));
             seeded++;
         }
         return seeded;
@@ -116,11 +145,17 @@ final class BookLedger {
         }
         if (rows == null) return out;
         for (int i = 0; i < rows.length(); i++) {
-            JSONObject row = rows.getJSONObject(i);
+            JSONObject row = rows.optJSONObject(i);
+            if (row == null) continue;    // seed() already warned about it
             String symbol = row.optString("symbol", "");
             if (symbol.isBlank()) continue;
+            String side = row.optString("side", "");
+            // A live position on the OTHER side is not the recorded one still open: the recorded
+            // one exited (its stop-out must be journaled) and a hand trade took the symbol.
             boolean stillOpen = exchange.stream()
-                    .anyMatch(p -> p.symbol().equals(symbol) && p.signedQuantity().signum() != 0);
+                    .anyMatch(p -> p.symbol().equals(symbol) && p.signedQuantity().signum() != 0
+                            && (side.isBlank() || side.equals(
+                                    p.signedQuantity().signum() > 0 ? Side.LONG.name() : Side.SHORT.name())));
             if (stillOpen) continue;
             out.add(new ClosedWhileAway(symbol, row.optString("side", ""), row.optString("stopId", "")));
         }

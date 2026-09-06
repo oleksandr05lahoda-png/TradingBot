@@ -133,7 +133,12 @@ class ReconcilerGuardsTest {
         ExecutionCoordinator coordinator = ExecFixtures.coordinator(exchange, engine, halt, alerts);
         reconciler.withStopRepair(coordinator::closeOut);
 
-        Reconciler.Report report = reconciler.reconcile(Instant.parse("2026-08-09T12:00:30Z"));
+        // A foreign id no endpoint answers for is ignorance first (the stop may have fired between
+        // the position read and the lookup); it becomes a naked position at the unconfirmable limit.
+        Reconciler.Report first = reconciler.reconcile(Instant.parse("2026-08-09T12:00:30Z"));
+        assertTrue(first.healthy(), "one unanswered lookup is not yet a naked position: " + first.describe());
+        reconciler.reconcile(Instant.parse("2026-08-09T12:01:00Z"));
+        Reconciler.Report report = reconciler.reconcile(Instant.parse("2026-08-09T12:01:30Z"));
 
         assertFalse(report.healthy(), "a naked hand position is reported, not repaired");
         assertTrue(report.describe().contains("not this process's to repair"), report.describe());

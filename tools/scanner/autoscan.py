@@ -32,6 +32,7 @@ import io
 import json
 import math
 import os
+import shutil
 import sys
 import time
 import urllib.error
@@ -80,11 +81,23 @@ SWEEP_BUDGET_FRACTION = 0.5
 MAX_THROTTLES_PER_SWEEP = 3
 
 
+_log_broken = [False]
+
+
 def log(msg, path):
     line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
     print(line, flush=True)
-    with io.open(path, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    # Best effort, like the bot's own journal: a full or read-only volume must not take the
+    # scanner down - and with it the whole container, so the JVM re-booted (reconcile, alerts,
+    # book replay) every few minutes for as long as the disk stayed full (audit 06.09).
+    try:
+        with io.open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        _log_broken[0] = False
+    except OSError as e:
+        if not _log_broken[0]:
+            print("autoscan.log unwritable (%s) - continuing on stdout only" % e, flush=True)
+            _log_broken[0] = True
 
 
 def get(path, params, base=FAPI, gap=0.25, tries=5):
@@ -225,7 +238,9 @@ def bot_owned(workdir):
     Ownership is the stop id's prefix: every order this machine mints starts with "bt-". riskUsd
     alone is NOT ownership - on the real venue the ledger adopts ANY position that carries a stop,
     the owner's hand trade with a stop from the app included, and assigns it a risk figure (audit
-    03.09). A row with risk but no id yet is a position adopted from an entry intent - ours."""
+    03.09). A row with risk but no id yet is a position adopted from an entry intent - ours.
+    Returns None when no ledger could be read: "unknown" is not "nobody's", and a transient read
+    failure must not disown a real position (settle_bookkeeping skips its ownership prune)."""
     for name in ("book-ledger-real.json", "book-ledger.json"):
         path = os.path.join(workdir, name)
         if not os.path.exists(path):
@@ -234,7 +249,7 @@ def bot_owned(workdir):
             with io.open(path, encoding="utf-8") as f:
                 doc = json.load(f)
         except Exception:
-            return set()
+            return None
         rows = doc.get("positions", doc) if isinstance(doc, dict) else doc
         out = set()
         for r in rows or []:
@@ -247,7 +262,7 @@ def bot_owned(workdir):
             except (TypeError, ValueError):
                 pass
         return out
-    return set()
+    return None
 
 
 def read_journal_feedback(workdir, since_ts):
@@ -277,7 +292,10 @@ def read_journal_feedback(workdir, since_ts):
                 sym = row.get("symbol") or ""
                 if row.get("kind") == "rejected" and sym:
                     rejected[sym] = row.get("reason") or "rejected"
-                elif row.get("kind") == "entry" and sym:
+                elif row.get("kind") in ("entry", "aborted") and sym:
+                    # An aborted entry (filled, then unwound because the stop could not be placed
+                    # or the fill slipped) WAS held and paid the round trip: without the cooldown
+                    # it was re-proposed hourly while the cause persisted (audit 06.09).
                     filled.add(sym)
                     rejected.pop(sym, None)
     except OSError:
@@ -298,6 +316,78 @@ def _journal_ts(text):
         return datetime.datetime.fromisoformat(t).replace(tzinfo=datetime.timezone.utc).timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def settle_bookkeeping(state, held, feedback, owned, now, interval, cooldown_hours, say=None):
+    """The entry clocks, cooldowns and ownership map, settled against what the exchange and the
+    journal say. Pure - no I/O - so it is pinned offline (tools/scanner/test_bookkeeping.py).
+
+    `held` is every non-zero position on the account; `feedback` the (rejected, filled, newest)
+    triple from read_journal_feedback; `owned` the ledger's bot-owned symbols, or None when no
+    ledger could be read. The caller saves the state afterwards.
+
+    A stop or take that fired on the exchange leaves no CLOSE line, so without a cooldown the
+    coin was re-proposed at the very next pass while still top of the momentum list. But only a
+    coin that was actually HELD earns that cooldown: a proposal the bot refused (stale, risk,
+    notional) never traded, and punishing it with 24h of silence was the audit-30.08 finding.
+    Never-held proposals are forgotten without a cooldown once they are too old to still fill
+    (SIGNAL_MAX_AGE plus one pass).
+
+    Audit 06.09, three ways the map lied:
+      - a fill that opened and was stopped out inside one interval is never in the hourly sample;
+        the journal's fill evidence used to be merged AFTER the prune, so the coin skipped the
+        cooldown once and re-entered an hour after its stop. It is merged first now.
+      - a symbol proposed here but opened by the OWNER (the bot refused ours, the owner traded by
+        hand) stayed in `entered` and was later CLOSEd by the hold rules. Once the fill window has
+        passed, a held symbol with no fill proof of ours - no auto-* fill in the journal, no bt-
+        stop in the ledger - is not ours and loses its clock.
+      - `was_held` only ever shrank for symbols in `entered`: hand trades and replayed history
+        stayed in it forever and turned a later REFUSAL into the 24h cooldown. It is now cut down
+        to what is still held or still clocked."""
+    say = say or (lambda msg: None)
+    rejected, filled, newest = feedback
+    entered = state.setdefault("entered", {})
+    cooldown = state.setdefault("cooldown", {})
+    entered_trig = state.setdefault("entered_trig", {})
+    if newest > float(state.get("journal_seen_ts", 0) or 0):
+        state["journal_seen_ts"] = newest
+    was_held = set(state.setdefault("was_held", [])) | held | filled
+    # Fill proof outlives the journal window: the journal is read incrementally, so a fill seen
+    # once is remembered until the clock it vouches for is gone.
+    confirmed = set(state.setdefault("filled_ok", [])) | filled
+    stale_after = interval + 2 * 3600
+    for s in [x for x in entered if x not in held]:
+        if s in was_held:
+            cooldown[s] = now
+        elif now - entered.get(s, 0) < stale_after:
+            continue          # may still legally fill; judge it next pass
+        entered.pop(s, None)
+        entered_trig.pop(s, None)
+        confirmed.discard(s)
+    for s in [x for x in entered if x in held]:
+        if now - entered.get(s, 0) <= stale_after or s in confirmed:
+            continue
+        if owned is None or s in owned:
+            continue          # ours by the ledger, or the ledger is unreadable: keep the clock
+        say("%s: held, but not ours - no auto-* fill in the journal and no bt- stop in the "
+            "ledger; forgetting its clock so the hold rules leave it alone" % s)
+        entered.pop(s, None)
+        entered_trig.pop(s, None)
+    was_held &= (set(entered) | held)
+    confirmed &= set(entered)
+    # The state file must not grow forever: a week-old cooldown is long expired.
+    for s in [x for x, t in cooldown.items() if now - t > 7 * 86400]:
+        cooldown.pop(s, None)
+    # A refusal earns the coin a rest: six hours for a sizing refusal (equity does not change by
+    # the hour), two for anything else.
+    for sym, reason in rejected.items():
+        sizing = (reason.startswith("BELOW_MIN_NOTIONAL") or reason.startswith("BELOW_MIN_QUANTITY")
+                  or (reason.startswith("EXCHANGE_REFUSED") and "-4164" in reason))
+        rest = (6 if sizing else 2) * 3600
+        cooldown[sym] = max(cooldown.get(sym, 0), now - cooldown_hours * 3600 + rest)
+        say("%s: the bot refused the last line (%s) - resting %dh" % (sym, reason[:80], rest // 3600))
+    state["was_held"] = sorted(was_held)
+    state["filled_ok"] = sorted(confirmed)
 
 
 MIN_NOTIONAL = {}    # symbol -> exchange minimum notional in USDT, refreshed with the universe
@@ -483,12 +573,21 @@ def load_state(path):
                 raise ValueError("state is not an object")
             if candidate != path:
                 print("state file %s unreadable - recovered from %s" % (path, candidate), flush=True)
-            return doc
+            return _seed_journal_mark(doc)
         except FileNotFoundError:
             continue
         except Exception as e:
             print("state file %s unreadable (%s)" % (candidate, e), flush=True)
-    return {"entered": {}, "cooldown": {}}
+    return _seed_journal_mark({"entered": {}, "cooldown": {}})
+
+
+def _seed_journal_mark(doc):
+    """A state without a journal mark starts reading the journal from NOW. From 0 it replayed
+    every fill in the file's history as fresh "was held" evidence, and a coin from weeks ago then
+    earned the 24h cooldown for a mere refusal (audit 06.09)."""
+    if not doc.get("journal_seen_ts"):
+        doc["journal_seen_ts"] = time.time()
+    return doc
 
 
 def save_state(path, state):
@@ -502,7 +601,9 @@ def save_state(path, state):
             pass
     if os.path.exists(path):
         try:
-            os.replace(path, path + ".bak")
+            # A copy, not a rename: between a rename and the replace below there was no state
+            # file at all, and the host-side self-check reading it in that gap alerted.
+            shutil.copyfile(path, path + ".bak")
         except OSError:
             pass
     os.replace(tmp, path)
@@ -718,7 +819,7 @@ def main():
                 # riskUsd 0) are deliberately left alone, as everywhere else.
                 _entered = state.setdefault("entered", {})
                 _trig = state.setdefault("entered_trig", {})
-                _orphans = sorted((held & bot_owned(args.workdir)) - set(_entered))
+                _orphans = sorted((held & (bot_owned(args.workdir) or set())) - set(_entered))
                 if _orphans:
                     stamp = time.time()
                     for _s in _orphans:
@@ -798,7 +899,13 @@ def main():
                 acct = signed_get("/fapi/v2/account", env)
                 equity = float(acct.get("totalWalletBalance") or 0) + float(acct.get("totalUnrealizedProfit") or 0)
                 if equity > 0:
-                    risk_usd = equity * float(env.get("RISK_PER_TRADE", "0.005"))
+                    # The bot clamps this to its 1% hard cap (RiskConstants); sizing here from the
+                    # raw figure would nominate coins the bot then refuses BELOW_MIN_NOTIONAL.
+                    frac = float(env.get("RISK_PER_TRADE", "0.005"))
+                    if frac > 0.01:
+                        log("RISK_PER_TRADE=%s exceeds the bot's 1%% cap - sizing at the cap" % frac,
+                            logpath)
+                    risk_usd = equity * min(0.01, max(0.0, frac))
             except Exception as e:
                 log("account unreadable (%s) - feasibility filter off this pass" % type(e).__name__, logpath)
             tick = get("/fapi/v1/ticker/price", {}, gap=0.5) or []
@@ -957,34 +1064,17 @@ def main():
                         logpath)
 
             now = time.time()
-            entered = state.setdefault("entered", {})
-            cooldown = state.setdefault("cooldown", {})
-            entered_trig = state.setdefault("entered_trig", {})
-            # A stop or take that fired on the exchange leaves no CLOSE line, so without this the
-            # coin was re-proposed at the very next pass while still top of the momentum list.
-            # But only a coin that was actually SEEN HELD earned that cooldown: a proposal the
-            # bot refused (stale, risk, notional) never traded, and punishing it with 24h of
-            # silence was the audit-30.08 finding. Never-held proposals are forgotten without
-            # a cooldown once they are too old to still fill (SIGNAL_MAX_AGE plus one pass).
-            was_held = set(state.setdefault("was_held", []))
-            newly_held = held - was_held
-            if newly_held:
-                was_held |= newly_held
-                state["was_held"] = sorted(was_held)
-                save_state(statepath, state)
-            stale_after = args.interval + 2 * 3600
-            for s in [x for x in entered if x not in held]:
-                if s in was_held:
-                    cooldown[s] = now
-                    was_held.discard(s)
-                    state["was_held"] = sorted(was_held)
-                elif now - entered.get(s, 0) < stale_after:
-                    continue          # may still legally fill; judge it next pass
-                entered.pop(s, None)
-                entered_trig.pop(s, None)
-            # The state file must not grow forever: a week-old cooldown is long expired.
-            for s in [x for x, t in cooldown.items() if now - t > 7 * 86400]:
-                cooldown.pop(s, None)
+            # What the risk core did with the last lines, from the journal on the same volume,
+            # read BEFORE the clocks are settled: a fill is proof the coin WAS held, which the
+            # hourly sample above misses when a position opens and closes inside one interval.
+            # The rules themselves live in settle_bookkeeping, where they are pinned offline.
+            feedback = read_journal_feedback(args.workdir, float(state.get("journal_seen_ts", 0) or 0))
+            settle_bookkeeping(state, held, feedback, bot_owned(args.workdir), now, args.interval,
+                               args.cooldown_hours, lambda msg: log(msg, logpath))
+            save_state(statepath, state)
+            entered = state["entered"]
+            cooldown = state["cooldown"]
+            entered_trig = state["entered_trig"]
 
             to_close = []
             for s in sorted(held - hold_ok):
@@ -996,6 +1086,9 @@ def main():
                     continue
                 if now - entered.get(s, 0) < args.min_hold_hours * 3600:
                     continue           # the exchange-side stop still guards it meanwhile
+                # Named after the trigger that stopped holding: a dip entry leaving is not a
+                # trend exit, and the lab's exit-mix arithmetic counts these labels.
+                reasons.setdefault(s, entered_trig.get(s, "trend") + "-exited")
                 to_close.append(s)
             if max_hold_hours is not None:
                 # Measured 22.08: a near-high entry held at most ~2 days kept 49% winners and cut
@@ -1017,26 +1110,6 @@ def main():
             # accident. Measured 2024-26 as a 10-slot portfolio: alphabet -3.0% (worse than
             # random +5%), momentum-first +21% with a smaller drawdown, better in 5 of 5
             # half-years. This removes a handicap; it does not create an edge.
-            # What the risk core did with the last lines, from the journal on the same volume. A
-            # refusal earns the coin a rest: six hours for a sizing refusal (equity does not change
-            # by the hour), two for anything else. A fill is proof the coin WAS held, which the
-            # hourly sample above can miss when a position opens and closes inside one interval.
-            rejected, filled, newest = read_journal_feedback(
-                args.workdir, float(state.get("journal_seen_ts", 0) or 0))
-            if newest > float(state.get("journal_seen_ts", 0) or 0):
-                state["journal_seen_ts"] = newest
-            if filled:
-                was_held = set(state.setdefault("was_held", []))
-                was_held |= filled
-                state["was_held"] = sorted(was_held)
-            for sym, reason in rejected.items():
-                sizing = reason.startswith("BELOW_MIN_NOTIONAL") or reason.startswith("BELOW_MIN_QUANTITY")
-                rest = (6 if sizing else 2) * 3600
-                cooldown[sym] = max(cooldown.get(sym, 0), now - args.cooldown_hours * 3600 + rest)
-                log("%s: the bot refused the last line (%s) - resting %dh" % (sym, reason[:80], rest // 3600),
-                    logpath)
-            if rejected or filled:
-                save_state(statepath, state)
             fresh = [s for s in sorted((entry_ok & entry_pool) - held,
                                        key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
@@ -1066,18 +1139,21 @@ def main():
                     step = STEP_SIZE.get(sym) or 0.0
                     if step > 0:
                         qty = int(qty / step + 1e-9) * step
+                    # The bot judges the minimum one percent under the signal price, because the
+                    # exchange judges it at MARK, which sits below LAST about half the time.
+                    floor_price = m["price"] * 0.99
                     ok = (qty > 0 and qty >= MIN_QTY.get(sym, 0.0)
-                          and qty * m["price"] >= MIN_NOTIONAL.get(sym, 5.0))
+                          and qty * floor_price >= MIN_NOTIONAL.get(sym, 5.0))
                     if ok or step <= 0 or round_up_tol <= 0:
                         return ok
                     # The bot's step 9b (05.09): round UP to the exchange minimum when the floor
                     # is refused, inside the tolerance; the 1% hard cap binds regardless.
                     min_notional = MIN_NOTIONAL.get(sym, 5.0)
-                    by_notional = math.ceil(min_notional / m["price"] / step - 1e-9) * step
+                    by_notional = math.ceil(min_notional / floor_price / step - 1e-9) * step
                     minimum = max(qty + step, by_notional, MIN_QTY.get(sym, 0.0))
                     return (minimum * distance <= risk_usd * (1 + round_up_tol) + 1e-9
                             and minimum * distance <= equity * 0.01 + 1e-9
-                            and minimum * m["price"] >= min_notional)
+                            and minimum * floor_price >= min_notional)
                 infeasible = [sym for sym in fresh if not feasible(sym)]
                 if infeasible:
                     log("%d candidate(s) too wide to size at this equity (risk $%.2f vs min notional): %s"

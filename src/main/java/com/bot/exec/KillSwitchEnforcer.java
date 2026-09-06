@@ -118,6 +118,7 @@ public final class KillSwitchEnforcer {
         }
 
         int closed = 0;
+        int alreadyGone = 0;
         int failed = 0;
         for (ExposureBook.OpenPosition position : open) {
             // Run stamp + attempt number keep a retry from adopting a stale terminal order under the
@@ -128,7 +129,14 @@ public final class KillSwitchEnforcer {
                 ExecutionCoordinator.CloseReport report = closer.close(position.symbol(), requestId);
                 if (report.flat()) {
                     closed++;
-                    if (closedListener != null) {
+                    // "Already flat" is confirmed, but it is not a fill of ours: its stop or take
+                    // did the closing, and the reconciler journals that exit. A row saying this
+                    // switch closed 0 @ 0 would replace the real exit in the forward record.
+                    if (report.closedQuantity().signum() <= 0) {
+                        alreadyGone++;
+                        LOG.info("[KillSwitchEnforcer] " + position.symbol()
+                                + " was already gone before the flatten reached it (" + report.note() + ")");
+                    } else if (closedListener != null) {
                         try {
                             closedListener.closed(requestId, position.symbol(), report);
                         } catch (RuntimeException e) {
@@ -149,8 +157,10 @@ public final class KillSwitchEnforcer {
 
         if (failed == 0) {
             alerts.warning("Book closed on the daily loss limit",
-                    closed + " position(s) closed reduce-only" + describeLeftAlone(leftAlone)
-                            + "; trading resumes at 00:00 UTC");
+                    (closed - alreadyGone) + " position(s) closed reduce-only"
+                            + (alreadyGone > 0 ? ", " + alreadyGone + " already gone (exited on the "
+                                    + "exchange before the flatten reached them)" : "")
+                            + describeLeftAlone(leftAlone) + "; trading resumes at 00:00 UTC");
             return;
         }
         if (attempts >= MAX_FLATTEN_ATTEMPTS) {

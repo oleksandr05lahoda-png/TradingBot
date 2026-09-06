@@ -105,4 +105,51 @@ class DailyLossKillSwitchLatchTest {
         sw.seedRealizedPnl(-25, NOON.plusSeconds(90));                   // the feed is back with the truth
         assertEquals(-25, sw.evaluate(NOON.plusSeconds(90)).effectivePnl(), 1e-9);
     }
+
+    @Test
+    @DisplayName("while a breach is confirming, the entry gate is already shut")
+    void confirmingBreachClosesTheEntryGate() {
+        DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03).withConfirmationWindowMs(20_000L);
+        killSwitch.observeBalance(1000, NOON);
+        killSwitch.observeOpenUnrealizedPnl(0, NOON);
+        killSwitch.seedRealizedPnl(-40, NOON);
+        DailyLossKillSwitch.Status status = killSwitch.evaluate(NOON);
+        assertFalse(status.tripped(), "the window delays the flatten");
+        assertTrue(status.confirming());
+
+        RiskEngine engine = new RiskEngine(RiskConfig.defaults(), new ExposureBook(), killSwitch);
+        RiskDecision decision = engine.evaluate(
+                RiskFixtures.request(com.bot.core.Side.LONG, 64_000, 62_800, 3), 1000, NOON.plusSeconds(2));
+        RiskDecision.Rejected rejected = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                RiskDecision.Rejected.class, decision);
+        assertEquals(RejectReason.TRADING_HALTED, rejected.reason());
+        assertFalse(killSwitch.evaluate(NOON.plusSeconds(2)).tripped(), "still confirming, not yet tripped");
+    }
+
+    @Test
+    @DisplayName("the rollover baseline survives a restart, so a carried-in loser is still credited back")
+    void rolloverBaselineSurvivesRestart() {
+        Path latch = dir.resolve("killswitch-latch.json");
+        Instant yesterday = Instant.parse("2026-08-08T23:00:00Z");
+        Instant dayStart = Instant.parse("2026-08-09T00:10:00Z");
+        DailyLossKillSwitch first = new DailyLossKillSwitch(0.03).withLatchFile(latch, yesterday);
+        first.observeBalance(1000, yesterday);
+        first.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -10.0), yesterday);
+        first.observeBalance(1000, dayStart);
+        first.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -40.0), dayStart);   // the rollover baseline
+        assertFalse(first.isTripped(dayStart));
+
+        // A deploy at 00:40. AAA stops out at -50 at 14:00: only -10 of it is today's.
+        DailyLossKillSwitch restarted = new DailyLossKillSwitch(0.03)
+                .withLatchFile(latch, dayStart.plusSeconds(1800));
+        restarted.observeBalance(1000, dayStart.plusSeconds(1800));
+        restarted.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -40.0), dayStart.plusSeconds(1800));
+        Instant afternoon = Instant.parse("2026-08-09T14:00:00Z");
+        restarted.seedRealizedPnl(-50, afternoon);
+        restarted.observeOpenUnrealizedPnl(java.util.Map.of(), afternoon);
+
+        DailyLossKillSwitch.Status status = restarted.evaluate(afternoon);
+        assertEquals(-10.0, status.effectivePnl(), 1e-9, "yesterday's -40 must stay credited after the restart");
+        assertFalse(status.tripped());
+    }
 }

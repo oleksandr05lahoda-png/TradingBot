@@ -47,6 +47,44 @@ class IdempotentResubmitTest {
     }
 
     @Test
+    @DisplayName("a lost response whose probes see nothing is NOT resent: a filled market id is reusable on Binance")
+    void lostResponseWithBlindProbesIsNotResent() throws Exception {
+        // Binance semantics: the first attempt FILLED, so its id is no longer among the open orders
+        // and a second POST is accepted — the -4116 backstop the older test leans on does not exist
+        // for a filled market order. The pre-send look-up and both probes miss the order, as they
+        // do when the matching engine lags or the reads are 429'd.
+        exchange.filledIdsReusable = true;
+        exchange.loseNextResponse = true;
+        exchange.hideNextQueries = 3;
+
+        ExchangeException thrown = assertThrows(ExchangeException.class, () -> placer.place(entry()));
+
+        assertTrue(thrown.ambiguous(), "the caller must hear 'unknown', never 'refused': " + thrown.getMessage());
+        assertEquals(1, exchange.placeOrderCalls, "the market entry was sent again after an ambiguous send");
+        assertEquals(1, exchange.openPositions().size());
+        assertEquals(0, exchange.openPositions().get(0).signedQuantity().compareTo(new BigDecimal("0.041")),
+                "the position doubled: a MARKET entry was resent on ignorance");
+    }
+
+    @Test
+    @DisplayName("a reduce-only close IS resent after an ambiguous send: a duplicate cannot over-close")
+    void reduceOnlyCloseIsStillResent() throws Exception {
+        exchange.filledIdsReusable = true;
+        placer.place(entry());
+        OrderRequest close = OrderRequest.emergencyClose("BTCUSDT", OrderSide.SELL, new BigDecimal("0.041"),
+                ClientOrderIdFactory.create("sig-1", OrderPurpose.EMERGENCY_CLOSE, 0));
+        // The first send dies before the exchange records anything; the probes see nothing. For a
+        // reducing order the placer must still try again — a flat symbol would answer -2022.
+        exchange.failNextPlaceWith = ExchangeException.ambiguous("timeout", null);
+        exchange.hideNextQueries = 3;
+
+        OrderStatus result = placer.place(close);
+
+        assertTrue(result.hasFill());
+        assertTrue(exchange.openPositions().isEmpty(), "the close was not resent");
+    }
+
+    @Test
     @DisplayName("sending the identical request again is a no-op")
     void resendingIsANoOp() throws Exception {
         OrderStatus first = placer.place(entry());

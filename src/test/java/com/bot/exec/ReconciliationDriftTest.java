@@ -387,10 +387,73 @@ class ReconciliationDriftTest {
     }
 
     @Test
+    @DisplayName("a foreign entry order on a flat symbol is the owner's; only our leftovers are swept")
+    void foreignEntryOrderOnAFlatSymbolIsLeftAlone() throws Exception {
+        // The owner's hand trade was booked by the ledger (foreign stop id), its stop fired, and a
+        // LIMIT buy he placed by hand still rests. The per-symbol branch used to cancel it.
+        exchange.placeOrder(OrderRequest.limitEntry("BTCUSDT", com.bot.exec.OrderTypes.OrderSide.BUY,
+                new BigDecimal("0.010"), new BigDecimal("60000.0"),
+                com.bot.exec.OrderTypes.TimeInForce.GTC, "web_abc"));
+        exchange.placeOrder(OrderRequest.takeProfit("BTCUSDT", com.bot.exec.OrderTypes.OrderSide.SELL,
+                new BigDecimal("0.041"), new BigDecimal("70000.0"),
+                ClientOrderIdFactory.create("s1", com.bot.exec.OrderTypes.OrderPurpose.TAKE_PROFIT, 0)));
+        exchange.ageOrder("web_abc", 120_000L);
+        String tpId = ClientOrderIdFactory.create("s1", com.bot.exec.OrderTypes.OrderPurpose.TAKE_PROFIT, 0);
+        exchange.ageOrder(tpId, 120_000L);
+        engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.of("web_stop")));
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(exchange.order("web_abc").orElseThrow().isWorking(),
+                "the owner's resting entry must survive: " + report.describe());
+        assertFalse(exchange.order(tpId).orElseThrow().isWorking(),
+                "our reduce-only leftover is the orphan: " + report.describe());
+    }
+
+    @Test
     @DisplayName("bootstrap refuses to start trading when the start-up state does not converge")
     void bootstrapRefusesOnDrift() {
         exchange.plantPosition("ETHUSDT", "-2.0", "3000");
         assertFalse(reconciler.bootstrap(ExecFixtures.NOON));
         assertTrue(halt.isHalted());
+    }
+
+    @Test
+    @DisplayName("a foreign stop id the exchange does not answer for is ignorance first, a naked position only at the limit")
+    void foreignStopUnknownToTheExchangeIsNotAnInstantHalt() {
+        exchange.plantPosition("ADAUSDT", "100", "0.5");
+        engine.book().open(new ExposureBook.OpenPosition("ADAUSDT", Side.LONG,
+                new BigDecimal("100"), 0.5, 50, 1.0, Optional.of("web_xyz")));
+
+        Reconciler.Report first = reconciler.reconcile(ExecFixtures.NOON);
+        assertFalse(halt.isHalted(), "one unanswered lookup of a foreign stop is not proof: " + first.describe());
+
+        reconciler.reconcile(ExecFixtures.NOON.plusSeconds(30));
+        Reconciler.Report third = reconciler.reconcile(ExecFixtures.NOON.plusSeconds(60));
+        assertTrue(halt.isHalted(), "three passes of ignorance is a naked position: " + third.describe());
+    }
+
+    @Test
+    @DisplayName("the orphan grace is measured on the exchange's clock, not the host's")
+    void orphanGraceUsesTheExchangeClock() throws Exception {
+        // The host runs 120 s behind the exchange. A reduce-only leg updated at exchange NOON is
+        // 120 s old on the exchange's clock and "in the future" on the host's.
+        DelegatingExchange skewed = new DelegatingExchange() {
+            @Override public long clockSkewMillis() { return 120_000L; }
+        };
+        String tpId = ClientOrderIdFactory.create("s9", com.bot.exec.OrderTypes.OrderPurpose.TAKE_PROFIT, 0);
+        skewed.placeOrder(OrderRequest.takeProfit("BTCUSDT", com.bot.exec.OrderTypes.OrderSide.SELL,
+                new BigDecimal("0.041"), new BigDecimal("70000.0"), tpId));
+        Reconciler reconciler = new Reconciler(skewed, engine, halt, alerts,
+                new IdempotentOrderPlacer(skewed, 1, 1, 0, ExecFixtures.NO_SLEEP));
+        engine.book().open(new ExposureBook.OpenPosition("BTCUSDT", Side.LONG,
+                new BigDecimal("0.041"), 64_000, 2_624, 49.2, Optional.empty()));
+
+        Reconciler.Report report = reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(report.drifts().stream().anyMatch(d -> d.kind() == Reconciler.Drift.Kind.ORPHAN_ORDER),
+                "on the exchange's clock the leg is out of grace: " + report.describe());
+        assertFalse(skewed.delegate.order(tpId).orElseThrow().isWorking());
     }
 }

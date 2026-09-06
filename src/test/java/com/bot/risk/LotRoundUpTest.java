@@ -80,23 +80,25 @@ class LotRoundUpTest {
     @DisplayName("several lot steps to the minimum: a coin one step could never clear is sized to $5")
     void roundsAllTheWayToTheMinimum() {
         // stop 0.44 -> R 0.06 -> ideal 8.33 -> floor 8 ($4.00, refused); one step = 9 ($4.50, still
-        // refused - the rule before 05.09); the minimum is 10 units = $5.00, risk 0.60 = +20%.
-        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decideCents(0.44, 0.20)).plan();
-        assertEquals(0, plan.quantity().compareTo(new BigDecimal("10")));
-        assertEquals(0.60, plan.riskUsd(), 1e-9);
-        assertTrue(plan.sizingNote().contains("rounded UP 2 lot step(s)"), plan.sizingNote());
+        // refused - the rule before 05.09); 10 units are $5.00 at last but $4.95 at a mark 1% under
+        // (the -4164 of 06.09), so the minimum is 11 units = $5.50, risk 0.66 = +32%.
+        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decideCents(0.44, 0.50)).plan();
+        assertEquals(0, plan.quantity().compareTo(new BigDecimal("11")));
+        assertEquals(0.66, plan.riskUsd(), 1e-9);
+        assertTrue(plan.sizingNote().contains("rounded UP 3 lot step(s)"), plan.sizingNote());
     }
 
     @Test
     @DisplayName("the minimum beyond the tolerance is still refused, however many steps it is")
     void minimumBeyondToleranceIsRefused() {
-        // stop 0.43 -> R 0.07 -> ideal 7.14 -> floor 7 ($3.50); minimum 10 units risk 0.70 = +40% > 20%
-        RiskDecision.Rejected rejected = assertInstanceOf(RiskDecision.Rejected.class, decideCents(0.43, 0.20));
+        // stop 0.43 -> R 0.07 -> ideal 7.14 -> floor 7 ($3.50); minimum 11 units (at the 1% mark
+        // cushion) risk 0.77 = +54% > 50%
+        RiskDecision.Rejected rejected = assertInstanceOf(RiskDecision.Rejected.class, decideCents(0.43, 0.50));
         assertEquals(RejectReason.BELOW_MIN_NOTIONAL, rejected.reason());
-        // ...and approved once the operator widens the dial to 0.5
-        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decideCents(0.43, 0.50)).plan();
-        assertEquals(0, plan.quantity().compareTo(new BigDecimal("10")));
-        assertEquals(0.70, plan.riskUsd(), 1e-9);
+        // ...and approved once the operator widens the dial to 1.0 (0.77 is under the $1.00 cap)
+        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decideCents(0.43, 1.0)).plan();
+        assertEquals(0, plan.quantity().compareTo(new BigDecimal("11")));
+        assertEquals(0.77, plan.riskUsd(), 1e-9);
     }
 
     @Test
@@ -125,6 +127,44 @@ class LotRoundUpTest {
         // $100 balance at 1% cap = $1.00 max risk. Stop 1.60 -> R 0.40 -> ideal 1.25 -> floor 1 ($2, refused)
         // -> 2 units risk $0.80 = +60%: beyond a 0.5 tolerance? 0.80 <= 0.50*1.5 = 0.75 is false -> refused.
         RiskDecision.Rejected rejected = assertInstanceOf(RiskDecision.Rejected.class, decide(1.60, 0.5));
+        assertEquals(RejectReason.BELOW_MIN_NOTIONAL, rejected.reason());
+    }
+
+    @Test
+    @DisplayName("on: the minimum is judged one percent under the signal price, where the exchange's mark may sit")
+    void roundUpClearsTheMinimumAtTheMarkCushion() {
+        // Lot 1, $5 minimum, signal 0.5000: 10 units are exactly $5.00 at last and $4.95 at a mark
+        // 1% lower - the -4164 the exchange answered half the time. Stop 0.44 -> R 0.06 -> ideal
+        // 8.33 -> floor 8 ($4.00) refused -> 11 units ($5.50), risk $0.66 = +32% inside a 50% dial.
+        InstrumentFilters fine = InstrumentFilters.of("FINEUSDT", "0.0001", "1", "5");
+        RiskEngine engine = RiskFixtures.engine().withLotRoundUpTolerance(0.5);
+        RiskDecision decision = engine.evaluate(
+                RiskFixtures.request(Side.LONG, 0.5, 0.44, 2, fine), 100, RiskFixtures.NOON);
+        TradePlan plan = assertInstanceOf(RiskDecision.Approved.class, decision).plan();
+        assertEquals(0, plan.quantity().compareTo(new BigDecimal("11")), plan.quantity().toPlainString());
+
+        // Inside the dial 10 units would have passed at last; at the cushioned price it is refused.
+        RiskDecision tight = RiskFixtures.engine().withLotRoundUpTolerance(0.25).evaluate(
+                RiskFixtures.request(Side.LONG, 0.5, 0.44, 2, fine), 100, RiskFixtures.NOON);
+        assertEquals(RejectReason.BELOW_MIN_NOTIONAL,
+                assertInstanceOf(RiskDecision.Rejected.class, tight).reason());
+    }
+
+    @Test
+    @DisplayName("on: the round-up never lifts a size above the exposure cap that clipped it")
+    void roundUpDoesNotBreachTheSideCap() {
+        // Long exposure headroom is $3: the floor lands on 1 unit ($2), and 3 units ($6) would
+        // clear the minimum but sit above the cap the engine itself computed.
+        RiskConfig config = RiskConfig.defaults().withMaxConcurrentPositions(5);
+        RiskEngine engine = RiskFixtures.engine(config).withLotRoundUpTolerance(1.0);
+        double longCap = 100 * config.maxLongExposureFraction();
+        engine.book().open(new ExposureBook.OpenPosition("OTHERUSDT", Side.LONG, new BigDecimal("1"),
+                longCap - 3.0, longCap - 3.0, 0.05, java.util.Optional.empty()));
+
+        RiskDecision decision = engine.evaluate(
+                RiskFixtures.request(Side.LONG, 2.0, 1.95, 2, coarse()), 100, RiskFixtures.NOON);
+
+        RiskDecision.Rejected rejected = assertInstanceOf(RiskDecision.Rejected.class, decision);
         assertEquals(RejectReason.BELOW_MIN_NOTIONAL, rejected.reason());
     }
 }

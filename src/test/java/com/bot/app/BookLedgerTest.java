@@ -109,6 +109,77 @@ class BookLedgerTest {
         assertTrue(after.all().isEmpty());
     }
 
+    @Test
+    void seedingTwiceIsIdempotentAcrossBootRetries() {
+        // The boot loop retries after a failure in bootstrap(): a second seed of the same book
+        // used to throw "already open" and turn one transient 5xx into a halt (audit 06.09).
+        Path file = dir.resolve("ledger.json");
+        ExposureBook before = new ExposureBook();
+        before.open(pos("AAAUSDT", "bt-s0-alpha"));
+        before.open(pos("BBBUSDT", "bt-s0-beta"));
+        BookLedger.save(before, file, new String[]{""});
+        List<PositionSnapshot> live = List.of(snap("AAAUSDT", "100", "2.0"), snap("BBBUSDT", "100", "2.0"));
+
+        ExposureBook after = new ExposureBook();
+        assertEquals(2, BookLedger.seed(after, live, file));
+        assertEquals(0, BookLedger.seed(after, live, file), "a second pass must open nothing and not throw");
+        assertEquals(2, after.openCount());
+        assertEquals(Optional.of("bt-s0-alpha"), after.get("AAAUSDT").orElseThrow().protectiveStopId());
+    }
+
+    @Test
+    void nonObjectRowIsSkippedNotACrash() throws Exception {
+        Path file = dir.resolve("ledger.json");
+        Files.writeString(file, "{\"positions\":[null,\"x\",{\"symbol\":\"AAAUSDT\",\"side\":\"LONG\","
+                + "\"stopId\":\"bt-1\",\"riskUsd\":1}]}");
+        List<PositionSnapshot> live = List.of(snap("AAAUSDT", "1", "1.0"));
+        ExposureBook after = new ExposureBook();
+        assertEquals(1, BookLedger.seed(after, live, file));
+        assertTrue(BookLedger.closedWhileAway(live, file).isEmpty());
+    }
+
+    @Test
+    void positionFlippedByHandWhileDownIsNotSeededWithTheOldStop() {
+        // The ledger recorded a LONG with our stop; the exchange now holds a SHORT on the symbol.
+        // The recorded position is gone (its exit must be journaled) and the short is not ours.
+        Path file = dir.resolve("ledger.json");
+        ExposureBook before = new ExposureBook();
+        before.open(pos("AAAUSDT", "bt-s0-alpha"));
+        BookLedger.save(before, file, new String[]{""});
+        List<PositionSnapshot> live = List.of(snap("AAAUSDT", "-100", "2.0"));
+
+        ExposureBook after = new ExposureBook();
+        assertEquals(0, BookLedger.seed(after, live, file));
+        assertTrue(after.all().isEmpty(), "a hand short must not inherit the long's stop id and risk");
+        List<BookLedger.ClosedWhileAway> gone = BookLedger.closedWhileAway(live, file);
+        assertEquals(1, gone.size());
+        assertEquals("AAAUSDT", gone.get(0).symbol());
+    }
+
+    @Test
+    void riskScalesToTheLiveQuantityAfterAPartialExitWhileDown() {
+        // 100 units risked $25 (stop 0.25 away); half was closed while the process was down. The
+        // implied stop distance must stay 0.25, so the risk carried for 50 units is $12.50.
+        Path file = dir.resolve("ledger.json");
+        ExposureBook before = new ExposureBook();
+        before.open(pos("AAAUSDT", "bt-s0-alpha"));
+        BookLedger.save(before, file, new String[]{""});
+
+        ExposureBook after = new ExposureBook();
+        assertEquals(1, BookLedger.seed(after, List.of(snap("AAAUSDT", "50", "2.0")), file));
+        assertEquals(12.5, after.get("AAAUSDT").orElseThrow().riskUsd(), 1e-9);
+    }
+
+    @Test
+    void legacyRowWithoutQuantityKeepsItsRiskFigure() throws Exception {
+        Path file = dir.resolve("ledger.json");
+        Files.writeString(file, "{\"positions\":[{\"symbol\":\"AAAUSDT\",\"side\":\"LONG\","
+                + "\"stopId\":\"bt-1\",\"riskUsd\":25}]}");
+        ExposureBook after = new ExposureBook();
+        BookLedger.seed(after, List.of(snap("AAAUSDT", "50", "2.0")), file);
+        assertEquals(25.0, after.get("AAAUSDT").orElseThrow().riskUsd(), 1e-9);
+    }
+
     // ─── Adoption from the exchange ──────────────────────────────────────────────────────────
 
     /** Only the two calls {@link BookLedger#adopt} makes; the rest must never be reached. */

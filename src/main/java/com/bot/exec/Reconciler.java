@@ -197,6 +197,10 @@ public final class Reconciler {
     /** One pass: realigns local state and cancels provably unmanaged orders. Never opens anything. */
     public Report reconcile(Instant now) {
         Preconditions.notNull(now, "now");
+        // Order update times are the exchange's clock. The adapter corrects the host's skew for
+        // its signatures; the orphan grace compared the raw host clock with them, so a host 60 s
+        // behind never swept an orphan and one 60 s ahead swept a just-placed leg (audit 06.09).
+        long exchangeNow = now.toEpochMilli() + port.clockSkewMillis();
 
         AccountSnapshot account = port.fetchAccount();
         List<PositionSnapshot> exchangePositions = port.openPositions().stream()
@@ -357,10 +361,55 @@ public final class Reconciler {
                     unconfirmablePasses.remove(symbol);
                     checkLiquidationBuffer(symbol, exchangePositions, stop, drifts);
                 });
-            } else {
+                // An entry remainder of OURS resting on a held symbol: a limit that filled in part
+                // and whose cancel failed. Left alone it fills later, the position outgrows its
+                // stop's sizing and the next pass halts on POSITION_GREW (audit 06.09). Cancelled
+                // once out of grace; the intent that kept this symbol in view is spent only when
+                // no such order rests any more.
+                boolean entryRemainderRests = false;
                 for (OrderStatus order : working) {
+                    boolean reducing = order.reduceOnly() || order.closePosition();
+                    boolean ourEntry = ClientOrderIdFactory.isOurs(order.clientOrderId())
+                            && ClientOrderIdFactory.purposeOf(order.clientOrderId())
+                                    .filter(p -> p == OrderTypes.OrderPurpose.ENTRY).isPresent();
+                    if (reducing || !ourEntry) continue;
+                    entryRemainderRests = true;
                     boolean oldEnough = order.updateTimeMs() > 0
-                            && now.toEpochMilli() - order.updateTimeMs() > orphanGraceMillis;
+                            && exchangeNow - order.updateTimeMs() > orphanGraceMillis;
+                    if (!oldEnough) {
+                        stillInteresting.add(symbol);
+                        continue;
+                    }
+                    drifts.add(new Drift(Drift.Kind.ORPHAN_ORDER, symbol,
+                            order.type() + " " + order.clientOrderId()
+                                    + " is an entry remainder resting on a held symbol — cancelling"));
+                    placer.cancelQuietly(symbol, order.clientOrderId());
+                    stillInteresting.add(symbol);   // the cancel may have raced a fill: one more look
+                }
+                if (!entryRemainderRests && book.hasPosition(symbol)
+                        && intents.get(symbol, now.toEpochMilli()).isPresent()) {
+                    LOG.info("[Reconciler] " + symbol + ": booked and held with no entry remainder "
+                            + "resting — the recorded entry intent has done its job; clearing it");
+                    intents.clear(symbol);
+                }
+            } else {
+                // The same rule as the account-wide sweep: a non-reducing order this machine did not
+                // mint is the owner's resting entry, not an orphan. This branch cancelled EVERYTHING
+                // on a flat inspected symbol, and the ledger books any stopped hand trade, so the
+                // owner's next limit buy on it was swept the pass after his stop fired (audit 06.09).
+                List<OrderStatus> ours = new ArrayList<>();
+                for (OrderStatus order : working) {
+                    boolean reducing = order.reduceOnly() || order.closePosition();
+                    if (!reducing && !ClientOrderIdFactory.isOurs(order.clientOrderId())) {
+                        LOG.info("[Reconciler] " + symbol + ": foreign " + order.type() + " "
+                                + order.clientOrderId() + " on a flat symbol is the owner's — left alone");
+                        continue;
+                    }
+                    ours.add(order);
+                }
+                for (OrderStatus order : ours) {
+                    boolean oldEnough = order.updateTimeMs() > 0
+                            && exchangeNow - order.updateTimeMs() > orphanGraceMillis;
                     if (!oldEnough) {
                         // May belong to an entry still being worked; let the next pass decide.
                         stillInteresting.add(symbol);
@@ -371,14 +420,14 @@ public final class Reconciler {
                                     + " is working with no position behind it — cancelling"));
                     placer.cancelQuietly(symbol, order.clientOrderId());
                 }
-                // The intent is spent only on a pass that read the symbol flat with NOTHING working,
-                // and only once the intent itself is out of grace: an order cancelled just above may
-                // have filled between the read and the cancel, and a market send whose response was
-                // lost may still be settling. One pass of lag, never a naked position.
+                // The intent is spent only on a pass that read the symbol flat with NOTHING of ours
+                // working, and only once the intent itself is out of grace: an order cancelled just
+                // above may have filled between the read and the cancel, and a market send whose
+                // response was lost may still be settling. One pass of lag, never a naked position.
                 Optional<EntryIntents.Intent> intent = intents.get(symbol, now.toEpochMilli());
                 boolean intentOutOfGrace = intent.isPresent()
                         && now.toEpochMilli() - intent.get().recordedAtMs() > orphanGraceMillis;
-                if (working.isEmpty() && intentOutOfGrace) {
+                if (ours.isEmpty() && intentOutOfGrace) {
                     LOG.info("[Reconciler] " + symbol + ": flat with no working orders — the recorded "
                             + "entry intent never became a position; clearing it");
                     intents.clear(symbol);
@@ -433,7 +482,13 @@ public final class Reconciler {
                                 + "stops are unaffected.");
             }
         }
-        engine.killSwitch().observeOpenUnrealizedPnl(account.totalUnrealizedPnl().doubleValue(), now);
+        // Per symbol, so a loser carried in from yesterday is not counted twice - once excluded by
+        // the open baseline, then in full through the realised feed the moment it closes.
+        Map<String, Double> openPnlBySymbol = new LinkedHashMap<>();
+        for (PositionSnapshot p : exchangePositions) {
+            openPnlBySymbol.merge(p.symbol(), p.unrealizedPnl().doubleValue(), Double::sum);
+        }
+        engine.killSwitch().observeOpenUnrealizedPnl(openPnlBySymbol, now);
         engine.killSwitch().observeBalance(Math.max(1e-9, account.equityUsd()), now);
 
         Report report = new Report(now, drifts, exchangePositions.size(), before.size());
@@ -522,6 +577,7 @@ public final class Reconciler {
      */
     private void sweepAccountWideOrphans(Set<String> exchangeSymbols, ExposureBook book,
                                          Set<String> alreadyInspected, List<Drift> drifts, Instant now) {
+        long exchangeNow = now.toEpochMilli() + port.clockSkewMillis();
         List<OrderStatus> all;
         try {
             all = port.openOrdersAll();
@@ -536,7 +592,7 @@ public final class Reconciler {
                 continue;
             }
             boolean oldEnough = order.updateTimeMs() > 0
-                    && now.toEpochMilli() - order.updateTimeMs() > orphanGraceMillis;
+                    && exchangeNow - order.updateTimeMs() > orphanGraceMillis;
             if (!oldEnough) continue;
             drifts.add(new Drift(Drift.Kind.ORPHAN_ORDER, symbol,
                     order.type() + " " + order.clientOrderId()
@@ -607,6 +663,16 @@ public final class Reconciler {
                     + "build cannot read — not confirming it either way");
             countUnconfirmable(symbol, "stop " + stopId + " is in a state this build cannot read",
                     drifts, now);
+            return Optional.empty();
+        }
+        if (stop.isEmpty() && !ClientOrderIdFactory.isOurs(stopId)) {
+            // A foreign stop id (adopted from the exchange) that no endpoint answers for: this
+            // process cannot repair such a position, so "absent" here is a CRITICAL halt. One
+            // read of nothing is not proof - the stop may have fired between the position read
+            // and this lookup - so it is ignorance first, and missing only at the limit.
+            LOG.warning("[Reconciler] " + symbol + ": foreign stop " + stopId
+                    + " is unknown to the exchange this pass — not confirming it either way");
+            countUnconfirmable(symbol, "foreign stop " + stopId + " unknown to the exchange", drifts, now);
             return Optional.empty();
         }
         unconfirmablePasses.remove(symbol);

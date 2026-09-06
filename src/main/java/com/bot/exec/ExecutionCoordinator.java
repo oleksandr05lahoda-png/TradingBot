@@ -164,6 +164,14 @@ public final class ExecutionCoordinator {
                     + stopCheck.describe());
         }
 
+        // An intent still on record means an earlier entry on this symbol is unresolved: a limit
+        // that could not be cancelled, a remainder resting on a held symbol, a send whose fate is
+        // unknown. Recording a new one would replace it, and two entries could fill (audit 06.09).
+        if (intents.get(plan.symbol(), clock.millis()).isPresent()) {
+            return refused(plan, "an earlier entry on this symbol is still unresolved (intent on record); "
+                    + "the reconciler clears it once the order is gone or the fill is protected");
+        }
+
         // Margin mode and leverage before anything is sent. Both are idempotent.
         port.ensureIsolatedMargin(plan.symbol());
         port.setLeverage(plan.symbol(), plan.leverage());
@@ -199,7 +207,10 @@ public final class ExecutionCoordinator {
 
         BigDecimal filled = entry.executedQuantity();
         if (filled.signum() <= 0) {
-            if (entry.isWorking()) {
+            // UNKNOWN is a status string this build cannot read, not an absent order: the reconciler
+            // already treats it as ignorance for stops, and the coordinator treated it as "did not
+            // fill" for entries, wiping the intent of an order that may be live (audit 06.09).
+            if (entry.isWorking() || entry.state() == OrderState.UNKNOWN) {
                 // The window closed, the cancel did not go through, and the re-read still says the
                 // order rests. A GTC limit that fills after this return would be a position the book
                 // knows nothing about, so the intent is NOT spent: the reconciler inspects intent
@@ -207,7 +218,8 @@ public final class ExecutionCoordinator {
                 // late fill with the planned stop, and clears the intent only once the symbol is
                 // flat with nothing working (the limit-orphan gap of the 30.08 backlog).
                 LOG.warning("[Coordinator] " + plan.symbol() + " entry " + entry.clientOrderId() + " is still "
-                        + entry.state() + " after the fill window and its cancel failed — intent kept");
+                        + entry.state() + " after the fill window" + (entry.isWorking()
+                                ? " and its cancel failed" : " (a state this build cannot read)") + " — intent kept");
                 alerts.warning("Entry still resting after its window",
                         plan.symbol() + ": the limit entry could not be cancelled and may still fill. "
                                 + "Its planned stop stays on record; the reconciler will cancel the order "
@@ -224,7 +236,10 @@ public final class ExecutionCoordinator {
         }
 
         BigDecimal avgPrice = entry.averagePrice().signum() > 0 ? entry.averagePrice() : plan.entryPrice();
-        return protect(plan, stopRequest, Optional.of(entry), filled, avgPrice);
+        // Filled in part with the rest still resting (the cancel failed): the fill is protected
+        // below, but the remainder can still fill onto a held symbol. The intent stays for it.
+        boolean remainderResting = entry.isWorking();
+        return protect(plan, stopRequest, Optional.of(entry), filled, avgPrice, remainderResting);
     }
 
     /**
@@ -232,7 +247,8 @@ public final class ExecutionCoordinator {
      * a normal fill and from an ambiguous send whose position turned up on the exchange anyway.
      */
     private Report protect(TradePlan plan, OrderRequest stopRequest, Optional<OrderStatus> entry,
-                           BigDecimal filled, BigDecimal avgPrice) throws InterruptedException {
+                           BigDecimal filled, BigDecimal avgPrice, boolean remainderResting)
+            throws InterruptedException {
         // The stop goes on now. Nothing between the fill and this.
         OrderStatus stop;
         try {
@@ -242,8 +258,21 @@ public final class ExecutionCoordinator {
         }
 
         engine.registerFill(plan, filled, avgPrice.doubleValue(), stop.clientOrderId());
-        // Protected and on the book: the intent has done its job.
-        intents.clear(plan.symbol());
+        if (remainderResting) {
+            // Protected and on the book, but the unfilled remainder still rests and could grow the
+            // position past its stop's sizing. The intent keeps the symbol under the reconciler's
+            // eye: it cancels the remainder once out of grace and clears the intent only then.
+            BigDecimal rest = plan.quantity().subtract(filled);
+            LOG.warning("[Coordinator] " + plan.symbol() + ": " + filled.toPlainString() + " filled and "
+                    + "protected, " + rest.toPlainString() + " still rests and could not be cancelled — intent kept");
+            alerts.warning("Entry remainder still resting",
+                    plan.symbol() + ": " + filled.toPlainString() + " filled and protected, "
+                            + rest.toPlainString() + " still rests and could not be cancelled; the "
+                            + "reconciler cancels it once it is out of grace.");
+        } else {
+            // Protected and on the book: the intent has done its job.
+            intents.clear(plan.symbol());
+        }
 
         double realisedRisk = filled.doubleValue()
                 * Math.abs(avgPrice.doubleValue() - plan.stopPrice().doubleValue());
@@ -318,10 +347,15 @@ public final class ExecutionCoordinator {
 
         if (position == null) {
             // Already flat. Any protective order still resting is an orphan by definition, so it goes.
+            // The book is NOT touched: if it still holds the symbol, the exit happened on the
+            // exchange (a stop, a take, a close whose response was lost) and the reconciler's
+            // ghost path is what journals it. Closing the book here erased that exit from the
+            // record the forward verdict is built on (audit 06.09).
             cancelLeftovers(symbol);
-            engine.registerClose(symbol);
             intents.clear(symbol);
-            LOG.info("[Coordinator] " + symbol + " was already flat — cancelled leftover orders");
+            LOG.info("[Coordinator] " + symbol + " was already flat — cancelled leftover orders"
+                    + (engine.book().hasPosition(symbol) ? "; the book keeps it until the reconciler "
+                            + "records the exchange-side exit" : ""));
             return new CloseReport(symbol, true, BigDecimal.ZERO, BigDecimal.ZERO, "already flat");
         }
 
@@ -335,13 +369,48 @@ public final class ExecutionCoordinator {
             // Not a latch. The caller retries with backoff and escalates when the retries are spent;
             // halting here on one 429 stood the scanner down for the life of the process while the
             // second attempt closed the position seconds later (audit 03.09).
-            String note = "reduce-only close was refused (" + e.getMessage()
-                    + ") — the position and its stop are still in place";
+            boolean ambiguous = e instanceof ExchangeException x && x.ambiguous();
+            if (ambiguous && Boolean.TRUE.equals(readFlat(symbol))) {
+                // The send's outcome was never read, but the position is gone: the close executed.
+                // Reported as "refused ... still in place" this told the operator something the code
+                // did not know, and the retry then journaled nothing for a close of ours (audit 06.09).
+                boolean cleaned = cancelLeftovers(symbol);
+                engine.registerClose(symbol);
+                intents.clear(symbol);
+                BigDecimal price = closePriceIfReadable(symbol, requestId);
+                LOG.info("[Coordinator] " + symbol + " close " + requestId + ": the response was lost but "
+                        + "the position is flat — treating it as closed" + (cleaned ? "" : "; leftover orders "
+                        + "await the orphan sweep"));
+                return new CloseReport(symbol, true, held, price,
+                        "closed reduce-only (the response was lost; the position read flat afterwards)"
+                                + (cleaned ? "" : "; leftover orders await the orphan sweep"));
+            }
+            String note = ambiguous
+                    ? "reduce-only close outcome UNKNOWN (" + e.getMessage() + ") — re-read on the retry; "
+                            + "the stop stays until the position is confirmed flat"
+                    : "reduce-only close was refused (" + e.getMessage()
+                            + ") — the position and its stop are still in place";
             LOG.warning("[Coordinator] " + symbol + ": " + note);
             return new CloseReport(symbol, false, BigDecimal.ZERO, BigDecimal.ZERO, note);
         }
 
         BigDecimal residual = held.subtract(close.executedQuantity());
+        if (residual.signum() != 0 && Boolean.TRUE.equals(readFlat(symbol))) {
+            // The ORDER says less than `held` filled, the POSITION says nothing is left: a take or
+            // the stop filled between the read at the top and this send, and the venue trimmed
+            // the reduce-only quantity to what remained. Believing the order here latched the
+            // halt on a "partial close" of a symbol that was flat, and left the book holding it.
+            boolean cleaned = cancelLeftovers(symbol);
+            engine.registerClose(symbol);
+            intents.clear(symbol);
+            LOG.info("[Coordinator] " + symbol + " closed " + close.executedQuantity().toPlainString()
+                    + " of " + held.toPlainString() + " @ " + close.averagePrice().toPlainString()
+                    + "; the remainder had already left through a resting exit"
+                    + (cleaned ? "; protective orders cancelled" : "; protective orders NOT yet cancelled"));
+            return new CloseReport(symbol, true, close.executedQuantity(), close.averagePrice(),
+                    "closed reduce-only; the remainder had already left through a resting exit"
+                            + (cleaned ? "" : "; leftover orders await the orphan sweep"));
+        }
         if (residual.signum() != 0) {
             // Negative means the order under this id reports MORE filled than the position holds:
             // the placer adopted a terminal order from an earlier close under a repeated id, so it
@@ -372,6 +441,27 @@ public final class ExecutionCoordinator {
         return new CloseReport(symbol, true, close.executedQuantity(), close.averagePrice(),
                 cleaned ? "closed reduce-only in full"
                         : "closed reduce-only in full; leftover orders await the orphan sweep");
+    }
+
+    /** The average price of the close under {@code requestId}, or ZERO when it cannot be read. */
+    private BigDecimal closePriceIfReadable(String symbol, String requestId) {
+        try {
+            return port.queryOrder(symbol, ClientOrderIdFactory.create(requestId, OrderPurpose.EMERGENCY_CLOSE, 0))
+                    .map(OrderStatus::averagePrice).orElse(BigDecimal.ZERO);
+        } catch (RuntimeException e) {
+            return BigDecimal.ZERO;
+        }
+    }
+
+    /** @return {@code TRUE} flat, {@code FALSE} still held, {@code null} when the read failed */
+    private Boolean readFlat(String symbol) {
+        try {
+            return port.openPositions().stream().noneMatch(p -> p.symbol().equals(symbol) && !p.isFlat());
+        } catch (RuntimeException e) {
+            LOG.warning("[Coordinator] " + symbol + ": could not re-read the position after the close ("
+                    + e.getMessage() + ")");
+            return null;
+        }
     }
 
     /** @return {@code true} when the symbol's working orders are gone; {@code false} leaves them to the sweep */
@@ -490,7 +580,7 @@ public final class ExecutionCoordinator {
                     alerts.warning("Entry landed despite a lost response",
                             plan.symbol() + ": " + filled.toPlainString() + " @ " + avgPrice.toPlainString()
                                     + " found on the exchange after " + probe + " probe(s); placing its stop.");
-                    return protect(plan, stopRequest, Optional.empty(), filled, avgPrice);
+                    return protect(plan, stopRequest, Optional.empty(), filled, avgPrice, false);
                 }
             }
         } catch (RuntimeException probeFailure) {

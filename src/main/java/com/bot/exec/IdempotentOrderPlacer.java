@@ -11,7 +11,10 @@ import java.util.logging.Logger;
  * Sends orders so a lost response cannot become a second position: query first by the deterministic
  * client order id, treat {@code -4116 DUPLICATED_CLIENT_ORDER_ID} as success and adopt the existing
  * order, probe by id before resending after an ambiguous failure — always with the same id, which
- * keeps the duplicate rejection as the backstop. A definite refusal propagates, never retried.
+ * keeps the duplicate rejection as the backstop. That backstop only exists for orders that REST:
+ * a filled MARKET entry is no longer open, so its id is accepted again and a resend is a second
+ * fill. Such an entry is never resent; its fate is left to the caller's position probe. A definite
+ * refusal propagates, never retried.
  */
 public final class IdempotentOrderPlacer {
 
@@ -96,6 +99,16 @@ public final class IdempotentOrderPlacer {
                     LOG.info("[Placer] " + request.clientOrderId() + " did land despite the failure — adopting it");
                     return landed.get();
                 }
+                if (!resendIsBackstopped(request)) {
+                    // A MARKET entry that filled is no longer OPEN, so its id is accepted again and a
+                    // resend is a second fill, not a duplicate rejection. Three probes that found
+                    // nothing (or could not read) are not proof it never landed: the matching engine
+                    // is slowest under exactly the load that produces -1007. The caller's own
+                    // position probe decides; nothing is sent again.
+                    throw ExchangeException.ambiguous("the fate of " + request.clientOrderId()
+                            + " is unknown after an ambiguous send and a resend could fill twice — "
+                            + "not resending; the position itself must be checked", e);
+                }
             }
         }
         throw ExchangeException.ambiguous(
@@ -141,6 +154,16 @@ public final class IdempotentOrderPlacer {
         }
         throw ExchangeException.neverSent("could not verify " + request.clientOrderId()
                 + " before sending — nothing was sent (" + last.getMessage() + ")", last);
+    }
+
+    /**
+     * Whether {@code -4116} really guards a resend of this request. A resting order (LIMIT, the
+     * conditional types) keeps its id among the OPEN orders, so a second send is rejected as a
+     * duplicate. A reduce-only market close cannot over-close: a flat symbol answers -2022. Only a
+     * non-reducing MARKET entry has no backstop at all once it filled.
+     */
+    static boolean resendIsBackstopped(OrderRequest request) {
+        return request.type() != OrderTypes.OrderType.MARKET || request.isStrictlyReducing();
     }
 
     /** A terminal order older than this is a relic of an earlier process, not this attempt's fill. */

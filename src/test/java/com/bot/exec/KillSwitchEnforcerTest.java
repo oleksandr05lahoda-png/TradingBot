@@ -96,6 +96,32 @@ class KillSwitchEnforcerTest {
     }
 
     @Test
+    @DisplayName("a position already gone when the flatten reaches it is not journaled as a 0 @ 0 close")
+    void alreadyFlatIsNotJournaledAsAClose() throws Exception {
+        openBook("BTCUSDT", "ETHUSDT");
+        tripTheDay(ExecFixtures.NOON);
+
+        // ETH's stop fired a second before enforce() ran: the coordinator reports flat with
+        // nothing closed, and the reconciler's ghost path will journal the real exit.
+        enforcer((symbol, requestId) -> {
+            closed.add(symbol);
+            if (symbol.equals("ETHUSDT")) {
+                return new ExecutionCoordinator.CloseReport(symbol, true,
+                        BigDecimal.ZERO, BigDecimal.ZERO, "already flat");
+            }
+            engine.registerClose(symbol);
+            return new ExecutionCoordinator.CloseReport(symbol, true,
+                    new BigDecimal("0.041"), new BigDecimal("63000"), "closed reduce-only in full");
+        }, KillSwitchEnforcer.Action.FLATTEN).enforce(ExecFixtures.NOON);
+
+        assertEquals(List.of("BTCUSDT"), journaled,
+                "a 'closed 0 @ 0' row would replace the real stop-out in the forward record");
+        assertTrue(alerts.messages.stream().anyMatch(m -> m.contains("Book closed")
+                && m.contains("1 position(s) closed") && m.contains("1 already gone")),
+                alerts.messages.toString());
+    }
+
+    @Test
     @DisplayName("a failed close is retried on the next pass with a fresh request id")
     void failedCloseRetriesNextPass() throws Exception {
         openBook("BTCUSDT");

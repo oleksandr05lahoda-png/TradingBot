@@ -161,6 +161,38 @@ class OperatorChannelTest {
     }
 
     @Test
+    @DisplayName("/resume on an observe venue clears the drift latch but does not promise entries")
+    void resumeInObserveModeDoesNotPromiseEntries() throws Exception {
+        TradingHalt halt = new TradingHalt();
+        halt.halt("reconciliation drift: UNKNOWN_POSITION on XUSDT", NOON);
+        FakeTelegram tg = new FakeTelegram();
+        OperatorChannel ops = new OperatorChannel(tg, "42", halt).withObserveMode(true);
+
+        ops.handleUpdates(update(1, "42", "/resume"));
+
+        assertFalse(halt.isHalted(), "the drift latch itself is the operator's to clear");
+        assertFalse(tg.sent.get(0).contains("Entries resume"), tg.sent.get(0));
+        assertTrue(tg.sent.get(0).contains("REAL_MODE=observe"), tg.sent.get(0));
+        // ...and the loop puts the observe latch back on its next tick.
+        assertTrue(TestnetBot.relatchObserve(halt, true, NOON));
+        assertTrue(halt.reason().orElse("").startsWith(OperatorChannel.OBSERVE_REASON_PREFIX));
+        assertFalse(TestnetBot.relatchObserve(halt, true, NOON), "already latched: nothing to do");
+    }
+
+    @Test
+    @DisplayName("the observe re-latch never overwrites a genuine halt and never fires on a trade venue")
+    void relatchObserveRespectsOtherHalts() {
+        TradingHalt drift = new TradingHalt();
+        drift.halt("reconciliation drift: x", NOON);
+        assertFalse(TestnetBot.relatchObserve(drift, true, NOON));
+        assertEquals("reconciliation drift: x", drift.reason().orElseThrow());
+
+        TradingHalt clear = new TradingHalt();
+        assertFalse(TestnetBot.relatchObserve(clear, false, NOON));
+        assertFalse(clear.isHalted());
+    }
+
+    @Test
     @DisplayName("the channel only exists when Telegram is configured")
     void absentWithoutCredentials() {
         assertEquals(null, OperatorChannel.fromEnvironmentOrNull(k -> null, new TradingHalt()));

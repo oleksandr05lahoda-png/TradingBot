@@ -115,6 +115,59 @@ class DailyLossKillSwitchTest {
     }
 
     @Test
+    @DisplayName("a loser carried in from yesterday that closes today counts only for today's part of its trip")
+    void carriedOverLoserClosingTodayIsCreditedBack() {
+        DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
+        killSwitch.observeBalance(1_000, MORNING);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -10.0, "BBB", -5.0), MORNING);
+
+        // The UTC rollover in-process: what is open now is the new day's zero, per symbol.
+        killSwitch.observeBalance(1_000, NEXT_DAY);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -40.0, "BBB", -20.0), NEXT_DAY);
+        assertFalse(killSwitch.isTripped(NEXT_DAY));
+
+        // AAA is closed by its stop at -50: the exchange's income row carries the WHOLE trip, of
+        // which only -10 happened today. BBB is unchanged.
+        Instant later = NEXT_DAY.plusSeconds(3600);
+        killSwitch.seedRealizedPnl(-50, later);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of("BBB", -20.0), later);
+
+        DailyLossKillSwitch.Status status = killSwitch.evaluate(later);
+        assertEquals(-10.0, status.effectivePnl(), 1e-9,
+                "the -40 that was already lost yesterday re-entered through the realised channel");
+        assertFalse(status.tripped(),
+                "a day that moved -1% must not flatten the book because a 4% loser from yesterday closed");
+    }
+
+    @Test
+    @DisplayName("after a same-day restart the pre-baseline loss IS today's: nothing is credited back")
+    void restartBaselineDoesNotCreditBack() {
+        // A fresh process at noon: the baseline it takes is not a day start, and the realised figure
+        // read from the exchange since midnight is all today's loss.
+        DailyLossKillSwitch afterRestart = new DailyLossKillSwitch(0.03);
+        afterRestart.observeBalance(1_000, MORNING);
+        afterRestart.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -40.0), MORNING);
+        afterRestart.seedRealizedPnl(-50, MORNING.plusSeconds(60));
+        afterRestart.observeOpenUnrealizedPnl(java.util.Map.of(), MORNING.plusSeconds(60));
+
+        DailyLossKillSwitch.Status status = afterRestart.evaluate(MORNING.plusSeconds(60));
+        assertEquals(-50.0, status.effectivePnl(), 1e-9);
+        assertTrue(status.tripped(), "a restart must not become a way to forgive the day's loss");
+    }
+
+    @Test
+    @DisplayName("a symbol opened today has no baseline: its open loss counts in full")
+    void symbolOpenedTodayCountsInFull() {
+        DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
+        killSwitch.observeBalance(1_000, MORNING);
+        killSwitch.observeBalance(1_000, NEXT_DAY);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of(), NEXT_DAY);       // the day starts flat
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of("CCC", -35.0), NEXT_DAY.plusSeconds(60));
+        assertTrue(killSwitch.isTripped(NEXT_DAY.plusSeconds(60)),
+                "the per-symbol baseline must not weaken the open channel for fresh positions");
+    }
+
+    @Test
     @DisplayName("an open winner cannot mask a realised loss")
     void openWinnerCannotOffsetARealisedLoss() {
         DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
@@ -172,5 +225,28 @@ class DailyLossKillSwitchTest {
 
         assertInstanceOf(RiskDecision.Approved.class, engine.evaluate(
                 RiskFixtures.request(Side.LONG, 64_000, 62_800, 3), 9_600, NEXT_DAY));
+    }
+
+    @Test
+    @DisplayName("a baselined symbol that closes and is re-entered the same day starts from zero")
+    void reEnteredSymbolIsNotMeasuredAgainstYesterdaysLoss() {
+        DailyLossKillSwitch killSwitch = new DailyLossKillSwitch(0.03);
+        killSwitch.observeBalance(1_000, MORNING);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -10.0), MORNING);
+        killSwitch.observeBalance(1_000, NEXT_DAY);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of("AAA", -40.0), NEXT_DAY);
+
+        // AAA closes at -50 (of which -10 today), then is re-opened by hand at zero open PnL.
+        Instant later = NEXT_DAY.plusSeconds(3600);
+        killSwitch.seedRealizedPnl(-50, later);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of(), later);
+        assertEquals(-10.0, killSwitch.evaluate(later).effectivePnl(), 1e-9);
+
+        Instant reEntered = NEXT_DAY.plusSeconds(7200);
+        killSwitch.observeOpenUnrealizedPnl(java.util.Map.of("AAA", 0.0), reEntered);
+        DailyLossKillSwitch.Status status = killSwitch.evaluate(reEntered);
+        assertEquals(-10.0, status.effectivePnl(), 1e-9,
+                "the fresh position has no pre-day part; the credit for the closed one stays");
+        assertFalse(status.tripped());
     }
 }

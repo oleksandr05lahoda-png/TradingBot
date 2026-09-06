@@ -144,4 +144,25 @@ class RateLimiterTest {
         time.nowMs.addAndGet(2_000);
         assertEquals(0, limiter.usedWeight(time.nowMs.get()), "the whole burst is now older than a minute");
     }
+
+    @Test
+    @DisplayName("a budget exceeded by the exchange's header alone waits once, not in thousands of 1 ms sleeps")
+    void headerOnlyOverrunWaitsInOneSleep() throws Exception {
+        FakeTime time = new FakeTime();
+        java.util.List<Long> sleeps = new java.util.ArrayList<>();
+        RateLimiter limiter = new RateLimiter(2_400, 300, 1_200, time.nowMs::get, millis -> {
+            sleeps.add(millis);
+            time.nowMs.addAndGet(millis);
+        });
+
+        // Another process on this IP spent the whole budget; this limiter's own window is empty.
+        limiter.observeUsedWeight(2_399);
+        limiter.acquire(5, false);
+
+        // acquire() sleeps in 5 s chunks, so a minute is a dozen sleeps - not sixty thousand 1 ms ones.
+        assertTrue(sleeps.size() <= 20, "expected a handful of sleeps, got " + sleeps.size());
+        assertTrue(sleeps.stream().allMatch(ms -> ms >= 50L), "a 1 ms sleep is the spin: " + sleeps);
+        long untilBoundary = 60_000L - (1_000_000L % 60_000L);
+        assertTrue(time.nowMs.get() - 1_000_000L >= untilBoundary, "did not wait for the minute boundary");
+    }
 }

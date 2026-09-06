@@ -58,6 +58,8 @@ public final class OperatorChannel implements AutoCloseable {
     private volatile long startedAtEpochSec;
     private volatile String venueTag = "";
     private volatile com.bot.exec.AlertSink alerts;
+    /** REAL_MODE=observe: /resume may clear a drift latch, but entries stay off and the loop re-latches. */
+    private volatile boolean observeMode;
     private final java.util.concurrent.ConcurrentLinkedQueue<CloseRequest> closes =
             new java.util.concurrent.ConcurrentLinkedQueue<>();
     private int pollFailures;
@@ -72,6 +74,12 @@ public final class OperatorChannel implements AutoCloseable {
     /** Replies carry the venue, because demo and real share one chat and may share one token. */
     public OperatorChannel withVenueTag(String tag) {
         this.venueTag = tag == null ? "" : tag;
+        return this;
+    }
+
+    /** Tells /resume not to promise entries on a venue whose mode forbids them. */
+    public OperatorChannel withObserveMode(boolean on) {
+        this.observeMode = on;
         return this;
     }
 
@@ -224,6 +232,11 @@ public final class OperatorChannel implements AutoCloseable {
                             + "environment and restart to enable entries.";
                 }
                 halt.clear();
+                if (observeMode) {
+                    // The loop re-latches observe on its next tick; promising entries here was a lie.
+                    return "halt cleared. It was: " + was + "\nThe venue stays in REAL_MODE=observe: "
+                            + "entries remain OFF and the observe latch returns on the next tick.";
+                }
                 return "halt cleared. It was: " + was + "\nEntries resume at the next signal; the "
                         + "scanner proposes entries again on its next hourly pass (its exits were "
                         + "never stopped by the halt).";

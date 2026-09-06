@@ -147,4 +147,66 @@ class AlertSinkTest {
         assertEquals(1, logged.size(), "the log floor dropped the alert: " + logged);
         assertEquals(Level.SEVERE, logged.get(0).getLevel());
     }
+
+    // --- Delivery, driven through the Sender seam ---------------------------------------------
+
+    /** Records every send; answers with the scripted statuses in order, then 200. */
+    private static final class ScriptedSender implements AlertSink.Telegram.Sender {
+        final List<String> texts = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final java.util.ArrayDeque<AlertSink.Telegram.SendResult> script = new java.util.ArrayDeque<>();
+        long blockMs = 0;
+
+        @Override public AlertSink.Telegram.SendResult send(String chatId, String text) throws InterruptedException {
+            if (blockMs > 0) Thread.sleep(blockMs);
+            texts.add(text);
+            AlertSink.Telegram.SendResult next = script.poll();
+            return next == null ? new AlertSink.Telegram.SendResult(200, "{\"ok\":true}") : next;
+        }
+    }
+
+    @Test
+    @DisplayName("flush waits for an alert that is in flight, not only for one still queued")
+    void flushWaitsForAnInFlightDelivery() {
+        ScriptedSender sender = new ScriptedSender();
+        sender.blockMs = 300;
+        AlertSink.Telegram telegram = new AlertSink.Telegram("not-a-real-token", "42", sender);
+
+        telegram.alert(AlertSink.Severity.CRITICAL, "Reconciliation drift", "why the bot halted");
+        telegram.flush(5_000L);
+
+        assertEquals(1, sender.texts.size(),
+                "the shutdown hook returned while the POST was still running, and the JVM killed it");
+    }
+
+    @Test
+    @DisplayName("flood control (429) is waited out and retried, not blamed on the credentials")
+    void floodControlIsRetried() {
+        ScriptedSender sender = new ScriptedSender();
+        sender.script.add(new AlertSink.Telegram.SendResult(429,
+                "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":1}}"));
+        AlertSink.Telegram telegram = new AlertSink.Telegram("not-a-real-token", "42", sender);
+
+        telegram.alert(AlertSink.Severity.INFO, "Bot is up", "proof of life");
+        telegram.flush(10_000L);
+
+        assertEquals(2, sender.texts.size(), "one refused by flood control, one delivered");
+        assertTrue(logged.stream().noneMatch(r -> r.getMessage().contains("check TELEGRAM")),
+                "flood control is not a credentials problem: " + logged);
+    }
+
+    @Test
+    @DisplayName("a message over Telegram's 4096 chars is cut, not refused with a 400")
+    void oversizedMessageIsTruncated() {
+        ScriptedSender sender = new ScriptedSender();
+        AlertSink.Telegram telegram = new AlertSink.Telegram("not-a-real-token", "42", sender);
+
+        telegram.alert(AlertSink.Severity.WARNING, "Reconciliation drift", "x".repeat(6_000));
+        telegram.flush(5_000L);
+
+        assertEquals(1, sender.texts.size());
+        assertTrue(sender.texts.get(0).length() <= AlertSink.Telegram.MAX_TEXT_CHARS, "" + sender.texts.get(0).length());
+        assertTrue(sender.texts.get(0).startsWith("⚠ Reconciliation drift"), "the title must survive the cut");
+        assertEquals(1_000L, AlertSink.Telegram.retryAfterMillis("no such field"));
+        assertEquals(3_000L, AlertSink.Telegram.retryAfterMillis("{\"parameters\":{\"retry_after\": 3}}"));
+    }
 }

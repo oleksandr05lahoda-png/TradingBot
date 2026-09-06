@@ -45,6 +45,9 @@ public final class RiskEngine {
      */
     private volatile double lotRoundUpTolerance = 0.0;
 
+    /** MIN_NOTIONAL is judged at the exchange's mark, not the signal's last: the margin allowed between them. */
+    static final double MIN_NOTIONAL_CUSHION = 0.01;
+
     public RiskEngine withLotRoundUpTolerance(double tolerance) {
         Preconditions.inClosedRange(tolerance, 0.0, 1.0, "lotRoundUpTolerance");
         this.lotRoundUpTolerance = tolerance;
@@ -74,6 +77,14 @@ public final class RiskEngine {
         DailyLossKillSwitch.Status halt = killSwitch.evaluate(now);
         if (halt.tripped()) {
             return RiskDecision.reject(RejectReason.TRADING_HALTED, halt.reason());
+        }
+        if (halt.confirming()) {
+            // The confirmation window exists so one mark wick cannot FLATTEN the book; it was never
+            // meant to re-open the entry gate on a day already past the limit. Entries approved in
+            // those 20 s were filled, protected and market-closed by the next pass (audit 06.09).
+            return RiskDecision.reject(RejectReason.TRADING_HALTED, String.format(
+                    "daily loss limit breached (%.2f%% of $%.2f); the flatten is confirming, entries are off",
+                    halt.drawdownFraction() * 100, halt.dayStartBalance()));
         }
 
         // 3 ─ Leverage. RiskConfig cannot exceed RiskConstants.MAX_LEVERAGE, so this covers both.
@@ -178,15 +189,26 @@ public final class RiskEngine {
         //      The tolerance is the operator's dial; the 1% hard cap binds regardless. Off at 0.
         double budgetOverrunAllowed = 0.0;
         double tolerance = lotRoundUpTolerance;
+        // Binance evaluates MIN_NOTIONAL for a MARKET order at the MARK price, and the signal price
+        // is the scanner's LAST: a size rounded to exactly $5.00 at last was refused with -4164
+        // whenever mark sat a fraction below, which is about half the time (audit 06.09; backlog
+        // 03.09 "MIN_NOTIONAL by mark"). The minimum is therefore measured at a price one percent
+        // below the signal, roughly twice the usual mark-last basis.
+        double floorPrice = entry * (1 - MIN_NOTIONAL_CUSHION);
+        BigDecimal floorTick = BigDecimal.valueOf(floorPrice);
         boolean refusedAsIs = quantity.signum() <= 0 || !filters.isQuantityInRange(quantity, true)
-                || !filters.meetsMinNotional(entryTick, quantity);
+                || !filters.meetsMinNotional(floorTick, quantity);
         if (tolerance > 0 && refusedAsIs) {
-            BigDecimal minimum = filters.smallestTradableQuantity(entry).max(quantity.add(filters.stepSize()));
+            BigDecimal minimum = filters.smallestTradableQuantity(floorPrice).max(quantity.add(filters.stepSize()));
             double riskAtMinimum = PositionSizer.riskUsd(minimum.doubleValue(), entry, stopPrice);
             boolean withinTolerance = riskAtMinimum <= budgetedRiskUsd * (1 + tolerance) + 1e-9
                     && riskAtMinimum / balanceUsd <= RiskConstants.MAX_RISK_FRACTION_PER_TRADE + 1e-12;
-            if (withinTolerance && filters.isQuantityInRange(minimum, true)
-                    && filters.meetsMinNotional(entryTick, minimum)) {
+            // The round-up lifts a size the stop made too small, never one a cap (per trade, side
+            // headroom, margin, lot) clipped: step 10 re-checks margin only, so without this the
+            // book could end one minimum notional above the configured exposure cap.
+            boolean withinCaps = minimum.doubleValue() * entry <= notionalCap + 1e-9;
+            if (withinTolerance && withinCaps && filters.isQuantityInRange(minimum, true)
+                    && filters.meetsMinNotional(floorTick, minimum)) {
                 long steps = minimum.subtract(quantity).divide(filters.stepSize(), 0, RoundingMode.HALF_UP).longValue();
                 quantity = minimum;
                 budgetOverrunAllowed = tolerance;
@@ -209,10 +231,12 @@ public final class RiskEngine {
                             100.0 * Math.abs(entry - stopPrice) / entry, balanceNeeded,
                             effectiveRiskFraction * 100));
         }
-        if (!filters.meetsMinNotional(entryTick, quantity)) {
+        if (!filters.meetsMinNotional(floorTick, quantity)) {
             return RiskDecision.reject(RejectReason.BELOW_MIN_NOTIONAL,
-                    String.format("notional $%.4f is below the exchange minimum $%s",
-                            quantity.doubleValue() * entry, filters.minNotional().toPlainString()));
+                    String.format("notional $%.4f is below the exchange minimum $%s (measured %.0f%% under "
+                                    + "the signal price, where the exchange's mark may sit)",
+                            quantity.doubleValue() * entry, filters.minNotional().toPlainString(),
+                            MIN_NOTIONAL_CUSHION * 100));
         }
 
         // 10 ─ Everything from here is computed from the FINAL quantity, never the intended one.

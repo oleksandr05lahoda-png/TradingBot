@@ -9,6 +9,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -218,5 +219,30 @@ class CoordinatorFailurePathsTest {
         exchange.cancelFailure = ExchangeException.refused("service unavailable", 500, 0);
         assertFalse(placer.cancelQuietly("BTCUSDT", "bt-e0-nothing-here"),
                 "a failed cancel must not read as a successful one — the order may still be live");
+    }
+
+    @Test
+    @DisplayName("an entry in a state this build cannot read keeps its intent: unknown is not absent")
+    void unknownEntryStateKeepsTheIntent() throws Exception {
+        DelegatingExchange unreadable = new DelegatingExchange() {
+            @Override public Optional<OrderStatus> queryOrder(String symbol, String clientOrderId) {
+                return delegate.queryOrder(symbol, clientOrderId).map(o -> new OrderStatus(
+                        o.clientOrderId(), o.exchangeOrderId(), o.symbol(), OrderTypes.OrderState.UNKNOWN,
+                        o.type(), o.originalQuantity(), BigDecimal.ZERO, BigDecimal.ZERO, o.stopPrice(),
+                        o.reduceOnly(), o.closePosition(), o.updateTimeMs()));
+            }
+        };
+        ExecutionCoordinator.Settings limit = new ExecutionCoordinator.Settings(
+                OrderTypes.OrderType.LIMIT, OrderTypes.TimeInForce.GTC, 2, 500, 0.20);
+        ExecutionCoordinator coordinator = new ExecutionCoordinator(unreadable, engine,
+                new IdempotentOrderPlacer(unreadable, 3, 2, 0, ExecFixtures.NO_SLEEP), halt, alerts,
+                limit, ExecFixtures.CLOCK, ExecFixtures.NO_SLEEP);
+
+        ExecutionCoordinator.Report report = coordinator.execute(plan());
+
+        assertEquals(ExecutionCoordinator.Outcome.NOT_FILLED, report.outcome(), report.note());
+        assertTrue(coordinator.intents().get("BTCUSDT", ExecFixtures.NOON.toEpochMilli()).isPresent(),
+                "an order whose state cannot be read may still be live; its intent must outlive the report");
+        assertFalse(engine.book().hasPosition("BTCUSDT"));
     }
 }

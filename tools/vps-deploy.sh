@@ -58,8 +58,11 @@ fi
 [ -f "$ENV_FILE" ] || die "$ENV_FILE does not exist. Create it first - see VPS_SETUP.md
     step 4 - with the keys and the strategy settings, then run this again."
 chmod 600 "$ENV_FILE"
-grep -q '^BINANCE_REAL_API_KEY=.\+' "$ENV_FILE" \
-    || die "BINANCE_REAL_API_KEY is empty in $ENV_FILE. Nothing was started."
+# Whitespace and CR stripped first: on a CRLF file `.\+` matched the bare carriage return, an
+# EMPTY key passed, and the running container was stopped for one that refused to boot.
+key=$(grep -E '^BINANCE_REAL_API_KEY=' "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+[ -n "$key" ] || die "BINANCE_REAL_API_KEY is empty in $ENV_FILE. Nothing was started."
+unset key
 
 # The venue gate is fail-closed in the container too, but say plainly here what this run
 # is about to become - the operator should never learn it from the exchange.

@@ -155,4 +155,39 @@ class LimitEntryIntentTest {
         assertFalse(halt.isHalted());
         assertEquals(0, engine.book().openCount());
     }
+
+    @Test
+    @DisplayName("a partial fill whose remainder cannot be cancelled keeps its intent until the reconciler cancels it")
+    void partialFillWithRestingRemainderKeepsTheIntent() throws Exception {
+        ExecutionCoordinator coordinator = coordinator();
+        reconciler.withEntryIntents(coordinator.intents());
+        TradePlan plan = ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT"));
+        exchange.limitFillRatio = 0.5;
+        exchange.cancelFailure = ExchangeException.refused("service unavailable", 500, 0);
+
+        ExecutionCoordinator.Report report = coordinator.execute(plan);
+        String entryId = report.entryOrder().orElseThrow().clientOrderId();
+
+        assertTrue(report.opened(), report.note());
+        assertTrue(engine.book().hasPosition("BTCUSDT"), "the filled half is protected and booked");
+        assertTrue(exchange.order(entryId).orElseThrow().isWorking(), "the remainder still rests");
+        assertTrue(coordinator.intents().get("BTCUSDT", ExecFixtures.NOON.toEpochMilli()).isPresent(),
+                "the remainder can still fill onto a held symbol: the intent must stay");
+        assertTrue(alerts.sawWarning("Entry remainder still resting"), alerts.messages.toString());
+
+        // A second entry on the symbol is refused while the first is unresolved.
+        ExecutionCoordinator.Report again = coordinator.execute(plan);
+        assertEquals(ExecutionCoordinator.Outcome.REFUSED, again.outcome(), again.note());
+        assertTrue(again.note().contains("unresolved"), again.note());
+
+        // The reconciler cancels the remainder once it is out of grace, then spends the intent.
+        exchange.cancelFailure = null;
+        exchange.ageOrder(entryId, 120_000L);
+        reconciler.reconcile(ExecFixtures.NOON);
+        assertFalse(exchange.order(entryId).orElseThrow().isWorking(), "the remainder must be cancelled");
+        reconciler.reconcile(ExecFixtures.NOON.plusSeconds(30));
+        assertTrue(coordinator.intents().get("BTCUSDT", ExecFixtures.NOON.toEpochMilli()).isEmpty(),
+                "nothing of ours rests any more: the intent is spent");
+        assertFalse(halt.isHalted());
+    }
 }

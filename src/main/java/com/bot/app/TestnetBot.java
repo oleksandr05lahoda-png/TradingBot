@@ -73,6 +73,10 @@ public final class TestnetBot {
     private static final long SHUTDOWN_GRACE_MS = 40_000L;
     /** The one halt reason the loop may lift by itself, once a converged pass contradicts it. */
     private static final String BOOT_READ_HALT_PREFIX = "boot could not read the exchange: ";
+    /** The observe latch's reason; the scanner recognises the prefix and stands down on closes too. */
+    static final String OBSERVE_HALT_REASON = OperatorChannel.OBSERVE_REASON_PREFIX
+            + " - reading the account, accepting closes, opening nothing. Set REAL_MODE=trade "
+            + "and restart to enable entries.";
 
     /** A close that did not confirm flat, waiting for its next attempt. */
     private record PendingClose(CloseRequest close, int attempts, long notBeforeMs) {}
@@ -171,6 +175,7 @@ public final class TestnetBot {
         // Observe is enforced here, on every signal, independent of any latch: the latch below
         // exists so the scanner stands down, but a latch can be cleared and a mode cannot.
         final boolean observeOnly = venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE;
+        if (operator != null) operator.withObserveMode(observeOnly);
 
         // The raw material for honest learning: one JSONL row per event, on the volume.
         TradeJournal journal = TradeJournal.fromEnvironmentOrNull();
@@ -222,13 +227,19 @@ public final class TestnetBot {
             // measured with an invalid key on 20.08.
             boolean bootstrapped;
             int bootAttempts = 0;
+            // The journal appends unconditionally: a retry of this loop after a failure further
+            // down must not write the same exchange-exit rows a second time (audit 06.09).
+            boolean exitsJournaled = false;
             while (true) {
                 try {
                     // One 5xx or timeout here used to leave the book empty for the life of the process
                     // and every later pass flagging UNKNOWN_POSITION. Three tries, then the loop retries
                     // adoption itself after its first successful reconcile.
                     List<PositionSnapshot> live = readPositionsWithRetry(port, 3);
-                    journalExitsWhileDown(journal, port, live, ledgerPath);
+                    if (!exitsJournaled) {
+                        journalExitsWhileDown(journal, port, live, ledgerPath);
+                        exitsJournaled = true;
+                    }
                     int seeded = BookLedger.seed(engine.book(), live, ledgerPath);
                     if (seeded > 0) {
                         LOG.info("[Boot] re-armed " + seeded + " position(s) with recorded stop ids from " + ledgerPath);
@@ -283,10 +294,10 @@ public final class TestnetBot {
             // reconciliation keep working, only an operator restart with REAL_MODE=trade clears it.
             // Latched AFTER bootstrap (a clean observe boot is not a failed reconcile) and only if
             // no genuine halt holds the latch — a drift reason must not be overwritten by it.
-            if (venue.isReal() && venue.realMode() == BinanceVenue.RealMode.OBSERVE
-                    && !halt.isHalted()) {
-                halt.halt("REAL_MODE=observe — reading the account, accepting closes, opening "
-                        + "nothing. Set REAL_MODE=trade and restart to enable entries.", Instant.now());
+            // When a genuine halt does hold it, the loop re-latches observe the moment that halt
+            // is cleared: without that the scanner read the cleared halt as a trading bot and drove
+            // closes into a read-only account (audit 06.09).
+            if (relatchObserve(halt, observeOnly, Instant.now())) {
                 alerts.warning("Real venue in OBSERVE mode",
                         "the bot reads the account and accepts closes; no position will be opened");
             }
@@ -514,6 +525,12 @@ public final class TestnetBot {
                             halt.clearIfReasonStartsWith(BOOT_READ_HALT_PREFIX,
                                     "the exchange answered and the book converged");
                         }
+                        // Observe is an invariant, not a one-shot: whatever cleared the halt (the
+                        // line above, an operator /resume), the venue mode is still read-only.
+                        if (relatchObserve(halt, observeOnly, Instant.now())) {
+                            alerts.warning("Real venue in OBSERVE mode",
+                                    "re-latched after another halt was cleared; entries stay off");
+                        }
                         if (!adoptionDone) {
                             // The boot read failed; the book was realigned from the exchange but
                             // carries no stop ids. Read them back now that the exchange answers.
@@ -680,6 +697,18 @@ public final class TestnetBot {
             journal.exchangeExit(gone.symbol(), "closed while the process was down; ledger side "
                     + gone.side(), gone.stopId(), state, price, qty, true);
         }
+    }
+
+    /**
+     * Puts the observe latch back whenever the venue is observe-only and nothing else holds the
+     * halt. A drift or boot-read reason is never overwritten; the latch returns once it is gone.
+     *
+     * @return {@code true} when this call latched it (the caller alerts once per latch)
+     */
+    static boolean relatchObserve(TradingHalt halt, boolean observeOnly, Instant now) {
+        if (!observeOnly || halt.isHalted()) return false;
+        halt.halt(OBSERVE_HALT_REASON, now);
+        return true;
     }
 
     private static List<PositionSnapshot> readPositionsWithRetry(ExchangePort port, int attempts)
@@ -849,6 +878,13 @@ public final class TestnetBot {
                                     report.averageFillPrice().toPlainString(),
                                     report.filledQuantity().toPlainString(),
                                     report.outcome().name(), report.note());
+                        } else if (journal != null
+                                && report.outcome() == ExecutionCoordinator.Outcome.REFUSED) {
+                            // Refused by the EXCHANGE (a -4164 at mark, a validator refusal): the
+                            // scanner rests a coin only on a journaled refusal, so without this row
+                            // the same unplaceable line was re-proposed and refused every hour.
+                            journal.entryRejected(signal.id(), signal.symbol(),
+                                    "EXCHANGE_REFUSED: " + report.note());
                         }
                         signals.onRejected(signal, report.outcome() + ": " + report.note());
                     }

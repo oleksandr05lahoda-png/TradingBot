@@ -79,8 +79,20 @@ public final class RateLimiter {
             return bannedUntilMs - now;
         }
         long waitMs = 0;
-        if (usedWeight(now) + weight > weightPerMinute) {
+        int local = sum(weightWindow, now, 60_000L);
+        if (local + weight > weightPerMinute) {
             waitMs = Math.max(waitMs, millisUntilRoomInWindow(weightWindow, now, 60_000L));
+        }
+        boolean headerFresh = exchangeReportedAtMs > 0 && now - exchangeReportedAtMs < 60_000L;
+        if (headerFresh && exchangeReportedWeight + weight > weightPerMinute) {
+            // The exchange's own tally is what exceeds the budget (a shared IP: the scanner runs in
+            // the same container) while the local window may be empty. Asking the local window
+            // answered 1 ms, and acquire() spun in 1 ms sleeps for up to a minute (audit 06.09).
+            // Binance's used-weight window resets on the fixed minute boundary, so the wait is the
+            // earlier of that boundary and the header's own expiry - never less than 50 ms.
+            long untilBoundary = 60_000L - (now % 60_000L);
+            long untilStale = exchangeReportedAtMs + 60_000L - now;
+            waitMs = Math.max(waitMs, Math.max(50L, Math.min(untilBoundary, untilStale) + 1));
         }
         if (isOrder) {
             if (count(orderWindow, now, 10_000L) + 1 > ordersPer10s) {

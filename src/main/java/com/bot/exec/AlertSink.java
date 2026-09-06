@@ -71,7 +71,27 @@ public interface AlertSink {
         /** WARNING and CRITICAL get two more tries; the alert path is what replaces the log nobody reads. */
         private static final int RETRIES_FOR_SERIOUS = 3;
 
-        private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+        /** Telegram refuses a text longer than this with HTTP 400; a summary over 12 symbols reached it. */
+        static final int MAX_TEXT_CHARS = 4096;
+
+        /** What one HTTP send came back with; the body carries {@code retry_after} on a 429. */
+        record SendResult(int status, String body) {}
+
+        /** The transport, so a test can drive delivery without a network. */
+        interface Sender {
+            SendResult send(String chatId, String text) throws IOException, InterruptedException;
+        }
+
+        private final Sender sender;
+        /**
+         * Alerts accepted and not yet delivered, in flight included. The outbox alone lied to
+         * {@link #flush}: the worker takes an item BEFORE delivering it, so a CRITICAL in the middle
+         * of its HTTP send (or a retry sleep) left the queue empty and the shutdown hook returned at
+         * once, and the JVM killed the daemon mid-POST (audit 06.09).
+         */
+        private final java.util.concurrent.atomic.AtomicInteger pending =
+                new java.util.concurrent.atomic.AtomicInteger();
+        private volatile boolean shuttingDown;
 
         /**
          * Delivery runs on its own thread. Every caller is the loop thread — the one that executes
@@ -83,13 +103,44 @@ public interface AlertSink {
                 new java.util.concurrent.LinkedBlockingQueue<>(256);
 
         private Telegram(String token, String chatId) {
+            this(token, chatId, new HttpSender(token));
+        }
+
+        /** Package-private: the seam a test uses to stand in for Telegram itself. */
+        Telegram(String token, String chatId, Sender sender) {
             this.token = token;
             this.chatId = chatId;
+            this.sender = Preconditions.notNull(sender, "sender");
             Thread worker = new Thread(this::drainForever, "telegram-alerts");
             worker.setDaemon(true);
             worker.start();
-            // A shutdown must not lose the last CRITICAL: give the outbox a bounded moment.
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> flush(5_000L), "telegram-alerts-flush"));
+            // A shutdown must not lose the last CRITICAL: give the outbox a bounded moment. The
+            // flag makes deliver() skip its retry sleeps, so the wait is spent sending, not sleeping.
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                shuttingDown = true;
+                flush(10_000L);
+            }, "telegram-alerts-flush"));
+        }
+
+        /** The real transport: one POST to the Bot API. */
+        private static final class HttpSender implements Sender {
+            private final String token;
+            private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+
+            HttpSender(String token) { this.token = token; }
+
+            @Override public SendResult send(String chatId, String text) throws IOException, InterruptedException {
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create("https://api.telegram.org/bot" + token + "/sendMessage"))
+                        .timeout(Duration.ofSeconds(8))
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .POST(HttpRequest.BodyPublishers.ofString(
+                                "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
+                                        + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8)))
+                        .build();
+                HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+                return new SendResult(response.statusCode(), response.body());
+            }
         }
 
         private void drainForever() {
@@ -104,10 +155,10 @@ public interface AlertSink {
             }
         }
 
-        /** Waits until the outbox is empty or the deadline passes; for shutdown and tests. */
+        /** Waits until every accepted alert is delivered (or given up) or the deadline passes. */
         void flush(long maxWaitMs) {
             long deadline = System.currentTimeMillis() + maxWaitMs;
-            while (!outbox.isEmpty() && System.currentTimeMillis() < deadline) {
+            while (pending.get() > 0 && System.currentTimeMillis() < deadline) {
                 try {
                     Thread.sleep(50L);
                 } catch (InterruptedException e) {
@@ -165,9 +216,40 @@ public interface AlertSink {
         }
 
         @Override public void alert(Severity severity, String title, String message) {
-            if (!outbox.offer(() -> deliver(severity, title, message))) {
+            // Counted before the offer so flush() can never observe "nothing pending" between the
+            // offer and the increment; a refused offer takes the count back.
+            pending.incrementAndGet();
+            Runnable job = () -> {
+                try {
+                    deliver(severity, title, message);
+                } finally {
+                    pending.decrementAndGet();
+                }
+            };
+            if (!outbox.offer(job)) {
+                pending.decrementAndGet();
                 LOG.warning("Telegram outbox is full — alert dropped (still in this log): " + title);
             }
+        }
+
+        /** Telegram's flood control names its own wait: {@code "parameters":{"retry_after":N}}. */
+        static long retryAfterMillis(String body) {
+            if (body == null) return 1_000L;
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"retry_after\"\\s*:\\s*(\\d+)").matcher(body);
+            if (!m.find()) return 1_000L;
+            try {
+                return Math.max(1_000L, Math.min(30_000L, Long.parseLong(m.group(1)) * 1_000L));
+            } catch (NumberFormatException e) {
+                return 1_000L;
+            }
+        }
+
+        /** Keeps the head of an oversized message: the title and the first lines say what happened. */
+        static String truncate(String text) {
+            if (text.length() <= MAX_TEXT_CHARS) return text;
+            String marker = "\n[... truncated; the full text is in the log]";
+            return text.substring(0, MAX_TEXT_CHARS - marker.length()) + marker;
         }
 
         private void deliver(Severity severity, String title, String message) {
@@ -178,27 +260,40 @@ public interface AlertSink {
             } + title + "\n" + message;
             // One dropped packet used to lose the message outright, and the only record of a lost
             // CRITICAL was the log the alert exists to replace. Serious alerts get three tries.
+            text = truncate(text);
             int attempts = severity == Severity.INFO ? 1 : RETRIES_FOR_SERIOUS;
+            boolean floodRetried = false;
             for (int attempt = 1; attempt <= attempts; attempt++) {
                 try {
-                    HttpRequest request = HttpRequest.newBuilder()
-                            .uri(URI.create("https://api.telegram.org/bot" + token + "/sendMessage"))
-                            .timeout(Duration.ofSeconds(8))
-                            .header("Content-Type", "application/x-www-form-urlencoded")
-                            .POST(HttpRequest.BodyPublishers.ofString(
-                                    "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
-                                            + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8)))
-                            .build();
-                    HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-                    if (response.statusCode() / 100 == 2) return;
-                    // 4xx is the chat id or the token — retrying cannot fix it, and a rotated token
-                    // must not cost three timeouts for every alert.
-                    if (response.statusCode() / 100 == 4) {
-                        LOG.warning("Telegram alert REFUSED, HTTP " + response.statusCode()
-                                + " — check TELEGRAM_CHAT_ID and TELEGRAM_BOT_TOKEN");
+                    SendResult response = sender.send(chatId, text);
+                    int status = response.status();
+                    if (status / 100 == 2) return;
+                    // Flood control is a 4xx too, but it names its own wait and is not the
+                    // credentials: a burst at boot used to drop the CRITICAL among six alerts with
+                    // a line blaming the token (audit 06.09). One extra try even for INFO.
+                    if (status == 429) {
+                        if (shuttingDown) return;
+                        long wait = retryAfterMillis(response.body());
+                        if (!floodRetried) {
+                            floodRetried = true;
+                            attempts = Math.max(attempts, attempt + 1);
+                        }
+                        LOG.warning("Telegram flood control, waiting " + wait + " ms (attempt "
+                                + attempt + "/" + attempts + ")");
+                        Thread.sleep(wait);
+                        continue;
+                    }
+                    // 401/403/404 are the chat id or the token - retrying cannot fix it, and a
+                    // rotated token must not cost three timeouts for every alert. Any other 4xx
+                    // names its own reason in the body.
+                    if (status / 100 == 4) {
+                        LOG.warning("Telegram alert REFUSED, HTTP " + status
+                                + (status == 401 || status == 403 || status == 404
+                                        ? " — check TELEGRAM_CHAT_ID and TELEGRAM_BOT_TOKEN"
+                                        : " — " + redact(String.valueOf(response.body()))));
                         return;
                     }
-                    LOG.warning("Telegram alert not delivered, HTTP " + response.statusCode()
+                    LOG.warning("Telegram alert not delivered, HTTP " + status
                             + " (attempt " + attempt + "/" + attempts + ")");
                 } catch (IOException e) {
                     LOG.warning("Telegram alert not delivered: " + redact(String.valueOf(e.getMessage()))
@@ -212,6 +307,8 @@ public interface AlertSink {
                     return;
                 }
                 if (attempt < attempts) {
+                    // The shutdown hook is waiting on this thread: send again at once or give up.
+                    if (shuttingDown) continue;
                     try {
                         Thread.sleep(2000L * attempt);
                     } catch (InterruptedException e) {

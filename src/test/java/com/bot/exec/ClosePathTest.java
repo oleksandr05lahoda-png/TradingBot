@@ -1,5 +1,6 @@
 package com.bot.exec;
 
+import com.bot.exec.ExchangeSnapshots.OrderStatus;
 import com.bot.risk.RiskEngine;
 import com.bot.risk.TradePlan;
 import org.junit.jupiter.api.DisplayName;
@@ -62,6 +63,64 @@ class ClosePathTest {
         assertEquals(0, report.closedQuantity().compareTo(BigDecimal.ZERO));
         assertFalse(exchange.order(stopId).orElseThrow().isWorking(),
                 "orders left behind by a position that no longer exists are unmanaged risk");
+    }
+
+    @Test
+    @DisplayName("an already-flat close leaves the book entry for the reconciler, which journals the exchange-side exit")
+    void alreadyFlatLeavesTheExitToTheReconciler() throws Exception {
+        openOne();
+        exchange.clearPosition("BTCUSDT");   // the stop fired, or a close whose response was lost filled
+
+        ExecutionCoordinator.CloseReport report = coordinator().closeOut("BTCUSDT", "close-7");
+
+        assertTrue(report.flat());
+        assertTrue(engine.book().hasPosition("BTCUSDT"),
+                "closing the book here erased the exit from the journal: no 'close' row (nothing "
+                        + "filled) and no ghost for the reconciler to record either");
+
+        java.util.List<String> exits = new java.util.ArrayList<>();
+        Reconciler reconciler = new Reconciler(exchange, engine, halt, alerts,
+                new IdempotentOrderPlacer(exchange, 1, 1, 0, ExecFixtures.NO_SLEEP));
+        reconciler.onExchangeExit((symbol, detail) -> exits.add(symbol));
+        reconciler.reconcile(ExecFixtures.NOON);
+
+        assertEquals(java.util.List.of("BTCUSDT"), exits, "the exit must reach the journal once");
+        assertFalse(engine.book().hasPosition("BTCUSDT"));
+        assertFalse(halt.isHalted());
+    }
+
+    @Test
+    @DisplayName("a take filling between the read and the send trims the reduce-only close: flat, not a partial-close halt")
+    void trimmedCloseAfterATakeIsAFullClose() throws Exception {
+        DelegatingExchange venue = new DelegatingExchange() {
+            @Override public OrderStatus placeOrder(OrderRequest request) {
+                if (request.purpose() != com.bot.exec.OrderTypes.OrderPurpose.EMERGENCY_CLOSE) {
+                    return delegate.placeOrder(request);
+                }
+                // The take leg filled the whole position a second before this send. Binance trims
+                // a reduce-only market order to what is left, which is nothing: no error, a
+                // response with executedQty 0 against a symbol that is now flat.
+                delegate.clearPosition(request.symbol());
+                return new OrderStatus(request.clientOrderId(), 99L, request.symbol(),
+                        com.bot.exec.OrderTypes.OrderState.EXPIRED, com.bot.exec.OrderTypes.OrderType.MARKET,
+                        request.quantity(), BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
+                        true, false, delegate.serverTimeMillis());
+            }
+        };
+        ExecutionCoordinator coordinator = new ExecutionCoordinator(venue, engine,
+                new IdempotentOrderPlacer(venue, 3, 2, 0, ExecFixtures.NO_SLEEP), halt, alerts,
+                ExecutionCoordinator.Settings.defaults(), ExecFixtures.CLOCK, ExecFixtures.NO_SLEEP);
+        TradePlan plan = ExecFixtures.approvedPlan(engine, venue.fetchFilters("BTCUSDT"));
+        ExecutionCoordinator.Report opened = coordinator.execute(plan);
+        String stopId = opened.protectiveStop().orElseThrow().clientOrderId();
+
+        ExecutionCoordinator.CloseReport report = coordinator.closeOut("BTCUSDT", "close-8");
+
+        assertTrue(report.flat(), report.note());
+        assertFalse(halt.isHalted(), "a symbol that IS flat must not latch a partial-close halt");
+        assertFalse(alerts.sawCritical("Partial close"), alerts.messages.toString());
+        assertFalse(engine.book().hasPosition("BTCUSDT"));
+        assertFalse(venue.delegate.order(stopId).orElseThrow().isWorking(), "leftovers cancelled");
     }
 
     @Test
@@ -129,5 +188,24 @@ class ClosePathTest {
         assertTrue(again.flat());
         assertEquals(callsAfterFirst, exchange.placeOrderCalls,
                 "a redelivered close must not open an opposite position");
+    }
+
+    @Test
+    @DisplayName("a close whose response is lost but whose position reads flat is a close, not a refusal")
+    void ambiguousCloseThatFlattenedIsReportedAsClosed() throws Exception {
+        ExecutionCoordinator.Report opened = openOne();
+        String stopId = opened.protectiveStop().orElseThrow().clientOrderId();
+        // The order executes, the response is lost, and the placer's probes see nothing.
+        exchange.loseNextResponse = true;
+        exchange.hideNextQueries = 5;
+
+        ExecutionCoordinator.CloseReport report = coordinator().closeOut("BTCUSDT", "close-amb");
+
+        assertTrue(report.flat(), "the position is flat on the exchange: " + report.note());
+        assertFalse(report.note().contains("still in place"), report.note());
+        assertEquals(0, report.closedQuantity().compareTo(new BigDecimal("0.041")));
+        assertFalse(engine.book().hasPosition("BTCUSDT"), "the book follows the confirmed flat read");
+        assertFalse(exchange.order(stopId).orElseThrow().isWorking(), "the orphaned stop is cancelled");
+        assertFalse(halt.isHalted());
     }
 }
