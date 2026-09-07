@@ -395,7 +395,10 @@ STEP_SIZE = {}       # symbol -> LOT_SIZE stepSize; the bot floors quantity to i
 MIN_QTY = {}         # symbol -> LOT_SIZE minQty
 
 
-def universe(top, min_volume, by_cap, cached_cap=None):
+_EXOTIC_LOGGED = set()
+
+
+def universe(top, min_volume, by_cap, cached_cap=None, logpath=None):
     """Returns (pool, source). Source 'cap' is the live CoinGecko list; 'cap-cached' is the last
     good one when CoinGecko refuses; 'none' when neither exists. There is deliberately no
     volume fallback for a cap universe: top-100 by volume is where the pumps live, and on
@@ -409,9 +412,24 @@ def universe(top, min_volume, by_cap, cached_cap=None):
         if cached_cap:
             return [(s, 0.0) for s in cached_cap][:top], "cap-cached"
         return [], "none"
+    # isascii(): Binance lists perps whose base asset is written in non-Latin script
+    # (07.09: the CJK-named perp aborted a scan mid-write, silently dropping every entry
+    # queued after it). Such a symbol is not tradable end to end - the operator channel
+    # validates /close against [A-Z0-9]{5,20}, so a position opened in one could never be
+    # flattened by hand - so it is dropped from the universe rather than handled downstream.
     tradable = {s["symbol"] for s in info["symbols"]
                 if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
-                and s.get("status") == "TRADING" and s.get("underlyingType") == "COIN"}
+                and s.get("status") == "TRADING" and s.get("underlyingType") == "COIN"
+                and s["symbol"].isascii()}
+    exotic = sorted(s["symbol"] for s in info["symbols"]
+                    if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING" and s.get("underlyingType") == "COIN"
+                    and not s["symbol"].isascii())
+    if exotic and logpath and set(exotic) - _EXOTIC_LOGGED:
+        # Once per new symbol, not once per scan: the universe is rebuilt every hour.
+        log("universe: skipping %d non-ASCII symbol(s) the operator channel could not close: %s"
+            % (len(exotic), ",".join(exotic)), logpath)
+        _EXOTIC_LOGGED.update(exotic)
     for s in info["symbols"]:
         if s["symbol"] in tradable:
             for f in s.get("filters", []):
@@ -856,7 +874,7 @@ def main():
             # request - only the deeper klines sweep below, and only when the switch is armed.
             wide_pool, pool_source = universe(bear_top if bear_universe else args.top,
                                               args.min_volume, args.by_cap,
-                                              cached_cap=state.get("cap_pool"))
+                                              cached_cap=state.get("cap_pool"), logpath=logpath)
             pool = wide_pool[:args.top]
             if not pool:
                 log("universe empty (no exchangeInfo/CoinGecko answer and no cached list); skipping", logpath)
@@ -1223,7 +1241,9 @@ def main():
                     % (len(held), len(hold_ok), len(entry_ok)), logpath)
             else:
                 stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-                with io.open(args.script, "a", encoding="ascii") as f:
+                # utf-8, matching the UTF-8 the bot reads this file with: an ascii writer turned an
+                # unwritable symbol into a mid-write abort that dropped the rest of the scan.
+                with io.open(args.script, "a", encoding="utf-8") as f:
                     f.write("\n# autoscan %s\n" % stamp)
                     for s in to_close:
                         # an explicit id keeps a crash-replay idempotent without colliding

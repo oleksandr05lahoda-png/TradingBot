@@ -141,6 +141,25 @@ def main():
     except Exception as e:
         check("log() survives an unwritable path", False, repr(e))
 
+    # --- 8. a non-ASCII symbol never reaches the book, and the book writer is utf-8 -------
+    # 07.09: Binance lists CJK-named perps. The universe filter drops them (the operator
+    # channel validates /close against [A-Z0-9], so such a position could never be flattened
+    # by hand), and the book is written utf-8 like the bot reads it, so no symbol can abort a
+    # scan mid-write and silently drop every entry queued after it.
+    exotic = "".join(chr(c) for c in (0x5E01, 0x5B89, 0x4EBA, 0x751F)) + "USDT"
+    rows = [{"symbol": "BTCUSDT"}, {"symbol": exotic}]
+    kept = [r["symbol"] for r in rows if r["symbol"].isascii()]
+    check("non-ASCII symbol is dropped from the universe", kept == ["BTCUSDT"], repr(kept))
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "autoscan.py"),
+                  encoding="utf-8").read()
+    check("the book is not written as ascii", 'encoding="ascii"' not in src)
+    check("the universe filter is armed", 'isascii()' in src)
+    book = os.path.join(d, "book_utf8.txt")
+    line = exotic + " LONG entry=1 atr=1 lev=2" + chr(10)
+    with io.open(book, "a", encoding="utf-8") as f:
+        f.write(line)
+    check("a utf-8 book round-trips", io.open(book, encoding="utf-8").read() == line)
+
     print()
     if FAILED:
         print("FAILED: %d" % len(FAILED))
