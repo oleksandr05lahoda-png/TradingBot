@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -76,6 +77,69 @@ public final class Reconciler {
         }
     }
 
+    /**
+     * What took a booked position out, as far as the exchange is willing to say. The wording of the
+     * exit alert and the {@code cause} field of its journal row both come from here, so that a
+     * later analysis can tell a take-profit from a close the owner made in the app without parsing
+     * prose.
+     */
+    public enum ExitCause {
+        /** A take-profit leg of ours filled: the position reached its target. */
+        TAKE_PROFIT("take-profit"),
+        /** The protective stop filled. */
+        STOP_LOSS("stop-loss"),
+        /** This process closed it - an operator {@code /close}, the kill switch, a stop repair. */
+        BOT_CLOSE("bot-close"),
+        /** A reduce-only fill that is not ours: the owner closed it in the Binance app. */
+        HAND_CLOSE("hand-close"),
+        /** Gone while its own stop still rests - a take fill or a hand close, and the venue will not say which. */
+        CLOSED_EARLY("closed-early"),
+        /** The venue closed it itself: liquidation, auto-deleveraging or a settlement. */
+        LIQUIDATION("liquidation"),
+        /** Nothing the exchange returned accounts for it. */
+        UNEXPLAINED("unexplained"),
+        /** The position shrank rather than closed; this pass does not name the leg behind it. */
+        PARTIAL_EXIT("partial-exit");
+
+        private final String token;
+
+        ExitCause(String token) { this.token = token; }
+
+        /** Lowercase, stable, machine-readable - the journal's {@code cause} field. */
+        public String token() { return token; }
+
+        /**
+         * An exit the owner or this machine meant to happen, and the only kind reported calmly.
+         * A liquidation is deliberately NOT expected: dressing one up as a normal exit would tell
+         * the owner his account is fine on the day it was not.
+         */
+        public boolean expected() {
+            // CLOSED_EARLY is deliberately NOT here. It is reached when the order history did not
+            // answer and the stop merely still rests - which is exactly what a liquidation looks
+            // like before the venue retires its legs. "Probably fine" is not an explanation, and a
+            // calm line about one would be the same lie as a calm line about a liquidation.
+            return this == TAKE_PROFIT || this == STOP_LOSS || this == BOT_CLOSE
+                    || this == HAND_CLOSE;
+        }
+    }
+
+    /**
+     * Hears an exchange-side exit the pass absorbed, for the trade journal. Never trading logic;
+     * {@code price} and {@code quantity} are blank when the order that closed it could not be read.
+     */
+    @FunctionalInterface
+    public interface ExitListener {
+        void exit(String symbol, String cause, String detail, String orderId, String price, String quantity);
+    }
+
+    /** A named exit plus the order that proves it. */
+    private record Exit(ExitCause cause, String detail, String orderId, String price, String quantity) {
+
+        static Exit unexplained() {
+            return new Exit(ExitCause.UNEXPLAINED, "it closed without this process noticing", "", "", "");
+        }
+    }
+
     public record Report(Instant at, List<Drift> drifts, int exchangePositions, int bookPositionsBefore) {
 
         public Report {
@@ -106,7 +170,16 @@ public final class Reconciler {
     private final long orphanGraceMillis;
 
     /** Hears benign exchange-side exits (ghost/shrink), for the trade journal. Never trading logic. */
-    private volatile java.util.function.BiConsumer<String, String> exchangeExitListener;
+    private volatile ExitListener exchangeExitListener;
+
+    /**
+     * How far back an order is allowed to be and still count as the one that closed a position.
+     * A ghost is at most one pass old, so this is slack for a paused host, not a real window; a
+     * closing fill older than the position's own entry is rejected outright below.
+     */
+    static final long EXIT_EVIDENCE_WINDOW_MS = 86_400_000L;
+    /** How fresh a closing fill must be to explain a position we never saw opened. */
+    static final long ADOPTED_EXIT_RECENCY_MS = 300_000L;
 
     /** Symbols whose working orders were still inside the grace window on the previous pass. */
     private volatile Set<String> carriedOverSymbols = Set.of();
@@ -178,8 +251,8 @@ public final class Reconciler {
         this(port, engine, halt, alerts, placer, new BigDecimal("0.0000001"), 60_000L);
     }
 
-    /** (symbol, detail) for each ghost or shrink the pass absorbed. */
-    public void onExchangeExit(java.util.function.BiConsumer<String, String> listener) {
+    /** One call per ghost or shrink the pass absorbed, with the cause it could prove. */
+    public void onExchangeExit(ExitListener listener) {
         this.exchangeExitListener = listener;
     }
 
@@ -235,6 +308,8 @@ public final class Reconciler {
         List<Drift> drifts = new ArrayList<>();
         List<ExposureBook.OpenPosition> truth = new ArrayList<>();
         Set<String> symbolsToInspect = new HashSet<>(localBySymbol.keySet());
+        // Symbol -> the exit this pass could prove, for the alert's severity and the journal's cause.
+        Map<String, Exit> exits = new LinkedHashMap<>();
 
         for (PositionSnapshot position : exchangePositions) {
             symbolsToInspect.add(position.symbol());
@@ -279,11 +354,18 @@ public final class Reconciler {
                 if (delta.abs().compareTo(quantityTolerance) > 0) {
                     // Direction decides severity: shrinking is a partial exit the closePosition stop
                     // still covers; growing means another actor holds risk under this bot's name.
+                    String detail = "book says " + local.quantity().toPlainString()
+                            + ", exchange says " + quantity.toPlainString();
                     drifts.add(new Drift(
                             delta.signum() > 0 ? Drift.Kind.POSITION_GREW : Drift.Kind.QUANTITY_MISMATCH,
-                            position.symbol(),
-                            "book says " + local.quantity().toPlainString()
-                                    + ", exchange says " + quantity.toPlainString()));
+                            position.symbol(), detail));
+                    if (delta.signum() < 0) {
+                        // A trim, not an exit: the position is still open and still protected, so no
+                        // leg is named for it. It keeps its warning on purpose - a book that shrank
+                        // for a reason this pass did not establish is not a calm event.
+                        exits.put(position.symbol(),
+                                new Exit(ExitCause.PARTIAL_EXIT, detail, "", "", ""));
+                    }
                 }
             }
 
@@ -293,12 +375,40 @@ public final class Reconciler {
 
         Set<String> exchangeSymbols = new HashSet<>();
         for (PositionSnapshot p : exchangePositions) exchangeSymbols.add(p.symbol());
+        // Positions this pass watched leave: their protective legs are orphans NOW, not after grace.
+        Set<String> justClosed = new HashSet<>();
+        // Only those whose exit the exchange actually NAMED. "One positionRisk read did not list
+        // this symbol" is not proof a position is gone, and cancelling a protective leg on that
+        // alone would strip a live position of its stop on a bad read. An unexplained or merely
+        // guessed exit keeps the old behaviour: the 60s grace, then the account-wide sweep.
+        Set<String> provenClosed = new HashSet<>();
         for (ExposureBook.OpenPosition local : before) {
             if (!exchangeSymbols.contains(local.symbol())) {
+                Exit exit = resolveExit(local, exchangeNow);
+                exits.put(local.symbol(), exit);
+                justClosed.add(local.symbol());
+                if (exit.cause() != ExitCause.UNEXPLAINED && exit.cause() != ExitCause.CLOSED_EARLY) {
+                    provenClosed.add(local.symbol());
+                }
                 drifts.add(new Drift(Drift.Kind.GHOST_POSITION, local.symbol(),
                         "the book holds " + local.side() + " " + local.quantity().toPlainString()
-                                + ", the exchange is flat — " + describeExit(local)));
+                                + ", the exchange is flat - " + exit.detail()));
                 intents.clear(local.symbol());
+                // Where the venue lists conditional orders the flat branch below cancels the
+                // leftovers on this very pass; demo-fapi lists none, so nothing can SEE the stop
+                // and only its recorded name reaches it. Waiting for the account-wide sweep left a
+                // live stop on a flat symbol for up to ten minutes. A stop that itself fired needs
+                // no cancel, and a foreign one is the owner's to manage.
+                // Same proof requirement as the flat branch: on a venue that lists nothing, a
+                // cancel by recorded name is fired blind, so it may only follow an exit the
+                // exchange named. A guess would cancel the stop of a position still open.
+                if (!port.canListConditionalOrders() && exit.cause() != ExitCause.STOP_LOSS
+                        && exit.cause() != ExitCause.UNEXPLAINED
+                        && exit.cause() != ExitCause.CLOSED_EARLY) {
+                    local.protectiveStopId()
+                            .filter(ClientOrderIdFactory::isOurs)
+                            .ifPresent(id -> placer.cancelQuietly(local.symbol(), id));
+                }
             }
         }
 
@@ -410,14 +520,24 @@ public final class Reconciler {
                 for (OrderStatus order : ours) {
                     boolean oldEnough = order.updateTimeMs() > 0
                             && exchangeNow - order.updateTimeMs() > orphanGraceMillis;
-                    if (!oldEnough) {
+                    // The grace exists because a young order may belong to an entry still being
+                    // worked. It does not apply to a protective leg of OURS on a position this very
+                    // pass watched leave: that one is provably guarding nothing, and leaving it to
+                    // the next pass (or the ~10-minute account sweep) is a live stop on a flat
+                    // symbol, eating the conditional-order cap and able to open a short of its own.
+                    boolean strandedByThisPass = provenClosed.contains(symbol)
+                            && (order.reduceOnly() || order.closePosition())
+                            && ClientOrderIdFactory.isOurs(order.clientOrderId());
+                    if (!oldEnough && !strandedByThisPass) {
                         // May belong to an entry still being worked; let the next pass decide.
                         stillInteresting.add(symbol);
                         continue;
                     }
                     drifts.add(new Drift(Drift.Kind.ORPHAN_ORDER, symbol,
                             order.type() + " " + order.clientOrderId()
-                                    + " is working with no position behind it — cancelling"));
+                                    + (strandedByThisPass
+                                            ? " is a protective leg of the position that just closed - cancelling"
+                                            : " is working with no position behind it - cancelling")));
                     placer.cancelQuietly(symbol, order.clientOrderId());
                 }
                 // The intent is spent only on a pass that read the symbol flat with NOTHING of ours
@@ -496,12 +616,14 @@ public final class Reconciler {
         // Exchange-side exits reach the journal whatever else the pass found: a stop-out on one
         // symbol next to a drift on another used to be lost because only the healthy branch told
         // the listener.
-        java.util.function.BiConsumer<String, String> listener = exchangeExitListener;
+        ExitListener listener = exchangeExitListener;
         if (listener != null) {
             for (Drift d : drifts) {
                 if (d.kind() == Drift.Kind.GHOST_POSITION || d.kind() == Drift.Kind.QUANTITY_MISMATCH) {
+                    Exit exit = exits.getOrDefault(d.symbol(), Exit.unexplained());
                     try {
-                        listener.accept(d.symbol(), d.detail());
+                        listener.exit(d.symbol(), exit.cause().token(), d.detail(),
+                                exit.orderId(), exit.price(), exit.quantity());
                     } catch (RuntimeException e) {
                         LOG.fine("[Reconciler] exit listener failed: " + e.getMessage());
                     }
@@ -554,11 +676,36 @@ public final class Reconciler {
             boolean exchangeSide = drifts.stream().anyMatch(d ->
                     d.kind() == Drift.Kind.GHOST_POSITION || d.kind() == Drift.Kind.QUANTITY_MISMATCH
                             || d.kind() == Drift.Kind.ORPHAN_ORDER);
-            String summary = "the exchange closed or trimmed position(s) while this process watched:"
-                    + report.describe();
             if (exchangeSide) {
+                // A take-profit that fired, a stop that did its job, a close the owner made in the
+                // app: the machine working. Announcing those with a warning sign and the words
+                // "without this process noticing" made the first take-profit this account ever
+                // scored (VVVUSDT, +$1.31 on 08.09) read like a fault. Only an exit nothing
+                // explains still warns - and a liquidation, which ExitCause.expected() excludes on
+                // purpose, because a calm line about one would be a lie on the worst day.
+                // A cancelled orphan is not an exit at all: it is this pass tidying up after one.
+                boolean anyExit = drifts.stream().anyMatch(d ->
+                        d.kind() == Drift.Kind.GHOST_POSITION || d.kind() == Drift.Kind.QUANTITY_MISMATCH);
+                boolean allExpected = drifts.stream()
+                        .filter(d -> d.kind() == Drift.Kind.GHOST_POSITION
+                                || d.kind() == Drift.Kind.QUANTITY_MISMATCH)
+                        .allMatch(d -> exits.getOrDefault(d.symbol(), Exit.unexplained())
+                                .cause().expected());
+                // allMatch over an empty stream is vacuously true: on a pass whose only drift is a
+                // cancelled ORPHAN there is no ghost to judge, and the 20-pass account-wide sweep -
+                // the alarm that once surfaced 64 dead conditional orders against a ~33 cap - went
+                // out as a calm "Leftover orders cancelled". A calm line needs a named exit behind it.
+                allExpected = allExpected && anyExit;
+                String summary = (allExpected
+                        ? "position(s) left the book the way they were meant to:"
+                        : "the exchange closed or trimmed position(s) while this process watched:")
+                        + report.describe();
                 LOG.info("[Reconciler] " + summary);
-                alerts.warning("Exchange-side exit", summary);
+                if (!allExpected) {
+                    alerts.warning("Exchange-side exit", summary);
+                } else {
+                    alerts.info(anyExit ? "Position closed" : "Leftover orders cancelled", summary);
+                }
             } else {
                 LOG.info("[Reconciler] pass repaired protection without drift to announce:"
                         + report.describe());
@@ -602,25 +749,154 @@ public final class Reconciler {
     }
 
     /**
-     * Names what took the position out, so the exit alert reads as a fact instead of a mystery.
-     * Best-effort: the answer changes the wording, never the verdict.
+     * Names what took the position out, so the exit reads as a fact instead of a mystery. Asking the
+     * stop by name was the whole answer until 08.09 and it is not enough: Binance retires a
+     * {@code closePosition} conditional order the moment the position goes, so after a take-profit
+     * fills the stop is neither FILLED nor working and every winner was announced as "it closed
+     * without this process noticing". The order history knows - a triggered conditional appears
+     * there under its own id - so that is asked first, and only on this rare flat path.
+     *
+     * <p>Best-effort throughout: what the exchange cannot prove stays UNEXPLAINED and keeps its
+     * warning. The answer changes the wording and the severity, never the verdict on the book.
      */
-    private String describeExit(ExposureBook.OpenPosition local) {
+    private Exit resolveExit(ExposureBook.OpenPosition local, long exchangeNow) {
+        Exit fromHistory = exitFromOrderHistory(local, exchangeNow);
+        if (fromHistory != null) return fromHistory;
+
         Optional<String> stopId = local.protectiveStopId();
-        if (stopId.isEmpty()) return "it closed without this process noticing";
+        if (stopId.isEmpty()) return Exit.unexplained();
         try {
             Optional<OrderStatus> stop = port.queryOrder(local.symbol(), stopId.get());
             if (stop.isPresent() && stop.get().state() == OrderState.FILLED) {
-                return "its protective stop " + stopId.get() + " filled";
+                return new Exit(ExitCause.STOP_LOSS, "its protective stop " + stopId.get() + " filled",
+                        stopId.get(), plain(stop.get().averagePrice()), plain(stop.get().executedQuantity()));
             }
             if (stop.isPresent() && stop.get().isWorking()) {
-                return "closed past its still-resting stop (a take-profit fill or a manual close); "
-                        + "leftover orders will be swept as orphans";
+                // The stop is intact, so it was not the stop: a take-profit fill or a close by hand.
+                // Which of the two only the order history can say, and it did not answer here.
+                return new Exit(ExitCause.CLOSED_EARLY, "it closed ahead of its still-resting stop "
+                        + stopId.get() + " - a take-profit fill or a close made by hand",
+                        stopId.get(), "", "");
             }
         } catch (RuntimeException e) {
             LOG.fine("[Reconciler] could not name the exit on " + local.symbol() + ": " + e.getMessage());
         }
-        return "it closed without this process noticing";
+        return Exit.unexplained();
+    }
+
+    /**
+     * The closing fill the venue recorded most recently on this symbol, or null when the venue does
+     * not answer, nothing there closes anything, or the newest closing fill is OLDER than our own
+     * newest entry fill - which means it belongs to a previous round trip on the same symbol and
+     * proves nothing about this one.
+     */
+    private Exit exitFromOrderHistory(ExposureBook.OpenPosition local, long exchangeNow) {
+        List<OrderStatus> history;
+        try {
+            history = port.recentOrders(local.symbol(), exchangeNow - EXIT_EVIDENCE_WINDOW_MS);
+        } catch (RuntimeException e) {
+            LOG.fine("[Reconciler] order history for " + local.symbol() + " is unreadable: " + e.getMessage());
+            return null;
+        }
+
+        // A port that answers null rather than throwing used to take the NPE out of this method and
+        // through the whole reconcile pass - the one pass that has to survive a bad answer, and one
+        // that counts toward the blind-pass limit.
+        if (history == null) return null;
+        OrderStatus closer = null;
+        ExitCause cause = null;
+        long ourNewestEntryFill = Long.MIN_VALUE;
+        for (OrderStatus order : history) {
+            if (order == null) continue;
+            if (!order.hasFill() && order.state() != OrderState.FILLED) continue;
+            ExitCause candidate = causeOf(order);
+            if (candidate == null) {
+                if (isOurEntry(order.clientOrderId())) {
+                    ourNewestEntryFill = Math.max(ourNewestEntryFill, order.updateTimeMs());
+                }
+                continue;
+            }
+            if (closer == null || order.updateTimeMs() >= closer.updateTimeMs()) {
+                closer = order;
+                cause = candidate;
+            }
+        }
+        if (closer == null || closer.updateTimeMs() < ourNewestEntryFill) return null;
+        // A position adopted from the exchange has no entry of ours to date the round trip from, so
+        // the 24h evidence window would accept a fill from yesterday as the cause of a close that
+        // happened seconds ago - and write yesterday's price into the journal. Without that anchor
+        // the closing fill has to be as young as a ghost can actually be: the loop runs every ~30s.
+        if (ourNewestEntryFill == Long.MIN_VALUE
+                && exchangeNow - closer.updateTimeMs() > ADOPTED_EXIT_RECENCY_MS) {
+            return null;
+        }
+
+        String id = closer.clientOrderId();
+        String price = plain(closer.averagePrice());
+        String at = price.isEmpty() ? "" : " at " + price;
+        String detail = switch (cause) {
+            case TAKE_PROFIT -> "its take-profit " + id + " filled" + at;
+            case STOP_LOSS -> "its protective stop " + id + " filled" + at;
+            case BOT_CLOSE -> "this process closed it (" + id + ")" + at;
+            case HAND_CLOSE -> "it was closed by hand on the exchange (" + id + ")" + at;
+            case LIQUIDATION -> "the exchange closed it itself (" + id
+                    + ") - a liquidation, auto-deleverage or settlement" + at;
+            default -> "it closed without this process noticing";
+        };
+        return new Exit(cause, detail, id, price, plain(closer.executedQuantity()));
+    }
+
+    /**
+     * Which exit a filled order is, from its client id alone - the ids are deterministic and carry
+     * their purpose. Null when the order closed nothing: our own entry, or a foreign order that
+     * adds rather than reduces.
+     */
+    private static ExitCause causeOf(OrderStatus order) {
+        String id = order.clientOrderId();
+        if (isVenueAutoClose(id)) return ExitCause.LIQUIDATION;
+        if (ClientOrderIdFactory.isOurs(id)) {
+            Optional<OrderTypes.OrderPurpose> purpose = ClientOrderIdFactory.purposeOf(id);
+            if (purpose.isEmpty()) return null;
+            return switch (purpose.get()) {
+                case TAKE_PROFIT -> ExitCause.TAKE_PROFIT;
+                case STOP_LOSS -> ExitCause.STOP_LOSS;
+                case EMERGENCY_CLOSE -> ExitCause.BOT_CLOSE;
+                case ENTRY -> null;
+            };
+        }
+        // Not ours, and it reduces. "By hand" is claimed only for a plain reduce - the Close
+        // button in the app. A foreign STOP_MARKET or TAKE_PROFIT_MARKET filling is the owner's
+        // own conditional order firing, which is not a decision he made just now and may well be a
+        // loss he wants to see; it is named for what it is rather than dressed as a hand close.
+        if (!(order.reduceOnly() || order.closePosition())) return null;
+        OrderTypes.OrderType type = order.type();
+        if (type == OrderTypes.OrderType.STOP_MARKET) return ExitCause.STOP_LOSS;
+        if (type == OrderTypes.OrderType.TAKE_PROFIT_MARKET) return ExitCause.TAKE_PROFIT;
+        return ExitCause.HAND_CLOSE;
+    }
+
+    private static boolean isOurEntry(String clientOrderId) {
+        return ClientOrderIdFactory.isOurs(clientOrderId)
+                && ClientOrderIdFactory.purposeOf(clientOrderId)
+                        .filter(p -> p == OrderTypes.OrderPurpose.ENTRY).isPresent();
+    }
+
+    /**
+     * Binance mints the ids of the orders it places for itself: {@code autoclose-} for a
+     * liquidation, {@code adl_autoclose} for auto-deleveraging, {@code settlement_autoclose} for a
+     * delisting. None of these may ever be reported as a normal exit.
+     */
+    private static boolean isVenueAutoClose(String id) {
+        // Substring and case-insensitive on purpose: an id one character off the exact prefix
+        // ("autoclose_" instead of "autoclose-") used to fall through and be announced calmly as a
+        // close made by hand. A venue-minted close must never be able to read as a normal exit
+        // because its id was punctuated differently.
+        return id != null && id.toLowerCase(Locale.ROOT).contains("autoclose");
+    }
+
+    /** Blank rather than "0" for a figure the venue did not fill in, so the journal row stays honest. */
+    private static String plain(BigDecimal value) {
+        return value == null || value.signum() <= 0 ? "" : value.toPlainString();
     }
 
     /**

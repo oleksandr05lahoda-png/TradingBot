@@ -55,6 +55,15 @@ public interface ExchangePort extends AutoCloseable {
     List<OrderStatus> openOrders(String symbol);
 
     /**
+     * Orders the venue recorded on the symbol recently, FINISHED ones included, newest last; those
+     * whose {@code updateTime} is older than {@code sinceEpochMs} (the exchange's clock) are left
+     * out. Asked for only when a booked position is found flat, to name what closed it - never on
+     * the happy path, because it is a heavy listing. An empty answer means "this venue cannot say",
+     * never "nothing happened", so callers must fall back rather than conclude.
+     */
+    default List<OrderStatus> recentOrders(String symbol, long sinceEpochMs) { return List.of(); }
+
+    /**
      * Every working order on the ACCOUNT, both plain and conditional, so orphans on symbols that
      * are neither booked nor held can be found at all — per-symbol listing never looks there.
      * Empty when the venue cannot enumerate account-wide; callers treat that as "nothing to sweep".

@@ -81,7 +81,7 @@ class ClosePathTest {
         java.util.List<String> exits = new java.util.ArrayList<>();
         Reconciler reconciler = new Reconciler(exchange, engine, halt, alerts,
                 new IdempotentOrderPlacer(exchange, 1, 1, 0, ExecFixtures.NO_SLEEP));
-        reconciler.onExchangeExit((symbol, detail) -> exits.add(symbol));
+        reconciler.onExchangeExit((symbol, cause, detail, orderId, price, qty) -> exits.add(symbol));
         reconciler.reconcile(ExecFixtures.NOON);
 
         assertEquals(java.util.List.of("BTCUSDT"), exits, "the exit must reach the journal once");

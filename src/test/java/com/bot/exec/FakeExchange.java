@@ -55,6 +55,8 @@ final class FakeExchange implements ExchangePort {
     BigDecimal reportedLiquidationPrice = BigDecimal.ZERO;
     /** False mirrors demo-fapi: conditional orders rest and answer a query by id, but never list. */
     boolean listsConditionalOrders = true;
+    /** False mirrors a venue with no order history at all, so the exit falls back to the stop id. */
+    boolean answersOrderHistory = true;
     /**
      * Binance keeps a client id unique among OPEN orders only: a FILLED market order's id is
      * accepted again and fills again. Off by default so the older tests keep the -4116-everywhere
@@ -100,6 +102,31 @@ final class FakeExchange implements ExchangePort {
                 existing.exchangeOrderId(), existing.symbol(), state, existing.type(),
                 existing.originalQuantity(), existing.executedQuantity(), existing.averagePrice(),
                 existing.stopPrice(), existing.reduceOnly(), existing.closePosition(), serverTimeMillis()));
+    }
+
+    /**
+     * Fills a resting order the way a trigger does: FILLED, with an executed quantity and a price.
+     * {@link #setOrderState} only relabels, and an order with no fill proves nothing about an exit.
+     */
+    void fillOrder(String clientOrderId, String executedQuantity, String averagePrice) {
+        OrderStatus existing = ordersByClientId.get(clientOrderId);
+        if (existing == null) return;
+        ordersByClientId.put(clientOrderId, new OrderStatus(existing.clientOrderId(),
+                existing.exchangeOrderId(), existing.symbol(), OrderState.FILLED, existing.type(),
+                existing.originalQuantity(), new BigDecimal(executedQuantity),
+                new BigDecimal(averagePrice), existing.stopPrice(), existing.reduceOnly(),
+                existing.closePosition(), serverTimeMillis()));
+    }
+
+    /**
+     * Writes a finished order straight into the history, as {@code /fapi/v1/allOrders} would report
+     * one this process never placed: the owner's close in the app, or a liquidation.
+     */
+    void recordFilledOrder(String clientOrderId, String symbol, OrderType type, String quantity,
+                           String price, boolean reduceOnly) {
+        ordersByClientId.put(clientOrderId, new OrderStatus(clientOrderId, orderIdSequence++, symbol,
+                OrderState.FILLED, type, new BigDecimal(quantity), new BigDecimal(quantity),
+                new BigDecimal(price), BigDecimal.ZERO, reduceOnly, false, serverTimeMillis()));
     }
 
     /** Moves an order's update time into the past, as a relic of an earlier process would read. */
@@ -235,6 +262,21 @@ final class FakeExchange implements ExchangePort {
         for (OrderStatus o : ordersByClientId.values()) {
             if (!o.isWorking()) continue;
             if (!listsConditionalOrders && o.type().isConditional()) continue;
+            out.add(o);
+        }
+        return out;
+    }
+
+    /**
+     * The venue's order history: finished orders included, and conditional ones too even when the
+     * open-order listing hides them - which is exactly why the reconciler asks here after an exit.
+     */
+    @Override public List<OrderStatus> recentOrders(String symbol, long sinceEpochMs) {
+        if (!answersOrderHistory) return List.of();
+        List<OrderStatus> out = new ArrayList<>();
+        for (OrderStatus o : ordersByClientId.values()) {
+            if (!o.symbol().equals(symbol)) continue;
+            if (o.updateTimeMs() > 0 && o.updateTimeMs() < sinceEpochMs) continue;
             out.add(o);
         }
         return out;

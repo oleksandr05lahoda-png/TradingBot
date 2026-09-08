@@ -180,6 +180,29 @@ class BookLedgerTest {
         assertEquals(25.0, after.get("AAAUSDT").orElseThrow().riskUsd(), 1e-9);
     }
 
+    @Test
+    void aLedgerWrittenBeforeTheExitCauseWorkAndItsSixPositionsStillLoad() throws Exception {
+        // The live machine holds a file of exactly this shape right now. Naming an exit by its
+        // cause (08.09) added no field to it on purpose, and a boot that cannot read what is
+        // already on that disk is a production incident, not a regression to find later.
+        Path file = dir.resolve("book-ledger-real.json");
+        StringBuilder body = new StringBuilder("{\"positions\":[");
+        List<PositionSnapshot> live = new java.util.ArrayList<>();
+        for (int i = 1; i <= 6; i++) {
+            if (i > 1) body.append(',');
+            body.append("{\"symbol\":\"S").append(i).append("USDT\",\"side\":\"LONG\",\"riskUsd\":1.4,")
+                    .append("\"quantity\":\"10\",\"stopId\":\"bt-s0-legacy").append(i).append("\"}");
+            live.add(snap("S" + i + "USDT", "10", "2.0"));
+        }
+        Files.writeString(file, body.append("]}").toString());
+
+        ExposureBook after = new ExposureBook();
+        assertEquals(6, BookLedger.seed(after, live, file));
+        assertEquals(Optional.of("bt-s0-legacy3"), after.get("S3USDT").orElseThrow().protectiveStopId());
+        assertEquals(1.4, after.get("S6USDT").orElseThrow().riskUsd(), 1e-9);
+        assertTrue(BookLedger.closedWhileAway(live, file).isEmpty());
+    }
+
     // ─── Adoption from the exchange ──────────────────────────────────────────────────────────
 
     /** Only the two calls {@link BookLedger#adopt} makes; the rest must never be reached. */

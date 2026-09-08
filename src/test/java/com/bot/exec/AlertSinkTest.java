@@ -195,6 +195,25 @@ class AlertSinkTest {
     }
 
     @Test
+    @DisplayName("good news is retried like bad news: an INFO gets the same three tries")
+    void infoIsRetriedLikeTheRest() {
+        ScriptedSender sender = new ScriptedSender();
+        // Two dropped packets in a row. Until 08.09 an INFO got one attempt and stopped here -
+        // and since that day the good news travels as INFO: the take-profit that fired, the
+        // position the owner closed in the app. The message the bot exists to send must not be
+        // the one it gives up on first.
+        sender.script.add(new AlertSink.Telegram.SendResult(500, "server error"));
+        sender.script.add(new AlertSink.Telegram.SendResult(500, "server error"));
+        AlertSink.Telegram telegram = new AlertSink.Telegram("not-a-real-token", "42", sender);
+
+        telegram.alert(AlertSink.Severity.INFO, "Position closed", "its take-profit filled");
+        telegram.flush(10_000L);
+
+        assertEquals(3, sender.texts.size(),
+                "two refusals then a delivery: " + sender.texts.size() + " attempt(s)");
+    }
+
+    @Test
     @DisplayName("a message over Telegram's 4096 chars is cut, not refused with a 400")
     void oversizedMessageIsTruncated() {
         ScriptedSender sender = new ScriptedSender();

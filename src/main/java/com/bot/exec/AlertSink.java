@@ -261,7 +261,11 @@ public interface AlertSink {
             // One dropped packet used to lose the message outright, and the only record of a lost
             // CRITICAL was the log the alert exists to replace. Serious alerts get three tries.
             text = truncate(text);
-            int attempts = severity == Severity.INFO ? 1 : RETRIES_FOR_SERIOUS;
+            // INFO used to get one try. Since 08.09 the good news travels as INFO - a
+            // take-profit that fired, a position the owner closed in the app - and the
+            // message this bot exists to send became the least reliably delivered one it
+            // has. Retries cost nothing on success, so every severity now gets three.
+            int attempts = RETRIES_FOR_SERIOUS;
             boolean floodRetried = false;
             for (int attempt = 1; attempt <= attempts; attempt++) {
                 try {

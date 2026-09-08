@@ -97,10 +97,31 @@ final class TradeJournal {
         write(row("exchange-exit", symbol).put("detail", detail));
     }
 
+    /**
+     * The live-pass exit, with the cause the reconciler could PROVE: {@code take-profit},
+     * {@code stop-loss}, {@code hand-close}, {@code bot-close}, {@code closed-early},
+     * {@code liquidation}, {@code partial-exit} or {@code unexplained}. Until 08.09 every one of
+     * these was the same row and the same prose, so the record could not tell the first take-profit
+     * this account ever scored from a close the owner made in the app.
+     */
+    void exchangeExit(String symbol, String cause, String detail, String orderId, String price,
+                      String quantity) {
+        write(row("exchange-exit", symbol)
+                .put("cause", cause == null ? "" : cause)
+                .put("detail", detail)
+                .put("orderId", orderId == null ? "" : orderId)
+                .put("price", price == null ? "" : price)
+                .put("qty", quantity == null ? "" : quantity)
+                .put("whileDown", false));
+    }
+
     /** Same, with what the order itself reported — the price and quantity the verdict needs. */
     void exchangeExit(String symbol, String detail, String orderId, String state, String price,
                       String quantity, boolean whileDown) {
         write(row("exchange-exit", symbol)
+                // Every exchange-exit row carries a cause now; this path never watched the exit, so
+                // the honest value is the one that says so rather than a guess from the stop state.
+                .put("cause", "closed-while-down")
                 .put("detail", detail)
                 .put("orderId", orderId == null ? "" : orderId)
                 .put("state", state == null ? "" : state)

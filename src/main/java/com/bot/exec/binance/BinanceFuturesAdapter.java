@@ -420,6 +420,32 @@ public final class BinanceFuturesAdapter implements ExchangePort {
         return out;
     }
 
+    /**
+     * Weight 5, asked for only when a booked position is found flat. A conditional order that fired
+     * appears HERE under its own clientOrderId, even though the algo endpoint has already retired
+     * it: on 08.09 VVVUSDT's take filled for +$1.31 and {@code /fapi/v1/allOrders} listed exactly
+     * the entry "bt-e0-..." and the take "bt-t0-...", while the stop id answered from nowhere. That
+     * is why the first take-profit this account ever scored could only be named from this listing.
+     */
+    @Override public List<OrderStatus> recentOrders(String symbol, long sinceEpochMs) {
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        // No startTime: with one, Binance answers from that point FORWARD and the cap can cut off
+        // the newest rows, which are the only ones that can explain an exit. Capped and filtered here.
+        params.put("limit", String.valueOf(RECENT_ORDERS_LIMIT));
+        JSONArray rows = new JSONArray(signedGet("/fapi/v1/allOrders", params, 5));
+        List<OrderStatus> out = new ArrayList<>();
+        for (int i = 0; i < rows.length(); i++) {
+            OrderStatus order = parseOrder(rows.getJSONObject(i));
+            if (order.updateTimeMs() > 0 && order.updateTimeMs() < sinceEpochMs) continue;
+            out.add(order);
+        }
+        return out;
+    }
+
+    /** Enough to cover both legs of several round trips on one symbol; the answer is filtered by age. */
+    private static final int RECENT_ORDERS_LIMIT = 50;
+
     /** Account-wide, both endpoints; weight 40 for the plain half, so callers keep it rare. */
     @Override public List<OrderStatus> openOrdersAll() {
         List<OrderStatus> out = new ArrayList<>();
