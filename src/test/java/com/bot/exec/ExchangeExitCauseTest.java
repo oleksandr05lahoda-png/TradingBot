@@ -200,6 +200,30 @@ class ExchangeExitCauseTest {
     }
 
     @Test
+    @DisplayName("a position we never saw opened does not borrow yesterday's closing fill")
+    void adoptedPositionNeedsAFreshFill() throws Exception {
+        ExecutionCoordinator.Report opened = openOne();
+        String entryId = opened.entryOrder().orElseThrow().clientOrderId();
+        // A position adopted from the exchange has no entry of OURS to date the round trip from -
+        // here the entry is pushed out of the evidence window entirely, which is the same thing.
+        // Without that anchor the 24h window would accept a fill from yesterday as the cause of a
+        // close that happened seconds ago, and write yesterday's price into the journal.
+        exchange.ageOrder(entryId, 2 * Reconciler.EXIT_EVIDENCE_WINDOW_MS);
+        exchange.recordFilledOrder("web_stale_1", "BTCUSDT", OrderType.MARKET,
+                "0.041", "70000.0", true);
+        exchange.ageOrder("web_stale_1", 20 * 3_600_000L);
+        exchange.setOrderState(opened.protectiveStop().orElseThrow().clientOrderId(), OrderState.EXPIRED);
+        exchange.clearPosition("BTCUSDT");
+
+        String detail = detailOf(reconciler.reconcile(ExecFixtures.NOON));
+
+        assertFalse(detail.contains("70000"),
+                "a 20-hour-old fill cannot explain a close that just happened: " + detail);
+        assertFalse(detail.contains("web_stale_1"), detail);
+        assertTrue(alerts.sawWarning("Exchange-side exit"), alerts.messages.toString());
+    }
+
+    @Test
     @DisplayName("a pass that only swept orphans is not dressed up as a position closing well")
     void orphanOnlySweepStillWarns() throws Exception {
         ExecutionCoordinator.Report opened = openOne();
