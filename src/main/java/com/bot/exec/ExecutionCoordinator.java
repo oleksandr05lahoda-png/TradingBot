@@ -467,11 +467,27 @@ public final class ExecutionCoordinator {
     /** @return {@code true} when the symbol's working orders are gone; {@code false} leaves them to the sweep */
     private boolean cancelLeftovers(String symbol) {
         try {
-            port.cancelAllOpenOrders(symbol);
-            return true;
+            // NOT cancelAllOpenOrders: that wipes every working order on the symbol, the owner's
+            // included. The reconciler learned this on 06.09 - a resting entry he placed by hand is
+            // his business, and a close of ours arriving on a symbol he already flattened himself
+            // would silently take it with it. A leg that REDUCES is an orphan whoever placed it,
+            // because the position it guarded is gone; anything else stays.
+            boolean all = true;
+            for (OrderStatus order : port.openOrders(symbol)) {
+                if (!order.isWorking()) continue;
+                boolean reduces = order.reduceOnly() || order.closePosition();
+                if (!reduces && !ClientOrderIdFactory.isOurs(order.clientOrderId())) {
+                    LOG.info("[Coordinator] " + symbol + ": leaving " + order.clientOrderId()
+                            + " alone - it adds exposure and is not this machine's to cancel");
+                    all = false;
+                    continue;
+                }
+                port.cancelOrder(symbol, order.clientOrderId());
+            }
+            return all;
         } catch (RuntimeException e) {
             LOG.warning("[Coordinator] " + symbol + ": could not cancel leftover orders after the close ("
-                    + e.getMessage() + ") — the reconciler sweeps them as orphans");
+                    + e.getMessage() + ") - the reconciler sweeps them as orphans");
             return false;
         }
     }

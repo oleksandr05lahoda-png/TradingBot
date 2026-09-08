@@ -208,4 +208,31 @@ class ClosePathTest {
         assertFalse(exchange.order(stopId).orElseThrow().isWorking(), "the orphaned stop is cancelled");
         assertFalse(halt.isHalted());
     }
+
+    @Test
+    @DisplayName("closing a symbol the owner already flattened does not take his own resting order with it")
+    void closeSparesTheOwnersRestingOrder() throws Exception {
+        ExecFixtures.RecordingAlerts alerts = new ExecFixtures.RecordingAlerts();
+        FakeExchange exchange = new FakeExchange();
+        RiskEngine engine = ExecFixtures.engine();
+        TradingHalt halt = new TradingHalt();
+        ExecutionCoordinator coordinator = ExecFixtures.coordinator(exchange, engine, halt, alerts);
+        ExecutionCoordinator.Report opened = coordinator.execute(
+                ExecFixtures.approvedPlan(engine, exchange.fetchFilters("BTCUSDT")));
+        String stopId = opened.protectiveStop().orElseThrow().clientOrderId();
+
+        // He closed it himself in the app and then put his own limit buy back on the coin. Ours
+        // arrives late, finds the symbol flat, and used to cancel every order on it - his included.
+        exchange.clearPosition("BTCUSDT");
+        OrderStatus his = exchange.placeOrder(OrderRequest.limitEntry("BTCUSDT", OrderTypes.OrderSide.BUY,
+                new BigDecimal("0.041"), new BigDecimal("50000"),
+                OrderTypes.TimeInForce.GTC, "web_limit_1"));
+
+        coordinator.closeOut("BTCUSDT", "op-close-1");
+
+        assertTrue(exchange.order(his.clientOrderId()).orElseThrow().isWorking(),
+                "an order that ADDS exposure is the owner's business, not this machine's to cancel");
+        assertFalse(exchange.order(stopId).orElseThrow().isWorking(),
+                "our own leg guarding a position that is gone is still an orphan and still goes");
+    }
 }
