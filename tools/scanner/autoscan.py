@@ -571,6 +571,31 @@ def evaluate(sym, lookback, dip_depth, live_price):
             "closes": [float(b[4]) for b in bars[-61:]]}
 
 
+def entry_gates(m, trig, near_high_max, vol_mult_min, near_high90_max, vol_max):
+    """The entry filters, in the order they are applied. Returns (passes, cut_by) where cut_by
+    names the 21.09 gate that refused the coin ('overhang' / 'volmax') or None.
+
+    Trend entries only: a DIP buys the drawdown by definition and is never gated here. An unset
+    key (None) skips its check, so with every key unset the result is always (True, None).
+    A missing metric (None) never passes a gate that is armed - the lab's NaN -> False."""
+    passes = True
+    if trig == "trend" and near_high_max is not None:
+        fh = m.get("from_high")
+        passes = fh is not None and fh <= near_high_max
+    if passes and trig == "trend" and vol_mult_min is not None:
+        vr = m.get("vol_ratio")
+        passes = vr is not None and vr >= vol_mult_min
+    if passes and trig == "trend" and near_high90_max is not None:
+        fh90 = m.get("from_high90")
+        if not (fh90 is not None and fh90 <= near_high90_max):
+            return False, "overhang"
+    if passes and trig == "trend" and vol_max is not None:
+        vr = m.get("vol_ratio")
+        if not (vr is not None and vr <= vol_max):
+            return False, "volmax"
+    return passes, None
+
+
 def corr60(a, b, n=60):
     """Pearson correlation of the last n aligned daily returns. 0.0 when either side is too
     short (<30 points) - fail-open, exactly how the 26.08 measurement treated missing data:
@@ -1035,25 +1060,16 @@ def main():
                 m["trig"] = "trend" if m["ret"] > args.entry_band else ("dip" if m["dip"] else None)
                 if m["trig"]:
                     if m["price"] > STOP_ATR_MULT * m["atr"]:
-                        passes = True
-                        if m["trig"] == "trend" and near_high_max is not None:
-                            fh = m.get("from_high")
-                            passes = fh is not None and fh <= near_high_max
-                        if passes and m["trig"] == "trend" and vol_mult_min is not None:
-                            vr = m.get("vol_ratio")
-                            passes = vr is not None and vr >= vol_mult_min
-                        # The two 21.09 gates. Counted when they bite so the log shows what the
-                        # old rule would have bought (their later outcomes are the live evidence).
-                        if passes and m["trig"] == "trend" and near_high90_max is not None:
-                            fh90 = m.get("from_high90")
-                            passes = fh90 is not None and fh90 <= near_high90_max
-                            if not passes:
-                                cut_overhang.append(sym)
-                        if passes and m["trig"] == "trend" and vol_max is not None:
-                            vr = m.get("vol_ratio")
-                            passes = vr is not None and vr <= vol_max
-                            if not passes:
-                                cut_volmax.append(sym)
+                        passes, cut_by = entry_gates(m, m["trig"], near_high_max, vol_mult_min,
+                                                     near_high90_max, vol_max)
+                        # The two 21.09 gates are counted when they bite. This is the SIGNAL
+                        # stage: a cut coin might still have been refused later by the pool,
+                        # cooldown, sizing or room - the list says what the gate saw, not what
+                        # the old rule would have bought.
+                        if cut_by == "overhang":
+                            cut_overhang.append(sym)
+                        elif cut_by == "volmax":
+                            cut_volmax.append(sym)
                         if passes:
                             entry_ok.add(sym)
                 if m["ret"] > -args.exit_band or m["dip"]:
@@ -1263,12 +1279,13 @@ def main():
                 r20 = [details[s].get("ret20") for s in details if details[s].get("ret20") is not None]
                 if r20:
                     med = sorted(r20)[len(r20) // 2]
-                    kept_rs = [x for x in to_open if (details[x].get("ret20") or -1e9) >= med]
+                    kept_rs = [x for x in to_open
+                               if details[x].get("ret20") is not None and details[x]["ret20"] >= med]
                     log("shadow rel-strength: %d of %d entr(ies) at/above the pool median 20d "
                         "(%+.1f%%): %s" % (len(kept_rs), len(to_open), med * 100,
                                            ",".join(kept_rs) or "-"), logpath)
             if cut_overhang or cut_volmax:
-                log("gates cut: no-overhang %d (%s); vol-cap %d (%s)"
+                log("gates cut at signal stage (pre-funnel): no-overhang %d (%s); vol-cap %d (%s)"
                     % (len(cut_overhang), ",".join(cut_overhang) or "-",
                        len(cut_volmax), ",".join(cut_volmax) or "-"), logpath)
             if regime == "BEAR" and to_open:

@@ -90,18 +90,23 @@ def main():
 
         # --- 5. the gate logic, replayed as the entry block does it -------------------------------
         def gate(m, trig, nh90=0.10, vmax=4.0):
-            passes = True
-            if trig == "trend" and nh90 is not None:
-                fh90 = m.get("from_high90"); passes = fh90 is not None and fh90 <= nh90
-            if passes and trig == "trend" and vmax is not None:
-                vr = m.get("vol_ratio"); passes = vr is not None and vr <= vmax
-            return passes
+            # the REAL function main() calls, with the old two gates disarmed
+            return A.entry_gates(m, trig, None, None, nh90, vmax)[0]
+        def cut_by(m, trig, nh90=0.10, vmax=4.0):
+            return A.entry_gates(m, trig, None, None, nh90, vmax)[1]
         check("trend 5% below 90d high, vol 2x -> passes", gate({"from_high90": 0.05, "vol_ratio": 2.0}, "trend"))
         check("trend 12% below 90d high -> cut (overhang)", not gate({"from_high90": 0.12, "vol_ratio": 2.0}, "trend"))
         check("trend vol 4.5x -> cut (blow-off)", not gate({"from_high90": 0.05, "vol_ratio": 4.5}, "trend"))
         check("trend young coin (None) -> cut", not gate({"from_high90": None, "vol_ratio": 2.0}, "trend"))
         check("DIP 30% below 90d high -> never gated", gate({"from_high90": 0.30, "vol_ratio": 6.0}, "dip"))
         check("both keys unset -> behaves as before", gate({"from_high90": 0.30, "vol_ratio": 6.0}, "trend", None, None))
+        check("both keys unset -> nothing is reported as cut", cut_by({"from_high90": 0.30, "vol_ratio": 6.0}, "trend", None, None) is None)
+        check("overhang cut is named", cut_by({"from_high90": 0.12, "vol_ratio": 2.0}, "trend") == "overhang")
+        check("vol cap cut is named", cut_by({"from_high90": 0.05, "vol_ratio": 4.5}, "trend") == "volmax")
+        check("old near-high gate still refuses before the new ones (no cut label)",
+              A.entry_gates({"from_high": 0.08, "from_high90": 0.05, "vol_ratio": 2.0}, "trend", 0.05, 1.5, 0.10, 4.0) == (False, None))
+        check("all four gates pass together",
+              A.entry_gates({"from_high": 0.03, "from_high90": 0.05, "vol_ratio": 2.0}, "trend", 0.05, 1.5, 0.10, 4.0) == (True, None))
     finally:
         A.get = real_get
         os.environ.pop("ENTRY_NEAR_HIGH90", None)
