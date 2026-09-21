@@ -186,7 +186,7 @@ def read_env(repo):
               "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
               "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE",
               "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR", "LOT_ROUND_UP",
-              "BEAR_UNIVERSE", "BEAR_DAY_PCT"):
+              "BEAR_UNIVERSE", "BEAR_DAY_PCT", "ENTRY_NEAR_HIGH90", "ENTRY_VOL_MAX"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
@@ -518,7 +518,9 @@ def evaluate(sym, lookback, dip_depth, live_price):
     # 61 closes feed the 60d correlation filter - same request weight (limit < 100). The
     # eligibility guard stays on the OLD minimum so young coins keep exactly the universe
     # membership they had before the filter existed.
-    bars = get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": max(need, 61)})
+    # 91 bars (still one request of weight 1): the no-overhang filter needs the 90d high, i.e.
+    # 89 completed days plus today's partial bar - the same convention as hi20 below.
+    bars = get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": max(need, 91)})
     if not bars or len(bars) < need - 3:
         return None
     a = atr(bars[-(ATR_PERIOD + 2):], ATR_PERIOD)
@@ -552,8 +554,20 @@ def evaluate(sym, lookback, dip_depth, live_price):
     else:
         projected = float(bars[-1][7]) / min(1.0, elapsed)
     vol_ratio = (projected / (sum(prior) / len(prior))) if prior and sum(prior) > 0 else None
+    # No-overhang input (21.09, StrategyLab #100 + volume cap: the only change that passed the
+    # closed year 2025-09..2026-09 - +6.5% at 4.0% maxDD against the live rule's +8.7% at 14.3%).
+    # Distance below the 90d high; None for a coin younger than 91 bars, which the gate treats
+    # as "not passing" exactly as the lab's brick does (NaN -> False).
+    hi90 = max(float(b[2]) for b in bars[-90:]) if len(bars) >= 91 else 0.0
+    # 20d return for the shadow "stronger than the pool median" candidate (logged, never acted on).
+    try:
+        base20 = float(bars[-21][4])
+    except (IndexError, ValueError):
+        base20 = 0.0
     return {"ret": ret, "dip": dip, "price": price, "atr": a,
             "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio,
+            "from_high90": (1 - price / hi90) if hi90 > 0 else None,
+            "ret20": (price / base20 - 1.0) if base20 > 0 else None,
             "closes": [float(b[4]) for b in bars[-61:]]}
 
 
@@ -734,6 +748,13 @@ def main():
     near_high_max = _float_env("ENTRY_NEAR_HIGH")
     vol_mult_min = _float_env("ENTRY_VOL_MULT")
     max_hold_hours = _float_env("MAX_HOLD_HOURS")
+    #   ENTRY_NEAR_HIGH90=0.10  trend entries only within 10% of the 90d high (no overhang of
+    #                           holders who bought higher in the last quarter)
+    #   ENTRY_VOL_MAX=4.0       and not on a blow-off day whose volume is > 4x the 20d mean
+    # Both unset = the scanner behaves exactly as before. Trend entries only; DIP buys the
+    # drawdown by definition and is never gated by either.
+    near_high90_max = _float_env("ENTRY_NEAR_HIGH90")
+    vol_max = _float_env("ENTRY_VOL_MAX")
     # LOT_ROUND_UP=on (or a fraction): when the lot-floored size is refused by the exchange's $5
     # minimum, one step UP is allowed inside this risk tolerance - mirrors RiskEngine step 9b, so
     # the scanner and the bot agree on what is sizeable. 'on' = 0.20; unset/off = never.
@@ -774,11 +795,11 @@ def main():
     state = load_state(statepath)
     log("autoscan start: venue=%s top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
         "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s near_high=%s vol_mult=%s max_hold=%s "
-        "max_corr=%s bear_universe=%s"
+        "max_corr=%s near_high90=%s vol_max=%s bear_universe=%s"
         % (args.venue, args.top, args.by_cap, args.lookback, args.dip_depth * 100,
            args.entry_band * 100, args.exit_band * 100, args.interval,
            args.max_positions, args.min_hold_hours, gate, near_high_max, vol_mult_min, max_hold_hours,
-           max_corr,
+           max_corr, near_high90_max, vol_max,
            ("on top-%d @ %+.1f%%" % (bear_top, bear_day_pct * 100)) if bear_universe else "off"),
         logpath)
 
@@ -957,6 +978,7 @@ def main():
                 save_state(statepath, state)
 
             entry_ok, hold_ok, details = set(), set(), {}
+            cut_overhang, cut_volmax = [], []   # what the 21.09 gates removed this pass
             # A held coin that drops out of the top list must still be judged by the rule,
             # never by list membership: to_close = held - hold_ok, so leaving it unevaluated
             # would close it for falling off CoinGecko's page.
@@ -1020,6 +1042,18 @@ def main():
                         if passes and m["trig"] == "trend" and vol_mult_min is not None:
                             vr = m.get("vol_ratio")
                             passes = vr is not None and vr >= vol_mult_min
+                        # The two 21.09 gates. Counted when they bite so the log shows what the
+                        # old rule would have bought (their later outcomes are the live evidence).
+                        if passes and m["trig"] == "trend" and near_high90_max is not None:
+                            fh90 = m.get("from_high90")
+                            passes = fh90 is not None and fh90 <= near_high90_max
+                            if not passes:
+                                cut_overhang.append(sym)
+                        if passes and m["trig"] == "trend" and vol_max is not None:
+                            vr = m.get("vol_ratio")
+                            passes = vr is not None and vr <= vol_max
+                            if not passes:
+                                cut_volmax.append(sym)
                         if passes:
                             entry_ok.add(sym)
                 if m["ret"] > -args.exit_band or m["dip"]:
@@ -1223,6 +1257,20 @@ def main():
                     "near-high+volume would keep %d (%s)"
                     % (len(to_open), len(kept_nh), ",".join(kept_nh) or "-",
                        len(kept_nv), ",".join(kept_nv) or "-"), logpath)
+                # Shadow candidate for "reads coins better" (owner, 21.09): stronger than the
+                # pool's median 20d return. Logged only - the closed year is spent, so this can
+                # earn its place on live outcomes alone.
+                r20 = [details[s].get("ret20") for s in details if details[s].get("ret20") is not None]
+                if r20:
+                    med = sorted(r20)[len(r20) // 2]
+                    kept_rs = [x for x in to_open if (details[x].get("ret20") or -1e9) >= med]
+                    log("shadow rel-strength: %d of %d entr(ies) at/above the pool median 20d "
+                        "(%+.1f%%): %s" % (len(kept_rs), len(to_open), med * 100,
+                                           ",".join(kept_rs) or "-"), logpath)
+            if cut_overhang or cut_volmax:
+                log("gates cut: no-overhang %d (%s); vol-cap %d (%s)"
+                    % (len(cut_overhang), ",".join(cut_overhang) or "-",
+                       len(cut_volmax), ",".join(cut_volmax) or "-"), logpath)
             if regime == "BEAR" and to_open:
                 if gate == "cash":
                     log("regime BEAR, gate cash: suppressing %d entry(ies) (%s)"
