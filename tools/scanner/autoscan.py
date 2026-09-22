@@ -186,7 +186,8 @@ def read_env(repo):
               "BINANCE_REAL_API_KEY", "BINANCE_REAL_API_SECRET",
               "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE",
               "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR", "LOT_ROUND_UP",
-              "BEAR_UNIVERSE", "BEAR_DAY_PCT", "ENTRY_NEAR_HIGH90", "ENTRY_VOL_MAX"):
+              "BEAR_UNIVERSE", "BEAR_DAY_PCT", "ENTRY_NEAR_HIGH90", "ENTRY_VOL_MAX",
+              "SHORT_ARMED", "SHORT_LOW_DAYS", "SHORT_BTC_SMA_DAYS"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
@@ -568,6 +569,10 @@ def evaluate(sym, lookback, dip_depth, live_price):
             "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio,
             "from_high90": (1 - price / hi90) if hi90 > 0 else None,
             "ret20": (price / base20 - 1.0) if base20 > 0 else None,
+            # COMPLETED bars only: bars[-1] is today's partial bar and its low already
+            # contains the live price, so a "below the 5-day low" test that included it
+            # could almost never be true.
+            "lows_done": [float(b[3]) for b in bars[-21:-1]],
             "closes": [float(b[4]) for b in bars[-61:]]}
 
 
@@ -594,6 +599,53 @@ def entry_gates(m, trig, near_high_max, vol_mult_min, near_high90_max, vol_max):
         if not (vr is not None and vr <= vol_max):
             return False, "volmax"
     return passes, None
+
+
+def btc_below_sma(closes, days):
+    """True when BTC's latest close sits below its own `days`-day average, None when the
+    series is too short to judge. `closes` is what btc_regime() already fetched, so the bear
+    arm costs no extra request. Unreadable is NOT a bear signal - the caller stays out."""
+    if not closes or len(closes) < days + 1:
+        return None
+    window = closes[-days:]
+    return closes[-1] < sum(window) / float(len(window))
+
+
+def short_gate(m, low_days, btc_below):
+    """The bear arm's entry (measured 22.09): a breakdown of the N-day low while BTC trades
+    below its 50-day average. BOTH halves are required. Without the BTC half the arm bleeds
+    in a bull market (-37.3% over 4.8 years, -$10.67/yr at $137); without the breakdown it
+    has no trigger. Five tighter variants and three "strength of the drop" filters were
+    measured the same day and every one of them cost more in the bear phase than it saved
+    in the bull - so this gate stays exactly this simple."""
+    if not btc_below:
+        return False
+    lows = m.get("lows_done") or []
+    if len(lows) < low_days or m.get("price", 0) <= 0:
+        return False
+    return m["price"] < min(lows[-low_days:])
+
+
+def holds(side, m, exit_band):
+    """Whether a HELD position stays held this pass, judged by the side it actually is.
+
+    A long holds while the coin has not fallen through -exit_band, or while it is still a
+    dip. Its mirror holds while the coin has not rallied through +exit_band. This is the
+    whole point of reading the side off the exchange: `to_close = held - hold_ok`, so a
+    short judged by the long branch would be closed exactly when it starts to win - the
+    coin falls, the long rule says "not holding", and the scanner writes a CLOSE on a
+    winning position. `side` is None for anything not currently held, which lands on the
+    long branch and leaves the old behaviour untouched.
+
+    A SHORT has NO signal exit. The bear arm was measured with three exits only - the stop,
+    the take and the 48h cap - and its entry (a breakdown of the 5-day low) never reads the
+    30-day return this band is built from. Judging it by that band was a bug the 22.09 review
+    caught: a coin whose 30d return is still above +band enters and is immediately outside
+    the hold test, so the scanner closed it at --min-hold-hours (24) regardless of profit,
+    at half the measured life. Max-hold below still ends it at 48h."""
+    if side == "SHORT":
+        return True
+    return m["ret"] > -exit_band or bool(m["dip"])
 
 
 def corr60(a, b, n=60):
@@ -780,6 +832,25 @@ def main():
     # drawdown by definition and is never gated by either.
     near_high90_max = _float_env("ENTRY_NEAR_HIGH90")
     vol_max = _float_env("ENTRY_VOL_MAX")
+    #   SHORT_ARMED=on          arms the bear arm: shorts the breakdown of the 5-day low
+    #                           while BTC is below its 50-day average, 48h max hold.
+    # DEFAULT OFF. Measured 22.09 on the cap-100 pool: alone +44.3% over 4.8 years (t 1.25),
+    # beside the live long rule +141.2% at t 2.28 against the long rule's own +66.6%/2.03 -
+    # but 38 bp per dollar of exposure against the long arm's 71, and its whole contribution
+    # is 2021-2023. It employs the money the long rule leaves idle in a bear phase; it is not
+    # a second income, and it is the owner's switch to throw, not the scanner's.
+    short_armed = env.get("SHORT_ARMED", "").strip().lower() in ("on", "1", "true", "yes")
+    def _int_env(name, default, lo, hi):
+        """A bad value must never take the scanner down on start - nan/inf reach int() alive."""
+        try:
+            v = int(_float_env(name) or default)
+        except (ValueError, OverflowError):
+            v = default
+        if not lo <= v <= hi:
+            v = default
+        return v
+    short_low_days = _int_env("SHORT_LOW_DAYS", 5, 2, 20)    # lows_done carries 20 completed bars
+    short_sma_days = _int_env("SHORT_BTC_SMA_DAYS", 50, 10, 60)  # closes carries 61 daily closes
     # LOT_ROUND_UP=on (or a fraction): when the lot-floored size is refused by the exchange's $5
     # minimum, one step UP is allowed inside this risk tolerance - mirrors RiskEngine step 9b, so
     # the scanner and the bot agree on what is sizeable. 'on' = 0.20; unset/off = never.
@@ -818,14 +889,22 @@ def main():
         raise SystemExit("missing %s/%s in local.env for --venue %s"
                          % (KEY_ENV[0], SECRET_ENV[0], args.venue))
     state = load_state(statepath)
+    if short_armed and max_hold_hours is None:
+        # The bear arm has no signal exit by design (its entry never reads the 30d band),
+        # so MAX_HOLD_HOURS is the only exit the SCANNER can give it. Without the cap a
+        # short rides to its stop or its take and nothing else - say so out loud.
+        log("SHORT_ARMED is on but MAX_HOLD_HOURS is unset: shorts will be left to the "
+            "exchange stop and take only, with no 48h cap. Set MAX_HOLD_HOURS=48.", logpath)
     log("autoscan start: venue=%s top=%d by_cap=%s lookback=%dd dip=%.0f%% bands=+%.0f%%/-%.0f%% "
         "interval=%ds max_pos=%d min_hold=%.0fh regime_gate=%s near_high=%s vol_mult=%s max_hold=%s "
-        "max_corr=%s near_high90=%s vol_max=%s bear_universe=%s"
+        "max_corr=%s near_high90=%s vol_max=%s bear_universe=%s short=%s"
         % (args.venue, args.top, args.by_cap, args.lookback, args.dip_depth * 100,
            args.entry_band * 100, args.exit_band * 100, args.interval,
            args.max_positions, args.min_hold_hours, gate, near_high_max, vol_mult_min, max_hold_hours,
            max_corr, near_high90_max, vol_max,
-           ("on top-%d @ %+.1f%%" % (bear_top, bear_day_pct * 100)) if bear_universe else "off"),
+           ("on top-%d @ %+.1f%%" % (bear_top, bear_day_pct * 100)) if bear_universe else "off",
+           ("ARMED: %d-day low, BTC below %dd" % (short_low_days, short_sma_days))
+           if short_armed else "off"),
         logpath)
 
     while True:
@@ -871,6 +950,12 @@ def main():
             try:
                 rows = signed_get("/fapi/v2/positionRisk", env)
                 held = {r["symbol"] for r in rows if float(r["positionAmt"]) != 0}
+                # The SIDE comes from the exchange, never from local state: a position
+                # carried across a restart or a move between machines must still be judged
+                # by the rule that fits it. A long judged as a short (or the reverse) would
+                # be closed by `to_close = held - hold_ok` exactly when it is winning.
+                held_side = {r["symbol"]: ("LONG" if float(r["positionAmt"]) > 0 else "SHORT")
+                             for r in rows if float(r["positionAmt"]) != 0}
                 held_since = {r["symbol"]: float(r.get("updateTime", 0)) / 1000.0
                               for r in rows if float(r["positionAmt"]) != 0 and r.get("updateTime")}
                 # ADOPTION (30.08). max-hold only ever fired for symbols in `entered`, and that
@@ -888,7 +973,7 @@ def main():
                     stamp = time.time()
                     for _s in _orphans:
                         _entered[_s] = stamp
-                        _trig[_s] = "trend"
+                        _trig[_s] = "short" if held_side.get(_s) == "SHORT" else "trend"
                     save_state(statepath, state)
                     log("adopted %d position(s) the risk core owns but this scanner had no clock "
                         "for: %s - max-hold now applies to them from this moment"
@@ -1003,7 +1088,14 @@ def main():
                 save_state(statepath, state)
 
             entry_ok, hold_ok, details = set(), set(), {}
+            short_ok = set()                    # bear-arm candidates this pass
             cut_overhang, cut_volmax = [], []   # what the 21.09 gates removed this pass
+            # One reading of the bear regime per pass, from the closes btc_regime() already
+            # fetched. None (series too short / unreadable) keeps the bear arm OUT.
+            btc_below = btc_below_sma(btc_closes, short_sma_days) if short_armed else False
+            if short_armed and btc_below is None:
+                log("bear arm armed but BTC history is too short to judge the %dd average"
+                    " - no shorts this pass" % short_sma_days, logpath)
             # A held coin that drops out of the top list must still be judged by the rule,
             # never by list membership: to_close = held - hold_ok, so leaving it unevaluated
             # would close it for falling off CoinGecko's page.
@@ -1072,7 +1164,14 @@ def main():
                             cut_volmax.append(sym)
                         if passes:
                             entry_ok.add(sym)
-                if m["ret"] > -args.exit_band or m["dip"]:
+                if (short_armed and sym != "BTCUSDT" and sym not in held
+                        and m["price"] > STOP_ATR_MULT * m["atr"]
+                        and short_gate(m, short_low_days, btc_below)):
+                    short_ok.add(sym)
+                # Judged by the side it actually IS. The long rule holds while the coin has
+                # not fallen; its mirror holds while the coin has not rallied. Running a
+                # short through the long branch would close it the moment it started to win.
+                if holds(held_side.get(sym), m, args.exit_band):
                     hold_ok.add(sym)
 
             # A cut-short sweep must never close a position it simply did not get to. to_close is
@@ -1095,6 +1194,9 @@ def main():
             # No shadow line when the switch is off: the deeper list is not fetched then, so
             # any "would have" would be computed from the top-100 and would be a lie.
             entry_pool = {sym for sym, _ in pool}
+            # Kept before BEAR_UNIVERSE may swap entry_pool below: that swap was measured for
+            # the long arm only, and the bear arm was measured on the cap-100 pool itself.
+            base_pool = set(entry_pool)
             if bear_day and not btc_closes:
                 # No BTC reference means no correlation. corr60 fails OPEN at 0.0, which in a
                 # ranking sorts an unmeasurable coin FIRST - so a single failed BTC read would
@@ -1167,7 +1269,9 @@ def main():
                 for s in sorted(held):
                     if s in to_close or s not in entered:
                         continue
-                    if entered_trig.get(s, "trend") != "trend":
+                    # "short" belongs here: the bear arm was measured with a 48h cap as part
+                    # of the rule, not as an afterthought. Dip entries are still exempt.
+                    if entered_trig.get(s, "trend") not in ("trend", "short"):
                         continue
                     if now - entered[s] >= max_hold_hours * 3600:
                         to_close.append(s)
@@ -1181,6 +1285,12 @@ def main():
             fresh = [s for s in sorted((entry_ok & entry_pool) - held,
                                        key=lambda s: -details[s]["ret"])
                      if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
+            # The bear arm goes through the SAME funnel: same pool, same held and cooldown
+            # rules, same sizing test below. Weakest 30d return first - the mirror of
+            # "strongest trend first", so the slot budget goes to the deepest breakdown.
+            fresh_short = [s for s in sorted((short_ok & base_pool) - held,
+                                             key=lambda s: details[s]["ret"])
+                           if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
             # The funnel, every pass, so "nothing to do" is never a mystery again. On 03.09 it
             # took an offline replay to learn that 32 entry-ok coins met a 34-coin bear pool in
             # 5 names, all of them unsizeable, while every real momentum name sat outside the
@@ -1227,6 +1337,13 @@ def main():
                     log("%d candidate(s) too wide to size at this equity (risk $%.2f vs min notional): %s"
                         % (len(infeasible), risk_usd, ",".join(infeasible[:12])), logpath)
                 fresh = [sym for sym in fresh if sym not in set(infeasible)]
+                if fresh_short:
+                    short_wide = [sym for sym in fresh_short if not feasible(sym)]
+                    if short_wide:
+                        log("bear arm: %d candidate(s) too wide to size at this equity"
+                            " (risk $%.2f vs min notional): %s"
+                            % (len(short_wide), risk_usd, ",".join(short_wide[:12])), logpath)
+                    fresh_short = [sym for sym in fresh_short if sym not in set(short_wide)]
             # Fifteen versions of the same bet is how a red day costs -5%: the correlation
             # filter keeps a candidate out while it moves in lockstep with something already
             # held. Off (MAX_CORR unset) it only reports; the shadow line below is forward
@@ -1296,12 +1413,32 @@ def main():
                 else:
                     log("regime BEAR, gate off: a cash gate would have suppressed %d entry(ies) (%s)"
                         % (len(to_open), ",".join(to_open)), logpath)
+            # REGIME_GATE=cash above governs the LONG arm, which is what it was measured as
+            # ("staying out of BEAR"). The bear arm carries its own BTC gate and is the one
+            # thing meant to work in that regime, so the cash gate does not touch it.
             if halted and to_open:
                 log("halt: suppressing %d entry(ies) (%s); exits keep working"
                     % (len(to_open), ",".join(to_open)), logpath)
                 to_open = []
+            # ONE book, one slot budget, and the bear arm is cut LAST - after the regime gate
+            # and the halt have taken their entries away, so it is sized against what the long
+            # arm actually opens, and never on a symbol that arm is buying this same pass.
+            to_open_short = []
+            if short_armed and not halted:
+                buying = set(to_open)
+                room_short = max(0, room - len(to_open))
+                to_open_short = [x for x in fresh_short if x not in buying][:room_short]
+                if to_open_short:
+                    log("bear arm: %d short(s) proposed (%s); BTC below its %dd average"
+                        % (len(to_open_short), ",".join(to_open_short), short_sma_days), logpath)
+                both = sorted(buying & set(fresh_short))
+                if both:
+                    log("bear arm: %d coin(s) wanted by BOTH arms this pass - the long wins, "
+                        "the short is dropped: %s" % (len(both), ",".join(both)), logpath)
+            elif short_armed and halted:
+                log("halt: the bear arm proposes nothing either", logpath)
 
-            if not to_close and not to_open:
+            if not to_close and not to_open and not to_open_short:
                 log("scan: %d held, %d hold-ok, %d entry-ok, nothing to do"
                     % (len(held), len(hold_ok), len(entry_ok)), logpath)
             else:
@@ -1332,10 +1469,22 @@ def main():
                                    snapshot_at))
                         entered[s] = now
                         entered_trig[s] = trig
+                    for s in to_open_short:
+                        m = details[s]
+                        # Same line, one word different: the bot reads it with Side.valueOf,
+                        # puts the stop ABOVE entry for a SHORT and sizes it from the same
+                        # ATR. The "short" label is what the max-hold rule reads back.
+                        f.write("%s SHORT entry=%.10g atr=%.10g lev=%d id=auto-short-%s-%s"
+                                " ts=%d\n"
+                                % (s, m["price"], m["atr"], args.leverage, s, stamp,
+                                   snapshot_at))
+                        entered[s] = now
+                        entered_trig[s] = "short"
                 save_state(statepath, state)
-                log("scan: %d held -> closing %d (%s), opening %d (%s)"
+                log("scan: %d held -> closing %d (%s), opening %d long (%s), %d short (%s)"
                     % (len(held), len(to_close), ",".join(to_close) or "-",
-                       len(to_open), ",".join(to_open) or "-"), logpath)
+                       len(to_open), ",".join(to_open) or "-",
+                       len(to_open_short), ",".join(to_open_short) or "-"), logpath)
         except Exception as e:
             log("scan error %r; continuing" % (e,), logpath)
             if not state.get("error_streak"):
