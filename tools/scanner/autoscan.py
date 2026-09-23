@@ -86,7 +86,15 @@ _log_broken = [False]
 
 def log(msg, path):
     line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-    print(line, flush=True)
+    # The console may not speak UTF-8 (a Windows laptop defaults to cp1251). Since Binance listed
+    # perps with CJK tickers, the "skipping non-ASCII symbols" line killed the laptop scanner with a
+    # UnicodeEncodeError on print (live demo test 23.09) - the backup machine would not have come up.
+    # The file below is always UTF-8; only the console copy degrades.
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
     # Best effort, like the bot's own journal: a full or read-only volume must not take the
     # scanner down - and with it the whole container, so the JVM re-booted (reconcile, alerts,
     # book replay) every few minutes for as long as the disk stayed full (audit 06.09).
@@ -187,7 +195,7 @@ def read_env(repo):
               "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REGIME_GATE", "RISK_PER_TRADE",
               "ENTRY_NEAR_HIGH", "ENTRY_VOL_MULT", "MAX_HOLD_HOURS", "MAX_CORR", "LOT_ROUND_UP",
               "BEAR_UNIVERSE", "BEAR_DAY_PCT", "ENTRY_NEAR_HIGH90", "ENTRY_VOL_MAX",
-              "SHORT_ARMED", "SHORT_LOW_DAYS", "SHORT_BTC_SMA_DAYS"):
+              "SHORT_ARMED", "SHORT_LOW_BARS", "SHORT_BTC_SMA_DAYS"):
         v = os.environ.get(k)
         if v:
             env[k] = v.strip()
@@ -569,10 +577,6 @@ def evaluate(sym, lookback, dip_depth, live_price):
             "from_high": (1 - price / hi20) if hi20 > 0 else None, "vol_ratio": vol_ratio,
             "from_high90": (1 - price / hi90) if hi90 > 0 else None,
             "ret20": (price / base20 - 1.0) if base20 > 0 else None,
-            # COMPLETED bars only: bars[-1] is today's partial bar and its low already
-            # contains the live price, so a "below the 5-day low" test that included it
-            # could almost never be true.
-            "lows_done": [float(b[3]) for b in bars[-21:-1]],
             "closes": [float(b[4]) for b in bars[-61:]]}
 
 
@@ -611,19 +615,88 @@ def btc_below_sma(closes, days):
     return closes[-1] < sum(window) / float(len(window))
 
 
-def short_gate(m, low_days, btc_below):
-    """The bear arm's entry (measured 22.09): a breakdown of the N-day low while BTC trades
-    below its 50-day average. BOTH halves are required. Without the BTC half the arm bleeds
-    in a bull market (-37.3% over 4.8 years, -$10.67/yr at $137); without the breakdown it
-    has no trigger. Five tighter variants and three "strength of the drop" filters were
-    measured the same day and every one of them cost more in the bear phase than it saved
-    in the bull - so this gate stays exactly this simple."""
-    if not btc_below:
-        return False
-    lows = m.get("lows_done") or []
-    if len(lows) < low_days or m.get("price", 0) <= 0:
-        return False
-    return m["price"] < min(lows[-low_days:])
+# The bear arm reads 4h bars - the timeframe it was MEASURED on. The daily-bar version of the
+# same idea shipped first (eb0a13a) and, measured faithfully on 22.09, returned -6.7% over 4.8
+# years and made the long book WORSE (+55.8% t 1.27 DD -19.0% against the long rule's own
+# +66.6% t 2.03 DD -13.9%): a daily close under the 5-day low arrives a day late and sells the
+# bounce. On 4h bars, with the bot's shared 1.75R take, the arm returns +28.0% and the book
+# +113.9% t 2.01. The stop width is the same either way (~20% median).
+SHORT_BARS_4H = 99           # 30 for the breakdown window, the rest to settle Wilder's ATR (99 = weight 1)
+SHORT_STOP_ATR4H_MULT = 6.0  # the measured stop: 6 x ATR(14) on 4h bars
+SHORT_LIQ_BUFFER = 0.30      # RiskConstants.MIN_LIQUIDATION_BUFFER_FRACTION: |stop-liq| >= 0.30|entry-liq|
+SHORT_MMR_ASSUMED = 0.05     # worst first-bracket maintenance rate among the pool's alts; a real MMR
+                             # below it only skips a short the bot would have taken - the safe side
+SHORT_FRESH_MIN = 90         # act only on a 4h bar that closed at most this long ago
+
+
+def evaluate_4h(sym, low_bars, now_ms=None):
+    """The bear arm's own reading of one coin, decided on COMPLETED 4h bars exactly like the
+    lab: a breakdown is the last completed close under the lowest low of the `low_bars` bars
+    before it (lab prior_low). bars[-1] is the 4h bar still forming and is never read.
+
+    `fresh` is False when that completed bar closed more than SHORT_FRESH_MIN ago: the lab
+    fills at the next 4h open, so a breakdown first seen three hours late is not the trade
+    that was measured - it is a later, different one. None on missing or short data."""
+    bars = get("/fapi/v1/klines", {"symbol": sym, "interval": "4h", "limit": SHORT_BARS_4H})
+    if not bars or len(bars) < low_bars + ATR_PERIOD + 3:
+        return None
+    done = bars[:-1]
+    close = float(done[-1][4])
+    ref_low = min(float(b[3]) for b in done[-(low_bars + 1):-1])
+    a = atr(done, ATR_PERIOD)
+    if a is None or a <= 0 or close <= 0 or ref_low <= 0:
+        return None
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    age_min = (now_ms - int(done[-1][6])) / 60000.0
+    return {"close4h": close, "ref_low4h": ref_low, "atr4h": a,
+            "broke": close < ref_low, "fresh": age_min <= SHORT_FRESH_MIN, "age_min": age_min}
+
+
+def short_gate(s4, btc_below):
+    """Both halves, as measured: BTC below its 50-day average AND a fresh 4h breakdown. Five
+    tighter gates and three "strength of the drop" filters were measured on 22.09 and every
+    one of them cost more in the bear phase than it saved in the bull - it stays this simple."""
+    return bool(btc_below and s4 and s4["broke"] and s4["fresh"])
+
+
+def short_max_stop_frac(leverage):
+    """The widest stop (fraction of entry) the bot will accept on a SHORT at this leverage.
+
+    RiskEngine step 11 refuses a stop that leaves under 30% of the entry-to-liquidation distance
+    (LIQUIDATION_BUFFER). For an isolated short, liq = entry x (1 + 1/lev - fee) / (1 + MMR), so the
+    stop may sit at most 0.7 x that distance above entry: ~30% at 2x with MMR 5%. The 23.09 review
+    caught the scanner capping at 50% only (the shared 1.75R take's limit): from a ~$285 deposit
+    it would write shorts with 33-50% stops that the bot refuses, each spending a slot and a 2h
+    rest. The 0.5 cap stays as the outer bound that keeps the 1.75R take above zero at 1x."""
+    lev = max(1.0, float(leverage))
+    liq = (1.0 + 1.0 / lev - 0.0005) / (1.0 + SHORT_MMR_ASSUMED) - 1.0
+    return min(0.5, (1.0 - SHORT_LIQ_BUFFER) * liq)
+
+
+def next_wait(interval, align_4h, pass_start_s, now_s, lead_s=120):
+    """Seconds to sleep after a pass.
+
+    Normally the flat interval - with the bear arm off, or BTC above its average, EXACTLY as before.
+    While the arm is armed and its gate is open, the scanner does not drift against the 4h UTC
+    closes: the arm was measured filling at the open of the bar after the breakdown, and a pass
+    landing anywhere up to an hour later trades a later, weaker version of that rule (23.09 review:
+    a 1h delay cut the measured edge by ~40% in an independent per-trade re-sim, paired t 5.28).
+    So: if this pass began before the latest 4h close could be read, run again in 30 s; otherwise
+    sleep no longer than the next 4h close + lead_s."""
+    if not align_4h:
+        return interval
+    period = 4 * 3600
+    last_close = now_s - (now_s % period)
+    if pass_start_s < last_close + 20:          # 20 s for the exchange to roll the bar
+        return 30
+    return max(30, min(interval, last_close + period + lead_s - now_s))
+
+
+def short_line_atr(s4):
+    """The atr= written on a SHORT line. The bot places its stop at STOP_ATR_MULT x atr, so the
+    scanner scales the value to land that stop at SHORT_STOP_ATR4H_MULT x ATR4h - the stop the
+    arm was measured with - without touching the risk core."""
+    return SHORT_STOP_ATR4H_MULT * s4["atr4h"] / STOP_ATR_MULT
 
 
 def holds(side, m, exit_band):
@@ -849,7 +922,7 @@ def main():
         if not lo <= v <= hi:
             v = default
         return v
-    short_low_days = _int_env("SHORT_LOW_DAYS", 5, 2, 20)    # lows_done carries 20 completed bars
+    short_low_bars = _int_env("SHORT_LOW_BARS", 30, 6, 60)   # 4h bars; 30 = 5 days, as measured
     short_sma_days = _int_env("SHORT_BTC_SMA_DAYS", 50, 10, 60)  # closes carries 61 daily closes
     # LOT_ROUND_UP=on (or a fraction): when the lot-floored size is refused by the exchange's $5
     # minimum, one step UP is allowed inside this risk tolerance - mirrors RiskEngine step 9b, so
@@ -903,11 +976,14 @@ def main():
            args.max_positions, args.min_hold_hours, gate, near_high_max, vol_mult_min, max_hold_hours,
            max_corr, near_high90_max, vol_max,
            ("on top-%d @ %+.1f%%" % (bear_top, bear_day_pct * 100)) if bear_universe else "off",
-           ("ARMED: %d-day low, BTC below %dd" % (short_low_days, short_sma_days))
+           ("ARMED: 4h breakdown of %d bars, stop %.0fxATR4h, BTC below %dd"
+            % (short_low_bars, SHORT_STOP_ATR4H_MULT, short_sma_days))
            if short_armed else "off"),
         logpath)
 
+    bear_gate_open = False          # the bear gate as last read; drives only the post-pass sleep
     while True:
+        pass_start = time.time()
         try:
             halted = bot_is_halted(args.bot_log)
             if halted and halt_reason_is_observe(args.bot_log):
@@ -1007,6 +1083,7 @@ def main():
                                               args.min_volume, args.by_cap,
                                               cached_cap=state.get("cap_pool"), logpath=logpath)
             pool = wide_pool[:args.top]
+            top_syms = {sym for sym, _ in pool}
             if not pool:
                 log("universe empty (no exchangeInfo/CoinGecko answer and no cached list); skipping", logpath)
                 if not state.get("told_universe_empty"):
@@ -1093,6 +1170,7 @@ def main():
             # One reading of the bear regime per pass, from the closes btc_regime() already
             # fetched. None (series too short / unreadable) keeps the bear arm OUT.
             btc_below = btc_below_sma(btc_closes, short_sma_days) if short_armed else False
+            bear_gate_open = bool(btc_below)
             if short_armed and btc_below is None:
                 log("bear arm armed but BTC history is too short to judge the %dd average"
                     " - no shorts this pass" % short_sma_days, logpath)
@@ -1164,10 +1242,19 @@ def main():
                             cut_volmax.append(sym)
                         if passes:
                             entry_ok.add(sym)
-                if (short_armed and sym != "BTCUSDT" and sym not in held
-                        and m["price"] > STOP_ATR_MULT * m["atr"]
-                        and short_gate(m, short_low_days, btc_below)):
-                    short_ok.add(sym)
+                # 4h klines are fetched ONLY while the bear gate is open: in a bull market the
+                # arm costs not one extra request.
+                # Only coins of the top-100 itself: the arm draws from base_pool, so on a red day
+                # with BEAR_UNIVERSE=on the ~200 deeper coins would be fetched and thrown away.
+                if (short_armed and btc_below and sym != "BTCUSDT" and sym not in held
+                        and sym in top_syms):
+                    s4 = evaluate_4h(sym, short_low_bars)
+                    if short_gate(s4, btc_below):
+                        line_atr = short_line_atr(s4)
+                        if (STOP_ATR_MULT * line_atr
+                                <= short_max_stop_frac(args.leverage) * m["price"]):
+                            m["short_atr"] = line_atr
+                            short_ok.add(sym)
                 # Judged by the side it actually IS. The long rule holds while the coin has
                 # not fallen; its mirror holds while the coin has not rallied. Running a
                 # short through the long branch would close it the moment it started to win.
@@ -1303,14 +1390,14 @@ def main():
                    ("; strongest OUTSIDE the pool: " + ",".join(_outside[:6])) if _outside else ""),
                 logpath)
             if risk_usd:
-                def feasible(sym):
+                def feasible(sym, atr_value=None):
                     # The bot's arithmetic, not an approximation of it: quantity = risk / stop
                     # distance, FLOORED to the lot step, then the notional check. The unrounded
                     # notional cleared $5 for TWTUSDT five passes running while the floored one
                     # was $4.83, and each of those passes spent its slot on a line that could never
                     # fill (audit 03.09).
                     m = details[sym]
-                    distance = STOP_ATR_MULT * m["atr"]
+                    distance = STOP_ATR_MULT * (m["atr"] if atr_value is None else atr_value)
                     if distance <= 0 or m["price"] <= 0:
                         return False
                     qty = risk_usd / distance
@@ -1338,7 +1425,8 @@ def main():
                         % (len(infeasible), risk_usd, ",".join(infeasible[:12])), logpath)
                 fresh = [sym for sym in fresh if sym not in set(infeasible)]
                 if fresh_short:
-                    short_wide = [sym for sym in fresh_short if not feasible(sym)]
+                    short_wide = [sym for sym in fresh_short
+                                  if not feasible(sym, details[sym]["short_atr"])]
                     if short_wide:
                         log("bear arm: %d candidate(s) too wide to size at this equity"
                             " (risk $%.2f vs min notional): %s"
@@ -1476,7 +1564,7 @@ def main():
                         # ATR. The "short" label is what the max-hold rule reads back.
                         f.write("%s SHORT entry=%.10g atr=%.10g lev=%d id=auto-short-%s-%s"
                                 " ts=%d\n"
-                                % (s, m["price"], m["atr"], args.leverage, s, stamp,
+                                % (s, m["price"], m["short_atr"], args.leverage, s, stamp,
                                    snapshot_at))
                         entered[s] = now
                         entered_trig[s] = "short"
@@ -1498,7 +1586,7 @@ def main():
             if state.get("error_streak"):
                 state["error_streak"] = 0
                 save_state(statepath, state)
-        time.sleep(args.interval)
+        time.sleep(next_wait(args.interval, short_armed and bear_gate_open, pass_start, time.time()))
 
 
 if __name__ == "__main__":
