@@ -390,7 +390,14 @@ def settle_bookkeeping(state, held, feedback, owned, now, interval, cooldown_hou
     # A refusal earns the coin a rest: six hours for a sizing refusal (equity does not change by
     # the hour), two for anything else.
     for sym, reason in rejected.items():
-        sizing = (reason.startswith("BELOW_MIN_NOTIONAL") or reason.startswith("BELOW_MIN_QUANTITY")
+        if reason.startswith("TRADING_HALTED"):
+            # The daily loss limit refuses EVERY line until 00:00 UTC - the coin did nothing to earn
+            # a rest. Resting it made the first passes after midnight skip the very coins the list
+            # was made of (23.09: PENGU, ASTER, POL, CC refused at 14:43, then again every hour).
+            say("%s: refused while the bot is halted (%s) - no rest, the coin is not the reason"
+                % (sym, reason[:80]))
+            continue
+        sizing =(reason.startswith("BELOW_MIN_NOTIONAL") or reason.startswith("BELOW_MIN_QUANTITY")
                   or (reason.startswith("EXCHANGE_REFUSED") and "-4164" in reason))
         rest = (6 if sizing else 2) * 3600
         cooldown[sym] = max(cooldown.get(sym, 0), now - cooldown_hours * 3600 + rest)
@@ -791,6 +798,296 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
+# ---- the scanner view (23.09) -------------------------------------------------------------------
+# What the scanner SAW, for the bot's Telegram screens. The owner could always see the book but
+# never the queue behind it: "why is nothing opening?" took an offline replay on 03.09 and a
+# 22-agent audit on 16.09, and both answers were already in this process's memory. One JSON file
+# per pass, beside the state, read by the bot as optional (SCANNER VIEW CONTRACT, v1).
+#
+# Nothing below may steer a decision. It runs after the pass has decided and written its lines,
+# every exception is swallowed with one log line per pass, and the only state it owns is the
+# "why" key - the entry reasons of what this scanner opened, kept until the position is gone.
+VIEW_FILE = "scanner_view.json"
+VIEW_VERSION = 1
+VIEW_QUEUE_MAX = 30
+VIEW_REASONS = ("book_full", "too_wide", "cooldown", "corr", "outside_pool", "halt", "regime",
+                "other")
+
+
+def _iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _num(x):
+    """A finite number as JSON, else null. Eight significant digits: enough for a 1000PEPE price
+    and a 30d return alike. NaN/inf must never reach the file - the bot's JSON parser is strict."""
+    if x is None or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    return float("%.8g" % v)
+
+
+def _stop_frac(m, line_atr):
+    try:
+        return _num(STOP_ATR_MULT * float(line_atr) / float(m["price"]))
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return None
+
+
+def _view_note(reason, stop_frac=None):
+    if reason == "book_full":
+        return "нет свободного места"
+    if reason == "too_wide":
+        return ("стоп %.1f%%: не по депозиту" % (stop_frac * 100)) if stop_frac else "стоп не по депозиту"
+    if reason == "cooldown":
+        return "пауза после выхода или отказа"
+    if reason == "corr":
+        return "ходит вместе с открытыми"
+    if reason == "outside_pool":
+        return "вне пула этого прохода"
+    if reason == "halt":
+        return "бот на паузе"
+    if reason == "regime":
+        return "BTC в минусе за 30д, гейт cash"
+    return "причина не определена"
+
+
+def _corr_skipped(pre, kept, room):
+    """Which symbols the MAX_CORR loop in main() skipped, from its input and output alone. The loop
+    walks `pre` in order and stops the moment `kept` reaches the room, so everything after the last
+    kept symbol was never looked at (book_full), and everything before it that is not kept was a
+    correlation skip. When the room was never reached, the loop saw the whole list."""
+    if kept and len(kept) >= room:
+        last = pre.index(kept[-1]) if kept[-1] in pre else len(pre) - 1
+        considered = pre[:last + 1]
+    else:
+        considered = pre
+    kept_set = set(kept)
+    return {s for s in considered if s not in kept_set}
+
+
+def view_queue(pv):
+    """Every symbol that passed an entry gate this pass and was NOT opened, with the gate that
+    stopped it, in the scanner's own order: the long funnel (strongest 30d first) that gets the
+    room first, then the bear arm (weakest first), then long signals outside the entry pool (never
+    in the funnel at all). Held symbols are not waiting for anything and are left out.
+
+    Each reason is read off the snapshots main() took between the funnel's steps, in the order the
+    steps run; whatever cannot be placed from them is "other" rather than a guess."""
+    details = pv.get("details") or {}
+    held = pv.get("held") or set()
+    entry_ok = pv.get("entry_ok") or set()
+    entry_pool = pv.get("entry_pool")
+    halted = bool(pv.get("halted"))
+
+    def ret_of(s):
+        r = (details.get(s) or {}).get("ret")
+        return r if isinstance(r, (int, float)) and math.isfinite(r) else 0.0
+
+    def row(sym, side, trig, reason, line_atr, note=None):
+        m = details.get(sym) or {}
+        sf = _stop_frac(m, line_atr)
+        return {"symbol": sym, "side": side, "trig": trig, "reason": reason,
+                "ret30": _num(m.get("ret")), "from_high20": _num(m.get("from_high")),
+                "vol_ratio": _num(m.get("vol_ratio")), "stop_frac": sf,
+                "note": note or _view_note(reason, sf)}
+
+    out = []
+    # --- the long funnel: pool -> cooldown -> sizing -> MAX_CORR -> room -> regime -> halt ------
+    final = set(pv.get("l_final") or [])
+    in_pool = entry_ok if entry_pool is None else (entry_ok & entry_pool)
+    corr_skip = set()
+    if pv.get("corr_ran") and "l_feas" in pv and "l_corr" in pv:
+        corr_skip = _corr_skipped(pv["l_feas"], pv["l_corr"], pv.get("room") or 0)
+    for s in sorted(in_pool - held - final, key=lambda s: -ret_of(s)):
+        m = details.get(s) or {}
+        steps = [("l_cool", "cooldown"), ("l_feas", "too_wide"), ("l_corr", None),
+                 ("l_room", "book_full"), ("l_regime", "regime"), ("l_final", "halt")]
+        reason = "other"
+        for key, why in steps:
+            if key not in pv:
+                break                          # the pass ended before this step: unknown
+            if s not in pv[key]:
+                reason = why or ("corr" if s in corr_skip else "book_full")
+                break
+        out.append(row(s, "LONG", m.get("trig") or "trend", reason, m.get("atr")))
+    # --- the bear arm: same pool/cooldown/sizing, then halt, the long's claim, the room -------
+    short_ok = pv.get("short_ok") or set()
+    base_pool = pv.get("base_pool")
+    s_final = set(pv.get("s_final") or [])
+    buying = set(pv.get("l_final") or [])
+    s_in = short_ok if base_pool is None else (short_ok & base_pool)
+    for s in sorted(s_in - held - s_final, key=ret_of):
+        m = details.get(s) or {}
+        note = None
+        if "s_cool" not in pv:
+            reason = "other"
+        elif s not in pv["s_cool"]:
+            reason = "cooldown"
+        elif "s_feas" not in pv:
+            reason = "other"
+        elif s not in pv["s_feas"]:
+            reason = "too_wide"
+        elif "s_final" not in pv:
+            reason = "other"
+        elif halted:
+            reason = "halt"
+        elif s in buying:
+            reason, note = "other", "эту монету берёт лонг"
+        else:
+            reason = "book_full"
+        out.append(row(s, "SHORT", "short", reason, m.get("short_atr"), note))
+    for s in sorted(short_ok - s_in - held, key=ret_of):
+        out.append(row(s, "SHORT", "short", "outside_pool", (details.get(s) or {}).get("short_atr")))
+    # --- long signals the entry pool never admitted (a red day's narrow pool) ------------------
+    if entry_pool is not None:
+        for s in sorted(entry_ok - entry_pool - held, key=lambda s: -ret_of(s)):
+            m = details.get(s) or {}
+            out.append(row(s, "LONG", m.get("trig") or "trend", "outside_pool", m.get("atr")))
+    return out[:VIEW_QUEUE_MAX]
+
+
+def _opened_rows(pv):
+    """(symbol, side, trig, line_atr) of every line this pass WROTE, in writing order."""
+    wrote = pv.get("wrote")
+    if not wrote:
+        return []
+    _closes, longs, shorts, _reasons = wrote
+    details = pv.get("details") or {}
+    rows = []
+    for s in longs:
+        m = details.get(s) or {}
+        rows.append((s, "LONG", m.get("trig") or "trend", m.get("atr")))
+    for s in shorts:
+        rows.append((s, "SHORT", "short", (details.get(s) or {}).get("short_atr")))
+    return rows
+
+
+def _close_reason(reason):
+    if reason == "max-hold":
+        return "max-hold"
+    if isinstance(reason, str) and reason.endswith("-exited"):
+        return "exit-band"
+    return "other"
+
+
+def note_why(state, pv):
+    """Record why this pass opened what it opened, and forget the reasons of what is gone.
+    Returns True when state["why"] changed (the caller saves).
+
+    Kept exactly as long as the symbol's entry clock (`entered`): settle_bookkeeping drops the
+    clock on the first pass the exchange says the position is gone, or once a line that never
+    filled is too old to, or when the position turns out to be the owner's - the three ways a
+    position stops being one this scanner opened. A state file from before 23.09 has no key and
+    loads as it always did; the key appears with the first entry."""
+    old = state.get("why")
+    why = dict(old) if isinstance(old, dict) else {}
+    details = pv.get("details") or {}
+    now = pv.get("now") or time.time()
+    for sym, side, trig, line_atr in _opened_rows(pv):
+        m = details.get(sym) or {}
+        why[sym] = {"opened_ts": _iso(now), "side": side, "trig": trig,
+                    "price": _num(m.get("price")), "ret30": _num(m.get("ret")),
+                    "from_high20": _num(m.get("from_high")),
+                    "from_high90": _num(m.get("from_high90")),
+                    "vol_ratio": _num(m.get("vol_ratio")), "atr": _num(line_atr),
+                    "stop_frac": _stop_frac(m, line_atr)}
+    keep = state.get("entered") or {}
+    why = {s: v for s, v in why.items() if s in keep}
+    if not why and "why" not in state:
+        return False
+    if why == old:
+        return False
+    state["why"] = why
+    return True
+
+
+def build_view(pv, state, now, eta):
+    """The whole document, from the pass snapshot. Pure; unknown numbers are null."""
+    held = pv.get("held")
+    closes = pv.get("btc_closes")
+    days = int(pv.get("sma_days") or 50)
+    sma = (sum(closes[-days:]) / float(days)) if closes and len(closes) >= days + 1 else None
+    below = btc_below_sma(closes, days) if closes else None
+    price = pv.get("btc_price") or (closes[-1] if closes else None)
+    wrote = pv.get("wrote")
+    closed = []
+    if wrote:
+        closes_w, _l, _s, reasons = wrote
+        closed = [{"symbol": s, "reason": _close_reason(reasons.get(s, "trend-exited"))}
+                  for s in closes_w]
+    why = state.get("why") if isinstance(state.get("why"), dict) else {}
+    return {
+        "v": VIEW_VERSION,
+        "ts": _iso(now),
+        "next_pass_eta": _iso(eta),
+        "held": len(held) if held is not None else None,
+        "room": pv.get("room"),
+        "max_positions": pv.get("max_positions"),
+        "entry_ok": len(pv["entry_ok"]) if "entry_ok" in pv else None,
+        "hold_ok": len(pv["hold_ok"]) if "hold_ok" in pv else None,
+        "halted": bool(pv.get("halted")),
+        "btc": {"price": _num(price), "sma50": _num(sma),
+                "short_gate_open": None if below is None else bool(below)},
+        "short_armed": bool(pv.get("short_armed")),
+        "queue": view_queue(pv),
+        "opened": [{"symbol": s, "side": side, "trig": trig}
+                   for s, side, trig, _a in _opened_rows(pv)],
+        "closed": closed,
+        "why": {s: dict(v) for s, v in sorted(why.items())},
+    }
+
+
+def write_json_atomic(path, doc):
+    """The whole file or nothing: a tmp beside it, flushed, then one os.replace. The bot reads
+    this file while the scanner writes it; a half-written view must never be what it parses."""
+    tmp = path + ".tmp"
+    try:
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, allow_nan=False, indent=1)
+            f.write("\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def publish_view(viewpath, pv, state, statepath, logpath, wait_s):
+    """End of every pass, idle ones and cut-short ones included. NEVER raises: a broken view costs
+    the owner a screen, never the scanner a pass. `wait_s` is a callable giving the seconds until
+    the next pass (evaluated in here so that it, too, cannot throw into the loop)."""
+    failed = None
+    try:
+        if note_why(state, pv):
+            save_state(statepath, state)
+    except Exception as e:
+        failed = e
+    try:
+        now = time.time()
+        write_json_atomic(viewpath, build_view(pv, state, now, now + float(wait_s())))
+    except Exception as e:
+        failed = failed or e
+    if failed is not None:
+        try:
+            log("view: %s not written (%s: %.160s) - trading unaffected"
+                % (VIEW_FILE, type(failed).__name__, failed), logpath)
+        except Exception:
+            pass
+
+
 def bot_is_ready(bot_log):
     """True once the bot has adopted the account (its first agreed reconcile). Before that it
     may still be booting or sitting out an exchange-side hold, and a line written now would be
@@ -879,6 +1176,7 @@ def main():
     workdir = args.workdir or os.path.join(args.repo, "analysis", "forward")
     logpath = os.path.join(workdir, "autoscan.log")
     statepath = os.path.join(workdir, "autoscan_state.json")
+    viewpath = os.path.join(workdir, VIEW_FILE)
     env = read_env(args.repo)
     gate = args.regime_gate or env.get("REGIME_GATE", "off").lower()
     if gate not in ("off", "cash"):
@@ -984,8 +1282,13 @@ def main():
     bear_gate_open = False          # the bear gate as last read; drives only the post-pass sleep
     while True:
         pass_start = time.time()
+        # What this pass saw, for scanner_view.json. Filled with COPIES beside the decisions and
+        # never read by them; publish_view() turns it into the file at the end of the pass.
+        pv = {"max_positions": args.max_positions, "short_armed": short_armed,
+              "sma_days": short_sma_days}
         try:
             halted = bot_is_halted(args.bot_log)
+            pv["halted"] = halted
             if halted and halt_reason_is_observe(args.bot_log):
                 # REAL_MODE=observe is the operator's own choice of a read-only bot; the scanner
                 # must not drive closes into it. Stand down completely, as before.
@@ -998,6 +1301,7 @@ def main():
                                 "opened or closed until REAL_MODE=trade", logpath)
                     state["told_halted"] = "observe"
                     save_state(statepath, state)
+                publish_view(viewpath, pv, state, statepath, logpath, lambda: min(args.interval, 300))
                 time.sleep(min(args.interval, 300))
                 continue
             if halted:
@@ -1019,6 +1323,7 @@ def main():
                 # Short sleep: the moment the bot adopts the account the next pass should feed it.
                 log("bot not ready (booting, or held by the exchange) - writing nothing this pass",
                     logpath)
+                publish_view(viewpath, pv, state, statepath, logpath, lambda: min(args.interval, 300))
                 time.sleep(min(args.interval, 300))
                 continue
 
@@ -1066,6 +1371,7 @@ def main():
                            % (type(e).__name__, e), logpath)
                 state["fail_streak"] = state.get("fail_streak", 0) + 1
                 save_state(statepath, state)
+                publish_view(viewpath, pv, state, statepath, logpath, lambda: min(args.interval, 300))
                 # Five minutes, not the whole hour: a pass without a position read also managed no
                 # EXITS, and the retry inside signed_get already absorbed the transient case.
                 time.sleep(min(args.interval, 300))
@@ -1075,6 +1381,7 @@ def main():
                        % state["fail_streak"], logpath)
                 state["fail_streak"] = 0
                 save_state(statepath, state)
+            pv["held"] = set(held)
 
             # One call, sliced twice: the bull pool is the head of the same ranked list the
             # bear pool is drawn from, so a bear day costs no extra CoinGecko or exchangeInfo
@@ -1092,6 +1399,7 @@ def main():
                                 "scans are skipped until one answers", logpath)
                     state["told_universe_empty"] = True
                     save_state(statepath, state)
+                publish_view(viewpath, pv, state, statepath, logpath, lambda: min(args.interval, 300))
                 # Five minutes, not an hour: a pass that produced no pool also produced no EXITS,
                 # and one transient refusal should not cost the whole hour's exit management.
                 # Matches the not-ready branch above.
@@ -1145,6 +1453,7 @@ def main():
             # gate ("off") it changes nothing - the log records what a cash gate WOULD have
             # suppressed, which is the paper forward of that gate, for free.
             regime, btc_ret, btc_ret1, btc_closes = btc_regime(args.lookback, live)
+            pv["btc_closes"], pv["btc_price"] = btc_closes, live.get("BTCUSDT")
             # A red BTC day is a different fact from a bear month and drives a different
             # switch. Unreadable => not a bear day: the pool stays where it is rather than
             # swinging on a failed request.
@@ -1270,6 +1579,8 @@ def main():
             if unjudged:
                 log("%d held coin(s) not reached this pass - holding, not judging: %s"
                     % (len(unjudged), ",".join(sorted(unjudged))), logpath)
+            pv["entry_ok"], pv["hold_ok"], pv["short_ok"] = set(entry_ok), set(hold_ok), set(short_ok)
+            pv["details"] = details
 
             if swept >= len(to_evaluate) and state.get("told_sweep_cut"):
                 state["told_sweep_cut"] = False
@@ -1319,8 +1630,10 @@ def main():
                 else:
                     log("bear day, but no coin had a measurable correlation - entry pool unchanged",
                         logpath)
+            pv["entry_pool"], pv["base_pool"] = set(entry_pool), set(base_pool)
 
             now = time.time()
+            pv["now"] = now
             # What the risk core did with the last lines, from the journal on the same volume,
             # read BEFORE the clocks are settled: a fill is proof the coin WAS held, which the
             # hourly sample above misses when a position opens and closes inside one interval.
@@ -1378,6 +1691,7 @@ def main():
             fresh_short = [s for s in sorted((short_ok & base_pool) - held,
                                              key=lambda s: details[s]["ret"])
                            if now - cooldown.get(s, 0) > args.cooldown_hours * 3600]
+            pv["room"], pv["l_cool"], pv["s_cool"] = room, list(fresh), list(fresh_short)
             # The funnel, every pass, so "nothing to do" is never a mystery again. On 03.09 it
             # took an offline replay to learn that 32 entry-ok coins met a 34-coin bear pool in
             # 5 names, all of them unsizeable, while every real momentum name sat outside the
@@ -1432,6 +1746,7 @@ def main():
                             " (risk $%.2f vs min notional): %s"
                             % (len(short_wide), risk_usd, ",".join(short_wide[:12])), logpath)
                     fresh_short = [sym for sym in fresh_short if sym not in set(short_wide)]
+            pv["l_feas"], pv["s_feas"] = list(fresh), list(fresh_short)
             # Fifteen versions of the same bet is how a red day costs -5%: the correlation
             # filter keeps a candidate out while it moves in lockstep with something already
             # held. Off (MAX_CORR unset) it only reports; the shadow line below is forward
@@ -1464,7 +1779,10 @@ def main():
                     if shadow:
                         log("shadow corr-filter 0.75 would skip %d of %d entr(ies): %s"
                             % (len(shadow), min(room, len(fresh)), ",".join(shadow)), logpath)
+            pv["l_corr"] = list(fresh)
+            pv["corr_ran"] = max_corr is not None and bool(pv["l_feas"]) and room > 0
             to_open = fresh[:room]
+            pv["l_room"] = list(to_open)
             if to_open:
                 def near_high(sym):
                     fh = details[sym].get("from_high")
@@ -1504,10 +1822,12 @@ def main():
             # REGIME_GATE=cash above governs the LONG arm, which is what it was measured as
             # ("staying out of BEAR"). The bear arm carries its own BTC gate and is the one
             # thing meant to work in that regime, so the cash gate does not touch it.
+            pv["l_regime"] = list(to_open)
             if halted and to_open:
                 log("halt: suppressing %d entry(ies) (%s); exits keep working"
                     % (len(to_open), ",".join(to_open)), logpath)
                 to_open = []
+            pv["l_final"] = list(to_open)
             # ONE book, one slot budget, and the bear arm is cut LAST - after the regime gate
             # and the halt have taken their entries away, so it is sized against what the long
             # arm actually opens, and never on a symbol that arm is buying this same pass.
@@ -1525,6 +1845,7 @@ def main():
                         "the short is dropped: %s" % (len(both), ",".join(both)), logpath)
             elif short_armed and halted:
                 log("halt: the bear arm proposes nothing either", logpath)
+            pv["s_final"] = list(to_open_short)
 
             if not to_close and not to_open and not to_open_short:
                 log("scan: %d held, %d hold-ok, %d entry-ok, nothing to do"
@@ -1568,6 +1889,9 @@ def main():
                                    snapshot_at))
                         entered[s] = now
                         entered_trig[s] = "short"
+                # Only once every line is in the book: a write that died halfway reports nothing
+                # as opened rather than something that may not be there.
+                pv["wrote"] = (list(to_close), list(to_open), list(to_open_short), dict(reasons))
                 save_state(statepath, state)
                 log("scan: %d held -> closing %d (%s), opening %d long (%s), %d short (%s)"
                     % (len(held), len(to_close), ",".join(to_close) or "-",
@@ -1586,6 +1910,10 @@ def main():
             if state.get("error_streak"):
                 state["error_streak"] = 0
                 save_state(statepath, state)
+        # After everything the pass decided and wrote, and whatever way it ended. Never raises.
+        publish_view(viewpath, pv, state, statepath, logpath,
+                     lambda: next_wait(args.interval, short_armed and bear_gate_open, pass_start,
+                                       time.time()))
         time.sleep(next_wait(args.interval, short_armed and bear_gate_open, pass_start, time.time()))
 
 

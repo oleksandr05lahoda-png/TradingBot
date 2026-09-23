@@ -173,6 +173,13 @@ public final class Reconciler {
     private volatile ExitListener exchangeExitListener;
 
     /**
+     * When the trade notifier announces every exit in its own words, the calm "Position closed"
+     * push says the same thing twice in two languages (23.09). It then goes to the log only.
+     * Warnings - an exit nothing explains, a liquidation - are pushed exactly as before.
+     */
+    private volatile boolean calmExitsAnnouncedElsewhere;
+
+    /**
      * How far back an order is allowed to be and still count as the one that closed a position.
      * A ghost is at most one pass old, so this is slack for a paused host, not a real window; a
      * closing fill older than the position's own entry is rejected outright below.
@@ -228,6 +235,22 @@ public final class Reconciler {
      */
     private int emptyReadsInARow = 0;
     private int passes = 0;
+
+    /** The account and non-flat positions a pass read and believed. A view for humans, never an input to trading. */
+    public record LastRead(Instant at, AccountSnapshot account, List<PositionSnapshot> positions) {
+        public LastRead {
+            Preconditions.notNull(at, "at");
+            Preconditions.notNull(account, "account");
+            positions = List.copyOf(Preconditions.notNull(positions, "positions"));
+        }
+    }
+
+    private volatile LastRead lastRead;
+
+    /** Empty until a pass has read the exchange; the operator channel renders it, nothing trades on it. */
+    public Optional<LastRead> lastRead() {
+        return Optional.ofNullable(lastRead);
+    }
     /** Account-wide orphan sweep cadence in passes (~10 min at 30 s); the plain listing weighs 40. */
     static final int ORPHAN_SWEEP_EVERY = 20;
 
@@ -254,6 +277,11 @@ public final class Reconciler {
     /** One call per ghost or shrink the pass absorbed, with the cause it could prove. */
     public void onExchangeExit(ExitListener listener) {
         this.exchangeExitListener = listener;
+    }
+
+    /** True when per-trade notifications carry the calm exits; see {@link #calmExitsAnnouncedElsewhere}. */
+    public void announceCalmExitsElsewhere(boolean on) {
+        this.calmExitsAnnouncedElsewhere = on;
     }
 
     public Reconciler(ExchangePort port, RiskEngine engine, TradingHalt halt, AlertSink alerts,
@@ -304,6 +332,10 @@ public final class Reconciler {
         } else {
             emptyReadsInARow = 0;
         }
+        // Kept for the operator's /status and /book, which must not call the exchange from the
+        // Telegram thread: these two reads already happened, so showing them costs no weight.
+        // Only a read this pass BELIEVED is kept - a disbelieved empty listing threw above.
+        lastRead = new LastRead(now, account, exchangePositions);
 
         List<Drift> drifts = new ArrayList<>();
         List<ExposureBook.OpenPosition> truth = new ArrayList<>();
@@ -703,7 +735,7 @@ public final class Reconciler {
                 LOG.info("[Reconciler] " + summary);
                 if (!allExpected) {
                     alerts.warning("Exchange-side exit", summary);
-                } else {
+                } else if (!(anyExit && calmExitsAnnouncedElsewhere)) {
                     alerts.info(anyExit ? "Position closed" : "Leftover orders cancelled", summary);
                 }
             } else {

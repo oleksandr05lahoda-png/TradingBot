@@ -88,6 +88,8 @@ public final class TestnetBot {
             System.out.println(usage());
             return;
         }
+        Instant processStartedAt = Instant.now();
+        String buildStamp = buildStamp(Path.of("/app/BUILD_STAMP"), System.getenv("BUILD_STAMP"));
 
         int defaultLeverage = intProperty("DEFAULT_LEVERAGE", 3);
         String sourceName = argValue(args, "--source", "manual");
@@ -170,7 +172,8 @@ public final class TestnetBot {
         // is not configured, and nothing here can open a position.
         OperatorChannel operator = OperatorChannel.fromEnvironmentOrNull(halt);
         if (operator != null) {
-            operator.withVenueTag(venue.isReal() ? "REAL " + venue.realMode() : "DEMO").withAlerts(alerts);
+            operator.withVenueTag(venue.isReal() ? "REAL " + venue.realMode() : "DEMO").withAlerts(alerts)
+                    .withExchangeHold(port::heldByExchangeForMillis);
         }
         // Observe is enforced here, on every signal, independent of any latch: the latch below
         // exists so the scanner stands down, but a latch can be cleared and a mode cannot.
@@ -179,6 +182,11 @@ public final class TestnetBot {
 
         // The raw material for honest learning: one JSONL row per event, on the volume.
         TradeJournal journal = TradeJournal.fromEnvironmentOrNull();
+
+        // One Telegram line per entry and exit, beside the journal row and never instead of it.
+        // Sent from its own thread: the loop only drops the line into a bounded queue.
+        final TradeNotifier notes = operator == null ? null : tradeNotifier(operator);
+        if (operator != null) operator.withScannerView(dataDir.resolve(ScannerView.FILE_NAME));
 
         // `closedOnExit` only releases the port on the way out; components are wired to `port`.
         try (ExchangePort closedOnExit = port;
@@ -197,13 +205,23 @@ public final class TestnetBot {
             // A booked position found without a stop is repaired — stop re-placed from the book's
             // record, or closed reduce-only — instead of only halted on (28.08 audit, finding #1).
             reconciler.withStopRepair(coordinator::closeOut);
-            if (journal != null) {
-                reconciler.onExchangeExit(journal::exchangeExit);
-                reconciler.onRepairClose((requestId, symbol, closeReport) ->
+            if (journal != null || notes != null) {
+                // Journal first: the record is the thing that must not be lost; the line is a courtesy.
+                reconciler.onExchangeExit((symbol, cause, detail, orderId, price, quantity) -> {
+                    if (journal != null) journal.exchangeExit(symbol, cause, detail, orderId, price, quantity);
+                    notifyExchangeExit(notes, symbol, cause, price, quantity);
+                });
+                reconciler.onRepairClose((requestId, symbol, closeReport) -> {
+                    if (journal != null) {
                         journal.closed(requestId, symbol, "stop-repair",
                                 closeReport.closedQuantity().toPlainString(),
-                                closeReport.averagePrice().toPlainString(), closeReport.note()));
+                                closeReport.averagePrice().toPlainString(), closeReport.note());
+                    }
+                    notifyClose(notes, symbol, "stop-repair", closeReport);
+                });
             }
+            // The calm English "Position closed" push would repeat the line the notifier just sent.
+            if (notes != null) reconciler.announceCalmExitsElsewhere(true);
             DeadMansSwitch deadMansSwitch = new DeadMansSwitch(port, engine, alerts,
                     DEAD_MANS_COUNTDOWN_MS, DEAD_MANS_MAX_SILENCE_MS);
             // The daily loss limit closes the book on the trip (KILL_SWITCH_ACTION=halt-only opts
@@ -211,10 +229,14 @@ public final class TestnetBot {
             TradeJournal journalRef = journal;
             KillSwitchEnforcer killSwitchEnforcer = new KillSwitchEnforcer(engine,
                     coordinator::closeOut, alerts, killSwitchAction(),
-                    journalRef == null ? null : (requestId, symbol, closeReport) ->
+                    journalRef == null && notes == null ? null : (requestId, symbol, closeReport) -> {
+                        if (journalRef != null) {
                             journalRef.closed(requestId, symbol, "daily-loss-kill-switch",
                                     closeReport.closedQuantity().toPlainString(),
-                                    closeReport.averagePrice().toPlainString(), closeReport.note()));
+                                    closeReport.averagePrice().toPlainString(), closeReport.note());
+                        }
+                        notifyClose(notes, symbol, "daily-loss-kill-switch", closeReport);
+                    });
 
             banner(venue, port, signals, config, defaultLeverage);
 
@@ -237,7 +259,7 @@ public final class TestnetBot {
                     // adoption itself after its first successful reconcile.
                     List<PositionSnapshot> live = readPositionsWithRetry(port, 3);
                     if (!exitsJournaled) {
-                        journalExitsWhileDown(journal, port, live, ledgerPath);
+                        journalExitsWhileDown(journal, notes, port, live, ledgerPath);
                         exitsJournaled = true;
                     }
                     int seeded = BookLedger.seed(engine.book(), live, ledgerPath);
@@ -385,6 +407,21 @@ public final class TestnetBot {
             // close used to be single-shot: one 429 destroyed the request forever (28.08 audit).
             java.util.ArrayDeque<PendingClose> pendingCloses = new java.util.ArrayDeque<>();
             long signalMaxAgeMs = Math.max(0, intProperty("SIGNAL_MAX_AGE_MIN", 90)) * 60_000L;
+            // The operator's screens: built here from what the loop already knows, rendered on the
+            // Telegram thread. /status answers from the first second, not 30 s after boot.
+            Instant lastReconcileOkAt = bootstrapped ? Instant.now() : null;
+            PnlProbe pnlProbe = new PnlProbe(port);
+            OperatorSnapshot.Pnl pnl = null;
+            if (operator != null) {
+                try {
+                    OperatorSnapshot first = operatorSnapshot(processStartedAt, buildStamp, observeOnly, engine, port,
+                            deadMansSwitch, reconciler, journal, false, 0, pendingCloses, lastReconcileOkAt, null);
+                    operator.publish(first);
+                    if (notes != null) notes.observe(first.positions());
+                } catch (RuntimeException e) {
+                    LOG.warning("[Boot] operator snapshot not published: " + e.getMessage());
+                }
+            }
 
             while (!Thread.currentThread().isInterrupted()) {
                 Instant now = Instant.now();
@@ -403,15 +440,17 @@ public final class TestnetBot {
                             continue;
                         }
                         attemptClose(pending.close(), pending.attempts() + 1,
-                                coordinator, signals, alerts, journal, halt, pendingCloses);
+                                coordinator, signals, alerts, journal, notes, halt, pendingCloses);
                     }
                     if (operator != null) {
-                        for (CloseRequest close : operator.drainCloses()) {
-                            attemptClose(close, 1, coordinator, signals, alerts, journal, halt, pendingCloses);
+                        // A confirmed 🧯 is expanded here, against what is held NOW: its prompt was
+                        // drawn from the last reconcile pass and could miss this hour's fills.
+                        for (CloseRequest close : operator.drainCloses(() -> heldSymbols(engine, port))) {
+                            attemptClose(close, 1, coordinator, signals, alerts, journal, notes, halt, pendingCloses);
                         }
                     }
                     for (CloseRequest close : signals.pollCloses()) {
-                        attemptClose(close, 1, coordinator, signals, alerts, journal, halt, pendingCloses);
+                        attemptClose(close, 1, coordinator, signals, alerts, journal, notes, halt, pendingCloses);
                     }
                     for (Signal signal : signals.poll()) {
                         if (observeOnly) {
@@ -460,7 +499,7 @@ public final class TestnetBot {
                                     + "writer's clock disagrees with this process's");
                             continue;
                         }
-                        handle(signal, engine, coordinator, port, signals, atSignal, journal);
+                        handle(signal, engine, coordinator, port, signals, atSignal, journal, notes);
                     }
                     if (sourceFailures > 0) {
                         LOG.info("[Loop] signal source is answering again after " + sourceFailures + " failure(s)");
@@ -507,18 +546,13 @@ public final class TestnetBot {
                     lastHeartbeatMs = nowMs;
                 }
                 if (nowMs - lastReconcileMs >= RECONCILE_INTERVAL_MS) {
-                    if (operator != null) {
-                        operator.publishStatus(
-                                statusLine(venue, engine, halt, port, deadMansSwitch,
-                                        pendingCloses.size(), blind, reconcileFailures),
-                                Instant.now());
-                    }
                     try {
                         // Any completed pass earns the right to persist — reconcile realigns the book
                         // to the exchange before returning, so what follows is truthful even when the
                         // pass also found drift. Only a pass that THREW leaves the flag untouched.
                         Reconciler.Report passReport = reconciler.reconcile(Instant.now());
                         bookAgreesWithExchange = true;
+                        lastReconcileOkAt = Instant.now();
                         if (passReport.converged()) {
                             // The only self-clearing latch: a boot that could not READ the exchange,
                             // now contradicted by a converged pass. Drift latches stay for /resume.
@@ -577,6 +611,23 @@ public final class TestnetBot {
                                     "no successful pass for " + reconcileFailures + " attempts: "
                                             + e.getMessage() + ". New entries are refused until a pass "
                                             + "succeeds; closes, stops and takes keep working.");
+                        }
+                    }
+                    if (operator != null) {
+                        // After the pass, so /book shows what the exchange just said. The P&L read
+                        // waits for a healthy pass: while reconciliation fails, one more call to the
+                        // same exchange would only fail too. Nothing here may disturb the loop.
+                        try {
+                            if (reconcileFailures == 0) pnl = pnlProbe.refreshIfDue(Instant.now());
+                            OperatorSnapshot snap = operatorSnapshot(processStartedAt, buildStamp, observeOnly,
+                                    engine, port, deadMansSwitch, reconciler, journal, blind, reconcileFailures,
+                                    pendingCloses, lastReconcileOkAt, pnl);
+                            operator.publish(snap);
+                            // The notifier learns entries, sizes and open times from the same view,
+                            // so an exit can say what it made and how long it was held.
+                            if (notes != null) notes.observe(snap.positions());
+                        } catch (RuntimeException e) {
+                            LOG.warning("[Loop] operator snapshot not published: " + e.getMessage());
                         }
                     }
                     lastReconcileMs = nowMs;
@@ -673,9 +724,9 @@ public final class TestnetBot {
      * order names the price when the venue still answers for it. Without this row the forward
      * record simply lost every stop-out and take-profit that fired between two runs.
      */
-    private static void journalExitsWhileDown(TradeJournal journal, ExchangePort port,
+    private static void journalExitsWhileDown(TradeJournal journal, TradeNotifier notes, ExchangePort port,
                                               List<PositionSnapshot> live, Path ledgerPath) {
-        if (journal == null) return;
+        if (journal == null && notes == null) return;
         for (BookLedger.ClosedWhileAway gone : BookLedger.closedWhileAway(live, ledgerPath)) {
             String state = "", price = "", qty = "";
             if (!gone.stopId().isBlank()) {
@@ -694,8 +745,16 @@ public final class TestnetBot {
             }
             LOG.info("[Boot] " + gone.symbol() + " left the book while this process was down (stop "
                     + gone.stopId() + (state.isEmpty() ? "" : " " + state) + ")");
-            journal.exchangeExit(gone.symbol(), "closed while the process was down; ledger side "
-                    + gone.side(), gone.stopId(), state, price, qty, true);
+            if (journal != null) {
+                journal.exchangeExit(gone.symbol(), "closed while the process was down; ledger side "
+                        + gone.side(), gone.stopId(), state, price, qty, true);
+            }
+            if (notes != null) {
+                // Only a stop that says FILLED is named; anything else is honestly "gone".
+                boolean stopFilled = "FILLED".equals(state);
+                notes.exit(gone.symbol(), stopFilled ? TradeNotifier.ExitKind.STOP : TradeNotifier.ExitKind.UNEXPLAINED,
+                        number(price), number(qty), Instant.now(), "пока бот стоял");
+            }
         }
     }
 
@@ -726,31 +785,154 @@ public final class TestnetBot {
         throw last;
     }
 
-    /** One line the operator can read on a phone; built on the loop thread from the loop's own state. */
-    private static String statusLine(BinanceVenue venue, RiskEngine engine, TradingHalt halt,
-                                     ExchangePort port, DeadMansSwitch deadMansSwitch,
-                                     int pendingCloses, boolean blind, int reconcileFailures) {
-        StringBuilder sb = new StringBuilder();
-        sb.append(venue.isReal() ? "REAL " + venue.realMode() : "DEMO").append(" | ");
-        List<ExposureBook.OpenPosition> open = engine.book().all();
-        sb.append(open.size()).append(" position(s)");
-        for (ExposureBook.OpenPosition p : open) {
-            sb.append("\n  ").append(p.symbol()).append(' ').append(p.side())
-                    .append(" qty ").append(p.quantity().stripTrailingZeros().toPlainString())
-                    .append(" risk $").append(String.format(java.util.Locale.ROOT, "%.2f", p.riskUsd()))
-                    .append(p.protectiveStopId().isPresent() ? " stop ok" : " NO STOP ID");
+    /**
+     * Everything the operator's screens show, built on the loop thread from the loop's own state and
+     * the reconciler's last read - no exchange call of its own. Every state that pauses entries is
+     * in it, or /status would say "green" while the bot quietly refuses every signal.
+     */
+    private static OperatorSnapshot operatorSnapshot(Instant startedAt, String buildStamp, boolean observeOnly,
+                                                     RiskEngine engine, ExchangePort port,
+                                                     DeadMansSwitch deadMansSwitch, Reconciler reconciler,
+                                                     TradeJournal journal, boolean blind, int reconcileFailures,
+                                                     java.util.Collection<PendingClose> pendingCloses,
+                                                     Instant lastReconcileOkAt, OperatorSnapshot.Pnl pnl) {
+        Instant now = Instant.now();
+        java.util.Optional<Reconciler.LastRead> read = reconciler.lastRead();
+        java.util.Map<String, TradeJournal.OpenMark> marks = journal == null ? java.util.Map.of() : journal.openMarks();
+        List<OperatorSnapshot.Position> positions = OperatorSnapshot.positions(
+                read.map(Reconciler.LastRead::positions).orElse(null), engine.book().all(), marks);
+        return new OperatorSnapshot(now, startedAt, buildStamp, observeOnly,
+                engine.killSwitch().isTripped(now), port.heldByExchangeForMillis(),
+                deadMansSwitch.isDegraded(), blind, reconcileFailures, pendingCloses.size(), lastReconcileOkAt,
+                read.map(r -> OperatorSnapshot.Account.of(r.account())).orElse(null),
+                positions, read.isPresent(), pnl, closeQueue(pendingCloses));
+    }
+
+    /**
+     * Everything a confirmed 🧯 must cover at the moment the loop executes it: the book this process
+     * keeps (a fill lands there before the next reconcile pass does) and the exchange's own listing
+     * (a position the book does not know). Read only when a 🧯 is pending. An exchange read that
+     * fails costs its extras only - the book, and the symbols the prompt listed, are still closed.
+     */
+    static java.util.Set<String> heldSymbols(RiskEngine engine, ExchangePort port) {
+        java.util.Set<String> held = new java.util.LinkedHashSet<>();
+        for (com.bot.risk.ExposureBook.OpenPosition p : engine.book().all()) held.add(p.symbol());
+        try {
+            for (PositionSnapshot p : port.openPositions()) {
+                if (!p.isFlat()) held.add(p.symbol());
+            }
+        } catch (RuntimeException e) {
+            LOG.warning("[Loop] close-all: exchange positions unreadable (" + e.getMessage()
+                    + ") - closing the book and the listed symbols");
         }
-        sb.append("\nhalt: ").append(halt.isHalted() ? halt.reason().orElse("yes") : "none");
-        long held = port.heldByExchangeForMillis();
-        if (held > 0) sb.append("\nexchange hold: ").append(held / 60_000).append(" min left");
-        // Every state that pauses entries must be visible here, or /status says "none" while the
-        // bot quietly refuses every signal.
-        if (deadMansSwitch.isDegraded()) sb.append("\nentries: PAUSED (exchange contact lost)");
-        if (blind) sb.append("\nentries: PAUSED (reconciliation blind, ")
-                .append(reconcileFailures).append(" failed passes)");
-        if (pendingCloses > 0) sb.append("\ncloses retrying: ").append(pendingCloses);
-        sb.append("\nkill switch: ").append(engine.killSwitch().isTripped(Instant.now()) ? "TRIPPED" : "armed");
-        return sb.toString();
+        return held;
+    }
+
+    /** The retry queue as /queue shows it: attempts spent of the cap, and when the next one is due. */
+    private static List<OperatorSnapshot.QueuedClose> closeQueue(java.util.Collection<PendingClose> pending) {
+        List<OperatorSnapshot.QueuedClose> out = new java.util.ArrayList<>();
+        for (PendingClose p : pending) {
+            out.add(new OperatorSnapshot.QueuedClose(p.close().symbol(), p.close().reason(), p.attempts(),
+                    CLOSE_MAX_ATTEMPTS, Instant.ofEpochMilli(p.notBeforeMs())));
+        }
+        return out;
+    }
+
+    /**
+     * The notifier behind {@code TRADE_NOTIFY} / {@code QUIET_HOURS}, delivering through the
+     * operator channel from a thread of its own. Null when notifications are off. Quiet hours get a
+     * ticker, so the night's summary goes out when the window ends even if the book is idle.
+     */
+    private static TradeNotifier tradeNotifier(OperatorChannel operator) {
+        TgOutbox outbox = new TgOutbox(operator::deliverHtml, Thread::sleep);
+        TradeNotifier notes = TradeNotifier.fromEnvironmentOrNull(System::getenv, outbox::offer);
+        if (notes == null) return null;
+        outbox.start();
+        if (notes.quietHours() != null) {
+            Thread ticker = new Thread(() -> {
+                while (true) {
+                    try {
+                        Thread.sleep(30_000L);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    notes.tick(Instant.now());
+                }
+            }, "trade-notes-ticker");
+            ticker.setDaemon(true);
+            ticker.start();
+        }
+        return notes;
+    }
+
+    /** An exit the reconciler proved, told in the owner's words. A failure here costs the line only. */
+    static void notifyExchangeExit(TradeNotifier notes, String symbol, String cause, String price, String quantity) {
+        if (notes == null) return;
+        try {
+            if ("partial-exit".equals(cause)) {
+                notes.partial(symbol, Instant.now());
+                return;
+            }
+            notes.exit(symbol, TradeNotifier.ExitKind.ofCause(cause), number(price), number(quantity),
+                    Instant.now(), "");
+        } catch (RuntimeException e) {
+            LOG.warning("[Notify] exit line for " + symbol + " not sent: " + e.getMessage());
+        }
+    }
+
+    /** An entry that filled and is protected: fill, planned stop and first take, dollars at risk. */
+    static void notifyEntry(TradeNotifier notes, Signal signal, ExecutionCoordinator.Report report) {
+        if (notes == null) return;
+        try {
+            double fill = report.averageFillPrice().doubleValue();
+            double qty = report.filledQuantity().doubleValue();
+            double stop = report.plan().stopPrice().doubleValue();
+            double take = report.takeProfitOrders().stream()
+                    .filter(o -> o.stopPrice() != null && o.stopPrice().signum() > 0)
+                    .mapToDouble(o -> o.stopPrice().doubleValue()).findFirst().orElse(Double.NaN);
+            notes.entry(signal.symbol(), signal.side(), fill, qty, stop, take,
+                    PositionSizer.riskUsd(qty, fill, stop), Instant.now());
+        } catch (RuntimeException e) {
+            LOG.warning("[Notify] entry line for " + signal.symbol() + " not sent: " + e.getMessage());
+        }
+    }
+
+    /** A close this process made and confirmed with a fill. A failure here costs the line only. */
+    static void notifyClose(TradeNotifier notes, String symbol, String reason,
+                            ExecutionCoordinator.CloseReport report) {
+        if (notes == null || report == null || report.closedQuantity().signum() <= 0) return;
+        try {
+            TradeNotifier.ExitKind kind = TradeNotifier.ExitKind.ofCloseReason(reason);
+            notes.exit(symbol, kind, report.averagePrice().doubleValue(), report.closedQuantity().doubleValue(),
+                    Instant.now(), kind == TradeNotifier.ExitKind.OTHER ? reason : "");
+        } catch (RuntimeException e) {
+            LOG.warning("[Notify] close line for " + symbol + " not sent: " + e.getMessage());
+        }
+    }
+
+    private static double number(String raw) {
+        if (raw == null || raw.isBlank()) return Double.NaN;
+        try {
+            return Double.parseDouble(raw.trim());
+        } catch (NumberFormatException e) {
+            return Double.NaN;
+        }
+    }
+
+    /**
+     * Which build is running, for /status: the Dockerfile writes {@code /app/BUILD_STAMP}; a run
+     * outside the container may set {@code BUILD_STAMP}; anything else is "unknown", said plainly.
+     */
+    static String buildStamp(Path file, String env) {
+        try {
+            if (file != null && java.nio.file.Files.isRegularFile(file)) {
+                String s = java.nio.file.Files.readString(file, java.nio.charset.StandardCharsets.UTF_8).trim();
+                if (!s.isEmpty()) return s;
+            }
+        } catch (IOException | RuntimeException e) {
+            LOG.fine("[Boot] build stamp unreadable: " + e.getMessage());
+        }
+        return env == null || env.isBlank() ? "unknown" : env.trim();
     }
 
     /**
@@ -762,7 +944,8 @@ public final class TestnetBot {
      */
     private static void attemptClose(CloseRequest close, int attempt, ExecutionCoordinator coordinator,
                                      SignalSource signals, AlertSink alerts, TradeJournal journal,
-                                     TradingHalt halt, java.util.ArrayDeque<PendingClose> pendingCloses)
+                                     TradeNotifier notes, TradingHalt halt,
+                                     java.util.ArrayDeque<PendingClose> pendingCloses)
             throws Exception {
         LOG.info("[Loop] " + close
                 + (attempt > 1 ? " (attempt " + attempt + "/" + CLOSE_MAX_ATTEMPTS + ")" : ""));
@@ -778,6 +961,7 @@ public final class TestnetBot {
                             report.closedQuantity().toPlainString(),
                             report.averagePrice().toPlainString(), report.note());
                 }
+                notifyClose(notes, close.symbol(), close.reason(), report);
                 signals.onClosed(close, new ExecutionFeedback(close.id(), report.closedQuantity(),
                         report.averagePrice(), report.note()));
                 if (attempt > 1) {
@@ -816,7 +1000,8 @@ public final class TestnetBot {
     }
 
     private static void handle(Signal signal, RiskEngine engine, ExecutionCoordinator coordinator,
-                               ExchangePort port, SignalSource signals, Instant now, TradeJournal journal)
+                               ExchangePort port, SignalSource signals, Instant now, TradeJournal journal,
+                               TradeNotifier notes)
             throws Exception {
         LOG.info("[Loop] " + signal);
         try {
@@ -866,6 +1051,7 @@ public final class TestnetBot {
                                     plan.leverage(), qty * fill,
                                     report.outcome() + ": " + report.note());
                         }
+                        notifyEntry(notes, signal, report);
                         signals.onAccepted(signal, new ExecutionFeedback(
                                 report.entryOrder().map(o -> o.clientOrderId()).orElse("unknown"),
                                 report.filledQuantity(),
@@ -995,6 +1181,8 @@ public final class TestnetBot {
                         + RiskConstants.MAX_LEVERAGE + ")",
                 "  SUPABASE_URL / SUPABASE_QUEUE_KEY   only for --source supabase",
                 "  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID   optional, for push alerts",
+                "  TRADE_NOTIFY                on (default) | off: one Telegram line per entry and exit",
+                "  QUIET_HOURS                 e.g. 23-08 (Warsaw): trade lines held, one summary after",
                 "",
                 "Manual signal format:",
                 "  SYMBOL SIDE entry=<price> [stop=<price>] [atr=<value>] [lev=<1.."

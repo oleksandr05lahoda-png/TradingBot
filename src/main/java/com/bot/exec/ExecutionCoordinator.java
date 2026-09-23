@@ -395,6 +395,7 @@ public final class ExecutionCoordinator {
         }
 
         BigDecimal residual = held.subtract(close.executedQuantity());
+        BigDecimal fillPrice = fillPrice(close, symbol, requestId);
         if (residual.signum() != 0 && Boolean.TRUE.equals(readFlat(symbol))) {
             // The ORDER says less than `held` filled, the POSITION says nothing is left: a take or
             // the stop filled between the read at the top and this send, and the venue trimmed
@@ -404,10 +405,10 @@ public final class ExecutionCoordinator {
             engine.registerClose(symbol);
             intents.clear(symbol);
             LOG.info("[Coordinator] " + symbol + " closed " + close.executedQuantity().toPlainString()
-                    + " of " + held.toPlainString() + " @ " + close.averagePrice().toPlainString()
+                    + " of " + held.toPlainString() + " @ " + fillPrice.toPlainString()
                     + "; the remainder had already left through a resting exit"
                     + (cleaned ? "; protective orders cancelled" : "; protective orders NOT yet cancelled"));
-            return new CloseReport(symbol, true, close.executedQuantity(), close.averagePrice(),
+            return new CloseReport(symbol, true, close.executedQuantity(), fillPrice,
                     "closed reduce-only; the remainder had already left through a resting exit"
                             + (cleaned ? "" : "; leftover orders await the orphan sweep"));
         }
@@ -425,7 +426,7 @@ public final class ExecutionCoordinator {
                             + "earlier close, not this one; keeping the protective orders";
             alerts.critical("Partial close", symbol + ": " + note);
             halt.halt("partial close on " + symbol, clock.instant());
-            return new CloseReport(symbol, false, close.executedQuantity(), close.averagePrice(), note);
+            return new CloseReport(symbol, false, close.executedQuantity(), fillPrice, note);
         }
 
         // The close is confirmed: it must be booked and reported whatever the cleanup does. A 429 on
@@ -436,11 +437,25 @@ public final class ExecutionCoordinator {
         engine.registerClose(symbol);
         intents.clear(symbol);
         LOG.info("[Coordinator] " + symbol + " closed " + held.toPlainString()
-                + " @ " + close.averagePrice().toPlainString()
+                + " @ " + fillPrice.toPlainString()
                 + (cleaned ? "; protective orders cancelled" : "; protective orders NOT yet cancelled"));
-        return new CloseReport(symbol, true, close.executedQuantity(), close.averagePrice(),
+        return new CloseReport(symbol, true, close.executedQuantity(), fillPrice,
                 cleaned ? "closed reduce-only in full"
                         : "closed reduce-only in full; leftover orders await the orphan sweep");
+    }
+
+    /**
+     * What the close filled at. Binance can answer a MARKET close FILLED with avgPrice 0 and fill
+     * the price in a moment later: three of the fifteen kill-switch closes of 23.09 (SUI, SOL, ENS)
+     * reached the journal at price 0, and the record the lab judges live trades by lost their exits.
+     * One read of the order under the same id fixes the number; 0 stays only when that read fails too.
+     */
+    private BigDecimal fillPrice(OrderStatus close, String symbol, String requestId) {
+        if (close.averagePrice().signum() > 0 || close.executedQuantity().signum() <= 0) {
+            return close.averagePrice();
+        }
+        BigDecimal read = closePriceIfReadable(symbol, requestId);
+        return read.signum() > 0 ? read : close.averagePrice();
     }
 
     /** The average price of the close under {@code requestId}, or ZERO when it cannot be read. */

@@ -81,6 +81,24 @@ class ReconcilerGuardsTest {
     }
 
     @Test
+    @DisplayName("the operator's view keeps the last BELIEVED read; a disbelieved empty listing never replaces it")
+    void lastReadIsOnlyWhatThePassBelieved() {
+        assertTrue(reconciler.lastRead().isEmpty(), "nothing before the first pass");
+        bookOne("BTCUSDT", "0.041", "64000");
+        exchange.setUnrealizedPnl("1.25");
+
+        reconciler.reconcile(ExecFixtures.NOON);
+        Reconciler.LastRead first = reconciler.lastRead().orElseThrow();
+        assertEquals(1, first.positions().size());
+        assertEquals("BTCUSDT", first.positions().get(0).symbol());
+        assertEquals(0, new BigDecimal("1.25").compareTo(first.account().totalUnrealizedPnl()));
+
+        exchange.clearPosition("BTCUSDT");          // truncated listing while the PnL says open
+        assertThrows(ExchangeException.class, () -> reconciler.reconcile(ExecFixtures.NOON.plusSeconds(30)));
+        assertEquals(first, reconciler.lastRead().orElseThrow(), "/book must not show an empty book it did not believe");
+    }
+
+    @Test
     @DisplayName("after the operator clears the halt, the same drift is announced again at once")
     void driftAnnouncesAgainAfterResume() {
         exchange.plantPosition("BTCUSDT", "0.5", "64000");     // foreign: nothing on the book, no intent

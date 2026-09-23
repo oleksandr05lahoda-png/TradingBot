@@ -1,0 +1,11 @@
+# Scripts that run on the Linux VPS keep LF on every checkout. core.autocrlf=true on the laptop would
+# otherwise write CRLF into them, and a CRLF shell script copied to the server dies on its first line
+# ("bash\r: No such file or directory") - tools/ops/INSTALL.md step 4 strips CR on the server as a
+# second line of defence, this is the first.
+*.sh    text eol=lf
+gradlew text eol=lf
+tools/ops/crontab.txt text eol=lf
+# The Python that ships to the host (ops scripts, the scanner baked into the image) too: INSTALL.md
+# compares them with the server's copies by md5 and cmp, and a CRLF checkout (branch switch, stash,
+# fresh clone) turned pautina.py's 047ef86b... into 2c82bd52... - a DIFF over nothing (review 23.09).
+tools/**/*.py text eol=lf

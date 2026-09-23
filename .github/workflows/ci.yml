@@ -1,0 +1,40 @@
+# Every push and PR: the Java suite, and the offline Python checks the VPS deploy also runs before
+# it builds (tools/vps-deploy.sh step 6) - so a red scanner or ops test is seen here first, not on
+# the server. No secrets, no network beyond the dependency caches: nothing here can reach an exchange.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      # gradlew is committed without the exec bit (the repo lives on Windows).
+      - run: chmod +x gradlew && ./gradlew --no-daemon test
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: offline tests (scanner + ops)
+        run: |
+          for t in tools/scanner/test_*.py tools/ops/test_*.py; do
+            echo "== $t"
+            python -B "$t" || exit 1
+          done
+      - name: shell syntax
+        run: |
+          for s in tools/vps-deploy.sh tools/docker-entrypoint.sh tools/ops/*.sh; do
+            bash -n "$s" || exit 1
+          done

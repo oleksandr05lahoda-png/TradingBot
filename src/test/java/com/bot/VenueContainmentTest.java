@@ -54,6 +54,33 @@ class VenueContainmentTest {
     private static final Set<String> REAL_HOST_ALLOWED_FILES = Set.of(
             VENUE_FILE, "autoscan.py", "scan.py");
 
+    /**
+     * The host-side ops scripts in tools/ops, run by cron on the VPS and never inside the container.
+     * They READ the live account (signed GETs: account, positions, income, open stops) or public
+     * market data, and ran there since 31.08 outside this test's sight; selfcheck.py came under
+     * version control on 23.09 and turned this test red, the rest followed the same day. They may
+     * name the production REST host ONLY at that exact path, and only while
+     * {@link #opsScriptsHaveNoTradingEndpoint} finds no order, leverage, margin or cancel endpoint in
+     * them. A new ops script is a review decision here, exactly like the list above.
+     */
+    private static final Set<String> READ_ONLY_OPS_FILES = Set.of(
+            "selfcheck.py", "digest.py", "balance_probe.py", "pautina.py", "crowd.py");
+
+    /** Every USDⓈ-M endpoint that can open, change or cancel anything. */
+    private static final Pattern TRADING_ENDPOINT = Pattern.compile(
+            "/fapi/v\\d/(order|batchOrders|algoOrder|allOpenOrders|countdownCancelAll|leverage|marginType"
+                    + "|positionMargin|positionSide|multiAssetsMargin|listenKey)\\b");
+
+    /** The one production host an ops script may name: REST. No websocket, no other API. */
+    private static final String OPS_HOST = "fapi." + BINANCE_DOMAIN;
+
+    private static boolean isReadOnlyOps(Path file) {
+        Path parent = file.getParent();
+        return READ_ONLY_OPS_FILES.contains(file.getFileName().toString())
+                && parent != null && parent.getFileName().toString().equals("ops")
+                && parent.getParent() != null && parent.getParent().getFileName().toString().equals("tools");
+    }
+
     private static final Set<String> DEMO_HOSTS = Set.of(
             "demo-fapi." + BINANCE_DOMAIN,
             "demo-fstream." + BINANCE_DOMAIN);
@@ -93,11 +120,12 @@ class VenueContainmentTest {
             String content = Files.readString(file, StandardCharsets.UTF_8);
             String name = file.getFileName().toString();
             boolean allowed = REAL_HOST_ALLOWED_FILES.contains(name);
+            boolean ops = isReadOnlyOps(file);
             for (String label : PRODUCTION_LABELS) {
                 Matcher matcher = hostPattern(label).matcher(content);
                 while (matcher.find()) {
                     String host = matcher.group().toLowerCase(Locale.ROOT);
-                    if (allowed && REAL_HOSTS.contains(host)) {
+                    if ((allowed && REAL_HOSTS.contains(host)) || (ops && host.equals(OPS_HOST))) {
                         if (name.equals(VENUE_FILE)) venueFileNamesProduction = true;
                         continue;
                     }
@@ -121,10 +149,12 @@ class VenueContainmentTest {
         List<String> offences = new ArrayList<>();
         for (Path file : sourceFiles()) {
             if (REAL_HOST_ALLOWED_FILES.contains(file.getFileName().toString())) continue;
+            boolean ops = isReadOnlyOps(file);
             Matcher matcher = ANY_BINANCE_HOST.matcher(Files.readString(file, StandardCharsets.UTF_8));
             while (matcher.find()) {
                 String host = matcher.group().toLowerCase(Locale.ROOT);
                 if (host.equals(BINANCE_DOMAIN)) continue; // bare-domain doc mention
+                if (ops && host.equals(OPS_HOST)) continue; // read-only ops, REST only
                 if (!DEMO_HOSTS.contains(host)) {
                     offences.add(host + "  (in " + file + ")");
                 }
@@ -133,6 +163,41 @@ class VenueContainmentTest {
         assertTrue(offences.isEmpty(),
                 "hostnames outside the demo allowlist " + DEMO_HOSTS + " appear outside "
                         + REAL_HOST_ALLOWED_FILES + ": " + offences);
+    }
+
+    @Test
+    @DisplayName("the read-only ops scripts carry no order, leverage, margin or cancel endpoint")
+    void opsScriptsHaveNoTradingEndpoint() throws IOException {
+        List<String> offences = new ArrayList<>();
+        int seen = 0;
+        for (Path file : sourceFiles()) {
+            if (!isReadOnlyOps(file)) continue;
+            seen++;
+            String content = Files.readString(file, StandardCharsets.UTF_8);
+            Matcher matcher = TRADING_ENDPOINT.matcher(content);
+            while (matcher.find()) {
+                offences.add(file + " line " + lineOf(content, matcher.start()) + ": " + matcher.group());
+            }
+        }
+        if (Files.isDirectory(scanRoot().resolve("tools").resolve("ops"))) {
+            assertTrue(seen > 0, "tools/ops exists but none of " + READ_ONLY_OPS_FILES + " was scanned");
+        }
+        assertTrue(offences.isEmpty(), "an ops script allowed to name production has a trading endpoint - "
+                + "it is no longer read-only and must leave " + READ_ONLY_OPS_FILES + ":\n  "
+                + String.join("\n  ", offences));
+    }
+
+    @Test
+    @DisplayName("the ops allowance is by path: the same name elsewhere, or a new name in tools/ops, is not allowed")
+    void opsAllowanceIsByPath() {
+        assertTrue(isReadOnlyOps(Path.of("tools", "ops", "digest.py")));
+        assertFalse(isReadOnlyOps(Path.of("src", "main", "digest.py")));
+        assertFalse(isReadOnlyOps(Path.of("tools", "scanner", "selfcheck.py")));
+        assertFalse(isReadOnlyOps(Path.of("tools", "ops", "trader.py")));
+        assertTrue(TRADING_ENDPOINT.matcher("/fapi/v1/order?symbol=X").find());
+        assertTrue(TRADING_ENDPOINT.matcher("/fapi/v1/algoOrder").find());
+        assertFalse(TRADING_ENDPOINT.matcher("/fapi/v1/openAlgoOrders").find(), "a read of open stops is not a trade");
+        assertFalse(TRADING_ENDPOINT.matcher("/fapi/v2/positionRisk").find());
     }
 
     // ─── The gate: fail-closed on every edge ────────────────────────────────────────────────

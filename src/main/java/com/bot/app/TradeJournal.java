@@ -9,7 +9,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.logging.Logger;
 
 /**
@@ -138,7 +140,85 @@ final class TradeJournal {
         return new JSONObject().put("ts", Instant.now().toString()).put("kind", kind).put("symbol", symbol);
     }
 
+    /**
+     * What the operator's {@code /book} needs about an open trade that neither the exchange nor the
+     * book keeps: when it opened and where its take rests. {@code NaN} when the row did not say.
+     */
+    record OpenMark(String side, Instant openedAt, double stopPrice, double takePrice) {}
+
+    /** Last entry per symbol still open by this journal's own account of it. */
+    private final Map<String, OpenMark> openMarks = new HashMap<>();
+    private boolean indexed;
+
+    /**
+     * The journal's open trades, read from the file once and then kept current by every row this
+     * process writes. A view for the operator only: the book and the exchange stay the truth.
+     */
+    synchronized Map<String, OpenMark> openMarks() {
+        if (!indexed) {
+            indexed = true;
+            if (Files.exists(path) && !Files.isDirectory(path)) {
+                try (java.util.stream.Stream<String> lines = Files.lines(path, StandardCharsets.UTF_8)) {
+                    lines.forEach(line -> {
+                        if (line.isBlank()) return;
+                        try {
+                            index(openMarks, new JSONObject(line));
+                        } catch (RuntimeException e) {
+                            // One torn line (a crash mid-append) must not blind the whole view.
+                        }
+                    });
+                } catch (IOException | java.io.UncheckedIOException e) {
+                    LOG.warning("[Journal] could not read " + path + " for the open-trade view: " + e.getMessage());
+                }
+            }
+        }
+        return Map.copyOf(openMarks);
+    }
+
+    /** One row's effect on the open-trade view; the file replay and live writes share it. */
+    static void index(Map<String, OpenMark> marks, JSONObject row) {
+        String symbol = row.optString("symbol", "");
+        if (symbol.isEmpty()) return;
+        switch (row.optString("kind", "")) {
+            case "entry" -> {
+                Instant at;
+                try {
+                    at = Instant.parse(row.optString("ts", ""));
+                } catch (RuntimeException e) {
+                    at = null;
+                }
+                JSONArray tp = row.optJSONArray("tp");
+                double take = Double.NaN;
+                if (tp != null) {
+                    for (int i = 0; i < tp.length() && Double.isNaN(take); i++) take = price(tp.optString(i, ""));
+                }
+                marks.put(symbol, new OpenMark(row.optString("side", ""), at,
+                        price(row.optString("stopPrice", "")), take));
+            }
+            case "close", "aborted" -> marks.remove(symbol);
+            // A shrink leaves the trade open; every other exchange exit ends it.
+            case "exchange-exit" -> {
+                if (!"partial-exit".equals(row.optString("cause", ""))) marks.remove(symbol);
+            }
+            default -> { }
+        }
+    }
+
+    private static double price(String raw) {
+        try {
+            double v = Double.parseDouble(raw.trim());
+            return v > 0 && Double.isFinite(v) ? v : Double.NaN;
+        } catch (RuntimeException e) {
+            return Double.NaN;
+        }
+    }
+
     private void write(JSONObject row) {
+        // Before the append: once the view is built, the file is not read again, so the live row
+        // must reach it even when the disk refuses the line.
+        synchronized (this) {
+            if (indexed) index(openMarks, row);
+        }
         try {
             Files.writeString(path, row + System.lineSeparator(), StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);

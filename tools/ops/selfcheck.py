@@ -28,20 +28,26 @@ K, S = env.get("BINANCE_REAL_API_KEY", ""), env.get("BINANCE_REAL_API_SECRET", "
 # The exchange's clock, not this host's: a signed request is refused with -1021 when the local
 # clock drifts, and the bot survives that by tracking the skew (BinanceFuturesAdapter) while this
 # script used raw local time. One /fapi/v1/time call per run, reused for every signature below.
+# --- clock:begin
 _SKEW = [0]
 
 
 def _resync():
+    # The skew is taken against the moment the answer ARRIVED, not the midpoint of the call.
+    # urlopen's time includes DNS, TCP and TLS set-up, all BEFORE the server stamps serverTime,
+    # so the midpoint sat early and a slow handshake pushed the skew - and every timestamp -
+    # ahead of the exchange: 23.09 11:00 "1000ms ahead of the server's time" on a host whose
+    # NTP was in sync. Against the arrival the stamp can only lag by the one-way trip, and a
+    # lagging timestamp is what recvWindow is for; a leading one over 1s is refused outright.
     try:
-        t0 = time.time() * 1000
         with urllib.request.urlopen("https://fapi.binance.com/fapi/v1/time", timeout=15) as f:
             srv = json.loads(f.read().decode())["serverTime"]
-        _SKEW[0] = int(srv - (t0 + time.time() * 1000) / 2)
+        _SKEW[0] = int(srv - time.time() * 1000)
     except Exception:
         _SKEW[0] = 0
 
 
-def call(path, extra=""):
+def call(path, extra="", _retried=False):
     q = "timestamp=%d&recvWindow=10000%s" % (int(time.time() * 1000) + _SKEW[0], extra)
     sig = hmac.new(S.encode(), q.encode(), hashlib.sha256).hexdigest()
     r = urllib.request.Request("https://fapi.binance.com%s?%s&signature=%s" % (path, q, sig),
@@ -57,7 +63,13 @@ def call(path, extra=""):
             body = e.read().decode()[:200]
         except Exception:
             body = "<no body>"
+        # -1021 says nothing about the book, only that this request's clock was off: measure the
+        # skew again and ask once more. A second -1021 is real and is reported as before.
+        if '"code":-1021' in body.replace(" ", "") and not _retried:
+            _resync()
+            return call(path, extra, _retried=True)
         raise RuntimeError("%s %s -> HTTP %s %s" % (path, extra, e.code, body)) from None
+# --- clock:end
 
 fails = []
 now = time.time()

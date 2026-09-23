@@ -235,4 +235,54 @@ class ClosePathTest {
         assertFalse(exchange.order(stopId).orElseThrow().isWorking(),
                 "our own leg guarding a position that is gone is still an orphan and still goes");
     }
+
+    /** A venue that answers the market close FILLED at avgPrice 0 - the 23.09 kill-switch closes. */
+    private static DelegatingExchange zeroPriceCloseVenue(boolean orderUnreadable) {
+        return new DelegatingExchange() {
+            @Override public OrderStatus placeOrder(OrderRequest request) {
+                OrderStatus real = delegate.placeOrder(request);
+                if (request.purpose() != com.bot.exec.OrderTypes.OrderPurpose.EMERGENCY_CLOSE) return real;
+                if (orderUnreadable) delegate.hideNextQueries = 5;
+                return new OrderStatus(real.clientOrderId(), real.exchangeOrderId(), real.symbol(), real.state(),
+                        real.type(), real.originalQuantity(), real.executedQuantity(), BigDecimal.ZERO,
+                        real.stopPrice(), real.reduceOnly(), real.closePosition(), real.updateTimeMs());
+            }
+        };
+    }
+
+    private ExecutionCoordinator.CloseReport closeOn(DelegatingExchange venue, String requestId) throws Exception {
+        ExecutionCoordinator coordinator = new ExecutionCoordinator(venue, engine,
+                new IdempotentOrderPlacer(venue, 3, 2, 0, ExecFixtures.NO_SLEEP), halt, alerts,
+                ExecutionCoordinator.Settings.defaults(), ExecFixtures.CLOCK, ExecFixtures.NO_SLEEP);
+        coordinator.execute(ExecFixtures.approvedPlan(engine, venue.fetchFilters("BTCUSDT")));
+        return coordinator.closeOut("BTCUSDT", requestId);
+    }
+
+    @Test
+    @DisplayName("a close answered FILLED at price 0 reports the price the order itself shows a moment later")
+    void zeroPriceCloseReadsTheOrderForItsPrice() throws Exception {
+        DelegatingExchange venue = zeroPriceCloseVenue(false);
+
+        ExecutionCoordinator.CloseReport report = closeOn(venue, "ks-zero");
+
+        assertTrue(report.flat(), report.note());
+        BigDecimal real = venue.delegate.queryOrder("BTCUSDT", ClientOrderIdFactory.create("ks-zero",
+                com.bot.exec.OrderTypes.OrderPurpose.EMERGENCY_CLOSE, 0)).orElseThrow().averagePrice();
+        assertTrue(real.signum() > 0, "the fake fills at a real price");
+        assertEquals(0, report.averagePrice().compareTo(real),
+                "the journal wrote price 0 for SUI, SOL and ENS on 23.09 - the exit the lab judges by was lost");
+    }
+
+    @Test
+    @DisplayName("when the order cannot be read either, the close still reports flat - the price stays 0, the close is not undone")
+    void zeroPriceCloseWithUnreadableOrderIsStillAClose() throws Exception {
+        DelegatingExchange venue = zeroPriceCloseVenue(true);
+
+        ExecutionCoordinator.CloseReport report = closeOn(venue, "ks-zero-2");
+
+        assertTrue(report.flat(), report.note());
+        assertEquals(0, report.averagePrice().signum(), "no invented price when none could be read");
+        assertFalse(engine.book().hasPosition("BTCUSDT"));
+        assertFalse(halt.isHalted());
+    }
 }

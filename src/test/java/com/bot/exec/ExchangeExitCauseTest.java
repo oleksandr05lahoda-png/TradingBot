@@ -343,6 +343,41 @@ class ExchangeExitCauseTest {
     }
 
     @Test
+    @DisplayName("with trade lines on, a calm take is not pushed twice - but the listener still hears it")
+    void calmExitLeftToTheTradeLine() throws Exception {
+        ExecutionCoordinator.Report opened = openOne();
+        String takeId = opened.takeProfitOrders().get(0).clientOrderId();
+        exchange.fillOrder(takeId, "0.041", "23.368");
+        exchange.setOrderState(opened.protectiveStop().orElseThrow().clientOrderId(), OrderState.EXPIRED);
+        exchange.clearPosition("BTCUSDT");
+        List<String> causes = new ArrayList<>();
+        reconciler.onExchangeExit((symbol, cause, detail, orderId, price, qty) -> causes.add(cause));
+        reconciler.announceCalmExitsElsewhere(true);
+
+        reconciler.reconcile(ExecFixtures.NOON);
+
+        assertEquals(List.of("take-profit"), causes);
+        assertFalse(alerts.sawInfo("Position closed"), "the trade line says it: " + alerts.messages);
+        assertFalse(alerts.sawWarning("Exchange-side exit"), alerts.messages.toString());
+        assertFalse(engine.book().hasPosition("BTCUSDT"), "the book is realigned exactly as before");
+    }
+
+    @Test
+    @DisplayName("with trade lines on, a liquidation is still pushed as a warning")
+    void liquidationWarnsEvenWithTradeLines() throws Exception {
+        ExecutionCoordinator.Report opened = openOne();
+        exchange.setOrderState(opened.protectiveStop().orElseThrow().clientOrderId(), OrderState.EXPIRED);
+        exchange.recordFilledOrder("autoclose-1757260000000", "BTCUSDT", OrderType.LIMIT,
+                "0.041", "61900.0", false);
+        exchange.clearPosition("BTCUSDT");
+        reconciler.announceCalmExitsElsewhere(true);
+
+        reconciler.reconcile(ExecFixtures.NOON);
+
+        assertTrue(alerts.sawWarning("Exchange-side exit"), alerts.messages.toString());
+    }
+
+    @Test
     @DisplayName("a hand close reaches the journal under its own cause")
     void journalHearsAHandClose() throws Exception {
         ExecutionCoordinator.Report opened = openOne();

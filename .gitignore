@@ -68,3 +68,4 @@ local.env.*
 *.env
 !example.env
 tools/scanner/__pycache__/
+tools/ops/__pycache__/

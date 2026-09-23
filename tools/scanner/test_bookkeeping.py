@@ -75,6 +75,20 @@ def main():
     check("... without the 24h cooldown",
           st["cooldown"]["Y"] < T0 + 4 * H - 12 * H, "cooldown=%r" % st["cooldown"])
 
+    # --- 2b. a refusal by the daily loss limit is not the coin's fault (23.09) ----------
+    st = {"entered": {"PENGU": T0}, "cooldown": {}, "entered_trig": {"PENGU": "dip"}, "was_held": []}
+    said = []
+    settle(st, held=set(), now=T0 + 1 * H, said=said,
+           rejected={"PENGU": "TRADING_HALTED: daily loss 3.37% of the day's starting balance $145.86"})
+    check("a kill-switch refusal earns no rest", "PENGU" not in st["cooldown"], "cooldown=%r" % st["cooldown"])
+    check("... so the coin is fresh again the moment the limit resets",
+          T0 + 1 * H - st["cooldown"].get("PENGU", 0) > COOLDOWN_H * H)
+    check("... and the log says why", any("halted" in s for s in said), repr(said))
+    st = {"entered": {"Q": T0}, "cooldown": {}, "entered_trig": {"Q": "trend"}, "was_held": []}
+    settle(st, held=set(), now=T0 + 1 * H, rejected={"Q": "STALE_SIGNAL: 95 min old"})
+    check("any other refusal still rests 2h",
+          abs(st["cooldown"]["Q"] - (T0 + 1 * H - COOLDOWN_H * H + 2 * H)) < 1, "cooldown=%r" % st["cooldown"])
+
     # --- 3. held but not ours ------------------------------------------------------------
     def owner_case(owned, filled=(), age_h=4):
         st = {"entered": {"CAKE": T0}, "cooldown": {}, "entered_trig": {"CAKE": "trend"},
