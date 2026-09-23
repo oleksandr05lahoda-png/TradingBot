@@ -24,6 +24,7 @@ import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -347,9 +348,13 @@ class OperatorChannelTest {
             String description = commands.getJSONObject(i).getString("description");
             assertTrue(description.matches(".*[А-Яа-я].*"), "Russian description: " + description);
         }
-        assertEquals(List.of("menu", "status", "book", "pnl", "queue", "why", "halt", "resume", "close", "help"), names);
-        for (String name : names) {
-            ops.handleUpdates(update(names.indexOf(name) + 1, "42", "/" + name));
+        // Control and the one fallback screen (24.09); the numbers live in the lab bot's panel.
+        assertEquals(List.of("status", "halt", "resume", "close", "menu", "help"), names);
+        // The unadvertised read-only screens still answer when typed.
+        List<String> typed = new ArrayList<>(names);
+        typed.addAll(List.of("book", "pnl", "queue", "why"));
+        for (String name : typed) {
+            ops.handleUpdates(update(typed.indexOf(name) + 1, "42", "/" + name));
         }
         assertFalse(tg.sent().stream().anyMatch(t -> t.contains("Не знаю такой команды")), tg.sent().toString());
     }
@@ -422,7 +427,7 @@ class OperatorChannelTest {
     // ─── Buttons ────────────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("/menu shows the state first and the eight buttons; every callback_data fits 64 bytes")
+    @DisplayName("/menu shows the state first and control only (24.09); every callback_data fits 64 bytes")
     void menuHasTheButtons() throws Exception {
         FakeTelegram tg = new FakeTelegram();
         OperatorChannel ops = channel(tg, new TradingHalt());
@@ -441,8 +446,8 @@ class OperatorChannelTest {
                 assertTrue(button.getString("callback_data").getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 64);
             }
         }
-        assertEquals(List.of("📊 Статус", "📒 Книга", "💰 PnL", "⏳ Очередь", "⏸ Халт", "▶️ Возобновить",
-                "🧯 Закрыть всё"), labels);
+        assertEquals(List.of("📊 Статус", "⏸ Халт", "▶️ Снять халт", "🧯 Закрыть всё"), labels);
+        assertEquals(3, rows.length(), "status / halt + resume / close all");
         assertThrows(IllegalArgumentException.class, () -> new OperatorViews.Button("x", "d".repeat(65)));
     }
 
@@ -648,7 +653,7 @@ class OperatorChannelTest {
     }
 
     @Test
-    @DisplayName("/why ADA reads the scanner's file; no argument asks which coin, with the book's buttons")
+    @DisplayName("/why ADA reads the scanner's file; no argument asks which coin, without coin buttons (24.09)")
     void whyCommand() throws Exception {
         FakeTelegram tg = new FakeTelegram();
         OperatorChannel ops = channel(tg, new TradingHalt()).withScannerView(scannerFile());
@@ -660,12 +665,12 @@ class OperatorChannelTest {
         assertTrue(tg.sent().get(0).startsWith("📒 <b>ADA · LONG · почему вошли</b>"), tg.sent().get(0));
         assertTrue(tg.sent().get(0).contains("Сейчас: +1.0%"), tg.sent().get(0));
         assertTrue(tg.sent().get(1).startsWith("🟠 <b>Какую монету?</b>"), tg.sent().get(1));
-        assertTrue(tg.of("sendMessage").get(1).params().get("reply_markup").contains("w:ADAUSDT"));
+        assertNull(tg.of("sendMessage").get(1).params().get("reply_markup"));
     }
 
     @Test
-    @DisplayName("/book carries a /why button per coin; pressing one turns the message into /why, with a way back")
-    void bookButtonsOpenWhy() throws Exception {
+    @DisplayName("24.09: /book has no coin buttons; an old message's coin button still draws /why, read-only")
+    void oldCoinButtonsStillAnswer() throws Exception {
         FakeTelegram tg = new FakeTelegram();
         OperatorChannel ops = channel(tg, new TradingHalt()).withScannerView(scannerFile());
         ops.publish(snapshot(NOON, List.of(position("ADAUSDT", Side.LONG, 1.0, 1.01))));
@@ -676,13 +681,14 @@ class OperatorChannelTest {
         ops.handleUpdates(press(3, "42", now, OperatorViews.CB_WHY + "ADAUSDT"));
         ops.handleUpdates(press(4, "42", now, OperatorViews.CB_WHY + "ada<script>"));
 
-        assertTrue(tg.of("sendMessage").get(0).params().get("reply_markup").contains("w:ADAUSDT"));
+        assertNull(tg.of("sendMessage").get(0).params().get("reply_markup"), "typed /book: no keyboard");
         List<FakeTelegram.Call> edits = tg.of("editMessageText");
         assertEquals(2, edits.size(), "a garbage coin draws nothing");
-        assertTrue(edits.get(0).params().get("reply_markup").contains("w:ADAUSDT"));
+        assertFalse(edits.get(0).params().get("reply_markup").contains("w:"), "no coin buttons under the book");
         assertTrue(edits.get(0).params().get("reply_markup").contains("m:status"), "the menu stays under the book");
         assertTrue(edits.get(1).params().get("text").startsWith("📒 <b>ADA · LONG · почему вошли</b>"));
-        assertTrue(edits.get(1).params().get("reply_markup").contains("\"m:book\""), "« Книга goes back");
+        assertTrue(edits.get(1).params().get("reply_markup").contains("m:status"), "the menu under /why");
+        assertFalse(edits.get(1).params().get("reply_markup").contains("\"m:book\""), "no « Книга any more");
         assertEquals(3, tg.of("answerCallbackQuery").size(), "every press answered, the bad one too");
         assertEquals("Неизвестная монета", tg.of("answerCallbackQuery").get(2).params().get("text"));
         assertTrue(ops.drainCloses().isEmpty(), "a coin button never closes anything");

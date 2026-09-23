@@ -345,6 +345,12 @@ public final class TestnetBot {
                 alerts.warning("Conditional-order budget above the venue cap", text);
             }
 
+            // The same snapshot as a file for the lab bot's panel (24.09). Writes on its own thread;
+            // offer() never throws and never waits on the disk. Null = the panel reads no file.
+            // Created before the hold watchdog, which writes it while the loop is parked.
+            BotViewWriter botView = operator == null ? null
+                    : BotViewWriter.startOrNull(dataDir.resolve(BotViewWriter.FILE_NAME));
+
             // The loop thread parks inside the rate limiter for the length of an exchange hold, so
             // it cannot repeat its own alert: 17 hours of sleep used to be one Telegram line at the
             // start and then silence. This thread exists only to keep telling the truth meanwhile.
@@ -357,6 +363,12 @@ public final class TestnetBot {
                         return;
                     }
                     long held = port.heldByExchangeForMillis();
+                    // The panel file too (24.09 review): the parked loop offers nothing, so the file
+                    // said "trading" through a whole ban. The channel's last view with the hold read
+                    // now; offerDuringHold never throws and is a no-op for a short hold.
+                    if (botView != null) {
+                        botView.offerDuringHold(held, operator::snapshot, halt::reason);
+                    }
                     if (held < 300_000L) {
                         lastReminderMs = 0;
                         continue;
@@ -417,6 +429,7 @@ public final class TestnetBot {
                     OperatorSnapshot first = operatorSnapshot(processStartedAt, buildStamp, observeOnly, engine, port,
                             deadMansSwitch, reconciler, journal, false, 0, pendingCloses, lastReconcileOkAt, null);
                     operator.publish(first);
+                    if (botView != null) botView.offer(first, halt.reason());
                     if (notes != null) notes.observe(first.positions());
                 } catch (RuntimeException e) {
                     LOG.warning("[Boot] operator snapshot not published: " + e.getMessage());
@@ -623,6 +636,7 @@ public final class TestnetBot {
                                     engine, port, deadMansSwitch, reconciler, journal, blind, reconcileFailures,
                                     pendingCloses, lastReconcileOkAt, pnl);
                             operator.publish(snap);
+                            if (botView != null) botView.offer(snap, halt.reason());
                             // The notifier learns entries, sizes and open times from the same view,
                             // so an exit can say what it made and how long it was held.
                             if (notes != null) notes.observe(snap.positions());
@@ -801,11 +815,15 @@ public final class TestnetBot {
         java.util.Map<String, TradeJournal.OpenMark> marks = journal == null ? java.util.Map.of() : journal.openMarks();
         List<OperatorSnapshot.Position> positions = OperatorSnapshot.positions(
                 read.map(Reconciler.LastRead::positions).orElse(null), engine.book().all(), marks);
+        // One evaluate() - exactly what isTripped(now) ran before - so the panel's figures and the
+        // tripped flag come from the same reading of the switch (24.09).
+        com.bot.risk.DailyLossKillSwitch.Status ks = engine.killSwitch().evaluate(now);
         return new OperatorSnapshot(now, startedAt, buildStamp, observeOnly,
-                engine.killSwitch().isTripped(now), port.heldByExchangeForMillis(),
+                ks.tripped(), port.heldByExchangeForMillis(),
                 deadMansSwitch.isDegraded(), blind, reconcileFailures, pendingCloses.size(), lastReconcileOkAt,
-                read.map(r -> OperatorSnapshot.Account.of(r.account())).orElse(null),
-                positions, read.isPresent(), pnl, closeQueue(pendingCloses));
+                read.map(r -> OperatorSnapshot.Account.of(r.account(), r.at())).orElse(null),
+                positions, read.isPresent(), pnl, closeQueue(pendingCloses),
+                OperatorSnapshot.KillSwitch.of(ks, engine.killSwitch().dailyLossFractionLimit()));
     }
 
     /**

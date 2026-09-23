@@ -172,23 +172,19 @@ class ScannerScreensTest {
     }
 
     @Test
-    @DisplayName("under /book: a /why button per coin, four to a row, callback data within 64 bytes")
-    void bookButtons() {
+    @DisplayName("24.09: /book no longer promises coin buttons - they went with the duplicates")
+    void bookHasNoCoinButtons() {
         List<OperatorSnapshot.Position> rows = new ArrayList<>();
         for (int i = 0; i < 15; i++) rows.add(OperatorChannelTest.position("C" + i + "USDT", Side.LONG, 1.0, 1.0));
-        List<List<OperatorViews.Button>> kb = OperatorViews.bookKeyboard(snap(rows, List.of()), true);
+        String book = OperatorViews.book(snap(rows, List.of()), NOW);
 
-        assertEquals(4 + OperatorViews.MENU.size(), kb.size(), "15 coins = 4 rows, then the menu");
-        assertEquals(4, kb.get(0).size());
-        assertEquals(3, kb.get(3).size());
-        assertEquals("📒 C0", kb.get(0).get(0).text());
-        assertEquals("w:C0USDT", kb.get(0).get(0).data());
-        for (List<OperatorViews.Button> row : kb) {
-            for (OperatorViews.Button b : row) assertTrue(b.data().getBytes(StandardCharsets.UTF_8).length <= 64);
+        assertFalse(book.contains("Кнопка монеты"), book);
+        assertTrue(book.contains("C14"), "every coin is still on the screen");
+        for (List<OperatorViews.Button> row : OperatorViews.MENU) {
+            for (OperatorViews.Button b : row) {
+                assertFalse(b.data().startsWith(OperatorViews.CB_WHY), "no coin button in the menu");
+                assertTrue(b.data().getBytes(StandardCharsets.UTF_8).length <= 64);
+            }
         }
-        assertNull(OperatorViews.bookKeyboard(snap(List.of(), List.of()), false), "no book, no keyboard");
-        assertTrue(OperatorViews.book(snap(rows, List.of()), NOW).contains("ничего не закрывает"),
-                "the coin buttons say they are read-only");
-        assertFalse(OperatorViews.whyKeyboard().isEmpty());
     }
 }

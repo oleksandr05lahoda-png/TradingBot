@@ -25,6 +25,7 @@ import java.util.Map;
  * @param positions             from the exchange when {@code positionsFromExchange}, else the bot's book
  * @param pnl                   realised figures, or null before the first attempt
  * @param closeQueue            closes that did not confirm flat and wait for their next attempt
+ * @param killSwitch            the daily limit's own figures, or null when the loop did not read them
  */
 record OperatorSnapshot(
         Instant at,
@@ -42,12 +43,44 @@ record OperatorSnapshot(
         List<Position> positions,
         boolean positionsFromExchange,
         Pnl pnl,
-        List<QueuedClose> closeQueue) {
+        List<QueuedClose> closeQueue,
+        KillSwitch killSwitch) {
 
     OperatorSnapshot {
         positions = positions == null ? List.of() : List.copyOf(positions);
         closeQueue = closeQueue == null ? List.of() : List.copyOf(closeQueue);
         buildStamp = buildStamp == null || buildStamp.isBlank() ? "unknown" : buildStamp.trim();
+    }
+
+    /** Without the daily limit's figures: the screens only ever needed its tripped flag. */
+    OperatorSnapshot(Instant at, Instant startedAt, String buildStamp, boolean observeOnly, boolean killSwitchTripped,
+                     long exchangeHoldMs, boolean contactLost, boolean blind, int reconcileFailures, int pendingCloses,
+                     Instant lastReconcileOkAt, Account account, List<Position> positions,
+                     boolean positionsFromExchange, Pnl pnl, List<QueuedClose> closeQueue) {
+        this(at, startedAt, buildStamp, observeOnly, killSwitchTripped, exchangeHoldMs, contactLost, blind,
+                reconcileFailures, pendingCloses, lastReconcileOkAt, account, positions, positionsFromExchange, pnl,
+                closeQueue, null);
+    }
+
+    /**
+     * The daily loss limit as the switch itself reads it, for the owner's panel (24.09: "my budget
+     * is not shown", and a paused bot said nothing about how far the day had fallen). NaN / null
+     * where the switch does not know yet - before the first balance of the day, for instance.
+     *
+     * @param dayLossFrac today's loss as a fraction of the day's start (0.0337 = −3.37%); 0 on a green day
+     * @param resumesAt   when a trip lifts by itself (the next UTC midnight); null when not tripped
+     */
+    record KillSwitch(boolean tripped, double limitFrac, double dayStartBalance, double dayLossFrac,
+                      Instant resumesAt) {
+
+        static KillSwitch of(com.bot.risk.DailyLossKillSwitch.Status s, double limitFrac) {
+            if (s == null) return null;
+            boolean known = s.dayStartBalance() > 0;
+            Instant resumes = s.tripped() && s.utcDay() != null
+                    ? s.utcDay().plusDays(1).atStartOfDay(java.time.ZoneOffset.UTC).toInstant() : null;
+            return new KillSwitch(s.tripped(), limitFrac, known ? s.dayStartBalance() : Double.NaN,
+                    known ? s.drawdownFraction() : Double.NaN, resumes);
+        }
     }
 
     /**
@@ -58,7 +91,7 @@ record OperatorSnapshot(
     OperatorSnapshot withExchangeHold(long holdMs) {
         return new OperatorSnapshot(at, startedAt, buildStamp, observeOnly, killSwitchTripped, holdMs,
                 contactLost, blind, reconcileFailures, pendingCloses, lastReconcileOkAt, account, positions,
-                positionsFromExchange, pnl, closeQueue);
+                positionsFromExchange, pnl, closeQueue, killSwitch);
     }
 
     /**
@@ -67,12 +100,29 @@ record OperatorSnapshot(
      */
     record QueuedClose(String symbol, String reason, int attemptsSpent, int maxAttempts, Instant nextTryAt) {}
 
-    /** Wallet includes locked margin; available excludes it. */
-    record Account(double wallet, double available, double unrealized) {
+    /**
+     * Wallet includes locked margin; available excludes it.
+     *
+     * @param at when the reconciler read it; null when not known
+     */
+    record Account(double wallet, double available, double unrealized, Instant at) {
+
+        Account(double wallet, double available, double unrealized) {
+            this(wallet, available, unrealized, null);
+        }
 
         static Account of(AccountSnapshot a) {
+            return of(a, null);
+        }
+
+        static Account of(AccountSnapshot a, Instant at) {
             return a == null ? null : new Account(a.walletBalance().doubleValue(),
-                    a.availableBalance().doubleValue(), a.totalUnrealizedPnl().doubleValue());
+                    a.availableBalance().doubleValue(), a.totalUnrealizedPnl().doubleValue(), at);
+        }
+
+        /** Wallet plus open P&amp;L - Binance's "margin balance", what the account is worth now. */
+        double marginBalance() {
+            return wallet + unrealized;
         }
 
         /** Margin in use: equity minus what is still free. */

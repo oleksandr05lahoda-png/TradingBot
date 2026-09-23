@@ -34,8 +34,9 @@ import java.util.logging.Logger;
 import static com.bot.app.TgFormat.esc;
 
 /**
- * The operator's hands, over Telegram: {@code /status}, {@code /book}, {@code /pnl}, {@code /halt},
- * {@code /resume}, {@code /close}, and the same behind inline buttons ({@code /menu}). Until 21.08
+ * The operator's hands, over Telegram: {@code /status}, {@code /halt}, {@code /resume},
+ * {@code /close}, and the same behind inline buttons ({@code /menu}); since 24.09 the numbers live
+ * in the lab bot's panel and /status is the one fallback screen here. Until 21.08
  * a halt cleared only with a redeploy and "what is the bot doing" meant opening the hosting
  * console. Commands are accepted from the configured chat only, and nothing here can open a
  * position or call the exchange: every screen renders a snapshot the main loop publishes, halt
@@ -74,17 +75,17 @@ public final class OperatorChannel implements AutoCloseable {
     static final Duration CLOSE_ALL_TTL = Duration.ofSeconds(60);
     static final String CLOSE_ALL_REASON = "operator: close all via Telegram";
 
-    /** The "/" menu in the Telegram client. Russian: it is read by the owner, typed in latin. */
+    /**
+     * The "/" menu in the Telegram client. Russian: it is read by the owner, typed in latin. Control
+     * and the one fallback screen only (24.09): /book /pnl /queue /why still answer when typed, but
+     * the lab bot's 📊 Панель is where those numbers live, and three places showing them was noise.
+     */
     static final List<String[]> COMMANDS = List.of(
-            new String[] {"menu", "Кнопки управления"},
             new String[] {"status", "Состояние бота"},
-            new String[] {"book", "Открытые позиции"},
-            new String[] {"pnl", "Итог: день, 7 и 30 дней"},
-            new String[] {"queue", "Кто ждёт входа и закрытия"},
-            new String[] {"why", "Почему вошли: /why ADA"},
             new String[] {"halt", "Стоп новых входов"},
             new String[] {"resume", "Снять халт"},
             new String[] {"close", "Закрыть: /close ADAUSDT или all"},
+            new String[] {"menu", "Кнопки управления"},
             new String[] {"help", "Все команды"});
 
     private final Transport transport;
@@ -290,7 +291,7 @@ public final class OperatorChannel implements AutoCloseable {
         thread = new Thread(this::loop, "operator-channel");
         thread.setDaemon(true);
         thread.start();
-        LOG.info("[Operator] Telegram commands armed: /menu /status /book /pnl /queue /why /halt /resume /close /help");
+        LOG.info("[Operator] Telegram commands armed: /status /halt /resume /close /menu /help");
     }
 
     @Override public void close() {
@@ -446,8 +447,10 @@ public final class OperatorChannel implements AutoCloseable {
                 return new CallbackOutcome("", new Reply(OperatorViews.menu(s, halt.reason(), now), OperatorViews.MENU));
             case OperatorViews.CB_STATUS:
                 return new CallbackOutcome("", withMenu(OperatorViews.status(s, halt.reason(), now)));
+            // 📒 💰 ⏳ and the coin buttons left the menu on 24.09; old messages still carry them,
+            // so they keep drawing their read-only screens rather than spinning.
             case OperatorViews.CB_BOOK:
-                return new CallbackOutcome("", new Reply(OperatorViews.book(s, now), OperatorViews.bookKeyboard(s, true)));
+                return new CallbackOutcome("", withMenu(OperatorViews.book(s, now)));
             case OperatorViews.CB_PNL:
                 return new CallbackOutcome("", withMenu(OperatorViews.pnl(s, now)));
             case OperatorViews.CB_QUEUE:
@@ -465,8 +468,7 @@ public final class OperatorChannel implements AutoCloseable {
             // Read-only: the symbol only picks which screen to draw, and garbage draws "no data".
             String symbol = data.substring(OperatorViews.CB_WHY.length());
             if (!symbol.matches("[A-Z0-9]{2,20}")) return new CallbackOutcome("Неизвестная монета", null);
-            return new CallbackOutcome("", new Reply(OperatorViews.why(symbol, s, scannerView(now), now),
-                    OperatorViews.whyKeyboard()));
+            return new CallbackOutcome("", withMenu(OperatorViews.why(symbol, s, scannerView(now), now)));
         }
         if (data.startsWith(OperatorViews.CB_CLOSE_ALL_YES)) {
             return confirmCloseAll(data.substring(OperatorViews.CB_CLOSE_ALL_YES.length()), now);
@@ -505,8 +507,10 @@ public final class OperatorChannel implements AutoCloseable {
                 return new Reply(OperatorViews.menu(s, halt.reason(), now), OperatorViews.MENU);
             case "/status":
                 return Reply.of(OperatorViews.status(s, halt.reason(), now));
+            // Not advertised since 24.09 (the lab bot's panel shows these), still answered when
+            // typed: read-only, and a remembered command should not meet "unknown command".
             case "/book":
-                return new Reply(OperatorViews.book(s, now), OperatorViews.bookKeyboard(s, false));
+                return Reply.of(OperatorViews.book(s, now));
             case "/pnl":
                 return Reply.of(OperatorViews.pnl(s, now));
             case "/queue":
@@ -515,8 +519,8 @@ public final class OperatorChannel implements AutoCloseable {
                 String arg = words.length > 1 ? words[1].toUpperCase(Locale.ROOT) : "";
                 String symbol = resolveSymbol(arg, s);
                 if (symbol == null) {
-                    return new Reply("🟠 <b>Какую монету?</b>\n/why ADA — почему бот вошёл",
-                            OperatorViews.bookKeyboard(s, false));
+                    // No coin buttons since 24.09: they were the /why buttons the owner removed.
+                    return Reply.of("🟠 <b>Какую монету?</b>\n/why ADA — почему бот вошёл");
                 }
                 return Reply.of(OperatorViews.why(symbol, s, scannerView(now), now));
             }

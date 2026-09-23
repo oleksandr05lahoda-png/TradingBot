@@ -23,11 +23,13 @@ LAB_VPS = os.path.join(HERE, "..", "..", "..", "StrategyLab", "lab", "watch", "v
 FAILED = []
 PASSED = [0]
 
-# StrategyLab lab/watch/vps.py REMOTE, as of 23.09.2026. Check 1 keeps this copy honest.
+# StrategyLab lab/watch/vps.py REMOTE, as of 24.09.2026. Check 1 keeps this copy honest.
+# 24.09: the watcher dropped the container and scanner lines (the server's own watchdog and selfcheck say
+# those) and now asks for two facts only. The forced command still prints all four, so a key installed on
+# 23.09 keeps working: the watcher's parser ignores keys it does not read. The checks below therefore ask
+# that every line REMOTE prints comes out of the script byte for byte - not that the outputs are equal.
 REMOTE = (
-    "echo status=$(docker inspect -f '{{.State.Status}}' tradingbot 2>/dev/null || echo missing); "
     "echo now=$(date -u +%s); "
-    "echo scan=$(tail -n 4000 /opt/tradingbot-data/autoscan.log 2>/dev/null | grep ' scan: ' | tail -1 | cut -c1-19); "
     "echo selfcheck=$(tail -n 1 /opt/tradingbot-data/ops/selfcheck.log 2>/dev/null | cut -c1-20)"
 )
 
@@ -90,6 +92,12 @@ def run(bash, tmp, data, docker_state, *, script=True, client_cmd=""):
     return re.sub(rb"^now=\d{10}$", b"now=N", res.stdout, flags=re.M)
 
 
+def carries(script_out, remote_out):
+    """Every line the watcher's own REMOTE prints is in the forced command's output, byte for byte."""
+    lines = script_out.splitlines()
+    return remote_out != b"" and all(line in lines for line in remote_out.splitlines())
+
+
 def lab_remote():
     try:
         src = io.open(LAB_VPS, encoding="utf-8").read()
@@ -132,7 +140,7 @@ def main():
 
         a = run(bash, tmp, data, "running", script=False)
         b = run(bash, tmp, data, "running")
-        check("healthy: identical bytes", a == b and a != b"", "%r vs %r" % (a, b))
+        check("healthy: the script prints every REMOTE line byte for byte", carries(b, a), "%r vs %r" % (a, b))
         snap = parse(b.decode("utf-8"))
         check("healthy: the watcher reads all four keys",
               snap == {"status": "running", "now": "N", "scan": "2026-09-23 17:40:01",
@@ -151,7 +159,7 @@ def main():
         os.makedirs(empty)
         a = run(bash, tmp, empty, None, script=False)
         b = run(bash, tmp, empty, None)
-        check("container missing, no logs: identical bytes", a == b, "%r vs %r" % (a, b))
+        check("container missing, no logs: every REMOTE line byte for byte", carries(b, a), "%r vs %r" % (a, b))
         check("container missing, no logs: status=missing, empty scan and selfcheck",
               parse(b.decode()) == {"status": "missing", "now": "N", "scan": "", "selfcheck": ""},
               repr(b))

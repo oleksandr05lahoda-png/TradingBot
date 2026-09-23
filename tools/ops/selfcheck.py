@@ -13,6 +13,15 @@ cannot see that; an invariant check can. Runs every 30 min, alerts only on a NEW
 import hmac, hashlib, time, urllib.request, urllib.parse, urllib.error, json, io, os, subprocess, calendar, re
 
 STATE = "/opt/selfcheck.state"
+# 24.09 (owner: one incident = one message). A stopped container was announced twice in the same
+# chat: by /opt/watchdog.sh within 5 minutes and again by check 1 below at the next half hour.
+# watchdog.sh leaves this flag once its alert was DELIVERED and removes it on recovery, so while the
+# flag stands for this stop check 1's failure is already said: it still withholds the pulse and goes
+# to the cron log, it only stays out of Telegram. Otherwise this script remains the backup voice
+# (what "stands for this stop" means: _said_by_watchdog below).
+WATCHDOG_FLAG = "/opt/watchdog.alerted"
+WATCHDOG_ERR = "/opt/watchdog.err"
+CONTAINER_DOWN = "контейнер не работает"
 env = {}
 for ln in io.open("/opt/tradingbot.env", encoding="utf-8", errors="ignore"):
     s = ln.strip()
@@ -74,12 +83,23 @@ def call(path, extra="", _retried=False):
 fails = []
 now = time.time()
 
+# --- container:begin (tools/ops/test_selfcheck_alert.py runs checks 1-2 on their own)
 # 1. container alive
+# down_since (24.09): when the container stopped, from docker's own FinishedAt. The watchdog's flag
+# counts only if it was set AFTER this moment (alert block below): a flag left from an old incident,
+# with the watchdog dead since, must not mute a new one. None = unknown -> the flag never counts.
+down_since = None
 try:
-    st = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", "tradingbot"],
-                        capture_output=True, text=True, timeout=30).stdout.strip()
+    st, _, fin = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}|{{.State.FinishedAt}}", "tradingbot"],
+                                capture_output=True, text=True, timeout=30).stdout.strip().partition("|")
     if st != "running":
-        fails.append("контейнер не работает (%s)" % st)
+        fails.append("%s (%s)" % (CONTAINER_DOWN, st))
+        try:
+            down_since = calendar.timegm(time.strptime(fin[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            down_since = None
+        if down_since is not None and down_since < 86400:  # "0001-01-01...": never stopped, nothing to tie to
+            down_since = None
 except Exception as e:
     fails.append("не удалось проверить контейнер: %s" % e)
 
@@ -94,17 +114,21 @@ try:
                 last_pass = calendar.timegm(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S"))
             except ValueError:
                 pass
-    started = subprocess.run(["docker", "inspect", "-f", "{{.State.StartedAt}}", "tradingbot"],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
+    status2, _, started = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}|{{.State.StartedAt}}", "tradingbot"],
+                                         capture_output=True, text=True, timeout=30).stdout.strip().partition("|")
     try:
         import datetime
         up_for = now - datetime.datetime.fromisoformat(started[:26] + "+00:00").timestamp()
     except Exception:
         up_for = 1e9
-    if (last_pass is None or now - last_pass > 9000) and up_for > 9000:
+    # The scanner runs INSIDE the container: a stopped container is check 1's alert and its silent
+    # scanner is the same incident, not a second one (24.09: a stop longer than 2.5 h sent a second
+    # message that named only the symptom, not the stopped container). Same rule as check 6.
+    if status2 == "running" and (last_pass is None or now - last_pass > 9000) and up_for > 9000:
         fails.append("сканер не делал проходов больше 2.5 часов")
 except Exception as e:
     fails.append("не удалось прочитать лог сканера: %s" % e)
+# --- container:end
 
 # 3. every open position must carry a STOP on the closing side (a take-profit is not a stop)
 positions, unprotected = {}, []
@@ -278,14 +302,6 @@ except FileNotFoundError:
 except Exception as e:
     fails.append("не удалось проверить пульс торговой петли: %s" % e)
 
-prev = ""
-if os.path.exists(STATE):
-    prev = io.open(STATE, encoding="utf-8").read().strip()
-cur = " | ".join(fails)
-# Compared WITHOUT the numbers: "20 passes" and "21 passes" are the same open problem, and the
-# count changing every half hour used to make each run a "new" alert (03.09: four in three hours).
-key = re.sub(r"\d+", "N", cur)
-
 def tg(text):
     """True when Telegram took the message. A delivery failure used to raise out of the script:
     no state written, nothing printed anywhere cron could keep, and the one alert that mattered
@@ -306,14 +322,55 @@ def tg(text):
             f.write("%s telegram delivery failed: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), why.strip()))
         return False
 
-delivered = True
-if cur and key != prev:
-    delivered = tg("Самопроверка нашла проблему:\n\n- " + "\n- ".join(fails) +
-                   "\n\nПозиции защищены биржевыми стопами, если выше не написано иначе.")
-elif prev and not cur:
+# --- alert:begin (tools/ops/test_selfcheck_alert.py runs this block on its own)
+def _said_by_watchdog():
+    """True only when the watchdog's flag shows THIS stop reached Telegram (24.09 review).
+    The flag alone did not: the watchdog.sh of 03.09 touched it even when curl failed, and a flag
+    left from an old incident (watchdog cron lost since) would have muted every later stop - with no
+    HEARTBEAT_URL on the host, nothing else would have spoken. So the flag counts only if
+      - it was set after this stop (docker's FinishedAt; 60 s for cron timing), and
+      - no watchdog delivery failure sits next to it or after it: the 03.09 watchdog wrote its
+        failure line and touched the flag in the same second; the fixed one touches only after a
+        delivery that worked, so its failed tries are >= 5 min older than the flag.
+    In any doubt this script speaks: two messages for one stop beat none."""
+    try:
+        flag_t = os.path.getmtime(WATCHDOG_FLAG)
+    except OSError:
+        return False
+    if down_since is None or flag_t < down_since - 60:
+        return False
+    try:
+        err_t = os.path.getmtime(WATCHDOG_ERR)
+    except OSError:
+        return True
+    return err_t < flag_t - 60
+
+
+# told = what goes to Telegram; fails stays whole for the pulse below and for the cron log line.
+said = _said_by_watchdog()
+told = [f for f in fails if not (said and f.startswith(CONTAINER_DOWN))]
+prev = ""
+if os.path.exists(STATE):
+    prev = io.open(STATE, encoding="utf-8").read().strip()
+cur = " | ".join(fails)
+# Compared WITHOUT the numbers: "20 passes" and "21 passes" are the same open problem, and the
+# count changing every half hour used to make each run a "new" alert (03.09: four in three hours).
+key = re.sub(r"\d+", "N", " | ".join(told))
+
+delivered, keep = True, False
+if told:
+    if key != prev:
+        delivered = tg("Самопроверка нашла проблему:\n\n- " + "\n- ".join(told) +
+                       "\n\nПозиции защищены биржевыми стопами, если выше не написано иначе.")
+elif fails:
+    # Only the watchdog's incident is open. Nothing to say, and the state is KEPT: "back to normal"
+    # while the container is still down would be a lie, so it waits for a run with no failure at all.
+    keep = True
+elif prev:
     delivered = tg("Самопроверка: всё вернулось в норму.")
-if delivered:
+if delivered and not keep:
     io.open(STATE, "w", encoding="utf-8").write(key)
+# --- alert:end
 
 # External pulse (23.09). Every watcher above - this script, watchdog.sh, the digest - lives ON this
 # machine: when the machine, its network or cron dies, they die with it and the owner hears nothing
@@ -340,6 +397,7 @@ if hb:
                 f.write("%s heartbeat failed: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                                        pulse.split(": ", 1)[1].strip()))
 # --- pulse:end
-print("%s checks: %d fail(s): %s%s | %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), len(fails),
-                                             cur or "ок", "" if delivered else " [TELEGRAM NOT DELIVERED, will retry]",
-                                             pulse))
+print("%s checks: %d fail(s): %s%s%s | %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), len(fails),
+                                               cur or "ок", "" if delivered else " [TELEGRAM NOT DELIVERED, will retry]",
+                                               " [container: said by watchdog]" if len(told) < len(fails) else "",
+                                               pulse))

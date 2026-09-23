@@ -114,6 +114,14 @@ public final class DailyLossKillSwitch {
         this.dailyLossFractionLimit = dailyLossFractionLimit;
     }
 
+    /**
+     * The limit as a fraction of the day's starting balance (0.03 = 3%). Read-only, for the
+     * operator's panel (24.09): the owner asked what the limit is and how close the day is to it.
+     */
+    public double dailyLossFractionLimit() {
+        return dailyLossFractionLimit;
+    }
+
     /** A breach must hold for this long before the latch; the next reconcile pass confirms it. */
     public synchronized DailyLossKillSwitch withConfirmationWindowMs(long millis) {
         Preconditions.require(millis >= 0, "confirmation window must not be negative");

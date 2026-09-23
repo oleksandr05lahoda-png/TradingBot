@@ -64,11 +64,23 @@ final class OperatorViews {
     /** {@code w:ADAUSDT} - /why for one coin. Symbols are checked to fit the 64-byte ceiling. */
     static final String CB_WHY = "w:";
 
+    /**
+     * Control plus one fallback screen (24.09). The owner reads the book, P&amp;L and queue in the
+     * lab bot's 📊 Панель now, and the same numbers in three places was the complaint. 📒 💰 ⏳ and
+     * the per-coin /why buttons are gone from here; their callbacks still answer, because old
+     * messages in the chat carry them and a dead button that spins is worse than an old screen.
+     */
     static final List<List<Button>> MENU = List.of(
-            List.of(new Button("📊 Статус", CB_STATUS), new Button("📒 Книга", CB_BOOK)),
-            List.of(new Button("💰 PnL", CB_PNL), new Button("⏳ Очередь", CB_QUEUE)),
-            List.of(new Button("⏸ Халт", CB_HALT), new Button("▶️ Возобновить", CB_RESUME)),
+            List.of(new Button("📊 Статус", CB_STATUS)),
+            List.of(new Button("⏸ Халт", CB_HALT), new Button("▶️ Снять халт", CB_RESUME)),
             List.of(new Button("🧯 Закрыть всё", CB_CLOSE_ALL)));
+
+    /**
+     * The last line of /status: where the full picture lives. The panel is sent by the lab bot,
+     * which runs on the owner's laptop - so it says when it is there. Broken in two only so every
+     * line of /status stays phone-width (the ≤40-character rule the screen is tested against).
+     */
+    static final String PANEL_HINT = "<i>Полная панель — кнопка 📊 Панель\nв лаб-боте (когда ноутбук включён)</i>";
 
     /** The loop publishes every 30 s; three minutes of silence means it is parked or stuck. */
     static final Duration STALE_AFTER = Duration.ofMinutes(3);
@@ -91,27 +103,58 @@ final class OperatorViews {
      * exchange outranks a halt, a halt outranks the daily limit, and only then is it green.
      */
     static List<String> states(OperatorSnapshot s, Optional<String> haltReason, Instant now) {
-        if (s == null) return List.of("🟠 <b>Запуск</b> — цикл ещё не прислал данных");
-        java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        return stateList(s, haltReason, now).stream().map(State::html).toList();
+    }
+
+    /**
+     * The headline's machine name, for the panel file (bot_view.json): {@code trading}, {@code halt},
+     * {@code kill_switch}, {@code observe}, {@code exchange_hold}, {@code loop_silent},
+     * {@code contact_lost}, {@code blind} or {@code starting}. Same ranking as the line /status shows,
+     * because it is the same list - a second copy of the logic would drift from the screen.
+     */
+    static String stateCode(OperatorSnapshot s, Optional<String> haltReason, Instant now) {
+        return stateList(s, haltReason, now).get(0).code();
+    }
+
+    /** One true state: its code for the panel file, and the line /status renders for it. */
+    record State(String code, String html) {}
+
+    private static List<State> stateList(OperatorSnapshot s, Optional<String> haltReason, Instant now) {
+        if (s == null) return List.of(new State("starting", "🟠 <b>Запуск</b> — цикл ещё не прислал данных"));
+        java.util.ArrayList<State> out = new java.util.ArrayList<>();
         Duration silent = Duration.between(s.at(), now);
         // The hold first: it is the usual reason the loop falls silent, and it names when it ends.
         if (s.exchangeHoldMs() > 0) {
-            out.add("🔴 <b>Биржа не отвечает</b> — пауза ещё " + age(Duration.ofMillis(s.exchangeHoldMs())));
+            out.add(new State("exchange_hold",
+                    "🔴 <b>Биржа не отвечает</b> — пауза ещё " + age(Duration.ofMillis(s.exchangeHoldMs()))));
         }
-        if (silent.compareTo(STALE_AFTER) > 0) out.add("🔴 <b>Цикл молчит " + age(silent) + "</b>");
-        if (s.contactLost()) out.add("🔴 <b>Биржа не отвечает</b> — нет связи, входы на паузе");
+        if (silent.compareTo(STALE_AFTER) > 0) {
+            out.add(new State("loop_silent", "🔴 <b>Цикл молчит " + age(silent) + "</b>"));
+        }
+        if (s.contactLost()) {
+            out.add(new State("contact_lost", "🔴 <b>Биржа не отвечает</b> — нет связи, входы на паузе"));
+        }
         if (s.blind()) {
-            out.add("🔴 <b>Биржа не отвечает</b> — " + s.reconcileFailures() + " сверок подряд не прошли");
+            out.add(new State("blind",
+                    "🔴 <b>Биржа не отвечает</b> — " + s.reconcileFailures() + " сверок подряд не прошли"));
         }
         // Observe is the venue's mode, not only a latch: a drift halt can stand in its place, and a
         // /resume leaves the latch empty until the loop's next pass - the screen said 🟢 then while
         // every signal was refused. The published flag is the truth; the latch only words it.
         boolean observeLatched = haltReason.isPresent()
                 && haltReason.get().startsWith(OperatorChannel.OBSERVE_REASON_PREFIX);
-        if (s.observeOnly() || observeLatched) out.add("👁 <b>Наблюдение</b> — входы выключены");
-        if (haltReason.isPresent() && !observeLatched) out.add("⏸ <b>Халт:</b> " + esc(haltReason.get()));
-        if (s.killSwitchTripped()) out.add("⏸ <b>Дневной лимит убытка</b> — входов нет");
-        if (out.isEmpty()) out.add("🟢 <b>Торгует</b>");
+        if (s.observeOnly() || observeLatched) out.add(new State("observe", "👁 <b>Наблюдение</b> — входы выключены"));
+        if (haltReason.isPresent() && !observeLatched) {
+            out.add(new State("halt", "⏸ <b>Халт:</b> " + esc(haltReason.get())));
+        }
+        if (s.killSwitchTripped()) {
+            // How far the day fell, when the switch said (24.09): "paused" alone left the owner asking.
+            OperatorSnapshot.KillSwitch ks = s.killSwitch();
+            String loss = ks != null && Double.isFinite(ks.dayLossFrac()) && ks.dayLossFrac() > 0
+                    ? " " + pct(-ks.dayLossFrac() * 100.0) : "";
+            out.add(new State("kill_switch", "⏸ <b>Дневной лимит убытка</b>" + loss + " — входов нет"));
+        }
+        if (out.isEmpty()) out.add(new State("trading", "🟢 <b>Торгует</b>"));
         return out;
     }
 
@@ -121,7 +164,7 @@ final class OperatorViews {
         List<String> states = states(s, haltReason, now);
         StringBuilder sb = new StringBuilder(states.get(0));
         if (s == null) {
-            return sb.append("\nПервые данные — через полминуты после старта.").toString();
+            return sb.append("\nПервые данные — через полминуты после старта.\n").append(PANEL_HINT).toString();
         }
         // The headline names only the worst state; the others must still be on the screen, or
         // /status says one thing while the bot quietly refuses every signal for another.
@@ -150,8 +193,13 @@ final class OperatorViews {
                 .filter(p -> s.positionsFromExchange() && !p.stopOnRecord())
                 .map(p -> esc(p.symbol())).toList();
         if (!noStop.isEmpty()) sb.append("\n🟠 Без стопа в книге: ").append(String.join(", ", noStop));
-        if (s.pendingCloses() > 0) sb.append("\n🟠 Закрытия повторяются — /queue");
-        return sb.append('\n').append(footer(s.at(), now)).toString();
+        if (s.pendingCloses() > 0) {
+            // Named here, not behind /queue: /status is the one screen this bot still advertises.
+            List<String> retrying = s.closeQueue().stream().map(c -> esc(shortSymbol(c.symbol()))).distinct().toList();
+            sb.append("\n🟠 Закрытия повторяются: ")
+                    .append(retrying.isEmpty() ? Integer.toString(s.pendingCloses()) : String.join(", ", retrying));
+        }
+        return sb.append('\n').append(footer(s.at(), now)).append('\n').append(PANEL_HINT).toString();
     }
 
     private static void row(StringBuilder sb, String label, String value, boolean first) {
@@ -184,7 +232,7 @@ final class OperatorViews {
         for (OperatorSnapshot.Position p : rows) sb.append('\n').append(esc(bookRow(p, now)));
         sb.append("</pre>");
         sb.append("\n💰 Нереал.: ").append(anyPnl ? money(total) : "—");
-        sb.append("\n<i>Стоп/Тейк — сколько пройти цене.\nКнопка монеты — почему вошли\n(ничего не закрывает).</i>");
+        sb.append("\n<i>Стоп/Тейк — сколько пройти цене.</i>");
         if (!s.positionsFromExchange()) sb.append("\n🟠 Цен с биржи ещё нет — показана книга бота");
         return sb.append('\n').append(footer(s.at(), now)).toString();
     }
@@ -264,19 +312,21 @@ final class OperatorViews {
         return sb.append("\nВыбери действие:").toString();
     }
 
+    /**
+     * Control and the one fallback screen (24.09). /book /pnl /queue /why still answer when typed -
+     * harmless, read-only, and the owner's thumbs may remember them - but they are not advertised:
+     * the lab bot's 📊 Панель is where those numbers live now.
+     */
     static String help() {
         return "📊 <b>Команды</b>\n"
-                + "/menu — кнопки\n"
                 + "/status — состояние бота\n"
-                + "/book — открытые позиции\n"
-                + "/pnl — итог: день, 7 и 30 дней\n"
-                + "/queue — кто ждёт входа и закрытия\n"
-                + "/why ADA — почему вошли\n"
                 + "/halt — стоп новых входов\n"
                 + "/resume — снять халт\n"
                 + "/close ADAUSDT — закрыть одну\n"
                 + "/close all — закрыть всё\n"
-                + "<i>Халт не трогает выходы: стопы,\nтейки и закрытия работают всегда.</i>";
+                + "/menu — кнопки\n"
+                + "<i>Халт не трогает выходы: стопы,\nтейки и закрытия работают всегда.</i>\n"
+                + PANEL_HINT;
     }
 
     // ─── /queue ──────────────────────────────────────────────────────────────────────────────
@@ -482,44 +532,6 @@ final class OperatorViews {
             sb.append("</i>");
         }
         return sb.toString();
-    }
-
-    /**
-     * One button per position under /book, four to a row, each opening its /why. A symbol that
-     * would push the callback past 64 bytes gets no button rather than a refused keyboard.
-     */
-    static List<List<Button>> whyButtons(List<OperatorSnapshot.Position> rows) {
-        List<List<Button>> out = new java.util.ArrayList<>();
-        List<Button> line = new java.util.ArrayList<>();
-        for (OperatorSnapshot.Position p : rows) {
-            String data = CB_WHY + p.symbol();
-            if (data.getBytes(StandardCharsets.UTF_8).length > 64 || out.size() >= MAX_WHY_ROWS) continue;
-            line.add(new Button("📒 " + shortSymbol(p.symbol()), data));
-            if (line.size() == 4) {
-                out.add(List.copyOf(line));
-                line.clear();
-            }
-        }
-        if (!line.isEmpty() && out.size() < MAX_WHY_ROWS) out.add(List.copyOf(line));
-        return out;
-    }
-
-    /** Ten rows of four: 40 coins, far past the book's 15 slots and inside Telegram's 100 buttons. */
-    static final int MAX_WHY_ROWS = 10;
-
-    /** The /book keyboard: the coins' /why buttons, then the menu. */
-    static List<List<Button>> bookKeyboard(OperatorSnapshot s, boolean withMenu) {
-        List<List<Button>> out = new java.util.ArrayList<>(s == null ? List.of() : whyButtons(s.positions()));
-        if (withMenu) out.addAll(MENU);
-        return out.isEmpty() ? null : out;
-    }
-
-    /** Under a /why screen: back to the book, then the menu. */
-    static List<List<Button>> whyKeyboard() {
-        List<List<Button>> out = new java.util.ArrayList<>();
-        out.add(List.of(new Button("« Книга", CB_BOOK)));
-        out.addAll(MENU);
-        return out;
     }
 
     /** The close-all confirmation: exactly what will be closed, and for how long the button lives. */

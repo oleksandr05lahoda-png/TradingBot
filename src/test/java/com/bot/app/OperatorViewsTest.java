@@ -79,6 +79,65 @@ class OperatorViewsTest {
         assertEquals(1, latched.size(), "flag and latch together are said once: " + latched);
     }
 
+    @Test
+    @DisplayName("the panel file's state code is the headline /status shows, from the same list (24.09)")
+    void stateCodeFollowsTheHeadline() {
+        Optional<String> none = Optional.empty();
+        OperatorSnapshot green = snap(false, false, false, false, List.of(), null);
+        assertEquals("starting", OperatorViews.stateCode(null, none, NOON));
+        assertEquals("trading", OperatorViews.stateCode(green, none, NOON));
+        assertEquals("kill_switch", OperatorViews.stateCode(snap(false, false, false, true, List.of(), null), none, NOON));
+        assertEquals("halt", OperatorViews.stateCode(snap(false, false, false, true, List.of(), null), Optional.of("drift"), NOON));
+        assertEquals("observe", OperatorViews.stateCode(green, Optional.of(TestnetBot.OBSERVE_HALT_REASON), NOON));
+        assertEquals("exchange_hold", OperatorViews.stateCode(snap(true, true, true, true, List.of(), null), Optional.of("x"), NOON));
+        assertEquals("contact_lost", OperatorViews.stateCode(snap(false, true, true, false, List.of(), null), none, NOON));
+        assertEquals("blind", OperatorViews.stateCode(snap(false, false, true, false, List.of(), null), none, NOON));
+        assertEquals("loop_silent", OperatorViews.stateCode(green, none, NOON.plusSeconds(300)));
+    }
+
+    @Test
+    @DisplayName("a tripped daily limit says how far the day fell when the switch knows (24.09)")
+    void killSwitchLineNamesTheLoss() {
+        OperatorSnapshot s = snap(false, false, false, true, List.of(), null);
+        OperatorSnapshot withFigures = new OperatorSnapshot(s.at(), s.startedAt(), s.buildStamp(), false, true, 0L,
+                false, false, 0, 0, s.lastReconcileOkAt(), s.account(), List.of(), true, null, List.of(),
+                new OperatorSnapshot.KillSwitch(true, 0.03, 145.86, 0.0337, Instant.parse("2026-09-24T00:00:00Z")));
+        assertEquals("⏸ <b>Дневной лимит убытка</b> −3.4% — входов нет",
+                OperatorViews.stateLine(withFigures, Optional.empty(), NOON));
+        assertEquals("⏸ <b>Дневной лимит убытка</b> — входов нет", OperatorViews.stateLine(s, Optional.empty(), NOON),
+                "without the figures: no number invented");
+    }
+
+    @Test
+    @DisplayName("KillSwitch.of: day start and loss from the switch, the next UTC midnight when tripped, NaN before the first balance")
+    void killSwitchFigures() {
+        com.bot.risk.DailyLossKillSwitch.Status tripped = new com.bot.risk.DailyLossKillSwitch.Status(true, "limit",
+                java.time.LocalDate.parse("2026-09-23"), 145.86, -4.0, -0.915, -4.915, false);
+        OperatorSnapshot.KillSwitch k = OperatorSnapshot.KillSwitch.of(tripped, 0.03);
+        assertTrue(k.tripped());
+        assertEquals(0.03, k.limitFrac());
+        assertEquals(145.86, k.dayStartBalance());
+        assertEquals(4.915 / 145.86, k.dayLossFrac(), 1e-12);
+        assertEquals(Instant.parse("2026-09-24T00:00:00Z"), k.resumesAt());
+
+        com.bot.risk.DailyLossKillSwitch.Status fresh = new com.bot.risk.DailyLossKillSwitch.Status(false, "",
+                java.time.LocalDate.parse("2026-09-23"), 0.0, 0, 0, 0, false);
+        OperatorSnapshot.KillSwitch unknown = OperatorSnapshot.KillSwitch.of(fresh, 0.03);
+        assertTrue(Double.isNaN(unknown.dayStartBalance()), "no balance yet today is not $0");
+        assertTrue(Double.isNaN(unknown.dayLossFrac()));
+        assertNull(unknown.resumesAt(), "not tripped: nothing to resume");
+        assertNull(OperatorSnapshot.KillSwitch.of(null, 0.03));
+    }
+
+    @Test
+    @DisplayName("/help lists control and the fallback screen only (24.09)")
+    void helpIsControlOnly() {
+        String h = OperatorViews.help();
+        for (String c : List.of("/status", "/halt", "/resume", "/close", "/menu")) assertTrue(h.contains(c), c);
+        for (String c : List.of("/book", "/pnl", "/queue", "/why")) assertFalse(h.contains(c), c);
+        assertTrue(h.endsWith(OperatorViews.PANEL_HINT), h);
+    }
+
     // ─── /status ────────────────────────────────────────────────────────────────────────────
 
     @Test
@@ -96,7 +155,10 @@ class OperatorViewsTest {
         assertTrue(s.contains("Сверка     37 с назад"), s);
         assertTrue(s.contains("Работает   3 д 1 ч"), s);
         assertTrue(s.contains("Сборка     20260923-053822Z"), s);
-        assertTrue(s.endsWith("<i>Данные 12 с назад · 12:00</i>"), s);
+        assertTrue(s.contains("<i>Данные 12 с назад · 12:00</i>\n"), s);
+        // 24.09: the one fallback screen ends by saying where the full panel is.
+        assertTrue(s.endsWith(OperatorViews.PANEL_HINT), s);
+        assertTrue(TgFormat.plain(s).endsWith("Полная панель — кнопка 📊 Панель\nв лаб-боте (когда ноутбук включён)"), s);
         for (String line : TgFormat.plain(s).split("\n")) {
             assertTrue(line.length() <= 40, "fits a phone: " + line);
         }
@@ -108,6 +170,19 @@ class OperatorViewsTest {
         String s = OperatorViews.status(null, Optional.empty(), NOON);
         assertTrue(s.startsWith("🟠 <b>Запуск</b>"), s);
         assertFalse(s.contains("$"), s);
+        assertTrue(s.endsWith(OperatorViews.PANEL_HINT), s);
+    }
+
+    @Test
+    @DisplayName("/status names the coins whose closes are retrying - /queue is no longer advertised (24.09)")
+    void statusNamesRetryingCloses() {
+        OperatorSnapshot base = snap(false, false, false, false, List.of(adaLong()), null);
+        OperatorSnapshot s = new OperatorSnapshot(base.at(), base.startedAt(), base.buildStamp(), false, false, 0L,
+                false, false, 0, 1, base.lastReconcileOkAt(), base.account(), base.positions(), true, null,
+                List.of(new OperatorSnapshot.QueuedClose("ADAUSDT", "stop", 1, 5, NOON.plusSeconds(30))));
+        String out = OperatorViews.status(s, Optional.empty(), NOON);
+        assertTrue(out.contains("🟠 Закрытия повторяются: ADA"), out);
+        assertFalse(out.contains("/queue"), out);
     }
 
     // ─── /book ──────────────────────────────────────────────────────────────────────────────

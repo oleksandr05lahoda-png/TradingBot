@@ -1,5 +1,4 @@
 */5 * * * * /opt/watchdog.sh
-0 18 * * * /usr/bin/python3 /opt/digest.py >> /opt/tradingbot-data/ops/digest.log 2>&1
 */30 * * * * /usr/bin/python3 /opt/selfcheck.py >> /opt/tradingbot-data/ops/selfcheck.log 2>&1
 */15 * * * * /usr/bin/python3 /opt/pautina.py >> /opt/tradingbot-data/flow/collector.log 2>&1
 7 * * * * /usr/bin/python3 /opt/crowd.py >> /opt/tradingbot-data/flow/crowd.log 2>&1

@@ -17,7 +17,11 @@
 # string escaped, and one plain-text resend if it still answers 400 (an alert is never lost to
 # formatting). Nothing here can touch the trading account: two signed GETs and public klines.
 #
-# Run by cron at 18:00 host time (Europe/Berlin = Warsaw): /opt/digest.py >> .../ops/digest.log
+# 24.09: NOT RUN ANY MORE. The owner removed the 18:00 line from crontab.txt: the same numbers came
+# from the digest, the bot's menu and the lab's /panel, and he keeps only the panel in the lab bot
+# (he asks for the current state there when he wants it). Kept in the repo, tested, unused; putting
+# it back is one cron line - tools/ops/INSTALL.md, section "24.09: одна панель".
+# Was run by cron at 18:00 host time (Europe/Berlin = Warsaw): /opt/digest.py >> .../ops/digest.log
 # Offline checks: tools/ops/test_digest.py
 import calendar, hashlib, hmac, html, io, json, os, re, struct, subprocess, sys, time, zlib
 import urllib.error, urllib.parse, urllib.request
